@@ -61,6 +61,8 @@ DB_DIR = CAO_HOME_DIR / "db"
 LOG_DIR = CAO_HOME_DIR / "logs"
 TERMINAL_LOG_DIR = LOG_DIR / "terminal"  # Per-terminal log files for pipe-pane output
 TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+DRAFT_LOG_DIR = LOG_DIR / "drafts"  # Stashed human composer drafts before CAO injection
+DRAFT_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # FIFO directory for event-driven terminal output streaming
 FIFO_DIR = CAO_HOME_DIR / "fifos"  # Named pipes for tmux pipe-pane streaming

@@ -829,6 +829,55 @@ class TestCodexScreenDetection:
         assert self._p().get_status_from_screen(["", "", ""]) == TerminalStatus.PROCESSING
 
 
+class TestCodexComposerDraftParsing:
+    def _p(self):
+        return CodexProvider("test1234", "test-session", "window-0")
+
+    def test_empty_composer(self):
+        screen = [
+            "› ",
+            "  ? for shortcuts                     100% context left",
+        ]
+        assert self._p().read_composer_draft(screen) == ""
+
+    def test_placeholder_counts_as_empty(self):
+        screen = [
+            "› Explain this codebase",
+            "  ? for shortcuts                     100% context left",
+        ]
+        assert self._p().read_composer_draft(screen) == ""
+
+    def test_one_line_draft(self):
+        screen = [
+            "› keep this draft",
+            "  ? for shortcuts                     100% context left",
+        ]
+        assert self._p().read_composer_draft(screen) == "keep this draft"
+
+    def test_multi_line_draft(self):
+        screen = [
+            "› line one",
+            "  line two",
+            "  ? for shortcuts                     100% context left",
+        ]
+        assert self._p().read_composer_draft(screen) == "line one\nline two"
+
+    def test_large_paste_placeholder_is_preserved_literally(self):
+        screen = [
+            "› [Pasted Content 2001 chars]",
+            "  ? for shortcuts                     100% context left",
+        ]
+        assert self._p().read_composer_draft(screen) == "[Pasted Content 2001 chars]"
+
+    def test_wrapped_segment_joins_without_newline_when_line_fills_width(self):
+        screen = [
+            "› " + "x" * 40,
+            "continued",
+            "  ? for shortcuts                     100% context left",
+        ]
+        assert self._p().read_composer_draft(screen) == ("x" * 40) + "continued"
+
+
 class TestCodexBulletFormatStatusDetection:
     """Tests for Codex's real interactive output format using › prompt and • bullets."""
 

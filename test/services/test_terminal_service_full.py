@@ -643,10 +643,13 @@ class TestSendInput:
     """Tests for send_input function."""
 
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.preserve_draft_before_send")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_send_input_success(self, mock_get_metadata, mock_tmux, mock_pm, mock_update):
+    def test_send_input_success(
+        self, mock_get_metadata, mock_tmux, mock_pm, mock_preserve, mock_update
+    ):
         """Test sending input successfully."""
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
@@ -655,6 +658,7 @@ class TestSendInput:
         mock_provider = mock_pm.get_provider.return_value
         mock_provider.paste_enter_count = 2
         mock_provider.paste_submit_delay = 0.3
+        mock_preserve.return_value = None
 
         result = send_input("test1234", "test message")
 
@@ -667,6 +671,40 @@ class TestSendInput:
             force_bracketed_paste=True,
             submit_delay=0.3,
         )
+        mock_preserve.assert_called_once_with("test1234", mock_get_metadata.return_value, mock_provider)
+        mock_update.assert_called_once_with("test1234")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.preserve_draft_before_send")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_restores_preserved_draft(
+        self, mock_get_metadata, mock_tmux, mock_pm, mock_preserve, mock_update
+    ):
+        """A stashed draft is restored after the injected message is submitted."""
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.paste_enter_count = 2
+        mock_provider.paste_submit_delay = 0.3
+        preserved = MagicMock()
+        mock_preserve.return_value = preserved
+
+        result = send_input("test1234", "test message")
+
+        assert result is True
+        mock_tmux.send_keys.assert_called_once_with(
+            "cao-session",
+            "developer-abcd",
+            "test message",
+            enter_count=2,
+            force_bracketed_paste=True,
+            submit_delay=0.3,
+        )
+        preserved.restore.assert_called_once_with(mock_tmux)
         mock_update.assert_called_once_with("test1234")
 
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")

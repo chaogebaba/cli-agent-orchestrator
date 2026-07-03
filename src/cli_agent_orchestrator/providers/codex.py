@@ -85,6 +85,10 @@ TUI_PROGRESS_PATTERN = r"•.*\(\d+s\s*•\s*esc to interrupt\)"
 TRUST_PROMPT_PATTERN = r"allow Codex to work in this folder"
 # Codex welcome banner indicating normal startup (no trust prompt)
 CODEX_WELCOME_PATTERN = r"OpenAI Codex"
+CODEX_EMPTY_COMPOSER_PLACEHOLDERS = {
+    "Explain this codebase",
+    "Ask Codex to do anything",
+}
 
 
 def _compute_tui_footer_cutoff(all_lines: list) -> int:
@@ -527,6 +531,91 @@ class CodexProvider(BaseProvider):
     # ClaudeCodeProvider reference implementation for a provider that DOES need
     # a purpose-built override.
     supports_screen_detection = True
+    supports_draft_preservation = True
+    composer_clear_keys = ["C-a", "C-k"]
+
+    def read_composer_draft(self, screen_lines: list[str]) -> str | None:
+        """Read the visible Codex composer draft from rendered screen lines.
+
+        Codex renders the editable composer at the bottom with a leading ``›``.
+        The status footer sits below it. The parser intentionally uses only the
+        provider's rendered screen shape; the shared draft guard stays generic.
+        """
+        if not screen_lines:
+            return None
+
+        raw_lines = [line.rstrip("\r") for line in screen_lines]
+        visible = [line.rstrip() for line in raw_lines]
+
+        footer_idx = len(visible)
+        for i in range(len(visible) - 1, -1, -1):
+            if re.search(TUI_FOOTER_PATTERN, visible[i]):
+                footer_idx = i
+                break
+
+        search_end = footer_idx
+        while search_end > 0 and not visible[search_end - 1].strip():
+            search_end -= 1
+
+        prompt_idx: int | None = None
+        lower_bound = max(0, search_end - 12)
+        for i in range(search_end - 1, lower_bound - 1, -1):
+            if "›" in visible[i]:
+                prompt_idx = i
+                break
+        if prompt_idx is None:
+            return None
+
+        prompt_line = visible[prompt_idx]
+        prompt_pos = prompt_line.rfind("›")
+        first = prompt_line[prompt_pos + 1 :]
+        if first.startswith(" "):
+            first = first[1:]
+
+        segments = [first]
+        for line in visible[prompt_idx + 1 : search_end]:
+            text = line.strip()
+            if not text:
+                segments.append("")
+                continue
+            if text.startswith(("╭", "╰", "│")) and text.endswith(("╮", "╯", "│")):
+                continue
+            segments.append(text)
+
+        while segments and segments[-1] == "":
+            segments.pop()
+
+        draft = self._join_composer_segments(raw_lines, prompt_idx, prompt_pos, segments)
+        if draft.strip() in CODEX_EMPTY_COMPOSER_PLACEHOLDERS:
+            return ""
+        return draft
+
+    @staticmethod
+    def _join_composer_segments(
+        raw_lines: list[str],
+        prompt_idx: int,
+        prompt_pos: int,
+        segments: list[str],
+    ) -> str:
+        if not segments:
+            return ""
+
+        joined = segments[0]
+        for offset, segment in enumerate(segments[1:], start=1):
+            prev_raw = raw_lines[prompt_idx + offset - 1]
+            width = len(prev_raw)
+            prev_visible = prev_raw.rstrip()
+            if offset == 1:
+                available = max(width - prompt_pos - 2, 0)
+                prev_len = len(prev_visible[prompt_pos + 2 :])
+            else:
+                available = width
+                prev_len = len(prev_visible)
+            if available >= 20 and prev_len >= available:
+                joined += segment
+            else:
+                joined += "\n" + segment
+        return joined
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Codex's final response from terminal output.

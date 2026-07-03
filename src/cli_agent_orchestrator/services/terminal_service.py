@@ -43,6 +43,7 @@ from cli_agent_orchestrator.plugins import (
     PostSendMessageEvent,
 )
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services.draft_guard import preserve_draft_before_send
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.memory_service import MemoryService
@@ -494,7 +495,10 @@ def send_input(
         # working on the new message.
         status_monitor.notify_input_sent(terminal_id)
 
-        get_backend().send_keys(
+        backend = get_backend()
+        preserved_draft = preserve_draft_before_send(terminal_id, metadata, provider)
+
+        backend.send_keys(
             metadata["tmux_session"],
             metadata["tmux_window"],
             message,
@@ -502,6 +506,8 @@ def send_input(
             force_bracketed_paste=True,
             submit_delay=provider.paste_submit_delay if provider else 0.3,
         )
+        if preserved_draft is not None:
+            preserved_draft.restore(backend)
 
         # Notify the provider that external input was received.
         # This allows providers to adjust status

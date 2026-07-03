@@ -174,6 +174,21 @@ class BaseProvider(ABC):
         """
         return self.get_status("\n".join(screen_lines))
 
+    # Opt-in flag for preserving an unsent human composer draft before CAO
+    # injects orchestrated input. Providers that set this True must implement
+    # read_composer_draft() against rendered screen lines and provide a single
+    # clear-key iteration in composer_clear_keys.
+    supports_draft_preservation: bool = False
+    composer_clear_keys: List[str] = []
+
+    def read_composer_draft(self, screen_lines: List[str]) -> Optional[str]:
+        """Return the visible unsent composer draft from a rendered screen.
+
+        Return "" when the composer is visible and empty, or None when the
+        provider cannot confidently identify its composer on this screen.
+        """
+        return None
+
     @property
     def paste_submit_delay(self) -> float:
         """Seconds to wait after a bracketed paste before sending the Enter key.

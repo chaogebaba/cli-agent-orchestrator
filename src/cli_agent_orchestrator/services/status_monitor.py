@@ -488,6 +488,18 @@ class StatusMonitor:
         with self._lock:
             return self._buffers.get(terminal_id, "")
 
+    def get_rendered_screen(self, terminal_id: str) -> Optional[List[str]]:
+        """Return the current pyte-composited screen for a terminal if present."""
+        with self._lock:
+            scr = self._screens.get(terminal_id)
+            if scr is None:
+                return None
+            try:
+                return list(scr[0].display)
+            except Exception:
+                logger.exception("Error rendering screen for %s", terminal_id)
+                return None
+
 
 # Module-level singleton
 status_monitor = StatusMonitor()
