@@ -1465,6 +1465,30 @@ async def create_inbox_message_endpoint(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
+    metadata = get_terminal_metadata(receiver_id)
+    if not metadata:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Terminal '{receiver_id}' not found",
+        )
+
+    backend = get_backend()
+    if not backend.session_exists(metadata["tmux_session"]):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Terminal '{receiver_id}' not found: session "
+                f"'{metadata['tmux_session']}' is gone"
+            ),
+        )
+    try:
+        backend.get_history(metadata["tmux_session"], metadata["tmux_window"], tail_lines=1)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Terminal '{receiver_id}' not found: {str(e)}",
+        )
+
     try:
         inbox_msg = create_inbox_message(
             sender_id,

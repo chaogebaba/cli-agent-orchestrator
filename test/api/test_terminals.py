@@ -333,9 +333,16 @@ class TestCreateInboxMessageEndpoint:
         mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
 
         with (
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value={"tmux_session": "cao-test", "tmux_window": "worker"},
+            ),
+            patch("cli_agent_orchestrator.api.main.get_backend") as mock_backend,
             patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
             patch("cli_agent_orchestrator.api.main.inbox_service") as mock_inbox,
         ):
+            mock_backend.return_value.session_exists.return_value = True
+            mock_backend.return_value.get_history.return_value = ""
             mock_create.return_value = mock_msg
 
             response = client.post(
@@ -364,9 +371,16 @@ class TestCreateInboxMessageEndpoint:
         mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
 
         with (
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value={"tmux_session": "cao-test", "tmux_window": "worker"},
+            ),
+            patch("cli_agent_orchestrator.api.main.get_backend") as mock_backend,
             patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
             patch("cli_agent_orchestrator.api.main.inbox_service") as mock_inbox,
         ):
+            mock_backend.return_value.session_exists.return_value = True
+            mock_backend.return_value.get_history.return_value = ""
             mock_create.return_value = mock_msg
             mock_inbox.deliver_pending.side_effect = Exception("TMux busy")
 
@@ -380,8 +394,10 @@ class TestCreateInboxMessageEndpoint:
 
     def test_create_inbox_message_not_found(self, client):
         """POST returns 404 when terminal not found."""
-        with patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create:
-            mock_create.side_effect = ValueError("Terminal not found")
+        with (
+            patch("cli_agent_orchestrator.api.main.get_terminal_metadata", return_value=None),
+            patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
+        ):
 
             response = client.post(
                 "/terminals/deadbeef/inbox/messages",
@@ -389,10 +405,63 @@ class TestCreateInboxMessageEndpoint:
             )
 
             assert response.status_code == 404
+            mock_create.assert_not_called()
+
+    def test_create_inbox_message_stale_session_fails_before_queueing(self, client):
+        """POST returns 404 when metadata exists but the tmux session is gone."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value={"tmux_session": "cao-gone", "tmux_window": "worker"},
+            ),
+            patch("cli_agent_orchestrator.api.main.get_backend") as mock_backend,
+            patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
+        ):
+            mock_backend.return_value.session_exists.return_value = False
+
+            response = client.post(
+                "/terminals/deadbeef/inbox/messages",
+                params={"sender_id": "sender1", "message": "hello"},
+            )
+
+            assert response.status_code == 404
+            assert "session 'cao-gone' is gone" in response.json()["detail"]
+            mock_create.assert_not_called()
+
+    def test_create_inbox_message_stale_window_fails_before_queueing(self, client):
+        """POST returns 404 when the terminal row points at a missing pane."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value={"tmux_session": "cao-test", "tmux_window": "worker"},
+            ),
+            patch("cli_agent_orchestrator.api.main.get_backend") as mock_backend,
+            patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
+        ):
+            mock_backend.return_value.session_exists.return_value = True
+            mock_backend.return_value.get_history.side_effect = ValueError("Window not found")
+
+            response = client.post(
+                "/terminals/deadbeef/inbox/messages",
+                params={"sender_id": "sender1", "message": "hello"},
+            )
+
+            assert response.status_code == 404
+            assert "Window not found" in response.json()["detail"]
+            mock_create.assert_not_called()
 
     def test_create_inbox_message_server_error(self, client):
         """POST returns 500 on internal error."""
-        with patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create:
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value={"tmux_session": "cao-test", "tmux_window": "worker"},
+            ),
+            patch("cli_agent_orchestrator.api.main.get_backend") as mock_backend,
+            patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
+        ):
+            mock_backend.return_value.session_exists.return_value = True
+            mock_backend.return_value.get_history.return_value = ""
             mock_create.side_effect = Exception("DB error")
 
             response = client.post(
