@@ -246,6 +246,22 @@ class StatusMonitor:
                 return TerminalStatus.UNKNOWN
         if not lines or provider is None:
             return TerminalStatus.UNKNOWN
+
+        # Auto-responder: inspect the same composited screen for whitelisted
+        # blocking dialogs (whitelist-only auto-answer, or WAITING_USER_ANSWER
+        # + supervisor push for anything unrecognized). Capability-gated inside
+        # on_screen (supports_screen_detection + CAO_AUTO_ANSWER kill switch),
+        # so this is a no-op for providers/servers that don't opt in. A
+        # non-None return overrides normal detection for this tick.
+        try:
+            from cli_agent_orchestrator.services.auto_responder import auto_responder
+
+            override = auto_responder.on_screen(terminal_id, provider, lines)
+            if override is not None:
+                return override
+        except Exception:
+            logger.exception("Error in auto-responder for %s", terminal_id)
+
         try:
             return provider.get_status_from_screen(lines)
         except Exception:
@@ -487,6 +503,17 @@ class StatusMonitor:
         """Get accumulated output buffer for a terminal."""
         with self._lock:
             return self._buffers.get(terminal_id, "")
+
+    def force_status(self, terminal_id: str, status: TerminalStatus) -> None:
+        """Force-publish a status, going through the normal latch/publish path.
+
+        Used by the auto-responder to surface WAITING_USER_ANSWER when a
+        retry-exhausted rule leaves a dialog unresolved outside the regular
+        detection tick (its verify/retry loop runs on a background thread,
+        off the event loop, so it can't just return an override like
+        ``_detect_screen`` callers do).
+        """
+        self._apply_detection(terminal_id, status)
 
     def get_rendered_screen(self, terminal_id: str) -> Optional[List[str]]:
         """Return the current pyte-composited screen for a terminal if present."""
