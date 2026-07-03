@@ -20,6 +20,7 @@ Session Lifecycle:
 """
 
 import logging
+import time
 from typing import Dict, List
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -37,6 +38,9 @@ from cli_agent_orchestrator.services.terminal_service import create_terminal
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 
 logger = logging.getLogger(__name__)
+
+SESSION_TEARDOWN_VERIFY_ATTEMPTS = 5
+SESSION_TEARDOWN_VERIFY_DELAY_SECONDS = 0.2
 
 
 async def create_session(
@@ -143,9 +147,25 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
             except Exception as e:
                 logger.warning(f"Failed to cleanup terminal {terminal['id']}: {e}")
 
-        # Kill backend session only if it still exists
+        backend = get_backend()
+        # Kill backend session only if it still exists. Then verify it is
+        # actually gone: terminal-level cleanup can race with tmux session
+        # teardown, and a stale named session blocks immediate relaunch.
         if session_alive:
-            get_backend().kill_session(session_name)
+            backend.kill_session(session_name)
+        for attempt in range(SESSION_TEARDOWN_VERIFY_ATTEMPTS):
+            if not backend.session_exists(session_name):
+                break
+            logger.warning(
+                "Session %s still exists after teardown attempt %d; retrying kill",
+                session_name,
+                attempt + 1,
+            )
+            backend.kill_session(session_name)
+            if attempt < SESSION_TEARDOWN_VERIFY_ATTEMPTS - 1:
+                time.sleep(SESSION_TEARDOWN_VERIFY_DELAY_SECONDS)
+        if backend.session_exists(session_name):
+            raise RuntimeError(f"Session '{session_name}' still exists after teardown")
 
         # Drop the per-session forwarded-env mapping (issue #248). Safe
         # even when no vars were forwarded — the helper is a no-op then.

@@ -188,7 +188,7 @@ class TestDeleteSession:
         buffer, provider, DB) to terminal_service.delete_terminal, then kills
         the backend session and returns the Dict result shape.
         """
-        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.side_effect = [True, False, False]
         mock_list_terminals.return_value = [
             {"id": "terminal1"},
             {"id": "terminal2"},
@@ -227,7 +227,7 @@ class TestDeleteSession:
         self, mock_get_backend, mock_list_terminals, mock_delete_terminal
     ):
         """Test deleting session with no terminals."""
-        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.side_effect = [True, False, False]
         mock_list_terminals.return_value = []
 
         result = delete_session("cao-test")
@@ -253,7 +253,7 @@ class TestDeleteSession:
         self, mock_get_backend, mock_list_terminals, mock_delete_terminal
     ):
         """Test that delete_session continues even when terminal teardown fails for some terminals."""
-        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.side_effect = [True, False, False]
         mock_list_terminals.return_value = [
             {"id": "terminal1"},
             {"id": "terminal2"},
@@ -275,6 +275,42 @@ class TestDeleteSession:
         # All three terminal teardowns were attempted
         assert mock_delete_terminal.call_count == 3
 
+    @patch("cli_agent_orchestrator.services.session_service.time.sleep")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_delete_session_retries_when_session_survives_initial_kill(
+        self, mock_get_backend, mock_list_terminals, mock_delete_terminal, mock_sleep
+    ):
+        """If tmux still reports the session after graceful cleanup, kill it again."""
+        backend = mock_get_backend.return_value
+        backend.session_exists.side_effect = [True, True, False, False]
+        mock_list_terminals.return_value = []
+
+        result = delete_session("cao-test")
+
+        assert result == {"deleted": ["cao-test"], "errors": []}
+        assert backend.kill_session.call_count == 2
+        backend.kill_session.assert_any_call("cao-test")
+        mock_sleep.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.session_service.time.sleep")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_delete_session_raises_when_session_remains_after_retries(
+        self, mock_get_backend, mock_list_terminals, mock_delete_terminal, mock_sleep
+    ):
+        """A still-live tmux session is an error so callers do not relaunch into 400."""
+        backend = mock_get_backend.return_value
+        backend.session_exists.return_value = True
+        mock_list_terminals.return_value = []
+
+        with pytest.raises(RuntimeError, match="still exists after teardown"):
+            delete_session("cao-test")
+
+        assert backend.kill_session.call_count == 6
+
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
@@ -282,7 +318,7 @@ class TestDeleteSession:
         self, mock_get_backend, mock_list_terminals, mock_delete_terminal
     ):
         """Test that delete_session tears down every terminal in the session via delete_terminal."""
-        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.side_effect = [True, False, False]
         mock_list_terminals.return_value = [
             {"id": "term-aaa"},
             {"id": "term-bbb"},
