@@ -784,6 +784,51 @@ class TestCodexProviderStatusDetection:
         assert status == TerminalStatus.COMPLETED
 
 
+class TestCodexScreenDetection:
+    """get_status_from_screen (pyte composited viewport) — opt-in regression net.
+
+    Regression for a live bug: an unsent draft typed into the Codex composer
+    generates enough raw pipe-pane redraw bytes to evict the ``›`` user-prompt
+    anchor from the 8KB rolling buffer, so the raw-buffer get_status() falls to
+    its PROCESSING catch-all forever even though the turn is done. A composited
+    screen (pyte / capture-pane) always reflects full current content regardless
+    of redraw history, so routing through get_status_from_screen (base class
+    default: join lines, delegate to get_status) recovers COMPLETED using the
+    exact same regex logic already covered above.
+    """
+
+    def _p(self):
+        return CodexProvider("test1234", "test-session", "window-0")
+
+    def test_completed_turn_visible_on_composited_screen(self):
+        screen = [
+            "› Fix the bug",
+            "• I've fixed the issue in main.py.",
+            "",
+            "› ",
+            "  ? for shortcuts                     100% context left",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
+    def test_processing_spinner_on_composited_screen(self):
+        screen = [
+            "› Fix the bug",
+            "• Working (5s • esc to interrupt)",
+            "› ",
+            "  ? for shortcuts                     100% context left",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+
+    def test_blank_screen_falls_to_processing_catch_all(self):
+        """Unlike ClaudeCodeProvider, Codex's get_status() has no bare
+        ``if not output.strip(): return UNKNOWN`` guard — blank content with no
+        idle prompt hits the same catch-all as real PROCESSING output. This
+        matches existing (pre-screen-detection) get_status() behavior; the
+        screen path intentionally reuses it verbatim rather than special-casing
+        blank frames."""
+        assert self._p().get_status_from_screen(["", "", ""]) == TerminalStatus.PROCESSING
+
+
 class TestCodexBulletFormatStatusDetection:
     """Tests for Codex's real interactive output format using › prompt and • bullets."""
 

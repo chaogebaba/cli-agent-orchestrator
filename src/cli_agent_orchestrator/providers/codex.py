@@ -45,6 +45,12 @@ ASSISTANT_PREFIX_PATTERN = r"^(?:(?:assistant|codex|agent)\s*:|[^\S\n]*•)"
 # paren) is required so legitimate model bullets like "• Called attention
 # to the bug" don't get filtered as tool calls.
 MCP_TOOL_CALL_PATTERN = r"^[^\S\n]*•\s+Called\s+[\w-]+\.[\w-]+\("
+# Codex startup/system notice bullets that are NOT model replies, e.g.
+# "• You have 3 usage limit resets available. Run /usage to use one."
+# These render with the same "•" prefix as assistant messages; without this
+# filter a fresh terminal showing only the banner is classified COMPLETED and
+# the banner text gets extracted as the model's reply (false handoff success).
+SYSTEM_NOTICE_PATTERN = r"^[^\S\n]*•\s+You have \d+ usage limit reset"
 # Match user input: "You ..." (label style) or "› text" (Codex interactive prompt).
 # The "›[^\S\n]*\S" alternative requires a non-whitespace character on the same line
 # to distinguish user input ("› what is your role?") from the empty idle prompt ("› ").
@@ -187,6 +193,8 @@ def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
             line_end = len(text)
         line = text[m.start() : line_end]
         if re.match(MCP_TOOL_CALL_PATTERN, line):
+            continue
+        if re.match(SYSTEM_NOTICE_PATTERN, line):
             continue
         return m
     return None
@@ -509,6 +517,17 @@ class CodexProvider(BaseProvider):
         # assume the CLI is still producing output.
         return TerminalStatus.PROCESSING
 
+    # Opt in to pyte rendered-screen detection (gated by CAO_PYTE_STATUS). The
+    # existing get_status() regex logic above already works correctly against a
+    # composited screen (verified against a live capture-pane snapshot) — the
+    # bug is specific to the raw pipe-pane rolling buffer, where an unsent TUI
+    # composer draft can evict the user/assistant anchors from the 8KB window.
+    # The base class's default get_status_from_screen() (join + delegate to
+    # get_status) is sufficient here, so no override is needed — see base.py's
+    # ClaudeCodeProvider reference implementation for a provider that DOES need
+    # a purpose-built override.
+    supports_screen_detection = True
+
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Codex's final response from terminal output.
 
@@ -599,6 +618,8 @@ class CodexProvider(BaseProvider):
                 line_end = len(clean_output)
             line = clean_output[m.start() : line_end]
             if re.match(MCP_TOOL_CALL_PATTERN, line):
+                continue
+            if re.match(SYSTEM_NOTICE_PATTERN, line):
                 continue
             matches.append(m)
 
