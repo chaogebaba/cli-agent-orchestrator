@@ -21,7 +21,6 @@ space -- never against raw lines. Rules must never encode newlines.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import re
@@ -44,6 +43,8 @@ RETRY_MAX = 3
 RETRY_DELAY_S = 1.0
 COOLDOWN_S = 5.0
 KEY_DELAY_S = 0.1
+UNKNOWN_DIALOG_PUSH_FLOOR_S = 300.0
+UNKNOWN_DIALOG_PAYLOAD_CHARS = 600
 
 # Seed rule files, created only if absent -- never overwritten. Keys are the
 # provider filename (``<provider>.yaml``); values are the verbatim YAML from
@@ -180,6 +181,13 @@ class _RuleState:
     cooldown_until: float = field(default=0.0)
 
 
+@dataclass
+class _UnknownDialogState:
+    episode_open: bool = False
+    non_dialog_ticks: int = 0
+    last_push_at: float = field(default=-UNKNOWN_DIALOG_PUSH_FLOOR_S)
+
+
 class AutoResponder:
     """Whitelist-only engine: fires ``answer`` keys for matched rules,
     surfaces everything else as WAITING_USER_ANSWER.
@@ -188,7 +196,7 @@ class AutoResponder:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._rule_state: Dict[tuple, _RuleState] = {}
-        self._unknown_hash: Dict[str, str] = {}
+        self._unknown_state: Dict[str, _UnknownDialogState] = {}
 
     def on_screen(
         self, terminal_id: str, provider: Any, lines: List[str]
@@ -225,6 +233,10 @@ class AutoResponder:
         # session-wide for multi-window sessions.
         session_env = get_session_env(metadata["tmux_session"])
         if session_env.get("CAO_AUTO_ANSWER", "true").lower() == "false":
+            return None
+
+        if self._find_supervisor(metadata["tmux_session"]) == terminal_id:
+            logger.debug("auto-responder: skipping supervisor terminal %s", terminal_id)
             return None
 
         provider_name = metadata["provider"]
@@ -341,16 +353,34 @@ class AutoResponder:
         self, terminal_id: str, metadata: Dict[str, Any], provider_name: str, normalized: str
     ) -> Optional[TerminalStatus]:
         if not self._looks_like_dialog(normalized, provider_name):
+            close_episode = False
             with self._lock:
-                self._unknown_hash.pop(terminal_id, None)
+                state = self._unknown_state.get(terminal_id)
+                if state and state.episode_open:
+                    state.non_dialog_ticks += 1
+                    if state.non_dialog_ticks >= 2:
+                        state.episode_open = False
+                        state.non_dialog_ticks = 0
+                        close_episode = True
+            if state and state.episode_open and not close_episode:
+                return TerminalStatus.WAITING_USER_ANSWER
             return None
 
-        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        now = time.monotonic()
         with self._lock:
-            already_pushed = self._unknown_hash.get(terminal_id) == digest
-            self._unknown_hash[terminal_id] = digest
+            state = self._unknown_state.get(terminal_id)
+            if state is None:
+                state = _UnknownDialogState()
+                self._unknown_state[terminal_id] = state
+            new_episode = not state.episode_open
+            state.episode_open = True
+            state.non_dialog_ticks = 0
+            should_push = new_episode and now - state.last_push_at >= UNKNOWN_DIALOG_PUSH_FLOOR_S
+            if should_push:
+                state.last_push_at = now
 
-        if not already_pushed:
+        if should_push:
+            dialog_text = self._payload_excerpt(normalized)
             self._push(
                 terminal_id,
                 metadata,
@@ -359,9 +389,15 @@ class AutoResponder:
                 "worker is stalled. Ask the user how to answer it (auto-answer "
                 "default / other keys / always wait), then append a rule to "
                 f"~/.aws/cli-agent-orchestrator/auto-answers/{provider_name}.yaml.\n\n"
-                f"Dialog text (normalized): {normalized}",
+                f"Dialog text (normalized): {dialog_text}",
             )
         return TerminalStatus.WAITING_USER_ANSWER
+
+    @staticmethod
+    def _payload_excerpt(normalized: str) -> str:
+        if len(normalized) <= UNKNOWN_DIALOG_PAYLOAD_CHARS:
+            return normalized
+        return normalized[:UNKNOWN_DIALOG_PAYLOAD_CHARS] + "..."
 
     @staticmethod
     def _looks_like_dialog(normalized: str, provider_name: str) -> bool:
@@ -371,8 +407,7 @@ class AutoResponder:
             if re.search(WAITING_PROMPT_PATTERN, normalized):
                 return True
         return bool(
-            _NUMBERED_OPTION_PATTERN.search(normalized)
-            and _PRESS_ENTER_PATTERN.search(normalized)
+            _NUMBERED_OPTION_PATTERN.search(normalized) and _PRESS_ENTER_PATTERN.search(normalized)
         )
 
     # ----- supervisor push -------------------------------------------------
@@ -397,6 +432,9 @@ class AutoResponder:
                 metadata["tmux_session"],
                 terminal_id,
             )
+            return
+        if supervisor_id == terminal_id:
+            logger.warning("auto-responder: refusing to push terminal %s to itself", terminal_id)
             return
         try:
             create_inbox_message(terminal_id, supervisor_id, message)
