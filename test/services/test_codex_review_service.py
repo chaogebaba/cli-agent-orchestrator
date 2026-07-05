@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -45,6 +46,90 @@ def test_build_codex_review_command_maps_scopes():
 def test_build_codex_review_command_rejects_invalid_contract(instructions, scope, target, message):
     with pytest.raises(ValueError, match=message):
         svc.build_codex_review_command(instructions, scope, target)
+
+
+def test_create_codex_review_job_requires_cwd():
+    with pytest.raises(ValueError, match="cwd is required"):
+        svc.create_codex_review_job(requester_id="deadbeef", scope="commit", target="abc123")
+
+
+@pytest.mark.parametrize(
+    ("instructions", "scope"),
+    [
+        ("focus", None),
+        (None, "uncommitted"),
+    ],
+)
+def test_create_codex_review_job_checks_findings_file_is_git_ignored(
+    tmp_path, monkeypatch, instructions, scope
+):
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(svc.subprocess, "run", fake_run)
+
+    job = svc.create_codex_review_job(
+        requester_id="deadbeef",
+        instructions=instructions,
+        scope=scope,
+        cwd=str(tmp_path),
+    )
+
+    assert calls == [
+        (
+            ["git", "check-ignore", "-q", f"tmp/orch/review-{job.review_id}.md"],
+            {
+                "cwd": str(tmp_path),
+                "check": False,
+                "stdout": svc.subprocess.DEVNULL,
+                "stderr": svc.subprocess.DEVNULL,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("scope", "target"),
+    [
+        ("base", "main"),
+        ("commit", "abc123"),
+    ],
+)
+def test_create_codex_review_job_skips_ignore_check_for_fixed_scopes(
+    tmp_path, monkeypatch, scope, target
+):
+    monkeypatch.setattr(
+        svc.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not check git")),
+    )
+
+    job = svc.create_codex_review_job(
+        requester_id="deadbeef",
+        scope=scope,
+        target=target,
+        cwd=str(tmp_path),
+    )
+
+    assert job.scope == scope
+
+
+def test_create_codex_review_job_rejects_unignored_findings_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        svc.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=1),
+    )
+
+    with pytest.raises(ValueError, match=r"gitignore tmp/ in .* or use scope=base/commit"):
+        svc.create_codex_review_job(
+            requester_id="deadbeef",
+            scope="uncommitted",
+            cwd=str(tmp_path),
+        )
 
 
 @pytest.mark.asyncio

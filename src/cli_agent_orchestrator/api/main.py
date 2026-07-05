@@ -320,7 +320,7 @@ class CodexReviewRequest(BaseModel):
         default=None,
         description="Base branch for scope=base or commit SHA for scope=commit",
     )
-    cwd: Optional[str] = Field(default=None, description="Repository to review")
+    cwd: Optional[str] = Field(default=None, description="Required repository to review")
 
 
 class CreateFlowRequest(BaseModel):
@@ -347,6 +347,8 @@ async def lifespan(app: FastAPI):
     logger.info("Starting CLI Agent Orchestrator server...")
     setup_logging()
     init_db()
+    purged = terminal_service.purge_stale_terminal_records()
+    logger.info("purged %d stale terminals", purged)
     registry = PluginRegistry()
     await registry.load()
     app.state.plugin_registry = registry

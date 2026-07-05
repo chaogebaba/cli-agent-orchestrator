@@ -29,6 +29,7 @@ from cli_agent_orchestrator.clients.database import create_terminal as db_create
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
+    list_all_terminals as db_list_all_terminals,
     update_last_active,
     update_terminal_shell_command,
 )
@@ -71,6 +72,30 @@ _memory_injected_lock = threading.Lock()
 
 class TerminalInputBlockedError(Exception):
     """Raised when orchestrated input would answer an active interactive prompt."""
+
+
+def purge_stale_terminal_records() -> int:
+    """Delete DB terminal records whose backend window no longer exists."""
+    backend = get_backend()
+    purged = 0
+    for metadata in db_list_all_terminals():
+        terminal_id = metadata["id"]
+        try:
+            backend.get_history(
+                metadata["tmux_session"],
+                metadata["tmux_window"],
+                tail_lines=1,
+            )
+        except Exception:
+            if db_delete_terminal(terminal_id):
+                purged += 1
+                logger.debug(
+                    "Purged stale terminal record %s for missing window %s:%s",
+                    terminal_id,
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                )
+    return purged
 
 
 def inject_memory_context(first_message: str, terminal_id: str) -> str:

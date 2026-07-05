@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
+import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 VALID_REVIEW_SCOPES = {"uncommitted", "base", "commit"}
 STDERR_TAIL_CHARS = 4000
+FINDINGS_FILE_GITIGNORE_MESSAGE = "gitignore tmp/ in {repo} or use scope=base/commit"
 
 
 @dataclass(frozen=True)
@@ -83,11 +84,19 @@ def create_codex_review_job(
     target: str | None = None,
     cwd: str | None = None,
 ) -> CodexReviewJob:
-    """Create a review job descriptor without launching the subprocess."""
+    """Create a review job descriptor without launching the subprocess.
+
+    ``cwd`` is required so callers explicitly choose the repository under
+    review. Instructions-only and uncommitted reviews also require the findings
+    path to be ignored by Git to avoid reviewing CAO's own output file.
+    """
+    if cwd is None or not cwd.strip():
+        raise ValueError("cwd is required")
     review_id = uuid.uuid4().hex[:8]
-    review_cwd = Path(cwd or os.getcwd()).expanduser()
+    review_cwd = Path(cwd).expanduser()
     findings_file = review_cwd / "tmp" / "orch" / f"review-{review_id}.md"
     command = tuple(build_codex_review_command(instructions, scope, target))
+    _validate_findings_file_is_git_ignored(review_cwd, findings_file, scope)
     return CodexReviewJob(
         review_id=review_id,
         requester_id=requester_id,
@@ -98,6 +107,36 @@ def create_codex_review_job(
         findings_file=findings_file,
         command=command,
     )
+
+
+def _validate_findings_file_is_git_ignored(
+    review_cwd: Path,
+    findings_file: Path,
+    scope: str | None,
+) -> None:
+    """Ensure generated findings cannot contaminate working-tree review input."""
+    if scope in {"base", "commit"}:
+        return
+
+    relative_findings = findings_file.relative_to(review_cwd).as_posix()
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "-q", relative_findings],
+            cwd=str(review_cwd),
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        raise ValueError(
+            f"unable to verify findings file ignore status; "
+            + FINDINGS_FILE_GITIGNORE_MESSAGE.format(repo=review_cwd)
+        ) from exc
+    if result.returncode != 0:
+        raise ValueError(
+            f"findings file {relative_findings!r} is not git-ignored; "
+            + FINDINGS_FILE_GITIGNORE_MESSAGE.format(repo=review_cwd)
+        )
 
 
 def _stderr_tail(stderr: str) -> str:
@@ -169,7 +208,10 @@ def start_codex_review(
     cwd: str | None = None,
     registry: PluginRegistry | None = None,
 ) -> dict[str, Any]:
-    """Schedule a Codex review and return the async handle immediately."""
+    """Schedule a Codex review and return the async handle immediately.
+
+    ``cwd`` is mandatory; callers must pass the target repository explicitly.
+    """
     job = create_codex_review_job(
         requester_id=requester_id,
         instructions=instructions,

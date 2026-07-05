@@ -1118,7 +1118,13 @@ def _codex_review_impl(
     target: Optional[str] = None,
     cwd: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Implementation of async headless Codex review launch."""
+    """Implementation of async headless Codex review launch.
+
+    ``cwd`` is mandatory so the reviewed repository is explicit.
+    """
+    if cwd is None:
+        raise ValueError("cwd is required")
+
     requester_id = os.environ.get("CAO_TERMINAL_ID")
     if not requester_id:
         return {
@@ -1131,7 +1137,7 @@ def _codex_review_impl(
 
     payload: Dict[str, Any] = {
         "requester_id": requester_id,
-        "cwd": cwd or os.getcwd(),
+        "cwd": cwd,
     }
     if instructions is not None:
         payload["instructions"] = instructions
@@ -1183,7 +1189,7 @@ async def codex_review(
     ),
     cwd: Optional[str] = Field(
         default=None,
-        description="Repository to review; defaults to the caller's current working directory",
+        description="Required repository to review",
     ),
 ) -> Dict[str, Any]:
     """Launch a headless ``codex review`` process asynchronously.

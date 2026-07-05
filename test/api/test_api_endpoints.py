@@ -1132,7 +1132,7 @@ class TestLifespan:
     """Tests for the lifespan() context manager."""
 
     @pytest.mark.asyncio
-    async def test_lifespan_startup_and_shutdown(self):
+    async def test_lifespan_startup_and_shutdown(self, caplog):
         """lifespan starts the event-bus consumers on entry, cleans up on exit.
 
         The watchdog PollingObserver inbox watcher was replaced by event-bus
@@ -1162,6 +1162,10 @@ class TestLifespan:
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
+            patch(
+                "cli_agent_orchestrator.api.main.terminal_service.purge_stale_terminal_records",
+                return_value=2,
+            ) as mock_purge,
             patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
             patch("cli_agent_orchestrator.api.main.cleanup_expired_memories", quick_return),
             patch("cli_agent_orchestrator.api.main.flow_daemon", fake_daemon),
@@ -1180,16 +1184,20 @@ class TestLifespan:
             patch("cli_agent_orchestrator.plugins.PluginRegistry.load", mock_load),
             patch("cli_agent_orchestrator.plugins.PluginRegistry.teardown", mock_teardown),
         ):
-            async with lifespan(app):
-                # Inside the lifespan — startup completed.
-                # The registry was loaded and stored on app state.
-                mock_load.assert_awaited_once()
-                assert app.state.plugin_registry is not None
-                # The event loop was registered with the event bus so the
-                # thread-safe publishers can reach the asyncio consumers.
-                mock_bus.set_loop.assert_called_once()
-                loop_arg = mock_bus.set_loop.call_args.args[0]
-                assert loop_arg is asyncio.get_running_loop()
+            with caplog.at_level("INFO", logger="cli_agent_orchestrator.api.main"):
+                async with lifespan(app):
+                    # Inside the lifespan — startup completed.
+                    # The registry was loaded and stored on app state.
+                    mock_load.assert_awaited_once()
+                    assert app.state.plugin_registry is not None
+                    # The event loop was registered with the event bus so the
+                    # thread-safe publishers can reach the asyncio consumers.
+                    mock_bus.set_loop.assert_called_once()
+                    loop_arg = mock_bus.set_loop.call_args.args[0]
+                    assert loop_arg is asyncio.get_running_loop()
+                    mock_purge.assert_called_once_with()
+
+            assert "purged 2 stale terminals" in caplog.text
 
             # After exit — shutdown tears down the plugin registry.
             mock_teardown.assert_awaited_once()
@@ -1229,6 +1237,10 @@ class TestLifespan:
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
+            patch(
+                "cli_agent_orchestrator.api.main.terminal_service.purge_stale_terminal_records",
+                return_value=0,
+            ),
             patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
             patch("cli_agent_orchestrator.api.main.cleanup_expired_memories", quick_return),
             patch("cli_agent_orchestrator.api.main.flow_daemon", fake_daemon),

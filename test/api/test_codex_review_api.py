@@ -61,3 +61,20 @@ def test_codex_review_endpoint_surfaces_contract_errors(client):
 
     assert response.status_code == 400
     assert "target is required" in response.json()["detail"]
+
+
+def test_codex_review_endpoint_surfaces_missing_cwd(client):
+    with (
+        patch("cli_agent_orchestrator.api.main.get_terminal_metadata") as metadata,
+        patch("cli_agent_orchestrator.api.main.codex_review_service.start_codex_review") as start,
+    ):
+        metadata.return_value = {"id": "deadbeef"}
+        start.side_effect = ValueError("cwd is required")
+
+        response = client.post(
+            "/codex-review",
+            json={"requester_id": "deadbeef", "scope": "uncommitted"},
+        )
+
+    assert response.status_code == 400
+    assert "cwd is required" in response.json()["detail"]

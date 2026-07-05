@@ -7,10 +7,32 @@ import pytest
 from cli_agent_orchestrator.services.terminal_service import (
     exit_terminal_cli,
     get_working_directory,
+    purge_stale_terminal_records,
     send_special_key,
 )
 
 _TS = "cli_agent_orchestrator.services.terminal_service"
+
+
+class TestPurgeStaleTerminalRecords:
+    @patch(f"{_TS}.db_delete_terminal", return_value=True)
+    @patch(f"{_TS}.get_backend")
+    @patch(f"{_TS}.db_list_all_terminals")
+    def test_deletes_records_when_backend_window_is_missing(
+        self, mock_list, mock_backend, mock_delete
+    ):
+        mock_list.return_value = [
+            {"id": "live", "tmux_session": "cao-test", "tmux_window": "dev-live"},
+            {"id": "stale", "tmux_session": "cao-test", "tmux_window": "dev-stale"},
+        ]
+        backend = mock_backend.return_value
+        backend.get_history.side_effect = ["", RuntimeError("Window not found")]
+
+        assert purge_stale_terminal_records() == 1
+
+        backend.get_history.assert_any_call("cao-test", "dev-live", tail_lines=1)
+        backend.get_history.assert_any_call("cao-test", "dev-stale", tail_lines=1)
+        mock_delete.assert_called_once_with("stale")
 
 
 class TestTerminalServiceWorkingDirectory:
