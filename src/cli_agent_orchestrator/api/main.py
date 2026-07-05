@@ -79,6 +79,7 @@ from cli_agent_orchestrator.security.auth import (
     require_any_scope,
 )
 from cli_agent_orchestrator.services import (
+    codex_review_service,
     flow_service,
     session_service,
     terminal_service,
@@ -298,6 +299,30 @@ class MemoryDetail(MemorySummary):
     content: str
 
 
+class CodexReviewRequest(BaseModel):
+    """Request body for launching an async headless Codex review."""
+
+    requester_id: TerminalId = Field(description="Terminal that receives completion inbox push")
+    instructions: Optional[str] = Field(
+        default=None,
+        description=(
+            "Custom review instructions. Mutually exclusive with scope; "
+            "instructions-only reviews the working-tree diff."
+        ),
+    )
+    scope: Optional[str] = Field(
+        default=None,
+        description=(
+            "Review scope: uncommitted, base, or commit. Mutually exclusive with instructions."
+        ),
+    )
+    target: Optional[str] = Field(
+        default=None,
+        description="Base branch for scope=base or commit SHA for scope=commit",
+    )
+    cwd: Optional[str] = Field(default=None, description="Repository to review")
+
+
 class CreateFlowRequest(BaseModel):
     """Request model for creating a flow."""
 
@@ -495,6 +520,31 @@ async def oauth_protected_resource_metadata():
         "scopes_supported": SCOPES_SUPPORTED,
         "bearer_methods_supported": ["header"],
     }
+
+
+@app.post("/codex-review")
+async def codex_review_endpoint(
+    request: Request,
+    review_request: CodexReviewRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Launch headless ``codex review`` and push completion to requester inbox."""
+    if not get_terminal_metadata(review_request.requester_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Terminal '{review_request.requester_id}' not found",
+        )
+    try:
+        return codex_review_service.start_codex_review(
+            requester_id=review_request.requester_id,
+            instructions=review_request.instructions,
+            scope=review_request.scope,
+            target=review_request.target,
+            cwd=review_request.cwd,
+            registry=get_plugin_registry(request),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @app.get("/health")

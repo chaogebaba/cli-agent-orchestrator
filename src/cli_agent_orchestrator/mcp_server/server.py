@@ -1112,6 +1112,93 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
         return {"success": False, "error": str(e)}
 
 
+def _codex_review_impl(
+    instructions: Optional[str] = None,
+    scope: Optional[str] = None,
+    target: Optional[str] = None,
+    cwd: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Implementation of async headless Codex review launch."""
+    requester_id = os.environ.get("CAO_TERMINAL_ID")
+    if not requester_id:
+        return {
+            "success": False,
+            "error": (
+                "CAO_TERMINAL_ID not set - cannot route Codex review completion. "
+                "Run codex_review from inside a CAO terminal."
+            ),
+        }
+
+    payload: Dict[str, Any] = {
+        "requester_id": requester_id,
+        "cwd": cwd or os.getcwd(),
+    }
+    if instructions is not None:
+        payload["instructions"] = instructions
+    if scope is not None:
+        payload["scope"] = scope
+    if target is not None:
+        payload["target"] = target
+
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/codex-review",
+            json=payload,
+            timeout=_mcp_timeout(),
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.HTTPError as exc:
+        detail = str(exc)
+        if exc.response is not None:
+            detail = _extract_error_detail(exc.response, detail)
+        return {"success": False, "error": f"Failed to launch Codex review: {detail}"}
+    except requests.ConnectionError:
+        return {
+            "success": False,
+            "error": "Failed to connect to cao-server. The server may not be running.",
+        }
+    except Exception as exc:
+        return {"success": False, "error": f"Failed to launch Codex review: {str(exc)}"}
+
+
+@mcp.tool()
+async def codex_review(
+    instructions: Optional[str] = Field(
+        default=None,
+        description=(
+            "Custom instructions to pass to codex review. Mutually exclusive with scope; "
+            "instructions-only reviews the working-tree diff."
+        ),
+    ),
+    scope: Optional[str] = Field(
+        default=None,
+        description=(
+            "Review scope: uncommitted, base, or commit. Mutually exclusive with instructions."
+        ),
+    ),
+    target: Optional[str] = Field(
+        default=None,
+        description="Base branch for scope=base or commit SHA for scope=commit",
+    ),
+    cwd: Optional[str] = Field(
+        default=None,
+        description="Repository to review; defaults to the caller's current working directory",
+    ),
+) -> Dict[str, Any]:
+    """Launch a headless ``codex review`` process asynchronously.
+
+    Provide exactly one of ``instructions`` or ``scope``. Scope flags cannot be
+    combined with a prompt in codex-cli 0.142.5; instructions-only reviews the
+    working-tree diff.
+
+    Returns immediately with a review id and raw findings file path. When the
+    process exits, cao-server pushes an inbox message to this terminal with the
+    review id, exit code, findings file path, and stderr tail on failure.
+    """
+    return _codex_review_impl(instructions, scope, target, cwd)
+
+
 @mcp.tool()
 async def send_message(
     message: str = Field(description="Message content to send"),
