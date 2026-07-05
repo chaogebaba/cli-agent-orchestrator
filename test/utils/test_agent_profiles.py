@@ -556,6 +556,33 @@ class TestLoadAgentProfileEnvResolution:
 
     @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", return_value=[])
     @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs", return_value={})
+    def test_load_agent_profile_parses_inherit_user_mcp_servers(
+        self, mock_get_agent_dirs, mock_get_extra_dirs, tmp_path, monkeypatch
+    ):
+        """New profile fields should pass from frontmatter into AgentProfile."""
+        local_store_dir = tmp_path / "agent-store"
+        local_store_dir.mkdir()
+        profile_path = local_store_dir / "service-agent.md"
+        profile_path.write_text(
+            "---\n"
+            "name: service-agent\n"
+            "description: Service agent\n"
+            "inheritUserMcpServers: true\n"
+            "---\n"
+            "Body\n"
+        )
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store_dir
+        )
+        monkeypatch.setattr("cli_agent_orchestrator.utils.env.CAO_ENV_FILE", tmp_path / ".env")
+
+        profile = load_agent_profile("service-agent")
+
+        assert profile.inheritUserMcpServers is True
+
+    @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", return_value=[])
+    @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs", return_value={})
     def test_load_agent_profile_leaves_missing_vars_intact(
         self, mock_get_agent_dirs, mock_get_extra_dirs, tmp_path, monkeypatch
     ):

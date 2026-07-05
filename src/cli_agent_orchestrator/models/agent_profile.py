@@ -29,6 +29,9 @@ class AgentProfile(BaseModel):
     # Q CLI agent fields (all optional, will be passed through to JSON)
     prompt: Optional[str] = None
     mcpServers: Optional[Dict[str, Any]] = None
+    # claude_code-only. When true, omit --strict-mcp-config so Claude Code
+    # merges native user/project MCP config with CAO-injected servers.
+    inheritUserMcpServers: Optional[bool] = None
     tools: Optional[List[str]] = Field(default=None)
     toolAliases: Optional[Dict[str, str]] = None
     allowedTools: Optional[List[str]] = None

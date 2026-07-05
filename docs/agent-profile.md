@@ -28,6 +28,7 @@ Define the agent's role, responsibilities, and behavior here.
 - `provider` (string): Provider to run this agent on (e.g., `"claude_code"`, `"kiro_cli"`). See [Cross-Provider Orchestration](#cross-provider-orchestration).
 - `allowedTools` (array): CAO tool vocabulary whitelist. Overrides role-based defaults. Can be used with or without `role`. See [Tool Restrictions](tool-restrictions.md).
 - `mcpServers` (object): MCP server configurations for additional tools
+- `inheritUserMcpServers` (boolean, `claude_code` only): When true and `mcpServers` is set, CAO still passes the profile's generated `--mcp-config` file but omits `--strict-mcp-config`. Claude Code can then merge its native user/project MCP servers with the profile servers.
 - `tools` (array): List of allowed tools, use `["*"]` for all
 - `toolAliases` (object): Map tool names to aliases
 - `toolsSettings` (object): Tool-specific configuration

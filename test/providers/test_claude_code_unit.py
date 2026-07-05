@@ -223,6 +223,7 @@ class TestClaudeCodeProviderInitialization:
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {"server1": {"command": "test", "args": ["--flag"]}}
         mock_profile.permissionMode = None
+        mock_profile.inheritUserMcpServers = None
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
@@ -1134,15 +1135,43 @@ class TestClaudeCodeProviderMisc:
             "cao-mcp-server": {"command": "cao-mcp-server", "args": ["--port", "8080"]}
         }
         mock_profile.permissionMode = None
+        mock_profile.inheritUserMcpServers = None
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("term-42", "test-session", "window-0", "test-agent")
         command = provider._build_claude_command()
 
         assert "--mcp-config" in command
+        assert "--strict-mcp-config" in shlex.split(command)
         mcp_data = _extract_mcp_config(command)
         server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
         assert server_env["CAO_TERMINAL_ID"] == "term-42"
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_mcp_inherit_user_servers_omits_strict_flag(self, mock_load):
+        """Test inheritUserMcpServers keeps CAO MCP config but lets Claude merge native config."""
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {"command": "cao-mcp-server", "args": ["--port", "8080"]}
+        }
+        mock_profile.permissionMode = None
+        mock_profile.inheritUserMcpServers = True
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("term-42", "test-session", "window-0", "test-agent")
+        command = provider._build_claude_command()
+        args = shlex.split(command)
+
+        assert "--mcp-config" in args
+        assert "--strict-mcp-config" not in args
+        mcp_file = Path(args[args.index("--mcp-config") + 1])
+        try:
+            mcp_data = json.loads(mcp_file.read_text())
+        finally:
+            mcp_file.unlink(missing_ok=True)
+        assert mcp_data["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "term-42"
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_command_mcp_preserves_existing_env(self, mock_load):
@@ -1157,6 +1186,7 @@ class TestClaudeCodeProviderMisc:
             }
         }
         mock_profile.permissionMode = None
+        mock_profile.inheritUserMcpServers = None
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("term-99", "test-session", "window-0", "test-agent")
@@ -1183,6 +1213,7 @@ class TestClaudeCodeProviderMisc:
             }
         }
         mock_profile.permissionMode = None
+        mock_profile.inheritUserMcpServers = None
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("term-99", "test-session", "window-0", "test-agent")

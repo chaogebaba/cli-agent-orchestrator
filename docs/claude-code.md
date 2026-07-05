@@ -82,6 +82,8 @@ When launched with an agent profile (e.g., `--agents code_supervisor`), CAO:
 3. Passes it via `--append-system-prompt` (newlines escaped to `\n` for tmux compatibility)
 4. Injects MCP servers via `--mcp-config` JSON if the profile defines `mcpServers`
 
+By default CAO also passes `--strict-mcp-config`, so Claude Code uses only the profile-injected MCP servers for that terminal. Set `inheritUserMcpServers: true` on a `claude_code` profile to omit the strict flag and let Claude Code merge its native user/project MCP config with the profile's `mcpServers`.
+
 ### Launch Command
 
 The provider builds the command via `_build_claude_command()`:
