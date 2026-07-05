@@ -10,9 +10,10 @@ from cli_agent_orchestrator.mcp_server.server import MAX_USER_PROMPT_ANSWER_LENG
 
 class TestAnswerUserPrompt:
     @patch("cli_agent_orchestrator.mcp_server.server.requests")
-    def test_delivers_answer_when_terminal_waits_for_user_answer(self, mock_requests):
+    def test_delivers_answer_when_terminal_waits_for_user_answer(self, mock_requests, monkeypatch):
         from cli_agent_orchestrator.mcp_server.server import _send_user_prompt_answer
 
+        monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
         status_response = MagicMock()
         status_response.json.return_value = {"status": "waiting_user_answer"}
         status_response.raise_for_status.return_value = None
@@ -121,9 +122,12 @@ class TestAnswerUserPrompt:
 
     @patch("cli_agent_orchestrator.mcp_server.server.time.sleep")
     @patch("cli_agent_orchestrator.mcp_server.server.requests")
-    def test_hermes_clarify_custom_answer_uses_other_then_text(self, mock_requests, mock_sleep):
+    def test_hermes_clarify_custom_answer_uses_other_then_text(
+        self, mock_requests, mock_sleep, monkeypatch
+    ):
         from cli_agent_orchestrator.mcp_server.server import _send_user_prompt_answer
 
+        monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
         status_response = MagicMock()
         status_response.json.return_value = {"status": "waiting_user_answer", "provider": "hermes"}
         status_response.raise_for_status.return_value = None

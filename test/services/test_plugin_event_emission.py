@@ -99,7 +99,7 @@ class TestSessionPluginEvents:
         async def record_dispatch(*_args):
             call_order.append("dispatch")
 
-        mock_tmux.return_value.session_exists.return_value = True
+        mock_tmux.return_value.session_exists.side_effect = [True, False, False]
         mock_tmux.return_value.kill_session.side_effect = lambda *_: call_order.append(
             "kill_session"
         )
