@@ -60,3 +60,6 @@ aidlc-docs
 
 # Separate git repos (not part of this project)
 cao-flows/
+
+# CAO orchestration data plane (briefs, review findings)
+tmp/
