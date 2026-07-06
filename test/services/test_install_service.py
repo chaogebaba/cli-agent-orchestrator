@@ -205,6 +205,38 @@ class TestInstallAgent:
         assert post.metadata["description"] == "Test agent"
         assert "secret-token" in post.content
 
+    def test_install_grok_registers_profile_mcp_servers(
+        self, install_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Grok installs should register profile MCP servers in user-scope config."""
+        local_profile = install_paths["local_store_dir"] / "grok-agent.md"
+        local_profile.write_text(_profile_text(name="grok-agent"), encoding="utf-8")
+        ensured = []
+
+        def fake_ensure(mcp_servers):
+            ensured.append(mcp_servers)
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.install_service.ensure_grok_mcp_servers",
+            fake_ensure,
+        )
+
+        result = install_agent("grok-agent", "grok_cli", {"API_TOKEN": "secret-token"})
+
+        assert result.success is True
+        assert result.agent_file is None
+        assert ensured == [
+            {
+                "service": {
+                    "command": "service-mcp",
+                    "env": {
+                        "API_TOKEN": "secret-token",
+                        "BASE_URL": "${BASE_URL}",
+                    },
+                }
+            }
+        ]
+
     def test_install_from_builtin_writes_kiro_config(
         self, install_paths: dict[str, Path], tmp_path: Path
     ) -> None:

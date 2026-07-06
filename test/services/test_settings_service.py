@@ -13,6 +13,7 @@ from cli_agent_orchestrator.services.settings_service import (
     get_agent_dirs,
     get_extra_agent_dirs,
     get_extra_skill_dirs,
+    get_provider_defaults,
     set_agent_dirs,
     set_extra_agent_dirs,
     set_extra_skill_dirs,
@@ -31,6 +32,10 @@ def settings_file(tmp_path):
         patch(
             "cli_agent_orchestrator.services.settings_service.CAO_HOME_DIR",
             tmp_path,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.settings_service.PROVIDER_DEFAULTS_FILE",
+            tmp_path / "providers.toml",
         ),
     ):
         yield fake_settings
@@ -92,6 +97,29 @@ class TestSave:
         _save({"old": True})
         _save({"new": True})
         assert json.loads(settings_file.read_text()) == {"new": True}
+
+
+class TestGetProviderDefaults:
+    """Tests for per-provider defaults loaded from providers.toml."""
+
+    def test_missing_file_returns_empty_dict(self, settings_file):
+        assert get_provider_defaults("codex") == {}
+
+    def test_missing_section_returns_empty_dict(self, settings_file, tmp_path):
+        defaults_file = tmp_path / "providers.toml"
+        defaults_file.write_text('[grok_cli]\nmodel = "grok-composer-2.5-fast"\n')
+        assert get_provider_defaults("codex") == {}
+
+    def test_reads_provider_section(self, settings_file, tmp_path):
+        defaults_file = tmp_path / "providers.toml"
+        defaults_file.write_text(
+            '[codex]\nmodel = "gpt-5.5"\nreasoning_effort = "high"\n',
+            encoding="utf-8",
+        )
+        assert get_provider_defaults("codex") == {
+            "model": "gpt-5.5",
+            "reasoning_effort": "high",
+        }
 
 
 class TestGetAgentDirs:

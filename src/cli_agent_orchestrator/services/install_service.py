@@ -27,6 +27,7 @@ from cli_agent_orchestrator.utils.agent_profiles import (
     parse_agent_profile_text,
 )
 from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
+from cli_agent_orchestrator.utils.grok_config import ensure_grok_mcp_servers
 from cli_agent_orchestrator.utils.opencode_config import (
     ensure_skills_symlink,
     remove_agent_tools,
@@ -335,6 +336,10 @@ def install_agent(
                 upsert_agent_tools(agent_id, mcp_names)
             else:
                 remove_agent_tools(agent_id)
+
+        elif provider == ProviderType.GROK_CLI.value:
+            if profile.mcpServers:
+                ensure_grok_mcp_servers(profile.mcpServers)
 
         return InstallResult(
             success=True,

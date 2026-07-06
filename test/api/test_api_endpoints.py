@@ -122,9 +122,10 @@ class TestAgentProviders:
 
         assert response.status_code == 200
         data = response.json()
-        assert len(data) == 9
+        assert len(data) == 10
         names = [p["name"] for p in data]
         assert "kiro_cli" in names
+        assert "grok_cli" in names
         assert "claude_code" in names
         assert "codex" in names
         assert "hermes" in names
@@ -161,6 +162,7 @@ class TestAgentProviders:
         assert providers_dict["kiro_cli"]["installed"] is True
         assert providers_dict["claude_code"]["installed"] is False
         assert providers_dict["codex"]["installed"] is False
+        assert providers_dict["grok_cli"]["installed"] is False
         assert providers_dict["kimi_cli"]["installed"] is False
         assert providers_dict["copilot_cli"]["installed"] is False
         assert providers_dict["opencode_cli"]["installed"] is False
@@ -175,6 +177,7 @@ class TestAgentProviders:
         assert providers_dict["kiro_cli"]["binary"] == "kiro-cli"
         assert providers_dict["claude_code"]["binary"] == "claude"
         assert providers_dict["codex"]["binary"] == "codex"
+        assert providers_dict["grok_cli"]["binary"] == "grok"
         assert providers_dict["kimi_cli"]["binary"] == "kimi"
         assert providers_dict["copilot_cli"]["binary"] == "copilot"
         assert providers_dict["opencode_cli"]["binary"] == "opencode"

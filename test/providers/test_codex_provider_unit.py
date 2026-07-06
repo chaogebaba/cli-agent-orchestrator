@@ -16,6 +16,16 @@ from cli_agent_orchestrator.providers.codex import (
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
+@pytest.fixture(autouse=True)
+def provider_defaults_file(tmp_path, monkeypatch):
+    path = tmp_path / "providers.toml"
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.settings_service.PROVIDER_DEFAULTS_FILE",
+        path,
+    )
+    return path
+
+
 def load_fixture(filename: str) -> str:
     with open(FIXTURES_DIR / filename, "r") as f:
         return f.read()
@@ -323,6 +333,43 @@ class TestCodexProviderModelFlag:
 
         assert "--model" not in command
 
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_build_command_uses_default_model_when_profile_unset(
+        self, mock_load, provider_defaults_file
+    ):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = None
+        mock_load.return_value = mock_profile
+        provider_defaults_file.write_text('[codex]\nmodel = "gpt-5.5"\n', encoding="utf-8")
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+
+        assert "--model gpt-5.5" in command
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_build_command_profile_model_wins_over_default(
+        self, mock_load, provider_defaults_file
+    ):
+        mock_profile = MagicMock()
+        mock_profile.model = "gpt-5-profile"
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = None
+        mock_load.return_value = mock_profile
+        provider_defaults_file.write_text('[codex]\nmodel = "gpt-5.5"\n', encoding="utf-8")
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+
+        assert "--model gpt-5-profile" in command
+        assert "--model gpt-5.5" not in command
+
 
 class TestCodexBuildCommandExtra:
     """Coverage for branches inside ``_build_codex_command`` that the
@@ -594,6 +641,47 @@ class TestCodexProviderCodexConfig:
         assert "--model gpt-5.5" in command
         assert "mcp_servers.cao-mcp-server.command=" in command
         assert 'model_reasoning_effort="xhigh"' in command
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_provider_reasoning_effort_default_applies(self, mock_load, provider_defaults_file):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = None
+        mock_load.return_value = mock_profile
+        provider_defaults_file.write_text(
+            '[codex]\nreasoning_effort = "high"\n',
+            encoding="utf-8",
+        )
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+
+        assert 'model_reasoning_effort="high"' in command
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_profile_codex_config_wins_over_reasoning_effort_default(
+        self, mock_load, provider_defaults_file
+    ):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = {"model_reasoning_effort": "xhigh"}
+        mock_load.return_value = mock_profile
+        provider_defaults_file.write_text(
+            '[codex]\nreasoning_effort = "high"\n',
+            encoding="utf-8",
+        )
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+
+        assert 'model_reasoning_effort="xhigh"' in command
+        assert 'model_reasoning_effort="high"' not in command
 
 
 class TestCodexProviderStatusDetection:

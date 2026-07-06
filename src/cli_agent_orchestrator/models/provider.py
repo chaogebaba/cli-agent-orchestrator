@@ -5,6 +5,7 @@ class ProviderType(str, Enum):
     """Provider type enumeration."""
 
     KIRO_CLI = "kiro_cli"
+    GROK_CLI = "grok_cli"
     CLAUDE_CODE = "claude_code"
     CODEX = "codex"
     KIMI_CLI = "kimi_cli"

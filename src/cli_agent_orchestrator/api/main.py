@@ -738,6 +738,7 @@ async def list_providers_endpoint() -> List[Dict]:
         "kiro_cli": "kiro-cli",
         "claude_code": "claude",
         "codex": "codex",
+        "grok_cli": "grok",
         "hermes": "hermes",
         "kimi_cli": "kimi",
         "copilot_cli": "copilot",

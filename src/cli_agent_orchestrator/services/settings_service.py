@@ -6,11 +6,17 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+try:
+    import tomllib
+except ImportError:  # pragma: no cover - exercised on Python 3.10
+    import tomli as tomllib  # type: ignore[import-not-found]
+
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 
 logger = logging.getLogger(__name__)
 
 SETTINGS_FILE = CAO_HOME_DIR / "settings.json"
+PROVIDER_DEFAULTS_FILE = CAO_HOME_DIR / "providers.toml"
 
 # Default agent directories per provider
 _DEFAULTS = {
@@ -37,6 +43,25 @@ def _save(data: Dict[str, Any]) -> None:
     """Save settings to disk."""
     CAO_HOME_DIR.mkdir(parents=True, exist_ok=True)
     SETTINGS_FILE.write_text(json.dumps(data, indent=2))
+
+
+def get_provider_defaults(provider: str) -> Dict[str, Any]:
+    """Return defaults for *provider* from ``providers.toml``.
+
+    Missing file, invalid TOML, missing provider section, or malformed section
+    all resolve to ``{}``. This file is intentionally separate from
+    ``settings.json`` and has no env-var overlay.
+    """
+    if not PROVIDER_DEFAULTS_FILE.exists():
+        return {}
+    try:
+        data = tomllib.loads(PROVIDER_DEFAULTS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    section = data.get(provider)
+    if not isinstance(section, dict):
+        return {}
+    return dict(section)
 
 
 def get_agent_dirs() -> Dict[str, str]:

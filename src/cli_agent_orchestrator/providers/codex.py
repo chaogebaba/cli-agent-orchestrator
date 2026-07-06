@@ -10,7 +10,10 @@ from typing import Any, Optional
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
-from cli_agent_orchestrator.services.settings_service import get_server_settings
+from cli_agent_orchestrator.services.settings_service import (
+    get_provider_defaults,
+    get_server_settings,
+)
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -255,10 +258,12 @@ class CodexProvider(BaseProvider):
             command_parts = ["codex", "--yolo"]
         command_parts.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
 
-        if profile is not None:
-            if profile.model:
-                command_parts.extend(["--model", profile.model])
+        provider_defaults = get_provider_defaults("codex")
+        model = profile.model if profile and profile.model else provider_defaults.get("model")
+        if isinstance(model, str) and model:
+            command_parts.extend(["--model", model])
 
+        if profile is not None:
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
             system_prompt = self._apply_skill_prompt(system_prompt)
 
@@ -326,9 +331,13 @@ class CodexProvider(BaseProvider):
             # (e.g. "features.fast_mode"); values are serialized to TOML
             # scalars. Emitted last so they take precedence over CAO's own
             # overrides and the profile/config defaults on key conflicts.
-            if profile.codexConfig:
-                for key, value in profile.codexConfig.items():
-                    command_parts.extend(["-c", _toml_override(key, value)])
+        codex_config: dict[str, Any] = {}
+        if isinstance(provider_defaults.get("reasoning_effort"), str):
+            codex_config["model_reasoning_effort"] = provider_defaults["reasoning_effort"]
+        if profile is not None and isinstance(getattr(profile, "codexConfig", None), dict):
+            codex_config.update(profile.codexConfig)
+        for key, value in codex_config.items():
+            command_parts.extend(["-c", _toml_override(key, value)])
 
         return shlex.join(command_parts)
 
