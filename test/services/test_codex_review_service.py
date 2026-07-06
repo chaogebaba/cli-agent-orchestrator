@@ -182,7 +182,7 @@ async def test_run_codex_review_job_creates_findings_path_and_pushes_completion(
             "codex_review:abc123ef",
             "deadbeef",
             (
-                "Codex review abc123ef completed.\n"
+                "Codex review abc123ef: REVIEW COMPLETED (0 findings)\n"
                 "Exit code: 0\n"
                 f"Findings file: {job.findings_file}"
             ),
@@ -209,7 +209,7 @@ async def test_run_codex_review_job_pushes_stderr_tail_on_nonzero(tmp_path, monk
         returncode = 2
 
         async def communicate(self):
-            return None, b"quota exhausted\n"
+            return None, b"quota exceeded\n"
 
     async def fake_create_subprocess_exec(*args, **kwargs):
         return Proc()
@@ -225,9 +225,10 @@ async def test_run_codex_review_job_pushes_stderr_tail_on_nonzero(tmp_path, monk
     await svc.run_codex_review_job(job)
 
     message = created_messages[0][2]
+    assert "REVIEW FAILED (quota)" in message
     assert "Exit code: 2" in message
     assert f"Findings file: {job.findings_file}" in message
-    assert "stderr tail:\nquota exhausted" in message
+    assert "stderr tail:\nquota exceeded" in message
 
 
 @pytest.mark.asyncio
@@ -260,9 +261,92 @@ async def test_run_codex_review_job_pushes_failure_for_bad_cwd(tmp_path, monkeyp
 
     assert not missing_cwd.exists()
     message = created_messages[0][2]
+    assert "REVIEW FAILED (infra)" in message
     assert "Exit code: -1" in message
     assert f"Findings file: {job.findings_file}" in message
     assert f"stderr tail:\ncwd not found or not a directory: {missing_cwd}" in message
+
+
+def test_completion_label_parses_success_finding_count(tmp_path):
+    findings = tmp_path / "findings.md"
+    findings.write_text(
+        "- [P1] first issue\n"
+        "context line\n"
+        "1. [P2] second issue\n"
+        "No bullet here\n",
+        encoding="utf-8",
+    )
+    job = svc.CodexReviewJob(
+        review_id="count1234",
+        requester_id="deadbeef",
+        instructions=None,
+        scope="uncommitted",
+        target=None,
+        cwd=tmp_path,
+        findings_file=findings,
+        command=("codex", "review", "--uncommitted"),
+    )
+
+    message = svc._completion_message(job, exit_code=0, stderr="")
+
+    assert "REVIEW COMPLETED (2 findings)" in message
+
+
+def test_completion_label_empty_findings_file_is_infra_failure(tmp_path):
+    findings = tmp_path / "findings.md"
+    findings.write_text("", encoding="utf-8")
+    job = svc.CodexReviewJob(
+        review_id="empty123",
+        requester_id="deadbeef",
+        instructions=None,
+        scope="uncommitted",
+        target=None,
+        cwd=tmp_path,
+        findings_file=findings,
+        command=("codex", "review", "--uncommitted"),
+    )
+
+    message = svc._completion_message(job, exit_code=0, stderr="")
+
+    assert "REVIEW FAILED (infra)" in message
+
+
+def test_completion_label_detects_quota_patterns_on_failure(tmp_path):
+    findings = tmp_path / "findings.md"
+    findings.write_text("partial output\n", encoding="utf-8")
+    job = svc.CodexReviewJob(
+        review_id="quota123",
+        requester_id="deadbeef",
+        instructions=None,
+        scope="uncommitted",
+        target=None,
+        cwd=tmp_path,
+        findings_file=findings,
+        command=("codex", "review", "--uncommitted"),
+    )
+
+    message = svc._completion_message(job, exit_code=1, stderr="403 insufficient quota")
+
+    assert "REVIEW FAILED (quota)" in message
+
+
+def test_completion_label_treats_insufficient_permissions_as_infra(tmp_path):
+    findings = tmp_path / "findings.md"
+    findings.write_text("partial output\n", encoding="utf-8")
+    job = svc.CodexReviewJob(
+        review_id="infra123",
+        requester_id="deadbeef",
+        instructions=None,
+        scope="uncommitted",
+        target=None,
+        cwd=tmp_path,
+        findings_file=findings,
+        command=("codex", "review", "--uncommitted"),
+    )
+
+    message = svc._completion_message(job, exit_code=1, stderr="insufficient permissions")
+
+    assert "REVIEW FAILED (infra)" in message
 
 
 def test_codex_review_response_contains_async_handle(tmp_path):

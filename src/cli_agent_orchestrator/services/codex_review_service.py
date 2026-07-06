@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import subprocess
 import uuid
 from dataclasses import dataclass
@@ -19,6 +20,16 @@ logger = logging.getLogger(__name__)
 VALID_REVIEW_SCOPES = {"uncommitted", "base", "commit"}
 STDERR_TAIL_CHARS = 4000
 FINDINGS_FILE_GITIGNORE_MESSAGE = "gitignore tmp/ in {repo} or use scope=base/commit"
+QUOTA_FAILURE_RE = re.compile(
+    r"(?:"
+    r"\b(?:HTTP\s*)?(?:402|403|429)\b"
+    r"|预扣费"
+    r"|\busage limit\b"
+    r"|\brate limit exceeded\b"
+    r"|\bquota exceeded\b"
+    r")",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -145,9 +156,35 @@ def _stderr_tail(stderr: str) -> str:
     return stderr[-STDERR_TAIL_CHARS:]
 
 
+def _read_findings_text(findings_file: Path) -> str:
+    try:
+        return findings_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+def _count_findings(findings_text: str) -> int:
+    """Count actionable findings in Codex review markdown."""
+    count = 0
+    for line in findings_text.splitlines():
+        stripped = line.strip()
+        if re.match(r"^(?:[-*]|\d+\.)\s+(?:\[[^\]]+\]\s+)?\S", stripped):
+            count += 1
+    return count
+
+
+def _completion_label(exit_code: int, stderr: str, findings_text: str) -> str:
+    if exit_code != 0 or not findings_text.strip():
+        kind = "quota" if QUOTA_FAILURE_RE.search(stderr) else "infra"
+        return f"REVIEW FAILED ({kind})"
+    return f"REVIEW COMPLETED ({_count_findings(findings_text)} findings)"
+
+
 def _completion_message(job: CodexReviewJob, exit_code: int, stderr: str) -> str:
+    findings_text = _read_findings_text(job.findings_file)
+    label = _completion_label(exit_code, stderr, findings_text)
     lines = [
-        f"Codex review {job.review_id} completed.",
+        f"Codex review {job.review_id}: {label}",
         f"Exit code: {exit_code}",
         f"Findings file: {job.findings_file}",
     ]

@@ -42,6 +42,7 @@ class AgentProfile(BaseModel):
     model: Optional[str] = None
     permissionMode: Optional[PermissionMode] = None
     native_agent: Optional[str] = None  # Claude Code native agent name (thin-wrapper mode)
+    messageContract: Optional[str] = Field(default=None, min_length=1)
 
     # Codex-only. Names a [profiles.<name>] block in ~/.codex/config.toml.
     # Used as --profile <name> when yolo mode is not active; unrestricted

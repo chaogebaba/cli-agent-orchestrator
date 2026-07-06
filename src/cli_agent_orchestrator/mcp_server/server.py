@@ -630,6 +630,32 @@ def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
         return {"success": False, "error": f"Failed to retrieve skill: {str(exc)}"}
 
 
+def _peek_terminal_impl(terminal_id: str, lines: int = 40) -> Dict[str, Any]:
+    """Return a read-only terminal pane tail via cao-server."""
+    capped_lines = max(1, min(int(lines), 200))
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/terminals/{terminal_id}/peek",
+            params={"lines": capped_lines},
+            timeout=_mcp_timeout(),
+        )
+        response.raise_for_status()
+        data = response.json()
+        return {
+            "success": True,
+            "terminal_id": data.get("terminal_id", terminal_id),
+            "lines": data.get("lines", capped_lines),
+            "output": data.get("output", ""),
+        }
+    except requests.HTTPError as exc:
+        detail = str(exc)
+        if exc.response is not None:
+            detail = _extract_error_detail(exc.response, detail)
+        return {"success": False, "terminal_id": terminal_id, "error": detail}
+    except Exception as exc:
+        return {"success": False, "terminal_id": terminal_id, "error": str(exc)}
+
+
 # Implementation functions
 async def _handoff_impl(
     agent_profile: str, message: str, timeout: int = 600, working_directory: Optional[str] = None
@@ -1251,6 +1277,15 @@ async def answer_user_prompt(
     task delivery should use assign, handoff, or send_message instead.
     """
     return _send_user_prompt_answer(terminal_id, answer)
+
+
+@mcp.tool()
+async def peek_terminal(
+    terminal_id: str = Field(description="Terminal ID to inspect"),
+    lines: int = Field(default=40, description="Number of rendered pane lines to return, max 200"),
+) -> Dict[str, Any]:
+    """Return the last N rendered pane lines for a terminal, read-only."""
+    return _peek_terminal_impl(terminal_id, lines)
 
 
 @mcp.tool(description=LOAD_SKILL_TOOL_DESCRIPTION)

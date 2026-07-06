@@ -88,6 +88,11 @@ async def _fake_opencode_daemon(registry: object) -> None:
     del registry
 
 
+async def _fake_watchdog_run(registry: object) -> None:
+    """Replacement for stalled-callback watchdog run loop."""
+    del registry
+
+
 @contextmanager
 def _patched_lifespan(backend: object, tasks: list):
     """Patch every external dependency the lifespan touches at startup/shutdown.
@@ -114,6 +119,7 @@ def _patched_lifespan(backend: object, tasks: list):
         patch_main("cleanup_old_data")
         patch_main("flow_daemon", new=_fake_flow_daemon)
         patch_main("opencode_inbox_delivery_daemon", new=_fake_opencode_daemon)
+        patch_main("stalled_callback_watchdog").run.side_effect = _fake_watchdog_run
 
         namespace = SimpleNamespace(
             get_backend=patch_main("get_backend", return_value=backend),

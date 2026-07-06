@@ -16,6 +16,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     get_output,
     get_terminal,
     get_working_directory,
+    peek_terminal,
     send_input,
 )
 
@@ -787,6 +788,144 @@ class TestSendInput:
         )
         mock_update.assert_called_once_with("test1234")
 
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.preserve_draft_before_send")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_appends_profile_contract_for_orchestrated_delivery(
+        self,
+        mock_get_metadata,
+        mock_backend,
+        mock_pm,
+        mock_load_profile,
+        mock_preserve,
+        mock_update,
+    ):
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+            "agent_profile": "contracted",
+        }
+        mock_load_profile.return_value = AgentProfile(
+            name="contracted",
+            description="",
+            messageContract="reply with send_message",
+        )
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.paste_enter_count = 1
+        mock_provider.paste_submit_delay = 0.3
+        mock_preserve.return_value = None
+
+        send_input("test1234", "task", orchestration_type=OrchestrationType.SEND_MESSAGE)
+
+        assert mock_backend.send_keys.call_args.args[2] == (
+            "task\n\n[Contract: reply with send_message]"
+        )
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.preserve_draft_before_send")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_skips_contract_for_manual_input(
+        self,
+        mock_get_metadata,
+        mock_backend,
+        mock_pm,
+        mock_load_profile,
+        mock_preserve,
+        mock_update,
+    ):
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+            "agent_profile": "contracted",
+        }
+        mock_load_profile.return_value = AgentProfile(
+            name="contracted",
+            description="",
+            messageContract="reply with send_message",
+        )
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.paste_enter_count = 1
+        mock_provider.paste_submit_delay = 0.3
+        mock_preserve.return_value = None
+
+        send_input("test1234", "manual")
+
+        assert mock_backend.send_keys.call_args.args[2] == "manual"
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.preserve_draft_before_send")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_skips_absent_contract(
+        self,
+        mock_get_metadata,
+        mock_backend,
+        mock_pm,
+        mock_load_profile,
+        mock_preserve,
+        mock_update,
+    ):
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+            "agent_profile": "plain",
+        }
+        mock_load_profile.return_value = AgentProfile(name="plain", description="")
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.paste_enter_count = 1
+        mock_provider.paste_submit_delay = 0.3
+        mock_preserve.return_value = None
+
+        send_input("test1234", "task", orchestration_type=OrchestrationType.ASSIGN)
+
+        assert mock_backend.send_keys.call_args.args[2] == "task"
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.preserve_draft_before_send")
+    @patch(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.stalled_callback_watchdog"
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_message_from_peer_does_not_rearm_watchdog_episode(
+        self,
+        mock_get_metadata,
+        mock_backend,
+        mock_pm,
+        mock_watchdog,
+        mock_preserve,
+        mock_update,
+    ):
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+            "agent_profile": "worker",
+            "caller_id": "caller1",
+        }
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.paste_enter_count = 1
+        mock_provider.paste_submit_delay = 0.3
+        mock_preserve.return_value = None
+        mock_watchdog.has_episode.return_value = True
+
+        send_input(
+            "worker1",
+            "oracle answer",
+            sender_id="oracle1",
+            orchestration_type=OrchestrationType.SEND_MESSAGE,
+        )
+
+        mock_watchdog.record_inbound_task.assert_not_called()
+
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_input_not_found(self, mock_get_metadata):
         """Test sending input to non-existent terminal."""
@@ -794,6 +933,33 @@ class TestSendInput:
 
         with pytest.raises(ValueError, match="not found"):
             send_input("nonexistent", "message")
+
+
+class TestPeekTerminal:
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_peek_terminal_returns_backend_tail_with_cap(self, mock_get_metadata, mock_backend):
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_backend.get_history.return_value = "tail"
+
+        assert peek_terminal("test1234", lines=999) == "tail"
+
+        mock_backend.get_history.assert_called_once_with(
+            "cao-session",
+            "developer-abcd",
+            tail_lines=200,
+            strip_escapes=True,
+        )
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_peek_terminal_missing_terminal(self, mock_get_metadata):
+        mock_get_metadata.return_value = None
+
+        with pytest.raises(ValueError, match="not found"):
+            peek_terminal("missing")
 
 
 class TestGetOutput:

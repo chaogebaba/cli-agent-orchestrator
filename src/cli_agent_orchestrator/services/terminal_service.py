@@ -155,6 +155,30 @@ SOFT_ENFORCEMENT_PROVIDERS = {
     ProviderType.ANTIGRAVITY_CLI.value,
 }
 
+MAX_PEEK_TERMINAL_LINES = 200
+
+
+def _append_message_contract(message: str, metadata: Dict, orchestration_value: str) -> str:
+    """Append a profile-declared contract to CAO-orchestrated deliveries."""
+    if orchestration_value not in {
+        OrchestrationType.ASSIGN.value,
+        OrchestrationType.SEND_MESSAGE.value,
+        OrchestrationType.HANDOFF.value,
+    }:
+        return message
+
+    profile_name = metadata.get("agent_profile")
+    if not profile_name:
+        return message
+
+    try:
+        profile = load_agent_profile(profile_name)
+    except Exception:
+        return message
+    if not profile.messageContract:
+        return message
+    return f"{message}\n\n[Contract: {profile.messageContract}]"
+
 
 async def create_terminal(
     provider: str,
@@ -500,6 +524,11 @@ def send_input(
                 f"sending {orchestration_value} input."
             )
 
+        # Inject profile contracts only for orchestrated deliveries. Direct
+        # human pane input and answer_user_prompt keep their literal text.
+        original_message = message
+        message = _append_message_contract(message, metadata, orchestration_value)
+
         # Inject memory context into the very first user message after init.
         # Phase 1 wires injection inline for every provider. The Kiro
         # AgentSpawn hook will replace this path once the plugin
@@ -508,7 +537,6 @@ def send_input(
         # Keep the original message for the PostSendMessageEvent so
         # plugins/webhooks see what the caller sent — not the
         # internal <cao-memory> block that we paste into the TUI.
-        original_message = message
         message = inject_memory_context(message, terminal_id)
 
         # Check how many Enter keys the provider needs after paste
@@ -543,6 +571,29 @@ def send_input(
             provider.mark_input_received()
 
         update_last_active(terminal_id)
+        if metadata.get("caller_id") and orchestration_value in {
+            OrchestrationType.ASSIGN.value,
+            OrchestrationType.SEND_MESSAGE.value,
+        }:
+            from cli_agent_orchestrator.services.stalled_callback_watchdog import (
+                stalled_callback_watchdog,
+            )
+
+            if orchestration_value == OrchestrationType.ASSIGN.value:
+                stalled_callback_watchdog.record_inbound_task(
+                    terminal_id,
+                    metadata["caller_id"],
+                    metadata.get("agent_profile") or "",
+                )
+            elif (
+                sender_id == metadata["caller_id"]
+                and stalled_callback_watchdog.has_episode(terminal_id)
+            ):
+                stalled_callback_watchdog.record_inbound_task(
+                    terminal_id,
+                    metadata["caller_id"],
+                    metadata.get("agent_profile") or "",
+                )
         logger.info(f"Sent input to terminal: {terminal_id}")
         if registry is not None and sender_id is not None and orchestration_type is not None:
             dispatch_plugin_event(
@@ -789,6 +840,21 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
         raise
 
 
+def peek_terminal(terminal_id: str, lines: int = 40) -> str:
+    """Return the rendered pane tail for a terminal through the active backend."""
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata:
+        raise ValueError(f"Terminal '{terminal_id}' not found")
+
+    capped_lines = max(1, min(int(lines), MAX_PEEK_TERMINAL_LINES))
+    return get_backend().get_history(
+        metadata["tmux_session"],
+        metadata["tmux_window"],
+        tail_lines=capped_lines,
+        strip_escapes=True,
+    )
+
+
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
     """Delete terminal and kill its tmux window."""
     try:
@@ -865,6 +931,11 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
         provider_manager.cleanup_provider(terminal_id)
         with _memory_injected_lock:
             _memory_injected_terminals.discard(terminal_id)
+        from cli_agent_orchestrator.services.stalled_callback_watchdog import (
+            stalled_callback_watchdog,
+        )
+
+        stalled_callback_watchdog.clear_terminal(terminal_id)
         # Drop any per-curator dispatch lock so the registry doesn't grow
         # forever as memory_manager terminals come and go.
         from cli_agent_orchestrator.services.memory_service import _curator_locks

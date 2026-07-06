@@ -6,7 +6,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from cli_agent_orchestrator.mcp_server.server import _get_cleanup_nudge, delete_terminal
+from cli_agent_orchestrator.mcp_server.server import (
+    _get_cleanup_nudge,
+    _peek_terminal_impl,
+    delete_terminal,
+)
 
 
 class TestGetCleanupNudge:
@@ -111,3 +115,41 @@ class TestDeleteTerminal:
             result = delete_terminal("t1")
         assert result["success"] is False
         assert "Failed" in result["message"]
+
+
+class TestPeekTerminal:
+    def test_success_caps_lines_and_returns_output(self):
+        with patch("cli_agent_orchestrator.mcp_server.server.requests.get") as mock_get:
+            response = MagicMock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = {
+                "terminal_id": "t1",
+                "lines": 200,
+                "output": "pane tail",
+            }
+            mock_get.return_value = response
+
+            result = _peek_terminal_impl("t1", lines=999)
+
+        assert result == {
+            "success": True,
+            "terminal_id": "t1",
+            "lines": 200,
+            "output": "pane tail",
+        }
+        assert mock_get.call_args.kwargs["params"] == {"lines": 200}
+
+    def test_http_error_returns_structured_error(self):
+        with patch("cli_agent_orchestrator.mcp_server.server.requests.get") as mock_get:
+            http_err = requests.HTTPError("404")
+            http_err.response = MagicMock()
+            http_err.response.json.return_value = {"detail": "Terminal 't1' not found"}
+            response = MagicMock()
+            response.raise_for_status.side_effect = http_err
+            mock_get.return_value = response
+
+            result = _peek_terminal_impl("t1")
+
+        assert result["success"] is False
+        assert result["terminal_id"] == "t1"
+        assert "not found" in result["error"]

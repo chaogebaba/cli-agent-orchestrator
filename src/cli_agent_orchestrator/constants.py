@@ -145,6 +145,11 @@ INBOX_RECONCILE_INTERVAL = 30  # seconds between reconciliation sweeps
 # and missed.
 INBOX_RECONCILE_GRACE_SECONDS = 30
 
+# Assigned-worker callback watchdog. A worker created via assign that becomes
+# ready and never sends a message back to its recorded caller gets one
+# caller-only notification after this grace window.
+STALLED_CALLBACK_GRACE_SECONDS = _env_int("CAO_STALLED_CALLBACK_GRACE_SECONDS", 120)
+
 # =============================================================================
 # Cleanup Service Configuration
 # =============================================================================

@@ -99,6 +99,7 @@ from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.stalled_callback_watchdog import stalled_callback_watchdog
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
@@ -170,6 +171,12 @@ async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
 class TerminalOutputResponse(BaseModel):
     output: str
     mode: str
+
+
+class TerminalPeekResponse(BaseModel):
+    terminal_id: str
+    lines: int
+    output: str
 
 
 class RunStepRequest(BaseModel):
@@ -377,6 +384,7 @@ async def lifespan(app: FastAPI):
     # Start provider-agnostic reconciliation sweep for orphaned PENDING messages
     # the immediate and event-driven status paths missed (issue #131).
     inbox_reconcile_task = asyncio.create_task(inbox_reconciliation_daemon(registry))
+    watchdog_task = asyncio.create_task(stalled_callback_watchdog.run(registry))
 
     # Herdr delivers inbox via its own socket events; the tmux backend uses the
     # FIFO -> EventBus pipeline (StatusMonitor / LogWriter / InboxService) started
@@ -413,6 +421,7 @@ async def lifespan(app: FastAPI):
     status_monitor_task.cancel()
     log_writer_task.cancel()
     inbox_service_task.cancel()
+    watchdog_task.cancel()
     # Cancel daemon on shutdown
     daemon_task.cancel()
 
@@ -421,6 +430,7 @@ async def lifespan(app: FastAPI):
             status_monitor_task,
             log_writer_task,
             inbox_service_task,
+            watchdog_task,
             daemon_task,
             return_exceptions=True,
         )
@@ -1205,6 +1215,23 @@ async def get_terminal_output(
         )
 
 
+@app.get("/terminals/{terminal_id}/peek", response_model=TerminalPeekResponse)
+async def peek_terminal(
+    terminal_id: TerminalId,
+    lines: int = Query(default=40, ge=1, le=200),
+) -> TerminalPeekResponse:
+    try:
+        output = terminal_service.peek_terminal(terminal_id, lines)
+        return TerminalPeekResponse(terminal_id=terminal_id, lines=lines, output=output)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to peek terminal: {str(e)}",
+        )
+
+
 @app.post("/terminals/{terminal_id}/exit")
 async def exit_terminal(
     terminal_id: TerminalId,
@@ -1557,6 +1584,7 @@ async def create_inbox_message_endpoint(
             receiver_id,
             message,
         )
+        stalled_callback_watchdog.record_callback_if_to_caller(sender_id, receiver_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:

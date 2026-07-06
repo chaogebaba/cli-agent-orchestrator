@@ -1184,6 +1184,11 @@ class TestLifespan:
             patch.object(
                 main_module.inbox_service, "run", new=AsyncMock(side_effect=never_returns)
             ),
+            patch.object(
+                main_module.stalled_callback_watchdog,
+                "run",
+                new=AsyncMock(side_effect=never_returns),
+            ),
             patch("cli_agent_orchestrator.plugins.PluginRegistry.load", mock_load),
             patch("cli_agent_orchestrator.plugins.PluginRegistry.teardown", mock_teardown),
         ):
@@ -1262,6 +1267,11 @@ class TestLifespan:
             patch.object(main_module.log_writer, "run", new=AsyncMock(side_effect=never_returns)),
             patch.object(
                 main_module.inbox_service, "run", new=AsyncMock(side_effect=never_returns)
+            ),
+            patch.object(
+                main_module.stalled_callback_watchdog,
+                "run",
+                new=AsyncMock(side_effect=never_returns),
             ),
             patch("cli_agent_orchestrator.plugins.PluginRegistry.load", new=AsyncMock()),
             patch("cli_agent_orchestrator.plugins.PluginRegistry.teardown", new=AsyncMock()),
