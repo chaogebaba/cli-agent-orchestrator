@@ -259,7 +259,13 @@ class CodexProvider(BaseProvider):
         command_parts.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
 
         provider_defaults = get_provider_defaults("codex")
-        model = profile.model if profile and profile.model else provider_defaults.get("model")
+        default_model = provider_defaults.get("model")
+        if "model" in provider_defaults and isinstance(default_model, str):
+            model = default_model or None
+        elif profile and profile.model:
+            model = profile.model
+        else:
+            model = None
         if isinstance(model, str) and model:
             command_parts.extend(["--model", model])
 
@@ -329,13 +335,17 @@ class CodexProvider(BaseProvider):
             # etc. — without editing the global ~/.codex/config.toml or
             # maintaining named profile files. Keys may be dotted config paths
             # (e.g. "features.fast_mode"); values are serialized to TOML
-            # scalars. Emitted last so they take precedence over CAO's own
-            # overrides and the profile/config defaults on key conflicts.
+            # scalars. Emitted before providers.toml defaults so per-key TOML
+            # settings can take precedence while other profile keys remain.
         codex_config: dict[str, Any] = {}
-        if isinstance(provider_defaults.get("reasoning_effort"), str):
-            codex_config["model_reasoning_effort"] = provider_defaults["reasoning_effort"]
         if profile is not None and isinstance(getattr(profile, "codexConfig", None), dict):
             codex_config.update(profile.codexConfig)
+        reasoning_effort = provider_defaults.get("reasoning_effort")
+        if "reasoning_effort" in provider_defaults and isinstance(reasoning_effort, str):
+            if reasoning_effort:
+                codex_config["model_reasoning_effort"] = reasoning_effort
+            else:
+                codex_config.pop("model_reasoning_effort", None)
         for key, value in codex_config.items():
             command_parts.extend(["-c", _toml_override(key, value)])
 

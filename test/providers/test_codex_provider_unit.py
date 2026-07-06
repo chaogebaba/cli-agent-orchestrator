@@ -352,7 +352,7 @@ class TestCodexProviderModelFlag:
         assert "--model gpt-5.5" in command
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
-    def test_build_command_profile_model_wins_over_default(
+    def test_build_command_default_model_wins_over_profile(
         self, mock_load, provider_defaults_file
     ):
         mock_profile = MagicMock()
@@ -367,8 +367,27 @@ class TestCodexProviderModelFlag:
         provider = CodexProvider("tid", "sess", "win", "agent")
         command = provider._build_codex_command()
 
-        assert "--model gpt-5-profile" in command
-        assert "--model gpt-5.5" not in command
+        assert "--model gpt-5.5" in command
+        assert "gpt-5-profile" not in command
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_build_command_empty_default_model_suppresses_profile_model(
+        self, mock_load, provider_defaults_file
+    ):
+        mock_profile = MagicMock()
+        mock_profile.model = "gpt-5-profile"
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = None
+        mock_load.return_value = mock_profile
+        provider_defaults_file.write_text('[codex]\nmodel = ""\n', encoding="utf-8")
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+
+        assert "--model" not in command
+        assert "gpt-5-profile" not in command
 
 
 class TestCodexBuildCommandExtra:
@@ -662,7 +681,7 @@ class TestCodexProviderCodexConfig:
         assert 'model_reasoning_effort="high"' in command
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
-    def test_profile_codex_config_wins_over_reasoning_effort_default(
+    def test_provider_reasoning_effort_default_wins_over_profile_codex_config(
         self, mock_load, provider_defaults_file
     ):
         mock_profile = MagicMock()
@@ -670,7 +689,10 @@ class TestCodexProviderCodexConfig:
         mock_profile.system_prompt = None
         mock_profile.mcpServers = None
         mock_profile.codexProfile = None
-        mock_profile.codexConfig = {"model_reasoning_effort": "xhigh"}
+        mock_profile.codexConfig = {
+            "model_reasoning_effort": "xhigh",
+            "features.fast_mode": True,
+        }
         mock_load.return_value = mock_profile
         provider_defaults_file.write_text(
             '[codex]\nreasoning_effort = "high"\n',
@@ -680,8 +702,34 @@ class TestCodexProviderCodexConfig:
         provider = CodexProvider("tid", "sess", "win", "agent")
         command = provider._build_codex_command()
 
-        assert 'model_reasoning_effort="xhigh"' in command
-        assert 'model_reasoning_effort="high"' not in command
+        assert 'model_reasoning_effort="high"' in command
+        assert 'model_reasoning_effort="xhigh"' not in command
+        assert "features.fast_mode=true" in command
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_empty_reasoning_effort_default_suppresses_profile_codex_config_key(
+        self, mock_load, provider_defaults_file
+    ):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = {
+            "model_reasoning_effort": "xhigh",
+            "features.fast_mode": True,
+        }
+        mock_load.return_value = mock_profile
+        provider_defaults_file.write_text(
+            '[codex]\nreasoning_effort = ""\n',
+            encoding="utf-8",
+        )
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+
+        assert "model_reasoning_effort" not in command
+        assert "features.fast_mode=true" in command
 
 
 class TestCodexProviderStatusDetection:

@@ -266,7 +266,7 @@ def test_grok_command_uses_default_model_when_profile_unset(
     assert "-m grok-composer-2.5-fast" in command
 
 
-def test_grok_command_profile_model_wins_over_default(
+def test_grok_command_default_model_wins_over_profile(
     provider_defaults_file, monkeypatch
 ) -> None:
     profile = type(
@@ -289,8 +289,55 @@ def test_grok_command_profile_model_wins_over_default(
 
     command = _provider()._build_grok_command()
 
+    assert "-m grok-composer-2.5-fast" in command
+    assert "grok-profile-model" not in command
+
+
+def test_grok_command_empty_default_model_suppresses_profile_model(
+    provider_defaults_file, monkeypatch
+) -> None:
+    profile = type(
+        "Profile",
+        (),
+        {
+            "model": "grok-profile-model",
+            "mcpServers": None,
+            "system_prompt": None,
+        },
+    )()
+    provider_defaults_file.write_text(
+        '[grok_cli]\nmodel = ""\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
+        lambda _name: profile,
+    )
+
+    command = _provider()._build_grok_command()
+
+    assert " -m " not in command
+    assert "grok-profile-model" not in command
+
+
+def test_grok_command_uses_profile_model_when_default_absent(monkeypatch) -> None:
+    profile = type(
+        "Profile",
+        (),
+        {
+            "model": "grok-profile-model",
+            "mcpServers": None,
+            "system_prompt": None,
+        },
+    )()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
+        lambda _name: profile,
+    )
+
+    command = _provider()._build_grok_command()
+
     assert "-m grok-profile-model" in command
-    assert "grok-composer-2.5-fast" not in command
 
 
 def test_grok_command_absent_defaults_preserves_current_behavior(monkeypatch) -> None:

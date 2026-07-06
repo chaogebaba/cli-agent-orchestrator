@@ -135,7 +135,13 @@ class GrokCliProvider(BaseProvider):
             ensure_grok_mcp_servers(profile.mcpServers)
 
         provider_defaults = get_provider_defaults("grok_cli")
-        model = profile.model if profile and profile.model else provider_defaults.get("model")
+        default_model = provider_defaults.get("model")
+        if "model" in provider_defaults and isinstance(default_model, str):
+            model = default_model or None
+        elif profile and profile.model:
+            model = profile.model
+        else:
+            model = None
         if isinstance(model, str) and model:
             command_parts.extend(["-m", model])
 
