@@ -1524,6 +1524,39 @@ async def cancel_workflow_run_endpoint(
     return {"success": True, "run_id": run_id}
 
 
+@app.post("/workflows/runs/{run_id}/resume")
+async def resume_workflow_run_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Resume a crashed/failed run from its durable journal (FR-6.2, N6).
+
+    Re-drives the snapshotted spec from the journal, skipping already-completed
+    steps and re-running the rest with fresh terminals; awaited INLINE like the run
+    endpoint and returns the same ``WorkflowRunResult``. Error mapping
+    (business-logic-model §5): malformed run_id -> 400, unknown run -> 404, terminal
+    or live-RUNNING run -> 409, corrupt snapshot -> 422. The two resume subtypes are
+    caught BEFORE the bare ``ValueError`` arm so they map to their distinct codes.
+    """
+    from cli_agent_orchestrator.services import workflow_service
+
+    try:
+        result = await workflow_service.resume_from_last_completed(run_id)
+    except KeyError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+    except workflow_service.ResumeNotAllowedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except workflow_service.ResumeCorruptError as e:
+        # 422 by literal code: the ``status`` alias name differs across Starlette
+        # versions in the CI matrix; the integer is stable and warning-free.
+        raise HTTPException(status_code=422, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except workflow_service.WorkflowEngineError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    return result.model_dump()
+
+
 @app.delete("/terminals/{terminal_id}")
 async def delete_terminal(
     request: Request,
@@ -2077,6 +2110,85 @@ async def list_memories_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list memories: {str(e)}",
         )
+
+
+@app.get("/memory/export")
+async def export_memories_endpoint(
+    scope: MemoryScope,
+    format: str = Query(default="okf"),
+    scope_id: Optional[MemoryScopeId] = None,
+    include_history: bool = False,
+    redact: bool = False,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    """Stream one scope as an archive tarball (#345 D6, read-only mirror).
+
+    Declared BEFORE /memory/{key} so "export" is not captured as a key.
+    Private scopes (session/agent) are refused outright — there is no
+    include-private escape hatch over HTTP (D5). The bundle is built by
+    the same directory writer into a temp dir, tar'd, and streamed.
+    """
+    from fastapi.responses import FileResponse
+    from starlette.background import BackgroundTask
+
+    _require_memory_enabled()
+    # Private-scope gate: the CLI's --include-private is a local-operator
+    # affordance; the API surface never exports private tiers.
+    if scope in (MemoryScope.SESSION, MemoryScope.AGENT):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"scope '{scope.value}' is private and cannot be exported via the API",
+        )
+    if scope == MemoryScope.PROJECT and scope_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="scope 'project' requires scope_id",
+        )
+
+    import tempfile
+
+    from cli_agent_orchestrator.services.memory_archive import get_backend
+    from cli_agent_orchestrator.services.memory_archive.okf import export_bundle_to_tar
+
+    svc = _get_memory_service()
+    try:
+        backend = get_backend(format)(svc)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    tmp_dir = tempfile.mkdtemp(prefix="cao-memory-export-")
+    tar_path = Path(tmp_dir) / f"cao-memory-{scope.value}.tar.gz"
+
+    def _cleanup() -> None:
+        import shutil
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    try:
+        export_bundle_to_tar(
+            backend,
+            scope.value,
+            scope_id,
+            tar_path,
+            include_history=include_history,
+            redact=redact,
+        )
+    except ValueError as e:
+        _cleanup()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        _cleanup()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to export memories: {str(e)}",
+        )
+
+    return FileResponse(
+        path=str(tar_path),
+        media_type="application/gzip",
+        filename=tar_path.name,
+        background=BackgroundTask(_cleanup),
+    )
 
 
 @app.get("/memory/{key}", response_model=MemoryDetail)
