@@ -24,6 +24,33 @@ def test_watchdog_pushes_exactly_one_due_notification():
         assert svc.collect_due_notifications(now=14.0) == []
 
 
+def test_watchdog_polls_idle_status_when_no_post_task_status_event():
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    svc.record_inbound_task("worker1", "caller1", "developer")
+
+    with patch(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
+        return_value=TerminalStatus.IDLE,
+    ) as mock_get_status:
+        svc.poll_unarmed_statuses(now=10.0)
+
+    mock_get_status.assert_called_once_with("worker1")
+
+    with patch(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        return_value={"id": "worker1"},
+    ):
+        assert svc.collect_due_notifications(now=12.0) == []
+        assert svc.collect_due_notifications(now=13.0) == [
+            (
+                "worker1",
+                "caller1",
+                "[watchdog] worker worker1 (developer) idle 3s without callback",
+            )
+        ]
+        assert svc.collect_due_notifications(now=14.0) == []
+
+
 def test_watchdog_suppresses_notification_after_callback_to_recorded_caller():
     svc = StalledCallbackWatchdog(grace_seconds=3)
     svc.record_inbound_task("worker1", "caller1", "developer")

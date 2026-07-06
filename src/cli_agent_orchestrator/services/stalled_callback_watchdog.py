@@ -77,6 +77,29 @@ class StalledCallbackWatchdog:
             else:
                 episode.idle_since = None
 
+    def poll_unarmed_statuses(self, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            terminal_ids = [
+                terminal_id
+                for terminal_id, episode in self._episodes.items()
+                if not episode.callback_seen and not episode.fired and episode.idle_since is None
+            ]
+
+        if not terminal_ids:
+            return
+
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        for terminal_id in terminal_ids:
+            try:
+                self.record_status(terminal_id, status_monitor.get_status(terminal_id), now=now)
+            except Exception:
+                logger.exception(
+                    "Failed to poll status for stalled-callback watchdog: %s",
+                    terminal_id,
+                )
+
     def collect_due_notifications(self, now: float | None = None) -> list[tuple[str, str, str]]:
         now = time.monotonic() if now is None else now
         due: list[tuple[str, str, str]] = []
@@ -127,6 +150,7 @@ class StalledCallbackWatchdog:
                         terminal_id,
                         TerminalStatus(event["data"]["status"]),
                     )
+                await asyncio.to_thread(self.poll_unarmed_statuses)
                 await asyncio.to_thread(self.notify_due, registry)
             except Exception:
                 logger.exception("StalledCallbackWatchdog error")
