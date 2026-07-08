@@ -41,6 +41,35 @@ pytestmark = [pytest.mark.integration, pytest.mark.slow]
 KIRO_AGENTS_DIR = Path.home() / ".kiro" / "agents"
 TEST_AGENT_NAME = "agent-kiro-cli-integration-test"
 WATCH_MODE = os.environ.get("CAO_TEST_WATCH", "") == "1"
+KIRO_211_SKIP_REASON = "requires kiro-cli >= 2.11 (upstream d3fab72 detection targets 2.11 TUI)"
+
+
+def _kiro_cli_version() -> tuple[int, ...] | None:
+    binary = shutil.which("kiro-cli")
+    if not binary:
+        return None
+    try:
+        result = subprocess.run(
+            [binary, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    match = re.search(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", result.stdout or result.stderr)
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups(default="0"))
+
+
+def _kiro_cli_lt_211() -> bool:
+    version = _kiro_cli_version()
+    return version is not None and version < (2, 11, 0)
+
+
+requires_kiro_cli_211 = pytest.mark.skipif(_kiro_cli_lt_211(), reason=KIRO_211_SKIP_REASON)
 
 
 @pytest.fixture(scope="session")
@@ -215,6 +244,7 @@ class TestKiroCliProviderIntegration:
         assert status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
 
     @pytest.mark.asyncio
+    @requires_kiro_cli_211
     async def test_real_kiro_simple_query_and_completed(self, terminal):
         """Covers N6: COMPLETED status after response, message extraction."""
         _log("QUERY", "Sending: Say 'Hello, integration test!'")
@@ -301,6 +331,7 @@ class TestKiroCliPermissionPromptIntegration:
         assert status == TerminalStatus.WAITING_USER_ANSWER
 
     @pytest.mark.asyncio
+    @requires_kiro_cli_211
     async def test_n4_n5_processing_state(self, terminal):
         """N4/N5: No permission prompt during processing."""
         _send(terminal.id, "What is 2+2?")
