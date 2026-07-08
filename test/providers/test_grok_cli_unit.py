@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -22,6 +24,21 @@ def _provider() -> GrokCliProvider:
         window_name="window",
         agent_profile="grok_dev",
         allowed_tools=["*"],
+    )
+
+
+def _profile(
+    *,
+    name: str = "grok_dev",
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+):
+    return SimpleNamespace(
+        name=name,
+        model=model,
+        reasoningEffort=reasoning_effort,
+        mcpServers=None,
+        system_prompt=None,
     )
 
 
@@ -358,3 +375,135 @@ def test_grok_command_absent_defaults_preserves_current_behavior(monkeypatch) ->
     command = _provider()._build_grok_command()
 
     assert " -m " not in command
+
+
+def test_grok_command_per_profile_effort_wins(
+    provider_defaults_file, monkeypatch
+) -> None:
+    provider_defaults_file.write_text(
+        "[grok_cli]\n"
+        'reasoning_effort = "low"\n'
+        "\n"
+        "[grok_cli.profiles.grok_dev]\n"
+        'reasoning_effort = "high"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
+        lambda _name: _profile(reasoning_effort="medium"),
+    )
+
+    command = _provider()._build_grok_command()
+
+    assert "--reasoning-effort high" in command
+    assert "medium" not in command
+    assert "low" not in command
+
+
+def test_grok_command_provider_effort_wins_over_profile(
+    provider_defaults_file, monkeypatch
+) -> None:
+    provider_defaults_file.write_text(
+        '[grok_cli]\nreasoning_effort = "medium"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
+        lambda _name: _profile(reasoning_effort="high"),
+    )
+
+    command = _provider()._build_grok_command()
+
+    assert "--reasoning-effort medium" in command
+    assert "high" not in command
+
+
+def test_grok_command_profile_effort_used_when_toml_absent(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
+        lambda _name: _profile(reasoning_effort="high"),
+    )
+
+    command = _provider()._build_grok_command()
+
+    assert "--reasoning-effort high" in command
+
+
+def test_grok_command_absent_effort_omits_flag(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
+        lambda _name: _profile(),
+    )
+
+    command = _provider()._build_grok_command()
+
+    assert " --reasoning-effort " not in command
+
+
+def test_grok_command_empty_per_profile_effort_clears_lower_tiers(
+    provider_defaults_file, monkeypatch
+) -> None:
+    provider_defaults_file.write_text(
+        "[grok_cli]\n"
+        'reasoning_effort = "medium"\n'
+        "\n"
+        "[grok_cli.profiles.grok_dev]\n"
+        'reasoning_effort = ""\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
+        lambda _name: _profile(reasoning_effort="high"),
+    )
+
+    command = _provider()._build_grok_command()
+
+    assert " --reasoning-effort " not in command
+    assert "medium" not in command
+    assert "high" not in command
+
+
+def test_grok_command_per_profile_model_wins(
+    provider_defaults_file, monkeypatch
+) -> None:
+    provider_defaults_file.write_text(
+        "[grok_cli]\n"
+        'model = "grok-provider-model"\n'
+        "\n"
+        "[grok_cli.profiles.grok_dev]\n"
+        'model = "grok-profile-table-model"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
+        lambda _name: _profile(model="grok-frontmatter-model"),
+    )
+
+    command = _provider()._build_grok_command()
+
+    assert "-m grok-profile-table-model" in command
+    assert "grok-provider-model" not in command
+    assert "grok-frontmatter-model" not in command
+
+
+def test_grok_command_empty_per_profile_model_clears_lower_tiers(
+    provider_defaults_file, monkeypatch
+) -> None:
+    provider_defaults_file.write_text(
+        "[grok_cli]\n"
+        'model = "grok-provider-model"\n'
+        "\n"
+        "[grok_cli.profiles.grok_dev]\n"
+        'model = ""\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
+        lambda _name: _profile(model="grok-frontmatter-model"),
+    )
+
+    command = _provider()._build_grok_command()
+
+    assert " -m " not in command
+    assert "grok-provider-model" not in command
+    assert "grok-frontmatter-model" not in command

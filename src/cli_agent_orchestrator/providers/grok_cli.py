@@ -14,7 +14,7 @@ import logging
 import re
 import shlex
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -68,6 +68,33 @@ EMPTY_DRAFT_PLACEHOLDERS = {
 
 class ProviderError(Exception):
     """Exception raised for Grok provider-specific errors."""
+
+
+def _profile_defaults(
+    provider_defaults: Dict[str, Any],
+    profile_name: Optional[str],
+) -> Dict[str, Any]:
+    profiles = provider_defaults.get("profiles")
+    if not profile_name or not isinstance(profiles, dict):
+        return {}
+    defaults = profiles.get(profile_name)
+    return dict(defaults) if isinstance(defaults, dict) else {}
+
+
+def _resolve_string_option(
+    profile_defaults: Dict[str, Any],
+    provider_defaults: Dict[str, Any],
+    profile,
+    toml_key: str,
+    profile_attr: str,
+) -> Optional[str]:
+    for defaults in (profile_defaults, provider_defaults):
+        value = defaults.get(toml_key)
+        if toml_key in defaults and isinstance(value, str):
+            return value or None
+
+    value = getattr(profile, profile_attr, None) if profile is not None else None
+    return value if isinstance(value, str) and value else None
 
 
 class GrokCliProvider(BaseProvider):
@@ -135,15 +162,27 @@ class GrokCliProvider(BaseProvider):
             ensure_grok_mcp_servers(profile.mcpServers)
 
         provider_defaults = get_provider_defaults("grok_cli")
-        default_model = provider_defaults.get("model")
-        if "model" in provider_defaults and isinstance(default_model, str):
-            model = default_model or None
-        elif profile and profile.model:
-            model = profile.model
-        else:
-            model = None
+        profile_name = getattr(profile, "name", None) or self._agent_profile
+        profile_defaults = _profile_defaults(provider_defaults, profile_name)
+        model = _resolve_string_option(
+            profile_defaults,
+            provider_defaults,
+            profile,
+            "model",
+            "model",
+        )
         if isinstance(model, str) and model:
             command_parts.extend(["-m", model])
+
+        reasoning_effort = _resolve_string_option(
+            profile_defaults,
+            provider_defaults,
+            profile,
+            "reasoning_effort",
+            "reasoningEffort",
+        )
+        if isinstance(reasoning_effort, str) and reasoning_effort:
+            command_parts.extend(["--reasoning-effort", reasoning_effort])
 
         system_prompt = profile.system_prompt if profile and profile.system_prompt else ""
         system_prompt = self._apply_skill_prompt(system_prompt)

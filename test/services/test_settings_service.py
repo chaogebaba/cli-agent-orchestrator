@@ -121,6 +121,27 @@ class TestGetProviderDefaults:
             "reasoning_effort": "high",
         }
 
+    def test_provider_section_preserves_nested_profile_tables(self, settings_file, tmp_path):
+        defaults_file = tmp_path / "providers.toml"
+        defaults_file.write_text(
+            "[grok_cli]\n"
+            'model = "grok-provider-model"\n'
+            "\n"
+            "[grok_cli.profiles.grok_dev]\n"
+            'model = "grok-profile-model"\n'
+            'reasoning_effort = "high"\n',
+            encoding="utf-8",
+        )
+        assert get_provider_defaults("grok_cli") == {
+            "model": "grok-provider-model",
+            "profiles": {
+                "grok_dev": {
+                    "model": "grok-profile-model",
+                    "reasoning_effort": "high",
+                }
+            },
+        }
+
 
 class TestGetAgentDirs:
     """Tests for get_agent_dirs function."""
