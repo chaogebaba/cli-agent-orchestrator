@@ -28,9 +28,12 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import BaseModel, Field, field_validator
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from cli_agent_orchestrator.backends import TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
@@ -54,6 +57,8 @@ from cli_agent_orchestrator.constants import (
     SERVER_VERSION,
     TERMINALS_RUN_STEP_ROUTE,
     TRUSTED_FORWARDER_IPS,
+    WORKFLOW_ENV_ALLOWLIST,
+    WORKFLOW_ENV_VALUE_MAX_LEN,
     WS_ALLOWED_CLIENTS,
     add_local_cors_origins,
 )
@@ -100,6 +105,7 @@ from cli_agent_orchestrator.services.install_service import InstallResult, insta
 from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.stalled_callback_watchdog import stalled_callback_watchdog
+from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
@@ -179,6 +185,20 @@ class TerminalPeekResponse(BaseModel):
     output: str
 
 
+class CreateTerminalBody(BaseModel):
+    """Optional JSON body for POST /sessions/{name}/terminals.
+
+    Carries the deferred-init message payload OUT of the query string:
+    prompt content can be large (URL-length 414 risk) and sensitive (query
+    strings are routinely captured in HTTP access logs and traces). Routing
+    fields (provider, defer_init, etc.) stay as query params; only the
+    message content lives here.
+    """
+
+    initial_message: Optional[str] = None
+    initial_message_orchestration_type: Optional[str] = None
+
+
 class RunStepRequest(BaseModel):
     """Request body for the combined step-execution endpoint (N0, #312)."""
 
@@ -208,6 +228,87 @@ class RunStepRequest(BaseModel):
         default=None,
         description="Resolved allowed-tools list for a freshly created terminal (handoff inheritance)",
     )
+    env_vars: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=(
+            "Workflow identity env vars injected into a freshly created terminal. "
+            "Keys are restricted to the WORKFLOW_ENV_ALLOWLIST (NFR-SEC-4); "
+            "values are validated but never echoed in error bodies."
+        ),
+    )
+
+    @field_validator("env_vars")
+    @classmethod
+    def validate_env_vars(cls, v: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+        """Per-key checks for the env-var injection surface (U2/C6, A2).
+
+        Check order is load-bearing (security-requirements.md): allowlist ->
+        length cap -> control chars -> shared validator. Error messages name
+        the KEY and the violated rule only — the supplied VALUE is never
+        echoed into a 422 body (NFR-SEC-2 extended to the error path).
+        """
+        if v is None:
+            return v
+        for key, value in v.items():
+            if key not in WORKFLOW_ENV_ALLOWLIST:
+                raise ValueError(
+                    f"env var key '{key}' not in allowlist "
+                    f"{{{', '.join(sorted(WORKFLOW_ENV_ALLOWLIST))}}}"
+                )
+            # Pre-regex defense-in-depth, NOT redundancy: bounds the input
+            # O(1) before any regex evaluation and bounds what can be staged
+            # into a terminal environment regardless of future regex changes.
+            # Do not simplify away as duplicate validation (the effective
+            # accepted length is 64 via WORKFLOW_NAME_RE downstream).
+            if len(value) > WORKFLOW_ENV_VALUE_MAX_LEN:
+                raise ValueError(
+                    f"value for '{key}' exceeds the {WORKFLOW_ENV_VALUE_MAX_LEN}-char cap"
+                )
+            # Values land in a tmux session environment — escape-sequence
+            # injection into a terminal is the concrete threat.
+            if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+                raise ValueError(f"value for '{key}' contains control characters")
+            try:
+                _validate_key_part(value, key)
+            except ValueError:
+                # The shared validator's message interpolates the VALUE;
+                # re-raise with a key-name-only message so the supplied value
+                # never round-trips into the 422 body (NFR-SEC-4 sanitized
+                # error rule). `from None` drops the value-bearing cause.
+                raise ValueError(
+                    f"value for '{key}' is invalid (must be a 1-64 char "
+                    "[A-Za-z0-9_-] identifier)"
+                ) from None
+        return v
+
+    @model_validator(mode="after")
+    def validate_env_var_shape(self) -> "RunStepRequest":
+        """Cross-field checks (U2/C6, A3) — all surface as FastAPI-native 422s.
+
+        RUN_ID <-> GENERATION is a symmetric required pair (ADR-9/10): an
+        unanchored generation token — or a run id without its fence — would
+        silently no-op the stale-generation fence. STEP_ID requires RUN_ID
+        (a step key with no run to journal under is meaningless; RUN_ID
+        without STEP_ID is allowed for run-row-level calls).
+        """
+        keys = set(self.env_vars or {})
+        has_run = "CAO_WORKFLOW_RUN_ID" in keys
+        has_gen = "CAO_WORKFLOW_GENERATION" in keys
+        if has_run and not has_gen:
+            raise ValueError("CAO_WORKFLOW_RUN_ID requires CAO_WORKFLOW_GENERATION (required pair)")
+        if has_gen and not has_run:
+            raise ValueError("CAO_WORKFLOW_GENERATION requires CAO_WORKFLOW_RUN_ID (required pair)")
+        if "CAO_WORKFLOW_STEP_ID" in keys and not has_run:
+            raise ValueError("CAO_WORKFLOW_STEP_ID requires CAO_WORKFLOW_RUN_ID")
+        if self.env_vars and self.reuse_terminal_id:
+            # run_agent_step documents env injection as ignored on reused
+            # terminals — a silently dropped RUN_ID/GENERATION fence token is
+            # the quiet identity failure NFR-SEC-4 exists to prevent (BR-8).
+            raise ValueError(
+                "env_vars cannot be injected into a reused terminal "
+                "(env injection only applies to freshly created terminals)"
+            )
+        return self
 
 
 class RunStepResponse(BaseModel):
@@ -506,6 +607,33 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def _redact_env_vars_validation_error(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Redact ``env_vars`` VALUES from 422 bodies (U2, NFR-SEC-4).
+
+    FastAPI's default 422 envelope echoes the offending ``input`` back to the
+    caller. For ``env_vars`` violations the values are agent- or
+    attacker-supplied and must never round-trip into a response body — the
+    validator messages already name only the key and the rule, so the echoed
+    ``input``/``ctx`` are dropped for those entries. Every other field's 422
+    keeps FastAPI's stock shape byte-identical.
+    """
+    errors = []
+    for err in exc.errors():
+        # Field-validator errors anchor at ("body", "env_vars"); model-validator
+        # errors anchor at ("body",) with the WHOLE body echoed as input — both
+        # shapes can carry env_vars values, so both are redacted.
+        echoes_env_vars = "env_vars" in err.get("loc", ()) or (
+            isinstance(err.get("input"), dict) and "env_vars" in err["input"]
+        )
+        if echoes_env_vars:
+            err = {k: v for k, v in err.items() if k not in ("input", "ctx")}
+        errors.append(err)
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
 
 
 @app.get("/.well-known/oauth-protected-resource")
@@ -1033,9 +1161,26 @@ async def create_terminal_in_session(
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
     caller_id: Optional[TerminalId] = None,
+    defer_init: bool = False,
+    body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
-    """Create additional terminal in existing session."""
+    """Create additional terminal in existing session.
+
+    ``defer_init=true``: return as soon as the tmux window is created and the
+    terminal is registered in the DB, without waiting for the CLI provider to
+    reach IDLE. Provider initialization runs as a background task; when
+    ``body.initial_message`` is also provided it is sent to the terminal via
+    the same task once init completes. Used by the MCP `assign` tool to keep
+    tool-call latency well under kiro-cli 2.11's ~60s per-tool client
+    timeout, and to allow multiple concurrent assigns to run their init
+    phases in parallel.
+
+    The message payload lives in the JSON body (``initial_message``,
+    ``initial_message_orchestration_type``) rather than query params so prompt
+    content isn't exposed in HTTP access logs and isn't subject to URL-length
+    limits.
+    """
     try:
         validate_tmux_name(session_name, "session_name")
     except ValueError as e:
@@ -1049,6 +1194,43 @@ async def create_terminal_in_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
+        initial_message = body.initial_message if body else None
+
+        # The initial-message payload is only delivered on the deferred-init
+        # path; create_terminal() ignores it otherwise. Reject it explicitly
+        # when defer_init is false rather than silently dropping it, which would
+        # surface later as a "worker never received task" mystery.
+        if (
+            not defer_init
+            and body
+            and (
+                body.initial_message is not None
+                or body.initial_message_orchestration_type is not None
+            )
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "initial_message / initial_message_orchestration_type require "
+                    "defer_init=true; they are not delivered on the synchronous path"
+                ),
+            )
+
+        # Deferred init only makes sense when a message will follow — we
+        # still accept the flag alone (no message) for future non-assign uses.
+        orch_type = None
+        if body and body.initial_message_orchestration_type:
+            try:
+                orch_type = OrchestrationType(body.initial_message_orchestration_type)
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"invalid initial_message_orchestration_type: "
+                        f"{body.initial_message_orchestration_type!r}"
+                    ),
+                )
+
         result = await terminal_service.create_terminal(
             provider=resolved_provider,
             agent_profile=agent_profile,
@@ -1058,8 +1240,15 @@ async def create_terminal_in_session(
             allowed_tools=allowed_tools_list,
             registry=get_plugin_registry(request),
             caller_id=caller_id,
+            defer_init=defer_init,
+            initial_message=initial_message,
+            initial_message_orchestration_type=orch_type,
         )
         return result
+    except HTTPException:
+        # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
+        # orchestration_type) — propagate as-is instead of masking as a 500.
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -1090,7 +1279,12 @@ async def list_terminals_in_session(session_name: str) -> List[Dict]:
 @app.get("/terminals/{terminal_id}", response_model=Terminal)
 async def get_terminal(terminal_id: TerminalId) -> Terminal:
     try:
-        terminal = terminal_service.get_terminal(terminal_id)
+        # get_terminal reads status_monitor.get_status(), which for a
+        # PROCESSING terminal does a fresh detection that can shell out to
+        # tmux (blocking subprocess). This endpoint is polled heavily by
+        # wait_until_terminal_status, so run it off the loop to keep the
+        # server responsive under concurrent orchestration.
+        terminal = await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
         return Terminal(**terminal)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1152,7 +1346,12 @@ async def send_terminal_input(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     try:
-        success = terminal_service.send_input(
+        # send_input is blocking tmux I/O (bracketed paste + key sends). Run it
+        # off the event loop so a slow tmux call can't freeze every other
+        # request — including /health and concurrent assign/handoff. Same
+        # hazard class as issue #382 (only fixed for DELETE /sessions there).
+        success = await asyncio.to_thread(
+            terminal_service.send_input,
             terminal_id,
             message,
             registry=get_plugin_registry(request),
@@ -1188,7 +1387,8 @@ async def send_terminal_key(
         )
 
     try:
-        success = terminal_service.send_special_key(terminal_id, key)
+        # Blocking tmux send-keys — off the loop.
+        success = await asyncio.to_thread(terminal_service.send_special_key, terminal_id, key)
         return {"success": success}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1204,7 +1404,10 @@ async def get_terminal_output(
     terminal_id: TerminalId, mode: OutputMode = OutputMode.FULL
 ) -> TerminalOutputResponse:
     try:
-        output = terminal_service.get_output(terminal_id, mode)
+        # get_output does a blocking tmux capture-pane plus provider regex
+        # extraction over the scrollback — run it off the loop so a large
+        # transcript can't stall the whole server.
+        output = await asyncio.to_thread(terminal_service.get_output, terminal_id, mode)
         return TerminalOutputResponse(output=output, mode=mode)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1239,7 +1442,8 @@ async def exit_terminal(
 ) -> Dict:
     """Send provider-specific exit command to terminal."""
     try:
-        terminal_service.exit_terminal_cli(terminal_id)
+        # Blocking tmux I/O — off the loop.
+        await asyncio.to_thread(terminal_service.exit_terminal_cli, terminal_id)
         return {"success": True}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1312,6 +1516,7 @@ async def run_step(
             caller_id=body.caller_id,
             allowed_tools=body.allowed_tools,
             registry=get_plugin_registry(request),
+            env_vars=body.env_vars,
         )
         return RunStepResponse(
             terminal_id=result.terminal_id,
@@ -1565,8 +1770,15 @@ async def delete_terminal(
 ) -> Dict:
     """Delete a terminal."""
     try:
-        success = terminal_service.delete_terminal(
-            terminal_id, registry=get_plugin_registry(request)
+        # delete_terminal is fully synchronous: blocking tmux kills, a
+        # full-history scrollback snapshot capture, and DB writes. Off the
+        # loop so a stalled tmux/FIFO op bounds its blast radius to this one
+        # request instead of wedging the whole server (issue #382 fixed this
+        # for DELETE /sessions; the per-terminal path had the same hazard).
+        success = await asyncio.to_thread(
+            terminal_service.delete_terminal,
+            terminal_id,
+            registry=get_plugin_registry(request),
         )
         return {"success": success}
     except ValueError as e:
