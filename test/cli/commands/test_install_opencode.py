@@ -512,6 +512,7 @@ class TestStaleMcpGrantsRemoved:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(
     shutil.which("opencode") is None,
     reason="opencode binary not on PATH",
