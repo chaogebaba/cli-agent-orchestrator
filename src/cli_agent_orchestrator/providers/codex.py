@@ -77,12 +77,13 @@ ERROR_PATTERN = r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|panic:)
 # which is shared across v0.111 and v0.136 status bars.
 TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])"
 # Codex TUI progress spinner: "• Working (0s • esc to interrupt)",
-# "• Thinking (2s ...)", "• Starting script creation (10s • esc to interrupt)".
-# The prefix text varies but the "(Ns • esc to interrupt)" format is consistent.
+# "• Thinking (3m 39s ...)",
+# "• Starting script creation (1h 2m 3s • esc to interrupt)".
+# The prefix text and elapsed-time format vary, but the interrupt hint is stable.
 # Appears inline with --no-alt-screen when the agent is actively processing.
 # Must be checked before COMPLETED to avoid false positives (the • matches
 # ASSISTANT_PREFIX_PATTERN and the TUI footer › matches idle prompt).
-TUI_PROGRESS_PATTERN = r"•.*\(\d+s\s*•\s*esc to interrupt\)"
+TUI_PROGRESS_PATTERN = r"•.*\([^)]*\besc to interrupt\)"
 
 # Workspace trust/approval prompt shown when Codex opens a new directory
 TRUST_PROMPT_PATTERN = r"allow Codex to work in this folder"

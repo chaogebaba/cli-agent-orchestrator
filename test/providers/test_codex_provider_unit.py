@@ -1174,6 +1174,36 @@ class TestCodexBulletFormatStatusDetection:
 
         assert status == TerminalStatus.PROCESSING
 
+    @pytest.mark.parametrize(
+        "spinner_line",
+        [
+            "• Working (39s • esc to interrupt)",
+            "• Working (3m 39s • esc to interrupt)",
+            "• Working (1h 2m 3s • esc to interrupt)",
+            (
+                "• Working (3m 39s • esc to interrupt) · "
+                "1 background terminal running · /ps to view · /stop to close"
+            ),
+        ],
+    )
+    def test_get_status_processing_tui_spinner_elapsed_formats(self, spinner_line):
+        """PROCESSING for Codex spinner elapsed formats past 60s."""
+        output = (
+            "› [CAO Handoff] Run the test suite.\n"
+            "\n"
+            "• Earlier assistant bullet that would otherwise look completed.\n"
+            f"{spinner_line}\n"
+            "\n"
+            "› Use /skills to list available skills\n"
+            "\n"
+            "  ? for shortcuts                     100% context left\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.PROCESSING
+
     def test_get_status_processing_tui_thinking_spinner(self):
         """PROCESSING when TUI shows • Thinking spinner."""
         output = (
