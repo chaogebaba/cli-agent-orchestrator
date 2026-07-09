@@ -955,6 +955,16 @@ class TestCodexScreenDetection:
         ]
         assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
 
+    def test_processing_spinner_above_tail_beats_ghost_footer_prompt(self):
+        screen = [
+            "› Fix the bug",
+            "• Working (5s • esc to interrupt)",
+            *[""] * 26,
+            "› Summarize recent commits",
+            "  ? for shortcuts                     100% context left",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+
     def test_blank_screen_falls_to_processing_catch_all(self):
         """Unlike ClaudeCodeProvider, Codex's get_status() has no bare
         ``if not output.strip(): return UNKNOWN`` guard — blank content with no
@@ -1012,6 +1022,82 @@ class TestCodexComposerDraftParsing:
             "  ? for shortcuts                     100% context left",
         ]
         assert self._p().read_composer_draft(screen) == ("x" * 40) + "continued"
+
+    def test_dim_sgr_ghost_hint_is_not_a_draft(self):
+        """capture-pane -e ghost: body wrapped in SGR 2 (dim) ⇒ empty draft."""
+        # Empirical probe (codex 0.143): \x1b[1m›\x1b[0m \x1b[2mHINT\x1b[0m
+        ghost_line = "\x1b[1m›\x1b[0m \x1b[2mWrite tests for @filename\x1b[0m"
+        screen = [
+            ghost_line,
+            "  gpt-5.5 high · ~/VScode_projects/cli-subagents",
+        ]
+        assert self._p().read_composer_draft(screen) == ""
+
+    def test_dim_sgr_ghost_with_bg_prefix_is_not_a_draft(self):
+        """Some builds emit bg then dim before the hint text."""
+        ghost_line = (
+            "\x1b[1m›\x1b[0m \x1b[48;2;30;30;30m\x1b[2mSummarize recent commits\x1b[0m"
+        )
+        screen = [
+            ghost_line,
+            "  ? for shortcuts                     100% context left",
+        ]
+        assert self._p().read_composer_draft(screen) == ""
+
+    def test_typed_text_with_prompt_sgr_is_preserved(self):
+        """Typed draft after bold prompt glyph has no dim on body ⇒ real draft."""
+        typed_line = "\x1b[1m›\x1b[0m xyzzy"
+        screen = [
+            typed_line,
+            "  gpt-5.5 high · ~/proj",
+        ]
+        assert self._p().read_composer_draft(screen) == "xyzzy"
+
+    def test_truecolor_wrapped_typed_text_is_preserved(self):
+        """Truecolour SGR 38;2;R;G;B must not be mistaken for dim (P1)."""
+        typed_line = "\x1b[1m›\x1b[0m \x1b[38;2;255;255;255mkeep me\x1b[0m"
+        screen = [
+            typed_line,
+            "  ? for shortcuts                     100% context left",
+        ]
+        assert self._p().read_composer_draft(screen) == "keep me"
+
+    def test_256_color_index_two_is_not_dim(self):
+        """256-colour form 38;5;2 uses colour index 2, not intensity dim."""
+        typed_line = "\x1b[1m›\x1b[0m \x1b[38;5;2mgreen draft\x1b[0m"
+        screen = [
+            typed_line,
+            "  ? for shortcuts                     100% context left",
+        ]
+        assert self._p().read_composer_draft(screen) == "green draft"
+
+    def test_standalone_dim_sgr_is_ghost(self):
+        """Actual dim intensity \\x1b[2m on body ⇒ ghost empty."""
+        ghost_line = "\x1b[1m›\x1b[0m \x1b[2mRun /review on my current changes\x1b[0m"
+        screen = [
+            ghost_line,
+            "  ? for shortcuts                     100% context left",
+        ]
+        assert self._p().read_composer_draft(screen) == ""
+
+    def test_combined_dim_and_truecolor_is_ghost(self):
+        """Combined SGR with standalone 2 then truecolour still counts as dim."""
+        ghost_line = (
+            "\x1b[1m›\x1b[0m \x1b[2;38;2;120;120;120mSummarize recent commits\x1b[0m"
+        )
+        screen = [
+            ghost_line,
+            "  ? for shortcuts                     100% context left",
+        ]
+        assert self._p().read_composer_draft(screen) == ""
+
+    def test_plain_placeholder_still_empty_without_escapes(self):
+        """Fallback: hardcoded empty placeholders on escape-stripped captures."""
+        screen = [
+            "› Ask Codex to do anything",
+            "  ? for shortcuts                     100% context left",
+        ]
+        assert self._p().read_composer_draft(screen) == ""
 
 
 class TestCodexBulletFormatStatusDetection:

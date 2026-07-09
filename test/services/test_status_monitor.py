@@ -6,10 +6,14 @@ backends (tmux) it returns the pushed pipeline status; for event-inbox backends
 provider's native status. These tests pin both paths.
 """
 
+import asyncio
 import threading
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 
 
@@ -106,6 +110,291 @@ class TestScreenDetection:
         assert sm._detect_screen("t1", provider) == TerminalStatus.IDLE
         provider.get_status.assert_called_once_with("raw buffer with idle footer")
         mock_pm.get_provider.assert_not_called()
+
+    def test_render_error_raw_processing_fallback_does_not_override_ready_latch(self):
+        class BrokenScreen:
+            @property
+            def display(self):
+                raise RuntimeError("torn pyte frame")
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.IDLE
+        sm._screens["t1"] = (BrokenScreen(), MagicMock())
+        sm._buffers["t1"] = "stale raw processing marker"
+        provider = MagicMock()
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        bus = MagicMock()
+
+        with patch("cli_agent_orchestrator.services.status_monitor.bus", bus):
+            sm._on_screen_quiescent("t1", provider)
+
+        provider.get_status.assert_called_once_with("stale raw processing marker")
+        provider.get_status_from_screen.assert_not_called()
+        bus.publish.assert_not_called()
+        assert sm._last_status["t1"] == TerminalStatus.IDLE
+
+    def test_screen_uses_backend_pane_size_when_creating_pyte_screen(self, caplog):
+        sm = StatusMonitor()
+        caplog.set_level("INFO", logger="cli_agent_orchestrator.services.status_monitor")
+
+        sm._feed_screen_locked("t1", "hello", screen_size=(12, 3))
+
+        screen, _stream = sm._screens["t1"]
+        assert screen.columns == 12
+        assert screen.lines == 3
+        assert "pyte screen created for t1 at 12x3" in caplog.text
+
+    def test_screen_defers_creation_when_pane_size_unknown(self, caplog):
+        """Regression: fallback-sized screens (220x50 vs real 139x49) freeze the
+        wrong viewport height and can leave stale prompt rows composited over a
+        busy turn. Unknown first size must not create that palimpsest screen.
+        """
+        sm = StatusMonitor()
+        caplog.set_level("WARNING", logger="cli_agent_orchestrator.services.status_monitor")
+
+        assert sm._feed_screen_locked("t1", "hello", screen_size=None) is False
+
+        assert "t1" not in sm._screens
+        assert "pyte screen creation deferred for t1: screen size unresolved" in caplog.text
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_first_chunk_before_metadata_replays_into_real_sized_screen(self, mock_pm, caplog):
+        sm = StatusMonitor()
+        caplog.set_level("INFO", logger="cli_agent_orchestrator.services.status_monitor")
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+
+        def detect(lines):
+            return (
+                TerminalStatus.PROCESSING
+                if "working spinner" in "\n".join(lines)
+                else TerminalStatus.UNKNOWN
+            )
+
+        provider.get_status_from_screen.side_effect = detect
+        mock_pm.get_provider.return_value = provider
+        bus = MagicMock()
+
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.bus", bus),
+            patch.object(sm, "_resolve_screen_size", side_effect=[None, (139, 49)]),
+        ):
+            sm._process_chunk("t1", "working spinner")
+            assert "t1" not in sm._screens
+            provider.get_status_from_screen.assert_not_called()
+
+            sm._process_chunk("t1", "\n")
+
+        screen, _stream = sm._screens["t1"]
+        assert screen.columns == 139
+        assert screen.lines == 49
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        provider.get_status_from_screen.assert_called_once()
+        assert "pyte screen creation deferred for t1: screen size unresolved" in caplog.text
+        assert "pyte screen created for t1 at 139x49" in caplog.text
+
+    def test_armed_screen_detection_runs_even_when_already_bursting(self):
+        sm = StatusMonitor()
+        provider = MagicMock()
+        statuses = iter([
+            TerminalStatus.IDLE,
+            TerminalStatus.COMPLETED,
+            TerminalStatus.PROCESSING,
+        ])
+        provider.get_status_from_screen.side_effect = lambda _lines: next(statuses)
+        bus = MagicMock()
+
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.bus", bus),
+            patch.object(sm, "_running_loop", return_value=MagicMock()),
+        ):
+            sm._feed_screen_locked("t1", "ready", screen_size=(80, 24))
+            sm._schedule_screen_detection("t1", provider)
+            sm.notify_input_sent("t1")
+            sm._feed_screen_locked("t1", "torn ready")
+            sm._schedule_screen_detection("t1", provider)
+            assert sm._last_status["t1"] == TerminalStatus.IDLE
+            sm._feed_screen_locked("t1", "working")
+            sm._schedule_screen_detection("t1", provider)
+
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert provider.get_status_from_screen.call_count == 3
+
+    def test_unarmed_mid_burst_does_not_detect_ready_state(self):
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.get_status_from_screen.return_value = TerminalStatus.COMPLETED
+        bus = MagicMock()
+
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.bus", bus),
+            patch.object(sm, "_running_loop", return_value=MagicMock()),
+        ):
+            sm._feed_screen_locked("t1", "ready", screen_size=(80, 24))
+            sm._schedule_screen_detection("t1", provider)
+            sm._feed_screen_locked("t1", "repaint")
+            sm._schedule_screen_detection("t1", provider)
+
+        assert provider.get_status_from_screen.call_count == 2
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        assert bus.publish.call_count == 1
+
+    def test_run9_screen_processing_after_idle_flap_reopens_busy_state(self):
+        sm = StatusMonitor()
+        sm._screens["t1"] = (MagicMock(display=["Working"]), MagicMock())
+        provider = MagicMock()
+        provider.get_status_from_screen.side_effect = [
+            TerminalStatus.PROCESSING,
+            TerminalStatus.IDLE,
+            TerminalStatus.PROCESSING,
+            TerminalStatus.PROCESSING,
+        ]
+        bus = MagicMock()
+        published = []
+        bus.publish.side_effect = lambda _topic, data: published.append(data["status"])
+
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.bus", bus),
+            patch(
+                "cli_agent_orchestrator.services.auto_responder.auto_responder.on_screen",
+                return_value=None,
+            ),
+        ):
+            sm.notify_input_sent("t1")
+            sm._schedule_screen_detection("t1", provider)
+            sm._schedule_screen_detection("t1", provider)
+            sm._schedule_screen_detection("t1", provider)
+            sm._schedule_screen_detection("t1", provider)
+
+        assert provider.get_status_from_screen.call_count == 4
+        assert published == ["processing", "idle", "processing"]
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    async def test_real_loop_codex_spinner_after_idle_flap_recovers_processing(self, mock_pm):
+        """Real-loop regression for run 11: a stale idle quiescence result must
+        not overwrite newer Codex spinner chunks and strand status at idle.
+        """
+        sm = StatusMonitor()
+        sm._loop = asyncio.get_running_loop()
+        provider = CodexProvider("t1", "session", "window")
+        real_screen_status = provider.get_status_from_screen
+        idle_detection_started = threading.Event()
+        release_idle_detection = threading.Event()
+        delay_next_idle_detection = threading.Event()
+
+        def delayed_status_from_screen(lines):
+            status = real_screen_status(lines)
+            if status == TerminalStatus.IDLE and delay_next_idle_detection.is_set():
+                delay_next_idle_detection.clear()
+                idle_detection_started.set()
+                assert release_idle_detection.wait(timeout=1)
+            return status
+
+        provider.get_status_from_screen = delayed_status_from_screen
+        mock_pm.get_provider.return_value = provider
+        published = []
+        bus = MagicMock()
+        bus.publish.side_effect = lambda _topic, data: published.append(data["status"])
+
+        def frame(*lines: str) -> str:
+            return "\x1b[2J\x1b[H" + "\r\n".join(lines)
+
+        async def feed(chunk: str) -> None:
+            await asyncio.to_thread(sm._process_chunk, "t1", chunk)
+            # Let call_soon_threadsafe timer setup run, but do not wait long
+            # enough for the 200ms quiescence callback to rescue the status.
+            await asyncio.sleep(0.01)
+
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.bus", bus),
+            patch.object(sm, "_resolve_screen_size", return_value=(139, 49)),
+            patch(
+                "cli_agent_orchestrator.services.auto_responder.auto_responder.on_screen",
+                return_value=None,
+            ),
+        ):
+            await feed(frame("› ", "? for shortcuts / 99% context left"))
+            delay_next_idle_detection.set()
+            assert await asyncio.to_thread(idle_detection_started.wait, 1)
+
+            sm.notify_input_sent("t1")
+            await feed(
+                frame(
+                    "› STILL false-idle probe",
+                    "• Working (0s • esc to interrupt)",
+                    "› ",
+                    "? for shortcuts / 99% context left",
+                )
+            )
+            assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+            release_idle_detection.set()
+            await asyncio.sleep(0.05)
+            assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+            await feed(
+                frame(
+                    "› STILL false-idle probe",
+                    "• Working (1s • esc to interrupt)",
+                    "› ",
+                    "? for shortcuts / 99% context left",
+                )
+            )
+
+        screen_lines = sm.get_rendered_screen("t1") or []
+        screen_text = "\n".join(screen_lines)
+        nonblank_tail = "\n".join([line for line in screen_lines if line.strip()][-8:])
+        assert "esc to interrupt" in screen_text
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING, nonblank_tail
+        assert published[-1] == "processing"
+        sm.clear_terminal("t1")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    async def test_ready_bursting_codex_one_line_spinner_repaint_recovers_processing(
+        self, mock_pm
+    ):
+        """Small Codex spinner repaints must recover even if debounce state is
+        already bursting; waiting for a later large burst is too late.
+        """
+        sm = StatusMonitor()
+        sm._loop = asyncio.get_running_loop()
+        provider = CodexProvider("t1", "session", "window")
+        mock_pm.get_provider.return_value = provider
+        bus = MagicMock()
+        published = []
+        bus.publish.side_effect = lambda _topic, data: published.append(data["status"])
+
+        async def feed(chunk: str) -> None:
+            await asyncio.to_thread(sm._process_chunk, "t1", chunk)
+            await asyncio.sleep(0.01)
+
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.bus", bus),
+            patch.object(sm, "_resolve_screen_size", return_value=(139, 49)),
+            patch(
+                "cli_agent_orchestrator.services.auto_responder.auto_responder.on_screen",
+                return_value=None,
+            ),
+        ):
+            await feed("\x1b[2J\x1b[H› \r\n? for shortcuts / 99% context left")
+            await asyncio.sleep(0.25)
+            assert sm._last_status["t1"] == TerminalStatus.IDLE
+
+            sm._bursting["t1"] = True
+            sm._allow_processing_revert["t1"] = False
+            await feed("\x1b[2;1H• Working (1s • esc to interrupt)\x1b[K")
+
+        screen_text = "\n".join(sm.get_rendered_screen("t1") or [])
+        assert "esc to interrupt" in screen_text
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert published[-1] == "processing"
+        sm.clear_terminal("t1")
 
 
 class _SequencedMonitor:
@@ -226,6 +515,18 @@ class TestStickyLatching:
         m.feed(TerminalStatus.IDLE)
         m.feed(TerminalStatus.PROCESSING)  # no new input — blocked
         assert m.status() == TerminalStatus.IDLE
+
+    def test_raw_processing_after_idle_flap_still_blocks_without_new_arm(self):
+        """Screen detections may override ready->PROCESSING, but raw buffer
+        detections keep the sticky latch because stale-buffer risk remains."""
+        m = _SequencedMonitor()
+        m.sm.notify_input_sent("t1")
+        m.feed(TerminalStatus.PROCESSING)
+        m.feed(TerminalStatus.IDLE)
+        m.feed(TerminalStatus.PROCESSING)
+        m.feed(TerminalStatus.PROCESSING)
+        assert m.status() == TerminalStatus.IDLE
+        assert m.published == ["processing", "idle"]
 
     def test_reset_buffer_clears_arm(self):
         m = _SequencedMonitor()
@@ -367,6 +668,100 @@ class TestQuiescenceTimerCancel:
         # No timer scheduled for this terminal — must not blow up.
         sm.clear_terminal("missing")
         sm._loop.call_soon_threadsafe.assert_not_called()
+
+
+class TestQuiescenceGeneration:
+    @pytest.mark.asyncio
+    async def test_screen_stale_result_in_generation_gap_cannot_publish(self):
+        sm = StatusMonitor()
+        sm._loop = asyncio.get_running_loop()
+        sm._chunk_seq["t1"] = 1
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._screens["t1"] = (MagicMock(display=["› "]), MagicMock())
+        started = threading.Event()
+        release = threading.Event()
+        provider = MagicMock()
+
+        def detect(_lines):
+            started.set()
+            assert release.wait(timeout=1)
+            return TerminalStatus.IDLE
+
+        provider.get_status_from_screen.side_effect = detect
+        bus = MagicMock()
+
+        with patch("cli_agent_orchestrator.services.status_monitor.bus", bus):
+            sm._on_screen_quiescent("t1", provider, expected_seq=1)
+            assert await asyncio.to_thread(started.wait, 1)
+            with sm._lock:
+                sm._bump_chunk_seq_locked("t1")
+            release.set()
+            await asyncio.sleep(0.05)
+
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        bus.publish.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_raw_stale_result_in_generation_gap_cannot_publish(self):
+        sm = StatusMonitor()
+        sm._loop = asyncio.get_running_loop()
+        sm._chunk_seq["t1"] = 1
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "ready"
+        started = threading.Event()
+        release = threading.Event()
+
+        def detect(_terminal_id, _buffer):
+            started.set()
+            assert release.wait(timeout=1)
+            return TerminalStatus.IDLE
+
+        bus = MagicMock()
+
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.bus", bus),
+            patch.object(sm, "_detect_status", side_effect=detect),
+        ):
+            sm._on_raw_quiescent("t1", expected_seq=1)
+            assert await asyncio.to_thread(started.wait, 1)
+            with sm._lock:
+                sm._bump_chunk_seq_locked("t1")
+            release.set()
+            await asyncio.sleep(0.05)
+
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        bus.publish.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reset_buffer_advances_generation_so_stale_task_cannot_publish(self):
+        sm = StatusMonitor()
+        sm._loop = asyncio.get_running_loop()
+        sm._chunk_seq["t1"] = 1
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "old ready"
+        started = threading.Event()
+        release = threading.Event()
+
+        def detect(_terminal_id, _buffer):
+            started.set()
+            assert release.wait(timeout=1)
+            return TerminalStatus.IDLE
+
+        bus = MagicMock()
+
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.bus", bus),
+            patch.object(sm, "_detect_status", side_effect=detect),
+        ):
+            sm._on_raw_quiescent("t1", expected_seq=1)
+            assert await asyncio.to_thread(started.wait, 1)
+            sm.reset_buffer("t1")
+            assert sm._chunk_seq["t1"] == 2
+            release.set()
+            await asyncio.sleep(0.05)
+
+        assert "t1" not in sm._last_status
+        bus.publish.assert_not_called()
 
 
 class TestRawDebounceArmedDetection:

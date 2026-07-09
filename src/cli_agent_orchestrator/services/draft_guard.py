@@ -19,6 +19,10 @@ DRAFT_STABILITY_RECHECK_SECONDS = 0.5
 DRAFT_STABILITY_TIMEOUT_SECONDS = 30.0
 DRAFT_CLEAR_MAX_ITERATIONS = 50
 DRAFT_CLEAR_RECHECK_DELAY_SECONDS = 0.05
+DRAFT_CLEAR_PROBE_RECHECK_DELAY_SECONDS = 0.3
+# Transient None re-read after clear-keys: retry before conservative "changed".
+DRAFT_CLEAR_PROBE_NONE_RETRIES = 2
+DRAFT_CLEAR_PROBE_NONE_RETRY_DELAY_SECONDS = 0.15
 
 
 @dataclass
@@ -73,8 +77,28 @@ def preserve_draft_before_send(
     if not draft:
         return None
 
+    # Ghost-text discrimination: TUI composer "ghost" suggestions (e.g.
+    # codex's rotating '› Summarize recent commits' hint, rendered dim) parse
+    # exactly like a typed draft, but they are not real text. Codex ghosts were
+    # empirically clear-immune across 50 clear attempts. Send ONE clear
+    # iteration and re-read: unchanged ⇒ ghost ⇒ nothing to preserve. Changed
+    # ⇒ a real draft, whose full text we already captured above. Residual risk:
+    # a provider whose ghost hint dismisses on keypress can look like a real
+    # draft, but preserving a human draft is the safer failure mode.
+    if not _clear_step_changed_draft(terminal_id, metadata, provider, draft):
+        logger.info(
+            "Composer text for terminal %s unaffected by clear keys (ghost suggestion); "
+            "not preserving as draft",
+            terminal_id,
+        )
+        return None
+
     _append_draft_log(terminal_id, draft)
-    _clear_composer(terminal_id, metadata, provider)
+    cleared = _clear_composer(terminal_id, metadata, provider)
+    if not cleared:
+        # Never restore what we could not clear: re-pasting on top of the
+        # leftover text would duplicate it in the composer.
+        return None
     return PreservedDraft(
         terminal_id=terminal_id,
         session_name=metadata["tmux_session"],
@@ -111,19 +135,128 @@ def _wait_for_stable_draft(
     return previous
 
 
-def _clear_composer(terminal_id: str, metadata: dict[str, Any], provider: Any) -> None:
-    backend = get_backend()
+def _send_clear_keys(terminal_id: str, metadata: dict[str, Any], provider: Any) -> bool:
+    """Send one round of the provider's composer clear keys. False if none configured."""
     clear_keys = list(getattr(provider, "composer_clear_keys", []) or [])
     if not clear_keys:
         logger.warning("Draft preservation enabled for %s but no clear keys configured", terminal_id)
-        return
+        return False
+    backend = get_backend()
+    for key in clear_keys:
+        backend.send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
+    return True
 
+
+def _clear_step_changed_draft(
+    terminal_id: str,
+    metadata: dict[str, Any],
+    provider: Any,
+    draft: str,
+) -> bool:
+    """One clear iteration, then re-read: did the composer text change?
+
+    True  ⇒ real draft (clear keys affected it).
+    False ⇒ ghost suggestion text (immune to clear keys) or no clear keys.
+    A None re-read is retried a few times (transient capture glitches); only
+    after retries fail do we take the conservative "changed" verdict so a
+    human draft is not discarded.
+    """
+    if not _send_clear_keys(terminal_id, metadata, provider):
+        logger.info(
+            "clear-probe terminal=%s path=no_clear_keys verdict=unchanged(ghost_or_unconfigured)",
+            terminal_id,
+        )
+        return False
+    time.sleep(DRAFT_CLEAR_PROBE_RECHECK_DELAY_SECONDS)
+    current: Optional[str] = None
+    attempts = 1 + DRAFT_CLEAR_PROBE_NONE_RETRIES
+    for attempt in range(attempts):
+        if attempt > 0:
+            time.sleep(DRAFT_CLEAR_PROBE_NONE_RETRY_DELAY_SECONDS)
+        current = _read_draft_via_capture(metadata, provider)
+        if current is not None:
+            changed = current != draft
+            logger.info(
+                "clear-probe terminal=%s path=reread attempt=%d/%d current=%r "
+                "verdict=%s",
+                terminal_id,
+                attempt + 1,
+                attempts,
+                current[:80] if current else current,
+                "changed(real_draft)" if changed else "unchanged(ghost)",
+            )
+            return changed
+        logger.debug(
+            "clear-probe terminal=%s path=reread attempt=%d/%d got None",
+            terminal_id,
+            attempt + 1,
+            attempts,
+        )
+    logger.info(
+        "clear-probe terminal=%s path=none_after_retries attempts=%d "
+        "verdict=changed(real_draft_conservative)",
+        terminal_id,
+        attempts,
+    )
+    return True
+
+
+def _provider_accepts_escapes(provider: Any) -> bool:
+    return getattr(provider, "composer_parse_accepts_escapes", False) is True
+
+
+def _read_provider_draft_from_capture(
+    metadata: dict[str, Any],
+    provider: Any,
+    *,
+    strip_escapes: bool,
+) -> Optional[str]:
+    """Capture pane and parse draft. ``strip_escapes`` selects plain vs -e."""
+    try:
+        captured = get_backend().get_history(
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            tail_lines=PYTE_SCREEN_ROWS,
+            strip_escapes=strip_escapes,
+        )
+    except Exception:
+        return None
+    try:
+        return provider.read_composer_draft(captured.splitlines())
+    except Exception:
+        return None
+
+
+def _read_draft_via_capture(
+    metadata: dict[str, Any],
+    provider: Any,
+) -> Optional[str]:
+    """Capture-based draft read, escape-preserving only when provider opts in.
+
+    Codex sets ``composer_parse_accepts_escapes`` so dim-SGR ghosts are visible.
+    Grok and other plain parsers must not receive ANSI. Opt-in providers that
+    return None from an escape-preserving parse get a plain-capture last resort.
+    """
+    if _provider_accepts_escapes(provider):
+        draft = _read_provider_draft_from_capture(
+            metadata, provider, strip_escapes=False
+        )
+        if draft is not None:
+            return draft
+        return _read_provider_draft_from_capture(
+            metadata, provider, strip_escapes=True
+        )
+    return _read_provider_draft_from_capture(metadata, provider, strip_escapes=True)
+
+
+def _clear_composer(terminal_id: str, metadata: dict[str, Any], provider: Any) -> bool:
+    """Drive the composer to empty. Returns True when confirmed empty."""
     for _ in range(DRAFT_CLEAR_MAX_ITERATIONS):
         current = _read_provider_draft(terminal_id, metadata, provider)
         if current == "":
-            return
-        for key in clear_keys:
-            backend.send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
+            return True
+        if not _send_clear_keys(terminal_id, metadata, provider):
+            return False
         time.sleep(DRAFT_CLEAR_RECHECK_DELAY_SECONDS)
 
     logger.warning(
@@ -131,6 +264,7 @@ def _clear_composer(terminal_id: str, metadata: dict[str, Any], provider: Any) -
         terminal_id,
         DRAFT_CLEAR_MAX_ITERATIONS,
     )
+    return False
 
 
 def _read_provider_draft(
@@ -138,8 +272,18 @@ def _read_provider_draft(
     metadata: dict[str, Any],
     provider: Any,
 ) -> Optional[str]:
+    # Escape-preserving capture is opt-in (codex dim-ghost detection). Other
+    # providers keep plain capture / pyte so ANSI does not break their parsers.
+    if _provider_accepts_escapes(provider):
+        captured_draft = _read_draft_via_capture(metadata, provider)
+        if captured_draft is not None:
+            return captured_draft
+
     screen = _read_screen_lines(terminal_id, metadata)
     if screen is None:
+        # Non-opt-in: try plain capture when pyte is also unavailable.
+        if not _provider_accepts_escapes(provider):
+            return _read_draft_via_capture(metadata, provider)
         return None
     try:
         return provider.read_composer_draft(screen)
@@ -154,6 +298,7 @@ def _read_screen_lines(terminal_id: str, metadata: dict[str, Any]) -> Optional[l
         return screen
 
     try:
+        # Plain capture only — escape-preserving is opt-in via _read_draft_via_capture.
         captured = get_backend().get_history(
             metadata["tmux_session"],
             metadata["tmux_window"],

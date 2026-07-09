@@ -93,6 +93,93 @@ CODEX_EMPTY_COMPOSER_PLACEHOLDERS = {
     "Explain this codebase",
     "Ask Codex to do anything",
 }
+# CSI SGR sequences only (colour/intensity). Used to walk dim state on
+# escape-preserving capture-pane (-e) lines without treating cursor CSI as text.
+_SGR_CSI_RE = re.compile(r"\x1b\[([0-9;]*)m")
+
+
+def _apply_sgr_params_to_dim(params: str, dim: bool) -> bool:
+    """Update dim/faint state from one SGR parameter list.
+
+    Walks codes left-to-right. Extended colour payloads after 38/48 are
+    consumed so their sub-parameters cannot be mistaken for intensity codes:
+    ``38;5;N`` (256-colour) skips N; ``38;2;R;G;B`` (truecolour) skips R,G,B.
+    Only a standalone intensity ``2`` sets dim; ``22`` clears it; ``0``/empty
+    resets all attributes (dim off).
+    """
+    if params == "":
+        return False
+    parts = params.split(";")
+    idx = 0
+    while idx < len(parts):
+        code = parts[idx]
+        idx += 1
+        if code == "" or code == "0":
+            dim = False
+            continue
+        if code in ("38", "48"):
+            # Select graphic rendition extended colour: next token is mode.
+            if idx >= len(parts):
+                break
+            mode = parts[idx]
+            idx += 1
+            if mode == "5":
+                # 256-colour: one colour index follows.
+                idx += 1
+            elif mode == "2":
+                # Truecolour: three RGB components follow.
+                idx += 3
+            # Unknown mode: stop consuming; remaining tokens are not intensity.
+            continue
+        if code == "2":
+            dim = True
+            continue
+        if code == "22":
+            dim = False
+            continue
+        # Other SGR codes (bold, italic, plain colours, …) leave dim as-is.
+    return dim
+
+
+def _composer_body_is_dim_ghost(raw_body: str) -> bool:
+    """Return True when composer body text is entirely dim/faint (SGR 2).
+
+    Empirical (codex 0.143 capture-pane -e): ghost suggestions render as
+    ``\\x1b[1m›\\x1b[0m \\x1b[2mHINT\\x1b[0m`` (sometimes with a bg SGR before
+    dim). Typed drafts have no dim on the body text. pyte drops dim, so this
+    only works on escape-preserving captures.
+
+    Truecolour / 256-colour SGR (``38;2;…`` / ``38;5;…``) must not be read as
+    dim: the ``2`` after ``38`` is a colour-space selector, not intensity.
+    """
+    dim = False
+    saw_text = False
+    saw_undimmed = False
+    i = 0
+    n = len(raw_body)
+    while i < n:
+        if raw_body[i] == "\x1b":
+            m = _SGR_CSI_RE.match(raw_body, i)
+            if m:
+                dim = _apply_sgr_params_to_dim(m.group(1), dim)
+                i = m.end()
+                continue
+            # Non-SGR CSI/OSC: skip to final byte or drop the ESC.
+            if i + 1 < n and raw_body[i + 1] == "[":
+                j = i + 2
+                while j < n and not ("A" <= raw_body[j] <= "Z" or "a" <= raw_body[j] <= "z"):
+                    j += 1
+                i = j + 1 if j < n else n
+                continue
+            i += 1
+            continue
+        ch = raw_body[i]
+        if not ch.isspace():
+            saw_text = True
+            if not dim:
+                saw_undimmed = True
+        i += 1
+    return saw_text and not saw_undimmed
 
 
 def _compute_tui_footer_cutoff(all_lines: list) -> int:
@@ -553,6 +640,35 @@ class CodexProvider(BaseProvider):
     supports_screen_detection = True
     supports_draft_preservation = True
     composer_clear_keys = ["C-a", "C-k"]
+    # Dim-SGR ghost detection needs escape-preserving capture-pane (-e).
+    composer_parse_accepts_escapes = True
+    liveness_exclude_patterns = [
+        rf"^\s*{IDLE_PROMPT_PATTERN}",
+        TUI_FOOTER_PATTERN,
+        r"\btab\s+to\s+queue\s+message\b",
+    ]
+
+    def get_status_from_screen(self, screen_lines) -> TerminalStatus:
+        """Screen-specific detection: progress spinner anywhere wins.
+
+        On a composited screen (unlike the raw rolling buffer, where frames
+        from finished turns linger as bytes), a visible
+        "(… esc to interrupt)" spinner means the agent IS busy right now — a
+        finished turn erases that row. get_status() only checks the spinner
+        in the last 25 lines while its COMPLETED/IDLE checks scan wider
+        regions; on a screen the asymmetry is wrong (the ghost '› …'
+        suggestion hint at the bottom satisfies the idle-prompt check while
+        the spinner sits above the tail window), and it latched a busy codex
+        as COMPLETED for a whole turn — false-firing the stalled-callback
+        watchdog. Keep the raw-path get_status() untouched: scanning the
+        whole rolling buffer for spinner text would false-report PROCESSING
+        from stale frames after completion.
+        """
+        joined = "\n".join(screen_lines)
+        clean = strip_terminal_escapes(joined)
+        if re.search(TUI_PROGRESS_PATTERN, clean, re.MULTILINE):
+            return TerminalStatus.PROCESSING
+        return self.get_status(joined)
 
     def read_composer_draft(self, screen_lines: list[str]) -> str | None:
         """Read the visible Codex composer draft from rendered screen lines.
@@ -560,40 +676,61 @@ class CodexProvider(BaseProvider):
         Codex renders the editable composer at the bottom with a leading ``›``.
         The status footer sits below it. The parser intentionally uses only the
         provider's rendered screen shape; the shared draft guard stays generic.
+
+        When lines retain SGR escapes (``capture-pane -e`` / strip_escapes=False),
+        dim-wrapped composer body text (SGR 2) is treated as a ghost suggestion
+        and returns ``""`` so it is not stashed/restored as a real draft. Plain
+        (escape-stripped) lines still work; placeholder strings remain a fallback.
         """
         if not screen_lines:
             return None
 
         raw_lines = [line.rstrip("\r") for line in screen_lines]
-        visible = [line.rstrip() for line in raw_lines]
+        # Structural matching uses escape-stripped text; segment join keeps raw
+        # widths where useful, then we strip SGR from the final draft.
+        plain_lines = [strip_terminal_escapes(line).rstrip() for line in raw_lines]
 
-        footer_idx = len(visible)
-        for i in range(len(visible) - 1, -1, -1):
-            if re.search(TUI_FOOTER_PATTERN, visible[i]):
+        footer_idx = len(plain_lines)
+        for i in range(len(plain_lines) - 1, -1, -1):
+            if re.search(TUI_FOOTER_PATTERN, plain_lines[i]):
                 footer_idx = i
                 break
 
         search_end = footer_idx
-        while search_end > 0 and not visible[search_end - 1].strip():
+        while search_end > 0 and not plain_lines[search_end - 1].strip():
             search_end -= 1
 
         prompt_idx: int | None = None
         lower_bound = max(0, search_end - 12)
         for i in range(search_end - 1, lower_bound - 1, -1):
-            if "›" in visible[i]:
+            if "›" in plain_lines[i]:
                 prompt_idx = i
                 break
         if prompt_idx is None:
             return None
 
-        prompt_line = visible[prompt_idx]
-        prompt_pos = prompt_line.rfind("›")
-        first = prompt_line[prompt_pos + 1 :]
-        if first.startswith(" "):
-            first = first[1:]
+        # Ghost detection needs the raw (possibly dim) body after › on the
+        # prompt line plus continuation rows before the footer.
+        raw_prompt = raw_lines[prompt_idx]
+        # Locate › in raw by walking with CSI skipped, or plain rfind on stripped.
+        plain_prompt = plain_lines[prompt_idx]
+        prompt_pos = plain_prompt.rfind("›")
+        first_plain = plain_prompt[prompt_pos + 1 :]
+        if first_plain.startswith(" "):
+            first_plain = first_plain[1:]
 
-        segments = [first]
-        for line in visible[prompt_idx + 1 : search_end]:
+        raw_body_parts: list[str] = []
+        # Extract raw suffix after › (CSI may wrap the glyph).
+        raw_after = self._raw_after_prompt_glyph(raw_prompt)
+        raw_body_parts.append(raw_after)
+        for line in raw_lines[prompt_idx + 1 : search_end]:
+            raw_body_parts.append(line)
+        raw_body = "\n".join(raw_body_parts)
+        if _composer_body_is_dim_ghost(raw_body):
+            return ""
+
+        segments = [first_plain]
+        for line in plain_lines[prompt_idx + 1 : search_end]:
             text = line.strip()
             if not text:
                 segments.append("")
@@ -605,10 +742,41 @@ class CodexProvider(BaseProvider):
         while segments and segments[-1] == "":
             segments.pop()
 
-        draft = self._join_composer_segments(raw_lines, prompt_idx, prompt_pos, segments)
+        # Join using plain line widths (escape-stripped); matches previous
+        # behavior for wrap detection on capture-pane plain or pyte screens.
+        draft = self._join_composer_segments(plain_lines, prompt_idx, prompt_pos, segments)
         if draft.strip() in CODEX_EMPTY_COMPOSER_PLACEHOLDERS:
             return ""
         return draft
+
+    @staticmethod
+    def _raw_after_prompt_glyph(raw_line: str) -> str:
+        """Return the raw substring after the composer ``›`` glyph (CSI-aware)."""
+        plain_chars: list[str] = []
+        raw_map: list[int] = []
+        j = 0
+        while j < len(raw_line):
+            if raw_line[j] == "\x1b" and j + 1 < len(raw_line) and raw_line[j + 1] == "[":
+                k = j + 2
+                while k < len(raw_line) and not (
+                    "A" <= raw_line[k] <= "Z" or "a" <= raw_line[k] <= "z"
+                ):
+                    k += 1
+                j = k + 1 if k < len(raw_line) else len(raw_line)
+                continue
+            plain_chars.append(raw_line[j])
+            raw_map.append(j)
+            j += 1
+        plain = "".join(plain_chars)
+        p = plain.rfind("›")
+        if p < 0 or p + 1 >= len(raw_map):
+            # Glyph at end or missing: body empty / whole line after last char.
+            if p >= 0 and p + 1 == len(raw_map):
+                return ""
+            idx = raw_line.rfind("›")
+            return raw_line[idx + 1 :] if idx >= 0 else raw_line
+        start = raw_map[p + 1]
+        return raw_line[start:]
 
     @staticmethod
     def _join_composer_segments(

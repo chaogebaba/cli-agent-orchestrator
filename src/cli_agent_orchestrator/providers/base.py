@@ -180,6 +180,11 @@ class BaseProvider(ABC):
     # clear-key iteration in composer_clear_keys.
     supports_draft_preservation: bool = False
     composer_clear_keys: List[str] = []
+    liveness_exclude_patterns: List[str] = []
+    # When True, draft_guard may feed capture-pane -e (SGR retained) lines into
+    # read_composer_draft. Default False: plain capture only (e.g. grok parses
+    # bare prompt glyphs and cannot handle ANSI).
+    composer_parse_accepts_escapes: bool = False
 
     def read_composer_draft(self, screen_lines: List[str]) -> Optional[str]:
         """Return the visible unsent composer draft from a rendered screen.

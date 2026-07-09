@@ -227,6 +227,18 @@ class TerminalBackend(ABC):
         """
         ...
 
+    def get_pane_size(self, session_name: str, window_name: str) -> Optional[tuple]:
+        """Get the (columns, rows) of a pane's real viewport.
+
+        Non-abstract with a None default: only screen-rendering consumers
+        (StatusMonitor's pyte path) need it, and only the tmux backend can
+        answer. None means "unknown — use configured fallback dimensions".
+
+        Returns:
+            (columns, rows) tuple, or None if unavailable
+        """
+        return None
+
     # --- Attach ---
 
     @abstractmethod

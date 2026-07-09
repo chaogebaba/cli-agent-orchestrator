@@ -126,6 +126,9 @@ class TmuxBackend(TerminalBackend):
     def get_pane_current_command(self, session_name: str, window_name: str) -> Optional[str]:
         return self._client.get_pane_current_command(session_name, window_name)
 
+    def get_pane_size(self, session_name: str, window_name: str) -> Optional[tuple]:
+        return self._client.get_pane_size(session_name, window_name)
+
     # --- Attach ---
 
     def attach_session(self, session_name: str) -> None:

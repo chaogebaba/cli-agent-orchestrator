@@ -12,8 +12,6 @@ from typing import Dict, List, Optional, Tuple
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
     PYTE_QUIESCENCE_DELAY_S,
-    PYTE_SCREEN_COLS,
-    PYTE_SCREEN_ROWS,
     STATE_BUFFER_MAX,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -77,6 +75,10 @@ class StatusMonitor:
         # keeps status flap-free.
         self._screens: Dict[str, Tuple[object, object]] = {}
         self._bursting: Dict[str, bool] = {}
+        # Monotonic per-terminal chunk generation. Quiescence detection runs in
+        # a worker thread; if newer chunks arrive before it applies, its result
+        # is stale and must not overwrite the newer screen/buffer state.
+        self._chunk_seq: Dict[str, int] = {}
         # Pending quiescence-detect timer handle per terminal (loop.call_later).
         self._quiesce_handle: Dict[str, asyncio.TimerHandle] = {}
         # The event loop that owns the quiescence timers. Captured when the
@@ -91,6 +93,13 @@ class StatusMonitor:
         # this a detection task can be garbage-collected mid-run and silently drop
         # a status transition. Tasks remove themselves on completion.
         self._detect_tasks: set = set()
+        self._screen_size_deferred_warned: set[str] = set()
+
+    def _bump_chunk_seq_locked(self, terminal_id: str) -> int:
+        """Advance the terminal generation. Caller holds _lock."""
+        chunk_seq = self._chunk_seq.get(terminal_id, 0) + 1
+        self._chunk_seq[terminal_id] = chunk_seq
+        return chunk_seq
 
     async def run(self) -> None:
         """Subscribe to output events and detect status changes.
@@ -141,13 +150,26 @@ class StatusMonitor:
             and getattr(provider, "supports_screen_detection", False)
         )
 
+        # Resolve the pyte screen size BEFORE taking the lock: the lookup
+        # shells out to tmux (fork/exec — see run()'s fork-storm note) and
+        # only happens once per terminal lifetime (screen absent). If metadata
+        # is not visible yet during terminal creation, screen creation is
+        # deferred and retried on the next chunk; exact first-screen sizing is
+        # load-bearing for TUI compositing.
+        screen_size = None
+        if use_screen and terminal_id not in self._screens:
+            screen_size = self._resolve_screen_size(terminal_id)
+
         with self._lock:
             buffer = self._buffers.get(terminal_id, "") + chunk
             if len(buffer) > STATE_BUFFER_MAX:
                 buffer = buffer[-STATE_BUFFER_MAX:]
             self._buffers[terminal_id] = buffer
+            chunk_seq = self._bump_chunk_seq_locked(terminal_id)
             if use_screen:
-                self._feed_screen_locked(terminal_id, chunk)
+                screen_ready = self._feed_screen_locked(terminal_id, chunk, screen_size)
+            else:
+                screen_ready = False
 
         if not use_screen:
             # Debounced raw detection: same rising-edge + quiescence pattern as
@@ -155,12 +177,20 @@ class StatusMonitor:
             # (catches PROCESSING transition), then waits for output to settle
             # before re-detecting (catches IDLE/COMPLETED without running costly
             # regex on every single chunk during bursts).
-            self._schedule_raw_detection(terminal_id, buffer)
+            self._schedule_raw_detection(terminal_id, buffer, chunk_seq)
             return
 
-        self._schedule_screen_detection(terminal_id, provider)
+        if screen_ready:
+            self._schedule_screen_detection(terminal_id, provider, chunk_seq)
 
-    def _apply_detection(self, terminal_id: str, detected: TerminalStatus) -> None:
+    def _apply_detection(
+        self,
+        terminal_id: str,
+        detected: TerminalStatus,
+        *,
+        trusted_busy: bool = False,
+        expected_seq: Optional[int] = None,
+    ) -> None:
         """Apply the sticky-latch rules to a freshly detected status and publish
         on change. Shared by the raw and pyte detection paths.
 
@@ -173,7 +203,13 @@ class StatusMonitor:
         (which would block the input's real PROCESSING and let InboxService
         paste into a busy agent).
         """
+        screen_spinner_override: Optional[TerminalStatus] = None
         with self._lock:
+            if (
+                expected_seq is not None
+                and self._chunk_seq.get(terminal_id, 0) != expected_seq
+            ):
+                return
             last = self._last_status.get(terminal_id)
 
             # UNKNOWN is "no signal", not a state: never let it overwrite a known
@@ -204,7 +240,10 @@ class StatusMonitor:
                     TerminalStatus.PROCESSING,
                     TerminalStatus.UNKNOWN,
                 ):
-                    return
+                    if trusted_busy and detected == TerminalStatus.PROCESSING:
+                        screen_spinner_override = last
+                    else:
+                        return
                 if last == TerminalStatus.COMPLETED and detected == TerminalStatus.IDLE:
                     return
 
@@ -220,28 +259,90 @@ class StatusMonitor:
         # Publish outside the lock — subscribers must never be able to
         # re-enter StatusMonitor while the latch state is mid-update.
         bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
+        if screen_spinner_override is not None:
+            logger.info("screen spinner override: %s→processing", screen_spinner_override.value)
         logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
 
     # ----- pyte rendered-screen detection (edge-debounced) -------------------
 
-    def _feed_screen_locked(self, terminal_id: str, chunk: str) -> None:
+    def _resolve_screen_size(self, terminal_id: str) -> Optional[Tuple[int, int]]:
+        """Resolve (cols, rows) of the terminal's REAL pane for pyte sizing.
+
+        Exact sizing is load-bearing, not cosmetic: the TUI app addresses rows
+        and scrolls against the real pane height. A pyte screen with a
+        different height never scrolls in step (an LF at the app's bottom row
+        49 does not scroll a 50-row pyte screen), so the composited display
+        degrades into a palimpsest of stale rows. Observed live: codex's
+        spinner missing from the display while the ghost '› …' hint still
+        matched the idle prompt — get_status latched COMPLETED through a whole
+        busy turn and the stalled-callback watchdog false-fired.
+
+        Must be called OFF the lock (shells out to tmux). None means the caller
+        defers screen creation and retries on a later chunk. A pane resized
+        mid-session is not tracked; the screen keeps its creation-time size
+        until reset_buffer/clear_terminal drops it.
+        """
+        try:
+            from cli_agent_orchestrator.backends.registry import get_backend
+            from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+            metadata = get_terminal_metadata(terminal_id)
+            if not metadata:
+                return None
+            return get_backend().get_pane_size(
+                metadata["tmux_session"], metadata["tmux_window"]
+            )
+        except Exception:
+            logger.exception("Failed to resolve pane size for %s", terminal_id)
+            return None
+
+    def _feed_screen_locked(
+        self,
+        terminal_id: str,
+        chunk: str,
+        screen_size: Optional[Tuple[int, int]] = None,
+    ) -> bool:
         """Feed a chunk into the terminal's pyte screen. Caller holds the lock.
 
         Lazily creates the Screen+Stream so pyte is only imported/used when the
-        screen path is active for this terminal.
+        screen path is active for this terminal. ``screen_size`` is the real
+        pane's (cols, rows) resolved off-lock by the caller; used only on
+        creation. If it is unavailable, creation is deferred so pyte never
+        freezes a terminal at a fallback size. When the deferred first screen is
+        eventually created, replay the rolling buffer so bytes received before
+        metadata commit are not lost.
         """
         scr = self._screens.get(terminal_id)
         if scr is None:
+            if screen_size is None:
+                if terminal_id not in self._screen_size_deferred_warned:
+                    self._screen_size_deferred_warned.add(terminal_id)
+                    logger.warning(
+                        "pyte screen creation deferred for %s: screen size unresolved",
+                        terminal_id,
+                    )
+                return False
             import pyte
 
-            screen = pyte.Screen(PYTE_SCREEN_COLS, PYTE_SCREEN_ROWS)
+            cols, rows = screen_size
+            screen = pyte.Screen(cols, rows)
             stream = pyte.Stream(screen)
             scr = (screen, stream)
             self._screens[terminal_id] = scr
+            logger.info("pyte screen created for %s at %sx%s", terminal_id, cols, rows)
+            chunk = self._buffers.get(terminal_id, "") or chunk
         scr[1].feed(chunk)
+        return True
 
     def _detect_screen(self, terminal_id: str, provider) -> TerminalStatus:
         """Detect status from the terminal's composited pyte screen."""
+        detected, _trusted_busy = self._detect_screen_with_trust(terminal_id, provider)
+        return detected
+
+    def _detect_screen_with_trust(
+        self, terminal_id: str, provider
+    ) -> Tuple[TerminalStatus, bool]:
+        """Detect screen status plus whether PROCESSING is a trusted screen read."""
         fallback_buffer: Optional[str] = None
         with self._lock:
             scr = self._screens.get(terminal_id)
@@ -260,14 +361,14 @@ class StatusMonitor:
                 lines = []
         if fallback_buffer is not None:
             if provider is None:
-                return TerminalStatus.UNKNOWN
+                return TerminalStatus.UNKNOWN, False
             try:
-                return provider.get_status(fallback_buffer)
+                return provider.get_status(fallback_buffer), False
             except Exception:
                 logger.exception("Error detecting fallback status for %s", terminal_id)
-                return TerminalStatus.UNKNOWN
+                return TerminalStatus.UNKNOWN, False
         if not lines or provider is None:
-            return TerminalStatus.UNKNOWN
+            return TerminalStatus.UNKNOWN, False
 
         # Auto-responder: inspect the same composited screen for whitelisted
         # blocking dialogs (whitelist-only auto-answer, or WAITING_USER_ANSWER
@@ -280,67 +381,125 @@ class StatusMonitor:
 
             override = auto_responder.on_screen(terminal_id, provider, lines)
             if override is not None:
-                return override
+                return override, False
         except Exception:
             logger.exception("Error in auto-responder for %s", terminal_id)
 
         try:
-            return provider.get_status_from_screen(lines)
+            return provider.get_status_from_screen(lines), True
         except Exception:
             # Full traceback: screen detectors are new and can trip on
             # unexpected TUI frames; the stack makes such regressions debuggable.
             logger.exception(f"Error detecting screen status for {terminal_id}")
-            return TerminalStatus.UNKNOWN
+            return TerminalStatus.UNKNOWN, False
 
-    def _schedule_screen_detection(self, terminal_id: str, provider) -> None:
+    def _schedule_screen_detection(
+        self, terminal_id: str, provider, chunk_seq: Optional[int] = None
+    ) -> None:
         """Edge-debounce detection on the pyte screen.
 
         Rising edge (first chunk after quiet) → detect immediately (catches the
         PROCESSING transition the instant work resumes). Quiescence (no new
         chunk for PYTE_QUIESCENCE_DELAY_S) → detect again (the TUI repaint has
-        settled, so the screen shows the true end state). Detection NEVER runs
-        mid-burst, which is what eliminates the flaps naive per-chunk rendered
-        detection produces.
+        settled, so the screen shows the true end state). Mid-burst detection
+        also runs while cached status is ready/armed to catch small spinner
+        repaints when debounce state is stuck bursting; only a detected
+        PROCESSING result is applied, so torn mid-burst ready frames never latch.
         """
         loop = self._loop or self._running_loop()
         if loop is None:
             # No event loop (unit tests / offline replay): detect immediately
             # on the current screen — deterministic, no timing.
-            self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
+            detected, trusted_busy = self._detect_screen_with_trust(terminal_id, provider)
+            self._apply_detection(
+                terminal_id,
+                detected,
+                trusted_busy=trusted_busy,
+                expected_seq=chunk_seq,
+            )
             return
 
         with self._lock:
+            if chunk_seq is None:
+                chunk_seq = self._chunk_seq.get(terminal_id, 0)
             was_bursting = self._bursting.get(terminal_id, False)
             self._bursting[terminal_id] = True
             handle = self._quiesce_handle.pop(terminal_id, None)
+            armed = self._allow_processing_revert.get(terminal_id, False)
+            last_status = self._last_status.get(terminal_id)
         self._cancel_quiesce_handle(handle)
 
         if not was_bursting:
-            self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
+            detected, trusted_busy = self._detect_screen_with_trust(terminal_id, provider)
+            self._apply_detection(
+                terminal_id,
+                detected,
+                trusted_busy=trusted_busy,
+                expected_seq=chunk_seq,
+            )
+        elif armed or last_status in _STICKY_READY_STATUSES or last_status is None:
+            detected, trusted_busy = self._detect_screen_with_trust(terminal_id, provider)
+            if detected == TerminalStatus.PROCESSING:
+                self._apply_detection(
+                    terminal_id,
+                    detected,
+                    trusted_busy=trusted_busy,
+                    expected_seq=chunk_seq,
+                )
 
-        self._arm_quiesce_timer(loop, terminal_id, self._on_screen_quiescent, provider)
+        self._arm_quiesce_timer(
+            loop, terminal_id, self._on_screen_quiescent, provider, chunk_seq
+        )
 
-    def _on_screen_quiescent(self, terminal_id: str, provider) -> None:
+    def _on_screen_quiescent(
+        self, terminal_id: str, provider, expected_seq: Optional[int] = None
+    ) -> None:
         """Quiescence timer fired: output stopped, so the screen has settled.
 
         Fires on the loop; offload the (potentially blocking) screen detection
         to a worker thread so the loop stays free.
         """
         with self._lock:
+            if (
+                expected_seq is not None
+                and self._chunk_seq.get(terminal_id, 0) != expected_seq
+            ):
+                return
             self._bursting[terminal_id] = False
             self._quiesce_handle.pop(terminal_id, None)
 
         async def _detect_and_apply() -> None:
-            detected = await asyncio.to_thread(self._detect_screen, terminal_id, provider)
-            self._apply_detection(terminal_id, detected)
+            detected, trusted_busy = await asyncio.to_thread(
+                self._detect_screen_with_trust, terminal_id, provider
+            )
+            with self._lock:
+                if (
+                    expected_seq is not None
+                    and self._chunk_seq.get(terminal_id, 0) != expected_seq
+                ):
+                    return
+            self._apply_detection(
+                terminal_id,
+                detected,
+                trusted_busy=trusted_busy,
+                expected_seq=expected_seq,
+            )
 
         loop = self._loop or self._running_loop()
         if loop is None:
-            self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
+            detected, trusted_busy = self._detect_screen_with_trust(terminal_id, provider)
+            self._apply_detection(
+                terminal_id,
+                detected,
+                trusted_busy=trusted_busy,
+                expected_seq=expected_seq,
+            )
         else:
             self._spawn_tracked(loop, _detect_and_apply())
 
-    def _schedule_raw_detection(self, terminal_id: str, buffer: str) -> None:
+    def _schedule_raw_detection(
+        self, terminal_id: str, buffer: str, chunk_seq: Optional[int] = None
+    ) -> None:
         """Edge-debounce detection on the raw rolling buffer.
 
         Detects on every chunk while the terminal is in a ready/armed state
@@ -365,6 +524,8 @@ class StatusMonitor:
             return
 
         with self._lock:
+            if chunk_seq is None:
+                chunk_seq = self._chunk_seq.get(terminal_id, 0)
             was_bursting = self._bursting.get(terminal_id, False)
             self._bursting[terminal_id] = True
             handle = self._quiesce_handle.pop(terminal_id, None)
@@ -376,9 +537,9 @@ class StatusMonitor:
         # delivery by InboxService). Once PROCESSING is observed, debounce.
         if not was_bursting or last_status in _STICKY_READY_STATUSES or last_status is None:
             detected = self._detect_status(terminal_id, buffer)
-            self._apply_detection(terminal_id, detected)
+            self._apply_detection(terminal_id, detected, expected_seq=chunk_seq)
 
-        self._arm_quiesce_timer(loop, terminal_id, self._on_raw_quiescent)
+        self._arm_quiesce_timer(loop, terminal_id, self._on_raw_quiescent, chunk_seq)
 
     def _arm_quiesce_timer(self, loop, terminal_id: str, callback, *cb_args) -> None:
         """Schedule the quiescence timer on ``loop`` from any thread.
@@ -414,7 +575,7 @@ class StatusMonitor:
             # Loop closed during shutdown — quiescence re-detect is moot.
             pass
 
-    def _on_raw_quiescent(self, terminal_id: str) -> None:
+    def _on_raw_quiescent(self, terminal_id: str, expected_seq: Optional[int] = None) -> None:
         """Quiescence timer fired for raw path: re-detect from current buffer.
 
         Fires on the event loop (via call_later), so the blocking
@@ -423,17 +584,32 @@ class StatusMonitor:
         on the loop.
         """
         with self._lock:
+            if (
+                expected_seq is not None
+                and self._chunk_seq.get(terminal_id, 0) != expected_seq
+            ):
+                return
             self._bursting[terminal_id] = False
             self._quiesce_handle.pop(terminal_id, None)
             buffer = self._buffers.get(terminal_id, "")
 
         async def _detect_and_apply() -> None:
             detected = await asyncio.to_thread(self._detect_status, terminal_id, buffer)
-            self._apply_detection(terminal_id, detected)
+            with self._lock:
+                if (
+                    expected_seq is not None
+                    and self._chunk_seq.get(terminal_id, 0) != expected_seq
+                ):
+                    return
+            self._apply_detection(terminal_id, detected, expected_seq=expected_seq)
 
         loop = self._loop or self._running_loop()
         if loop is None:
-            self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
+            self._apply_detection(
+                terminal_id,
+                self._detect_status(terminal_id, buffer),
+                expected_seq=expected_seq,
+            )
         else:
             self._spawn_tracked(loop, _detect_and_apply())
 
@@ -523,7 +699,9 @@ class StatusMonitor:
             self._last_status.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
+            self._screen_size_deferred_warned.discard(terminal_id)
             self._bursting.pop(terminal_id, None)
+            self._bump_chunk_seq_locked(terminal_id)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -543,7 +721,9 @@ class StatusMonitor:
             # Drop the rendered screen too so the relaunched CLI mode is
             # detected against a fresh viewport, not the failed attempt's.
             self._screens.pop(terminal_id, None)
+            self._screen_size_deferred_warned.discard(terminal_id)
             self._bursting.pop(terminal_id, None)
+            self._bump_chunk_seq_locked(terminal_id)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 

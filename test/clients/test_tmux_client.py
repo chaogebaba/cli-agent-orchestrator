@@ -740,3 +740,27 @@ class TestGetPaneCurrentCommand:
         result = tmux.get_pane_current_command("ses", "win")
 
         assert result is None
+
+
+class TestGetPaneSize:
+    def test_get_pane_size_uses_first_window_pane_like_get_history(self, tmux):
+        first_pane = MagicMock()
+        first_pane.cmd.return_value.stdout = ["213 49"]
+        active_pane = MagicMock()
+        active_pane.cmd.return_value.stdout = ["80 24"]
+        mock_window = MagicMock()
+        mock_window.panes = [first_pane]
+        mock_window.active_pane = active_pane
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.get_pane_size("ses", "win")
+
+        assert result == (213, 49)
+        first_pane.cmd.assert_called_once_with(
+            "display-message",
+            "-p",
+            "#{pane_width} #{pane_height}",
+        )
+        active_pane.cmd.assert_not_called()

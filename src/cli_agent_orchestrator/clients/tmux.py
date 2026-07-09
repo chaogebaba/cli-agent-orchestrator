@@ -575,6 +575,26 @@ class TmuxClient:
             logger.error(f"Failed to get pane command for {session_name}:{window_name}: {e}")
             return None
 
+    def get_pane_size(self, session_name: str, window_name: str) -> Optional[tuple]:
+        """Get the (columns, rows) of a pane's real viewport."""
+        try:
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                return None
+            window = session.windows.get(window_name=window_name)
+            if not window:
+                return None
+            pane = window.panes[0]
+            if pane:
+                result = pane.cmd("display-message", "-p", "#{pane_width} #{pane_height}")
+                if result.stdout:
+                    cols, rows = result.stdout[0].strip().split()
+                    return (int(cols), int(rows))
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get pane size for {session_name}:{window_name}: {e}")
+            return None
+
     def pipe_pane(self, session_name: str, window_name: str, file_path: str) -> None:
         """Start piping pane output to file.
 
