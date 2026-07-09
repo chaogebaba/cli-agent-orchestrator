@@ -445,5 +445,6 @@ class TestMessagePluginEvents:
             registry=registry,
             sender_id="supervisor-1",
             orchestration_type=OrchestrationType.SEND_MESSAGE,
+            defer_on_dialog=True,
         )
         mock_update_message_status.assert_called_once_with(17, MessageStatus.DELIVERED)

@@ -33,6 +33,9 @@ ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 CLAUDE_STASHED_CHIP_PATTERN = re.compile(
     r"›(?:\x1b\[[0-9;]*m)*\s*stashed", re.IGNORECASE
 )
+CLAUDE_DIALOG_PATTERN = re.compile(
+    r"Enter to select · ↑/↓ to navigate · Esc to cancel"
+)
 RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between marker and text
 # Response marker at the START of a line, for message EXTRACTION only (not
 # status detection). Matches the legacy "⏺" (U+23FA) and the newest TUI's

@@ -1,0 +1,1 @@
+[1mEnter[0m to select [2m·[0m [36m↑/↓[0m to navigate · [31mEsc[0m to cancel

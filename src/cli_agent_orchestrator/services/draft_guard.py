@@ -10,7 +10,9 @@ from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import DRAFT_LOG_DIR, PYTE_SCREEN_ROWS
+from cli_agent_orchestrator.providers.claude_code import CLAUDE_DIALOG_PATTERN
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +26,10 @@ DRAFT_CLEAR_PROBE_RECHECK_DELAY_SECONDS = 0.3
 DRAFT_CLEAR_PROBE_NONE_RETRIES = 2
 DRAFT_CLEAR_PROBE_NONE_RETRY_DELAY_SECONDS = 0.15
 STASH_SNAPSHOT_RETRIES = 3
+
+
+class DeliveryDeferredError(Exception):
+    """Raised when an inbox delivery would answer an active dialog."""
 
 
 @dataclass
@@ -66,13 +72,14 @@ def stash_draft_before_send(
     terminal_id: str,
     metadata: dict[str, Any],
     provider: Any,
+    defer_on_dialog: bool = False,
 ) -> bool:
     """Apply native stash; return whether a chip is present for the paste."""
     if not isinstance(getattr(provider, "composer_stash_keys", None), list):
         return False
 
     for _ in range(STASH_SNAPSHOT_RETRIES):
-        snapshot = _read_stash_snapshot(metadata, provider)
+        snapshot = _read_stash_snapshot(metadata, provider, defer_on_dialog)
         if snapshot is None:
             continue
         draft = snapshot.draft
@@ -81,11 +88,11 @@ def stash_draft_before_send(
             if not draft:
                 continue
             _append_draft_log(terminal_id, draft)
-            snapshot = _read_stash_snapshot(metadata, provider)
+            snapshot = _read_stash_snapshot(metadata, provider, defer_on_dialog)
             if snapshot is None or snapshot.draft != draft:
                 continue
 
-        before_key = _read_stash_snapshot(metadata, provider)
+        before_key = _read_stash_snapshot(metadata, provider, defer_on_dialog)
         if before_key != snapshot:
             continue
         if snapshot.draft is None:
@@ -93,7 +100,11 @@ def stash_draft_before_send(
         if snapshot.chip_present:
             if snapshot.draft:
                 snapshot = _clear_stash_draft(
-                    terminal_id, metadata, provider, snapshot.draft
+                    terminal_id,
+                    metadata,
+                    provider,
+                    snapshot.draft,
+                    defer_on_dialog,
                 )
                 return bool(snapshot and snapshot.chip_present)
             return True
@@ -101,11 +112,13 @@ def stash_draft_before_send(
             return False
 
         _send_stash_keys(metadata, provider)
-        confirmed = _read_stash_snapshot(metadata, provider)
+        confirmed = _read_stash_snapshot(metadata, provider, defer_on_dialog)
         if confirmed is not None and confirmed.chip_present and confirmed.draft == "":
             return True
         logger.warning("Native composer stash unconfirmed for terminal %s; degrading", terminal_id)
-        cleared = _clear_stash_draft(terminal_id, metadata, provider, snapshot.draft)
+        cleared = _clear_stash_draft(
+            terminal_id, metadata, provider, snapshot.draft, defer_on_dialog
+        )
         return bool(cleared and cleared.chip_present)
 
     logger.warning(
@@ -115,7 +128,11 @@ def stash_draft_before_send(
     return False
 
 
-def _read_stash_snapshot(metadata: dict[str, Any], provider: Any) -> ComposerSnapshot | None:
+def _read_stash_snapshot(
+    metadata: dict[str, Any],
+    provider: Any,
+    defer_on_dialog: bool = False,
+) -> ComposerSnapshot | None:
     try:
         captured = get_backend().get_history(
             metadata["tmux_session"],
@@ -123,6 +140,12 @@ def _read_stash_snapshot(metadata: dict[str, Any], provider: Any) -> ComposerSna
             tail_lines=PYTE_SCREEN_ROWS,
             strip_escapes=False,
         )
+    except Exception:
+        return None
+    match_capture = strip_terminal_escapes(captured)
+    if defer_on_dialog and CLAUDE_DIALOG_PATTERN.search(match_capture):
+        raise DeliveryDeferredError("Claude dialog is active")
+    try:
         lines = captured.splitlines()
         draft = provider.read_composer_draft(lines)
     except Exception:
@@ -144,12 +167,13 @@ def _clear_stash_draft(
     metadata: dict[str, Any],
     provider: Any,
     draft: str,
+    defer_on_dialog: bool = False,
 ) -> ComposerSnapshot | None:
     """C-u until empty; failure only warns because delivery must continue."""
     cap = draft.count("\n") + 4
     latest = None
     for _ in range(cap):
-        snapshot = _read_stash_snapshot(metadata, provider)
+        snapshot = _read_stash_snapshot(metadata, provider, defer_on_dialog)
         if snapshot is not None:
             latest = snapshot
         if snapshot is not None and snapshot.draft == "":

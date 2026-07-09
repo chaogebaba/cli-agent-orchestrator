@@ -1,6 +1,8 @@
 """Tests for the event-driven InboxService."""
 
 import asyncio
+import threading
+import time
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -10,13 +12,20 @@ from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.inbox_service import InboxService
 
 
-def _make_message(id=1, receiver_id="term-1", message="hello", status=MessageStatus.PENDING):
+def _make_message(
+    id=1,
+    receiver_id="term-1",
+    message="hello",
+    status=MessageStatus.PENDING,
+    sender_id="sender-1",
+):
     return InboxMessage(
         id=id,
-        sender_id="sender-1",
+        sender_id=sender_id,
         receiver_id=receiver_id,
         message=message,
         status=status,
@@ -38,7 +47,9 @@ class TestDeliverPending:
         svc = InboxService()
         svc.deliver_pending("term-1")
 
-        mock_term_svc.send_input.assert_called_once_with("term-1", "hello")
+        mock_term_svc.send_input.assert_called_once_with(
+            "term-1", "hello", defer_on_dialog=True
+        )
         mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
@@ -54,7 +65,9 @@ class TestDeliverPending:
         svc = InboxService()
         svc.deliver_pending("term-1")
 
-        mock_term_svc.send_input.assert_called_once_with("term-1", "hello")
+        mock_term_svc.send_input.assert_called_once_with(
+            "term-1", "hello", defer_on_dialog=True
+        )
         mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
@@ -115,7 +128,9 @@ class TestDeliverPending:
         svc.deliver_pending("term-1", num_messages=2)
 
         mock_get.assert_called_once_with("term-1", limit=2)
-        mock_term_svc.send_input.assert_called_once_with("term-1", "hello\nworld")
+        mock_term_svc.send_input.assert_called_once_with(
+            "term-1", "hello\nworld", defer_on_dialog=True
+        )
         assert mock_update.call_count == 2
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
@@ -133,7 +148,9 @@ class TestDeliverPending:
         svc.deliver_pending("term-1", num_messages=0)
 
         mock_get.assert_called_once_with("term-1", limit=100)
-        mock_term_svc.send_input.assert_called_once_with("term-1", "msg0\nmsg1\nmsg2")
+        mock_term_svc.send_input.assert_called_once_with(
+            "term-1", "msg0\nmsg1\nmsg2", defer_on_dialog=True
+        )
         assert mock_update.call_count == 3
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
@@ -209,6 +226,153 @@ class TestDeliverPending:
         # Final status is PENDING (reset after the optimistic DELIVERED), never FAILED.
         assert mock_update.call_args_list[-1] == call(1, MessageStatus.PENDING)
         assert call(1, MessageStatus.FAILED) not in mock_update.call_args_list
+
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_concurrent_delivery_sends_stateful_pending_message_once(
+        self, mock_get, mock_update, mock_monitor, mock_term_svc
+    ):
+        message = _make_message()
+        state_lock = threading.Lock()
+        statuses = {message.id: MessageStatus.PENDING}
+
+        def get_pending(*args, **kwargs):
+            with state_lock:
+                snapshot = (
+                    [message]
+                    if statuses[message.id] == MessageStatus.PENDING
+                    else []
+                )
+            time.sleep(0.2)
+            return snapshot
+
+        def update(message_id, status):
+            with state_lock:
+                statuses[message_id] = status
+
+        mock_get.side_effect = get_pending
+        mock_update.side_effect = update
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        start = threading.Barrier(3)
+        service = InboxService()
+
+        def deliver():
+            start.wait()
+            service.deliver_pending("term-1")
+
+        threads = [threading.Thread(target=deliver) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        start.wait()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        assert all(not thread.is_alive() for thread in threads)
+        mock_term_svc.send_input.assert_called_once_with(
+            "term-1", "hello", defer_on_dialog=True
+        )
+        assert statuses[message.id] == MessageStatus.DELIVERED
+
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_waiting_dialog_opened_before_send_resets_pending(
+        self, mock_get, mock_update, mock_monitor, mock_term_svc, mock_pm
+    ):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.side_effect = [
+            TerminalStatus.IDLE,
+            TerminalStatus.IDLE,
+            TerminalStatus.WAITING_USER_ANSWER,
+        ]
+        mock_pm.get_provider.return_value.blocks_orchestrated_input_while_waiting_user_answer = (
+            True
+        )
+
+        InboxService().deliver_pending("term-1")
+
+        mock_term_svc.send_input.assert_not_called()
+        assert mock_update.call_args_list == [
+            call(1, MessageStatus.DELIVERED),
+            call(1, MessageStatus.PENDING),
+        ]
+        assert mock_monitor.get_status.call_count == 3
+
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_waiting_before_first_sender_resets_all_marked_messages(
+        self, mock_get, mock_update, mock_monitor, mock_term_svc, mock_pm
+    ):
+        messages = [
+            _make_message(id=1, sender_id="sender-1"),
+            _make_message(id=2, sender_id="sender-2"),
+        ]
+        mock_get.return_value = messages
+        mock_monitor.get_status.side_effect = [
+            TerminalStatus.IDLE,
+            TerminalStatus.IDLE,
+            TerminalStatus.WAITING_USER_ANSWER,
+        ]
+        mock_pm.get_provider.return_value.blocks_orchestrated_input_while_waiting_user_answer = (
+            True
+        )
+
+        InboxService().deliver_pending("term-1", num_messages=0)
+
+        mock_term_svc.send_input.assert_not_called()
+        assert mock_update.call_args_list == [
+            call(1, MessageStatus.DELIVERED),
+            call(2, MessageStatus.DELIVERED),
+            call(1, MessageStatus.PENDING),
+            call(2, MessageStatus.PENDING),
+        ]
+
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_dialog_snapshot_defer_resets_pending_not_failed(
+        self, mock_get, mock_update, mock_monitor, mock_term_svc
+    ):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_term_svc.send_input.side_effect = DeliveryDeferredError("dialog")
+
+        InboxService().deliver_pending("term-1")
+
+        assert mock_update.call_args_list == [
+            call(1, MessageStatus.DELIVERED),
+            call(1, MessageStatus.PENDING),
+        ]
+        assert call(1, MessageStatus.FAILED) not in mock_update.call_args_list
+
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_processing_at_pre_send_recheck_still_delivers(
+        self, mock_get, mock_update, mock_monitor, mock_term_svc
+    ):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.side_effect = [
+            TerminalStatus.IDLE,
+            TerminalStatus.IDLE,
+            TerminalStatus.PROCESSING,
+        ]
+
+        InboxService().deliver_pending("term-1")
+
+        mock_term_svc.send_input.assert_called_once_with(
+            "term-1", "hello", defer_on_dialog=True
+        )
+        mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
 
 
 class TestEagerInboxDelivery:

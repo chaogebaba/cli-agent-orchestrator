@@ -692,6 +692,7 @@ def send_input(
     registry: PluginRegistry | None = None,
     sender_id: str | None = None,
     orchestration_type: OrchestrationType | None = None,
+    defer_on_dialog: bool = False,
 ) -> bool:
     """Send input to terminal via tmux paste buffer.
 
@@ -766,7 +767,7 @@ def send_input(
         backend = get_backend()
         if isinstance(getattr(provider, "composer_stash_keys", None), list):
             chip_present_at_inject = stash_draft_before_send(
-                terminal_id, metadata, provider
+                terminal_id, metadata, provider, defer_on_dialog=defer_on_dialog
             )
             if chip_present_at_inject:
                 enter_count = 1

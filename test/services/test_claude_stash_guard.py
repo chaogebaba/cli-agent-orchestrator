@@ -1,21 +1,31 @@
 """Claude native-stash guard strategy tests."""
 
 import re
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
 
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
-from cli_agent_orchestrator.services import draft_guard
+from cli_agent_orchestrator.services import draft_guard, terminal_service
 
 
 class StashProvider:
     composer_stash_keys = ["C-s"]
     composer_clear_keys = ["C-u"]
     composer_stashed_chip_pattern = re.compile("CHIP")
+    blocks_orchestrated_input_while_waiting_user_answer = True
+    paste_enter_count = 1
+    paste_submit_delay = 0.3
 
     def read_composer_draft(self, lines):
         for index, line in enumerate(lines):
             if line.startswith("DRAFT="):
                 return "\n".join([line.removeprefix("DRAFT="), *lines[index + 1 :]])
         return None
+
+    def mark_input_received(self):
+        pass
 
 
 def _setup(monkeypatch, tmp_path, frames):
@@ -125,3 +135,75 @@ def test_blank_and_indented_rows_log_verbatim_and_set_clear_bound(monkeypatch, t
 
     assert draft in (tmp_path / "t.log").read_text()
     assert calls == [("s", "w", "C-u")] * 6
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    ["fx3-dialog-capture.txt", "fx3-dialog-capture-sgr.txt"],
+)
+def test_dialog_raw_capture_defers_before_any_composer_key(
+    monkeypatch, tmp_path, fixture_name
+):
+    capture = (
+        Path(__file__).parents[1] / "fixtures" / "fx3" / fixture_name
+    ).read_text()
+    calls = _setup(monkeypatch, tmp_path, iter([capture]))
+
+    with pytest.raises(draft_guard.DeliveryDeferredError):
+        draft_guard.stash_draft_before_send(
+            "t",
+            {"tmux_session": "s", "tmux_window": "w"},
+            StashProvider(),
+            defer_on_dialog=True,
+        )
+
+    assert calls == []
+
+
+def test_normal_snapshot_does_not_defer(monkeypatch, tmp_path):
+    calls = _setup(monkeypatch, tmp_path, iter(["DRAFT=", "DRAFT="]))
+
+    assert (
+        draft_guard.stash_draft_before_send(
+            "t",
+            {"tmux_session": "s", "tmux_window": "w"},
+            StashProvider(),
+            defer_on_dialog=True,
+        )
+        is False
+    )
+    assert calls == []
+
+
+def test_send_input_default_does_not_defer_on_dialog(monkeypatch, tmp_path):
+    capture = (
+        Path(__file__).parents[1] / "fixtures" / "fx3" / "fx3-dialog-capture.txt"
+    ).read_text()
+    backend = MagicMock()
+    backend.get_history.return_value = capture
+    provider = StashProvider()
+    metadata = {"tmux_session": "s", "tmux_window": "w"}
+    monkeypatch.setattr(draft_guard, "get_backend", lambda: backend)
+    monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+    monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda _: metadata)
+    monkeypatch.setattr(
+        terminal_service.provider_manager, "get_provider", lambda _: provider
+    )
+    monkeypatch.setattr(terminal_service, "inject_memory_context", lambda message, _: message)
+    monkeypatch.setattr(terminal_service, "update_last_active", lambda _: None)
+    monkeypatch.setattr(terminal_service.status_monitor, "notify_input_sent", lambda _: None)
+    monkeypatch.setattr(
+        terminal_service.status_monitor, "clear_rolling_buffer", lambda _: None
+    )
+
+    assert terminal_service.send_input("t", "message") is True
+
+    backend.send_keys.assert_called_once_with(
+        "s",
+        "w",
+        "message",
+        enter_count=1,
+        force_bracketed_paste=True,
+        submit_delay=0.3,
+    )
+    backend.send_special_key.assert_not_called()

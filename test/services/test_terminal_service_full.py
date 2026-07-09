@@ -812,6 +812,13 @@ class TestSendInput:
 
         assert send_input("test1234", "test message") is True
 
+        mock_stash.assert_called_once_with(
+            "test1234",
+            mock_get_metadata.return_value,
+            mock_provider,
+            defer_on_dialog=False,
+        )
+
         mock_tmux.send_keys.assert_called_once_with(
             "cao-session",
             "developer-abcd",
