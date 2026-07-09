@@ -892,19 +892,31 @@ async def list_providers_endpoint() -> List[Dict]:
 
 
 @app.get("/settings/agent-dirs")
-async def get_agent_dirs_endpoint() -> Dict:
-    """Get configured agent directories per provider."""
+async def get_agent_dirs_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Get configured agent directories per provider.
+
+    Read-scope gated when auth is enabled: the response discloses local
+    filesystem layout (home paths), so it gets the same floor as other reads.
+    """
     from cli_agent_orchestrator.services.settings_service import (
         get_agent_dirs,
+        get_disabled_agent_dirs,
         get_extra_agent_dirs,
     )
 
-    return {"agent_dirs": get_agent_dirs(), "extra_dirs": get_extra_agent_dirs()}
+    return {
+        "agent_dirs": get_agent_dirs(),
+        "extra_dirs": get_extra_agent_dirs(),
+        "disabled_dirs": get_disabled_agent_dirs(),
+    }
 
 
 class AgentDirsUpdate(BaseModel):
     agent_dirs: Optional[Dict[str, str]] = None
     extra_dirs: Optional[List[str]] = None
+    disabled_dirs: Optional[List[str]] = None
 
 
 @app.get("/settings/memory")
@@ -920,22 +932,28 @@ async def set_agent_dirs_endpoint(
     body: AgentDirsUpdate,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    """Update agent directories per provider."""
+    """Update agent directories per provider (paths, extras, and disabled set)."""
     from cli_agent_orchestrator.services.settings_service import (
+        get_agent_dirs,
+        get_disabled_agent_dirs,
         get_extra_agent_dirs,
         set_agent_dirs,
+        set_disabled_agent_dirs,
         set_extra_agent_dirs,
     )
 
-    result_dirs = {}
-    result_extra = []
     if body.agent_dirs:
-        result_dirs = set_agent_dirs(body.agent_dirs)
+        set_agent_dirs(body.agent_dirs)
     if body.extra_dirs is not None:
-        result_extra = set_extra_agent_dirs(body.extra_dirs)
+        set_extra_agent_dirs(body.extra_dirs)
+    # After extras are persisted, so a just-added extra can be disabled in the
+    # same request; set_disabled validates against the current known dirs.
+    if body.disabled_dirs is not None:
+        set_disabled_agent_dirs(body.disabled_dirs)
     return {
-        "agent_dirs": result_dirs or {},
-        "extra_dirs": result_extra or get_extra_agent_dirs(),
+        "agent_dirs": get_agent_dirs(),
+        "extra_dirs": get_extra_agent_dirs(),
+        "disabled_dirs": get_disabled_agent_dirs(),
     }
 
 
@@ -1503,6 +1521,35 @@ async def run_step(
     The plugin registry is threaded so teardown's ``post_kill_terminal`` hooks
     fire (parity with the DELETE endpoint).
     """
+    # BR-31: for a script-tier run-step call, record the created terminal into the
+    # shared ScriptRunRecord's step_states AT creation time, so U4's orphan sweep
+    # can tear it down if the subprocess dies mid-call. No-op for YAML/handoff
+    # callers (no run/step env or no script record in the registry).
+    from cli_agent_orchestrator.services import workflow_service
+    from cli_agent_orchestrator.services.script_runner import make_step_terminal_recorder
+    from cli_agent_orchestrator.services.workflow_service import StaleGenerationError
+
+    on_terminal_created = make_step_terminal_recorder(body.env_vars)
+
+    # The generation fence (ADR-9 anti-double-drive, DR-5): a script run-step call
+    # carrying BOTH CAO_WORKFLOW_RUN_ID and CAO_WORKFLOW_GENERATION must be checked
+    # against the run's current journaled generation BEFORE dispatch — a resume or
+    # cancel bumps the generation, and a reparented predecessor subprocess's late
+    # calls must be fenced out rather than allowed to run.
+    env_vars = body.env_vars or {}
+    fence_run_id = env_vars.get("CAO_WORKFLOW_RUN_ID")
+    fence_generation = env_vars.get("CAO_WORKFLOW_GENERATION")
+    if fence_run_id is not None and fence_generation is not None:
+        try:
+            workflow_service.check_generation(fence_run_id, fence_generation)
+        except StaleGenerationError as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"run '{fence_run_id}': {e}",
+            )
+        except KeyError as e:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
     try:
         result = await run_agent_step(
             provider=body.provider,
@@ -1517,6 +1564,7 @@ async def run_step(
             allowed_tools=body.allowed_tools,
             registry=get_plugin_registry(request),
             env_vars=body.env_vars,
+            on_terminal_created=on_terminal_created,
         )
         return RunStepResponse(
             terminal_id=result.terminal_id,
