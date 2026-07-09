@@ -48,7 +48,7 @@ from cli_agent_orchestrator.plugins import (
     PostSendMessageEvent,
 )
 from cli_agent_orchestrator.providers.manager import provider_manager
-from cli_agent_orchestrator.services.draft_guard import preserve_draft_before_send
+from cli_agent_orchestrator.services.draft_guard import preserve_draft_before_send, stash_draft_before_send
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.memory_service import MemoryService
@@ -764,7 +764,15 @@ def send_input(
         status_monitor.clear_rolling_buffer(terminal_id)
 
         backend = get_backend()
-        preserved_draft = preserve_draft_before_send(terminal_id, metadata, provider)
+        if isinstance(getattr(provider, "composer_stash_keys", None), list):
+            chip_present_at_inject = stash_draft_before_send(
+                terminal_id, metadata, provider
+            )
+            if chip_present_at_inject:
+                enter_count = 1
+            preserved_draft = None
+        else:
+            preserved_draft = preserve_draft_before_send(terminal_id, metadata, provider)
 
         backend.send_keys(
             metadata["tmux_session"],

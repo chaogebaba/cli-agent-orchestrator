@@ -77,6 +77,17 @@ class InboxService:
             return
 
         status = status_monitor.get_status(terminal_id)
+        provider = None
+        if status == TerminalStatus.WAITING_USER_ANSWER:
+            provider = provider_manager.get_provider(terminal_id)
+            if (
+                provider is not None
+                and getattr(provider, "blocks_orchestrated_input_while_waiting_user_answer", False)
+                is True
+            ):
+                # Leave messages PENDING for the normal status transition/reconcile
+                # path. Raising here would mark them FAILED after optimistic delivery.
+                return
         if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
             # Not ready on the normal path. Eager delivery (#251) lets providers
             # that accept input mid-turn receive messages while PROCESSING or
@@ -86,7 +97,8 @@ class InboxService:
                 TerminalStatus.PROCESSING,
                 TerminalStatus.WAITING_USER_ANSWER,
             ):
-                provider = provider_manager.get_provider(terminal_id)
+                if provider is None:
+                    provider = provider_manager.get_provider(terminal_id)
                 eager_eligible = provider is not None and getattr(
                     provider, "accepts_input_while_processing", False
                 )

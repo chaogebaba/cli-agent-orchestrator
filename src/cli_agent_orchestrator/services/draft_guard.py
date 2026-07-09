@@ -23,6 +23,7 @@ DRAFT_CLEAR_PROBE_RECHECK_DELAY_SECONDS = 0.3
 # Transient None re-read after clear-keys: retry before conservative "changed".
 DRAFT_CLEAR_PROBE_NONE_RETRIES = 2
 DRAFT_CLEAR_PROBE_NONE_RETRY_DELAY_SECONDS = 0.15
+STASH_SNAPSHOT_RETRIES = 3
 
 
 @dataclass
@@ -53,6 +54,110 @@ class PreservedDraft:
                 self.terminal_id,
                 e,
             )
+
+
+@dataclass(frozen=True)
+class ComposerSnapshot:
+    chip_present: bool
+    draft: str | None
+
+
+def stash_draft_before_send(
+    terminal_id: str,
+    metadata: dict[str, Any],
+    provider: Any,
+) -> bool:
+    """Apply native stash; return whether a chip is present for the paste."""
+    if not isinstance(getattr(provider, "composer_stash_keys", None), list):
+        return False
+
+    for _ in range(STASH_SNAPSHOT_RETRIES):
+        snapshot = _read_stash_snapshot(metadata, provider)
+        if snapshot is None:
+            continue
+        draft = snapshot.draft
+        if draft not in (None, ""):
+            draft = _wait_for_stable_draft(terminal_id, metadata, provider, draft)
+            if not draft:
+                continue
+            _append_draft_log(terminal_id, draft)
+            snapshot = _read_stash_snapshot(metadata, provider)
+            if snapshot is None or snapshot.draft != draft:
+                continue
+
+        before_key = _read_stash_snapshot(metadata, provider)
+        if before_key != snapshot:
+            continue
+        if snapshot.draft is None:
+            break
+        if snapshot.chip_present:
+            if snapshot.draft:
+                snapshot = _clear_stash_draft(
+                    terminal_id, metadata, provider, snapshot.draft
+                )
+                return bool(snapshot and snapshot.chip_present)
+            return True
+        if snapshot.draft == "":
+            return False
+
+        _send_stash_keys(metadata, provider)
+        confirmed = _read_stash_snapshot(metadata, provider)
+        if confirmed is not None and confirmed.chip_present and confirmed.draft == "":
+            return True
+        logger.warning("Native composer stash unconfirmed for terminal %s; degrading", terminal_id)
+        cleared = _clear_stash_draft(terminal_id, metadata, provider, snapshot.draft)
+        return bool(cleared and cleared.chip_present)
+
+    logger.warning(
+        "Composer snapshot unreadable or changing for terminal %s; injecting without composer keys",
+        terminal_id,
+    )
+    return False
+
+
+def _read_stash_snapshot(metadata: dict[str, Any], provider: Any) -> ComposerSnapshot | None:
+    try:
+        captured = get_backend().get_history(
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            tail_lines=PYTE_SCREEN_ROWS,
+            strip_escapes=False,
+        )
+        lines = captured.splitlines()
+        draft = provider.read_composer_draft(lines)
+    except Exception:
+        return None
+    pattern = getattr(provider, "composer_stashed_chip_pattern", None)
+    if pattern is None:
+        return None
+    return ComposerSnapshot(bool(pattern.search(captured)), draft)
+
+
+def _send_stash_keys(metadata: dict[str, Any], provider: Any) -> None:
+    backend = get_backend()
+    for key in provider.composer_stash_keys:
+        backend.send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
+
+
+def _clear_stash_draft(
+    terminal_id: str,
+    metadata: dict[str, Any],
+    provider: Any,
+    draft: str,
+) -> ComposerSnapshot | None:
+    """C-u until empty; failure only warns because delivery must continue."""
+    cap = draft.count("\n") + 4
+    latest = None
+    for _ in range(cap):
+        snapshot = _read_stash_snapshot(metadata, provider)
+        if snapshot is not None:
+            latest = snapshot
+        if snapshot is not None and snapshot.draft == "":
+            return snapshot
+        if not _send_clear_keys(terminal_id, metadata, provider):
+            break
+    logger.warning("Could not confirm composer clear for terminal %s; injecting anyway", terminal_id)
+    return latest
 
 
 def preserve_draft_before_send(

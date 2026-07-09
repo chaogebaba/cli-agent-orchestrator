@@ -781,6 +781,46 @@ class TestSendInput:
         mock_preserve.assert_called_once_with("test1234", mock_get_metadata.return_value, mock_provider)
         mock_update.assert_called_once_with("test1234")
 
+    @pytest.mark.parametrize(
+        ("chip_present", "expected_enter_count"),
+        [(True, 1), (False, 2)],
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.stash_draft_before_send")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_stash_chip_controls_paste_enter_count(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_stash,
+        mock_update,
+        chip_present,
+        expected_enter_count,
+    ):
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.composer_stash_keys = ["C-s"]
+        mock_provider.paste_enter_count = 2
+        mock_provider.paste_submit_delay = 0.3
+        mock_stash.return_value = chip_present
+
+        assert send_input("test1234", "test message") is True
+
+        mock_tmux.send_keys.assert_called_once_with(
+            "cao-session",
+            "developer-abcd",
+            "test message",
+            enter_count=expected_enter_count,
+            force_bracketed_paste=True,
+            submit_delay=0.3,
+        )
+
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.services.terminal_service.preserve_draft_before_send")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")

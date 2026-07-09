@@ -180,6 +180,9 @@ class BaseProvider(ABC):
     # clear-key iteration in composer_clear_keys.
     supports_draft_preservation: bool = False
     composer_clear_keys: List[str] = []
+    # Non-None selects native composer stashing before delivery. Native stashes
+    # auto-restore after submit, so callers must never send restore keys.
+    composer_stash_keys: List[str] | None = None
     liveness_exclude_patterns: List[str] = []
     # When True, draft_guard may feed capture-pane -e (SGR retained) lines into
     # read_composer_draft. Default False: plain capture only (e.g. grok parses

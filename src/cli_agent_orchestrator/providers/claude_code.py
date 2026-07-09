@@ -30,6 +30,9 @@ class ProviderError(Exception):
 
 # Regex patterns for Claude Code output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
+CLAUDE_STASHED_CHIP_PATTERN = re.compile(
+    r"›(?:\x1b\[[0-9;]*m)*\s*stashed", re.IGNORECASE
+)
 RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between marker and text
 # Response marker at the START of a line, for message EXTRACTION only (not
 # status detection). Matches the legacy "⏺" (U+23FA) and the newest TUI's
@@ -145,6 +148,12 @@ NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*i
 
 class ClaudeCodeProvider(BaseProvider):
     """Provider for Claude Code CLI tool integration."""
+
+    composer_stash_keys = ["C-s"]
+    composer_clear_keys = ["C-u"]
+    composer_stashed_chip_pattern = CLAUDE_STASHED_CHIP_PATTERN
+    composer_parse_accepts_escapes = True
+    blocks_orchestrated_input_while_waiting_user_answer = True
 
     def __init__(
         self,
@@ -727,6 +736,37 @@ class ClaudeCodeProvider(BaseProvider):
             return TerminalStatus.IDLE
 
         return TerminalStatus.UNKNOWN
+
+    def read_composer_draft(self, screen_lines: List[str]) -> Optional[str]:
+        """Read Claude Code's boxed composer, excluding dim placeholder hints."""
+        for index in range(len(screen_lines) - 1, -1, -1):
+            raw = screen_lines[index]
+            clean = strip_terminal_escapes(raw).rstrip()
+            match = re.match(r"^\s*[❯>][ \xa0]?(.*)$", clean)
+            if not match:
+                continue
+            first = match.group(1)
+            if "\x1b[2m" in raw:
+                return ""
+            lines = [first]
+            found_rail = False
+            valid_composer = True
+            # The lower rail, not an arbitrary viewport window, terminates the
+            # composer. Continuations carry a two-column display gutter; keep
+            # every remaining character, including blank rows and indentation.
+            for continuation in screen_lines[index + 1 :]:
+                continuation_clean = strip_terminal_escapes(continuation)
+                if re.match(r"^\s*─{8,}", continuation_clean.rstrip()):
+                    found_rail = True
+                    break
+                if continuation_clean.startswith("  "):
+                    lines.append(continuation_clean[2:].rstrip())
+                else:
+                    valid_composer = False
+                    break
+            if found_rail and valid_composer:
+                return "\n".join(lines)
+        return None
 
     @property
     def paste_submit_delay(self) -> float:
