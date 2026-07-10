@@ -256,8 +256,10 @@ class TmuxClient:
 
         Uses load-buffer + paste-buffer instead of chunked send-keys to avoid
         slow character-by-character input and special character interpretation.
-        The -p flag enables bracketed paste mode so multi-line content is treated
-        as a single input rather than submitting on each newline.
+        The -p flag lets tmux add real bracketed-paste markers if and only if
+        the pane application requested DECSET 2004. tmux 3.7 and newer sanitize
+        buffer content via vis(3), so hand-crafted ESC wrappers render literally
+        and must not be reintroduced.
 
         Args:
             session_name: Name of tmux session
@@ -266,12 +268,8 @@ class TmuxClient:
             enter_count: Number of Enter keys to send after pasting (default 1).
                 Some TUIs enter multi-line mode after bracketed paste,
                 requiring 2 Enters to submit.
-            force_bracketed_paste: If True, unconditionally wrap content in
-                bracketed paste sequences (\x1b[200~...\x1b[201~) instead of
-                relying on paste-buffer -p. Use for message delivery to TUIs.
-                Do NOT use for shell commands sent to bash during initialization
-                (bash 4.x does not support bracketed paste and will inject the
-                escape sequences literally into the command line).
+            force_bracketed_paste: Retained for backend-interface compatibility;
+                the herdr backend honors it, but it is a no-op for tmux.
         """
         # Defence-in-depth: re-validate at the sink even though callers
         # validate at the API/MCP boundary. Both halves flow into a
@@ -285,16 +283,8 @@ class TmuxClient:
         buf_name = f"cao_{uuid.uuid4().hex[:8]}"
         try:
             logger.info(f"send_keys: {target} - keys: {keys}")
-            if force_bracketed_paste:
-                # Wrap unconditionally and use -r (no newline→CR conversion).
-                # paste-buffer -p only adds bracketed sequences if tmux tracks
-                # ?2004h for the pane — some TUIs (e.g. current Kiro) don't
-                # send ?2004h so -p is a no-op and \n becomes CR (Enter).
-                buf_content = b"\x1b[200~" + keys.encode() + b"\x1b[201~"
-                paste_flag = "-r"
-            else:
-                buf_content = keys.encode()
-                paste_flag = "-p"
+            buf_content = keys.encode()
+            paste_flag = "-p"
             subprocess.run(
                 ["tmux", "load-buffer", "-b", buf_name, "-"],
                 input=buf_content,

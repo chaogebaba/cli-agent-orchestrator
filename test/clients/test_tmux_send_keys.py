@@ -32,7 +32,7 @@ class TestSendKeys:
 
     def test_basic_message(self, client, mock_subprocess, mock_uuid):
         """Sends load-buffer, paste-buffer -p, send-keys Enter, delete-buffer."""
-        client.send_keys("sess", "win", "hello")
+        client.send_keys("sess", "win", "hello", force_bracketed_paste=False)
 
         assert mock_subprocess.run.call_count == 4
         calls = mock_subprocess.run.call_args_list
@@ -59,10 +59,38 @@ class TestSendKeys:
             check=False,
         )
 
+    def test_force_bracketed_paste_uses_tmux_wrapping(
+        self, client, mock_subprocess, mock_uuid
+    ):
+        """force=True sends raw content and still relies on paste-buffer -p."""
+        client.send_keys("sess", "win", "hello", force_bracketed_paste=True)
+
+        calls = mock_subprocess.run.call_args_list
+        assert calls[0] == call(
+            ["tmux", "load-buffer", "-b", "cao_abcd1234", "-"],
+            input=b"hello",
+            check=True,
+        )
+        assert b"\x1b" not in calls[0].kwargs["input"]
+        assert calls[1] == call(
+            [
+                "tmux",
+                "paste-buffer",
+                "-p",
+                "-b",
+                "cao_abcd1234",
+                "-t",
+                "sess:win",
+            ],
+            check=True,
+        )
+        assert "-p" in calls[1].args[0]
+        assert "-r" not in calls[1].args[0]
+
     def test_multiline_message(self, client, mock_subprocess, mock_uuid):
-        """Multi-line content is sent as-is; -p flag handles newlines."""
+        """Multi-line force=True content reaches load-buffer unmodified."""
         msg = "line 1\nline 2\nline 3"
-        client.send_keys("sess", "win", msg)
+        client.send_keys("sess", "win", msg, force_bracketed_paste=True)
 
         load_call = mock_subprocess.run.call_args_list[0]
         assert load_call == call(
