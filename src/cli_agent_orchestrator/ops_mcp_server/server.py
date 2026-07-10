@@ -194,9 +194,9 @@ async def get_profile_details(
 async def install_profile(
     source: Annotated[str, Field(description="Agent name or https:// URL to install")],
     provider: Annotated[
-        str,
+        Optional[str],
         Field(description="Target provider for the installed profile"),
-    ] = DEFAULT_PROVIDER,
+    ] = None,
     env_vars: Annotated[
         Optional[Dict[str, str]],
         Field(description="Optional environment variables to inject before install"),
@@ -224,7 +224,7 @@ async def install_profile(
 
     Args:
         source: Agent name or https:// URL from an allow-listed host
-        provider: Target provider (default: kiro_cli)
+        provider: Target provider (default: profile provider or kiro_cli)
         env_vars: Optional env vars written to the managed .env before install
 
     Returns:

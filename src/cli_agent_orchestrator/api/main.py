@@ -383,7 +383,7 @@ class InstallAgentProfileRequest(BaseModel):
     """
 
     source: str
-    provider: str = DEFAULT_PROVIDER
+    provider: Optional[str] = None
     env_vars: Optional[Dict[str, str]] = None
 
 

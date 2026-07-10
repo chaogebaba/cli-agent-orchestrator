@@ -142,6 +142,9 @@ You review code for quality and correctness.
 
 ## Installation
 
+`cao install --provider` overrides profile frontmatter `provider:`; without the flag,
+CAO uses the frontmatter provider and otherwise defaults to `kiro_cli`.
+
 ```bash
 # From local file
 cao install ./my-agent.md

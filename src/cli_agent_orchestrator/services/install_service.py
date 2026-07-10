@@ -1,5 +1,6 @@
 """Service helpers for installing agent profiles."""
 
+import logging
 import os
 import re
 from pathlib import Path
@@ -13,9 +14,11 @@ from pydantic import BaseModel
 from cli_agent_orchestrator.constants import (
     AGENT_CONTEXT_DIR,
     COPILOT_AGENTS_DIR,
+    DEFAULT_PROVIDER,
     KIRO_AGENTS_DIR,
     LOCAL_AGENT_STORE_DIR,
     OPENCODE_AGENTS_DIR,
+    PROVIDERS,
     SKILLS_DIR,
 )
 from cli_agent_orchestrator.models.copilot_agent import CopilotAgentConfig
@@ -39,6 +42,8 @@ from cli_agent_orchestrator.utils.opencode_config import (
 from cli_agent_orchestrator.utils.opencode_permissions import cao_tools_to_opencode_permission
 from cli_agent_orchestrator.utils.skill_injection import compose_agent_prompt
 from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+logger = logging.getLogger(__name__)
 
 
 class InstallResult(BaseModel):
@@ -221,7 +226,7 @@ def _build_provider_config(
 
 def install_agent(
     source: str,
-    provider: str,
+    provider: Optional[str] = None,
     env_vars: Optional[Dict[str, str]] = None,
 ) -> InstallResult:
     """Install an agent profile for the requested provider.
@@ -236,7 +241,7 @@ def install_agent(
     """
     try:
         valid_providers = [provider_type.value for provider_type in ProviderType]
-        if provider not in valid_providers:
+        if provider is not None and provider not in valid_providers:
             return InstallResult(
                 success=False,
                 message=(
@@ -272,6 +277,21 @@ def install_agent(
         raw_content = _read_agent_profile_source(agent_name)
         resolved_content = resolve_env_vars(raw_content)
         profile = parse_agent_profile_text(resolved_content, agent_name)
+
+        if provider is None:
+            if profile.provider in PROVIDERS:
+                provider = profile.provider
+            else:
+                if profile.provider:
+                    logger.warning(
+                        "Agent profile '%s' has invalid provider '%s'. "
+                        "Valid providers: %s. Falling back to '%s'.",
+                        agent_name,
+                        profile.provider,
+                        PROVIDERS,
+                        DEFAULT_PROVIDER,
+                    )
+                provider = DEFAULT_PROVIDER
 
         unresolved_vars = sorted(set(re.findall(r"\$\{(\w+)\}", resolved_content)))
         context_file = _write_context_file(profile.name, raw_content)

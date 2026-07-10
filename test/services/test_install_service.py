@@ -13,7 +13,9 @@ from cli_agent_orchestrator.services.install_service import InstallResult, insta
 from cli_agent_orchestrator.utils.skill_injection import refresh_agent_md_prompt
 
 
-def _profile_text(*, name: str, include_prompt: bool = True) -> str:
+def _profile_text(
+    *, name: str, include_prompt: bool = True, provider: str | None = None
+) -> str:
     """Build a profile fixture with env placeholders in prompt and MCP config."""
     prompt_lines = "Fallback prompt\n" if include_prompt else ""
     return (
@@ -21,6 +23,7 @@ def _profile_text(*, name: str, include_prompt: bool = True) -> str:
         f"name: {name}\n"
         "description: Test agent\n"
         "role: developer\n"
+        f"{f'provider: {provider}\n' if provider is not None else ''}"
         "mcpServers:\n"
         "  service:\n"
         "    command: service-mcp\n"
@@ -301,15 +304,82 @@ class TestInstallAgent:
             success=False, message="Agent profile not found: missing-agent"
         )
 
-    def test_install_returns_failure_for_invalid_provider(
+    def test_explicit_provider_overrides_profile_provider(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        local_profile = install_paths["local_store_dir"] / "provider-override.md"
+        local_profile.write_text(
+            _profile_text(name="provider-override", provider="grok_cli"), encoding="utf-8"
+        )
+
+        with patch(
+            "cli_agent_orchestrator.services.install_service.ensure_grok_mcp_servers"
+        ) as ensure_grok:
+            result = install_agent("provider-override", "codex")
+
+        assert result.success is True
+        ensure_grok.assert_not_called()
+        assert not (install_paths["kiro_dir"] / "provider-override.json").exists()
+
+    def test_profile_provider_is_used_when_argument_is_none(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        local_profile = install_paths["local_store_dir"] / "profile-provider.md"
+        local_profile.write_text(
+            _profile_text(name="profile-provider", provider="codex"), encoding="utf-8"
+        )
+
+        result = install_agent("profile-provider")
+
+        assert result.success is True
+        assert result.agent_file is None
+        assert not (install_paths["kiro_dir"] / "profile-provider.json").exists()
+
+    def test_missing_profile_provider_falls_back_to_kiro(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        local_profile = install_paths["local_store_dir"] / "default-provider.md"
+        local_profile.write_text(_profile_text(name="default-provider"), encoding="utf-8")
+
+        result = install_agent("default-provider")
+
+        assert result.success is True
+        assert (install_paths["kiro_dir"] / "default-provider.json").exists()
+
+    def test_invalid_profile_provider_warns_and_falls_back_to_kiro(
+        self, install_paths: dict[str, Path], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        local_profile = install_paths["local_store_dir"] / "invalid-profile-provider.md"
+        local_profile.write_text(
+            _profile_text(name="invalid-profile-provider", provider="bogus"), encoding="utf-8"
+        )
+
+        with caplog.at_level("WARNING"):
+            result = install_agent("invalid-profile-provider")
+
+        assert result.success is True
+        assert (install_paths["kiro_dir"] / "invalid-profile-provider.json").exists()
+        assert "invalid provider 'bogus'" in caplog.text
+
+    def test_explicit_invalid_provider_fails_before_source_or_env_mutation(
         self, install_paths: dict[str, Path]
     ) -> None:
         """Unknown providers should fail before any source or env side effects."""
-        result = install_agent("missing-agent", "bad_provider", {"API_TOKEN": "secret"})
+        with (
+            patch("cli_agent_orchestrator.services.install_service.requests.get") as get,
+            patch("cli_agent_orchestrator.services.install_service.set_env_var") as set_env,
+        ):
+            result = install_agent(
+                "https://raw.githubusercontent.com/org/repo/main/agent.md",
+                "bad_provider",
+                {"API_TOKEN": "secret"},
+            )
 
         assert result.success is False
         assert result.message.startswith("Invalid provider 'bad_provider'.")
         assert "kiro_cli" in result.message
+        get.assert_not_called()
+        set_env.assert_not_called()
         assert not install_paths["env_file"].exists()
 
     def test_install_returns_failure_for_download_errors(
