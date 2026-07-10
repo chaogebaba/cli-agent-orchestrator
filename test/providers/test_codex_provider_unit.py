@@ -1,5 +1,6 @@
 """Unit tests for Codex provider."""
 
+import shlex
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -52,7 +53,7 @@ class TestCodexProviderInitialization:
         mock_tmux.return_value.send_keys.assert_any_call(
             "test-session",
             "window-0",
-            "codex --yolo --no-alt-screen --disable shell_snapshot",
+            "codex --yolo --no-alt-screen --disable shell_snapshot -c features.multi_agent=false",
         )
         mock_wait_status.assert_called_once()
 
@@ -86,7 +87,13 @@ class TestCodexBuildCommand:
     def test_build_command_no_profile(self):
         provider = CodexProvider("test1234", "test-session", "window-0", None)
         command = provider._build_codex_command()
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot -c features.multi_agent=false"
+
+    def test_build_command_disables_native_multi_agent(self):
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+        argv = shlex.split(provider._build_codex_command())
+
+        assert ["-c", "features.multi_agent=false"] == argv[-2:]
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_with_skill_prompt(self, mock_load_profile):
@@ -248,7 +255,7 @@ class TestCodexBuildCommand:
         provider = CodexProvider("test1234", "test-session", "window-0", "empty_agent")
         command = provider._build_codex_command()
 
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot -c features.multi_agent=false"
         assert "developer_instructions" not in command
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
@@ -263,7 +270,7 @@ class TestCodexBuildCommand:
         provider = CodexProvider("test1234", "test-session", "window-0", "none_agent")
         command = provider._build_codex_command()
 
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot -c features.multi_agent=false"
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_profile_load_failure(self, mock_load_profile):
@@ -594,6 +601,21 @@ class TestCodexProviderCodexConfig:
         assert "features.fast_mode=true" in command
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_multi_agent_override_follows_profile_codex_config(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = {"features.multi_agent": True}
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        argv = shlex.split(provider._build_codex_command())
+
+        assert argv.index("features.multi_agent=true") < argv.index("features.multi_agent=false")
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_codex_config_composes_with_codex_profile(self, mock_load):
         # codexConfig must apply in the --profile path too, so effort/fast-mode
         # knobs work whether or not a named profile governs sandbox/approvals.
@@ -625,7 +647,7 @@ class TestCodexProviderCodexConfig:
         provider = CodexProvider("tid", "sess", "win", "agent")
         command = provider._build_codex_command()
 
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot -c features.multi_agent=false"
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_codex_config_empty_dict_emits_no_overrides(self, mock_load):
@@ -640,7 +662,7 @@ class TestCodexProviderCodexConfig:
         provider = CodexProvider("tid", "sess", "win", "agent")
         command = provider._build_codex_command()
 
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot -c features.multi_agent=false"
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_codex_config_composes_with_mcp_and_model(self, mock_load):

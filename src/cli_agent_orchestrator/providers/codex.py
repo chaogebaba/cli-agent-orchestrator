@@ -450,6 +450,8 @@ class CodexProvider(BaseProvider):
         for key, value in codex_config.items():
             command_parts.extend(["-c", _toml_override(key, value)])
 
+        command_parts.extend(["-c", "features.multi_agent=false"])
+
         return shlex.join(command_parts)
 
     async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:

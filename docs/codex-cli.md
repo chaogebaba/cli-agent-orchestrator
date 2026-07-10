@@ -125,6 +125,7 @@ The Codex provider automatically adds these flags for tmux compatibility:
 
 - `--no-alt-screen`: Runs Codex in inline mode so output stays in normal scrollback, making `tmux capture-pane` reliable
 - `--disable shell_snapshot`: Prevents TTY input conflicts (SIGTTIN) caused by the shell_snapshot subprocess inheriting stdin in tmux
+- `-c features.multi_agent=false`: Disables Codex-native multi-agent tools to prevent tool-name shadowing because CAO is the collaboration layer
 
 By default, CAO also passes `--yolo` (alias for `--dangerously-bypass-approvals-and-sandbox`) because CAO agents run in non-interactive tmux sessions where approval prompts block handoff/assign flows. Profiles can opt out via `codexProfile`; see [Custom Codex Profile](#custom-codex-profile). Any unrestricted allowed-tools configuration (`allowedTools: ["*"]`, `--allowed-tools '*'`, or `cao launch --yolo`) forces `--yolo` regardless of the profile setting.
 
