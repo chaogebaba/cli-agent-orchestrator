@@ -17,7 +17,7 @@ from cli_agent_orchestrator.api.main import (
     inbox_reconciliation_daemon,
     opencode_inbox_delivery_daemon,
 )
-from cli_agent_orchestrator.models.terminal import Terminal
+from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.utils.skills import SkillNameError
 
@@ -286,6 +286,8 @@ class TestCreateSession:
         assert data["id"] == "abcd1234"
         assert data["provider"] == "kiro_cli"
         assert data["agent_profile"] == "developer"
+        assert data["input_gen"] == 0
+        assert data["status_gen"] == 0
         mock_svc.create_session.assert_called_once_with(
             provider="kiro_cli",
             agent_profile="developer",
@@ -630,6 +632,8 @@ class TestCreateTerminalInSession:
         data = response.json()
         assert data["id"] == "abcd5678"
         assert data["session_name"] == "test-session"
+        assert data["input_gen"] == 0
+        assert data["status_gen"] == 0
         call_kwargs = mock_svc.create_terminal.call_args.kwargs
         assert call_kwargs["session_name"] == "test-session"
         assert call_kwargs["new_session"] is False
@@ -723,6 +727,8 @@ class TestGetTerminal:
             "session_name": "test-session",
             "provider": "kiro_cli",
             "agent_profile": "developer",
+            "input_gen": 4,
+            "status_gen": 3,
         }
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.get_terminal.return_value = mock_terminal_dict
@@ -733,7 +739,50 @@ class TestGetTerminal:
         data = response.json()
         assert data["id"] == "abcd1234"
         assert data["provider"] == "kiro_cli"
+        assert data["input_gen"] == 4
+        assert data["status_gen"] == 3
         mock_svc.get_terminal.assert_called_once_with("abcd1234")
+
+    @pytest.mark.parametrize(
+        ("monitor_status_gen", "wire_status_gen"),
+        [(3, 3), (None, 0)],
+    )
+    def test_get_terminal_uses_real_service_generation_mapping(
+        self, client, monitor_status_gen, wire_status_gen
+    ):
+        metadata = {
+            "id": "abcd1234",
+            "tmux_window": "test-window",
+            "tmux_session": "test-session",
+            "provider": "kiro_cli",
+            "agent_profile": "developer",
+            "last_active": None,
+        }
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=metadata,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.status_monitor"
+            ) as monitor,
+        ):
+            monitor.get_status.return_value = TerminalStatus.COMPLETED
+            monitor.get_input_gen.return_value = 4
+            monitor.get_status_gen.return_value = monitor_status_gen
+            response = client.get("/terminals/abcd1234")
+
+        assert response.status_code == 200
+        assert response.json()["input_gen"] == 4
+        assert response.json()["status_gen"] == wire_status_gen
+
+    def test_terminal_generation_fields_are_documented_in_openapi(self, client):
+        schema = client.get("/openapi.json").json()["components"]["schemas"]["Terminal"]
+        properties = schema["properties"]
+        assert properties["input_gen"]["default"] == 0
+        assert "trust dialogs and special keys" in properties["input_gen"]["description"]
+        assert properties["status_gen"]["default"] == 0
+        assert "never treat 0 as fresh COMPLETED" in properties["status_gen"]["description"]
 
     def test_get_terminal_not_found(self, client):
         """GET /terminals/{id} returns 404 for nonexistent terminal."""

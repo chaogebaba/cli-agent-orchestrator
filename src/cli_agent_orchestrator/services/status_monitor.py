@@ -66,6 +66,9 @@ class StatusMonitor:
         # IDLE/COMPLETED would freeze the terminal forever even when the
         # agent is genuinely processing new work.
         self._allow_processing_revert: Dict[str, bool] = {}
+        self._input_gen: Dict[str, int] = {}
+        self._processing_gen: Dict[str, int] = {}
+        self._status_gen: Dict[str, int] = {}
         # --- pyte rendered-screen detection state (only used when CAO_PYTE_STATUS
         # is on AND the provider opts in via supports_screen_detection) ---
         # Per-terminal pyte Screen+Stream that composites the raw byte stream
@@ -248,13 +251,18 @@ class StatusMonitor:
                     return
 
             if detected == last:
+                if detected in _STICKY_READY_STATUSES:
+                    self._status_gen[terminal_id] = self._processing_gen.get(terminal_id, 0)
                 return
 
             self._last_status[terminal_id] = detected
             if detected == TerminalStatus.PROCESSING:
+                self._processing_gen[terminal_id] = self._input_gen.get(terminal_id, 0)
                 self._allow_processing_revert[terminal_id] = False
-            elif detected in _STICKY_READY_STATUSES and last not in _STICKY_READY_STATUSES:
-                self._allow_processing_revert[terminal_id] = False
+            elif detected in _STICKY_READY_STATUSES:
+                self._status_gen[terminal_id] = self._processing_gen.get(terminal_id, 0)
+                if last not in _STICKY_READY_STATUSES:
+                    self._allow_processing_revert[terminal_id] = False
 
         # Publish outside the lock — subscribers must never be able to
         # re-enter StatusMonitor while the latch state is mid-update.
@@ -665,7 +673,23 @@ class StatusMonitor:
         IDLE/COMPLETED would block the genuine PROCESSING transition.
         """
         with self._lock:
+            self._input_gen[terminal_id] = self._input_gen.get(terminal_id, 0) + 1
+            self._bump_chunk_seq_locked(terminal_id)
             self._allow_processing_revert[terminal_id] = True
+
+    def get_input_gen(self, terminal_id: str) -> int:
+        """Return the current input-event generation for a terminal."""
+        with self._lock:
+            return self._input_gen.get(terminal_id, 0)
+
+    def get_status_gen(self, terminal_id: str) -> Optional[int]:
+        """Return the ready-status generation, or None for event-inbox terminals."""
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        if get_backend().supports_event_inbox():
+            return None
+        with self._lock:
+            return self._status_gen.get(terminal_id, 0)
 
     def clear_rolling_buffer(self, terminal_id: str) -> None:
         """Clear ONLY the rolling byte buffer for a terminal — preserves
@@ -699,6 +723,9 @@ class StatusMonitor:
             self._buffers.pop(terminal_id, None)
             self._last_status.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
+            self._input_gen.pop(terminal_id, None)
+            self._processing_gen.pop(terminal_id, None)
+            self._status_gen.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
             self._screen_size_deferred_warned.discard(terminal_id)
             self._bursting.pop(terminal_id, None)
@@ -719,6 +746,9 @@ class StatusMonitor:
             self._buffers[terminal_id] = ""
             self._last_status.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
+            self._input_gen.pop(terminal_id, None)
+            self._processing_gen.pop(terminal_id, None)
+            self._status_gen.pop(terminal_id, None)
             # Drop the rendered screen too so the relaunched CLI mode is
             # detected against a fresh viewport, not the failed attempt's.
             self._screens.pop(terminal_id, None)

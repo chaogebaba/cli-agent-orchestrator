@@ -640,6 +640,8 @@ def get_terminal(terminal_id: str) -> Dict:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
         status = status_monitor.get_status(terminal_id).value
+        input_gen = status_monitor.get_input_gen(terminal_id)
+        status_gen = status_monitor.get_status_gen(terminal_id)
 
         return {
             "id": metadata["id"],
@@ -650,6 +652,8 @@ def get_terminal(terminal_id: str) -> Dict:
             "caller_id": metadata.get("caller_id"),
             "allowed_tools": metadata.get("allowed_tools"),
             "status": status,
+            "input_gen": input_gen,
+            "status_gen": 0 if status_gen is None else status_gen,
             "last_active": metadata["last_active"],
         }
 

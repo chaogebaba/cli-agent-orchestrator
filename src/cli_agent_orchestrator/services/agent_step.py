@@ -226,11 +226,16 @@ async def run_agent_step(
     # the whole server for other requests (same hazard as issue #382, which was
     # only fixed for DELETE /sessions). Any failure raises and propagates.
     await asyncio.to_thread(terminal_service.send_input, terminal_id, prompt)
+    # A concurrent input event between send and this read only makes the wait
+    # stricter; it cannot admit a stale completion.
+    input_gen = status_monitor.get_input_gen(terminal_id)
 
     # Wait for completion — IN-PROCESS poll of status_monitor (NOT the
     # HTTP-polling wait_until_terminal_status, which would reintroduce the
     # self-loopback the single-seam rule forbids). False => timeout => raise.
-    completed = await wait_until_status(terminal_id, TerminalStatus.COMPLETED, timeout=timeout)
+    completed = await wait_until_status(
+        terminal_id, TerminalStatus.COMPLETED, timeout=timeout, min_gen=input_gen
+    )
     if not completed:
         # Distinguish a hard ERROR end-state (worker crashed) from a plain
         # timeout (worker ran long): the caller must be able to tell them apart

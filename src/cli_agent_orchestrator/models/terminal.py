@@ -41,6 +41,20 @@ class Terminal(BaseModel):
     status: Optional[TerminalStatus] = Field(
         None, description="Current terminal status (live only)"
     )
+    input_gen: int = Field(
+        0,
+        description=(
+            "Input-event generation; trust dialogs and special keys also bump it. "
+            "On event-inbox terminals it may advance while status_gen stays 0."
+        ),
+    )
+    status_gen: int = Field(
+        0,
+        description=(
+            "Generation of the latest ready status after processing. On event-inbox "
+            "terminals it stays 0; clients must never treat 0 as fresh COMPLETED."
+        ),
+    )
     last_active: Optional[datetime] = Field(None, description="Last active timestamp")
 
 

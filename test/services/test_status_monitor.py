@@ -601,12 +601,18 @@ class TestStickyLatching:
         real PROCESSING wins."""
         m = _SequencedMonitor()
         m.feed(TerminalStatus.COMPLETED)
+        assert m.sm.get_status_gen("t1") == 0
         m.sm.notify_input_sent("t1")
+        new_gen = m.sm.get_input_gen("t1")
         m.feed(TerminalStatus.UNKNOWN)  # torn rising-edge frame after the paste
         m.feed(TerminalStatus.COMPLETED)  # prior turn re-rendered at quiescence
+        assert m.sm.get_status_gen("t1") < new_gen
         m.feed(TerminalStatus.PROCESSING)  # genuine new-turn processing
-        assert m.status() == TerminalStatus.PROCESSING
-        assert m.published == ["completed", "processing"]
+        assert m.sm.get_status_gen("t1") < new_gen
+        m.feed(TerminalStatus.COMPLETED)
+        assert m.sm.get_status_gen("t1") == new_gen
+        assert m.status() == TerminalStatus.COMPLETED
+        assert m.published == ["completed", "processing", "completed"]
 
     def test_initial_unknown_is_published(self):
         """The first detection (last is None) may legitimately be UNKNOWN —
@@ -615,6 +621,65 @@ class TestStickyLatching:
         m.feed(TerminalStatus.UNKNOWN)
         assert m.status() == TerminalStatus.UNKNOWN
         assert m.published == ["unknown"]
+
+
+class TestStatusGenerations:
+    def test_processing_edge_then_ready_stamps_input_generation(self):
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.COMPLETED)
+        m.sm.notify_input_sent("t1")
+        gen = m.sm.get_input_gen("t1")
+        m.feed(TerminalStatus.COMPLETED)  # accepted no-change redraw, still stale
+        assert m.sm.get_status_gen("t1") < gen
+        m.feed(TerminalStatus.PROCESSING)
+        assert m.sm._processing_gen["t1"] == gen
+        assert m.sm.get_status_gen("t1") < gen
+        m.feed(TerminalStatus.COMPLETED)
+        assert m.sm.get_status_gen("t1") == gen
+
+    def test_notify_invalidates_detection_computed_at_live_sequence(self):
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.COMPLETED)
+        detection_seq = m.sm._chunk_seq["t1"]
+        m.sm.notify_input_sent("t1")
+        gen = m.sm.get_input_gen("t1")
+        assert m.sm._chunk_seq["t1"] > detection_seq
+
+        # This detection was computed before the send but only reached the
+        # apply boundary afterward. The send-time sequence bump must reject it.
+        m.sm._apply_detection(
+            "t1", TerminalStatus.PROCESSING, expected_seq=detection_seq
+        )
+        assert m.sm._processing_gen.get("t1", 0) < gen
+
+    def test_unknown_rejection_stamps_nothing(self):
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.COMPLETED)
+        m.sm.notify_input_sent("t1")
+        gen = m.sm.get_input_gen("t1")
+        m.feed(TerminalStatus.UNKNOWN)
+        assert m.sm.get_status_gen("t1") < gen
+
+    def test_generation_lifecycle(self):
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")
+        sm._processing_gen["t1"] = 1
+        sm._status_gen["t1"] = 1
+        sm.clear_rolling_buffer("t1")
+        assert (sm.get_input_gen("t1"), sm._processing_gen["t1"], sm._status_gen["t1"]) == (1, 1, 1)
+        sm.reset_buffer("t1")
+        assert sm.get_input_gen("t1") == 0
+        assert "t1" not in sm._processing_gen and "t1" not in sm._status_gen
+        sm.notify_input_sent("t1")
+        sm.clear_terminal("t1")
+        assert sm.get_input_gen("t1") == 0
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_event_inbox_has_no_status_generation(self, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=True)
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")
+        assert sm.get_status_gen("t1") is None
 
 
 class TestQuiescenceTimerCancel:

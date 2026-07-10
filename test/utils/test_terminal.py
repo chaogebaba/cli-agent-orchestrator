@@ -311,6 +311,37 @@ class TestWaitUntilStatus:
 
         assert result is True
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_min_gen_rejects_stale_then_accepts_fresh_status(self, mock_monitor):
+        mock_monitor.get_status.return_value = TerminalStatus.COMPLETED
+        mock_monitor.get_status_gen.side_effect = [3, 4]
+        result = await wait_until_status(
+            "test-terminal", TerminalStatus.COMPLETED, timeout=1.0,
+            polling_interval=0.01, min_gen=4,
+        )
+        assert result is True
+        assert mock_monitor.get_status_gen.call_count == 2
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_min_gen_fast_turn_without_processing_times_out(self, mock_monitor):
+        mock_monitor.get_status.return_value = TerminalStatus.COMPLETED
+        mock_monitor.get_status_gen.return_value = 3
+        assert await wait_until_status(
+            "test-terminal", TerminalStatus.COMPLETED, timeout=0.03,
+            polling_interval=0.01, min_gen=4,
+        ) is False
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_min_gen_event_inbox_falls_back_to_level_semantics(self, mock_monitor):
+        mock_monitor.get_status.return_value = TerminalStatus.COMPLETED
+        mock_monitor.get_status_gen.return_value = None
+        assert await wait_until_status(
+            "test-terminal", TerminalStatus.COMPLETED, timeout=1.0, min_gen=9
+        ) is True
+
 
 class TestWaitUntilTerminalStatus:
     """Tests for wait_until_terminal_status function."""

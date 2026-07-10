@@ -108,6 +108,27 @@ class TestHappyPath:
         m_exit.assert_not_called()
         m_send.assert_called_once_with("reuse99", "x")
 
+    def test_reads_generation_after_send_and_threads_min_gen(self):
+        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+            wait_results=(True,)
+        )
+        events = []
+        with (
+            create,
+            send as m_send,
+            delete,
+            get_output,
+            exit_cli,
+            wait as m_wait,
+            status,
+            patch(f"{_MODULE}.status_monitor.get_input_gen", return_value=7) as m_gen,
+        ):
+            m_send.side_effect = lambda *_args: events.append("send") or True
+            m_gen.side_effect = lambda *_args: events.append("gen") or 7
+            asyncio.run(run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99"))
+        assert events == ["send", "gen"]
+        assert m_wait.await_args.kwargs["min_gen"] == 7
+
     def test_working_directory_forwarded_to_create(self):
         create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
         with create as m_create, send, delete, get_output, exit_cli, wait, status:

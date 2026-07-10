@@ -162,13 +162,17 @@ async def wait_until_status(
     target_status: "TerminalStatus | set[TerminalStatus]",
     timeout: float = 30.0,
     polling_interval: float = 1.0,
+    min_gen: int | None = None,
 ) -> bool:
     """Wait until terminal reaches target status by polling status_monitor.
 
     status_monitor.get_status() is backend-aware: for pipe-pane backends (tmux)
     it returns the pushed pipeline status, and for event-inbox backends (herdr)
     it derives status on demand from the provider's native status. So this poll
-    works for both backends without special-casing here.
+    works for both backends without special-casing here. When ``min_gen`` is
+    set, pipe-pane terminals also require a ready-status generation at least
+    that new; event-inbox terminals have no generation tracking and retain
+    level semantics.
     """
     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
@@ -180,7 +184,8 @@ async def wait_until_status(
     start = time.time()
     while time.time() - start < timeout:
         current = status_monitor.get_status(terminal_id)
-        if current in targets:
+        status_gen = status_monitor.get_status_gen(terminal_id) if min_gen is not None else None
+        if current in targets and (min_gen is None or status_gen is None or status_gen >= min_gen):
             logger.info(f"wait_until_status [{terminal_id}]: reached {current.value}")
             return True
         await asyncio.sleep(polling_interval)
