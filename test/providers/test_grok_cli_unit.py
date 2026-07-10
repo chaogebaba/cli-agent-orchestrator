@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -75,6 +76,85 @@ def test_grok_status_processing_minimal() -> None:
 """
 
     assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+
+def test_grok_screen_status_processing_from_real_tool_capture() -> None:
+    fixture = (
+        Path(__file__).parents[1] / "fixtures" / "fx4" / "fx4-grok-toollist-capture.txt"
+    )
+    screen = [
+        line
+        for line in fixture.read_text(encoding="utf-8").splitlines()
+        if not line.startswith("#")
+    ]
+
+    assert _provider().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+
+
+def test_grok_screen_status_processing_from_topanchored_capture() -> None:
+    fixture = (
+        Path(__file__).parents[1]
+        / "fixtures"
+        / "fx5"
+        / "fx5-topanchored-capture.txt"
+    )
+    screen = fixture.read_text(encoding="utf-8").splitlines()
+
+    assert _provider().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+
+
+def test_grok_screen_status_processing_thinking_spinner() -> None:
+    screen = [
+        "⠋ Thinking… 1.0s",
+        "❯",
+        "Grok 4.5 (high) · always-approve · ctrl+o transcript",
+    ]
+
+    assert _provider().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+
+
+def test_grok_screen_status_idle_footer_without_spinner() -> None:
+    screen = ["❯", "Grok 4.5 (high) · always-approve · ctrl+o transcript"]
+
+    assert _provider().get_status_from_screen(screen) == TerminalStatus.IDLE
+
+
+def test_grok_screen_status_completed_marker_with_idle_footer() -> None:
+    screen = [
+        "Turn completed in 1.5s.",
+        "❯",
+        "Grok 4.5 (high) · always-approve · ctrl+o transcript",
+    ]
+
+    assert _provider().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
+
+def test_grok_screen_status_quoted_spinner_line_is_processing() -> None:
+    screen = [
+        "Quoted capture follows:",
+        "⠴ Locate cao-worker-protocols skill… 1.9s",
+        "❯",
+        "Grok 4.5 (high) · always-approve · ctrl+o transcript",
+    ]
+
+    assert _provider().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+
+
+def test_grok_screen_status_spinner_outside_bottom_twelve_is_idle() -> None:
+    screen = ["⠴ Old tool run… 1.9s", *[f"output row {i}" for i in range(11)]]
+    screen.extend(["❯", "Grok 4.5 (high) · always-approve · ctrl+o transcript"])
+
+    assert _provider().get_status_from_screen(screen) == TerminalStatus.IDLE
+
+
+def test_grok_screen_status_glyph_only_line_above_prompt_is_idle() -> None:
+    screen = [
+        "⠴",
+        "❯",
+        "Grok 4.5 (high) · always-approve · ctrl+o transcript",
+    ]
+
+    assert _provider().get_status_from_screen(screen) == TerminalStatus.IDLE
 
 
 def test_grok_status_completed_minimal() -> None:

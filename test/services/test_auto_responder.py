@@ -16,7 +16,7 @@ class FakeProvider:
     supports_screen_detection = True
 
     def get_status_from_screen(self, _lines):
-        return TerminalStatus.PROCESSING
+        return TerminalStatus.UNKNOWN
 
 
 class SyncThread:
@@ -358,7 +358,7 @@ def test_grok_tool_list_capture_is_suppressed_by_real_parser(monkeypatch, _reset
     provider = _grok_provider()
 
     assert ar.AutoResponder._looks_like_dialog(ar.normalize_screen(screen), "grok_cli")
-    assert provider.get_status_from_screen(screen) == TerminalStatus.IDLE
+    assert provider.get_status_from_screen(screen) == TerminalStatus.PROCESSING
     assert _reset_engine.on_screen("term1", provider, screen) is None
     assert pushed == []
 
@@ -386,7 +386,7 @@ def test_multi_press_enter_uses_later_adjacent_option():
 
 
 @pytest.mark.parametrize(
-    ("provider_name", "provider_factory", "screen", "expected_status"),
+    ("provider_name", "provider_factory", "screen", "expected_status", "fires"),
     [
         (
             "codex",
@@ -398,12 +398,14 @@ def test_multi_press_enter_uses_later_adjacent_option():
                 "• Working (1s • esc to interrupt)",
             ],
             TerminalStatus.PROCESSING,
+            False,
         ),
         (
             "grok_cli",
             _grok_provider,
             ["Unknown prompt", "1. Continue", "2. Cancel", "Press enter to choose"],
             TerminalStatus.UNKNOWN,
+            True,
         ),
         (
             "grok_cli",
@@ -415,6 +417,7 @@ def test_multi_press_enter_uses_later_adjacent_option():
                 "Press enter to choose  Enter:submit",
             ],
             TerminalStatus.WAITING_USER_ANSWER,
+            True,
         ),
     ],
 )
@@ -425,17 +428,20 @@ def test_genuine_unknown_non_ready_real_parsers_push_once(
     provider_factory,
     screen,
     expected_status,
+    fires,
 ):
     _wire_common(monkeypatch, metadata=_metadata(provider=provider_name))
     pushed = _capture_pushes(monkeypatch)
     provider = provider_factory()
 
     assert provider.get_status_from_screen(screen) == expected_status
-    assert (
-        _reset_engine.on_screen("term1", provider, screen)
-        == TerminalStatus.WAITING_USER_ANSWER
-    )
-    assert len(pushed) == 1
+    result = _reset_engine.on_screen("term1", provider, screen)
+    if fires:
+        assert result == TerminalStatus.WAITING_USER_ANSWER
+        assert len(pushed) == 1
+    else:
+        assert result is None
+        assert pushed == []
 
 
 def test_provider_parser_exception_is_treated_as_non_ready(monkeypatch, _reset_engine):
@@ -475,7 +481,7 @@ def test_codex_waiting_prompt_leading_branch_and_nonleading_generic_fallback(
     assert len(pushed) == 1
 
 
-def test_single_torn_codex_frame_opens_then_two_non_suspect_frames_close(
+def test_single_torn_codex_processing_frame_is_suppressed(
     monkeypatch, _reset_engine
 ):
     _wire_common(monkeypatch)
@@ -489,17 +495,9 @@ def test_single_torn_codex_frame_opens_then_two_non_suspect_frames_close(
     ]
 
     assert provider.get_status_from_screen(torn) == TerminalStatus.PROCESSING
-    assert (
-        _reset_engine.on_screen("term1", provider, torn)
-        == TerminalStatus.WAITING_USER_ANSWER
-    )
-    assert len(pushed) == 1
-    assert (
-        _reset_engine.on_screen("term1", provider, ["ordinary output"])
-        == TerminalStatus.WAITING_USER_ANSWER
-    )
-    assert _reset_engine.on_screen("term1", provider, ["ordinary output"]) is None
-    assert not _reset_engine._unknown_state["term1"].episode_open
+    assert _reset_engine.on_screen("term1", provider, torn) is None
+    assert pushed == []
+    assert "term1" not in _reset_engine._unknown_state
 
 
 def test_genuine_codex_menu_with_idle_footer_is_suppressed(monkeypatch, _reset_engine):

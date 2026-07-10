@@ -8,9 +8,10 @@ outer cli-subagents repo for the full design.
 Scope is intentionally narrow: only dialogs matching a rule the supervisor
 (or a human) has authored in ``~/.aws/cli-agent-orchestrator/auto-answers/
 <provider>.yaml`` are ever auto-answered. An unmatched screen is suspect only
-when dialog markers are close together and the provider parser reports a
-non-ready status. This deliberately errs toward silence for novel dialogs that
-parse as IDLE or COMPLETED; the stalled-callback watchdog remains the fallback.
+when dialog markers are close together. The unknown-dialog gate fires only on
+WAITING_USER_ANSWER / UNKNOWN / ERROR. This deliberately errs toward silence
+for novel dialogs that parse otherwise; the stalled-callback watchdog remains
+the fallback.
 Usage-reset prompts are dismiss-only by design — no rule may consume ``/usage``
 on the user's behalf.
 
@@ -367,7 +368,11 @@ class AutoResponder:
         if is_suspect:
             try:
                 status = provider.get_status_from_screen(lines)
-                is_suspect = status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
+                is_suspect = status in (
+                    TerminalStatus.WAITING_USER_ANSWER,
+                    TerminalStatus.UNKNOWN,
+                    TerminalStatus.ERROR,
+                )
             except Exception:
                 logger.debug(
                     "auto-responder: provider status parse failed for %s",

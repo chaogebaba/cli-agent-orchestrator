@@ -38,6 +38,7 @@ PROCESSING_PATTERN = (
     r"Waiting for response…"
     r"|Waiting for response\.\.\."
     r"|^\s*(?:⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏)?\s*(?:Thinking|Responding)\b"
+    r"|^[^\S\r\n]*(?:⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏)[^\S\r\n]+\S"
     r"| - (?:Waiting for response|Thinking|Responding) - "
 )
 COMPLETION_PATTERN = r"Turn completed in [\d.]+s\."
@@ -267,6 +268,8 @@ class GrokCliProvider(BaseProvider):
 
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         rows = [line.rstrip() for line in screen_lines]
+        while rows and not rows[-1].strip():
+            rows.pop()
         joined = "\n".join(rows)
         if not joined.strip():
             return TerminalStatus.UNKNOWN
