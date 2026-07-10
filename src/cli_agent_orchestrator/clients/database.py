@@ -664,6 +664,19 @@ def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
         return [row[0] for row in rows]
 
 
+def list_pending_receiver_ids() -> List[str]:
+    """List terminal IDs having at least one pending inbox message."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(InboxModel.receiver_id)
+            .join(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
+            .filter(InboxModel.status == MessageStatus.PENDING.value)
+            .distinct()
+            .all()
+        )
+        return [row[0] for row in rows]
+
+
 def delete_terminal(terminal_id: str) -> bool:
     """Delete terminal metadata."""
     with SessionLocal() as db:

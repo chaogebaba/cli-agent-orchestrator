@@ -805,3 +805,80 @@ def test_seed_file_created_once_and_never_overwritten(tmp_path, monkeypatch):
     ar._rules_path("codex")  # must not overwrite
     assert "custom" in path.read_text()
     assert "codex-usage-resets" not in path.read_text()
+
+
+class TestWaitingGate:
+    def test_wait_rule_match_sets_gate_and_nonmatching_tick_clears(
+        self, monkeypatch, _reset_engine
+    ):
+        _wire_common(monkeypatch)
+        monkeypatch.setattr(
+            ar._store,
+            "get_rules",
+            lambda provider: [ar.Rule("r", True, "contains", "danger", [], "wait")],
+        )
+
+        assert (
+            _reset_engine.on_screen("term1", FakeProvider(), ["danger zone"])
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+        assert _reset_engine.waiting_gate("term1") == "wait_rule"
+
+        _reset_engine.on_screen("term1", FakeProvider(), ["ordinary output"])
+        assert _reset_engine.waiting_gate("term1") is None
+
+    def test_unknown_episode_open_and_closed_reflects_gate(self, monkeypatch, _reset_engine):
+        _wire_common(monkeypatch)
+        monkeypatch.setattr(ar._store, "get_rules", lambda provider: [])
+        monkeypatch.setattr(ar.AutoResponder, "_push", lambda self, *args: None)
+        suspect = ["1. Continue", "2. Cancel", "Press enter to choose"]
+
+        _reset_engine.on_screen("term1", FakeProvider(), suspect)
+        assert _reset_engine.waiting_gate("term1") == "unknown_dialog"
+        _reset_engine.on_screen("term1", FakeProvider(), ["ordinary output"])
+        assert _reset_engine.waiting_gate("term1") == "unknown_dialog"
+        _reset_engine.on_screen("term1", FakeProvider(), ["ordinary output"])
+        assert _reset_engine.waiting_gate("term1") is None
+
+    def test_retry_exhausted_gate_clears_only_on_published_non_waiting(
+        self, monkeypatch, _reset_engine
+    ):
+        metadata = _metadata()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor.force_status",
+            lambda tid, status: None,
+        )
+        monkeypatch.setattr(ar.AutoResponder, "_push", lambda self, *args: None)
+        rule = ar.Rule("r", True, "contains", "trust", ["ok"], ["Enter"])
+
+        _reset_engine._surface_retry_exhausted("term1", metadata, rule)
+        assert _reset_engine.waiting_gate("term1") == "retry_exhausted"
+        _reset_engine.record_published_status("term1", TerminalStatus.WAITING_USER_ANSWER)
+        assert _reset_engine.waiting_gate("term1") == "retry_exhausted"
+        _reset_engine.record_published_status("term1", TerminalStatus.PROCESSING)
+        assert _reset_engine.waiting_gate("term1") is None
+
+    def test_unknown_terminal_has_no_gate(self, _reset_engine):
+        assert _reset_engine.waiting_gate("missing") is None
+
+    def test_clear_terminal_empties_all_waiting_gate_states(self, _reset_engine):
+        _reset_engine._wait_rule_active.add("term1")
+        _reset_engine._retry_exhausted.add("term1")
+        _reset_engine._unknown_state["term1"] = ar._UnknownDialogState(episode_open=True)
+
+        _reset_engine.clear_terminal("term1")
+
+        assert "term1" not in _reset_engine._wait_rule_active
+        assert "term1" not in _reset_engine._retry_exhausted
+        assert "term1" not in _reset_engine._unknown_state
+
+    def test_record_published_status_never_raises(self, caplog, _reset_engine):
+        class RaisingSet(set):
+            def discard(self, value):
+                raise RuntimeError("discard failed")
+
+        _reset_engine._retry_exhausted = RaisingSet({"term1"})
+
+        _reset_engine.record_published_status("term1", TerminalStatus.PROCESSING)
+
+        assert "failed to record published status" in caplog.text

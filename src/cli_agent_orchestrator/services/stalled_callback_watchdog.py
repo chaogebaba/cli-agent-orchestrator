@@ -10,8 +10,16 @@ import threading
 import time
 from dataclasses import dataclass
 
-from cli_agent_orchestrator.clients.database import create_inbox_message, get_terminal_metadata
-from cli_agent_orchestrator.constants import STALLED_CALLBACK_GRACE_SECONDS
+from cli_agent_orchestrator.clients.database import (
+    create_inbox_message,
+    get_terminal_metadata,
+    list_pending_receiver_ids,
+)
+from cli_agent_orchestrator.constants import (
+    CAO_WAITING_INBOX_GRACE_SECONDS,
+    STALLED_CALLBACK_GRACE_SECONDS,
+    WAITING_INBOX_PUSH_FLOOR_S,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.services.event_bus import bus
@@ -49,11 +57,19 @@ class _Episode:
     last_screen_fp: str | None = None
 
 
+@dataclass
+class WaitingInboxEpisode:
+    waiting_since: float
+    fired: bool = False
+
+
 class StalledCallbackWatchdog:
     def __init__(self, grace_seconds: int = STALLED_CALLBACK_GRACE_SECONDS) -> None:
         self.grace_seconds = grace_seconds
         self._lock = threading.RLock()
         self._episodes: dict[str, _Episode] = {}
+        self._waiting_inbox_episodes: dict[str, WaitingInboxEpisode] = {}
+        self._waiting_inbox_last_push: dict[str, float] = {}
 
     def record_inbound_task(self, terminal_id: str, caller_id: str, profile: str) -> None:
         now = time.monotonic()
@@ -71,6 +87,8 @@ class StalledCallbackWatchdog:
     def clear_terminal(self, terminal_id: str) -> None:
         with self._lock:
             self._episodes.pop(terminal_id, None)
+            self._waiting_inbox_episodes.pop(terminal_id, None)
+            self._waiting_inbox_last_push.pop(terminal_id, None)
 
     def record_callback_if_to_caller(self, sender_id: str, receiver_id: str) -> None:
         meta = get_terminal_metadata(sender_id)
@@ -221,6 +239,93 @@ class StalledCallbackWatchdog:
             except Exception:
                 logger.exception("Failed to push stalled-callback watchdog notification")
 
+    def tick_waiting_inbox(
+        self,
+        registry: PluginRegistry | None = None,
+        now: float | None = None,
+    ) -> None:
+        from cli_agent_orchestrator.services.auto_responder import auto_responder
+        from cli_agent_orchestrator.services.inbox_service import inbox_service
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        now = time.monotonic() if now is None else now
+        pending_ids = set(list_pending_receiver_ids())
+        with self._lock:
+            for terminal_id in set(self._waiting_inbox_episodes) - pending_ids:
+                self._waiting_inbox_episodes.pop(terminal_id, None)
+
+        for terminal_id in pending_ids:
+            metadata = get_terminal_metadata(terminal_id)
+            if metadata is None:
+                with self._lock:
+                    self._waiting_inbox_episodes.pop(terminal_id, None)
+                continue
+
+            status = status_monitor.get_status(terminal_id)
+            if status != TerminalStatus.WAITING_USER_ANSWER:
+                with self._lock:
+                    self._waiting_inbox_episodes.pop(terminal_id, None)
+                continue
+
+            with self._lock:
+                episode = self._waiting_inbox_episodes.get(terminal_id)
+                if episode is None:
+                    self._waiting_inbox_episodes[terminal_id] = WaitingInboxEpisode(
+                        waiting_since=now
+                    )
+                    continue
+                if episode.fired:
+                    continue
+                if now - episode.waiting_since < CAO_WAITING_INBOX_GRACE_SECONDS:
+                    continue
+
+            if auto_responder.waiting_gate(terminal_id) is not None:
+                continue
+
+            caller_id = metadata.get("caller_id")
+            if not caller_id or caller_id == terminal_id:
+                logger.warning(
+                    "waiting-inbox watchdog: refusing invalid caller for terminal %s",
+                    terminal_id,
+                )
+                with self._lock:
+                    current = self._waiting_inbox_episodes.get(terminal_id)
+                    if current is episode:
+                        current.fired = True
+                continue
+
+            with self._lock:
+                if (
+                    now - self._waiting_inbox_last_push.get(terminal_id, float("-inf"))
+                    < WAITING_INBOX_PUSH_FLOOR_S
+                ):
+                    continue
+                current = self._waiting_inbox_episodes.get(terminal_id)
+                if current is not episode or current.fired:
+                    continue
+                current.fired = True
+                self._waiting_inbox_last_push[terminal_id] = now
+
+            age = int(now - episode.waiting_since)
+            name = metadata.get("agent_profile") or "unknown"
+            message = (
+                f"[waiting-inbox watchdog] terminal {terminal_id} ({name}) has had pending "
+                f"inbox messages while status=waiting_user_answer for {age}s with no "
+                "auto-responder episode open — it may be stuck on an unrecognized dialog "
+                "or a false-WAITING parse. Peek it (peek_terminal / tmux attach) and nudge "
+                "or answer manually. This alert fires at most once per stuck episode "
+                "(floor 300s)."
+            )
+            try:
+                create_inbox_message(f"watchdog:{terminal_id}", caller_id, message)
+                inbox_service.deliver_pending(caller_id, registry=registry)
+            except Exception:
+                logger.warning(
+                    "Failed to push waiting-inbox watchdog notification for %s",
+                    terminal_id,
+                    exc_info=True,
+                )
+
     async def run(self, registry: PluginRegistry | None = None) -> None:
         queue = bus.subscribe("terminal.*.status")
         logger.info("StalledCallbackWatchdog started")
@@ -240,6 +345,7 @@ class StalledCallbackWatchdog:
                 await asyncio.to_thread(self.poll_unarmed_statuses)
                 await asyncio.to_thread(self.refresh_screen_fingerprints)
                 await asyncio.to_thread(self.notify_due, registry)
+                await asyncio.to_thread(self.tick_waiting_inbox, registry)
             except Exception:
                 logger.exception("StalledCallbackWatchdog error")
 

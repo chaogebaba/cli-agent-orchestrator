@@ -201,6 +201,44 @@ class AutoResponder:
         self._lock = threading.Lock()
         self._rule_state: Dict[tuple, _RuleState] = {}
         self._unknown_state: Dict[str, _UnknownDialogState] = {}
+        self._wait_rule_active: set[str] = set()
+        self._retry_exhausted: set[str] = set()
+
+    def waiting_gate(self, terminal_id: str) -> str | None:
+        with self._lock:
+            state = self._unknown_state.get(terminal_id)
+            if state is not None and state.episode_open:
+                return "unknown_dialog"
+            if terminal_id in self._wait_rule_active:
+                return "wait_rule"
+            if terminal_id in self._retry_exhausted:
+                return "retry_exhausted"
+            return None
+
+    def record_published_status(self, terminal_id: str, status: TerminalStatus) -> None:
+        try:
+            with self._lock:
+                if status != TerminalStatus.WAITING_USER_ANSWER:
+                    self._retry_exhausted.discard(terminal_id)
+        except BaseException:
+            try:
+                logger.warning(
+                    "auto-responder: failed to record published status for %s",
+                    terminal_id,
+                    exc_info=True,
+                )
+            except BaseException:
+                pass
+
+    def clear_terminal(self, terminal_id: str) -> None:
+        with self._lock:
+            self._wait_rule_active.discard(terminal_id)
+            self._retry_exhausted.discard(terminal_id)
+            self._unknown_state.pop(terminal_id, None)
+
+    def _clear_wait_rule(self, terminal_id: str) -> None:
+        with self._lock:
+            self._wait_rule_active.discard(terminal_id)
 
     def on_screen(
         self, terminal_id: str, provider: Any, lines: List[str]
@@ -211,12 +249,15 @@ class AutoResponder:
         provider detection. Never raises.
         """
         if os.environ.get("CAO_AUTO_ANSWER", "true").lower() == "false":
+            self._clear_wait_rule(terminal_id)
             return None
         if not getattr(provider, "supports_screen_detection", False):
+            self._clear_wait_rule(terminal_id)
             return None
         try:
             return self._on_screen(terminal_id, provider, lines)
         except Exception:
+            self._clear_wait_rule(terminal_id)
             logger.exception("auto-responder: error handling terminal %s", terminal_id)
             return None
 
@@ -228,6 +269,7 @@ class AutoResponder:
 
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
+            self._clear_wait_rule(terminal_id)
             return None
 
         # Per-terminal opt-out via ``cao launch --env CAO_AUTO_ANSWER=false``.
@@ -237,28 +279,35 @@ class AutoResponder:
         # session-wide for multi-window sessions.
         session_env = get_session_env(metadata["tmux_session"])
         if session_env.get("CAO_AUTO_ANSWER", "true").lower() == "false":
+            self._clear_wait_rule(terminal_id)
             return None
 
         if self._find_supervisor(metadata["tmux_session"]) == terminal_id:
+            self._clear_wait_rule(terminal_id)
             logger.debug("auto-responder: skipping supervisor terminal %s", terminal_id)
             return None
 
         provider_name = metadata["provider"]
         normalized = normalize_screen(lines)
         if not normalized:
+            self._clear_wait_rule(terminal_id)
             return None
 
         for rule in _store.get_rules(provider_name):
             if not rule.matches(normalized):
                 continue
             if rule.is_wait:
+                with self._lock:
+                    self._wait_rule_active.add(terminal_id)
                 return TerminalStatus.WAITING_USER_ANSWER
+            self._clear_wait_rule(terminal_id)
             state = self._state_for(terminal_id, rule.name)
             if time.monotonic() < state.cooldown_until:
                 return None  # redraw double-fire guard
             self._fire(terminal_id, metadata, rule, normalized, state)
             return None
 
+        self._clear_wait_rule(terminal_id)
         return self._check_unknown(
             terminal_id, metadata, provider_name, provider, lines, normalized
         )
@@ -346,6 +395,8 @@ class AutoResponder:
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         status_monitor.force_status(terminal_id, TerminalStatus.WAITING_USER_ANSWER)
+        with self._lock:
+            self._retry_exhausted.add(terminal_id)
         self._push(
             terminal_id,
             metadata,

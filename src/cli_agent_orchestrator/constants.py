@@ -150,6 +150,12 @@ INBOX_RECONCILE_GRACE_SECONDS = 30
 # caller-only notification after this grace window.
 STALLED_CALLBACK_GRACE_SECONDS = _env_int("CAO_STALLED_CALLBACK_GRACE_SECONDS", 120)
 
+# Pending-inbox WAITING watchdog. A terminal that remains in
+# WAITING_USER_ANSWER with queued messages and no legitimate auto-responder
+# gate gets one caller-only notification after this grace window.
+CAO_WAITING_INBOX_GRACE_SECONDS = _env_int("CAO_WAITING_INBOX_GRACE_SECONDS", 120)
+WAITING_INBOX_PUSH_FLOOR_S = 300
+
 # =============================================================================
 # Cleanup Service Configuration
 # =============================================================================

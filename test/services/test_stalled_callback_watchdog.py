@@ -1,4 +1,7 @@
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.stalled_callback_watchdog import StalledCallbackWatchdog
@@ -275,3 +278,273 @@ def test_notify_due_sends_only_to_caller():
 
     mock_create.assert_called_once_with("watchdog:worker1", "caller1", "notice")
     mock_deliver.assert_called_once_with("caller1", registry=None)
+
+
+@contextmanager
+def _waiting_inbox_fakes(
+    *,
+    pending=None,
+    metadata=None,
+    status=TerminalStatus.WAITING_USER_ANSWER,
+    gate=None,
+):
+    pending = ["worker1"] if pending is None else pending
+    metadata = (
+        {
+            "id": "worker1",
+            "caller_id": "caller1",
+            "agent_profile": "developer",
+        }
+        if metadata is None
+        else metadata
+    )
+    with (
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "list_pending_receiver_ids",
+            return_value=pending,
+        ) as mock_pending,
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog." "get_terminal_metadata",
+            return_value=metadata,
+        ) as mock_metadata,
+        patch(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
+            return_value=status,
+        ) as mock_status,
+        patch(
+            "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
+            return_value=gate,
+        ) as mock_gate,
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog." "create_inbox_message"
+        ) as mock_create,
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending"
+        ) as mock_deliver,
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "CAO_WAITING_INBOX_GRACE_SECONDS",
+            10,
+        ),
+    ):
+        yield {
+            "pending": mock_pending,
+            "metadata": mock_metadata,
+            "status": mock_status,
+            "gate": mock_gate,
+            "create": mock_create,
+            "deliver": mock_deliver,
+        }
+
+
+class TestWaitingInboxAlert:
+    def test_a_waiting_pending_below_grace_does_not_push(self):
+        svc = StalledCallbackWatchdog()
+        with _waiting_inbox_fakes() as fakes:
+            svc.tick_waiting_inbox(now=100.0)
+            svc.tick_waiting_inbox(now=109.0)
+
+        assert svc._waiting_inbox_episodes["worker1"].waiting_since == 100.0
+        fakes["create"].assert_not_called()
+
+    def test_b_crossing_grace_pushes_exactly_once_to_caller(self):
+        svc = StalledCallbackWatchdog()
+        metadata = {"id": "worker1", "caller_id": "caller1", "agent_profile": None}
+        with _waiting_inbox_fakes(metadata=metadata) as fakes:
+            svc.tick_waiting_inbox(now=100.0)
+            svc.tick_waiting_inbox(now=110.0)
+
+        fakes["create"].assert_called_once()
+        sender_id, caller_id, message = fakes["create"].call_args.args
+        assert sender_id == "watchdog:worker1"
+        assert caller_id == "caller1"
+        assert "[waiting-inbox watchdog] terminal worker1 (unknown)" in message
+        assert "for 10s" in message
+        fakes["deliver"].assert_called_once_with("caller1", registry=None)
+
+    def test_c_fired_episode_does_not_push_twice(self):
+        svc = StalledCallbackWatchdog()
+        with _waiting_inbox_fakes() as fakes:
+            svc.tick_waiting_inbox(now=100.0)
+            svc.tick_waiting_inbox(now=110.0)
+            svc.tick_waiting_inbox(now=200.0)
+
+        fakes["create"].assert_called_once()
+
+    def test_d_pending_rows_changing_during_wait_do_not_reopen_episode(self):
+        svc = StalledCallbackWatchdog()
+        with _waiting_inbox_fakes() as fakes:
+            fakes["pending"].side_effect = [
+                ["worker1"],
+                ["worker1", "worker1"],
+                ["worker1"],
+                ["worker1", "worker1"],
+            ]
+            svc.tick_waiting_inbox(now=100.0)
+            svc.tick_waiting_inbox(now=105.0)
+            svc.tick_waiting_inbox(now=110.0)
+            svc.tick_waiting_inbox(now=200.0)
+
+        fakes["create"].assert_called_once()
+
+    def test_e_drain_closes_episode_and_new_episode_obeys_push_floor(self):
+        svc = StalledCallbackWatchdog()
+        with _waiting_inbox_fakes() as fakes:
+            fakes["pending"].side_effect = [
+                ["worker1"],
+                ["worker1"],
+                [],
+                ["worker1"],
+                ["worker1"],
+                ["worker1"],
+            ]
+            svc.tick_waiting_inbox(now=100.0)
+            svc.tick_waiting_inbox(now=110.0)
+            svc.tick_waiting_inbox(now=111.0)
+            assert "worker1" not in svc._waiting_inbox_episodes
+            assert svc._waiting_inbox_last_push["worker1"] == 110.0
+            svc.tick_waiting_inbox(now=120.0)
+            svc.tick_waiting_inbox(now=130.0)
+            assert fakes["create"].call_count == 1
+            assert not svc._waiting_inbox_episodes["worker1"].fired
+            svc.tick_waiting_inbox(now=411.0)
+
+        assert fakes["create"].call_count == 2
+
+    def test_f_waiting_flap_resets_waiting_since(self):
+        svc = StalledCallbackWatchdog()
+        with _waiting_inbox_fakes() as fakes:
+            fakes["status"].side_effect = [
+                TerminalStatus.WAITING_USER_ANSWER,
+                TerminalStatus.PROCESSING,
+                TerminalStatus.WAITING_USER_ANSWER,
+                TerminalStatus.WAITING_USER_ANSWER,
+                TerminalStatus.WAITING_USER_ANSWER,
+            ]
+            svc.tick_waiting_inbox(now=100.0)
+            svc.tick_waiting_inbox(now=105.0)
+            svc.tick_waiting_inbox(now=106.0)
+            svc.tick_waiting_inbox(now=115.0)
+            assert fakes["create"].call_count == 0
+            svc.tick_waiting_inbox(now=116.0)
+
+        assert fakes["create"].call_count == 1
+
+    @pytest.mark.parametrize("gate", ["unknown_dialog", "wait_rule", "retry_exhausted"])
+    def test_g_each_waiting_gate_suppresses_push(self, gate):
+        svc = StalledCallbackWatchdog()
+        with _waiting_inbox_fakes(gate=gate) as fakes:
+            svc.tick_waiting_inbox(now=100.0)
+            svc.tick_waiting_inbox(now=110.0)
+
+        fakes["create"].assert_not_called()
+        assert not svc._waiting_inbox_episodes["worker1"].fired
+
+    def test_g_gate_opening_at_due_tick_suppresses_race(self):
+        svc = StalledCallbackWatchdog()
+        with _waiting_inbox_fakes() as fakes:
+            fakes["gate"].return_value = "unknown_dialog"
+            svc.tick_waiting_inbox(now=100.0)
+            svc.tick_waiting_inbox(now=110.0)
+
+        fakes["create"].assert_not_called()
+        assert not svc._waiting_inbox_episodes["worker1"].fired
+
+    def test_h_deleted_terminal_is_pruned_without_push(self):
+        svc = StalledCallbackWatchdog()
+        with _waiting_inbox_fakes(metadata={}) as fakes:
+            svc._waiting_inbox_episodes["worker1"] = MagicMock()
+            fakes["metadata"].return_value = None
+            svc.tick_waiting_inbox(now=100.0)
+
+        assert "worker1" not in svc._waiting_inbox_episodes
+        fakes["status"].assert_not_called()
+        fakes["create"].assert_not_called()
+
+    @pytest.mark.parametrize("caller_id", [None, "worker1"])
+    def test_i_invalid_caller_warns_and_permanently_suppresses_episode(self, caller_id, caplog):
+        svc = StalledCallbackWatchdog()
+        metadata = {
+            "id": "worker1",
+            "caller_id": caller_id,
+            "agent_profile": "developer",
+        }
+        with _waiting_inbox_fakes(metadata=metadata) as fakes:
+            svc.tick_waiting_inbox(now=100.0)
+            svc.tick_waiting_inbox(now=110.0)
+            metadata["caller_id"] = "caller1"
+            svc.tick_waiting_inbox(now=120.0)
+
+        assert svc._waiting_inbox_episodes["worker1"].fired
+        fakes["create"].assert_not_called()
+        assert "refusing invalid caller" in caplog.text
+
+    def test_j_non_waiting_status_has_no_episode(self):
+        svc = StalledCallbackWatchdog()
+        with _waiting_inbox_fakes(status=TerminalStatus.PROCESSING) as fakes:
+            svc.tick_waiting_inbox(now=100.0)
+
+        assert "worker1" not in svc._waiting_inbox_episodes
+        fakes["gate"].assert_not_called()
+        fakes["create"].assert_not_called()
+
+    def test_k_gate_clearing_after_grace_pushes_on_next_tick(self):
+        svc = StalledCallbackWatchdog()
+        with _waiting_inbox_fakes(gate="wait_rule") as fakes:
+            svc.tick_waiting_inbox(now=100.0)
+            svc.tick_waiting_inbox(now=110.0)
+            fakes["gate"].return_value = None
+            svc.tick_waiting_inbox(now=111.0)
+
+        fakes["create"].assert_called_once()
+        assert "for 11s" in fakes["create"].call_args.args[2]
+
+    def test_l_gate_precedes_invalid_caller_suppression(self):
+        svc = StalledCallbackWatchdog()
+        metadata = {"id": "worker1", "caller_id": None, "agent_profile": "developer"}
+        with _waiting_inbox_fakes(metadata=metadata, gate="wait_rule") as fakes:
+            svc.tick_waiting_inbox(now=100.0)
+            svc.tick_waiting_inbox(now=110.0)
+            assert not svc._waiting_inbox_episodes["worker1"].fired
+            metadata["caller_id"] = "caller1"
+            fakes["gate"].return_value = None
+            svc.tick_waiting_inbox(now=111.0)
+
+        fakes["create"].assert_called_once()
+
+    def test_m_invalid_caller_precedes_active_cross_episode_floor(self):
+        svc = StalledCallbackWatchdog()
+        metadata = {"id": "worker1", "caller_id": None, "agent_profile": "developer"}
+        svc._waiting_inbox_last_push["worker1"] = 105.0
+        with _waiting_inbox_fakes(metadata=metadata) as fakes:
+            svc.tick_waiting_inbox(now=100.0)
+            svc.tick_waiting_inbox(now=110.0)
+
+        assert svc._waiting_inbox_episodes["worker1"].fired
+        fakes["create"].assert_not_called()
+
+    def test_n_transport_failure_commits_episode_and_floor_without_retry(self, caplog):
+        svc = StalledCallbackWatchdog()
+        with _waiting_inbox_fakes() as fakes:
+            fakes["create"].side_effect = RuntimeError("transport failed")
+            svc.tick_waiting_inbox(now=100.0)
+            svc.tick_waiting_inbox(now=110.0)
+            svc.tick_waiting_inbox(now=120.0)
+
+        assert svc._waiting_inbox_episodes["worker1"].fired
+        assert svc._waiting_inbox_last_push["worker1"] == 110.0
+        fakes["create"].assert_called_once()
+        fakes["deliver"].assert_not_called()
+        assert "Failed to push waiting-inbox watchdog" in caplog.text
+
+    def test_clear_terminal_drops_episode_and_cross_episode_floor(self):
+        svc = StalledCallbackWatchdog()
+        with _waiting_inbox_fakes():
+            svc.tick_waiting_inbox(now=100.0)
+        svc._waiting_inbox_last_push["worker1"] = 90.0
+
+        svc.clear_terminal("worker1")
+
+        assert "worker1" not in svc._waiting_inbox_episodes
+        assert "worker1" not in svc._waiting_inbox_last_push

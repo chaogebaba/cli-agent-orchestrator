@@ -1159,6 +1159,12 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
         )
 
         stalled_callback_watchdog.clear_terminal(terminal_id)
+        try:
+            from cli_agent_orchestrator.services.auto_responder import auto_responder
+
+            auto_responder.clear_terminal(terminal_id)
+        except Exception as e:
+            logger.warning(f"Failed to clear auto-responder for {terminal_id}: {e}")
         # Drop any per-curator dispatch lock so the registry doesn't grow
         # forever as memory_manager terminals come and go.
         from cli_agent_orchestrator.services.memory_service import _curator_locks

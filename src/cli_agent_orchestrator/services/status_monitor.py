@@ -259,6 +259,7 @@ class StatusMonitor:
         # Publish outside the lock — subscribers must never be able to
         # re-enter StatusMonitor while the latch state is mid-update.
         bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
+        __import__(f"{__package__}.auto_responder", fromlist=["auto_responder"]).auto_responder.record_published_status(terminal_id, detected)  # fmt: skip
         if screen_spinner_override is not None:
             logger.info("screen spinner override: %s→processing", screen_spinner_override.value)
         logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
