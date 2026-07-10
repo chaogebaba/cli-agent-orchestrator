@@ -1578,7 +1578,14 @@ async def run_step(
         # apart instead of reporting every failure as a timeout. The detail is a
         # structured object carrying terminal_id, so callers read it as a field
         # rather than regex-scraping the message (the future engine reads it too).
-        code = status.HTTP_502_BAD_GATEWAY if e.kind == "error" else status.HTTP_504_GATEWAY_TIMEOUT
+        if e.kind == "input_blocked":
+            code = status.HTTP_409_CONFLICT
+        else:
+            code = (
+                status.HTTP_502_BAD_GATEWAY
+                if e.kind == "error"
+                else status.HTTP_504_GATEWAY_TIMEOUT
+            )
         raise HTTPException(
             status_code=code,
             detail={"message": str(e), "kind": e.kind, "terminal_id": e.terminal_id},
@@ -1944,6 +1951,7 @@ async def get_inbox_messages_endpoint(
                     "sender_id": msg.sender_id,
                     "receiver_id": msg.receiver_id,
                     "message": msg.message,
+                    "orchestration_type": msg.orchestration_type.value,
                     "status": msg.status.value,
                     "created_at": msg.created_at.isoformat() if msg.created_at else None,
                 }

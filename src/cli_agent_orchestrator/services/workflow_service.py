@@ -61,6 +61,8 @@ from cli_agent_orchestrator.services.step_output_store import (
     step_output_store,
 )
 
+NON_RETRYABLE_STEP_KINDS = frozenset({"input_blocked"})
+
 logger = logging.getLogger(__name__)
 
 
@@ -573,6 +575,8 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
             st.error = str(exc)
             if exc.terminal_id is not None:
                 st.terminal_id = exc.terminal_id
+            if exc.kind in NON_RETRYABLE_STEP_KINDS:
+                break
             continue  # consume an attempt, retry the same prompt
         # Settled (COMPLETED or COMPLETED_UNVALIDATED) — neither is a run-failure.
         st.state = outcome

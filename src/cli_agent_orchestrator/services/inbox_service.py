@@ -28,6 +28,7 @@ from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.terminal_service import TerminalInputBlockedError
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
@@ -144,13 +145,14 @@ class InboxService:
             for message in messages:
                 update_message_status(message.id, MessageStatus.DELIVERED)
 
-            # Deliver in contiguous runs of the same sender. With the default
-            # num_messages=1 this is a single run; when draining all pending messages
-            # (num_messages=0) a batch can span multiple senders, so each run is sent
-            # separately to keep PostSendMessageEvent attribution correct — otherwise
-            # every message would be attributed to messages[0].sender_id.
+            # Deliver in contiguous runs of the same sender and orchestration mode.
+            # With the default num_messages=1 this is a single run; when draining
+            # all pending messages (num_messages=0) a batch can span multiple groups,
+            # so each run is sent separately to keep attribution and shaping correct.
             sent_count = 0
-            for sender_id, group in groupby(messages, key=lambda m: m.sender_id):
+            for (sender_id, orchestration_type), group in groupby(
+                messages, key=lambda m: (m.sender_id, m.orchestration_type)
+            ):
                 batch = list(group)
                 combined = "\n".join(m.message for m in batch)
                 try:
@@ -158,20 +160,34 @@ class InboxService:
                         _defer_messages(terminal_id, messages[sent_count:])
                         return
                     if registry is None:
-                        terminal_service.send_input(
-                            terminal_id, combined, defer_on_dialog=True
-                        )
+                        if orchestration_type == OrchestrationType.SEND_MESSAGE:
+                            # Preserve the pre-FX12 no-registry SEND_MESSAGE path:
+                            # an absent mode intentionally bypasses contract/watchdog
+                            # behavior used only by the registry-aware path.
+                            terminal_service.send_input(
+                                terminal_id, combined, defer_on_dialog=True
+                            )
+                        else:
+                            terminal_service.send_input(
+                                terminal_id,
+                                combined,
+                                orchestration_type=orchestration_type,
+                                defer_on_dialog=True,
+                            )
                     else:
                         terminal_service.send_input(
                             terminal_id,
                             combined,
                             registry=registry,
                             sender_id=sender_id,
-                            orchestration_type=OrchestrationType.SEND_MESSAGE,
+                            orchestration_type=orchestration_type,
                             defer_on_dialog=True,
                         )
                     logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
                 except DeliveryDeferredError:
+                    _defer_messages(terminal_id, messages[sent_count:])
+                    return
+                except TerminalInputBlockedError:
                     _defer_messages(terminal_id, messages[sent_count:])
                     return
                 except TerminalNotFoundError as e:

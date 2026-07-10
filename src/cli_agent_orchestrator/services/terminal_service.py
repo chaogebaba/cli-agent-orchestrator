@@ -593,12 +593,32 @@ def _schedule_deferred_init(
                 terminal_id,
                 e,
             )
+            queued = False
+            try:
+                await asyncio.to_thread(
+                    create_inbox_message,
+                    caller_id or "unknown",
+                    terminal_id,
+                    initial_message,
+                    OrchestrationType.ASSIGN,
+                )
+                queued = True
+            except Exception:
+                logger.exception(
+                    "Could not queue blocked assigned task for terminal %s", terminal_id
+                )
+            notice = (
+                f"Worker {terminal_id} is waiting on a dialog; the assigned task is "
+                f"queued and will deliver when the dialog clears."
+                if queued
+                else f"Worker {terminal_id} is waiting on a dialog; the assigned task "
+                f"was not queued and remains undelivered. The worker is still alive; "
+                f"clear the dialog and re-assign the task or recover it manually."
+            )
             await asyncio.to_thread(
                 _notify_caller_of_deferred_failure,
                 terminal_id,
-                f"Worker {terminal_id} is waiting on an interactive prompt; the "
-                f"assigned task has not been delivered yet. Use answer_user_prompt "
-                f"to unblock it, then it will receive the task.",
+                notice,
                 registry,
                 delete_worker=False,
             )

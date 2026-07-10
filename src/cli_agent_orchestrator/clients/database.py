@@ -21,7 +21,7 @@ from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.flow import Flow
-from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
+from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,12 @@ class InboxModel(Base):
     sender_id = Column(String, nullable=False)
     receiver_id = Column(String, nullable=False)
     message = Column(String, nullable=False)
+    orchestration_type = Column(
+        String,
+        nullable=False,
+        default=OrchestrationType.SEND_MESSAGE.value,
+        server_default=OrchestrationType.SEND_MESSAGE.value,
+    )
     status = Column(String, nullable=False)  # MessageStatus enum value
     created_at = Column(DateTime, default=datetime.now)
 
@@ -174,6 +180,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
+    _migrate_inbox_orchestration_type()
     _migrate_memory_indexes()
     _migrate_add_access_count()
     _migrate_add_last_compiled_at()
@@ -181,6 +188,22 @@ def init_db() -> None:
     _migrate_workflow_index()
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+
+
+def _migrate_inbox_orchestration_type() -> None:
+    """Add the orchestration mode to inbox rows created by older releases."""
+    from sqlalchemy import text
+
+    with engine.begin() as connection:
+        columns = connection.execute(text("PRAGMA table_info(inbox)")).mappings().all()
+        if not columns or "orchestration_type" in {column["name"] for column in columns}:
+            return
+        connection.execute(
+            text(
+                "ALTER TABLE inbox ADD COLUMN orchestration_type TEXT NOT NULL "
+                "DEFAULT 'send_message'"
+            )
+        )
 
 
 def _restrict_db_file_permissions() -> None:
@@ -695,7 +718,12 @@ def delete_terminals_by_session(tmux_session: str) -> int:
         return deleted
 
 
-def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> InboxMessage:
+def create_inbox_message(
+    sender_id: str,
+    receiver_id: str,
+    message: str,
+    orchestration_type: OrchestrationType = OrchestrationType.SEND_MESSAGE,
+) -> InboxMessage:
     """Create inbox message with status=MessageStatus.PENDING.
 
     Raises:
@@ -708,6 +736,7 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
             sender_id=sender_id,
             receiver_id=receiver_id,
             message=message,
+            orchestration_type=orchestration_type.value,
             status=MessageStatus.PENDING.value,
         )
         db.add(inbox_msg)
@@ -718,6 +747,7 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
             sender_id=inbox_msg.sender_id,
             receiver_id=inbox_msg.receiver_id,
             message=inbox_msg.message,
+            orchestration_type=OrchestrationType(inbox_msg.orchestration_type),
             status=MessageStatus(inbox_msg.status),
             created_at=inbox_msg.created_at,
         )
@@ -755,6 +785,7 @@ def get_inbox_messages(
                 sender_id=msg.sender_id,
                 receiver_id=msg.receiver_id,
                 message=msg.message,
+                orchestration_type=OrchestrationType(msg.orchestration_type),
                 status=MessageStatus(msg.status),
                 created_at=msg.created_at,
             )

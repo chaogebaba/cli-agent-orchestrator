@@ -1,5 +1,6 @@
 """Full tests for terminal service."""
 
+import asyncio
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,6 +12,8 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.terminal_service import (
     OutputMode,
     TerminalInputBlockedError,
+    _deferred_init_tasks,
+    _schedule_deferred_init,
     create_terminal,
     delete_terminal,
     get_output,
@@ -19,6 +22,80 @@ from cli_agent_orchestrator.services.terminal_service import (
     peek_terminal,
     send_input,
 )
+
+
+@pytest.mark.asyncio
+async def test_blocked_deferred_assign_queues_verbatim_once_and_notifies_once():
+    provider = MagicMock()
+    provider.initialize = AsyncMock(return_value=True)
+    provider.shell_baseline = None
+    shaped = "MCP-shaped bytes\n[Assigned by terminal caller01]"
+
+    with (
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+            return_value={"caller_id": "caller01"},
+        ),
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.send_input",
+            side_effect=TerminalInputBlockedError("dialog"),
+        ),
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.create_inbox_message"
+        ) as create_message,
+        patch(
+            "cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure"
+        ) as notify,
+    ):
+        _schedule_deferred_init(
+            provider, "worker99", shaped, OrchestrationType.ASSIGN, registry=None
+        )
+        await asyncio.gather(*list(_deferred_init_tasks))
+
+    create_message.assert_called_once_with(
+        "caller01", "worker99", shaped, OrchestrationType.ASSIGN
+    )
+    notify.assert_called_once()
+    assert "queued" in notify.call_args.args[1]
+    assert "will deliver when the dialog clears" in notify.call_args.args[1]
+    assert notify.call_args.kwargs["delete_worker"] is False
+
+
+@pytest.mark.asyncio
+async def test_blocked_deferred_assign_enqueue_failure_reports_undelivered():
+    provider = MagicMock()
+    provider.initialize = AsyncMock(return_value=True)
+    provider.shell_baseline = None
+
+    with (
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+            return_value={"caller_id": "caller01"},
+        ),
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.send_input",
+            side_effect=TerminalInputBlockedError("dialog"),
+        ),
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.create_inbox_message",
+            side_effect=RuntimeError("db down"),
+        ),
+        patch(
+            "cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure"
+        ) as notify,
+    ):
+        _schedule_deferred_init(
+            provider, "worker99", "assigned task", OrchestrationType.ASSIGN, registry=None
+        )
+        await asyncio.gather(*list(_deferred_init_tasks))
+
+    notify.assert_called_once()
+    notice = notify.call_args.args[1]
+    assert "not queued" in notice
+    assert "undelivered" in notice
+    assert "still alive" in notice
+    assert "will deliver" not in notice
+    assert notify.call_args.kwargs["delete_worker"] is False
 
 
 class TestCreateTerminal:

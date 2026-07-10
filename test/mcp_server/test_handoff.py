@@ -265,6 +265,28 @@ class TestHandoffOutcomes:
         assert result.terminal_id == "a1b2c3d4"
 
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_endpoint_409_input_blocked_names_terminal_and_dialog(self, mock_provider):
+        mock_provider.return_value = _ctx("codex")
+        blocked = MagicMock()
+        blocked.status_code = 409
+        blocked.json.return_value = {
+            "detail": {
+                "message": "terminal a1b2c3d4 is waiting on a dialog",
+                "kind": "input_blocked",
+                "terminal_id": "a1b2c3d4",
+            }
+        }
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = blocked
+            mock_requests.Timeout = Exception
+            result = asyncio.run(_handoff_impl("developer", "Do task"))
+
+        assert result.success is False
+        assert result.terminal_id == "a1b2c3d4"
+        assert "a1b2c3d4" in result.message
+        assert "waiting on a dialog" in result.message
+
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
     def test_legacy_string_detail_still_scrapes_terminal_id(self, mock_provider):
         """Backward-compat: an older server returning a plain-string detail still
         yields the terminal id via the regex fallback."""

@@ -25,11 +25,12 @@ import asyncio
 import logging
 from typing import Callable, Optional
 
+from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.status_monitor import status_monitor
-from cli_agent_orchestrator.services.terminal_service import OutputMode
+from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
 from cli_agent_orchestrator.utils.terminal import wait_until_status
 
 logger = logging.getLogger(__name__)
@@ -225,7 +226,21 @@ async def run_agent_step(
     # key sends); run it off the event loop so a slow tmux call cannot freeze
     # the whole server for other requests (same hazard as issue #382, which was
     # only fixed for DELETE /sessions). Any failure raises and propagates.
-    await asyncio.to_thread(terminal_service.send_input, terminal_id, prompt)
+    try:
+        await asyncio.to_thread(
+            terminal_service.send_input,
+            terminal_id,
+            prompt,
+            orchestration_type=OrchestrationType.HANDOFF,
+        )
+    except TerminalInputBlockedError as exc:
+        current = status_monitor.get_status(terminal_id)
+        status_value = current.value if hasattr(current, "value") else str(current)
+        raise StepExecutionError(
+            f"terminal {terminal_id} is waiting on a dialog (status={status_value}); input blocked",
+            kind="input_blocked",
+            terminal_id=terminal_id,
+        ) from exc
     # A concurrent input event between send and this read only makes the wait
     # stricter; it cannot admit a stale completion.
     input_gen = status_monitor.get_input_gen(terminal_id)

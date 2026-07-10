@@ -11,9 +11,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.services.agent_step import StepExecutionError, run_agent_step
-from cli_agent_orchestrator.services.terminal_service import OutputMode
+from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
 
 _MODULE = "cli_agent_orchestrator.services.agent_step"
 
@@ -71,7 +72,9 @@ class TestHappyPath:
         assert result.status == TerminalStatus.COMPLETED
         # Canonical sequence: created, prompt sent, output extracted in LAST mode.
         m_create.assert_awaited_once()
-        m_send.assert_called_once_with("abc12345", "do the task")
+        m_send.assert_called_once_with(
+            "abc12345", "do the task", orchestration_type=OrchestrationType.HANDOFF
+        )
         m_out.assert_called_once_with("abc12345", OutputMode.LAST)
         # Created-here + teardown default -> graceful exit THEN delete.
         m_exit.assert_called_once_with("abc12345")
@@ -106,7 +109,34 @@ class TestHappyPath:
         m_delete.assert_not_called()
         # A reused terminal is owned by the caller — no graceful exit either.
         m_exit.assert_not_called()
-        m_send.assert_called_once_with("reuse99", "x")
+        m_send.assert_called_once_with(
+            "reuse99", "x", orchestration_type=OrchestrationType.HANDOFF
+        )
+
+    def test_dialog_block_surfaces_structured_non_retryable_error(self):
+        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+            wait_results=(True,)
+        )
+        with (
+            create,
+            send as m_send,
+            delete as m_delete,
+            get_output,
+            exit_cli,
+            wait,
+            status as m_status,
+        ):
+            m_send.side_effect = TerminalInputBlockedError("dialog")
+            m_status.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+            with pytest.raises(StepExecutionError) as exc_info:
+                asyncio.run(
+                    run_agent_step("codex", "dev", "x", reuse_terminal_id="reuse99")
+                )
+
+        assert exc_info.value.kind == "input_blocked"
+        assert exc_info.value.terminal_id == "reuse99"
+        assert "waiting on a dialog" in str(exc_info.value)
+        m_delete.assert_not_called()
 
     def test_reads_generation_after_send_and_threads_min_gen(self):
         create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
@@ -123,7 +153,7 @@ class TestHappyPath:
             status,
             patch(f"{_MODULE}.status_monitor.get_input_gen", return_value=7) as m_gen,
         ):
-            m_send.side_effect = lambda *_args: events.append("send") or True
+            m_send.side_effect = lambda *_args, **_kwargs: events.append("send") or True
             m_gen.side_effect = lambda *_args: events.append("gen") or 7
             asyncio.run(run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99"))
         assert events == ["send", "gen"]

@@ -782,7 +782,12 @@ async def _handoff_impl(
             # N-second timeout. The structured `kind` is authoritative; the
             # status code is only the fallback when an older server omits it
             # (504 -> timeout, 502 -> error).
-            if kind == "error" or (kind is None and response.status_code == 502):
+            if kind == "input_blocked":
+                msg = (
+                    f"Handoff blocked: terminal {tid or 'unknown'} is waiting on a dialog "
+                    f"({structured_detail})"
+                )
+            elif kind == "error" or (kind is None and response.status_code == 502):
                 msg = f"Handoff failed: worker errored ({structured_detail})"
             elif kind == "timeout" or (kind is None and response.status_code == 504):
                 msg = f"Handoff timed out after {timeout} seconds"

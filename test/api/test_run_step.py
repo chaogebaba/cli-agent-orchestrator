@@ -79,6 +79,26 @@ class TestRunStepEndpoint:
         assert detail["kind"] == "error"
         assert detail["terminal_id"] == "abc12345"
 
+    def test_input_blocked_maps_to_409_with_structured_terminal_id(self, client):
+        with patch(
+            _RUN_STEP,
+            new=AsyncMock(
+                side_effect=StepExecutionError(
+                    "terminal abc12345 is waiting on a dialog",
+                    kind="input_blocked",
+                    terminal_id="abc12345",
+                )
+            ),
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == {
+            "message": "terminal abc12345 is waiting on a dialog",
+            "kind": "input_blocked",
+            "terminal_id": "abc12345",
+        }
+
     def test_value_error_maps_to_404(self, client):
         with patch(_RUN_STEP, new=AsyncMock(side_effect=ValueError("Terminal 'x' not found"))):
             resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())

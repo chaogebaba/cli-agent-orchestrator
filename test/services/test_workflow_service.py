@@ -227,6 +227,27 @@ async def test_trace_e_all_attempts_crash_halt(monkeypatch):
     assert res.steps[0].error is not None
 
 
+@pytest.mark.asyncio
+async def test_input_blocked_is_not_retried_and_preserves_terminal(monkeypatch):
+    mock = AsyncMock(
+        side_effect=StepExecutionError(
+            "terminal blocked-terminal is waiting on a dialog",
+            kind="input_blocked",
+            terminal_id="blocked-terminal",
+        )
+    )
+    monkeypatch.setattr(ws, "run_agent_step", mock)
+
+    res = await ws.start_run(_spec(on_failure="halt"), {}, "runBlocked")
+
+    assert mock.await_count == 1
+    assert res.state == RunState.FAILED
+    assert res.steps[0].state == StepState.FAILED
+    assert res.steps[0].attempts == 1
+    record = ws.run_registry.get("runBlocked")
+    assert record.step_states["s1"].terminal_id == "blocked-terminal"
+
+
 # ---------------------------------------------------------------------------
 # on_failure halt / continue + _skip_remaining
 # ---------------------------------------------------------------------------

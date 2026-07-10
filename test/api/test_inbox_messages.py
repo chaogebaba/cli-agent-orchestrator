@@ -62,6 +62,7 @@ class TestGetInboxMessagesEndpoint:
                 assert "sender_id" in msg_data
                 assert "receiver_id" in msg_data
                 assert "message" in msg_data
+                assert msg_data["orchestration_type"] == "send_message"
                 assert "status" in msg_data
                 assert "created_at" in msg_data
 

@@ -33,6 +33,10 @@ def load_fixture(filename: str) -> str:
 
 
 class TestCodexProviderInitialization:
+    def test_blocks_orchestrated_input_during_dialogs(self):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        assert provider.blocks_orchestrated_input_while_waiting_user_answer is True
+
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")

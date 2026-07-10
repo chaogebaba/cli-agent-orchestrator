@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import (
@@ -35,7 +35,7 @@ from cli_agent_orchestrator.clients.database import (
     update_message_status,
     update_terminal_shell_command,
 )
-from cli_agent_orchestrator.models.inbox import MessageStatus
+from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 
 
 @pytest.fixture
@@ -661,8 +661,40 @@ class TestFlowOperations:
         assert result.sender_id == "sender-123"
         assert result.receiver_id == "receiver-456"
         assert result.message == "Hello"
+        assert result.orchestration_type is OrchestrationType.SEND_MESSAGE
         mock_session.add.assert_called_once()
         mock_session.commit.assert_called_once()
+
+    def test_inbox_orchestration_migration_is_legacy_safe_and_idempotent(
+        self, tmp_path, monkeypatch
+    ):
+        from cli_agent_orchestrator.clients import database
+
+        legacy_engine = create_engine(f"sqlite:///{tmp_path / 'legacy.db'}")
+        with legacy_engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE TABLE inbox (id INTEGER PRIMARY KEY, sender_id TEXT NOT NULL, "
+                    "receiver_id TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, "
+                    "created_at DATETIME)"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO inbox (sender_id, receiver_id, message, status) "
+                    "VALUES ('s', 'r', 'm', 'pending')"
+                )
+            )
+        monkeypatch.setattr(database, "engine", legacy_engine)
+
+        database._migrate_inbox_orchestration_type()
+        database._migrate_inbox_orchestration_type()
+
+        columns = {column["name"] for column in inspect(legacy_engine).get_columns("inbox")}
+        assert "orchestration_type" in columns
+        with legacy_engine.connect() as connection:
+            value = connection.execute(text("SELECT orchestration_type FROM inbox")).scalar_one()
+        assert value == OrchestrationType.SEND_MESSAGE.value
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_create_inbox_message_receiver_not_found(self, mock_session_class):

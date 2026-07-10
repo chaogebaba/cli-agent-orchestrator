@@ -427,12 +427,13 @@ class TestMessagePluginEvents:
         mock_terminal_service,
         mock_update_message_status,
     ):
-        """Queued inbox delivery should forward sender context and hardcode send_message."""
+        """Queued inbox delivery should forward sender context and its stored mode."""
         registry = _registry_mock()
         message = MagicMock()
         message.id = 17
         message.sender_id = "supervisor-1"
         message.message = "Please review this"
+        message.orchestration_type = OrchestrationType.SEND_MESSAGE
         mock_get_pending_messages.return_value = [message]
         # Status is sourced from the event-driven StatusMonitor, not the provider.
         mock_status_monitor.get_status.return_value = TerminalStatus.IDLE

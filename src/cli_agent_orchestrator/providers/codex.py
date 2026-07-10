@@ -659,6 +659,12 @@ class CodexProvider(BaseProvider):
     # ClaudeCodeProvider reference implementation for a provider that DOES need
     # a purpose-built override.
     supports_screen_detection = True
+
+    @property
+    def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
+        """Block orchestrated input while Codex is showing an interactive dialog."""
+        return True
+
     supports_draft_preservation = True
     composer_clear_keys = ["C-a", "C-k"]
     # Dim-SGR ghost detection needs escape-preserving capture-pane (-e).
