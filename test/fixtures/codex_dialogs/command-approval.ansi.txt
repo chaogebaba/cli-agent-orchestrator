@@ -1,0 +1,40 @@
+[2m╭─────────────────────────────────────────────────────╮[0m
+[2m│ >_ [0;1mOpenAI Codex[0;2m (v0.144.1)                          │[0m
+[2m│                                                     │[0m
+[2m│ model:     [0mgpt-5.5 high[2m   [0m[38;5;6m/model[2m[39m to change          │[0m
+[2m│ directory: [0m~/…/cli-subagents/cli-agent-orchestrator[2m │[0m
+[2m╰─────────────────────────────────────────────────────╯[0m
+
+  [1mTip:[0m [3mNew[0m Use [1m/fast[0m to enable our fastest inference with increased plan usage.
+
+
+[1;2m› [0mRun exactly this command: bash -lc 'printf probe'. Do not do anything else.
+
+
+[1m[38;2;167;167;167m•[0m [1mRunning[0m [38;2;137;180;250mbash[38;2;147;153;178m -[38;2;235;160;172mlc[38;2;205;214;244m [38;2;166;227;161m'printf probe'[39m
+
+
+  [1mWould you like to run the following command?[0m
+
+  Environment: [1mlocal[0m
+
+  $ [38;2;137;180;250mbash[38;2;147;153;178m -[38;2;235;160;172mlc[38;2;205;214;244m [38;2;166;227;161m'printf probe'[39m
+
+[1m[38;5;6m› 1. Yes, proceed (y)[0m
+  2. Yes, and don't ask again for commands that start with `printf probe` ([2mp[0m)
+  3. No, and tell Codex what to do differently ([2mesc[0m)
+
+  [2mPress enter to confirm or esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+

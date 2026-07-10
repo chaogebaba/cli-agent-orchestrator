@@ -1,0 +1,40 @@
+[2m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+[1m› [0mRun exactly this command: bash -lc 'printf probe'. Do not do anything else.
+
+
+[1m[38;5;2m•[0m [1mRan[0m [38;2;137;180;250mbash[38;2;147;153;178m -[38;2;235;160;172mlc[38;2;205;214;244m [38;2;166;227;161m'printf probe'[39m
+[2m  └ probe[0m
+
+[2m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+• [0mprobe
+
+[2m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+[1m› [0m[38;5;6m/permissions[39m experimental
+
+
+[2m• [0mI can’t change permissions directly from here. If you want to run a command or task that needs approval, send it and
+  I’ll request escalation when required.
+
+
+  [1mKeymap[0m
+  [2mAll configurable shortcuts.[0m
+  [2m109 actions, 0 customized, 3 unbound.[0m
+
+  [1m[38;5;6m[All][0m  [2mCommon[0m  [2mCustomized (0)[0m  [2mUnbound (3)[0m  [2mApp[0m  [2mComposer[0m  [2mEditor[0m  [2mVim[0m  [2mNavigation[0m  [2mApproval[0m  [2mDebug[0m
+
+  [2mType to search shortcuts[0m
+[1m[38;5;6m› Global         Open Transcript            ctrl-t[0m
+  [2mGlobal       [0m [2m [0mOpen External Editor       [2mctrl-g[0m
+  [2mGlobal       [0m [2m [0mCopy                       [2mctrl-o[0m
+  [2mGlobal       [0m [2m [0mClear Terminal             [2mctrl-l[0m
+  [2mGlobal       - [0mToggle Vim Mode            [2munbound[0m
+  [2mGlobal       - [0mToggle Fast Mode           [2munbound[0m
+  [2mGlobal       [0m [2m [0mToggle Raw Output          [2malt-r[0m
+  [2mChat         [0m [2m [0mInterrupt Turn             [2mesc[0m
+
+  [1;2m[38;5;6mleft/right[0;2m group · [1m[38;5;6menter[0;2m edit shortcut · [1m[38;5;6m*[0;2m custom · [1m[38;5;6m-[0;2m unbound · [1m[38;5;6mesc[0;2m close

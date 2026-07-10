@@ -347,6 +347,27 @@ def test_idle_numbered_document_is_suppressed_by_real_codex_parser(
     assert pushed == []
 
 
+def test_codex_permissions_picker_pushes_unknown_dialog(monkeypatch, _reset_engine):
+    _wire_common(monkeypatch)
+    pushed = _capture_pushes(monkeypatch)
+    fixture = (
+        Path(__file__).parents[1]
+        / "fixtures"
+        / "codex_dialogs"
+        / "permissions-picker.ansi.txt"
+    )
+    screen = fixture.read_text(encoding="utf-8").splitlines()
+    provider = _codex_provider()
+
+    assert provider.get_status_from_screen(screen) == TerminalStatus.WAITING_USER_ANSWER
+    assert (
+        _reset_engine.on_screen("term1", provider, screen)
+        == TerminalStatus.WAITING_USER_ANSWER
+    )
+    assert len(pushed) == 1
+    assert "unknown blocking dialog" in pushed[0]
+
+
 def test_grok_tool_list_capture_is_suppressed_by_real_parser(monkeypatch, _reset_engine):
     _wire_common(monkeypatch, metadata=_metadata(provider="grok_cli"))
     pushed = _capture_pushes(monkeypatch)

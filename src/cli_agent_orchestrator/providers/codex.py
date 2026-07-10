@@ -86,7 +86,20 @@ TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])
 TUI_PROGRESS_PATTERN = r"•.*\([^)]*\besc to interrupt\)"
 
 # Workspace trust/approval prompt shown when Codex opens a new directory
-TRUST_PROMPT_PATTERN = r"allow Codex to work in this folder"
+TRUST_PROMPT_PATTERN = (
+    r"(?:allow Codex to work in this folder"
+    r"|Do you trust the contents of this directory)"
+)
+TRUST_SELECTOR_PATTERN = re.compile(
+    r"^\s*›\s*1\.\s*(?:Yes|Allow|Trust|Continue)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+DIALOG_ACTION_FOOTER_PATTERN = re.compile(
+    r"(?:Press enter to\s+(?:confirm|continue|view)|"
+    r"Press space to select|"
+    r"left/right\s+group\s+.*enter\s+edit shortcut.*esc\s+close)",
+    re.IGNORECASE,
+)
 # Codex welcome banner indicating normal startup (no trust prompt)
 CODEX_WELCOME_PATTERN = r"OpenAI Codex"
 CODEX_EMPTY_COMPOSER_PLACEHOLDERS = {
@@ -560,8 +573,14 @@ class CodexProvider(BaseProvider):
 
         # Check trust prompt early — the trust menu uses › which matches the idle prompt
         # pattern, and PROCESSING_PATTERN matches "running" in "You are running Codex in..."
-        if re.search(TRUST_PROMPT_PATTERN, clean_output):
-            return TerminalStatus.WAITING_USER_ANSWER
+        trust = re.search(TRUST_PROMPT_PATTERN, clean_output)
+        if trust:
+            selector = TRUST_SELECTOR_PATTERN.search(clean_output, trust.end())
+            if (
+                selector is not None
+                and clean_output[trust.end() : selector.start()].count("\n") <= 4
+            ):
+                return TerminalStatus.WAITING_USER_ANSWER
 
         # Check bottom of captured output for idle prompt.
         # With --no-alt-screen, scrollback contains history so we can't anchor
@@ -668,6 +687,10 @@ class CodexProvider(BaseProvider):
         clean = strip_terminal_escapes(joined)
         if re.search(TUI_PROGRESS_PATTERN, clean, re.MULTILINE):
             return TerminalStatus.PROCESSING
+        nonblank = [ln.strip() for ln in clean.splitlines() if ln.strip()]
+        terminal_line = nonblank[-1] if nonblank else ""
+        if DIALOG_ACTION_FOOTER_PATTERN.search(terminal_line):
+            return TerminalStatus.WAITING_USER_ANSWER
         return self.get_status(joined)
 
     def read_composer_draft(self, screen_lines: list[str]) -> str | None:
