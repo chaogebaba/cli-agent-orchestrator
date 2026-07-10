@@ -975,7 +975,9 @@ def _assign_impl(
             worker_message = (
                 message
                 + f"\n\n[Assigned by terminal {sender_id}. "
-                + f"When done, send results back to terminal {sender_id} using send_message]"
+                + f"When done, send results back to terminal {sender_id} using the "
+                "cao-mcp-server send_message MCP tool — never a built-in "
+                "collaboration.send_message]"
             )
         else:
             worker_message = message
@@ -1169,7 +1171,8 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
         if ENABLE_SENDER_ID_INJECTION and own_terminal_id:
             message += (
                 f"\n\n[Message from terminal {own_terminal_id}. "
-                "Use send_message MCP tool for any follow-up work.]"
+                "Use the cao-mcp-server send_message MCP tool for any follow-up work — "
+                "never a built-in collaboration.send_message.]"
             )
 
         return _send_to_inbox(receiver_id, message)

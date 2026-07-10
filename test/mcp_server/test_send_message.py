@@ -72,7 +72,12 @@ class TestSendMessageSenderIdInjection:
         sent_message = mock_inbox.call_args[0][1]
         assert sent_message.startswith("Here are the results")
         assert "[Message from terminal sender-xyz" in sent_message
-        assert "Use send_message MCP tool for any follow-up work.]" in sent_message
+        assert (
+            "Use the cao-mcp-server send_message MCP tool for any follow-up work — "
+            "never a built-in collaboration.send_message.]"
+            in sent_message
+        )
+        assert "collaboration.send_message" in sent_message
 
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False)
     @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")

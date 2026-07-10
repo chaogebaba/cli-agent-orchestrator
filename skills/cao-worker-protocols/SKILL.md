@@ -9,6 +9,8 @@ Use this skill when acting as a worker agent inside CLI Agent Orchestrator.
 
 This skill explains how workers should interpret assigned versus handed-off work, when to call `send_message`, and how to report results back cleanly.
 
+Every `send_message` reference in this skill means the cao-mcp-server `send_message` MCP tool, never a provider-native `collaboration.send_message`.
+
 ## Understand the Dispatch Mode
 
 Workers receive tasks through one of two orchestration modes:
@@ -29,7 +31,7 @@ Do not call `send_message` for ordinary handoff completion unless the task expli
 When the task came through `assign`, send your results back after you finish the work:
 
 1. Format the result clearly and concisely.
-2. Call `send_message(message=...)` — omitting `receiver_id` routes the result to the terminal that assigned the task (the recorded caller). This is the reliable default.
+2. Call the cao-mcp-server `send_message` MCP tool with `send_message(message=...)` — never a built-in `collaboration.send_message`; omitting `receiver_id` routes the result to the terminal that assigned the task (the recorded caller). This is the reliable default.
 3. If the task message names a different callback terminal (directly or in an appended suffix such as `[Assigned by terminal ...]`), pass that ID as `receiver_id` instead.
 
 Do not stop after writing a normal response if the assignment explicitly requires a callback. The requesting terminal depends on `send_message` to receive the result.

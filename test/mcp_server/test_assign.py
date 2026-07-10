@@ -193,7 +193,12 @@ class TestAssignSenderIdInjection:
         sent_message = kwargs["initial_message"]
         assert sent_message.startswith("Analyze the logs")
         assert "[Assigned by terminal supervisor-abc123" in sent_message
-        assert "send results back to terminal supervisor-abc123 using send_message]" in sent_message
+        assert (
+            "send results back to terminal supervisor-abc123 using the cao-mcp-server "
+            "send_message MCP tool — never a built-in collaboration.send_message]"
+            in sent_message
+        )
+        assert "collaboration.send_message" in sent_message
         # And the orchestration_type is ASSIGN so plugin events see it
         from cli_agent_orchestrator.models.inbox import OrchestrationType
 
