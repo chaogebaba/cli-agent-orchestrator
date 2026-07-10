@@ -1,0 +1,15 @@
+# Live capture 2026-07-09, grok_cli mid-task (probe dd07e6ad).
+# Provider parser read IDLE for this screen while the spinner ran.
+# Tool-list rows are the "grok splash" false-alarm class content.
+  3. Handoff  Cao-mcp-server
+  4. Answer User Prompt  Cao-mcp-server
+  5. Load Skill  Cao-mcp-server
+◆ Run Locate cao-worker-protocols skill
+$ cat /home/chao/.claude/skills/cao-worker-protocols/SKILL.md 2>/dev/null ||
+  cat /home/chao/.agents/skills/cao-worker-protocols/SKILL.md 2>/dev/null || find /home/chao -name "*cao-worker*" 2>/dev/null | head -20
+    ───
+    pre_tool_use
+      ✓ global/settings:pre_tool_use[0].hooks[0] (14ms)
+⠴ Locate cao-worker-protocols skill… 1.9s                                                                                       4.6s ⇣12.8k
+❯
+Grok 4.5 (high) · always-approve · 12K / 500K (3%) · ctrl+o transcript

@@ -7,10 +7,12 @@ outer cli-subagents repo for the full design.
 
 Scope is intentionally narrow: only dialogs matching a rule the supervisor
 (or a human) has authored in ``~/.aws/cli-agent-orchestrator/auto-answers/
-<provider>.yaml`` are ever auto-answered. Anything else surfaces as
-WAITING_USER_ANSWER and (once per episode) pushes the normalized dialog text
-to the supervisor terminal so a rule can be authored. Usage-reset prompts are
-dismiss-only by design — no rule may consume ``/usage`` on the user's behalf.
+<provider>.yaml`` are ever auto-answered. An unmatched screen is suspect only
+when dialog markers are close together and the provider parser reports a
+non-ready status. This deliberately errs toward silence for novel dialogs that
+parse as IDLE or COMPLETED; the stalled-callback watchdog remains the fallback.
+Usage-reset prompts are dismiss-only by design — no rule may consume ``/usage``
+on the user's behalf.
 
 THE line-break trap: terminal width changes where TUI lines wrap, but a TUI
 never splits a word mid-token, so the word sequence is stable while the
@@ -45,6 +47,7 @@ COOLDOWN_S = 5.0
 KEY_DELAY_S = 0.1
 UNKNOWN_DIALOG_PUSH_FLOOR_S = 300.0
 UNKNOWN_DIALOG_PAYLOAD_CHARS = 600
+DIALOG_PROXIMITY_CHARS = 200
 
 # Seed rule files, created only if absent -- never overwritten. Keys are the
 # provider filename (``<provider>.yaml``); values are the verbatim YAML from
@@ -255,7 +258,9 @@ class AutoResponder:
             self._fire(terminal_id, metadata, rule, normalized, state)
             return None
 
-        return self._check_unknown(terminal_id, metadata, provider_name, normalized)
+        return self._check_unknown(
+            terminal_id, metadata, provider_name, provider, lines, normalized
+        )
 
     # ----- rule firing ---------------------------------------------------
 
@@ -350,9 +355,27 @@ class AutoResponder:
     # ----- unknown-dialog heuristic ---------------------------------------
 
     def _check_unknown(
-        self, terminal_id: str, metadata: Dict[str, Any], provider_name: str, normalized: str
+        self,
+        terminal_id: str,
+        metadata: Dict[str, Any],
+        provider_name: str,
+        provider: Any,
+        lines: List[str],
+        normalized: str,
     ) -> Optional[TerminalStatus]:
-        if not self._looks_like_dialog(normalized, provider_name):
+        is_suspect = self._looks_like_dialog(normalized, provider_name)
+        if is_suspect:
+            try:
+                status = provider.get_status_from_screen(lines)
+                is_suspect = status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
+            except Exception:
+                logger.debug(
+                    "auto-responder: provider status parse failed for %s",
+                    terminal_id,
+                    exc_info=True,
+                )
+
+        if not is_suspect:
             close_episode = False
             with self._lock:
                 state = self._unknown_state.get(terminal_id)
@@ -406,9 +429,17 @@ class AutoResponder:
 
             if re.search(WAITING_PROMPT_PATTERN, normalized):
                 return True
-        return bool(
-            _NUMBERED_OPTION_PATTERN.search(normalized) and _PRESS_ENTER_PATTERN.search(normalized)
-        )
+        numbered_options = list(_NUMBERED_OPTION_PATTERN.finditer(normalized))
+        for press_enter in _PRESS_ENTER_PATTERN.finditer(normalized):
+            candidates = [
+                option for option in numbered_options if option.start() < press_enter.start()
+            ]
+            if not candidates:
+                continue
+            nearest = max(candidates, key=lambda option: option.start())
+            if press_enter.start() - nearest.end() <= DIALOG_PROXIMITY_CHARS:
+                return True
+        return False
 
     # ----- supervisor push -------------------------------------------------
 

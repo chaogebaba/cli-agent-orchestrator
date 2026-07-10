@@ -2,15 +2,21 @@
 
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.codex import CodexProvider
+from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
 from cli_agent_orchestrator.services import auto_responder as ar
 
 
 class FakeProvider:
     supports_screen_detection = True
+
+    def get_status_from_screen(self, _lines):
+        return TerminalStatus.PROCESSING
 
 
 class SyncThread:
@@ -65,6 +71,9 @@ def _wire_common(monkeypatch, metadata=None, session_env=None, sent_keys=None):
     class FakeBackend:
         def send_special_key(self, session, window, key):
             (sent_keys if sent_keys is not None else []).append((session, window, key))
+
+        def get_native_status(self, session, window):
+            return None
 
     monkeypatch.setattr(
         "cli_agent_orchestrator.backends.registry.get_backend", lambda: FakeBackend()
@@ -280,6 +289,259 @@ def test_wait_rule_surfaces_without_firing_or_pushing(monkeypatch, _reset_engine
 
 
 # ----- unknown-dialog heuristic + dedupe ------------------------------------
+
+
+def _codex_provider():
+    return CodexProvider("term1", "cao-sess", "win")
+
+
+def _grok_provider():
+    return GrokCliProvider("term1", "cao-sess", "win")
+
+
+def _capture_pushes(monkeypatch):
+    pushed = []
+    monkeypatch.setattr(ar._store, "get_rules", lambda provider: [])
+    monkeypatch.setattr(ar.AutoResponder, "_push", lambda self, tid, meta, msg: pushed.append(msg))
+    return pushed
+
+
+def test_completed_numbered_content_is_suppressed_by_real_codex_parser(
+    monkeypatch, _reset_engine
+):
+    _wire_common(monkeypatch)
+    pushed = _capture_pushes(monkeypatch)
+    screen = [
+        "› Review the diff",
+        "• Review complete.",
+        "1. src/main.py changed",
+        "2. tests passed",
+        "Press enter to continue reading",
+        "› ",
+        "  ? for shortcuts                     100% context left",
+    ]
+    provider = _codex_provider()
+
+    assert provider.get_status_from_screen(screen) == TerminalStatus.COMPLETED
+    assert _reset_engine.on_screen("term1", provider, screen) is None
+    assert pushed == []
+
+
+def test_idle_numbered_document_is_suppressed_by_real_codex_parser(
+    monkeypatch, _reset_engine
+):
+    _wire_common(monkeypatch)
+    pushed = _capture_pushes(monkeypatch)
+    screen = [
+        "Release notes",
+        "1. Fixed startup",
+        "2. Added diagnostics",
+        "Press enter to continue reading",
+        "› ",
+        "  ? for shortcuts                     100% context left",
+    ]
+    provider = _codex_provider()
+
+    assert provider.get_status_from_screen(screen) == TerminalStatus.IDLE
+    assert _reset_engine.on_screen("term1", provider, screen) is None
+    assert pushed == []
+
+
+def test_grok_tool_list_capture_is_suppressed_by_real_parser(monkeypatch, _reset_engine):
+    _wire_common(monkeypatch, metadata=_metadata(provider="grok_cli"))
+    pushed = _capture_pushes(monkeypatch)
+    fixture = (
+        Path(__file__).parents[1] / "fixtures" / "fx4" / "fx4-grok-toollist-capture.txt"
+    )
+    screen = fixture.read_text(encoding="utf-8").splitlines()
+    screen.insert(5, "Press enter to view tool details")
+    provider = _grok_provider()
+
+    assert ar.AutoResponder._looks_like_dialog(ar.normalize_screen(screen), "grok_cli")
+    assert provider.get_status_from_screen(screen) == TerminalStatus.IDLE
+    assert _reset_engine.on_screen("term1", provider, screen) is None
+    assert pushed == []
+
+
+def test_numbered_option_at_least_201_chars_before_press_enter_is_not_suspect(
+    monkeypatch, _reset_engine
+):
+    _wire_common(monkeypatch)
+    pushed = _capture_pushes(monkeypatch)
+    screen = ["1. Continue" + "x" * 201 + "Press enter"]
+
+    assert not ar.AutoResponder._looks_like_dialog(ar.normalize_screen(screen), "other")
+    assert _reset_engine.on_screen("term1", FakeProvider(), screen) is None
+    assert pushed == []
+
+
+def test_multi_press_enter_uses_later_adjacent_option():
+    normalized = (
+        "Press enter for help "
+        + "x" * 220
+        + " 1. Continue 2. Cancel Press enter to choose"
+    )
+
+    assert ar.AutoResponder._looks_like_dialog(normalized, "other")
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "provider_factory", "screen", "expected_status"),
+    [
+        (
+            "codex",
+            _codex_provider,
+            [
+                "1. Continue",
+                "2. Cancel",
+                "Press enter to choose",
+                "• Working (1s • esc to interrupt)",
+            ],
+            TerminalStatus.PROCESSING,
+        ),
+        (
+            "grok_cli",
+            _grok_provider,
+            ["Unknown prompt", "1. Continue", "2. Cancel", "Press enter to choose"],
+            TerminalStatus.UNKNOWN,
+        ),
+        (
+            "grok_cli",
+            _grok_provider,
+            [
+                "Run Grok Build in a project directory?",
+                "1. Continue",
+                "2. Cancel",
+                "Press enter to choose  Enter:submit",
+            ],
+            TerminalStatus.WAITING_USER_ANSWER,
+        ),
+    ],
+)
+def test_genuine_unknown_non_ready_real_parsers_push_once(
+    monkeypatch,
+    _reset_engine,
+    provider_name,
+    provider_factory,
+    screen,
+    expected_status,
+):
+    _wire_common(monkeypatch, metadata=_metadata(provider=provider_name))
+    pushed = _capture_pushes(monkeypatch)
+    provider = provider_factory()
+
+    assert provider.get_status_from_screen(screen) == expected_status
+    assert (
+        _reset_engine.on_screen("term1", provider, screen)
+        == TerminalStatus.WAITING_USER_ANSWER
+    )
+    assert len(pushed) == 1
+
+
+def test_provider_parser_exception_is_treated_as_non_ready(monkeypatch, _reset_engine):
+    class RaisingProvider(FakeProvider):
+        def get_status_from_screen(self, _lines):
+            raise RuntimeError("parser failed")
+
+    _wire_common(monkeypatch)
+    pushed = _capture_pushes(monkeypatch)
+    screen = ["1. Continue", "2. Cancel", "Press enter to choose"]
+
+    assert (
+        _reset_engine.on_screen("term1", RaisingProvider(), screen)
+        == TerminalStatus.WAITING_USER_ANSWER
+    )
+    assert len(pushed) == 1
+
+
+def test_codex_waiting_prompt_leading_branch_and_nonleading_generic_fallback(
+    monkeypatch, _reset_engine
+):
+    _wire_common(monkeypatch)
+    pushed = _capture_pushes(monkeypatch)
+    leading = ["Approve command? y/n"]
+    provider = _codex_provider()
+
+    assert ar.AutoResponder._looks_like_dialog(ar.normalize_screen(leading), "codex")
+    assert provider.get_status_from_screen(leading) == TerminalStatus.WAITING_USER_ANSWER
+    assert (
+        _reset_engine.on_screen("term1", provider, leading)
+        == TerminalStatus.WAITING_USER_ANSWER
+    )
+    assert not ar.AutoResponder._looks_like_dialog("prefix Approve command? y/n", "codex")
+    assert ar.AutoResponder._looks_like_dialog(
+        "prefix Approve command? y/n 1. Yes Press enter", "codex"
+    )
+    assert len(pushed) == 1
+
+
+def test_single_torn_codex_frame_opens_then_two_non_suspect_frames_close(
+    monkeypatch, _reset_engine
+):
+    _wire_common(monkeypatch)
+    pushed = _capture_pushes(monkeypatch)
+    provider = _codex_provider()
+    torn = [
+        "1. Continue",
+        "2. Cancel",
+        "Press enter to choose",
+        "• Working (1s • esc to interrupt)",
+    ]
+
+    assert provider.get_status_from_screen(torn) == TerminalStatus.PROCESSING
+    assert (
+        _reset_engine.on_screen("term1", provider, torn)
+        == TerminalStatus.WAITING_USER_ANSWER
+    )
+    assert len(pushed) == 1
+    assert (
+        _reset_engine.on_screen("term1", provider, ["ordinary output"])
+        == TerminalStatus.WAITING_USER_ANSWER
+    )
+    assert _reset_engine.on_screen("term1", provider, ["ordinary output"]) is None
+    assert not _reset_engine._unknown_state["term1"].episode_open
+
+
+def test_genuine_codex_menu_with_idle_footer_is_suppressed(monkeypatch, _reset_engine):
+    _wire_common(monkeypatch)
+    pushed = _capture_pushes(monkeypatch)
+    provider = _codex_provider()
+    screen = [
+        "You have reached a usage limit",
+        "1. Wait until reset",
+        "2. Quit",
+        "Press enter to choose",
+        "› ",
+        "  ? for shortcuts                     100% context left",
+    ]
+
+    assert provider.get_status_from_screen(screen) == TerminalStatus.IDLE
+    assert _reset_engine.on_screen("term1", provider, screen) is None
+    assert pushed == []
+
+
+def test_open_episode_closes_after_two_ready_grok_frames(monkeypatch, _reset_engine):
+    _wire_common(monkeypatch, metadata=_metadata(provider="grok_cli"))
+    pushed = _capture_pushes(monkeypatch)
+    provider = _grok_provider()
+    suspect = ["1. Continue", "2. Cancel", "Press enter to choose"]
+    ready = ["1. Document row", "Press enter to read", "❯", "always-approve"]
+
+    assert provider.get_status_from_screen(suspect) == TerminalStatus.UNKNOWN
+    assert (
+        _reset_engine.on_screen("term1", provider, suspect)
+        == TerminalStatus.WAITING_USER_ANSWER
+    )
+    assert provider.get_status_from_screen(ready) == TerminalStatus.IDLE
+    assert (
+        _reset_engine.on_screen("term1", provider, ready)
+        == TerminalStatus.WAITING_USER_ANSWER
+    )
+    assert _reset_engine.on_screen("term1", provider, ready) is None
+    state = _reset_engine._unknown_state["term1"]
+    assert not state.episode_open
+    assert state.non_dialog_ticks == 0
+    assert len(pushed) == 1
 
 
 def test_supervisor_terminal_is_excluded_from_unknown_detection(monkeypatch, _reset_engine):
