@@ -66,7 +66,10 @@ class ProviderSessionModel(Base):
     created_at = Column(DateTime(timezone=True), default=_utcnow)
     updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
     __table_args__ = (
-        CheckConstraint("status IN ('ready','superseded')", name="ck_provider_sessions_status"),
+        CheckConstraint(
+            "status IN ('ready','superseded','retired')",
+            name="ck_provider_sessions_status",
+        ),
         Index("uq_provider_sessions_ready", "name", unique=True, sqlite_where=(status == "ready")),
     )
 
@@ -201,6 +204,7 @@ def init_db() -> None:
     """Initialize database tables and apply schema migrations."""
     _migrate_project_aliases_schema()
     Base.metadata.create_all(bind=engine)
+    _migrate_provider_sessions_status()
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
     _migrate_inbox_orchestration_type()
@@ -211,6 +215,52 @@ def init_db() -> None:
     _migrate_workflow_index()
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+
+
+def _migrate_provider_sessions_status() -> None:
+    """Rebuild legacy provider_sessions tables so ``retired`` is valid."""
+    from sqlalchemy import text
+
+    with engine.begin() as connection:
+        table_sql = connection.execute(
+            text(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='provider_sessions'"
+            )
+        ).scalar_one_or_none()
+        if table_sql is None or "'retired'" in table_sql:
+            return
+
+        connection.execute(text("ALTER TABLE provider_sessions RENAME TO provider_sessions_legacy"))
+        connection.execute(
+            text(
+                "CREATE TABLE provider_sessions ("
+                "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
+                "name TEXT NOT NULL, provider TEXT NOT NULL, session_uuid TEXT NOT NULL, "
+                "cwd TEXT NOT NULL, agent_profile TEXT NOT NULL, git_sha TEXT, "
+                "dirty_hashes TEXT DEFAULT '{}' NOT NULL, summary TEXT, status TEXT NOT NULL, "
+                "source_terminal_id TEXT, created_at DATETIME, updated_at DATETIME, "
+                "CONSTRAINT ck_provider_sessions_status "
+                "CHECK (status IN ('ready','superseded','retired')))"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO provider_sessions "
+                "(id, name, provider, session_uuid, cwd, agent_profile, git_sha, dirty_hashes, "
+                "summary, status, source_terminal_id, created_at, updated_at) "
+                "SELECT id, name, provider, session_uuid, cwd, agent_profile, git_sha, "
+                "dirty_hashes, summary, status, source_terminal_id, created_at, updated_at "
+                "FROM provider_sessions_legacy"
+            )
+        )
+        connection.execute(text("DROP TABLE provider_sessions_legacy"))
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX uq_provider_sessions_ready ON provider_sessions (name) "
+                "WHERE status = 'ready'"
+            )
+        )
 
 
 def _migrate_inbox_orchestration_type() -> None:
@@ -680,6 +730,19 @@ def register_provider_session(**values: Any) -> Dict[str, Any]:
         return provider_session_to_dict(row)
 
 
+def retire_provider_session(name: str) -> Optional[Dict[str, Any]]:
+    """Atomically retire the current ready registration for ``name``."""
+    with SessionLocal() as db:
+        row = db.query(ProviderSessionModel).filter_by(name=name, status="ready").first()
+        if row is None:
+            return None
+        row.status = "retired"
+        row.updated_at = _utcnow()
+        db.commit()
+        db.refresh(row)
+        return provider_session_to_dict(row)
+
+
 def provider_session_to_dict(row: ProviderSessionModel) -> Dict[str, Any]:
     return {c.name: getattr(row, c.name) for c in row.__table__.columns}
 
@@ -696,7 +759,9 @@ def get_provider_session_by_uuid(session_uuid: str) -> Optional[Dict[str, Any]]:
                .order_by((ProviderSessionModel.status == "ready").desc(),
                          ProviderSessionModel.updated_at.desc(), ProviderSessionModel.id.desc())
                .first())
-        return provider_session_to_dict(row) if row else None
+        if row is None or row.status == "retired":
+            return None
+        return provider_session_to_dict(row)
 
 
 def list_ready_provider_sessions() -> List[Dict[str, Any]]:

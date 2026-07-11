@@ -10,7 +10,7 @@ from typing import Any, Optional
 from cli_agent_orchestrator.clients.database import (
     get_provider_session_by_uuid, get_ready_provider_session, get_terminal_metadata,
     list_ready_provider_sessions, list_terminals_by_provider_session_id,
-    register_provider_session, update_terminal_provider_session_id,
+    register_provider_session, retire_provider_session, update_terminal_provider_session_id,
 )
 
 
@@ -232,3 +232,8 @@ def list_bases() -> list[dict[str, Any]]:
         row["staleness_count"] = None if changed is None else len(changed)
         result.append(row)
     return result
+
+
+def retire(name: str) -> Optional[dict[str, Any]]:
+    """Retire the current ready base registration without touching its terminal."""
+    return retire_provider_session(name)

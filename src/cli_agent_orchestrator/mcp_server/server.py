@@ -1192,6 +1192,18 @@ async def list_base_sessions() -> Dict[str, Any]:
     return {"success": True, "bases": list_bases()}
 
 
+@mcp.tool(description="Retire a registered fork base without deleting its terminal or session.")
+async def unregister_base(
+    name: str = Field(description="Ready base name to retire"),
+) -> Dict[str, Any]:
+    from cli_agent_orchestrator.services.fork_context_service import retire
+
+    row = retire(name)
+    if row is None:
+        return {"success": False, "error": f"no ready base named {name}"}
+    return {"success": True, "base": row}
+
+
 # Implementation function for send_message
 def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, Any]:
     """Implementation of send_message logic."""

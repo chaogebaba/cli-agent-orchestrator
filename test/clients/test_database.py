@@ -716,11 +716,13 @@ class TestInitDb:
 
     @patch("cli_agent_orchestrator.clients.database.Base")
     @patch("cli_agent_orchestrator.clients.database._migrate_project_aliases_schema")
-    def test_init_db(self, mock_alias_migrate, mock_base):
+    @patch("cli_agent_orchestrator.clients.database._migrate_provider_sessions_status")
+    def test_init_db(self, mock_provider_sessions_migrate, mock_alias_migrate, mock_base):
         """Test database initialization."""
         init_db()
 
         mock_base.metadata.create_all.assert_called_once()
+        mock_provider_sessions_migrate.assert_called_once()
 
 
 class TestTerminalsSchemaMigration:
