@@ -19,7 +19,9 @@ STAMP_FIELDS = ("commit", "dirty", "timestamp", "cwd")
 _PYTEST_OUTCOME = re.compile(
     r"(?P<count>\d+)\s+(?P<kind>passed|failed|error|errors|skipped|deselected|xfailed|xpassed)\b"
 )
-_PYTEST_COMPLETION = re.compile(r"\bin\s+\d+(?:\.\d+)?s\s*$")
+_PYTEST_COMPLETION = re.compile(
+    r"\bin\s+\d+(?:\.\d+)?s(?:\s+\(\d+:\d{2}:\d{2}\))?\s*$"
+)
 
 
 def git_root(cwd: Path | None = None) -> Path:

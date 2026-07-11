@@ -122,6 +122,29 @@ def test_suite_log_allows_lowercase_error_words_in_passing_output(tmp_path, monk
     assert reasons == []
 
 
+def test_pytest_summary_accepts_optional_wall_clock_suffix():
+    assert svc.pytest_summary_error(
+        "4481 passed, 13 skipped, 101 deselected in 60.03s (0:01:00)\n"
+    ) is None
+    assert svc.pytest_summary_error(
+        "4481 passed in 86400.00s (12:34:56)\n"
+    ) is None
+
+
+def test_suffixed_pytest_summary_still_rejects_failure_tampers():
+    counted = "4481 passed, 2 failed in 60.03s (0:01:00)\n"
+    marker = (
+        "4481 passed in 60.03s (0:01:00)\n"
+        "FAILED test_x.py::test_y - AssertionError\n"
+    )
+    assert svc.pytest_summary_error(counted) == (
+        "suite output contains a nonzero failed/error outcome"
+    )
+    assert svc.pytest_summary_error(marker) == (
+        "suite output contains a pytest failure/error marker"
+    )
+
+
 def test_suite_log_rejects_invalid_types_and_foreign_cwd(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     root.mkdir()
