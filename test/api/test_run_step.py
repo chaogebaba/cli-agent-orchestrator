@@ -22,6 +22,17 @@ def _body(**overrides):
 
 
 class TestRunStepEndpoint:
+    def test_invalid_working_directory_maps_to_400(self, client):
+        detail = "invalid_working_directory: Working directory does not exist: /missing"
+        with patch(_RUN_STEP, new=AsyncMock(side_effect=ValueError(detail))) as run:
+            resp = client.post(
+                TERMINALS_RUN_STEP_ROUTE,
+                json=_body(working_directory="/missing"),
+            )
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == detail
+        run.assert_awaited_once()
+
     def test_reused_ready_base_requires_refresh_authorization(self, client):
         with patch(
             "cli_agent_orchestrator.services.terminal_guard_service.get_ready_provider_session_by_source_terminal",

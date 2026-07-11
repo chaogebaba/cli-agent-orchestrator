@@ -19,6 +19,7 @@ Terminal Workflow:
 
 import asyncio
 import logging
+import os
 import threading
 import time
 from datetime import datetime
@@ -62,6 +63,7 @@ from cli_agent_orchestrator.services.session_env import (
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
+from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
@@ -241,6 +243,19 @@ async def create_terminal(
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
         TimeoutError: If provider initialization times out
     """
+    if working_directory is not None:
+        if not os.path.isabs(os.path.expanduser(working_directory)):
+            raise ValueError(
+                f"invalid_working_directory: Working directory must be an absolute path: "
+                f"{working_directory}"
+            )
+        try:
+            working_directory = resolve_and_validate_path(
+                working_directory, description="Working directory"
+            )
+        except ValueError as exc:
+            raise ValueError(f"invalid_working_directory: {exc}") from exc
+
     session_created = False  # tracks whether THIS call created the tmux session
     try:
         # Step 1: Generate unique identifiers

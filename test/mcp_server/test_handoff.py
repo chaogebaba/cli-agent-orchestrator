@@ -23,6 +23,15 @@ from cli_agent_orchestrator.mcp_server.server import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _supervisor_cwd():
+    with patch(
+        "cli_agent_orchestrator.mcp_server.server.strict_supervisor_cwd",
+        return_value="/repo",
+    ):
+        yield
+
+
 def _ctx(provider, session_name=None, caller_id=None, allowed_tools=None):
     """Build a HandoffContext for mocking _resolve_handoff_provider."""
     return HandoffContext(

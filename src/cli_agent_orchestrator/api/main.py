@@ -1234,6 +1234,8 @@ async def create_terminal_in_session(
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
     except ValueError as e:
+        if str(e).startswith("invalid_working_directory: "):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         raise HTTPException(
@@ -1566,6 +1568,8 @@ async def run_step(
         )
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
+        if str(e).startswith("invalid_working_directory: "):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         raise HTTPException(

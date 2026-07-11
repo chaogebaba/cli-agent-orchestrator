@@ -200,6 +200,27 @@ class TestTerminalCreationWithWorkingDirectory:
             call_kwargs = mock_svc.create_terminal.call_args.kwargs
             assert call_kwargs.get("working_directory") == str(tmp_path)
 
+    def test_invalid_working_directory_maps_to_400(self, client):
+        detail = "invalid_working_directory: Working directory does not exist: /missing"
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(side_effect=ValueError(detail))
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                    "working_directory": "/missing",
+                },
+            )
+        assert response.status_code == 400
+        assert response.json()["detail"] == detail
+
     def test_create_terminal_passes_caller_id(self, client):
         """caller_id query param threads through to the service (issue #284)."""
         with (

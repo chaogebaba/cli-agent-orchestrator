@@ -140,7 +140,9 @@ class TestEngineHandoffEquivalence:
                     ) as mock_requests:
                         mock_requests.post.side_effect = fake_post
                         mock_requests.Timeout = Exception
-                        return asyncio.run(_handoff_impl("developer", "do the task"))
+                        return asyncio.run(
+                            _handoff_impl("developer", "do the task", working_directory="/repo")
+                        )
 
         rec = _SequenceRecorder()
         patches = rec.install()
@@ -197,7 +199,9 @@ class TestEngineHandoffEquivalence:
                     ) as mock_requests:
                         mock_requests.post.side_effect = fake_post
                         mock_requests.Timeout = Exception
-                        asyncio.run(_handoff_impl("developer", "do the task"))
+                        asyncio.run(
+                            _handoff_impl("developer", "do the task", working_directory="/repo")
+                        )
         finally:
             for p in reversed(patches):
                 p.stop()

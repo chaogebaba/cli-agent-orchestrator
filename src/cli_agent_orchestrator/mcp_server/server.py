@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import time
 from typing import Any, Dict, NamedTuple, Optional, Tuple, Union
 
@@ -35,9 +36,6 @@ def _mcp_timeout() -> float:
     """Get MCP request timeout from server settings."""
     return float(get_server_settings()["mcp_request_timeout"])
 
-
-# Environment variable to enable/disable working_directory parameter
-ENABLE_WORKING_DIRECTORY = os.getenv("CAO_ENABLE_WORKING_DIRECTORY", "false").lower() == "true"
 
 # Environment variable to enable/disable automatic sender terminal ID injection.
 # Defaults to enabled (issue #284): callback routing must not depend on the
@@ -203,26 +201,6 @@ def _create_terminal(
         session_name = terminal_metadata["session_name"]
         parent_allowed_tools = terminal_metadata.get("allowed_tools")
 
-        # If no working_directory specified, get conductor's current directory
-        if working_directory is None:
-            try:
-                response = requests.get(
-                    f"{API_BASE_URL}/terminals/{current_terminal_id}/working-directory",
-                    timeout=_mcp_timeout(),
-                )
-                if response.status_code == 200:
-                    working_directory = response.json().get("working_directory")
-                    logger.info(f"Inherited working directory from conductor: {working_directory}")
-                else:
-                    logger.warning(
-                        f"Failed to get conductor's working directory (status {response.status_code}), "
-                        "will use server default"
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"Error fetching conductor's working directory: {e}, will use server default"
-                )
-
         # Resolve child's allowed_tools via inheritance
         child_allowed_tools = _resolve_child_allowed_tools(parent_allowed_tools, agent_profile)
 
@@ -289,6 +267,89 @@ def _create_terminal(
         terminal = response.json()
 
     return terminal["id"], provider
+
+
+def strict_supervisor_cwd() -> str:
+    """Return the live supervisor pane cwd or fail without a process-cwd fallback."""
+    terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    if not terminal_id:
+        raise ValueError("supervisor_working_directory_unavailable: CAO_TERMINAL_ID not set")
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/terminals/{terminal_id}/working-directory",
+            timeout=_mcp_timeout(),
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise ValueError(f"supervisor_working_directory_unavailable: {exc}") from exc
+    cwd = response.json().get("working_directory")
+    if not cwd:
+        raise ValueError("supervisor_working_directory_unavailable: empty working_directory")
+    return cwd
+
+
+_GIT_IDENTITY_ENV_VARS = {
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+}
+
+
+def _git_identity(path: str) -> tuple[str, str]:
+    """Return (toplevel, common-dir) using path-anchored, environment-clean git."""
+    if not os.path.isabs(os.path.expanduser(path)):
+        raise ValueError(f"invalid_working_directory: path must be absolute: {path}")
+    clean_env = {k: v for k, v in os.environ.items() if k not in _GIT_IDENTITY_ENV_VARS}
+    try:
+        top = subprocess.run(
+            ["git", "-C", path, "rev-parse", "--show-toplevel"], check=True,
+            capture_output=True, text=True, env=clean_env,
+        ).stdout.strip()
+        try:
+            common = subprocess.run(
+                ["git", "-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                check=True, capture_output=True, text=True, env=clean_env,
+            ).stdout.strip()
+        except subprocess.CalledProcessError:
+            common = subprocess.run(
+                ["git", "-C", path, "rev-parse", "--git-common-dir"], check=True,
+                capture_output=True, text=True, env=clean_env,
+            ).stdout.strip()
+            if not os.path.isabs(common):
+                common = os.path.join(path, common)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError(f"fork_working_directory_identity_failed: {path}") from exc
+    return os.path.realpath(top), os.path.realpath(common)
+
+
+def _resolve_fork_working_directory(row: Dict[str, Any], requested: Optional[str]) -> tuple[str, str]:
+    """Apply fork cwd precedence and return (launch cwd, optional preamble line)."""
+    base = row["cwd"]
+    if requested is None or os.path.realpath(requested) == os.path.realpath(base):
+        return base, ""
+    if row["provider"] != "codex":
+        raise ValueError(
+            f"fork_working_directory_provider_unsupported: {row['provider']} base cwd {base}, "
+            f"requested {requested}"
+        )
+    try:
+        base_top, base_common = _git_identity(base)
+    except ValueError as exc:
+        raise ValueError(
+            f"fork_working_directory_identity_failed: base {base}, requested {requested}; "
+            f"base identity unavailable"
+        ) from exc
+    try:
+        target_top, target_common = _git_identity(requested)
+    except ValueError as exc:
+        raise ValueError(
+            f"fork_working_directory_identity_failed: base {base}, requested {requested}; "
+            f"requested identity unavailable"
+        ) from exc
+    if base_top != target_top and base_common != target_common:
+        raise ValueError(
+            f"fork_working_directory_mismatch: base {base_top}, requested {target_top}"
+        )
+    return requested, f"[WORKDIR] launched in {requested}, base snapshot taken in {base}."
 
 
 def _send_direct_input(
@@ -712,6 +773,8 @@ async def _handoff_impl(
     terminal_id: Optional[str] = None
 
     try:
+        if working_directory is None:
+            working_directory = strict_supervisor_cwd()
         # Resolve the supervisor context WITHOUT creating a terminal, so the
         # codex fast-fail (which needs CAO_TERMINAL_ID) and the codex
         # prompt-shaping can both run caller-side before the single combined
@@ -838,27 +901,24 @@ async def _handoff_impl(
         )
 
 
-# Conditional tool registration based on environment variable
-if ENABLE_WORKING_DIRECTORY:
-
-    @mcp.tool()
-    async def handoff(
-        agent_profile: str = Field(
-            description='The agent profile to hand off to (e.g., "developer", "analyst")'
-        ),
-        message: str = Field(description="The message/task to send to the target agent"),
-        timeout: int = Field(
-            default=600,
-            description="Maximum time to wait for the agent to complete the task (in seconds)",
-            ge=1,
-            le=3600,
-        ),
-        working_directory: Optional[str] = Field(
-            default=None,
-            description='Optional working directory where the agent should execute (e.g., "/path/to/workspace/src/Package")',
-        ),
-    ) -> HandoffResult:
-        """Hand off a task to another agent via CAO terminal and wait for completion.
+@mcp.tool()
+async def handoff(
+    agent_profile: str = Field(
+        description='The agent profile to hand off to (e.g., "developer", "analyst")'
+    ),
+    message: str = Field(description="The message/task to send to the target agent"),
+    timeout: int = Field(
+        default=600,
+        description="Maximum time to wait for the agent to complete the task (in seconds)",
+        ge=1,
+        le=3600,
+    ),
+    working_directory: Optional[str] = Field(
+        default=None,
+        description='Optional working directory where the agent should execute',
+    ),
+) -> HandoffResult:
+    """Hand off a task to another agent via CAO terminal and wait for completion.
 
         This tool allows handing off tasks to other agents by creating a new terminal
         in the same session. It sends the message, waits for completion, and captures the output.
@@ -894,53 +954,8 @@ if ENABLE_WORKING_DIRECTORY:
 
         Returns:
             HandoffResult with success status, message, and agent output
-        """
-        return await _handoff_impl(agent_profile, message, timeout, working_directory)
-
-else:
-
-    @mcp.tool()
-    async def handoff(  # type: ignore[misc]
-        agent_profile: str = Field(
-            description='The agent profile to hand off to (e.g., "developer", "analyst")'
-        ),
-        message: str = Field(description="The message/task to send to the target agent"),
-        timeout: int = Field(
-            default=600,
-            description="Maximum time to wait for the agent to complete the task (in seconds)",
-            ge=1,
-            le=3600,
-        ),
-    ) -> HandoffResult:
-        """Hand off a task to another agent via CAO terminal and wait for completion.
-
-        This tool allows handing off tasks to other agents by creating a new terminal
-        in the same session. It sends the message, waits for completion, and captures the output.
-
-        ## Usage
-
-        Use this tool to hand off tasks to another agent and wait for the results.
-        The tool will:
-        1. Create a new terminal with the specified agent profile and provider
-        2. Send the message to the terminal (starts in supervisor's current directory)
-        3. Monitor until completion
-        4. Return the agent's response
-        5. Clean up the terminal with /exit
-
-        ## Requirements
-
-        - Must be called from within a CAO terminal (CAO_TERMINAL_ID environment variable)
-        - Target session must exist and be accessible
-
-        Args:
-            agent_profile: The agent profile for the new terminal
-            message: The task/message to send
-            timeout: Maximum wait time in seconds
-
-        Returns:
-            HandoffResult with success status, message, and agent output
-        """
-        return await _handoff_impl(agent_profile, message, timeout, None)
+    """
+    return await _handoff_impl(agent_profile, message, timeout, working_directory)
 
 
 # Implementation function for assign
@@ -1003,11 +1018,17 @@ def _assign_impl(agent_profile: str, message: str, working_directory: Optional[s
                     raise ValueError("session_live_owned")
                 if state == "error":
                     raise ValueError("owner_probe_failed")
+            working_directory, workdir_preamble = _resolve_fork_working_directory(
+                row, working_directory
+            )
             _, preamble = staleness(row)
+            if workdir_preamble:
+                preamble = f"{preamble}\n{workdir_preamble}"
             fork_context = ForkContext(mode="resume" if resume else "fork",
                                        session_uuid=row["session_uuid"], base_name=row["name"],
                                        provider=provider, initial_preamble=preamble)
-            working_directory = row["cwd"]
+        elif working_directory is None:
+            working_directory = strict_supervisor_cwd()
         # Fail fast before creating the worker terminal when CAO_TERMINAL_ID is
         # unset — REGARDLESS of the sender-ID-injection flag. The deferred-init
         # path only forwards the initial message on the existing-session branch
@@ -1085,7 +1106,7 @@ def _assign_impl(agent_profile: str, message: str, working_directory: Optional[s
         }
 
 
-def _build_assign_description(enable_sender_id: bool, enable_workdir: bool) -> str:
+def _build_assign_description(enable_sender_id: bool, enable_workdir: bool = True) -> str:
     """Build the assign tool description based on feature flags."""
     # Build tool description overview.
     if enable_sender_id:
@@ -1136,9 +1157,7 @@ Returns:
     return desc
 
 
-_assign_description = _build_assign_description(
-    ENABLE_SENDER_ID_INJECTION, ENABLE_WORKING_DIRECTORY
-)
+_assign_description = _build_assign_description(ENABLE_SENDER_ID_INJECTION, True)
 _assign_message_field_desc = (
     "The task message to send to the worker agent."
     if ENABLE_SENDER_ID_INJECTION
@@ -1154,34 +1173,19 @@ def _serialize_provider_session(row: Dict[str, Any]) -> Dict[str, Any]:
     return serialized
 
 
-if ENABLE_WORKING_DIRECTORY:
-
-    @mcp.tool(description=_assign_description)
-    async def assign(
-        agent_profile: str = Field(
-            description='The agent profile for the worker agent (e.g., "developer", "analyst")'
-        ),
-        message: str = Field(description=_assign_message_field_desc),
-        working_directory: Optional[str] = Field(
-            default=None, description="Optional working directory where the agent should execute"
-        ),
-        fork_from: Optional[str] = Field(default=None, description="Registered base name, UUID, or terminal id"),
-        resume: bool = Field(default=False, description="Resume instead of fork"),
-    ) -> Dict[str, Any]:
-        return _assign_impl(agent_profile, message, working_directory, fork_from, resume)
-
-else:
-
-    @mcp.tool(description=_assign_description)
-    async def assign(  # type: ignore[misc]
-        agent_profile: str = Field(
-            description='The agent profile for the worker agent (e.g., "developer", "analyst")'
-        ),
-        message: str = Field(description=_assign_message_field_desc),
-        fork_from: Optional[str] = Field(default=None, description="Registered base name, UUID, or terminal id"),
-        resume: bool = Field(default=False, description="Resume instead of fork"),
-    ) -> Dict[str, Any]:
-        return _assign_impl(agent_profile, message, None, fork_from, resume)
+@mcp.tool(description=_assign_description)
+async def assign(
+    agent_profile: str = Field(
+        description='The agent profile for the worker agent (e.g., "developer", "analyst")'
+    ),
+    message: str = Field(description=_assign_message_field_desc),
+    working_directory: Optional[str] = Field(
+        default=None, description="Optional working directory where the agent should execute"
+    ),
+    fork_from: Optional[str] = Field(default=None, description="Registered base name, UUID, or terminal id"),
+    resume: bool = Field(default=False, description="Resume instead of fork"),
+) -> Dict[str, Any]:
+    return _assign_impl(agent_profile, message, working_directory, fork_from, resume)
 
 
 @mcp.tool(description="Mark the caller's provider-native session as a ready fork base.")
