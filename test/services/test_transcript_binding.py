@@ -4,6 +4,9 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
 from cli_agent_orchestrator.services.message_trace_service import (
     TranscriptLiveReference,
     TranscriptResolution,
@@ -200,22 +203,33 @@ def test_same_path_mismatch_race_skips_only_bound_candidate(tmp_path):
     assert result.stale_note == "binding_stale:missing"
 
 
-def test_binding_epoch_reseed_hits_using_carried_reference(tmp_path):
-    old = tmp_path / "old.jsonl"
-    new = tmp_path / "new.jsonl"
+def test_binding_epoch_reseed_hits_after_real_null_binding_materializes(
+    tmp_path, monkeypatch
+):
+    from cli_agent_orchestrator.clients import database as db_mod
+
+    test_engine = create_engine("sqlite:///:memory:")
+    db_mod.Base.metadata.create_all(bind=test_engine)
+    monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=test_engine))
+    old = tmp_path / ".claude/projects/-work/old.jsonl"
+    new = tmp_path / ".claude/projects/-work/new.jsonl"
     _record(old, {"type": "user", "message": "old"})
-    _record(new, {"sessionId": "new", "type": "user", "message": "wire"})
-    stat = new.stat()
-    resolutions = [
-        TranscriptResolution(old, "exact_id"),
-        TranscriptResolution(new, "binding", stat.st_ino, live_reference=
-                             TranscriptLiveReference(new, stat.st_ino, stat.st_size)),
-    ]
-    with patch("cli_agent_orchestrator.services.message_trace_service.resolve_session_transcript",
-               side_effect=resolutions), patch(
-                   "cli_agent_orchestrator.services.message_trace_service.time.sleep"):
+    db_mod.create_transcript_binding("term", "new", str(new), None, "compact")
+    metadata = {"id": "term", "provider": "claude_code",
+                "provider_session_id": "old", "working_directory": "/work"}
+    materialized = False
+
+    def materialize(_delay):
+        nonlocal materialized
+        if not materialized:
+            materialized = True
+            _record(new, {"sessionId": "new", "type": "user", "message": "wire"})
+
+    with patch.object(Path, "home", return_value=tmp_path), patch(
+            "cli_agent_orchestrator.services.message_trace_service.time.sleep",
+            side_effect=materialize):
         outcome, evidence = confirm_delivery(
-            {}, wire_hash("wire"), expected_ref={"path": str(old),
+            metadata, wire_hash("wire"), expected_ref={"path": str(old),
             "inode": old.stat().st_ino, "size": old.stat().st_size}, timeout=1)
     assert outcome == "hit"
     assert evidence["continuity_reseed"] == "binding_epoch"

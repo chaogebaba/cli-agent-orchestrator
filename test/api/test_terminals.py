@@ -5,6 +5,8 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.models.terminal import Terminal
@@ -45,19 +47,26 @@ class TestTranscriptBindingEndpoint:
         assert response.json()["detail"].startswith("invalid_transcript_binding:")
         create.assert_not_called()
 
-    def test_binding_contained_missing_path_stores_null_inode(self, client, tmp_path):
+    def test_binding_contained_missing_path_stores_null_inode(
+        self, client, tmp_path, monkeypatch
+    ):
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        test_engine = create_engine(f"sqlite:///{tmp_path / 'bindings.db'}")
+        db_mod.Base.metadata.create_all(bind=test_engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=test_engine))
         path = tmp_path / ".claude" / "projects" / "repo" / "missing.jsonl"
         path.parent.mkdir(parents=True)
         payload = {"terminal_id": "abcd1234", "session_id": "s",
                    "transcript_path": str(path), "source": "startup"}
         with patch("cli_agent_orchestrator.api.main.Path.home", return_value=tmp_path), \
              patch("cli_agent_orchestrator.api.main.get_terminal_metadata",
-                   return_value={"id": "abcd1234"}), \
-             patch("cli_agent_orchestrator.api.main.create_transcript_binding",
-                   return_value={"id": 1, "inode": None}) as create:
+                   return_value={"id": "abcd1234"}):
             response = client.post("/terminals/abcd1234/transcript-binding", json=payload)
         assert response.status_code == 200
-        assert create.call_args.args[3] is None
+        stored = db_mod.get_current_transcript_binding("abcd1234")
+        assert stored["transcript_path"] == str(path)
+        assert stored["inode"] is None
 
     @pytest.mark.parametrize("case", ["non_regular", "unreadable"])
     def test_binding_existing_invalid_file_remains_400(self, client, tmp_path, case):
