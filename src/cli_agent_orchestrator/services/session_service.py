@@ -125,7 +125,9 @@ def get_session(session_name: str) -> Dict:
         raise
 
 
-def delete_session(session_name: str, registry: PluginRegistry | None = None) -> Dict:
+def delete_session(
+    session_name: str, registry: PluginRegistry | None = None, force: bool = False
+) -> Dict:
     """Delete session and cleanup.
 
     Returns:
@@ -138,6 +140,11 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
         from cli_agent_orchestrator.services import terminal_service
 
         terminals = list_terminals_by_session(session_name)
+
+        from cli_agent_orchestrator.services.terminal_guard_service import require_delete_allowed
+
+        for terminal in terminals:
+            require_delete_allowed(terminal["id"], force=force)
 
         # Clean up each terminal (snapshot, kill window, FIFO reader,
         # status buffer, provider, DB) via the event-driven teardown path.

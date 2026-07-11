@@ -171,6 +171,24 @@ class TestGetSession:
 
 
 class TestDeleteSession:
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_guard_service.require_delete_allowed")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_mixed_session_protection_is_all_or_nothing(
+        self, mock_backend, mock_list, mock_preflight, mock_delete
+    ):
+        mock_backend.return_value.session_exists.return_value = True
+        mock_list.return_value = [{"id": "plain"}, {"id": "protected"}]
+        mock_preflight.side_effect = [None, ValueError("protected")]
+
+        with pytest.raises(ValueError, match="protected"):
+            delete_session("cao-mixed")
+
+        assert mock_preflight.call_count == 2
+        mock_delete.assert_not_called()
+        mock_backend.return_value.kill_session.assert_not_called()
+
     """Tests for delete_session function."""
 
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")

@@ -802,6 +802,17 @@ def get_ready_provider_session(name: str) -> Optional[Dict[str, Any]]:
         return provider_session_to_dict(row) if row else None
 
 
+def get_ready_provider_session_by_source_terminal(
+    terminal_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Return the ready base owned by ``terminal_id``, if any."""
+    with SessionLocal() as db:
+        row = db.query(ProviderSessionModel).filter_by(
+            source_terminal_id=terminal_id, status="ready"
+        ).first()
+        return provider_session_to_dict(row) if row else None
+
+
 def get_provider_session_by_uuid(session_uuid: str) -> Optional[Dict[str, Any]]:
     with SessionLocal() as db:
         row = (db.query(ProviderSessionModel).filter_by(session_uuid=session_uuid)

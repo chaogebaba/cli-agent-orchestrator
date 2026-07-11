@@ -8,6 +8,47 @@ from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.models.terminal import Terminal
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+
+class TestTerminalProtection:
+    def test_delete_rejects_ready_base_owner(self, client):
+        with patch(
+            "cli_agent_orchestrator.services.terminal_guard_service.get_ready_provider_session_by_source_terminal",
+            return_value={"name": "infra"},
+        ), patch("cli_agent_orchestrator.api.main.terminal_service") as service:
+            response = client.delete("/terminals/abcd1234")
+
+        assert response.status_code == 409
+        assert "ready base 'infra'" in response.json()["detail"]
+        service.delete_terminal.assert_not_called()
+
+    def test_delete_rejects_protected_profile(self, client):
+        with patch(
+            "cli_agent_orchestrator.services.terminal_guard_service.get_ready_provider_session_by_source_terminal",
+            return_value=None,
+        ), patch(
+            "cli_agent_orchestrator.services.terminal_guard_service.get_terminal_metadata",
+            return_value={"agent_profile": "guarded"},
+        ), patch(
+            "cli_agent_orchestrator.services.terminal_guard_service.load_agent_profile",
+            return_value=AgentProfile(name="guarded", description="", protected=True),
+        ), patch("cli_agent_orchestrator.api.main.terminal_service") as service:
+            response = client.delete("/terminals/abcd1234")
+
+        assert response.status_code == 409
+        assert "protected profile 'guarded'" in response.json()["detail"]
+        service.delete_terminal.assert_not_called()
+
+    def test_delete_force_overrides_protection(self, client):
+        with patch(
+            "cli_agent_orchestrator.services.terminal_guard_service.get_ready_provider_session_by_source_terminal"
+        ) as lookup, patch("cli_agent_orchestrator.api.main.terminal_service") as service:
+            service.delete_terminal.return_value = True
+            response = client.delete("/terminals/abcd1234", params={"force": "true"})
+
+        assert response.status_code == 200
+        lookup.assert_not_called()
 
 
 class TestWorkingDirectoryEndpoint:
@@ -280,6 +321,26 @@ class TestExitTerminalEndpoint:
     boundary contract: delegation + domain-error -> HTTP-status mapping.
     """
 
+    def test_exit_rejects_protected_terminal(self, client):
+        with patch(
+            "cli_agent_orchestrator.services.terminal_guard_service.get_ready_provider_session_by_source_terminal",
+            return_value={"name": "infra"},
+        ), patch("cli_agent_orchestrator.api.main.terminal_service") as service:
+            response = client.post("/terminals/abcd1234/exit")
+
+        assert response.status_code == 409
+        service.exit_terminal_cli.assert_not_called()
+
+    def test_exit_force_overrides_protection(self, client):
+        with patch(
+            "cli_agent_orchestrator.services.terminal_guard_service.get_ready_provider_session_by_source_terminal"
+        ) as lookup, patch("cli_agent_orchestrator.api.main.terminal_service") as service:
+            response = client.post("/terminals/abcd1234/exit", params={"force": "true"})
+
+        assert response.status_code == 200
+        lookup.assert_not_called()
+        service.exit_terminal_cli.assert_called_once_with("abcd1234")
+
     def test_exit_terminal_delegates_and_returns_success(self, client):
         """A successful exit delegates to exit_terminal_cli and returns 200."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
@@ -346,6 +407,43 @@ class TestDeleteTerminalEndpoint:
 
 class TestCreateInboxMessageEndpoint:
     """Test POST /terminals/{receiver_id}/inbox/messages endpoint."""
+
+    def test_ready_base_rejected_before_queue_or_delivery(self, client):
+        with patch(
+            "cli_agent_orchestrator.services.terminal_guard_service.get_ready_provider_session_by_source_terminal",
+            return_value={"name": "infra"},
+        ), patch("cli_agent_orchestrator.api.main.create_inbox_message") as create, patch(
+            "cli_agent_orchestrator.api.main.inbox_service"
+        ) as inbox:
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={"sender_id": "sender1", "message": "poison"},
+            )
+
+        assert response.status_code == 409
+        create.assert_not_called()
+        inbox.deliver_pending.assert_not_called()
+
+    def test_refresh_ingest_allows_ready_base(self, client):
+        mock_msg = MagicMock(id=1, sender_id="sender1", receiver_id="abcd1234")
+        mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
+        with patch(
+            "cli_agent_orchestrator.services.terminal_guard_service.get_ready_provider_session_by_source_terminal"
+        ) as lookup, patch(
+            "cli_agent_orchestrator.api.main.get_terminal_metadata",
+            return_value={"tmux_session": "cao-test", "tmux_window": "worker"},
+        ), patch("cli_agent_orchestrator.api.main.get_backend") as backend, patch(
+            "cli_agent_orchestrator.api.main.create_inbox_message", return_value=mock_msg
+        ) as create, patch("cli_agent_orchestrator.api.main.inbox_service"):
+            backend.return_value.session_exists.return_value = True
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={"sender_id": "sender1", "message": "refresh", "refresh_ingest": "true"},
+            )
+
+        assert response.status_code == 200
+        lookup.assert_not_called()
+        create.assert_called_once()
 
     def test_create_inbox_message_success(self, client):
         """POST creates an inbox message and returns success."""

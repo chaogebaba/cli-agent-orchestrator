@@ -80,6 +80,32 @@ class TestGetCleanupNudge:
 
 
 class TestDeleteTerminal:
+    @patch("cli_agent_orchestrator.mcp_server.server.requests.delete")
+    def test_refuses_ready_base_owner(self, mock_delete):
+        error = requests.HTTPError("409")
+        error.response = MagicMock(status_code=409)
+        mock_delete.return_value.raise_for_status.side_effect = error
+        result = delete_terminal("t1")
+        assert result["success"] is False
+        assert "Failed" in result["message"]
+
+    @patch("cli_agent_orchestrator.mcp_server.server.requests.delete")
+    def test_refuses_protected_profile(self, mock_delete):
+        error = requests.HTTPError("409")
+        error.response = MagicMock(status_code=409)
+        mock_delete.return_value.raise_for_status.side_effect = error
+        result = delete_terminal("t1")
+        assert result["success"] is False
+        assert "Failed" in result["message"]
+
+    @patch("cli_agent_orchestrator.mcp_server.server.requests.delete")
+    def test_force_overrides_protection(self, mock_delete):
+        mock_delete.return_value.raise_for_status.return_value = None
+        result = delete_terminal("t1", force=True)
+        assert result["success"] is True
+        mock_delete.assert_called_once()
+        assert mock_delete.call_args.kwargs["params"] == {"force": True}
+
     def test_success(self):
         with patch("cli_agent_orchestrator.mcp_server.server.requests.delete") as mock_delete:
             mock_delete.return_value.raise_for_status.return_value = None

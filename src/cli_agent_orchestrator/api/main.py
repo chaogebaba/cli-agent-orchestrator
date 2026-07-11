@@ -109,6 +109,11 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.stalled_callback_watchdog import stalled_callback_watchdog
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
+from cli_agent_orchestrator.services.terminal_guard_service import (
+    TerminalProtectionError,
+    require_delete_allowed,
+    require_input_allowed,
+)
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
 from cli_agent_orchestrator.utils.skills import (
@@ -208,6 +213,10 @@ class RunStepRequest(BaseModel):
     )
     reuse_terminal_id: Optional[str] = Field(
         default=None, description="Reuse an existing terminal (skips create + teardown)"
+    )
+    refresh_ingest: bool = Field(
+        default=False,
+        description="Authorize reusing a ready-base terminal for refresh ingestion",
     )
     teardown: bool = Field(
         default=True,
@@ -1091,6 +1100,7 @@ async def get_session(session_name: str) -> Dict:
 async def delete_session(
     request: Request,
     session_name: str,
+    force: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
 ) -> Dict:
     try:
@@ -1104,9 +1114,14 @@ async def delete_session(
         # A worker thread bounds the blast radius of any future stall to this
         # one request.
         result = await asyncio.to_thread(
-            session_service.delete_session, session_name, registry=get_plugin_registry(request)
+            session_service.delete_session,
+            session_name,
+            registry=get_plugin_registry(request),
+            force=force,
         )
         return {"success": True, **result}
+    except TerminalProtectionError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -1312,9 +1327,11 @@ async def send_terminal_input(
     message: str,
     sender_id: Optional[str] = None,
     orchestration_type: Optional[OrchestrationType] = None,
+    refresh_ingest: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     try:
+        require_input_allowed(terminal_id, refresh_ingest=refresh_ingest)
         # send_input is blocking tmux I/O (bracketed paste + key sends). Run it
         # off the event loop so a slow tmux call can't freeze every other
         # request — including /health and concurrent assign/handoff. Same
@@ -1329,6 +1346,8 @@ async def send_terminal_input(
         )
         return {"success": success}
     except TerminalInputBlockedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except TerminalProtectionError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1390,13 +1409,17 @@ async def get_terminal_output(
 @app.post("/terminals/{terminal_id}/exit")
 async def exit_terminal(
     terminal_id: TerminalId,
+    force: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Send provider-specific exit command to terminal."""
     try:
+        require_delete_allowed(terminal_id, force=force)
         # Blocking tmux I/O — off the loop.
         await asyncio.to_thread(terminal_service.exit_terminal_cli, terminal_id)
         return {"success": True}
+    except TerminalProtectionError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -1468,6 +1491,14 @@ async def run_step(
     from cli_agent_orchestrator.services.workflow_service import StaleGenerationError
 
     on_terminal_created = make_step_terminal_recorder(body.env_vars)
+
+    if body.reuse_terminal_id:
+        try:
+            require_input_allowed(
+                body.reuse_terminal_id, refresh_ingest=body.refresh_ingest
+            )
+        except TerminalProtectionError as e:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
 
     # The generation fence (ADR-9 anti-double-drive, DR-5): a script run-step call
     # carrying BOTH CAO_WORKFLOW_RUN_ID and CAO_WORKFLOW_GENERATION must be checked
@@ -1759,10 +1790,12 @@ async def resume_workflow_run_endpoint(
 async def delete_terminal(
     request: Request,
     terminal_id: TerminalId,
+    force: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
 ) -> Dict:
     """Delete a terminal."""
     try:
+        require_delete_allowed(terminal_id, force=force)
         # delete_terminal is fully synchronous: blocking tmux kills, a
         # full-history scrollback snapshot capture, and DB writes. Off the
         # loop so a stalled tmux/FIFO op bounds its blast radius to this one
@@ -1774,6 +1807,8 @@ async def delete_terminal(
             registry=get_plugin_registry(request),
         )
         return {"success": success}
+    except TerminalProtectionError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -1789,9 +1824,14 @@ async def create_inbox_message_endpoint(
     receiver_id: TerminalId,
     sender_id: str,
     message: str,
+    refresh_ingest: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
+    try:
+        require_input_allowed(receiver_id, refresh_ingest=refresh_ingest)
+    except TerminalProtectionError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     metadata = get_terminal_metadata(receiver_id)
     if not metadata:
         raise HTTPException(

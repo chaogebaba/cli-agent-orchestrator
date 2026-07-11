@@ -594,7 +594,9 @@ def _parse_run_step_error(
     return None, fallback, None
 
 
-def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
+def _send_to_inbox(
+    receiver_id: str, message: str, refresh_ingest: bool = False
+) -> Dict[str, Any]:
     """Send message to another terminal's inbox (queued delivery when IDLE).
 
     Args:
@@ -617,6 +619,7 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
         params={
             "sender_id": sender_id,
             "message": message,
+            "refresh_ingest": refresh_ingest,
         },
         timeout=_mcp_timeout(),
     )
@@ -1192,7 +1195,25 @@ async def mark_base_ready(
             raise ValueError("CAO_TERMINAL_ID not set")
         from cli_agent_orchestrator.services.fork_context_service import mark_ready
         row = mark_ready(terminal_id, name, summary)
-        return {"success": True, "base": _serialize_provider_session(row)}
+        result = {
+            "success": True,
+            "base": _serialize_provider_session(row),
+            "callback": {"status": "not_applicable"},
+        }
+        try:
+            terminal_response = requests.get(
+                f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
+            )
+            terminal_response.raise_for_status()
+            caller_id = terminal_response.json().get("caller_id")
+            if caller_id:
+                callback = f"Base '{name}' ready: {summary or ''}"
+                _send_to_inbox(caller_id, callback)
+                result["callback"] = {"status": "delivered"}
+        except Exception as callback_exc:
+            logger.warning("Base %s ready but callback failed: %s", name, callback_exc)
+            result["callback"] = {"status": "failed", "error": str(callback_exc)}
+        return result
     except Exception as exc:
         return {"success": False, "error": str(exc)}
 
@@ -1217,7 +1238,9 @@ async def unregister_base(
 
 
 # Implementation function for send_message
-def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, Any]:
+def _send_message_impl(
+    receiver_id: Optional[str], message: str, refresh_ingest: bool = False
+) -> Dict[str, Any]:
     """Implementation of send_message logic."""
     try:
         own_terminal_id = os.environ.get("CAO_TERMINAL_ID")
@@ -1287,7 +1310,7 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
                 "never a built-in collaboration.send_message.]"
             )
 
-        return _send_to_inbox(receiver_id, message)
+        return _send_to_inbox(receiver_id, message, refresh_ingest=refresh_ingest)
     except requests.HTTPError as exc:
         # e.g. the receiver terminal (a recorded caller included) was deleted
         # before this reply — surface the API detail instead of a raw
@@ -1406,6 +1429,10 @@ async def send_message(
             "this one via handoff/assign (the recorded caller)."
         ),
     ),
+    refresh_ingest: bool = Field(
+        default=False,
+        description="Allow an explicit refresh-ingest dispatch to a ready base terminal",
+    ),
 ) -> Dict[str, Any]:
     """Send a message to another terminal's inbox.
 
@@ -1423,7 +1450,7 @@ async def send_message(
     Returns:
         Dict with success status and message details
     """
-    return _send_message_impl(receiver_id, message)
+    return _send_message_impl(receiver_id, message, refresh_ingest)
 
 
 @mcp.tool()
@@ -1466,6 +1493,7 @@ def delete_terminal(
     terminal_id: str = Field(
         description="The terminal ID to delete (obtained from assign or handoff results)"
     ),
+    force: bool = Field(default=False, description="Override ready-base and profile protection"),
 ) -> Dict[str, Any]:
     """Delete a terminal that is no longer needed, freeing system resources.
 
@@ -1484,7 +1512,9 @@ def delete_terminal(
     """
     try:
         response = requests.delete(
-            f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
+            f"{API_BASE_URL}/terminals/{terminal_id}",
+            params={"force": force is True},
+            timeout=_mcp_timeout(),
         )
         response.raise_for_status()
         return {"success": True, "message": f"Terminal {terminal_id} deleted successfully"}

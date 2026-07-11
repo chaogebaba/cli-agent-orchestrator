@@ -17,6 +17,13 @@ from cli_agent_orchestrator.utils.agent_profiles import (
 class TestLoadAgentProfile:
     """Tests for load_agent_profile function."""
 
+    def test_parse_protected_profile_flag(self):
+        profile = parse_agent_profile_text(
+            "---\nname: guarded\ndescription: Guarded\nprotected: true\n---\nPrompt",
+            "guarded",
+        )
+        assert profile.protected is True
+
     def test_load_agent_profile_from_local_store(self, tmp_path, monkeypatch):
         """Test loading agent profile from the local store."""
         local_store = tmp_path / "agent-store"

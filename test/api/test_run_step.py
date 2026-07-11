@@ -22,6 +22,36 @@ def _body(**overrides):
 
 
 class TestRunStepEndpoint:
+    def test_reused_ready_base_requires_refresh_authorization(self, client):
+        with patch(
+            "cli_agent_orchestrator.services.terminal_guard_service.get_ready_provider_session_by_source_terminal",
+            return_value={"name": "infra"},
+        ), patch(_RUN_STEP, new=AsyncMock()) as run:
+            resp = client.post(
+                TERMINALS_RUN_STEP_ROUTE,
+                json=_body(reuse_terminal_id="abc12345"),
+            )
+
+        assert resp.status_code == 409
+        assert "ready base 'infra'" in resp.json()["detail"]
+        run.assert_not_awaited()
+
+    def test_reused_ready_base_refresh_authorization_allows_step(self, client):
+        result = AgentStepResult(
+            terminal_id="abc12345", last_message="refreshed", status=TerminalStatus.COMPLETED
+        )
+        with patch(
+            "cli_agent_orchestrator.services.terminal_guard_service.get_ready_provider_session_by_source_terminal"
+        ) as lookup, patch(_RUN_STEP, new=AsyncMock(return_value=result)) as run:
+            resp = client.post(
+                TERMINALS_RUN_STEP_ROUTE,
+                json=_body(reuse_terminal_id="abc12345", refresh_ingest=True),
+            )
+
+        assert resp.status_code == 200
+        lookup.assert_not_called()
+        run.assert_awaited_once()
+
     def test_happy_path_returns_result(self, client):
         result = AgentStepResult(
             terminal_id="abc12345",

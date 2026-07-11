@@ -577,7 +577,33 @@ class TestDeleteSession:
         data = response.json()
         assert data["success"] is True
         assert data["deleted"] == ["test-session"]
-        mock_svc.delete_session.assert_called_once_with("test-session", registry=ANY)
+        mock_svc.delete_session.assert_called_once_with(
+            "test-session", registry=ANY, force=False
+        )
+
+    def test_protected_mixed_session_maps_to_409(self, client):
+        from cli_agent_orchestrator.services.terminal_guard_service import (
+            TerminalProtectionError,
+        )
+
+        with patch("cli_agent_orchestrator.api.main.session_service") as service:
+            service.delete_session.side_effect = TerminalProtectionError("protected member")
+            response = client.delete("/sessions/test-session")
+
+        assert response.status_code == 409
+        service.delete_session.assert_called_once_with(
+            "test-session", registry=ANY, force=False
+        )
+
+    def test_delete_session_force_propagates(self, client):
+        with patch("cli_agent_orchestrator.api.main.session_service") as service:
+            service.delete_session.return_value = {"deleted": ["test-session"], "errors": []}
+            response = client.delete("/sessions/test-session", params={"force": "true"})
+
+        assert response.status_code == 200
+        service.delete_session.assert_called_once_with(
+            "test-session", registry=ANY, force=True
+        )
 
     def test_delete_session_not_found(self, client):
         """DELETE /sessions/{name} returns 404 for nonexistent session."""
@@ -812,6 +838,19 @@ class TestGetTerminal:
 
 class TestSendTerminalInput:
     """Tests for POST /terminals/{terminal_id}/input endpoint."""
+
+    def test_ready_base_direct_input_rejected(self, client):
+        with patch(
+            "cli_agent_orchestrator.services.terminal_guard_service.get_ready_provider_session_by_source_terminal",
+            return_value={"name": "infra"},
+        ), patch("cli_agent_orchestrator.api.main.terminal_service") as service:
+            response = client.post(
+                "/terminals/abcd1234/input", params={"message": "poison"}
+            )
+
+        assert response.status_code == 409
+        assert "ready base 'infra'" in response.json()["detail"]
+        service.send_input.assert_not_called()
 
     def test_send_input_success(self, client):
         """POST /terminals/{id}/input sends message successfully."""

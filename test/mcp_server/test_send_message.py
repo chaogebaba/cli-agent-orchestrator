@@ -6,6 +6,41 @@ from unittest.mock import MagicMock, patch
 import requests
 
 
+class TestReadyBaseGuard:
+    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    def test_rejects_ready_base_owner(self, mock_inbox):
+        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+
+        response = MagicMock()
+        response.json.return_value = {
+            "detail": (
+                "terminal owns ready base 'infra'; only refresh-ingest dispatches allowed — "
+                "pass refresh_ingest=true"
+            )
+        }
+        error = requests.HTTPError("409")
+        error.response = response
+        mock_inbox.side_effect = error
+        result = _send_message_impl("base-term", "ordinary task")
+
+        assert result["success"] is False
+        assert "ready base 'infra'" in result["error"]
+        assert "refresh_ingest=true" in result["error"]
+        assert mock_inbox.call_args.kwargs == {"refresh_ingest": False}
+
+    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    def test_refresh_ingest_allows_ready_base_owner(self, mock_inbox):
+        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+
+        mock_inbox.return_value = {"success": True}
+        result = _send_message_impl("base-term", "refresh", refresh_ingest=True)
+
+        assert result["success"] is True
+        assert mock_inbox.call_args.args[0] == "base-term"
+        assert mock_inbox.call_args.args[1].startswith("refresh")
+        assert mock_inbox.call_args.kwargs == {"refresh_ingest": True}
+
+
 class TestSendMessageSelfSendGuard:
     """Tests for the self-send guard added for issue #24.
 

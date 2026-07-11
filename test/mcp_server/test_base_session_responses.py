@@ -11,11 +11,44 @@ from cli_agent_orchestrator.mcp_server.server import list_base_sessions, mark_ba
 async def test_mark_base_ready_replaces_dirty_hashes_with_count(monkeypatch):
     row = {"name": "base", "dirty_hashes": '{"one.py":"abc","two.py":null}'}
     monkeypatch.setenv("CAO_TERMINAL_ID", "terminal-1")
-    with patch("cli_agent_orchestrator.services.fork_context_service.mark_ready", return_value=row):
+    terminal_response = patch("cli_agent_orchestrator.mcp_server.server.requests.get")
+    with patch("cli_agent_orchestrator.services.fork_context_service.mark_ready", return_value=row), terminal_response as mock_get:
+        mock_get.return_value.json.return_value = {"caller_id": None}
         response = await mark_base_ready("base")
 
     assert response["base"]["dirty_file_count"] == 2
     assert "dirty_hashes" not in response["base"]
+    assert response["callback"] == {"status": "not_applicable"}
+
+
+@pytest.mark.asyncio
+async def test_mark_base_ready_notifies_recorded_caller(monkeypatch):
+    row = {"name": "infra", "dirty_hashes": "{}"}
+    monkeypatch.setenv("CAO_TERMINAL_ID", "terminal-1")
+    with patch("cli_agent_orchestrator.services.fork_context_service.mark_ready", return_value=row), patch(
+        "cli_agent_orchestrator.mcp_server.server.requests.get"
+    ) as mock_get, patch(
+        "cli_agent_orchestrator.mcp_server.server._send_to_inbox"
+    ) as mock_inbox:
+        mock_get.return_value.json.return_value = {"caller_id": "caller-1"}
+        response = await mark_base_ready("infra", "loaded context")
+
+    assert response["success"] is True
+    assert response["callback"] == {"status": "delivered"}
+    mock_inbox.assert_called_once_with("caller-1", "Base 'infra' ready: loaded context")
+
+
+@pytest.mark.asyncio
+async def test_mark_base_ready_reports_callback_failure_without_failing_mark(monkeypatch):
+    row = {"name": "infra", "dirty_hashes": "{}"}
+    monkeypatch.setenv("CAO_TERMINAL_ID", "terminal-1")
+    with patch("cli_agent_orchestrator.services.fork_context_service.mark_ready", return_value=row), patch(
+        "cli_agent_orchestrator.mcp_server.server.requests.get", side_effect=RuntimeError("offline")
+    ):
+        response = await mark_base_ready("infra", "loaded context")
+
+    assert response["success"] is True
+    assert response["callback"] == {"status": "failed", "error": "offline"}
 
 
 @pytest.mark.asyncio

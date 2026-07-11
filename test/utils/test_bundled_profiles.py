@@ -56,3 +56,7 @@ def test_bundled_profile_parses(name):
     meta = frontmatter.loads(text).metadata
     assert meta.get("name") == name
     assert meta.get("description")
+
+
+def test_bundled_code_supervisor_is_protected():
+    assert _load_bundled("code_supervisor").protected is True
