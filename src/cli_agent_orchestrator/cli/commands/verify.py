@@ -5,10 +5,8 @@ from pathlib import Path
 
 import click
 
-from cli_agent_orchestrator.constants import SERVER_PORT
 from cli_agent_orchestrator.services.verification_service import (
-    changed_files, compare_installed, git_root, installed_package_root,
-    listening_pid, process_start_time, verify_suite_log,
+    changed_files, deployment_status, git_root, verify_suite_log,
 )
 
 
@@ -37,22 +35,14 @@ def deploy() -> None:
         root = git_root()
     except subprocess.CalledProcessError as exc:
         raise click.ClickException(str(exc))
-    installed = installed_package_root()
-    if installed is None or not installed.is_dir():
-        state, count, newest = "not-found", None, None
+    status = deployment_status(root)
+    state = status["cli_path"]
+    count = status["differing_files"]
+    if state == "not-found":
         click.echo("CLI path: not-found")
     else:
-        state, count, newest = compare_installed(root, installed)
         click.echo(f"CLI path: {state} ({count} files differ)")
-    pid = listening_pid(SERVER_PORT)
-    if pid is None:
-        server_state = "not-running"
-    else:
-        started = process_start_time(pid)
-        if started is None or newest is None:
-            server_state = "unknown"
-        else:
-            server_state = "restart-needed" if newest > started else "current"
+    server_state = status["server"]
     click.echo(f"server: {server_state}")
     if state != "current" or server_state != "current":
         raise click.exceptions.Exit(1)

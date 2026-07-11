@@ -205,7 +205,7 @@ def parse_agent_profile_text(resolved_text: str, profile_name: str) -> AgentProf
     return AgentProfile(**meta)
 
 
-def _read_agent_profile_source(agent_name: str) -> str:
+def read_agent_profile_source(agent_name: str) -> str:
     """Locate an agent profile across configured stores and return the raw text.
 
     Search order:
@@ -277,10 +277,14 @@ def _read_agent_profile_source(agent_name: str) -> str:
     raise FileNotFoundError(f"Agent profile not found: {agent_name}")
 
 
+# Backward-compatible private alias; new manifest consumers use the public helper.
+_read_agent_profile_source = read_agent_profile_source
+
+
 def load_agent_profile(agent_name: str) -> AgentProfile:
     """Load an agent profile from the configured stores."""
     try:
-        raw_text = _read_agent_profile_source(agent_name)
+        raw_text = read_agent_profile_source(agent_name)
         return parse_agent_profile_text(resolve_env_vars(raw_text), agent_name)
     except (FileNotFoundError, ValueError):
         raise

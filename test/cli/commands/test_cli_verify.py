@@ -216,11 +216,10 @@ def test_verify_deploy_reports_states(monkeypatch):
     import cli_agent_orchestrator.cli.commands.verify as command
 
     monkeypatch.setattr(command, "git_root", lambda: Path("/repo"))
-    monkeypatch.setattr(command, "installed_package_root", lambda: Path("/installed"))
-    monkeypatch.setattr(Path, "is_dir", lambda self: True)
-    monkeypatch.setattr(command, "compare_installed", lambda *args: ("stale", 2, 200.0))
-    monkeypatch.setattr(command, "listening_pid", lambda port: 42)
-    monkeypatch.setattr(command, "process_start_time", lambda pid: 100.0)
+    monkeypatch.setattr(command, "deployment_status", lambda root: {
+        "cli_path": "stale", "differing_files": 2, "server": "restart-needed",
+        "source_root": str(root),
+    })
     result = CliRunner().invoke(cli, ["verify", "deploy"])
     assert result.exit_code == 1
     assert "CLI path: stale (2 files differ)" in result.output
@@ -231,11 +230,10 @@ def test_verify_deploy_current_is_only_success(monkeypatch):
     import cli_agent_orchestrator.cli.commands.verify as command
 
     monkeypatch.setattr(command, "git_root", lambda: Path("/repo"))
-    monkeypatch.setattr(command, "installed_package_root", lambda: Path("/installed"))
-    monkeypatch.setattr(Path, "is_dir", lambda self: True)
-    monkeypatch.setattr(command, "compare_installed", lambda *args: ("current", 0, 100.0))
-    monkeypatch.setattr(command, "listening_pid", lambda port: 42)
-    monkeypatch.setattr(command, "process_start_time", lambda pid: 200.0)
+    monkeypatch.setattr(command, "deployment_status", lambda root: {
+        "cli_path": "current", "differing_files": 0, "server": "current",
+        "source_root": str(root),
+    })
     result = CliRunner().invoke(cli, ["verify", "deploy"])
     assert result.exit_code == 0
     assert "server: current" in result.output
@@ -245,21 +243,62 @@ def test_verify_deploy_unknown_and_install_not_found_fail(monkeypatch):
     import cli_agent_orchestrator.cli.commands.verify as command
 
     monkeypatch.setattr(command, "git_root", lambda: Path("/repo"))
-    monkeypatch.setattr(command, "installed_package_root", lambda: Path("/installed"))
-    monkeypatch.setattr(Path, "is_dir", lambda self: True)
-    monkeypatch.setattr(command, "compare_installed", lambda *args: ("current", 0, 100.0))
-    monkeypatch.setattr(command, "listening_pid", lambda port: 42)
-    monkeypatch.setattr(command, "process_start_time", lambda pid: None)
+    monkeypatch.setattr(command, "deployment_status", lambda root: {
+        "cli_path": "current", "differing_files": 0, "server": "unknown",
+        "source_root": str(root),
+    })
     result = CliRunner().invoke(cli, ["verify", "deploy"])
     assert result.exit_code == 1
     assert "server: unknown" in result.output
 
-    monkeypatch.setattr(command, "installed_package_root", lambda: None)
-    monkeypatch.setattr(command, "listening_pid", lambda port: None)
+    monkeypatch.setattr(command, "deployment_status", lambda root: {
+        "cli_path": "not-found", "differing_files": None, "server": "not-running",
+        "source_root": str(root),
+    })
     result = CliRunner().invoke(cli, ["verify", "deploy"])
     assert result.exit_code == 1
     assert "CLI path: not-found" in result.output
     assert "server: not-running" in result.output
+
+
+def test_structured_deployment_status_current_stale_and_restart(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    source = root / "src" / "cli_agent_orchestrator"
+    installed = tmp_path / "installed"
+    source.mkdir(parents=True)
+    installed.mkdir()
+    (source / "module.py").write_text("same\n", encoding="utf-8")
+    (installed / "module.py").write_text("same\n", encoding="utf-8")
+    monkeypatch.setattr(svc, "installed_package_root", lambda: installed)
+    monkeypatch.setattr(svc, "listening_pid", lambda _port: 42)
+
+    newest = (installed / "module.py").stat().st_mtime
+    monkeypatch.setattr(svc, "process_start_time", lambda _pid: newest + 10)
+    assert svc.deployment_status(root) == {
+        "cli_path": "current", "differing_files": 0, "server": "current",
+        "source_root": str(root.resolve()),
+    }
+
+    (source / "module.py").write_text("changed\n", encoding="utf-8")
+    stale = svc.deployment_status(root)
+    assert (stale["cli_path"], stale["differing_files"]) == ("stale", 1)
+
+    (source / "module.py").write_text("same\n", encoding="utf-8")
+    monkeypatch.setattr(svc, "process_start_time", lambda _pid: newest - 10)
+    assert svc.deployment_status(root)["server"] == "restart-needed"
+
+
+def test_verify_deploy_cli_golden_bytes(monkeypatch):
+    import cli_agent_orchestrator.cli.commands.verify as command
+
+    monkeypatch.setattr(command, "git_root", lambda: Path("/repo"))
+    monkeypatch.setattr(command, "deployment_status", lambda root: {
+        "cli_path": "current", "differing_files": 0, "server": "current",
+        "source_root": str(root),
+    })
+    result = CliRunner().invoke(cli, ["verify", "deploy"])
+    assert result.exit_code == 0
+    assert result.stdout.encode() == b"CLI path: current (0 files differ)\nserver: current\n"
 
 
 def test_verify_scope_happy_and_failure(tmp_path, monkeypatch):

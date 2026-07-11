@@ -215,7 +215,7 @@ class TestTerminalPluginEvents:
         await asyncio.sleep(0)
         # pipe-pane is wired up before the provider initializes in the merged
         # event-driven flow; the dispatch still fires last, after all setup.
-        assert call_order == ["db_create", "pipe_pane", "provider_initialize", "dispatch"]
+        assert call_order == ["pipe_pane", "db_create", "provider_initialize", "dispatch"]
         event_type, event = registry.dispatch.await_args.args
         assert event_type == "post_create_terminal"
         assert isinstance(event, PostCreateTerminalEvent)

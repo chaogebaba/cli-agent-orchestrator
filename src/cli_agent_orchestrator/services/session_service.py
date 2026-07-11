@@ -51,6 +51,7 @@ async def create_session(
     allowed_tools: list[str] | None = None,
     registry: PluginRegistry | None = None,
     env_vars: dict[str, str] | None = None,
+    allow_incomplete_brief: bool = False,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
@@ -72,6 +73,7 @@ async def create_session(
         allowed_tools=allowed_tools,
         registry=registry,
         env_vars=env_vars,
+        allow_incomplete_brief=allow_incomplete_brief,
     )
     dispatch_plugin_event(
         registry,

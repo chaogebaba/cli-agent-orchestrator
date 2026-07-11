@@ -89,6 +89,10 @@
       "type": "array",
       "items": {"type": "string"}
     },
+    "sessionBrief": {
+      "type": "string",
+      "enum": ["required", "optional"]
+    },
     "prompt": {
       "type": "string"
     },

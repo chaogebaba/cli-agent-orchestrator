@@ -161,6 +161,38 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.ANTIGRAVITY_CLI.value,
 }
 
+SESSION_BRIEF_MARKER = "SESSION BRIEF UNAVAILABLE — world-model incomplete"
+
+
+def _rollback_terminal_creation(
+    terminal_id: str, session_name: str | None, window_name: str | None,
+    session_created: bool, window_created: bool, fifo_attached: bool, db_created: bool,
+) -> None:
+    """Single rollback seam preserving pipe-pane -> FIFO -> window/session order."""
+    try:
+        if db_created:
+            db_delete_terminal(terminal_id)
+    except Exception:
+        pass
+    try:
+        if fifo_attached and session_name and window_name:
+            get_backend().stop_pipe_pane(session_name, window_name)
+    except Exception:
+        pass
+    try:
+        if fifo_attached:
+            fifo_manager.stop_reader(terminal_id)
+    except Exception:
+        pass
+    try:
+        if session_created and session_name:
+            get_backend().kill_session(session_name)
+            clear_session_env(session_name)
+        elif window_created and session_name and window_name:
+            get_backend().kill_window(session_name, window_name)
+    except Exception:
+        pass
+
 # Providers whose tool restrictions are prompt-level text only (no native
 # blocking mechanism) — a restricted policy on these is advisory, not enforced.
 SOFT_ENFORCEMENT_PROVIDERS = {
@@ -208,6 +240,7 @@ async def create_terminal(
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
     fork_context=None,
+    allow_incomplete_brief: bool = False,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -243,6 +276,15 @@ async def create_terminal(
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
         TimeoutError: If provider initialization times out
     """
+    try:
+        early_profile = load_agent_profile(agent_profile)
+    except FileNotFoundError:
+        early_profile = None
+    candidate_brief_mode = early_profile.sessionBrief if early_profile else None
+    brief_mode = candidate_brief_mode if candidate_brief_mode in ("required", "optional") else None
+    if brief_mode and provider not in RUNTIME_SKILL_PROMPT_PROVIDERS:
+        raise ValueError(f"sessionBrief requires a runtime-context provider; resolved provider={provider}")
+
     if working_directory is not None:
         if not os.path.isabs(os.path.expanduser(working_directory)):
             raise ValueError(
@@ -257,6 +299,9 @@ async def create_terminal(
             raise ValueError(f"invalid_working_directory: {exc}") from exc
 
     session_created = False  # tracks whether THIS call created the tmux session
+    window_created = False
+    fifo_attached = False
+    db_created = False
     try:
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
@@ -289,6 +334,7 @@ async def create_terminal(
                 extra_env=env_vars,
             )
             session_created = True  # only set after successful creation
+            window_created = True
 
             # Persist forwarded env only after the tmux session actually
             # exists; the failure path below clears it if a later step
@@ -307,6 +353,7 @@ async def create_terminal(
                 working_directory,
                 extra_env=extra_env,
             )
+            window_created = True
 
         # Step 3: Load the profile once for allowed tool resolution before
         # provider initialization. The skill catalog is computed only for
@@ -320,7 +367,6 @@ async def create_terminal(
             if provider in RUNTIME_SKILL_PROMPT_PROVIDERS
             else None
         )
-
         # Step 3b: Resolve allowed_tools from profile if not explicitly provided
         if allowed_tools is None and profile is not None:
             from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
@@ -344,25 +390,14 @@ async def create_terminal(
                 f"copilot_cli."
             )
 
-        # Step 3c: Persist terminal metadata to database after restrictions
-        # are resolved so API reads and snapshots report the actual launch policy.
-        db_create_terminal(
-            terminal_id,
-            session_name,
-            window_name,
-            provider,
-            agent_profile,
-            allowed_tools,
-            caller_id=caller_id,
-        )
-
-        # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
+        # Step 4: Set up the FIFO event-driven output pipeline for pipe-pane
         # backends (tmux). Event-inbox backends (herdr) deliver via their own
         # socket events and their pipe_pane is a no-op, so skip the FIFO there and
         # rely on the herdr inbox registration below.
         if not get_backend().supports_event_inbox():
             # Reader must exist BEFORE pipe-pane starts so it captures from the start.
             fifo_manager.create_reader(terminal_id)
+            fifo_attached = True
 
             # Configure pipe-pane to stream output to the FIFO. This enables
             # real-time event-driven processing via StatusMonitor and LogWriter
@@ -377,6 +412,58 @@ async def create_terminal(
             # the StatusMonitor buffer empty so wait_for_shell() times out. A bare
             # Enter produces a fresh prompt line that flows through the pipe.
             get_backend().send_special_key(session_name, window_name, "Enter")
+
+        # Step 5: Persist terminal metadata after output capture is attached.
+        # The manifest below then sees the new row, while rollback unwinds DB
+        # before pipe-pane/FIFO/window in exact reverse acquisition order.
+        db_create_terminal(
+            terminal_id,
+            session_name,
+            window_name,
+            provider,
+            agent_profile,
+            allowed_tools,
+            caller_id=caller_id,
+        )
+        db_created = True
+
+        # The live snapshot is transactional launch context. Build it only after
+        # the terminal row and output plumbing exist, so it includes itself and a
+        # required-profile failure can unwind every preceding allocation.
+        if brief_mode:
+            from cli_agent_orchestrator.services.session_manifest_service import (
+                build_session_manifest,
+                core_sections_complete,
+                render_session_brief,
+            )
+
+            relax = allow_incomplete_brief or os.environ.get("CAO_SESSION_BRIEF_RELAX") == "1"
+            if os.environ.get("CAO_SESSION_BRIEF_RELAX") == "1":
+                logger.warning("CAO_SESSION_BRIEF_RELAX=1: required session brief is best-effort")
+            try:
+                manifest = build_session_manifest(session_name, terminal_id)
+                if brief_mode == "required" and not core_sections_complete(manifest) and not relax:
+                    failed = [
+                        name
+                        for name in ("profiles", "skills")
+                        if manifest["sections"].get(name) == "error"
+                    ]
+                    raise ValueError(
+                        f"required session brief core section failed: {','.join(failed)}"
+                    )
+                brief = render_session_brief(manifest)
+                if brief_mode == "required" and not manifest["complete"]:
+                    brief = f"{SESSION_BRIEF_MARKER}\n\n{brief}"
+                skill_prompt = f"{skill_prompt}\n\n{brief}" if skill_prompt else brief
+            except Exception:
+                if brief_mode == "required" and not relax:
+                    raise
+                if brief_mode == "required":
+                    skill_prompt = (
+                        f"{skill_prompt}\n\n{SESSION_BRIEF_MARKER}"
+                        if skill_prompt
+                        else SESSION_BRIEF_MARKER
+                    )
 
         # Step 6: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer").
@@ -479,10 +566,10 @@ async def create_terminal(
     except Exception as e:
         # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
-        try:
-            fifo_manager.stop_reader(terminal_id)
-        except Exception:
-            pass  # Ignore cleanup errors
+        _rollback_terminal_creation(
+            terminal_id, session_name, locals().get("window_name"), session_created,
+            window_created, fifo_attached, db_created,
+        )
         try:
             status_monitor.clear_terminal(terminal_id)
         except Exception:
@@ -491,15 +578,6 @@ async def create_terminal(
             provider_manager.cleanup_provider(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
-        if session_created and session_name:
-            try:
-                get_backend().kill_session(session_name)
-            except:
-                pass  # Ignore cleanup errors
-            # Session is gone, drop any forwarded env we stashed for it so
-            # secrets don't linger in memory or bleed into a future reuse
-            # of the same name.
-            clear_session_env(session_name)
         raise
 
 

@@ -33,6 +33,7 @@ class AgentProfile(BaseModel):
     # the full catalog (backward-compatible); [] = no skills advertised. Consumed
     # by CAO when composing the prompt, not passed through to provider JSON.
     skills: Optional[List[str]] = None
+    sessionBrief: Optional[Literal["required", "optional"]] = None
 
     # Q CLI agent fields (all optional, will be passed through to JSON)
     prompt: Optional[str] = None

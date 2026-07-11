@@ -144,6 +144,10 @@ def _parse_env_pairs(pairs):
     "the URL. Blocked prefixes (CLAUDE/CODEX_/__MISE_) and >=2048-byte values "
     "are rejected. See issue #248.",
 )
+@click.option(
+    "--allow-incomplete-brief", is_flag=True,
+    help="Allow a required session brief to degrade loudly instead of aborting startup.",
+)
 def launch(
     message,
     agents,
@@ -157,6 +161,7 @@ def launch(
     working_directory,
     memory,
     env_pairs,
+    allow_incomplete_brief,
 ):
     """Launch cao session with specified agent profile."""
     try:
@@ -284,6 +289,8 @@ def launch(
             params["allowed_tools"] = ",".join(resolved_allowed_tools)
         if memory:
             params["memory_manager"] = "true"
+        if allow_incomplete_brief:
+            params["allow_incomplete_brief"] = "true"
 
         # Forwarded env vars travel in the JSON body so values (which may
         # contain secrets) don't end up in cao-server's HTTP access log.

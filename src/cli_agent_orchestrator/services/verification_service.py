@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO
 
+from cli_agent_orchestrator.constants import SERVER_PORT
+
 
 STAMP_MAGIC = "# CAO_SUITE_LOG_V1"
 STAMP_FIELDS = ("commit", "dirty", "timestamp", "cwd")
@@ -243,6 +245,22 @@ def process_start_time(pid: int) -> float | None:
         return boot + ticks / os.sysconf("SC_CLK_TCK")
     except (OSError, ValueError, IndexError, StopIteration):
         return None
+
+
+def deployment_status(repo_root: Path) -> dict:
+    """Return structured deploy truth for an explicit source root."""
+    installed = installed_package_root()
+    if installed is None or not installed.is_dir():
+        state, count, newest = "not-found", None, None
+    else:
+        state, count, newest = compare_installed(repo_root, installed)
+    pid = listening_pid(SERVER_PORT)
+    if pid is None:
+        server = "not-running"
+    else:
+        started = process_start_time(pid)
+        server = "unknown" if started is None or newest is None else ("restart-needed" if newest > started else "current")
+    return {"cli_path": state, "differing_files": count, "server": server, "source_root": str(repo_root.resolve())}
 
 
 def find_workspace_file(start: Path, name: str) -> Path | None:

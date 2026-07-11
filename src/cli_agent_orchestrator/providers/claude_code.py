@@ -333,12 +333,29 @@ class ClaudeCodeProvider(BaseProvider):
                 "cli_agent_orchestrator.hooks.transcript_binding",
             ]
         )
+        hooks = [{"type": "command", "command": command, "timeout": 5}]
+        brief_mode = None
+        try:
+            if self._agent_profile:
+                from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text, read_agent_profile_source
+                raw = read_agent_profile_source(self._agent_profile)
+                candidate = parse_agent_profile_text(raw, self._agent_profile).sessionBrief
+                brief_mode = candidate if candidate in ("required", "optional") else None
+        except Exception:
+            pass
+        if brief_mode:
+            brief_command = shlex.join([
+                "env", f"CAO_API_BASE_URL={API_BASE_URL}",
+                f"CAO_SESSION_BRIEF_MODE={brief_mode}", sys.executable,
+                "-m", "cli_agent_orchestrator.hooks.session_brief",
+            ])
+            hooks.append({"type": "command", "command": brief_command, "timeout": 5})
         settings = {
             "hooks": {
                 "SessionStart": [
                     {
                         "matcher": "startup|resume|clear|compact",
-                        "hooks": [{"type": "command", "command": command, "timeout": 5}],
+                        "hooks": hooks,
                     }
                 ]
             }

@@ -721,6 +721,27 @@ def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
         return {"success": False, "error": f"Failed to retrieve skill: {str(exc)}"}
 
 
+@mcp.tool(description="Read the canonical live session manifest or rendered brief.")
+async def session_manifest(session_name: Optional[str] = None, brief: bool = False) -> Dict[str, Any]:
+    try:
+        terminal_id = os.environ.get("CAO_TERMINAL_ID")
+        if not session_name:
+            if not terminal_id:
+                raise ValueError("session_name required outside a CAO terminal")
+            response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout())
+            response.raise_for_status()
+            session_name = response.json()["session_name"]
+        response = requests.get(f"{API_BASE_URL}/sessions/{session_name}/manifest", timeout=_mcp_timeout())
+        response.raise_for_status()
+        manifest = response.json()
+        if brief:
+            from cli_agent_orchestrator.services.session_manifest_service import render_session_brief
+            return {"success": True, "brief": render_session_brief(manifest)}
+        return {"success": True, "manifest": manifest}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
 def _peek_terminal_impl(terminal_id: str, lines: int = 40) -> Dict[str, Any]:
     """Return a read-only terminal pane tail via cao-server."""
     capped_lines = max(1, min(int(lines), 200))

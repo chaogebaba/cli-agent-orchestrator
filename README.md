@@ -311,6 +311,7 @@ Three programmatic surfaces for driving CAO from outside, plus two extension poi
 | `cao session send <name> "msg" --async` | Fire-and-forget |
 | `cao session send <name> "msg" --timeout N` | Wait up to N seconds |
 | `cao launch --agents <profile>` | Launch a new supervisor session |
+| `cao session manifest --json\|--brief` | Inspect the live session world-model |
 | `cao shutdown --session <name>` | Shut down a specific session |
 | `cao shutdown --all` | Shut down every CAO session |
 | `cao terminal restore <terminal_id>` | Restore a deleted terminal's scrollback into a new window for debugging |
@@ -322,6 +323,13 @@ cao launch --agents supervisor --headless --yolo \
   --session-name my-task --working-directory '/path/to/project' "Your task here"
 ```
 
+
+Profiles may opt into live world-model delivery with `sessionBrief: required` or
+`sessionBrief: optional`. Required delivery fails closed when core inventory
+cannot be generated; `--allow-incomplete-brief` is a per-launch diagnostic escape
+hatch. `CAO_SESSION_BRIEF_RELAX=1` has the same effect and should never be exported
+persistently. Set `CAO_SOURCE_REPO` to the explicit CAO source checkout used for
+activation comparisons; the server never guesses it from its working directory.
 Add `--async` to return immediately without waiting for completion.
 
 > Session names are auto-prefixed with `cao-`. Use the prefixed form (e.g. `cao-my-task`) in later commands.

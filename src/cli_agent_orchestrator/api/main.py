@@ -999,6 +999,7 @@ async def create_session(
     allowed_tools: Optional[str] = None,
     memory_manager: Optional[str] = None,
     env_vars: Optional[Dict[str, str]] = Body(default=None, embed=True),
+    allow_incomplete_brief: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
     """Create a new session with exactly one terminal.
@@ -1033,15 +1034,14 @@ async def create_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
-        result = await session_service.create_session(
-            provider=provider,
-            agent_profile=agent_profile,
-            session_name=session_name,
-            working_directory=working_directory,
-            allowed_tools=allowed_tools_list,
-            registry=get_plugin_registry(request),
-            env_vars=env_vars,
+        create_kwargs = dict(
+            provider=provider, agent_profile=agent_profile, session_name=session_name,
+            working_directory=working_directory, allowed_tools=allowed_tools_list,
+            registry=get_plugin_registry(request), env_vars=env_vars,
         )
+        if allow_incomplete_brief:
+            create_kwargs["allow_incomplete_brief"] = True
+        result = await session_service.create_session(**create_kwargs)
 
         if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
             registry = get_plugin_registry(request)
@@ -1103,6 +1103,16 @@ async def get_session(session_name: str) -> Dict:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get session: {str(e)}",
         )
+
+
+@app.get("/sessions/{session_name}/manifest")
+async def get_session_manifest(session_name: str) -> Dict:
+    """Return the canonical live session world-model."""
+    from cli_agent_orchestrator.services.session_manifest_service import build_session_manifest
+    try:
+        return build_session_manifest(session_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
 
 @app.delete("/sessions/{session_name}")

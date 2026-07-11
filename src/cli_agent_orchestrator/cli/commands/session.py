@@ -1,6 +1,7 @@
 """Session commands for CLI Agent Orchestrator."""
 
 import json
+import os
 import sys
 import time
 from urllib.parse import quote
@@ -52,6 +53,35 @@ def _resolve_conductor(session_name):
 @click.group()
 def session():
     """Manage CAO sessions."""
+
+
+@session.command("manifest")
+@click.option("--session", "session_name")
+@click.option("--json", "as_json", is_flag=True)
+@click.option("--brief", is_flag=True)
+def manifest(session_name, as_json, brief):
+    """Print the canonical session manifest or its compact Markdown brief."""
+    if as_json and brief:
+        raise click.ClickException("choose exactly one of --json or --brief")
+    if not session_name:
+        terminal_id = os.environ.get("CAO_TERMINAL_ID")
+        if not terminal_id:
+            raise click.ClickException("--session is required outside a CAO terminal")
+        try:
+            session_name = _get_terminal(terminal_id)["session_name"]
+        except requests.RequestException as exc:
+            raise click.ClickException(f"could not resolve caller session: {exc}")
+    try:
+        response = requests.get(f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/manifest")
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        raise click.ClickException(f"failed to fetch session manifest: {exc}")
+    if brief:
+        from cli_agent_orchestrator.services.session_manifest_service import render_session_brief
+        click.echo(render_session_brief(payload))
+    else:
+        click.echo(json.dumps(payload, indent=2))
 
 
 @session.command("list")

@@ -79,3 +79,57 @@ def test_project_and_generated_session_start_hooks_both_fire(tmp_path):
         generated_path.unlink(missing_ok=True)
     assert project_marker.exists()
     assert generated_marker.exists()
+
+
+@pytest.mark.parametrize("failed_generated", [0, 1])
+def test_project_and_two_generated_hooks_are_additive_and_failure_isolated(
+    tmp_path, failed_generated
+):
+    claude = shutil.which("claude")
+    if claude is None:
+        pytest.skip("claude binary is not installed")
+    project_marker = tmp_path / "project-hook-fired"
+    generated_markers = [tmp_path / "generated-0-fired", tmp_path / "generated-1-fired"]
+    project_file = tmp_path / ".claude" / "settings.json"
+    project_file.parent.mkdir()
+    project_file.write_text(json.dumps({
+        "hooks": {"SessionStart": [{"hooks": [{
+            "type": "command",
+            "command": shlex.join([
+                sys.executable, "-c",
+                f"from pathlib import Path; Path({str(project_marker)!r}).touch()",
+            ]),
+        }]}]},
+    }), encoding="utf-8")
+
+    raw = "---\nname: supervisor\ndescription: test\nsessionBrief: required\n---\ncharter\n"
+    provider = ClaudeCodeProvider("hookterm", "session", "window", "supervisor")
+    with patch(
+        "cli_agent_orchestrator.utils.agent_profiles.read_agent_profile_source",
+        return_value=raw,
+    ):
+        generated_path = provider._write_terminal_settings()
+    try:
+        generated = json.loads(generated_path.read_text(encoding="utf-8"))
+        hooks = generated["hooks"]["SessionStart"][0]["hooks"]
+        assert len(hooks) == 2
+        for index, hook in enumerate(hooks):
+            hook["command"] = (
+                shlex.join([sys.executable, "-c", "raise SystemExit(7)"])
+                if index == failed_generated
+                else shlex.join([
+                    sys.executable, "-c",
+                    f"from pathlib import Path; Path({str(generated_markers[index])!r}).touch()",
+                ])
+            )
+        generated_path.write_text(json.dumps(generated), encoding="utf-8")
+        env = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE")}
+        subprocess.run(
+            [claude, "-p", "Reply with exactly OK.", "--settings", str(generated_path)],
+            cwd=tmp_path, env=env, text=True, capture_output=True, timeout=60, check=True,
+        )
+    finally:
+        generated_path.unlink(missing_ok=True)
+    assert project_marker.exists()
+    assert not generated_markers[failed_generated].exists()
+    assert generated_markers[1 - failed_generated].exists()
