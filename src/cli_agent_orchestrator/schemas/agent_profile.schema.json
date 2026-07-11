@@ -56,6 +56,17 @@
     "model": {
       "type": "string"
     },
+    "reasoningEffort": {
+      "type": "string",
+      "minLength": 1
+    },
+    "messageContract": {
+      "type": "string",
+      "minLength": 1
+    },
+    "inheritUserMcpServers": {
+      "type": "boolean"
+    },
     "permissionMode": {
       "type": "string",
       "enum": ["default", "acceptEdits", "plan", "auto", "bypassPermissions"]

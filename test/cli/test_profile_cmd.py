@@ -137,6 +137,33 @@ class TestValidateFrontmatter:
         meta = {"name": "x", "allowedTools": ["execute_bash", "@cao-mcp-server"]}
         assert _validate_frontmatter(meta) == []
 
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("reasoningEffort", "high"),
+            ("messageContract", "reply through send_message"),
+            ("inheritUserMcpServers", True),
+        ],
+    )
+    def test_fork_extension_key_is_accepted(self, key, value):
+        assert _validate_frontmatter({"name": "x", key: value}) == []
+
+    def test_unknown_extension_key_is_rejected(self):
+        messages = _validate_frontmatter({"name": "x", "bogusExtension": True})
+        assert any("[error]" in message and "bogusExtension" in message for message in messages)
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("reasoningEffort", False),
+            ("messageContract", ["send_message"]),
+            ("inheritUserMcpServers", "true"),
+        ],
+    )
+    def test_fork_extension_key_type_is_rejected(self, key, value):
+        messages = _validate_frontmatter({"name": "x", key: value})
+        assert any("[error]" in message and key in message for message in messages)
+
 
 class TestAgentsListCommand:
     """Tests for cao agents list."""
