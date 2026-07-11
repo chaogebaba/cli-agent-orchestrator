@@ -74,6 +74,23 @@ class ProviderSessionModel(Base):
     )
 
 
+class TranscriptBindingModel(Base):
+    """Append-only Claude transcript binding epochs reported by SessionStart."""
+
+    __tablename__ = "transcript_bindings"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    terminal_id = Column(String, nullable=False)
+    session_id = Column(String, nullable=False)
+    transcript_path = Column(Text, nullable=False)
+    inode = Column(Integer, nullable=False)
+    source = Column(String, nullable=False)
+    received_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    __table_args__ = (
+        Index("ix_transcript_bindings_terminal_received",
+              "terminal_id", "received_at", "id"),
+    )
+
+
 class InboxModel(Base):
     """SQLAlchemy model for inbox messages."""
 
@@ -762,6 +779,55 @@ def update_terminal_provider_session_id(terminal_id: str, session_uuid: str) -> 
         changed = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).update(
             {TerminalModel.provider_session_id: session_uuid}, synchronize_session=False)
         return changed > 0
+
+
+def create_transcript_binding(
+    terminal_id: str,
+    session_id: str,
+    transcript_path: str,
+    inode: int,
+    source: str,
+) -> Dict[str, Any]:
+    """Append a server-timestamped transcript binding epoch."""
+    with SessionLocal() as db:
+        row = TranscriptBindingModel(
+            terminal_id=terminal_id,
+            session_id=session_id,
+            transcript_path=transcript_path,
+            inode=inode,
+            source=source,
+            received_at=_utcnow(),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return {column.name: getattr(row, column.name) for column in row.__table__.columns}
+
+
+def get_current_transcript_binding(terminal_id: str) -> Optional[Dict[str, Any]]:
+    """Return the newest binding epoch using the deterministic epoch ordering."""
+    if not terminal_id:
+        return None
+    try:
+        with SessionLocal() as db:
+            row = (
+                db.query(TranscriptBindingModel)
+                .filter_by(terminal_id=terminal_id)
+                .order_by(
+                    TranscriptBindingModel.received_at.desc(),
+                    TranscriptBindingModel.id.desc(),
+                )
+                .first()
+            )
+            if row is None:
+                return None
+            return {column.name: getattr(row, column.name) for column in row.__table__.columns}
+    except Exception as exc:
+        # Direct library consumers can resolve transcripts before init_db has
+        # created the additive table. Server startup always initializes first.
+        if "no such table: transcript_bindings" in str(exc):
+            return None
+        raise
 
 
 def register_provider_session(**values: Any) -> Dict[str, Any]:

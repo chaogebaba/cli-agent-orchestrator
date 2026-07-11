@@ -67,6 +67,31 @@ def test_prior_attempt_hit_deduplicates_without_paste(monkeypatch, delivery):
     assert confirm.call_args.args[:2] == ([1], "old")
 
 
+def test_delivery_persists_resolution_kind_at_begin_and_settle(monkeypatch, delivery):
+    _message_row, _send, settle = delivery
+    begin = MagicMock(return_value="attempt-1")
+    monkeypatch.setattr(module, "begin_delivery_attempt", begin)
+    monkeypatch.setattr(
+        module, "transcript_ref",
+        lambda _resolution: {"path": "/trace", "inode": 7, "size": 0,
+                             "resolution_kind": "binding"},
+    )
+    monkeypatch.setattr(
+        module, "confirm_delivery",
+        lambda *_a, **_k: (
+            "hit",
+            {"kind": "transcript_user_turn", "path": "/trace", "inode": 7,
+             "resolution_kind": "binding"},
+        ),
+    )
+    InboxService().deliver_pending("receiver")
+    begin_evidence = json.loads(begin.call_args.kwargs["evidence"])
+    settle_evidence = json.loads(settle.call_args.kwargs["evidence"])
+    assert begin_evidence["resolution_kind"] == "binding"
+    assert settle_evidence["resolution_kind"] == "binding"
+    assert settle_evidence["kind"] == "transcript_user_turn"
+
+
 def test_prior_attempt_miss_performs_retry_paste(monkeypatch, delivery):
     _message_row, send, _settle = delivery
     monkeypatch.setattr(module, "list_message_attempts", lambda _ids: [{

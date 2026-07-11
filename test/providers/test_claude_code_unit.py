@@ -26,6 +26,8 @@ def cleanup_tmp_files():
             f.unlink(missing_ok=True)
         for f in tmp_dir.glob("term-*.mcp.json"):
             f.unlink(missing_ok=True)
+        for f in tmp_dir.glob("*.settings.json"):
+            f.unlink(missing_ok=True)
 
 
 # All initialization tests need to patch _ensure_skip_bypass_prompt_setting

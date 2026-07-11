@@ -41,6 +41,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.api.routes_fork import router as fork_router
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
+    create_transcript_binding,
     get_inbox_messages,
     get_message_trace,
     get_terminal_metadata,
@@ -379,6 +380,14 @@ class WorkingDirectoryResponse(BaseModel):
     working_directory: Optional[str] = Field(
         description="Current working directory of the terminal, or None if unavailable"
     )
+
+
+class TranscriptBindingRequest(BaseModel):
+    terminal_id: str
+    session_id: str
+    transcript_path: str
+    cwd: str = ""
+    source: str = ""
 
 
 class InstallAgentProfileRequest(BaseModel):
@@ -1320,6 +1329,42 @@ async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDire
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get working directory: {str(e)}",
         )
+
+
+@app.post("/terminals/{terminal_id}/transcript-binding")
+async def bind_transcript(
+    terminal_id: TerminalId,
+    body: TranscriptBindingRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Append a Claude-owned terminal-to-transcript binding epoch."""
+    if get_terminal_metadata(terminal_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Terminal not found")
+    try:
+        if body.terminal_id != terminal_id:
+            raise ValueError("terminal_id does not match route")
+        base_real = os.path.realpath(Path.home() / ".claude" / "projects")
+        candidate_real = os.path.realpath(body.transcript_path)
+        if not candidate_real.startswith(base_real + os.sep):
+            raise ValueError("transcript path is outside ~/.claude/projects")
+        candidate = Path(candidate_real)
+        if not candidate.is_file():
+            raise ValueError("transcript path is not an existing regular file")
+        if not os.access(candidate, os.R_OK):
+            raise ValueError("transcript path is unreadable")
+        row = create_transcript_binding(
+            terminal_id,
+            body.session_id,
+            candidate_real,
+            candidate.stat().st_ino,
+            body.source,
+        )
+        return {"success": True, "binding": row}
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid_transcript_binding: {exc}",
+        ) from exc
 
 
 @app.post("/terminals/{terminal_id}/input")

@@ -269,8 +269,9 @@ class InboxService:
                     ambiguous_count = count_ambiguous_attempts([m.id for m in batch])
                     metadata = get_terminal_metadata(terminal_id) or {}
                     message_ids = [m.id for m in batch]
-                    path = resolve_session_transcript(metadata)
-                    if path is not None:
+                    resolution = resolve_session_transcript(metadata)
+                    if resolution is not None:
+                        path = getattr(resolution, "path", resolution)
                         for prior in list_message_attempts(message_ids):
                             if prior.get("outcome") in {None, "deferred", "failed", "unresolved"}:
                                 continue
@@ -319,7 +320,7 @@ class InboxService:
                         batch, terminal_id, provider_name, digest, len(prepared.encode()),
                         status_monitor.get_input_gen(terminal_id),
                         status_monitor.get_status_gen(terminal_id),
-                        evidence=json.dumps(transcript_ref(path)),
+                        evidence=json.dumps(transcript_ref(resolution)),
                     )
                     terminal_service.send_prepared_input(
                         terminal_id, prepared, defer_on_dialog=True, registry=registry,
@@ -459,14 +460,19 @@ class InboxService:
                 settle_delivery_attempt(attempt_uuid, MessageStatus.PENDING,
                                         "interrupted", reason="pane_unresolvable")
                 continue
-            path = resolve_session_transcript(metadata)
-            if path is None:
+            resolution = resolve_session_transcript(metadata)
+            if resolution is None:
                 settle_delivery_attempt(attempt_uuid, MessageStatus.PENDING,
                                         "interrupted", reason="no_oracle")
                 continue
+            path = getattr(resolution, "path", resolution)
             result, evidence = transcript_lookup(
                 path, attempt["payload_hash"], attempt.get("started_at"),
                 attempt.get("evidence"))
+            evidence["resolution_kind"] = getattr(resolution, "resolution_kind", "exact_id")
+            stale_note = getattr(resolution, "stale_note", None)
+            if stale_note:
+                evidence["binding_stale"] = stale_note
             if result == "hit":
                 settle_delivery_attempt(
                     attempt_uuid, MessageStatus.DELIVERED, "confirmed",

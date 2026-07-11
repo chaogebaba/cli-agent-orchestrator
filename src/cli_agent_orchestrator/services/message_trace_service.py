@@ -9,15 +9,37 @@ import os
 import re
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
+from typing import Literal
 
-from cli_agent_orchestrator.clients.database import update_terminal_provider_session_id_if_null
+from cli_agent_orchestrator.clients.database import (
+    get_current_transcript_binding,
+    update_terminal_provider_session_id_if_null,
+)
 
 logger = logging.getLogger(__name__)
 _unresolved_warned: set[str] = set()
 _unresolved_warned_lock = threading.Lock()
+
+
+@dataclass(frozen=True, eq=False)
+class TranscriptResolution:
+    path: Path
+    resolution_kind: Literal["binding", "exact_id", "uuid_glob"]
+    inode: int | None = None
+    stale_note: str | None = None
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, TranscriptResolution):
+            return (
+                self.path, self.resolution_kind, self.inode, self.stale_note
+            ) == (other.path, other.resolution_kind, other.inode, other.stale_note)
+        if isinstance(other, Path):
+            return self.path == other
+        return NotImplemented
 
 
 def wire_hash(payload: str) -> str:
@@ -45,9 +67,55 @@ def _fd_codex_session(metadata: dict) -> str | None:
         return None
 
 
-def resolve_session_transcript(metadata: dict) -> Path | None:
+def _binding_path_state(path: Path) -> str | None:
+    """Return a stale reason, or None when a binding has native conversation rows."""
+    try:
+        if not path.is_file():
+            return "missing"
+        found_native = False
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                record = json.loads(line)
+                if record.get("type") in {"user", "assistant"}:
+                    found_native = True
+                    break
+                message = record.get("message")
+                if isinstance(message, dict) and message.get("role") in {"user", "assistant"}:
+                    found_native = True
+                    break
+        return None if found_native else "inert"
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return "unreadable"
+
+
+def resolve_session_transcript(metadata: dict) -> TranscriptResolution | None:
     provider = metadata.get("provider")
     session_id = metadata.get("provider_session_id")
+    binding = get_current_transcript_binding(str(metadata.get("id") or ""))
+    stale_note = None
+    excluded: set[Path] = set()
+    screen_fallback = False
+    if binding is not None:
+        binding_path = Path(binding["transcript_path"])
+        stale_reason = _binding_path_state(binding_path)
+        if stale_reason is None:
+            return TranscriptResolution(
+                binding_path,
+                "binding",
+                inode=int(binding["inode"]),
+            )
+        stale_note = f"binding_stale:{stale_reason}"
+        excluded.add(binding_path.resolve(strict=False))
+        screen_fallback = True
+
+    def candidate(path: Path, kind: Literal["exact_id", "uuid_glob"]):
+        resolved = path.resolve(strict=False)
+        if screen_fallback and (
+            resolved in excluded or _binding_path_state(path) is not None
+        ):
+            return None
+        return TranscriptResolution(path, kind, stale_note=stale_note)
+
     if provider == "codex" and not session_id:
         session_id = _fd_codex_session(metadata)
         if session_id:
@@ -68,7 +136,7 @@ def resolve_session_transcript(metadata: dict) -> Path | None:
         return None
     if provider == "codex":
         matches = list((Path.home() / ".codex" / "sessions").glob(f"**/*{session_id}*.jsonl"))
-        return matches[0] if len(matches) == 1 else None
+        return candidate(matches[0], "uuid_glob") if len(matches) == 1 else None
     cwd = metadata.get("working_directory") or metadata.get("cwd")
     if not cwd:
         try:
@@ -79,26 +147,50 @@ def resolve_session_transcript(metadata: dict) -> Path | None:
             cwd = None
     if provider == "grok_cli" and cwd:
         path = Path.home() / ".grok" / "sessions" / quote(cwd, safe="") / session_id / "chat_history.jsonl"
-        return path
+        return candidate(path, "exact_id")
     if provider == "claude_code" and cwd:
         encoded = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
         projects = Path.home() / ".claude" / "projects"
         path = projects / encoded / f"{session_id}.jsonl"
         if path.exists():
-            return path
+            result = candidate(path, "exact_id")
+            if result is not None:
+                return result
         matches = list(projects.glob(f"*/{session_id}.jsonl"))
-        return max(matches, key=lambda match: match.stat().st_mtime_ns, default=None)
+        for match in sorted(matches, key=lambda item: item.stat().st_mtime_ns, reverse=True):
+            result = candidate(match, "uuid_glob")
+            if result is not None:
+                return result
     return None
 
 
-def transcript_ref(path: Path | None) -> dict:
-    if path is None:
+def transcript_ref(resolution: TranscriptResolution | None) -> dict:
+    if resolution is None:
         return {"kind": "send_returned_unverified"}
+    if isinstance(resolution, Path):
+        resolution = TranscriptResolution(resolution, "exact_id")
+    path = resolution.path
     try:
         stat = path.stat()
-        return {"path": str(path), "inode": stat.st_ino, "size": stat.st_size}
+        evidence = {
+            "path": str(path),
+            "inode": resolution.inode if resolution.resolution_kind == "binding" else stat.st_ino,
+            "size": stat.st_size,
+            "resolution_kind": resolution.resolution_kind,
+        }
     except OSError:
-        return {"path": str(path), "inode": None, "size": 0}
+        evidence = {"path": str(path), "inode": None, "size": 0,
+                    "resolution_kind": resolution.resolution_kind}
+    if resolution.stale_note:
+        evidence["binding_stale"] = resolution.stale_note
+    return evidence
+
+
+def _with_resolution_evidence(evidence: dict, resolution: TranscriptResolution) -> dict:
+    merged = {**evidence, "resolution_kind": resolution.resolution_kind}
+    if resolution.stale_note:
+        merged["binding_stale"] = resolution.stale_note
+    return merged
 
 
 def _content_texts(content) -> list[str]:
@@ -164,6 +256,8 @@ def _native_user_turn_texts(record: dict) -> list[str]:
 def transcript_lookup(path: Path, payload_hash: str, started_at=None,
                       expected_ref: dict | None = None) -> tuple[str, dict]:
     """Return hit, absent, or unresolved with bounded continuity evidence."""
+    if isinstance(path, TranscriptResolution):
+        path = path.path
     try:
         before = path.stat()
         raw_bytes = path.read_bytes()
@@ -223,14 +317,31 @@ def transcript_lookup(path: Path, payload_hash: str, started_at=None,
 def confirm_delivery(metadata: dict, payload_hash: str, started_at=None,
                      expected_ref: dict | None = None,
                      timeout: float = 10.0) -> tuple[str, dict]:
-    path = resolve_session_transcript(metadata)
-    if path is None:
-        return "unverified", {"kind": "send_returned_unverified"}
     deadline = time.monotonic() + timeout
-    last = ("unresolved", {"kind": "transcript_unreadable", "path": str(path)})
+    last = ("unverified", {"kind": "send_returned_unverified"})
     continuity_ref = dict(expected_ref or {})
+    saw_resolution = False
+    if timeout <= 0:
+        resolution = resolve_session_transcript(metadata)
+        if resolution is None:
+            return last
+        if isinstance(resolution, Path):
+            resolution = TranscriptResolution(resolution, "exact_id")
+        saw_resolution = True
+        return "ambiguous", _with_resolution_evidence(
+            {"kind": "transcript_unreadable", "path": str(resolution.path)}, resolution
+        )
     while time.monotonic() < deadline:
-        last = transcript_lookup(path, payload_hash, started_at, continuity_ref)
+        resolution = resolve_session_transcript(metadata)
+        if resolution is None:
+            time.sleep(0.25)
+            continue
+        if isinstance(resolution, Path):
+            resolution = TranscriptResolution(resolution, "exact_id")
+        saw_resolution = True
+        path = resolution.path
+        outcome, evidence = transcript_lookup(path, payload_hash, started_at, continuity_ref)
+        last = (outcome, _with_resolution_evidence(evidence, resolution))
         if last[0] == "hit":
             return last
         if last[0] == "absent":
@@ -244,4 +355,6 @@ def confirm_delivery(metadata: dict, payload_hash: str, started_at=None,
                 "size": last[1].get("size", 0),
             }
         time.sleep(0.25)
+    if not saw_resolution:
+        return "unverified", {"kind": "send_returned_unverified"}
     return "ambiguous", last[1]

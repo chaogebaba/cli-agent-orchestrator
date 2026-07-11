@@ -14,9 +14,11 @@ from cli_agent_orchestrator.clients.database import (
     FlowModel,
     InboxModel,
     TerminalModel,
+    TranscriptBindingModel,
     create_flow,
     create_inbox_message,
     create_terminal,
+    create_transcript_binding,
     begin_delivery_attempt,
     confirm_batch_from_prior_attempt,
     count_ambiguous_attempts,
@@ -28,6 +30,7 @@ from cli_agent_orchestrator.clients.database import (
     get_message_trace,
     get_pending_messages,
     get_terminal_metadata,
+    get_current_transcript_binding,
     init_db,
     list_flows,
     list_pending_receiver_ids_by_provider,
@@ -73,6 +76,22 @@ class TestTerminalOperations:
 
 
 class TestMessageTraceTransactions:
+    def test_transcript_binding_epochs_append_and_tie_break_by_id(
+        self, test_db, monkeypatch
+    ):
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        monkeypatch.setattr(db_mod, "SessionLocal", test_db)
+        fixed = datetime(2026, 7, 11)
+        monkeypatch.setattr(db_mod, "_utcnow", lambda: fixed)
+        first = create_transcript_binding("term", "one", "/one", 1, "startup")
+        second = create_transcript_binding("term", "two", "/two", 2, "compact")
+        current = get_current_transcript_binding("term")
+        assert second["id"] > first["id"]
+        assert current["id"] == second["id"]
+        with test_db() as db:
+            assert db.query(TranscriptBindingModel).count() == 2
+
     def test_confirmed_settle_cas_and_callback_are_exactly_once(self, test_db, monkeypatch):
         from cli_agent_orchestrator.clients import database as db_mod
 

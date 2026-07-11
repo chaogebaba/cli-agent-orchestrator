@@ -5,13 +5,14 @@ import logging
 import os
 import re
 import shlex
+import sys
 import time
 import uuid
 from pathlib import Path
 from typing import List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.constants import API_BASE_URL, CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -222,6 +223,8 @@ class ClaudeCodeProvider(BaseProvider):
         else:
             command_parts = ["claude", "--dangerously-skip-permissions"]
         command_parts.extend(["--session-id", self.allocated_session_uuid])
+        settings_file = self._write_terminal_settings()
+        command_parts.extend(["--settings", str(settings_file)])
 
         # Route based on profile state
         native = getattr(profile, "native_agent", None) if profile else None
@@ -316,6 +319,37 @@ class ClaudeCodeProvider(BaseProvider):
             ") 2>/dev/null"
         )
         return f"{unset_cmd}; {claude_cmd}"
+
+    def _write_terminal_settings(self) -> Path:
+        """Write the terminal-scoped additive SessionStart hook settings."""
+        tmp_dir = CAO_HOME_DIR / "tmp"
+        tmp_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        command = shlex.join(
+            [
+                "env",
+                f"CAO_API_BASE_URL={API_BASE_URL}",
+                sys.executable,
+                "-m",
+                "cli_agent_orchestrator.hooks.transcript_binding",
+            ]
+        )
+        settings = {
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "matcher": "startup|resume|clear|compact",
+                        "hooks": [{"type": "command", "command": command, "timeout": 5}],
+                    }
+                ]
+            }
+        }
+        path = tmp_dir / f"{self.terminal_id}.settings.json"
+        path.write_text(json.dumps(settings), encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return path
 
     @staticmethod
     def _ensure_skip_bypass_prompt_setting() -> None:
@@ -864,7 +898,7 @@ class ClaudeCodeProvider(BaseProvider):
         self._initialized = False
         # Remove temp files created during initialization
         tmp_dir = CAO_HOME_DIR / "tmp"
-        for suffix in (".prompt", ".mcp.json"):
+        for suffix in (".prompt", ".mcp.json", ".settings.json"):
             tmp_file = tmp_dir / f"{self.terminal_id}{suffix}"
             try:
                 tmp_file.unlink(missing_ok=True)

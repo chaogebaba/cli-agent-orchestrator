@@ -11,6 +11,73 @@ from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
 
+class TestTranscriptBindingEndpoint:
+    def test_binding_happy_path_uses_server_inode(self, client, tmp_path):
+        transcript = tmp_path / ".claude" / "projects" / "repo" / "session.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text('{"type":"user"}\n', encoding="utf-8")
+        payload = {"terminal_id": "abcd1234", "session_id": "effective",
+                   "transcript_path": str(transcript), "cwd": "/work", "source": "compact"}
+        with patch("cli_agent_orchestrator.api.main.Path.home", return_value=tmp_path), \
+             patch("cli_agent_orchestrator.api.main.get_terminal_metadata", return_value={"id": "abcd1234"}), \
+             patch("cli_agent_orchestrator.api.main.create_transcript_binding",
+                   return_value={"id": 1}) as create:
+            response = client.post("/terminals/abcd1234/transcript-binding", json=payload)
+        assert response.status_code == 200
+        assert create.call_args.args[3] == transcript.stat().st_ino
+
+    @pytest.mark.parametrize("case", ["mismatch", "outside", "missing"])
+    def test_binding_rejections_are_route_local_400(self, client, tmp_path, case):
+        projects = tmp_path / ".claude" / "projects"
+        projects.mkdir(parents=True)
+        path = projects / "missing.jsonl"
+        terminal_id = "deadbeef" if case == "mismatch" else "abcd1234"
+        if case == "outside":
+            path = tmp_path / "outside.jsonl"
+            path.write_text("{}\n", encoding="utf-8")
+        payload = {"terminal_id": terminal_id, "session_id": "s",
+                   "transcript_path": str(path), "source": "startup"}
+        with patch("cli_agent_orchestrator.api.main.Path.home", return_value=tmp_path), \
+             patch("cli_agent_orchestrator.api.main.get_terminal_metadata", return_value={"id": "abcd1234"}), \
+             patch("cli_agent_orchestrator.api.main.create_transcript_binding") as create:
+            response = client.post("/terminals/abcd1234/transcript-binding", json=payload)
+        assert response.status_code == 400
+        assert response.json()["detail"].startswith("invalid_transcript_binding:")
+        create.assert_not_called()
+
+    def test_binding_unknown_terminal_is_404(self, client):
+        with patch("cli_agent_orchestrator.api.main.get_terminal_metadata", return_value=None):
+            response = client.post("/terminals/abcd1234/transcript-binding", json={
+                "terminal_id": "abcd1234", "session_id": "s",
+                "transcript_path": "/nope", "source": "startup"})
+        assert response.status_code == 404
+
+    def test_binding_400_does_not_change_sibling_value_error_404(self, client, tmp_path):
+        with patch("cli_agent_orchestrator.api.main.get_terminal_metadata", return_value={"id": "abcd1234"}):
+            binding = client.post("/terminals/abcd1234/transcript-binding", json={
+                "terminal_id": "wrong", "session_id": "s",
+                "transcript_path": str(tmp_path / "missing"), "source": "startup"})
+        with patch("cli_agent_orchestrator.api.main.terminal_service.get_working_directory",
+                   side_effect=ValueError("plain sibling failure")):
+            sibling = client.get("/terminals/abcd1234/working-directory")
+        assert binding.status_code == 400
+        assert sibling.status_code == 404
+
+    def test_binding_auth_enabled_missing_token_is_401_without_write(
+        self, client, monkeypatch
+    ):
+        monkeypatch.setenv("AUTH0_DOMAIN", "tenant.example")
+        monkeypatch.delenv("CAO_AUTH_LOCAL_TOKEN", raising=False)
+        with patch("cli_agent_orchestrator.api.main.get_terminal_metadata") as metadata, \
+             patch("cli_agent_orchestrator.api.main.create_transcript_binding") as create:
+            response = client.post("/terminals/abcd1234/transcript-binding", json={
+                "terminal_id": "abcd1234", "session_id": "s",
+                "transcript_path": "/nope", "source": "startup"})
+        assert response.status_code == 401
+        metadata.assert_not_called()
+        create.assert_not_called()
+
+
 class TestTerminalProtection:
     def test_delete_rejects_ready_base_owner(self, client):
         with patch(
