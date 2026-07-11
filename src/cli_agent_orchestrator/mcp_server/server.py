@@ -158,6 +158,7 @@ def _create_terminal(
     defer_init: bool = False,
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
+    fork_context=None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -248,6 +249,8 @@ def _create_terminal(
                     if isinstance(initial_message_orchestration_type, OrchestrationType)
                     else str(initial_message_orchestration_type)
                 )
+            if fork_context is not None:
+                json_body["fork_context"] = fork_context.model_dump()
 
         response = requests.post(
             f"{API_BASE_URL}/sessions/{session_name}/terminals",
@@ -937,9 +940,8 @@ else:
 
 
 # Implementation function for assign
-def _assign_impl(
-    agent_profile: str, message: str, working_directory: Optional[str] = None
-) -> Dict[str, Any]:
+def _assign_impl(agent_profile: str, message: str, working_directory: Optional[str] = None,
+                 fork_from: Optional[str] = None, resume: bool = False) -> Dict[str, Any]:
     """Implementation of assign logic.
 
     Uses the server-side deferred-init path: cao-server creates the tmux
@@ -952,6 +954,56 @@ def _assign_impl(
     """
     terminal_id: Optional[str] = None
     try:
+        fork_context = None
+        if resume and not fork_from:
+            raise ValueError("resume_requires_fork_from")
+        if fork_from:
+            from pathlib import Path
+            from urllib.parse import quote
+            from cli_agent_orchestrator.models.terminal import ForkContext
+            from cli_agent_orchestrator.services.fork_context_service import resolve_base, staleness
+            row = resolve_base(fork_from)
+            provider = resolve_provider(agent_profile, fallback_provider=row["provider"])
+            if provider != row["provider"]:
+                raise ValueError("provider_mismatch")
+            from cli_agent_orchestrator.providers.manager import get_provider_class
+            try:
+                supports_fork = get_provider_class(provider).supports_fork_context
+            except ValueError:
+                supports_fork = False
+            if not supports_fork:
+                raise ValueError("provider_lacks_fork_capability")
+            if resume and agent_profile != row["agent_profile"]:
+                raise ValueError("resume_profile_mismatch")
+            if provider == "codex":
+                found = any(row["session_uuid"] in p.name for p in
+                            (Path.home() / ".codex" / "sessions").glob("**/rollout-*.jsonl"))
+            else:
+                found = ((Path.home() / ".grok" / "sessions" / quote(row["cwd"], safe="") /
+                          row["session_uuid"]).exists())
+            if not found:
+                raise ValueError("session_file_missing")
+            if resume:
+                try:
+                    owner = requests.get(
+                        f"{API_BASE_URL}/provider-sessions/{row['session_uuid']}/owner",
+                        timeout=_mcp_timeout(),
+                    )
+                    owner.raise_for_status()
+                    state = owner.json()["state"]
+                    if state not in {"live", "gone", "error"}:
+                        raise ValueError("invalid owner state")
+                except Exception as exc:
+                    raise ValueError("owner_probe_failed") from exc
+                if state == "live":
+                    raise ValueError("session_live_owned")
+                if state == "error":
+                    raise ValueError("owner_probe_failed")
+            _, preamble = staleness(row)
+            fork_context = ForkContext(mode="resume" if resume else "fork",
+                                       session_uuid=row["session_uuid"], base_name=row["name"],
+                                       provider=provider, initial_preamble=preamble)
+            working_directory = row["cwd"]
         # Fail fast before creating the worker terminal when CAO_TERMINAL_ID is
         # unset — REGARDLESS of the sender-ID-injection flag. The deferred-init
         # path only forwards the initial message on the existing-session branch
@@ -1003,6 +1055,7 @@ def _assign_impl(
             defer_init=True,
             initial_message=worker_message,
             initial_message_orchestration_type=OrchestrationType.ASSIGN,
+            fork_context=fork_context,
         )
 
         return {
@@ -1099,8 +1152,10 @@ if ENABLE_WORKING_DIRECTORY:
         working_directory: Optional[str] = Field(
             default=None, description="Optional working directory where the agent should execute"
         ),
+        fork_from: Optional[str] = Field(default=None, description="Registered base name, UUID, or terminal id"),
+        resume: bool = Field(default=False, description="Resume instead of fork"),
     ) -> Dict[str, Any]:
-        return _assign_impl(agent_profile, message, working_directory)
+        return _assign_impl(agent_profile, message, working_directory, fork_from, resume)
 
 else:
 
@@ -1110,8 +1165,31 @@ else:
             description='The agent profile for the worker agent (e.g., "developer", "analyst")'
         ),
         message: str = Field(description=_assign_message_field_desc),
+        fork_from: Optional[str] = Field(default=None, description="Registered base name, UUID, or terminal id"),
+        resume: bool = Field(default=False, description="Resume instead of fork"),
     ) -> Dict[str, Any]:
-        return _assign_impl(agent_profile, message, None)
+        return _assign_impl(agent_profile, message, None, fork_from, resume)
+
+
+@mcp.tool(description="Mark the caller's provider-native session as a ready fork base.")
+async def mark_base_ready(
+    name: str = Field(description="Stable base name"),
+    summary: Optional[str] = Field(default=None, description="Context ingested by the base"),
+) -> Dict[str, Any]:
+    try:
+        terminal_id = os.environ.get("CAO_TERMINAL_ID")
+        if not terminal_id:
+            raise ValueError("CAO_TERMINAL_ID not set")
+        from cli_agent_orchestrator.services.fork_context_service import mark_ready
+        return {"success": True, "base": mark_ready(terminal_id, name, summary)}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+@mcp.tool(description="List ready provider-native base sessions with live staleness counts.")
+async def list_base_sessions() -> Dict[str, Any]:
+    from cli_agent_orchestrator.services.fork_context_service import list_bases
+    return {"success": True, "bases": list_bases()}
 
 
 # Implementation function for send_message

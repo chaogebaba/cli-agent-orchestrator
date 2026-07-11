@@ -15,6 +15,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    Index,
     create_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
@@ -26,6 +27,10 @@ from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, Orc
 logger = logging.getLogger(__name__)
 
 Base: Any = declarative_base()
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class TerminalModel(Base):
@@ -41,7 +46,29 @@ class TerminalModel(Base):
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
+    provider_session_id = Column(String, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
+
+
+class ProviderSessionModel(Base):
+    __tablename__ = "provider_sessions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(Text, nullable=False)
+    provider = Column(Text, nullable=False)
+    session_uuid = Column(Text, nullable=False)
+    cwd = Column(Text, nullable=False)
+    agent_profile = Column(Text, nullable=False)
+    git_sha = Column(Text, nullable=True)
+    dirty_hashes = Column(Text, nullable=False, default="{}", server_default="{}")
+    summary = Column(Text, nullable=True)
+    status = Column(Text, nullable=False)
+    source_terminal_id = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+    __table_args__ = (
+        CheckConstraint("status IN ('ready','superseded')", name="ck_provider_sessions_status"),
+        Index("uq_provider_sessions_ready", "name", unique=True, sqlite_where=(status == "ready")),
+    )
 
 
 class InboxModel(Base):
@@ -61,10 +88,6 @@ class InboxModel(Base):
     )
     status = Column(String, nullable=False)  # MessageStatus enum value
     created_at = Column(DateTime, default=datetime.now)
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 class MemoryMetadataModel(Base):
@@ -516,6 +539,10 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN caller_id TEXT")
             conn.commit()
             logger.info("Migration: added caller_id column to terminals table")
+        if "provider_session_id" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN provider_session_id TEXT")
+            conn.commit()
+            logger.info("Migration: added provider_session_id column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -530,6 +557,7 @@ def create_terminal(
     allowed_tools: Optional[List[str]] = None,
     shell_command: Optional[str] = None,
     caller_id: Optional[str] = None,
+    provider_session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -544,6 +572,7 @@ def create_terminal(
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
             shell_command=shell_command,
             caller_id=caller_id,
+            provider_session_id=provider_session_id,
         )
         db.add(terminal)
         db.commit()
@@ -556,6 +585,7 @@ def create_terminal(
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
+            "provider_session_id": terminal.provider_session_id,
         }
 
 
@@ -581,6 +611,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
+            "provider_session_id": terminal.provider_session_id,
             "last_active": terminal.last_active,
         }
 
@@ -622,6 +653,63 @@ def update_terminal_shell_command(terminal_id: str, shell_command: str) -> bool:
             db.commit()
             return True
         return False
+
+
+def update_terminal_provider_session_id(terminal_id: str, session_uuid: str) -> bool:
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return False
+        terminal.provider_session_id = session_uuid
+        db.commit()
+        return True
+
+
+def register_provider_session(**values: Any) -> Dict[str, Any]:
+    """Atomically supersede a ready name and register its replacement."""
+    with SessionLocal() as db:
+        now = _utcnow()
+        db.query(ProviderSessionModel).filter(
+            ProviderSessionModel.name == values["name"],
+            ProviderSessionModel.status == "ready",
+        ).update({"status": "superseded", "updated_at": now})
+        row = ProviderSessionModel(**values, status="ready", created_at=now, updated_at=now)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return provider_session_to_dict(row)
+
+
+def provider_session_to_dict(row: ProviderSessionModel) -> Dict[str, Any]:
+    return {c.name: getattr(row, c.name) for c in row.__table__.columns}
+
+
+def get_ready_provider_session(name: str) -> Optional[Dict[str, Any]]:
+    with SessionLocal() as db:
+        row = db.query(ProviderSessionModel).filter_by(name=name, status="ready").first()
+        return provider_session_to_dict(row) if row else None
+
+
+def get_provider_session_by_uuid(session_uuid: str) -> Optional[Dict[str, Any]]:
+    with SessionLocal() as db:
+        row = (db.query(ProviderSessionModel).filter_by(session_uuid=session_uuid)
+               .order_by((ProviderSessionModel.status == "ready").desc(),
+                         ProviderSessionModel.updated_at.desc(), ProviderSessionModel.id.desc())
+               .first())
+        return provider_session_to_dict(row) if row else None
+
+
+def list_ready_provider_sessions() -> List[Dict[str, Any]]:
+    with SessionLocal() as db:
+        return [provider_session_to_dict(r) for r in db.query(ProviderSessionModel)
+                .filter_by(status="ready").order_by(ProviderSessionModel.name).all()]
+
+
+def list_terminals_by_provider_session_id(session_uuid: str) -> List[Dict[str, Any]]:
+    with SessionLocal() as db:
+        rows = db.query(TerminalModel).filter_by(provider_session_id=session_uuid).all()
+        return [{"id": r.id, "tmux_session": r.tmux_session, "tmux_window": r.tmux_window,
+                 "provider": r.provider} for r in rows]
 
 
 def list_all_terminals() -> List[Dict[str, Any]]:

@@ -11,13 +11,16 @@ the CAO profile pins a model.
 """
 
 import logging
+import os
 import re
 import shlex
+import uuid
+from urllib.parse import quote
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import (
     get_provider_defaults,
@@ -99,6 +102,7 @@ def _resolve_string_option(
 
 
 class GrokCliProvider(BaseProvider):
+    supports_fork_context = True
     """Provider for Grok Build's interactive CLI."""
 
     supports_screen_detection = True
@@ -113,8 +117,12 @@ class GrokCliProvider(BaseProvider):
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
+        fork_context: Optional[ForkContext] = None,
     ):
-        super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
+        super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt, fork_context)
+        self.allocated_session_uuid = (
+            None if fork_context and fork_context.mode == "resume" else self._allocate_session_uuid()
+        )
         self._initialized = False
         self._input_received = False
         self._agent_profile = agent_profile
@@ -190,7 +198,52 @@ class GrokCliProvider(BaseProvider):
         if system_prompt:
             command_parts.extend(["--system-prompt-override", system_prompt])
 
+        if self._fork_context:
+            if self._fork_context.mode == "resume":
+                command_parts.extend(["--resume", self._fork_context.session_uuid])
+            else:
+                command_parts.extend(["--resume", self._fork_context.session_uuid, "--fork-session",
+                                      "--session-id", self.allocated_session_uuid])
+        else:
+            command_parts.extend(["--session-id", self.allocated_session_uuid])
+
         return shlex.join(command_parts)
+
+    def _allocate_session_uuid(self) -> str:
+        try:
+            cwd = get_backend().get_pane_working_directory(self.session_name, self.window_name) or os.getcwd()
+        except Exception:
+            cwd = os.getcwd()
+        root = Path.home() / ".grok" / "sessions" / quote(cwd, safe="")
+        for _ in range(2):
+            value = str(uuid.uuid4())
+            if not (root / value).exists():
+                return value
+        raise ProviderError("session_uuid_collision")
+
+    def build_fork_command(self, session_uuid: str, new_session_uuid: Optional[str]) -> list[str]:
+        old_context, old_uuid = self._fork_context, self.allocated_session_uuid
+        self._fork_context = ForkContext(mode="fork", session_uuid=session_uuid, base_name="base",
+                                         provider="grok_cli", initial_preamble="")
+        self.allocated_session_uuid = new_session_uuid or self._allocate_session_uuid()
+        try:
+            return shlex.split(self._build_grok_command())
+        finally:
+            self._fork_context, self.allocated_session_uuid = old_context, old_uuid
+
+    def build_resume_command(self, session_uuid: str) -> list[str]:
+        old_context = self._fork_context
+        self._fork_context = ForkContext(mode="resume", session_uuid=session_uuid, base_name="base",
+                                         provider="grok_cli", initial_preamble="")
+        try:
+            return shlex.split(self._build_grok_command())
+        finally:
+            self._fork_context = old_context
+
+    def capture_session_uuid(self, pane_pid: int, launch_time: float, cwd: str) -> str:
+        if not self.allocated_session_uuid:
+            raise ProviderError("base_session_unset")
+        return self.allocated_session_uuid
 
     async def initialize(self) -> bool:
         """Start Grok and wait for the prompt/footer to become interactive."""

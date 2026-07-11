@@ -7,6 +7,7 @@ from cli_agent_orchestrator.clients.database import get_terminal_metadata
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.models.terminal import ForkContext
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
@@ -18,6 +19,27 @@ from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
 
 logger = logging.getLogger(__name__)
+
+PROVIDER_CLASSES = {
+    ProviderType.KIRO_CLI.value: KiroCliProvider,
+    ProviderType.GROK_CLI.value: GrokCliProvider,
+    ProviderType.CLAUDE_CODE.value: ClaudeCodeProvider,
+    ProviderType.CODEX.value: CodexProvider,
+    ProviderType.COPILOT_CLI.value: CopilotCliProvider,
+    ProviderType.KIMI_CLI.value: KimiCliProvider,
+    ProviderType.OPENCODE_CLI.value: OpenCodeCliProvider,
+    ProviderType.HERMES.value: HermesProvider,
+    ProviderType.CURSOR_CLI.value: CursorCliProvider,
+    ProviderType.ANTIGRAVITY_CLI.value: AntigravityCliProvider,
+}
+
+
+def get_provider_class(provider_type: str) -> type[BaseProvider]:
+    """Resolve provider capability metadata without constructing a terminal provider."""
+    try:
+        return PROVIDER_CLASSES[provider_type]
+    except KeyError as exc:
+        raise ValueError(f"Unknown provider type: {provider_type}") from exc
 
 
 class ProviderManager:
@@ -36,6 +58,7 @@ class ProviderManager:
         allowed_tools: Optional[List[str]] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        fork_context: Optional[ForkContext] = None,
     ) -> BaseProvider:
         """Create and store provider instance."""
         try:
@@ -58,6 +81,7 @@ class ProviderManager:
                     agent_profile,
                     allowed_tools,
                     skill_prompt=skill_prompt,
+                    fork_context=fork_context,
                 )
             elif provider_type == ProviderType.CLAUDE_CODE.value:
                 provider = ClaudeCodeProvider(
@@ -76,6 +100,7 @@ class ProviderManager:
                     agent_profile,
                     allowed_tools,
                     skill_prompt=skill_prompt,
+                    fork_context=fork_context,
                 )
             elif provider_type == ProviderType.COPILOT_CLI.value:
                 provider = CopilotCliProvider(

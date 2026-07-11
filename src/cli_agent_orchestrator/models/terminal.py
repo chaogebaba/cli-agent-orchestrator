@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import Enum
-from typing import Annotated, List, Optional
+from typing import Annotated, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
@@ -56,6 +56,15 @@ class Terminal(BaseModel):
         ),
     )
     last_active: Optional[datetime] = Field(None, description="Last active timestamp")
+    provider_session_id: Optional[str] = None
+
+
+class ForkContext(BaseModel):
+    mode: Literal["fork", "resume"]
+    session_uuid: str
+    base_name: str
+    provider: str
+    initial_preamble: str
 
 
 class AgentStepResult(BaseModel):

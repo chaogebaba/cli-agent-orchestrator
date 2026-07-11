@@ -8,7 +8,7 @@ import time
 from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import (
     get_provider_defaults,
@@ -315,6 +315,7 @@ class ProviderError(Exception):
 
 
 class CodexProvider(BaseProvider):
+    supports_fork_context = True
     """Provider for Codex CLI tool integration."""
 
     def __init__(
@@ -325,9 +326,10 @@ class CodexProvider(BaseProvider):
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
+        fork_context: Optional[ForkContext] = None,
     ):
         """Initialize provider state."""
-        super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
+        super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt, fork_context)
         self._initialized = False
         self._agent_profile = agent_profile
 
@@ -452,7 +454,35 @@ class CodexProvider(BaseProvider):
 
         command_parts.extend(["-c", "features.multi_agent=false"])
 
+        if self._fork_context:
+            mode = self._fork_context.mode
+            prefix = ["codex", mode]
+            rest = command_parts[1:]
+            rest = ["--dangerously-bypass-approvals-and-sandbox" if x == "--yolo" else x for x in rest]
+            command_parts = prefix + rest + [self._fork_context.session_uuid]
         return shlex.join(command_parts)
+
+    def build_fork_command(self, session_uuid: str, new_session_uuid: Optional[str] = None) -> list[str]:
+        old = self._fork_context
+        self._fork_context = ForkContext(mode="fork", session_uuid=session_uuid, base_name="base",
+                                         provider="codex", initial_preamble="")
+        try:
+            return shlex.split(self._build_codex_command())
+        finally:
+            self._fork_context = old
+
+    def build_resume_command(self, session_uuid: str) -> list[str]:
+        old = self._fork_context
+        self._fork_context = ForkContext(mode="resume", session_uuid=session_uuid, base_name="base",
+                                         provider="codex", initial_preamble="")
+        try:
+            return shlex.split(self._build_codex_command())
+        finally:
+            self._fork_context = old
+
+    def capture_session_uuid(self, pane_pid: int, launch_time: float, cwd: str) -> str:
+        from cli_agent_orchestrator.services.fork_context_service import capture_codex_uuid
+        return capture_codex_uuid(pane_pid, launch_time, cwd)
 
     async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
         """Auto-accept the workspace trust prompt if it appears.

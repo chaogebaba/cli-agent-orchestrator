@@ -71,7 +71,7 @@ from cli_agent_orchestrator.models.memory import (
     MemoryScopeId,
     MemoryType,
 )
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
+from cli_agent_orchestrator.models.terminal import ForkContext, Terminal, TerminalId
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
@@ -197,6 +197,7 @@ class CreateTerminalBody(BaseModel):
 
     initial_message: Optional[str] = None
     initial_message_orchestration_type: Optional[str] = None
+    fork_context: Optional[ForkContext] = None
 
 
 class RunStepRequest(BaseModel):
@@ -1166,6 +1167,14 @@ async def delete_session(
         )
 
 
+@app.get("/provider-sessions/{session_uuid}/owner")
+async def get_provider_session_owner(
+    session_uuid: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
+) -> Dict[str, object]:
+    return terminal_service.provider_session_owner(session_uuid)
+
+
 @app.post(
     "/sessions/{session_name}/terminals",
     response_model=Terminal,
@@ -1261,6 +1270,7 @@ async def create_terminal_in_session(
             defer_init=defer_init,
             initial_message=initial_message,
             initial_message_orchestration_type=orch_type,
+            fork_context=body.fork_context if body else None,
         )
         return result
     except HTTPException:

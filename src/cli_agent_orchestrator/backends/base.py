@@ -95,6 +95,10 @@ class TerminalBackend(ABC):
 
     # --- Window/tab lifecycle ---
 
+    def window_liveness(self, session_name: str, window_name: str) -> str:
+        """Return live, gone, or error without collapsing backend failures."""
+        return "error"
+
     @abstractmethod
     def create_window(
         self,

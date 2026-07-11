@@ -30,6 +30,7 @@ from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
+from cli_agent_orchestrator.clients.database import list_terminals_by_provider_session_id
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
@@ -203,6 +204,7 @@ async def create_terminal(
     defer_init: bool = False,
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
+    fork_context=None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -375,7 +377,14 @@ async def create_terminal(
             allowed_tools,
             skill_prompt=skill_prompt,
             model=profile.model if profile else None,
+            fork_context=fork_context,
         )
+        allocated_uuid = getattr(provider_instance, "allocated_session_uuid", None)
+        if not isinstance(allocated_uuid, str):
+            allocated_uuid = None
+        if allocated_uuid:
+            from cli_agent_orchestrator.clients.database import update_terminal_provider_session_id
+            update_terminal_provider_session_id(terminal_id, allocated_uuid)
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
         # block on `provider.initialize()`. The remaining initialize + input
@@ -386,6 +395,8 @@ async def create_terminal(
         # keeps the tool call under 2s.
         if defer_init:
             shell_command = None  # unknown until initialize() runs
+            if fork_context and initial_message:
+                initial_message = f"{fork_context.initial_preamble}\n\n{initial_message}"
             _schedule_deferred_init(
                 provider_instance,
                 terminal_id,
@@ -421,6 +432,7 @@ async def create_terminal(
             shell_command=shell_command,
             status=initial_status,
             last_active=datetime.now(),
+            provider_session_id=allocated_uuid,
         )
 
         logger.info(
@@ -673,6 +685,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "agent_profile": metadata["agent_profile"],
             "caller_id": metadata.get("caller_id"),
             "allowed_tools": metadata.get("allowed_tools"),
+            "provider_session_id": metadata.get("provider_session_id"),
             "status": status,
             "input_gen": input_gen,
             "status_gen": 0 if status_gen is None else status_gen,
@@ -1102,6 +1115,16 @@ def peek_terminal(terminal_id: str, lines: int = 40) -> str:
         tail_lines=capped_lines,
         strip_escapes=True,
     )
+
+
+def provider_session_owner(session_uuid: str) -> dict:
+    saw_error = False
+    for terminal in list_terminals_by_provider_session_id(session_uuid):
+        state = get_backend().window_liveness(terminal["tmux_session"], terminal["tmux_window"])
+        if state == "live":
+            return {"state": "live", "terminal_id": terminal["id"]}
+        saw_error = saw_error or state == "error"
+    return {"state": "error" if saw_error else "gone", "terminal_id": None}
 
 
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:

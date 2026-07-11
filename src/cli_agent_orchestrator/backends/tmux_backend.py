@@ -79,6 +79,17 @@ class TmuxBackend(TerminalBackend):
     def kill_window(self, session_name: str, window_name: str) -> bool:
         return self._client.kill_window(session_name, window_name)
 
+    def window_liveness(self, session_name: str, window_name: str) -> str:
+        import subprocess
+        proc = subprocess.run(["tmux", "list-windows", "-t", session_name, "-F", "#{window_name}"],
+                              capture_output=True, text=True)
+        if proc.returncode == 0:
+            return "live" if window_name in proc.stdout.splitlines() else "gone"
+        stderr = proc.stderr.lower()
+        if "can't find session" in stderr or "no server running" in stderr:
+            return "gone"
+        return "error"
+
     # --- Input ---
 
     def send_keys(
