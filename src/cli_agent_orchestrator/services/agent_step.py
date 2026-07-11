@@ -132,14 +132,15 @@ async def run_agent_step(
             ``post_kill_terminal`` plugin hooks fire (parity with the DELETE
             endpoint). None (the in-process engine path today) means no hooks
             dispatch — behavior unchanged.
-        env_vars: Optional per-step environment variables to inject into a freshly
+        env_vars: Optional per-step environment variables to inject into a newly
             created terminal (ignored when reusing a terminal). The run engine (N5)
             uses this to set ``CAO_WORKFLOW_RUN_ID`` / ``CAO_WORKFLOW_STEP_ID`` so
             the worker's ``workflow_return`` tool routes its structured output to
             the correct ``(run_id, step_id)`` store key. With ``session_name=None``
-            the substrate creates a fresh session per step, so the per-step env is
-            injected cleanly (no stale step_id from a shared session). Default None
-            = behavior unchanged (the handoff caller passes nothing).
+            they initialize the fresh session. With an existing ``session_name``,
+            they overlay that session's shared environment for this window only,
+            with per-step values winning on collision and without persistence.
+            Default None preserves the session environment unchanged.
         on_terminal_created: Optional callback invoked with the ``terminal_id``
             IMMEDIATELY after a freshly created terminal exists (before the
             readiness wait / input). U4's script-tier orphan sweep (BR-31) uses

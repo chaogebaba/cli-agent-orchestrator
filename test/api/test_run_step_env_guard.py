@@ -35,6 +35,19 @@ def _ok_result():
 
 
 class TestForwarding:
+    def test_session_name_and_env_vars_forward_together(self, client):
+        with (
+            patch(_CHECK_GENERATION, return_value=None),
+            patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run,
+        ):
+            resp = client.post(
+                TERMINALS_RUN_STEP_ROUTE,
+                json=_body(session_name="cao-supervisor", env_vars=_ALL_KEYS),
+            )
+        assert resp.status_code == 200
+        assert m_run.await_args.kwargs["session_name"] == "cao-supervisor"
+        assert m_run.await_args.kwargs["env_vars"] == _ALL_KEYS
+
     def test_all_three_allowlisted_keys_forward_to_run_agent_step(self, client):
         # RUN_ID + GENERATION are both present, so the F1 fence fires — mock it
         # to a pass-through so this test stays focused on forwarding, not the

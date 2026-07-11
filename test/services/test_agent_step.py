@@ -178,12 +178,18 @@ class TestHappyPath:
 
     def test_session_name_adds_to_existing_session(self):
         """A supplied session_name adds a window to that EXISTING session
-        (new_session=False) — the handoff same-session path."""
+        (new_session=False) and preserves the per-step env overlay."""
+        env_vars = {"CAO_WORKFLOW_RUN_ID": "run-123", "CAO_WORKFLOW_GENERATION": "1"}
         create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
         with create as m_create, send, delete, get_output, exit_cli, wait, status:
-            asyncio.run(run_agent_step("kiro_cli", "dev", "x", session_name="cao-sup"))
+            asyncio.run(
+                run_agent_step(
+                    "kiro_cli", "dev", "x", session_name="cao-sup", env_vars=env_vars
+                )
+            )
         assert m_create.await_args.kwargs["new_session"] is False
         assert m_create.await_args.kwargs["session_name"] == "cao-sup"
+        assert m_create.await_args.kwargs["env_vars"] == env_vars
 
     def test_caller_id_and_allowed_tools_forwarded_to_create(self):
         """caller_id (#284 callback routing) and inherited allowed_tools must

@@ -251,8 +251,12 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.set_session_env")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_session_env")
     async def test_create_terminal_existing_session(
         self,
+        mock_get_session_env,
+        mock_set_session_env,
         mock_load_profile,
         mock_gen_id,
         mock_gen_session,
@@ -264,7 +268,9 @@ class TestCreateTerminal:
         mock_fifo_manager,
         mock_status_monitor,
     ):
-        """Test creating terminal in existing session."""
+        """Existing-session windows receive a caller-wins, non-persisted env overlay."""
+        session_floor = {"SHARED": "floor", "COLLISION": "session"}
+        mock_get_session_env.return_value = session_floor
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
@@ -277,9 +283,37 @@ class TestCreateTerminal:
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
 
         result = await create_terminal("kiro_cli", "developer", session_name="cao-existing")
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-existing",
+            env_vars={"CAO_WORKFLOW_RUN_ID": "run-123"},
+        )
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-existing",
+            env_vars={"COLLISION": "caller"},
+        )
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-existing",
+            env_vars={"WINDOW_ONLY": "overlay"},
+        )
+        await create_terminal("kiro_cli", "developer", session_name="cao-existing")
 
         assert result.id == "test1234"
-        mock_tmux.create_window.assert_called_once()
+        forwarded_envs = [call.kwargs["extra_env"] for call in mock_tmux.create_window.call_args_list]
+        assert forwarded_envs == [
+            session_floor,
+            {**session_floor, "CAO_WORKFLOW_RUN_ID": "run-123"},
+            {**session_floor, "COLLISION": "caller"},
+            {**session_floor, "WINDOW_ONLY": "overlay"},
+            session_floor,
+        ]
+        assert session_floor == {"SHARED": "floor", "COLLISION": "session"}
+        mock_set_session_env.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
