@@ -86,6 +86,14 @@ async def _wait_for_completion(
             status_gen = status_monitor.get_status_gen(terminal_id)
             if status_gen is not None and status_gen >= input_gen:
                 return _CompletionOutcome.IDLE_DONE
+        if current in (TerminalStatus.COMPLETED, TerminalStatus.IDLE):
+            logger.info(
+                "run_agent_step: rejected stale %s for terminal %s: status_gen=%s input_gen=%s",
+                current.value,
+                terminal_id,
+                status_gen,
+                input_gen,
+            )
         await asyncio.sleep(polling_interval)
     if cancel_signal is not None and cancel_signal.is_set():
         return _CompletionOutcome.CANCELLED

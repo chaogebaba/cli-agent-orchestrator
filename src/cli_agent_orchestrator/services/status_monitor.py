@@ -253,16 +253,42 @@ class StatusMonitor:
             if detected == last:
                 if detected in _STICKY_READY_STATUSES:
                     self._status_gen[terminal_id] = self._processing_gen.get(terminal_id, 0)
+                    logger.info(
+                        "Terminal %s accepted %s generation: input_gen=%s "
+                        "processing_gen=%s status_gen=%s",
+                        terminal_id,
+                        detected.value,
+                        self._input_gen.get(terminal_id, 0),
+                        self._processing_gen.get(terminal_id, 0),
+                        self._status_gen.get(terminal_id, 0),
+                    )
                 return
 
             self._last_status[terminal_id] = detected
             if detected == TerminalStatus.PROCESSING:
                 self._processing_gen[terminal_id] = self._input_gen.get(terminal_id, 0)
                 self._allow_processing_revert[terminal_id] = False
+                logger.info(
+                    "Terminal %s accepted processing generation: input_gen=%s "
+                    "processing_gen=%s status_gen=%s",
+                    terminal_id,
+                    self._input_gen.get(terminal_id, 0),
+                    self._processing_gen.get(terminal_id, 0),
+                    self._status_gen.get(terminal_id, 0),
+                )
             elif detected in _STICKY_READY_STATUSES:
                 self._status_gen[terminal_id] = self._processing_gen.get(terminal_id, 0)
                 if last not in _STICKY_READY_STATUSES:
                     self._allow_processing_revert[terminal_id] = False
+                logger.info(
+                    "Terminal %s accepted %s generation: input_gen=%s "
+                    "processing_gen=%s status_gen=%s",
+                    terminal_id,
+                    detected.value,
+                    self._input_gen.get(terminal_id, 0),
+                    self._processing_gen.get(terminal_id, 0),
+                    self._status_gen.get(terminal_id, 0),
+                )
 
         # Publish outside the lock — subscribers must never be able to
         # re-enter StatusMonitor while the latch state is mid-update.
@@ -676,6 +702,14 @@ class StatusMonitor:
             self._input_gen[terminal_id] = self._input_gen.get(terminal_id, 0) + 1
             self._bump_chunk_seq_locked(terminal_id)
             self._allow_processing_revert[terminal_id] = True
+            logger.info(
+                "Terminal %s input sent generation: input_gen=%s processing_gen=%s "
+                "status_gen=%s",
+                terminal_id,
+                self._input_gen[terminal_id],
+                self._processing_gen.get(terminal_id, 0),
+                self._status_gen.get(terminal_id, 0),
+            )
 
     def get_input_gen(self, terminal_id: str) -> int:
         """Return the current input-event generation for a terminal."""

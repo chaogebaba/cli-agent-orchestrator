@@ -7,6 +7,7 @@ success.
 """
 
 import asyncio
+import logging
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -426,7 +427,8 @@ class TestTypedCompletionWait:
         assert outcome == _CompletionOutcome.CANCELLED
         assert polls <= 2
 
-    def test_stale_idle_redraw_is_not_admitted(self):
+    def test_stale_idle_redraw_is_not_admitted(self, caplog):
+        caplog.set_level(logging.INFO)
         with (
             patch(f"{_MODULE}.status_monitor.get_status", return_value=TerminalStatus.IDLE),
             patch(f"{_MODULE}.status_monitor.get_status_gen", return_value=6),
@@ -435,6 +437,7 @@ class TestTypedCompletionWait:
         ):
             outcome = asyncio.run(_wait_for_completion("t1", input_gen=7, timeout=1.0))
         assert outcome == _CompletionOutcome.TIMEOUT
+        assert "status_gen=6 input_gen=7" in caplog.text
 
     @pytest.mark.parametrize(
         ("status", "expected"),

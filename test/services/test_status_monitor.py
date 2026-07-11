@@ -7,6 +7,7 @@ provider's native status. These tests pin both paths.
 """
 
 import asyncio
+import logging
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -624,6 +625,26 @@ class TestStickyLatching:
 
 
 class TestStatusGenerations:
+    def test_no_change_ready_acceptance_is_logged(self, caplog):
+        caplog.set_level(logging.INFO)
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.COMPLETED)
+        caplog.clear()
+        m.feed(TerminalStatus.COMPLETED)
+
+        assert "accepted completed generation: input_gen=0 processing_gen=0 status_gen=0" in caplog.text
+
+    def test_generation_acceptance_paths_are_logged(self, caplog):
+        caplog.set_level(logging.INFO)
+        m = _SequencedMonitor()
+        m.sm.notify_input_sent("t1")
+        m.feed(TerminalStatus.PROCESSING)
+        m.feed(TerminalStatus.COMPLETED)
+
+        assert "input sent generation: input_gen=1 processing_gen=0 status_gen=0" in caplog.text
+        assert "accepted processing generation: input_gen=1 processing_gen=1 status_gen=0" in caplog.text
+        assert "accepted completed generation: input_gen=1 processing_gen=1 status_gen=1" in caplog.text
+
     def test_processing_edge_then_ready_stamps_input_generation(self):
         m = _SequencedMonitor()
         m.feed(TerminalStatus.COMPLETED)

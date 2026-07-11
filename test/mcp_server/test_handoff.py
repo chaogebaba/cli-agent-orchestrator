@@ -246,6 +246,7 @@ class TestHandoffOutcomes:
 
         assert result.success is False
         assert "timed out after 600 seconds" in result.message
+        assert "terminal a1b2c3d4 remains live and must be deleted" in result.message
         assert result.terminal_id == "a1b2c3d4"
 
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")

@@ -865,7 +865,10 @@ async def _handoff_impl(
             elif kind == "error" or (kind is None and response.status_code == 502):
                 msg = f"Handoff failed: worker errored ({structured_detail})"
             elif kind == "timeout" or (kind is None and response.status_code == 504):
-                msg = f"Handoff timed out after {timeout} seconds"
+                msg = (
+                    f"Handoff timed out after {timeout} seconds; terminal {tid or 'unknown'} "
+                    "remains live and must be deleted"
+                )
             else:
                 msg = f"Handoff failed: {structured_detail}"
             return HandoffResult(success=False, message=msg, output=None, terminal_id=tid)
