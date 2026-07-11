@@ -20,6 +20,19 @@ class ForkContextError(ValueError):
         super().__init__(code)
 
 
+_FORK_ROLE_NOTICE = (
+    "ROLE NOTICE: You are a newly forked worker, distinct from the base session whose "
+    "transcript you inherit. Any role framing, read-only/do-not-edit constraints, or "
+    "base-ready declarations inside the inherited transcript applied only to the "
+    "original base. Your role, permissions, and constraints come solely from the "
+    "dispatch message below."
+)
+
+
+def _with_role_notice(preamble: str) -> str:
+    return f"{preamble}\n\n{_FORK_ROLE_NOTICE}"
+
+
 def _run_git(cwd: str, *args: str) -> str:
     return subprocess.run(["git", "-C", cwd, *args], check=True, text=True,
                           capture_output=True).stdout
@@ -55,7 +68,9 @@ def snapshot(cwd: str) -> tuple[Optional[str], str]:
 def staleness(row: dict[str, Any]) -> tuple[Optional[list[str]], str]:
     cwd, sha = row["cwd"], row.get("git_sha")
     if not sha:
-        return None, "[STALE-UNKNOWN] base snapshot is not a git worktree. Revalidate inherited context."
+        return None, _with_role_notice(
+            "[STALE-UNKNOWN] base snapshot is not a git worktree. Revalidate inherited context."
+        )
     manifest = json.loads(row.get("dirty_hashes") or "{}")
     try:
         candidates = set(_run_git(cwd, "diff", "--name-only", sha, "--").splitlines())
@@ -90,12 +105,16 @@ def staleness(row: dict[str, Any]) -> tuple[Optional[list[str]], str]:
             if current != expected:
                 changed.append(p)
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
-        return None, "[STALE-UNKNOWN] base snapshot could not be compared. Revalidate inherited context."
+        return None, _with_role_notice(
+            "[STALE-UNKNOWN] base snapshot could not be compared. Revalidate inherited context."
+        )
     if not changed:
-        return [], f"[FRESH] base '{row['name']}' snapshot current."
+        return [], _with_role_notice(f"[FRESH] base '{row['name']}' snapshot current.")
     shown = ", ".join(changed[:50])
-    return changed, (f"[STALE] {len(changed)} files changed since base '{row['name']}' "
-                     f"({sha[:8]}): {shown}. Re-read these before relying on inherited context.")
+    return changed, _with_role_notice(
+        f"[STALE] {len(changed)} files changed since base '{row['name']}' "
+        f"({sha[:8]}): {shown}. Re-read these before relying on inherited context."
+    )
 
 
 def resolve_base(value: str) -> dict[str, Any]:

@@ -27,12 +27,25 @@ def row(repo: Path, sha, hashes):
     return {"name": "base", "cwd": str(repo), "git_sha": sha, "dirty_hashes": hashes}
 
 
+def assert_fork_role_notice(preamble: str) -> None:
+    notice = (
+        "ROLE NOTICE: You are a newly forked worker, distinct from the base session whose "
+        "transcript you inherit. Any role framing, read-only/do-not-edit constraints, or "
+        "base-ready declarations inside the inherited transcript applied only to the "
+        "original base. Your role, permissions, and constraints come solely from the "
+        "dispatch message below."
+    )
+    assert notice in preamble
+    assert "normal edit, commit, and test permissions" not in preamble
+
+
 def test_tracked_modified_after_mark_is_stale(repo: Path):
     sha, hashes = snapshot(str(repo))
     (repo / "tracked.txt").write_text("changed")
     changed, preamble = staleness(row(repo, sha, hashes))
     assert changed == ["tracked.txt"]
     assert preamble.startswith("[STALE] 1 files")
+    assert_fork_role_notice(preamble)
 
 
 def test_dirty_at_snapshot_untouched_is_fresh(repo: Path):
@@ -41,7 +54,16 @@ def test_dirty_at_snapshot_untouched_is_fresh(repo: Path):
     assert json.loads(hashes)["tracked.txt"]
     changed, preamble = staleness(row(repo, sha, hashes))
     assert changed == []
-    assert preamble == "[FRESH] base 'base' snapshot current."
+    assert preamble.startswith("[FRESH] base 'base' snapshot current.")
+    assert_fork_role_notice(preamble)
+
+
+@pytest.mark.parametrize("sha, hashes", [(None, "{}"), ("invalid-sha", "{}")])
+def test_stale_unknown_includes_fork_role_notice(repo: Path, sha, hashes):
+    changed, preamble = staleness(row(repo, sha, hashes))
+    assert changed is None
+    assert preamble.startswith("[STALE-UNKNOWN]")
+    assert_fork_role_notice(preamble)
 
 
 def test_clean_tree_is_fresh(repo: Path):
