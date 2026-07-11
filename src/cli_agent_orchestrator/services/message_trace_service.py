@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -80,8 +81,13 @@ def resolve_session_transcript(metadata: dict) -> Path | None:
         path = Path.home() / ".grok" / "sessions" / quote(cwd, safe="") / session_id / "chat_history.jsonl"
         return path
     if provider == "claude_code" and cwd:
-        encoded = cwd.replace("/", "-")
-        return Path.home() / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
+        encoded = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+        projects = Path.home() / ".claude" / "projects"
+        path = projects / encoded / f"{session_id}.jsonl"
+        if path.exists():
+            return path
+        matches = list(projects.glob(f"*/{session_id}.jsonl"))
+        return max(matches, key=lambda match: match.stat().st_mtime_ns, default=None)
     return None
 
 

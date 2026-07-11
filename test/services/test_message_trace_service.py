@@ -141,11 +141,35 @@ def test_absent_start_poll_pins_first_readable_inode_before_swap():
 
 
 def test_resolve_provider_transcripts_uses_exact_session_ids(tmp_path):
-    claude = {"provider": "claude_code", "provider_session_id": "c-id", "working_directory": "/work/repo"}
+    claude = {
+        "provider": "claude_code",
+        "provider_session_id": "c-id",
+        "working_directory": "/home/user/work_space/.claude/repo",
+    }
     grok = {"provider": "grok_cli", "provider_session_id": "g-id", "working_directory": "/work/repo"}
+    encoded = tmp_path / ".claude/projects/-home-user-work-space--claude-repo/c-id.jsonl"
+    encoded.parent.mkdir(parents=True)
+    encoded.touch()
+    fallback = tmp_path / ".claude/projects/drifted-convention/c-id.jsonl"
+    fallback.parent.mkdir()
+    fallback.touch()
     with patch.object(Path, "home", return_value=tmp_path):
-        assert resolve_session_transcript(claude) == tmp_path / ".claude/projects/-work-repo/c-id.jsonl"
+        assert resolve_session_transcript(claude) == encoded
         assert resolve_session_transcript(grok) == tmp_path / ".grok/sessions/%2Fwork%2Frepo/g-id/chat_history.jsonl"
+
+
+def test_resolve_claude_transcript_falls_back_across_encoding_drift(tmp_path):
+    transcript = tmp_path / ".claude/projects/new_encoding/session-id.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.touch()
+    metadata = {
+        "provider": "claude_code",
+        "provider_session_id": "session-id",
+        "working_directory": "/work_space/.repo",
+    }
+
+    with patch.object(Path, "home", return_value=tmp_path):
+        assert resolve_session_transcript(metadata) == transcript
 
 
 def test_codex_null_session_uses_fd_capture_only_and_never_overwrites_non_null(tmp_path):
