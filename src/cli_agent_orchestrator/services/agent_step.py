@@ -31,6 +31,7 @@ from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
 from cli_agent_orchestrator.utils.terminal import wait_until_status
@@ -322,6 +323,12 @@ async def run_agent_step(
                 f"terminal {terminal_id} is waiting on a dialog "
                 f"(status={status_value}); input blocked",
                 kind="input_blocked",
+                terminal_id=terminal_id,
+            ) from exc
+        except DeliveryDeferredError as exc:
+            raise StepExecutionError(
+                str(exc),
+                kind="delivery_deferred",
                 terminal_id=terminal_id,
             ) from exc
         except Exception as exc:

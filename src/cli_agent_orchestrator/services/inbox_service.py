@@ -10,6 +10,8 @@ from itertools import groupby
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
+    create_inbox_message,
+    get_terminal_metadata,
     get_pending_messages,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
@@ -71,6 +73,64 @@ def _defer_messages(terminal_id: str, messages) -> None:
 
 class InboxService:
     """Delivers one pending message per terminal per IDLE cycle."""
+
+    def __init__(self) -> None:
+        self._defer_attempts: dict[int, int] = {}
+        self._defer_notified: set[int] = set()
+        self._defer_lock = threading.Lock()
+
+    def _evict_defer_state(self, messages) -> None:
+        with self._defer_lock:
+            for message in messages:
+                self._defer_attempts.pop(message.id, None)
+                self._defer_notified.discard(message.id)
+
+    def _record_delivery_deferred(self, terminal_id: str, messages) -> None:
+        notify_ids: list[int] = []
+        with self._defer_lock:
+            for message in messages:
+                attempts = self._defer_attempts.get(message.id, 0) + 1
+                self._defer_attempts[message.id] = attempts
+                if attempts == 5 and message.id not in self._defer_notified:
+                    self._defer_notified.add(message.id)
+                    notify_ids.append(message.id)
+
+        if not notify_ids:
+            return
+        try:
+            metadata = get_terminal_metadata(terminal_id)
+        except Exception:
+            metadata = None
+            logger.warning(
+                "Could not read caller metadata for deferred delivery to terminal %s",
+                terminal_id,
+                exc_info=True,
+            )
+        caller_id = metadata.get("caller_id") if metadata else None
+        if not caller_id:
+            logger.warning(
+                "Draft-guard delivery deferred 5 times for terminal %s message(s) %s; "
+                "no caller_id is available for notification",
+                terminal_id,
+                notify_ids,
+            )
+            return
+        for message_id in notify_ids:
+            try:
+                create_inbox_message(
+                    f"draft-guard:{terminal_id}",
+                    caller_id,
+                    f"[draft-guard] message {message_id} to terminal {terminal_id} has been "
+                    "deferred 5 times because the composer state could not be confirmed; "
+                    "delivery remains pending and will retry.",
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to enqueue draft-guard notification for terminal %s message %s",
+                    terminal_id,
+                    message_id,
+                    exc_info=True,
+                )
 
     async def run(self, registry: PluginRegistry | None = None) -> None:
         queue = bus.subscribe("terminal.*.status")
@@ -184,13 +244,16 @@ class InboxService:
                             defer_on_dialog=True,
                         )
                     logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
+                    self._evict_defer_state(batch)
                 except DeliveryDeferredError:
+                    self._record_delivery_deferred(terminal_id, batch)
                     _defer_messages(terminal_id, messages[sent_count:])
                     return
                 except TerminalInputBlockedError:
                     _defer_messages(terminal_id, messages[sent_count:])
                     return
                 except TerminalNotFoundError as e:
+                    self._evict_defer_state(batch)
                     # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
                     # for this window). Treat as transient: reset to PENDING so the
                     # reconcile sweep retries rather than marking FAILED. These were
@@ -202,6 +265,7 @@ class InboxService:
                         f"{len(batch)} message(s) pending for retry: {e}"
                     )
                 except Exception as e:
+                    self._evict_defer_state(batch)
                     for message in batch:
                         logger.error(
                             f"Failed to deliver message {message.id} to {terminal_id}: {e}"

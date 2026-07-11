@@ -119,6 +119,25 @@ class TestRunStepEndpoint:
             "terminal_id": "abc12345",
         }
 
+    def test_delivery_deferred_maps_to_409_with_structured_terminal_id(self, client):
+        with patch(
+            _RUN_STEP,
+            new=AsyncMock(
+                side_effect=StepExecutionError(
+                    "composer unstable",
+                    kind="delivery_deferred",
+                    terminal_id="abc12345",
+                )
+            ),
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == {
+            "message": "composer unstable",
+            "kind": "delivery_deferred",
+            "terminal_id": "abc12345",
+        }
+
     def test_value_error_maps_to_404(self, client):
         with patch(_RUN_STEP, new=AsyncMock(side_effect=ValueError("Terminal 'x' not found"))):
             resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())

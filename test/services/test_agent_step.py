@@ -20,6 +20,7 @@ from cli_agent_orchestrator.services.agent_step import (
     _wait_for_completion,
     run_agent_step,
 )
+from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
 
 _MODULE = "cli_agent_orchestrator.services.agent_step"
@@ -196,6 +197,19 @@ class TestHappyPath:
         assert exc_info.value.terminal_id == "reuse99"
         assert "waiting on a dialog" in str(exc_info.value)
         m_delete.assert_not_called()
+
+    def test_draft_guard_deferral_surfaces_structured_retryable_error(self):
+        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+            wait_results=(True,)
+        )
+        with create, send as m_send, delete, get_output, exit_cli, wait, status:
+            m_send.side_effect = DeliveryDeferredError("composer unstable")
+            with pytest.raises(StepExecutionError) as exc_info:
+                asyncio.run(
+                    run_agent_step("claude_code", "dev", "x", reuse_terminal_id="reuse99")
+                )
+        assert exc_info.value.kind == "delivery_deferred"
+        assert exc_info.value.terminal_id == "reuse99"
 
     def test_reads_generation_after_send_and_admits_fresh_idle(self):
         create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(

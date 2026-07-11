@@ -86,11 +86,11 @@ def test_unconfirmed_stash_never_repastes(monkeypatch, tmp_path):
         tmp_path,
         iter(["DRAFT=A", "DRAFT=A", "DRAFT=A", "DRAFT=A", "DRAFT=A", "DRAFT="]),
     )
-    chip_present = draft_guard.stash_draft_before_send(
-        "t", {"tmux_session": "s", "tmux_window": "w"}, StashProvider()
-    )
-    assert calls == [("s", "w", "C-s"), ("s", "w", "C-u")]
-    assert chip_present is False
+    with pytest.raises(draft_guard.DeliveryDeferredError):
+        draft_guard.stash_draft_before_send(
+            "t", {"tmux_session": "s", "tmux_window": "w"}, StashProvider()
+        )
+    assert calls == [("s", "w", "C-s")]
 
 
 def test_clear_is_bounded_by_draft_line_count_plus_three(monkeypatch, tmp_path):
@@ -102,7 +102,8 @@ def test_clear_is_bounded_by_draft_line_count_plus_three(monkeypatch, tmp_path):
             + ["CHIP\nDRAFT=one\ntwo"] * 5
         ),
     )
-    draft_guard.stash_draft_before_send("t", {"tmux_session": "s", "tmux_window": "w"}, StashProvider())
+    with pytest.raises(draft_guard.DeliveryDeferredError):
+        draft_guard.stash_draft_before_send("t", {"tmux_session": "s", "tmux_window": "w"}, StashProvider())
     assert calls == [("s", "w", "C-u")] * 5
 
 
@@ -112,7 +113,8 @@ def test_changed_snapshots_fall_back_without_composer_keys(monkeypatch, tmp_path
         tmp_path,
         iter([item for _ in range(3) for item in ("DRAFT=A", "DRAFT=B")]),
     )
-    draft_guard.stash_draft_before_send("t", {"tmux_session": "s", "tmux_window": "w"}, StashProvider())
+    with pytest.raises(draft_guard.DeliveryDeferredError):
+        draft_guard.stash_draft_before_send("t", {"tmux_session": "s", "tmux_window": "w"}, StashProvider())
     assert calls == []
 
 
@@ -131,7 +133,8 @@ def test_blank_and_indented_rows_log_verbatim_and_set_clear_bound(monkeypatch, t
     monkeypatch.setattr(draft_guard, "DRAFT_LOG_DIR", tmp_path)
     monkeypatch.setattr(draft_guard, "_wait_for_stable_draft", lambda *args: args[-1])
 
-    draft_guard.stash_draft_before_send("t", {"tmux_session": "s", "tmux_window": "w"}, provider)
+    with pytest.raises(draft_guard.DeliveryDeferredError):
+        draft_guard.stash_draft_before_send("t", {"tmux_session": "s", "tmux_window": "w"}, provider)
 
     assert draft in (tmp_path / "t.log").read_text()
     assert calls == [("s", "w", "C-u")] * 6
@@ -196,14 +199,8 @@ def test_send_input_default_does_not_defer_on_dialog(monkeypatch, tmp_path):
         terminal_service.status_monitor, "clear_rolling_buffer", lambda _: None
     )
 
-    assert terminal_service.send_input("t", "message") is True
+    with pytest.raises(draft_guard.DeliveryDeferredError):
+        terminal_service.send_input("t", "message")
 
-    backend.send_keys.assert_called_once_with(
-        "s",
-        "w",
-        "message",
-        enter_count=1,
-        force_bracketed_paste=True,
-        submit_delay=0.3,
-    )
+    backend.send_keys.assert_not_called()
     backend.send_special_key.assert_not_called()

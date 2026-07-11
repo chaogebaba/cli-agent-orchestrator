@@ -1592,7 +1592,7 @@ async def run_step(
         # apart instead of reporting every failure as a timeout. The detail is a
         # structured object carrying terminal_id, so callers read it as a field
         # rather than regex-scraping the message (the future engine reads it too).
-        if e.kind in {"input_blocked", "waiting_user_input"}:
+        if e.kind in {"delivery_deferred", "input_blocked", "waiting_user_input"}:
             code = status.HTTP_409_CONFLICT
         else:
             code = (

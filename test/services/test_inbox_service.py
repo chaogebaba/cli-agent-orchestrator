@@ -40,6 +40,51 @@ def _make_message(
 class TestDeliverPending:
     """Tests for InboxService.deliver_pending()."""
 
+    @patch("cli_agent_orchestrator.services.inbox_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.inbox_service.create_inbox_message")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_draft_guard_deferral_counts_attempted_only_and_notifies_caller_once(
+        self, mock_get, _mock_update, mock_monitor, mock_term_svc, mock_create, mock_metadata
+    ):
+        attempted = _make_message(id=1)
+        suffix = _make_message(id=2, sender_id="sender-2")
+        mock_get.return_value = [attempted, suffix]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_term_svc.send_input.side_effect = DeliveryDeferredError("unstable")
+        mock_metadata.return_value = {"caller_id": "caller-1"}
+        svc = InboxService()
+        for _ in range(6):
+            svc.deliver_pending("term-1", num_messages=0)
+        assert svc._defer_attempts == {1: 6}
+        assert svc._defer_notified == {1}
+        mock_create.assert_called_once()
+        assert mock_create.call_args.args[1] == "caller-1"
+
+    @patch("cli_agent_orchestrator.services.inbox_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.inbox_service.create_inbox_message")
+    def test_draft_guard_fifth_deferral_without_caller_warns_only(
+        self, mock_create, mock_metadata, caplog
+    ):
+        mock_metadata.return_value = {"caller_id": None}
+        svc = InboxService()
+        message = _make_message()
+        for _ in range(5):
+            svc._record_delivery_deferred("term-1", [message])
+        mock_create.assert_not_called()
+        assert "no caller_id" in caplog.text
+
+    def test_defer_state_is_evicted_on_terminal_outcomes(self):
+        svc = InboxService()
+        message = _make_message()
+        svc._defer_attempts[1] = 4
+        svc._defer_notified.add(1)
+        svc._evict_defer_state([message])
+        assert svc._defer_attempts == {}
+        assert svc._defer_notified == set()
+
     @pytest.mark.parametrize("registry", [None, MagicMock()])
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")

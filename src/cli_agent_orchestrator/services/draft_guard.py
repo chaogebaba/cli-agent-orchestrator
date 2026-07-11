@@ -29,7 +29,7 @@ STASH_SNAPSHOT_RETRIES = 3
 
 
 class DeliveryDeferredError(Exception):
-    """Raised when an inbox delivery would answer an active dialog."""
+    """Raised when transient terminal state makes delivery unsafe to attempt."""
 
 
 @dataclass
@@ -99,14 +99,18 @@ def stash_draft_before_send(
             break
         if snapshot.chip_present:
             if snapshot.draft:
-                snapshot = _clear_stash_draft(
+                cleared = _clear_stash_draft(
                     terminal_id,
                     metadata,
                     provider,
                     snapshot.draft,
                     defer_on_dialog,
                 )
-                return bool(snapshot and snapshot.chip_present)
+                if cleared is not None and cleared.draft == "":
+                    return cleared.chip_present
+                raise DeliveryDeferredError(
+                    f"Could not confirm composer clear for terminal {terminal_id}"
+                )
             return True
         if snapshot.draft == "":
             return False
@@ -116,16 +120,17 @@ def stash_draft_before_send(
         if confirmed is not None and confirmed.chip_present and confirmed.draft == "":
             return True
         logger.warning("Native composer stash unconfirmed for terminal %s; degrading", terminal_id)
-        cleared = _clear_stash_draft(
-            terminal_id, metadata, provider, snapshot.draft, defer_on_dialog
+        raise DeliveryDeferredError(
+            f"Could not confirm native composer stash for terminal {terminal_id}"
         )
-        return bool(cleared and cleared.chip_present)
 
     logger.warning(
-        "Composer snapshot unreadable or changing for terminal %s; injecting without composer keys",
+        "Composer snapshot unreadable or changing for terminal %s; deferring delivery",
         terminal_id,
     )
-    return False
+    raise DeliveryDeferredError(
+        f"Composer snapshot unreadable or changing for terminal {terminal_id}"
+    )
 
 
 def _read_stash_snapshot(
@@ -169,7 +174,7 @@ def _clear_stash_draft(
     draft: str,
     defer_on_dialog: bool = False,
 ) -> ComposerSnapshot | None:
-    """C-u until empty; failure only warns because delivery must continue."""
+    """C-u until empty; return the confirmed snapshot, or the latest observed one."""
     cap = draft.count("\n") + 4
     latest = None
     for _ in range(cap):
@@ -180,7 +185,7 @@ def _clear_stash_draft(
             return snapshot
         if not _send_clear_keys(terminal_id, metadata, provider):
             break
-    logger.warning("Could not confirm composer clear for terminal %s; injecting anyway", terminal_id)
+    logger.warning("Could not confirm composer clear for terminal %s", terminal_id)
     return latest
 
 
