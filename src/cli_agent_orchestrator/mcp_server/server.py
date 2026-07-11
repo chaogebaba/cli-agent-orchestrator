@@ -1,5 +1,6 @@
 """CLI Agent Orchestrator MCP Server implementation."""
 
+import json
 import logging
 import os
 import re
@@ -1141,6 +1142,15 @@ _assign_message_field_desc = (
     else "The task message to send. Include callback instructions for the worker to send results back."
 )
 
+
+def _serialize_provider_session(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Serialize a provider-session row without echoing its hash manifest."""
+    serialized = dict(row)
+    manifest = json.loads(serialized.pop("dirty_hashes", None) or "{}")
+    serialized["dirty_file_count"] = len(manifest)
+    return serialized
+
+
 if ENABLE_WORKING_DIRECTORY:
 
     @mcp.tool(description=_assign_description)
@@ -1181,7 +1191,8 @@ async def mark_base_ready(
         if not terminal_id:
             raise ValueError("CAO_TERMINAL_ID not set")
         from cli_agent_orchestrator.services.fork_context_service import mark_ready
-        return {"success": True, "base": mark_ready(terminal_id, name, summary)}
+        row = mark_ready(terminal_id, name, summary)
+        return {"success": True, "base": _serialize_provider_session(row)}
     except Exception as exc:
         return {"success": False, "error": str(exc)}
 
@@ -1189,7 +1200,8 @@ async def mark_base_ready(
 @mcp.tool(description="List ready provider-native base sessions with live staleness counts.")
 async def list_base_sessions() -> Dict[str, Any]:
     from cli_agent_orchestrator.services.fork_context_service import list_bases
-    return {"success": True, "bases": list_bases()}
+    bases = [_serialize_provider_session(row) for row in list_bases()]
+    return {"success": True, "bases": bases}
 
 
 @mcp.tool(description="Retire a registered fork base without deleting its terminal or session.")
@@ -1201,7 +1213,7 @@ async def unregister_base(
     row = retire(name)
     if row is None:
         return {"success": False, "error": f"no ready base named {name}"}
-    return {"success": True, "base": row}
+    return {"success": True, "base": _serialize_provider_session(row)}
 
 
 # Implementation function for send_message
