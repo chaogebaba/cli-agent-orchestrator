@@ -23,6 +23,8 @@ retry policy (FR-5.3); the HTTP handler maps it to an ``HTTPException``.
 
 import asyncio
 import logging
+import time
+from enum import Enum
 from typing import Callable, Optional
 
 from cli_agent_orchestrator.models.inbox import OrchestrationType
@@ -45,6 +47,45 @@ _READY_STATES = {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
 DEFAULT_READY_TIMEOUT = 120.0
 
 
+class _CompletionOutcome(str, Enum):
+    COMPLETED = "completed"
+    IDLE_DONE = "idle_done"
+    ERROR = "error"
+    WAITING_USER = "waiting_user"
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"  # Reserved for FX14b.
+
+
+async def _wait_for_completion(
+    terminal_id: str,
+    *,
+    input_gen: int,
+    timeout: float,
+    polling_interval: float = 1.0,
+) -> _CompletionOutcome:
+    """Poll the in-process monitor for a post-input terminal outcome."""
+    from cli_agent_orchestrator.services.auto_responder import auto_responder
+
+    start = time.time()
+    while time.time() - start < timeout:
+        current = status_monitor.get_status(terminal_id)
+        if current == TerminalStatus.ERROR:
+            return _CompletionOutcome.ERROR
+        if current == TerminalStatus.WAITING_USER_ANSWER:
+            if auto_responder.waiting_gate(terminal_id):
+                return _CompletionOutcome.WAITING_USER
+        elif current == TerminalStatus.COMPLETED:
+            status_gen = status_monitor.get_status_gen(terminal_id)
+            if status_gen is None or status_gen >= input_gen:
+                return _CompletionOutcome.COMPLETED
+        elif current == TerminalStatus.IDLE:
+            status_gen = status_monitor.get_status_gen(terminal_id)
+            if status_gen is not None and status_gen >= input_gen:
+                return _CompletionOutcome.IDLE_DONE
+        await asyncio.sleep(polling_interval)
+    return _CompletionOutcome.TIMEOUT
+
+
 class StepExecutionError(Exception):
     """A step failed to complete successfully.
 
@@ -54,9 +95,9 @@ class StepExecutionError(Exception):
 
     Carries two structured fields so callers never have to scrape the message:
 
-    - ``kind`` distinguishes a worker that *ran long* (``"timeout"``) from one
-      that *crashed* (``"error"``, i.e. the terminal reached ERROR). The two
-      were previously indistinguishable — both surfaced as a 504 "timed out".
+    - ``kind`` distinguishes a worker that *ran long* (``"timeout"``), one
+      that *crashed* (``"error"``, i.e. the terminal reached ERROR), and one
+      blocked on manual input (``"waiting_user_input"``).
     - ``terminal_id`` is the live terminal the step ran on (when known), so a
       failed caller can report/clean it up without regex-scraping the message.
     """
@@ -95,7 +136,7 @@ async def run_agent_step(
       1. Create a terminal (or reuse ``reuse_terminal_id``).
       2. Wait until it is ready to accept input (IDLE/COMPLETED).
       3. Send ``prompt`` (sync, bracketed-paste — the existing input path).
-      4. Wait until COMPLETED (in-process status poll).
+      4. Wait until the post-input turn settles (COMPLETED or generation-fresh IDLE).
       5. Extract the last agent message (provider-specific extraction).
       6. Tear the terminal down unless ``teardown=False`` or it was reused.
 
@@ -117,7 +158,7 @@ async def run_agent_step(
             caller owns the terminal's lifecycle).
         teardown: When True (default) and the terminal was created here, delete
             it after extraction. Ignored when ``reuse_terminal_id`` is set.
-        timeout: Max seconds to wait for the step to reach COMPLETED.
+        timeout: Max seconds to wait for the step to settle after input.
         ready_timeout: Max seconds to wait for a freshly created terminal to be
             ready to accept input.
         working_directory: Optional working directory for a freshly created
@@ -156,8 +197,9 @@ async def run_agent_step(
         ``AgentStepResult`` with status COMPLETED — ONLY on success.
 
     Raises:
-        StepExecutionError: readiness/completion wait timed out (``kind="timeout"``)
-            or the terminal reached ``TerminalStatus.ERROR`` (``kind="error"``).
+        StepExecutionError: readiness/completion wait timed out (``kind="timeout"``),
+            the terminal reached ``TerminalStatus.ERROR`` (``kind="error"``), or
+            a dialog requires manual input (``kind="waiting_user_input"``).
             ``terminal_id`` carries the live terminal so the caller can clean up.
         ValueError / TimeoutError: propagated from ``terminal_service`` (e.g.
             terminal-create failure, unknown terminal) — surfaced, never swallowed.
@@ -246,13 +288,23 @@ async def run_agent_step(
     # stricter; it cannot admit a stale completion.
     input_gen = status_monitor.get_input_gen(terminal_id)
 
-    # Wait for completion — IN-PROCESS poll of status_monitor (NOT the
-    # HTTP-polling wait_until_terminal_status, which would reintroduce the
-    # self-loopback the single-seam rule forbids). False => timeout => raise.
-    completed = await wait_until_status(
-        terminal_id, TerminalStatus.COMPLETED, timeout=timeout, min_gen=input_gen
-    )
-    if not completed:
+    # Wait in-process: COMPLETED retains FX11's event-inbox None-generation
+    # bypass, while IDLE requires concrete proof that PROCESSING occurred for
+    # this input generation. The reserved CANCELLED outcome is consumed by FX14b.
+    outcome = await _wait_for_completion(terminal_id, input_gen=input_gen, timeout=timeout)
+    if outcome == _CompletionOutcome.ERROR:
+        raise StepExecutionError(
+            f"terminal {terminal_id} reached ERROR status",
+            kind="error",
+            terminal_id=terminal_id,
+        )
+    if outcome == _CompletionOutcome.WAITING_USER:
+        raise StepExecutionError(
+            f"terminal {terminal_id} is waiting for user input",
+            kind="waiting_user_input",
+            terminal_id=terminal_id,
+        )
+    if outcome == _CompletionOutcome.TIMEOUT:
         # Distinguish a hard ERROR end-state (worker crashed) from a plain
         # timeout (worker ran long): the caller must be able to tell them apart
         # rather than reporting a 5s crash as a 600s timeout.

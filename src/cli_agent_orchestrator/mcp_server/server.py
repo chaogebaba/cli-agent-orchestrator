@@ -787,6 +787,11 @@ async def _handoff_impl(
                     f"Handoff blocked: terminal {tid or 'unknown'} is waiting on a dialog "
                     f"({structured_detail})"
                 )
+            elif kind == "waiting_user_input":
+                msg = (
+                    f"Handoff blocked: worker is waiting for user input "
+                    f"(terminal {tid or 'unknown'}; {structured_detail})"
+                )
             elif kind == "error" or (kind is None and response.status_code == 502):
                 msg = f"Handoff failed: worker errored ({structured_detail})"
             elif kind == "timeout" or (kind is None and response.status_code == 504):

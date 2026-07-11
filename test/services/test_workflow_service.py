@@ -248,6 +248,26 @@ async def test_input_blocked_is_not_retried_and_preserves_terminal(monkeypatch):
     assert record.step_states["s1"].terminal_id == "blocked-terminal"
 
 
+@pytest.mark.asyncio
+async def test_waiting_user_input_is_not_retried_and_preserves_terminal(monkeypatch):
+    mock = AsyncMock(
+        side_effect=StepExecutionError(
+            "terminal waiting-terminal is waiting for user input",
+            kind="waiting_user_input",
+            terminal_id="waiting-terminal",
+        )
+    )
+    monkeypatch.setattr(ws, "run_agent_step", mock)
+
+    res = await ws.start_run(_spec(on_failure="halt"), {}, "runWaiting")
+
+    assert mock.await_count == 1
+    assert res.state == RunState.FAILED
+    assert res.steps[0].state == StepState.FAILED
+    assert res.steps[0].attempts == 1
+    assert ws.run_registry["runWaiting"].step_states["s1"].terminal_id == "waiting-terminal"
+
+
 # ---------------------------------------------------------------------------
 # on_failure halt / continue + _skip_remaining
 # ---------------------------------------------------------------------------

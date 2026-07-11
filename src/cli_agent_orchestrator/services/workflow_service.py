@@ -61,7 +61,7 @@ from cli_agent_orchestrator.services.step_output_store import (
     step_output_store,
 )
 
-NON_RETRYABLE_STEP_KINDS = frozenset({"input_blocked"})
+NON_RETRYABLE_STEP_KINDS = frozenset({"input_blocked", "waiting_user_input"})
 
 logger = logging.getLogger(__name__)
 

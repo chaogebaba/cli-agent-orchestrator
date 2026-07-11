@@ -19,7 +19,7 @@ import pytest
 
 from cli_agent_orchestrator.mcp_server.server import HandoffContext
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.services.agent_step import run_agent_step
+from cli_agent_orchestrator.services.agent_step import _CompletionOutcome, run_agent_step
 from cli_agent_orchestrator.services.terminal_service import OutputMode
 
 _STEP = "cli_agent_orchestrator.services.agent_step"
@@ -56,12 +56,17 @@ class _SequenceRecorder:
             self.calls.append(("wait", terminal_id, target))
             return True
 
+        async def _completion(terminal_id, **k):
+            self.calls.append(("completion_wait", terminal_id))
+            return _CompletionOutcome.COMPLETED
+
         return [
             patch(f"{_STEP}.terminal_service.create_terminal", new=AsyncMock(side_effect=_create)),
             patch(f"{_STEP}.terminal_service.send_input", side_effect=_send),
             patch(f"{_STEP}.terminal_service.get_output", side_effect=_get_output),
             patch(f"{_STEP}.terminal_service.delete_terminal", side_effect=_delete),
             patch(f"{_STEP}.wait_until_status", new=AsyncMock(side_effect=_wait)),
+            patch(f"{_STEP}._wait_for_completion", new=AsyncMock(side_effect=_completion)),
             patch(
                 f"{_STEP}.status_monitor.get_status",
                 return_value=TerminalStatus.COMPLETED,
@@ -97,7 +102,7 @@ class TestEngineHandoffEquivalence:
             "create",
             "wait",  # readiness
             "send_input",
-            "wait",  # completion
+            "completion_wait",
             "get_output",
             "delete",
         ]
@@ -153,7 +158,7 @@ class TestEngineHandoffEquivalence:
             "create",
             "wait",
             "send_input",
-            "wait",
+            "completion_wait",
             "get_output",
             "delete",
         ]

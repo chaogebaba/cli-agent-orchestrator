@@ -1480,8 +1480,10 @@ async def exit_terminal(
         "Failure contract: a non-2xx body is a structured object "
         "`{message, kind, terminal_id}`. **`kind` is authoritative** — "
         '`kind="error"` means the worker CRASHED (terminal reached ERROR), '
-        '`kind="timeout"` means it RAN LONG. The HTTP status mirrors `kind` '
-        "(502 = crashed, 504 = ran long) for transport-layer consumers, but a "
+        '`kind="timeout"` means it RAN LONG, and `kind="waiting_user_input"` '
+        "means the worker needs manual input. The HTTP status mirrors `kind` "
+        "(502 = crashed, 504 = ran long, 409 = input required) for transport-layer "
+        "consumers, but a "
         "caller MUST branch on `kind`, not the status code. `terminal_id` names "
         "the live terminal (read it as a field; never regex-scrape `message`)."
     ),
@@ -1506,12 +1508,14 @@ async def run_step(
     out, not just inferable from the handler):
 
     - A failed step returns a STRUCTURED detail object
-      ``{"message": str, "kind": "timeout"|"error", "terminal_id": str|None}``.
+      ``{"message": str, "kind": "timeout"|"error"|"input_blocked"|
+      "waiting_user_input", "terminal_id": str|None}``.
     - ``kind`` is the AUTHORITATIVE discriminator. ``kind="error"`` => the worker
       CRASHED (the terminal reached ``TerminalStatus.ERROR``); ``kind="timeout"``
       => the worker RAN LONG (readiness/completion wait elapsed). The HTTP status
       is derived FROM ``kind`` (``error`` -> 502 Bad Gateway, ``timeout`` -> 504
-      Gateway Timeout) as a convenience for transport-layer consumers — a client
+      Gateway Timeout, ``waiting_user_input`` -> 409 Conflict) as a convenience
+      for transport-layer consumers — a client
       that can read the body MUST branch on ``kind``, not the status code.
     - ``terminal_id`` names the live terminal the step ran on (when known) so a
       caller can report/clean it up without regex-scraping ``message``.
@@ -1578,7 +1582,7 @@ async def run_step(
         # apart instead of reporting every failure as a timeout. The detail is a
         # structured object carrying terminal_id, so callers read it as a field
         # rather than regex-scraping the message (the future engine reads it too).
-        if e.kind == "input_blocked":
+        if e.kind in {"input_blocked", "waiting_user_input"}:
             code = status.HTTP_409_CONFLICT
         else:
             code = (

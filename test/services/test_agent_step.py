@@ -13,7 +13,12 @@ import pytest
 
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
-from cli_agent_orchestrator.services.agent_step import StepExecutionError, run_agent_step
+from cli_agent_orchestrator.services.agent_step import (
+    StepExecutionError,
+    _CompletionOutcome,
+    _wait_for_completion,
+    run_agent_step,
+)
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
 
 _MODULE = "cli_agent_orchestrator.services.agent_step"
@@ -138,9 +143,9 @@ class TestHappyPath:
         assert "waiting on a dialog" in str(exc_info.value)
         m_delete.assert_not_called()
 
-    def test_reads_generation_after_send_and_threads_min_gen(self):
+    def test_reads_generation_after_send_and_admits_fresh_idle(self):
         create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
-            wait_results=(True,)
+            wait_results=(True,), final_status=TerminalStatus.IDLE
         )
         events = []
         with (
@@ -149,15 +154,21 @@ class TestHappyPath:
             delete,
             get_output,
             exit_cli,
-            wait as m_wait,
-            status,
+            wait,
+            status as m_status,
             patch(f"{_MODULE}.status_monitor.get_input_gen", return_value=7) as m_gen,
+            patch(f"{_MODULE}.status_monitor.get_status_gen", return_value=7),
+            patch(f"{_MODULE}.asyncio.sleep", new=AsyncMock()),
         ):
             m_send.side_effect = lambda *_args, **_kwargs: events.append("send") or True
             m_gen.side_effect = lambda *_args: events.append("gen") or 7
+            m_status.side_effect = [
+                TerminalStatus.PROCESSING,
+                TerminalStatus.IDLE,
+                TerminalStatus.IDLE,
+            ]
             asyncio.run(run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99"))
         assert events == ["send", "gen"]
-        assert m_wait.await_args.kwargs["min_gen"] == 7
 
     def test_working_directory_forwarded_to_create(self):
         create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
@@ -223,15 +234,14 @@ class TestHappyPath:
 
 class TestFailureRaises:
     def test_completion_timeout_raises(self):
-        """wait_until_status -> False on completion: must RAISE, never return a
-        falsy success (the key reliability contract, RD-2.1)."""
+        """A typed completion timeout must raise, never return a falsy success."""
         create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
-            wait_results=(True, False),  # ready, then completion times out
+            wait_results=(True,),
             final_status=TerminalStatus.PROCESSING,
         )
         with create, send, delete, get_output, exit_cli, wait, status:
             with pytest.raises(StepExecutionError, match="did not complete") as exc_info:
-                asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
+                asyncio.run(run_agent_step("kiro_cli", "dev", "x", timeout=0))
         # Timeout (ran long), with the live terminal carried structurally.
         assert exc_info.value.kind == "timeout"
         assert exc_info.value.terminal_id == "abc12345"
@@ -248,27 +258,45 @@ class TestFailureRaises:
         assert exc_info.value.kind == "timeout"
         assert exc_info.value.terminal_id == "abc12345"
 
-    def test_error_end_state_raises_with_error_kind(self):
-        """Completion wait returns False AND status is ERROR -> kind='error'
-        (worker CRASHED), distinct from a plain timeout, with terminal_id."""
+    def test_error_fails_fast_with_error_kind(self):
+        """ERROR fails immediately rather than burning the nominal timeout."""
         create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
-            wait_results=(True, False),
+            wait_results=(True,),
             final_status=TerminalStatus.ERROR,
         )
-        with create, send, delete, get_output, exit_cli, wait, status:
+        with (
+            create,
+            send,
+            delete,
+            get_output as m_out,
+            exit_cli,
+            wait,
+            status,
+            patch(f"{_MODULE}.asyncio.sleep", new=AsyncMock()) as m_sleep,
+        ):
             with pytest.raises(StepExecutionError, match="ERROR status") as exc_info:
-                asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
+                asyncio.run(run_agent_step("kiro_cli", "dev", "x", timeout=3600))
         assert exc_info.value.kind == "error"
         assert exc_info.value.terminal_id == "abc12345"
+        m_sleep.assert_not_awaited()
+        m_out.assert_not_called()
 
-    def test_error_after_completed_wait_still_raises(self):
-        """Defensive re-check: even if completion wait returned True, an ERROR
-        final status must not be reported as success."""
+    def test_error_wins_final_recheck_after_completed_outcome(self):
+        """A completion-to-ERROR race must not be reported as success."""
         create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
-            wait_results=(True, True),
-            final_status=TerminalStatus.ERROR,
+            wait_results=(True,), final_status=TerminalStatus.COMPLETED
         )
-        with create, send, delete, get_output as m_out, exit_cli, wait, status:
+        with (
+            create,
+            send,
+            delete,
+            get_output as m_out,
+            exit_cli,
+            wait,
+            status as m_status,
+            patch(f"{_MODULE}.status_monitor.get_status_gen", return_value=None),
+        ):
+            m_status.side_effect = [TerminalStatus.COMPLETED, TerminalStatus.ERROR]
             with pytest.raises(StepExecutionError, match="ERROR status") as exc_info:
                 asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
         # No output extraction once ERROR is detected.
@@ -285,6 +313,96 @@ class TestFailureRaises:
             with pytest.raises(ValueError, match="session not found"):
                 asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
 
+
+class TestTypedCompletionWait:
+    def test_stale_idle_redraw_is_not_admitted(self):
+        with (
+            patch(f"{_MODULE}.status_monitor.get_status", return_value=TerminalStatus.IDLE),
+            patch(f"{_MODULE}.status_monitor.get_status_gen", return_value=6),
+            patch(f"{_MODULE}.time.time", side_effect=[0.0, 0.0, 2.0]),
+            patch(f"{_MODULE}.asyncio.sleep", new=AsyncMock()),
+        ):
+            outcome = asyncio.run(_wait_for_completion("t1", input_gen=7, timeout=1.0))
+        assert outcome == _CompletionOutcome.TIMEOUT
+
+    @pytest.mark.parametrize(
+        ("status", "expected"),
+        [
+            (TerminalStatus.IDLE, _CompletionOutcome.TIMEOUT),
+            (TerminalStatus.COMPLETED, _CompletionOutcome.COMPLETED),
+        ],
+    )
+    def test_none_generation_is_fail_closed_only_for_idle(self, status, expected):
+        with (
+            patch(f"{_MODULE}.status_monitor.get_status", return_value=status),
+            patch(f"{_MODULE}.status_monitor.get_status_gen", return_value=None),
+            patch(f"{_MODULE}.time.time", side_effect=[0.0, 0.0, 2.0]),
+            patch(f"{_MODULE}.asyncio.sleep", new=AsyncMock()),
+        ):
+            outcome = asyncio.run(_wait_for_completion("t1", input_gen=7, timeout=1.0))
+        assert outcome == expected
+
+    @pytest.mark.parametrize("gate", ["wait_rule", "retry_exhausted", "unknown_dialog"])
+    def test_nonempty_waiting_gate_requires_user_input(self, gate):
+        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+            wait_results=(True,), final_status=TerminalStatus.WAITING_USER_ANSWER
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output as m_out,
+            exit_cli,
+            wait,
+            status,
+            patch(
+                "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
+                return_value=gate,
+            ),
+            patch(f"{_MODULE}.asyncio.sleep", new=AsyncMock()) as m_sleep,
+        ):
+            with pytest.raises(StepExecutionError) as exc_info:
+                asyncio.run(
+                    run_agent_step(
+                        "kiro_cli", "dev", "x", reuse_terminal_id="reuse99", timeout=3600
+                    )
+                )
+        assert exc_info.value.kind == "waiting_user_input"
+        assert exc_info.value.terminal_id == "reuse99"
+        m_sleep.assert_not_awaited()
+        m_out.assert_not_called()
+
+    def test_empty_waiting_gate_keeps_waiting_until_completed(self):
+        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+            wait_results=(True,), final_status=TerminalStatus.WAITING_USER_ANSWER
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status as m_status,
+            patch(f"{_MODULE}.status_monitor.get_status_gen", return_value=None),
+            patch(
+                "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
+                return_value=None,
+            ),
+            patch(f"{_MODULE}.asyncio.sleep", new=AsyncMock()) as m_sleep,
+        ):
+            m_status.side_effect = [
+                TerminalStatus.WAITING_USER_ANSWER,
+                TerminalStatus.COMPLETED,
+                TerminalStatus.COMPLETED,
+            ]
+            result = asyncio.run(
+                run_agent_step(
+                    "kiro_cli", "dev", "x", reuse_terminal_id="reuse99", timeout=3600
+                )
+            )
+        assert result.status == TerminalStatus.COMPLETED
+        m_sleep.assert_awaited_once()
 
 class TestTeardownIsBestEffort:
     def test_teardown_failure_does_not_fail_successful_step(self):
