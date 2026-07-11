@@ -63,3 +63,6 @@ cao-flows/
 
 # CAO orchestration data plane (briefs, review findings)
 tmp/
+
+# Graphify knowledge-graph output
+graphify-out/

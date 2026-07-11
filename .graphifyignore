@@ -1,0 +1,14 @@
+# Graph scope (2026-07-10): AST on all code; semantic docs only from src/ + repo root.
+# Excludes fixture/aux markdown, media, and non-core doc trees from extraction.
+test/**/*.md
+examples/**/*.md
+web/**/*.md
+cao_mcp_apps/**/*.md
+docs/
+skills/
+.github/
+test/**/*.txt
+examples/**/*.txt
+web/**/*.txt
+cao_mcp_apps/**/*.txt
+cao_mcp_apps/**/*.md
