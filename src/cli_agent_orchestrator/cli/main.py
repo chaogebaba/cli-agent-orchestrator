@@ -20,6 +20,9 @@ from cli_agent_orchestrator.cli.commands.skills import skills
 from cli_agent_orchestrator.cli.commands.terminal import terminal
 from cli_agent_orchestrator.cli.commands.workflow import workflow
 from cli_agent_orchestrator.cli.commands.messages import messages
+from cli_agent_orchestrator.cli.commands.ledger import ledger
+from cli_agent_orchestrator.cli.commands.suite import suite
+from cli_agent_orchestrator.cli.commands.verify import verify
 
 try:
     __version__ = version("cli-agent-orchestrator")
@@ -51,6 +54,9 @@ cli.add_command(session)
 cli.add_command(terminal)
 cli.add_command(workflow)
 cli.add_command(messages)
+cli.add_command(suite)
+cli.add_command(verify)
+cli.add_command(ledger)
 
 
 if __name__ == "__main__":
