@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -26,11 +27,19 @@ _unresolved_warned_lock = threading.Lock()
 
 
 @dataclass(frozen=True, eq=False)
+class TranscriptLiveReference:
+    path: Path
+    inode: int
+    size: int
+
+
+@dataclass(frozen=True, eq=False)
 class TranscriptResolution:
     path: Path
     resolution_kind: Literal["binding", "exact_id", "uuid_glob"]
     inode: int | None = None
     stale_note: str | None = None
+    live_reference: TranscriptLiveReference | None = None
 
     def __eq__(self, other) -> bool:
         if isinstance(other, TranscriptResolution):
@@ -88,6 +97,39 @@ def _binding_path_state(path: Path) -> str | None:
         return "unreadable"
 
 
+def _validate_binding(
+    path: Path, session_id: str | None, *, check_identity: bool
+) -> tuple[str | None, TranscriptLiveReference | None]:
+    """Validate one binding against one descriptor and carry its exact identity."""
+    try:
+        with path.open("rb") as stream:
+            first_line = stream.readline()
+            first = json.loads(first_line) if first_line else {}
+            if check_identity:
+                recorded_session = first.get("sessionId")
+                if recorded_session is not None and recorded_session != session_id:
+                    return "session_mismatch", None
+            found_native = False
+            for raw_line in itertools.chain((first_line,), stream):
+                if not raw_line:
+                    continue
+                record = json.loads(raw_line)
+                if record.get("type") in {"user", "assistant"}:
+                    found_native = True
+                    break
+                message = record.get("message")
+                if isinstance(message, dict) and message.get("role") in {"user", "assistant"}:
+                    found_native = True
+                    break
+            stat = os.fstat(stream.fileno())
+            reference = TranscriptLiveReference(path, stat.st_ino, stat.st_size)
+            return (None, reference) if found_native else ("inert", reference)
+    except FileNotFoundError:
+        return "missing", None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return "unreadable", None
+
+
 def resolve_session_transcript(metadata: dict) -> TranscriptResolution | None:
     provider = metadata.get("provider")
     session_id = metadata.get("provider_session_id")
@@ -97,19 +139,36 @@ def resolve_session_transcript(metadata: dict) -> TranscriptResolution | None:
     screen_fallback = False
     if binding is not None:
         binding_path = Path(binding["transcript_path"])
-        stale_reason = _binding_path_state(binding_path)
+        deferred_inode = binding.get("inode") is None
+        stale_reason, live_reference = _validate_binding(
+            binding_path, binding.get("session_id"), check_identity=deferred_inode
+        )
         if stale_reason is None:
             return TranscriptResolution(
                 binding_path,
                 "binding",
-                inode=int(binding["inode"]),
+                inode=(live_reference.inode if deferred_inode else int(binding["inode"])),
+                live_reference=live_reference,
             )
         stale_note = f"binding_stale:{stale_reason}"
-        excluded.add(binding_path.resolve(strict=False))
-        screen_fallback = True
+        if stale_reason in {"inert", "unreadable"}:
+            excluded.add(binding_path.resolve(strict=False))
+            screen_fallback = True
 
     def candidate(path: Path, kind: Literal["exact_id", "uuid_glob"]):
         resolved = path.resolve(strict=False)
+        if (binding is not None and stale_note in {
+                "binding_stale:missing", "binding_stale:session_mismatch"
+        } and resolved == binding_path.resolve(strict=False)):
+            reason, reference = _validate_binding(
+                binding_path, binding.get("session_id"), check_identity=True
+            )
+            if reason is None:
+                return TranscriptResolution(
+                    binding_path, "binding", inode=reference.inode,
+                    stale_note=stale_note, live_reference=reference,
+                )
+            return None
         if screen_fallback and (
             resolved in excluded or _binding_path_state(path) is not None
         ):
@@ -171,6 +230,17 @@ def transcript_ref(resolution: TranscriptResolution | None) -> dict:
         resolution = TranscriptResolution(resolution, "exact_id")
     path = resolution.path
     try:
+        if resolution.resolution_kind == "binding" and resolution.live_reference is not None:
+            reference = resolution.live_reference
+            evidence = {
+                "path": str(reference.path),
+                "inode": reference.inode,
+                "size": reference.size,
+                "resolution_kind": resolution.resolution_kind,
+            }
+            if resolution.stale_note:
+                evidence["binding_stale"] = resolution.stale_note
+            return evidence
         stat = path.stat()
         evidence = {
             "path": str(path),
@@ -254,7 +324,8 @@ def _native_user_turn_texts(record: dict) -> list[str]:
 
 
 def transcript_lookup(path: Path, payload_hash: str, started_at=None,
-                      expected_ref: dict | None = None) -> tuple[str, dict]:
+                      expected_ref: dict | None = None,
+                      scan_from_start: bool = False) -> tuple[str, dict]:
     """Return hit, absent, or unresolved with bounded continuity evidence."""
     if isinstance(path, TranscriptResolution):
         path = path.path
@@ -269,7 +340,7 @@ def transcript_lookup(path: Path, payload_hash: str, started_at=None,
     except OSError:
         return "unresolved", {"kind": "transcript_unreadable", "path": str(path)}
     try:
-        baseline_size = int((expected_ref or {}).get("size") or 0)
+        baseline_size = 0 if scan_from_start else int((expected_ref or {}).get("size") or 0)
         if baseline_size > len(raw_bytes):
             return "unresolved", {"kind": "transcript_continuity_uncertain", "path": str(path)}
         raw = raw_bytes[baseline_size:].decode("utf-8")
@@ -340,8 +411,28 @@ def confirm_delivery(metadata: dict, payload_hash: str, started_at=None,
             resolution = TranscriptResolution(resolution, "exact_id")
         saw_resolution = True
         path = resolution.path
-        outcome, evidence = transcript_lookup(path, payload_hash, started_at, continuity_ref)
-        last = (outcome, _with_resolution_evidence(evidence, resolution))
+        current_path = continuity_ref.get("path")
+        if (resolution.resolution_kind == "binding" and
+                resolution.live_reference is not None and current_path and
+                Path(current_path) != path):
+            old_path = str(current_path)
+            reference = resolution.live_reference
+            continuity_ref = {
+                "path": str(reference.path), "inode": reference.inode,
+                "size": reference.size,
+            }
+            reseed_evidence = {
+                "continuity_reseed": "binding_epoch",
+                "continuity_reseed_old_path": old_path,
+                "continuity_reseed_new_path": str(reference.path),
+            }
+        else:
+            reseed_evidence = {}
+        outcome, evidence = transcript_lookup(
+            path, payload_hash, started_at, continuity_ref,
+            scan_from_start=bool(reseed_evidence),
+        )
+        last = (outcome, _with_resolution_evidence({**evidence, **reseed_evidence}, resolution))
         if last[0] == "hit":
             return last
         if last[0] == "absent":

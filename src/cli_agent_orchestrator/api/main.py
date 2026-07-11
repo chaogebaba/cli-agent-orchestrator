@@ -1348,15 +1348,18 @@ async def bind_transcript(
         if not candidate_real.startswith(base_real + os.sep):
             raise ValueError("transcript path is outside ~/.claude/projects")
         candidate = Path(candidate_real)
-        if not candidate.is_file():
-            raise ValueError("transcript path is not an existing regular file")
-        if not os.access(candidate, os.R_OK):
-            raise ValueError("transcript path is unreadable")
+        inode = None
+        if candidate.exists():
+            if not candidate.is_file():
+                raise ValueError("transcript path is not an existing regular file")
+            if not os.access(candidate, os.R_OK):
+                raise ValueError("transcript path is unreadable")
+            inode = candidate.stat().st_ino
         row = create_transcript_binding(
             terminal_id,
             body.session_id,
             candidate_real,
-            candidate.stat().st_ino,
+            inode,
             body.source,
         )
         return {"success": True, "binding": row}

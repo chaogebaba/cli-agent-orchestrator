@@ -26,7 +26,7 @@ class TestTranscriptBindingEndpoint:
         assert response.status_code == 200
         assert create.call_args.args[3] == transcript.stat().st_ino
 
-    @pytest.mark.parametrize("case", ["mismatch", "outside", "missing"])
+    @pytest.mark.parametrize("case", ["mismatch", "outside"])
     def test_binding_rejections_are_route_local_400(self, client, tmp_path, case):
         projects = tmp_path / ".claude" / "projects"
         projects.mkdir(parents=True)
@@ -43,6 +43,41 @@ class TestTranscriptBindingEndpoint:
             response = client.post("/terminals/abcd1234/transcript-binding", json=payload)
         assert response.status_code == 400
         assert response.json()["detail"].startswith("invalid_transcript_binding:")
+        create.assert_not_called()
+
+    def test_binding_contained_missing_path_stores_null_inode(self, client, tmp_path):
+        path = tmp_path / ".claude" / "projects" / "repo" / "missing.jsonl"
+        path.parent.mkdir(parents=True)
+        payload = {"terminal_id": "abcd1234", "session_id": "s",
+                   "transcript_path": str(path), "source": "startup"}
+        with patch("cli_agent_orchestrator.api.main.Path.home", return_value=tmp_path), \
+             patch("cli_agent_orchestrator.api.main.get_terminal_metadata",
+                   return_value={"id": "abcd1234"}), \
+             patch("cli_agent_orchestrator.api.main.create_transcript_binding",
+                   return_value={"id": 1, "inode": None}) as create:
+            response = client.post("/terminals/abcd1234/transcript-binding", json=payload)
+        assert response.status_code == 200
+        assert create.call_args.args[3] is None
+
+    @pytest.mark.parametrize("case", ["non_regular", "unreadable"])
+    def test_binding_existing_invalid_file_remains_400(self, client, tmp_path, case):
+        path = tmp_path / ".claude" / "projects" / "repo" / "session.jsonl"
+        if case == "non_regular":
+            path.mkdir(parents=True)
+        else:
+            path.parent.mkdir(parents=True)
+            path.write_text("{}\n", encoding="utf-8")
+        payload = {"terminal_id": "abcd1234", "session_id": "s",
+                   "transcript_path": str(path), "source": "startup"}
+        access = patch("cli_agent_orchestrator.api.main.os.access", return_value=False)
+        context = access if case == "unreadable" else patch(
+            "cli_agent_orchestrator.api.main.os.access", wraps=__import__("os").access)
+        with patch("cli_agent_orchestrator.api.main.Path.home", return_value=tmp_path), \
+             patch("cli_agent_orchestrator.api.main.get_terminal_metadata",
+                   return_value={"id": "abcd1234"}), context, \
+             patch("cli_agent_orchestrator.api.main.create_transcript_binding") as create:
+            response = client.post("/terminals/abcd1234/transcript-binding", json=payload)
+        assert response.status_code == 400
         create.assert_not_called()
 
     def test_binding_unknown_terminal_is_404(self, client):

@@ -82,7 +82,7 @@ class TranscriptBindingModel(Base):
     terminal_id = Column(String, nullable=False)
     session_id = Column(String, nullable=False)
     transcript_path = Column(Text, nullable=False)
-    inode = Column(Integer, nullable=False)
+    inode = Column(Integer, nullable=True)
     source = Column(String, nullable=False)
     received_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
     __table_args__ = (
@@ -259,6 +259,7 @@ def init_db() -> None:
     """Initialize database tables and apply schema migrations."""
     _migrate_project_aliases_schema()
     Base.metadata.create_all(bind=engine)
+    _migrate_transcript_bindings_inode_nullable()
     _migrate_provider_sessions_status()
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
@@ -314,6 +315,44 @@ def _migrate_provider_sessions_status() -> None:
             text(
                 "CREATE UNIQUE INDEX uq_provider_sessions_ready ON provider_sessions (name) "
                 "WHERE status = 'ready'"
+            )
+        )
+
+
+def _migrate_transcript_bindings_inode_nullable() -> None:
+    """Rebuild the r4 table so startup bindings may defer inode discovery."""
+    from sqlalchemy import text
+
+    with engine.begin() as connection:
+        columns = connection.execute(
+            text("PRAGMA table_info(transcript_bindings)")
+        ).mappings().all()
+        inode = next((column for column in columns if column["name"] == "inode"), None)
+        if inode is None or not inode["notnull"]:
+            return
+        connection.execute(
+            text(
+                "CREATE TABLE transcript_bindings_new ("
+                "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
+                "terminal_id VARCHAR NOT NULL, session_id VARCHAR NOT NULL, "
+                "transcript_path TEXT NOT NULL, inode INTEGER, source VARCHAR NOT NULL, "
+                "received_at DATETIME NOT NULL)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO transcript_bindings_new "
+                "(id, terminal_id, session_id, transcript_path, inode, source, received_at) "
+                "SELECT id, terminal_id, session_id, transcript_path, inode, source, received_at "
+                "FROM transcript_bindings"
+            )
+        )
+        connection.execute(text("DROP TABLE transcript_bindings"))
+        connection.execute(text("ALTER TABLE transcript_bindings_new RENAME TO transcript_bindings"))
+        connection.execute(
+            text(
+                "CREATE INDEX ix_transcript_bindings_terminal_received "
+                "ON transcript_bindings (terminal_id, received_at, id)"
             )
         )
 
@@ -785,7 +824,7 @@ def create_transcript_binding(
     terminal_id: str,
     session_id: str,
     transcript_path: str,
-    inode: int,
+    inode: int | None,
     source: str,
 ) -> Dict[str, Any]:
     """Append a server-timestamped transcript binding epoch."""

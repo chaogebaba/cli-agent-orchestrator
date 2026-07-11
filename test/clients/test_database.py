@@ -76,6 +76,62 @@ class TestTerminalOperations:
 
 
 class TestMessageTraceTransactions:
+    def test_transcript_binding_nullable_inode_migration_is_idempotent(
+        self, tmp_path, monkeypatch
+    ):
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        migration_engine = create_engine(f"sqlite:///{tmp_path / 'r4.db'}")
+        with migration_engine.begin() as connection:
+            connection.execute(text(
+                "CREATE TABLE transcript_bindings ("
+                "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, terminal_id VARCHAR NOT NULL, "
+                "session_id VARCHAR NOT NULL, transcript_path TEXT NOT NULL, "
+                "inode INTEGER NOT NULL, source VARCHAR NOT NULL, received_at DATETIME NOT NULL)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX ix_transcript_bindings_terminal_received "
+                "ON transcript_bindings (terminal_id, received_at, id)"
+            ))
+            connection.execute(text(
+                "INSERT INTO transcript_bindings VALUES "
+                "(7, 'term', 'session', '/path', 1234, 'resume', '2026-07-11 12:00:00')"
+            ))
+        monkeypatch.setattr(db_mod, "engine", migration_engine)
+        db_mod._migrate_transcript_bindings_inode_nullable()
+        with migration_engine.begin() as connection:
+            connection.execute(text(
+                "INSERT INTO transcript_bindings "
+                "(terminal_id, session_id, transcript_path, inode, source, received_at) "
+                "VALUES ('term', 'next', '/next', NULL, 'startup', '2026-07-11 12:01:00')"
+            ))
+            before_rows = connection.execute(text(
+                "SELECT * FROM transcript_bindings ORDER BY id"
+            )).all()
+            before_schema = connection.execute(text(
+                "SELECT type, name, sql FROM sqlite_master WHERE "
+                "tbl_name='transcript_bindings' ORDER BY type, name"
+            )).all()
+            inode = next(row for row in connection.execute(text(
+                "PRAGMA table_info(transcript_bindings)"
+            )).mappings() if row["name"] == "inode")
+        assert before_rows[0] == (7, "term", "session", "/path", 1234,
+                                  "resume", "2026-07-11 12:00:00")
+        assert inode["notnull"] == 0
+        assert any(row[1] == "ix_transcript_bindings_terminal_received"
+                   for row in before_schema)
+        db_mod._migrate_transcript_bindings_inode_nullable()
+        with migration_engine.connect() as connection:
+            after_rows = connection.execute(text(
+                "SELECT * FROM transcript_bindings ORDER BY id"
+            )).all()
+            after_schema = connection.execute(text(
+                "SELECT type, name, sql FROM sqlite_master WHERE "
+                "tbl_name='transcript_bindings' ORDER BY type, name"
+            )).all()
+        assert after_rows == before_rows
+        assert after_schema == before_schema
+
     def test_transcript_binding_epochs_append_and_tie_break_by_id(
         self, test_db, monkeypatch
     ):
