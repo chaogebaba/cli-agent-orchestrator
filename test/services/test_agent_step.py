@@ -7,6 +7,7 @@ success.
 """
 
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -92,11 +93,47 @@ class TestHappyPath:
         m_delete.assert_not_called()
         m_exit.assert_not_called()
 
-    def test_reuse_terminal_skips_create_and_delete(self):
-        # Reuse: only ONE wait (completion); no readiness wait, no create/delete.
+    def test_teardown_false_cancelled_skips_delete(self):
+        signal = asyncio.Event()
+        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
+
+        async def _cancel(*args, **kwargs):
+            signal.set()
+            return _CompletionOutcome.CANCELLED
+
+        with (
+            create,
+            send,
+            delete as m_delete,
+            get_output,
+            exit_cli as m_exit,
+            wait,
+            status,
+            patch(f"{_MODULE}._wait_for_completion", new=AsyncMock(side_effect=_cancel)),
+        ):
+            with pytest.raises(StepExecutionError) as exc_info:
+                asyncio.run(
+                    run_agent_step(
+                        "kiro_cli", "dev", "x", teardown=False, cancel_signal=signal
+                    )
+                )
+        assert exc_info.value.kind == "cancelled"
+        m_delete.assert_not_called()
+        m_exit.assert_not_called()
+
+    @pytest.mark.parametrize("cancelled", [False, True])
+    def test_reuse_terminal_skips_create_and_delete(self, cancelled):
         create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
             wait_results=(True,)
         )
+        signal = asyncio.Event()
+        outcome = _CompletionOutcome.CANCELLED if cancelled else _CompletionOutcome.COMPLETED
+
+        async def _completion(*args, **kwargs):
+            if cancelled:
+                signal.set()
+            return outcome
+
         with (
             create as m_create,
             send as m_send,
@@ -105,11 +142,28 @@ class TestHappyPath:
             exit_cli as m_exit,
             wait,
             status,
+            patch(
+                f"{_MODULE}._wait_for_completion",
+                new=AsyncMock(side_effect=_completion),
+            ),
         ):
-            result = asyncio.run(
-                run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99")
-            )
-        assert result.terminal_id == "reuse99"
+            if cancelled:
+                with pytest.raises(StepExecutionError) as exc_info:
+                    asyncio.run(
+                        run_agent_step(
+                            "kiro_cli",
+                            "dev",
+                            "x",
+                            reuse_terminal_id="reuse99",
+                            cancel_signal=signal,
+                        )
+                    )
+                assert exc_info.value.kind == "cancelled"
+            else:
+                result = asyncio.run(
+                    run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99")
+                )
+                assert result.terminal_id == "reuse99"
         m_create.assert_not_awaited()
         m_delete.assert_not_called()
         # A reused terminal is owned by the caller — no graceful exit either.
@@ -239,24 +293,44 @@ class TestFailureRaises:
             wait_results=(True,),
             final_status=TerminalStatus.PROCESSING,
         )
-        with create, send, delete, get_output, exit_cli, wait, status:
+        with (
+            create,
+            send,
+            delete as m_delete,
+            get_output,
+            exit_cli as m_exit,
+            wait,
+            status,
+        ):
             with pytest.raises(StepExecutionError, match="did not complete") as exc_info:
                 asyncio.run(run_agent_step("kiro_cli", "dev", "x", timeout=0))
         # Timeout (ran long), with the live terminal carried structurally.
         assert exc_info.value.kind == "timeout"
         assert exc_info.value.terminal_id == "abc12345"
+        m_exit.assert_not_called()
+        m_delete.assert_not_called()
 
     def test_readiness_timeout_raises(self):
         create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
             wait_results=(False,),  # readiness times out before any input
         )
-        with create, send as m_send, delete, get_output, exit_cli, wait, status:
+        with (
+            create,
+            send as m_send,
+            delete as m_delete,
+            get_output,
+            exit_cli as m_exit,
+            wait,
+            status,
+        ):
             with pytest.raises(StepExecutionError, match="ready status") as exc_info:
                 asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
         # Fail-fast: no prompt sent if the terminal never became ready.
         m_send.assert_not_called()
         assert exc_info.value.kind == "timeout"
         assert exc_info.value.terminal_id == "abc12345"
+        m_exit.assert_not_called()
+        m_delete.assert_not_called()
 
     def test_error_fails_fast_with_error_kind(self):
         """ERROR fails immediately rather than burning the nominal timeout."""
@@ -315,6 +389,29 @@ class TestFailureRaises:
 
 
 class TestTypedCompletionWait:
+    @pytest.mark.asyncio
+    async def test_cancel_interrupts_completion_wait_within_two_polls(self):
+        signal = asyncio.Event()
+        polls = 0
+
+        def _status(_terminal_id):
+            nonlocal polls
+            polls += 1
+            if polls == 1:
+                signal.set()
+            return TerminalStatus.PROCESSING
+
+        with patch(f"{_MODULE}.status_monitor.get_status", side_effect=_status):
+            outcome = await _wait_for_completion(
+                "t1",
+                input_gen=1,
+                timeout=60,
+                polling_interval=0,
+                cancel_signal=signal,
+            )
+        assert outcome == _CompletionOutcome.CANCELLED
+        assert polls <= 2
+
     def test_stale_idle_redraw_is_not_admitted(self):
         with (
             patch(f"{_MODULE}.status_monitor.get_status", return_value=TerminalStatus.IDLE),
@@ -403,6 +500,211 @@ class TestTypedCompletionWait:
             )
         assert result.status == TerminalStatus.COMPLETED
         m_sleep.assert_awaited_once()
+
+
+class TestCancellationPhaseTable:
+    @pytest.mark.parametrize(
+        ("case", "should_cleanup"),
+        [
+            ("pre_readiness", False),
+            ("success", True),
+            ("cancelled", True),
+            ("timeout", False),
+            ("error", False),
+            ("waiting_user_input", False),
+            ("input_blocked", False),
+            ("send_raw", False),
+            ("extraction_raw", False),
+        ],
+    )
+    def test_owned_terminal_phase_table(self, case, should_cleanup):
+        ready = case != "pre_readiness"
+        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+            wait_results=(ready,)
+        )
+        outcome = {
+            "success": _CompletionOutcome.COMPLETED,
+            "cancelled": _CompletionOutcome.CANCELLED,
+            "timeout": _CompletionOutcome.TIMEOUT,
+            "error": _CompletionOutcome.ERROR,
+            "waiting_user_input": _CompletionOutcome.WAITING_USER,
+            "input_blocked": _CompletionOutcome.COMPLETED,
+            "send_raw": _CompletionOutcome.COMPLETED,
+            "extraction_raw": _CompletionOutcome.COMPLETED,
+            "pre_readiness": _CompletionOutcome.COMPLETED,
+        }[case]
+        raw = RuntimeError(f"raw-{case}")
+        with (
+            create,
+            send as m_send,
+            delete as m_delete,
+            get_output as m_output,
+            exit_cli as m_exit,
+            wait,
+            status,
+            patch(f"{_MODULE}._wait_for_completion", new=AsyncMock(return_value=outcome)),
+        ):
+            if case == "input_blocked":
+                m_send.side_effect = TerminalInputBlockedError("blocked")
+            elif case == "send_raw":
+                m_send.side_effect = raw
+            elif case == "extraction_raw":
+                m_output.side_effect = raw
+
+            if case == "success":
+                result = asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
+                assert result.status == TerminalStatus.COMPLETED
+            else:
+                expected = (
+                    RuntimeError
+                    if case in {"send_raw", "extraction_raw"}
+                    else StepExecutionError
+                )
+                with pytest.raises(expected) as exc_info:
+                    asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
+                if case in {"send_raw", "extraction_raw"}:
+                    assert exc_info.value is raw
+
+        assert m_exit.call_count == int(should_cleanup)
+        assert m_delete.call_count == int(should_cleanup)
+
+    def test_cancel_before_send_skips_send_and_extraction(self):
+        signal = asyncio.Event()
+        signal.set()
+        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
+        with (
+            create,
+            send as m_send,
+            delete as m_delete,
+            get_output as m_output,
+            exit_cli as m_exit,
+            wait,
+            status,
+        ):
+            with pytest.raises(StepExecutionError) as exc_info:
+                asyncio.run(run_agent_step("kiro_cli", "dev", "x", cancel_signal=signal))
+        assert exc_info.value.kind == "cancelled"
+        m_send.assert_not_called()
+        m_output.assert_not_called()
+        m_exit.assert_called_once()
+        m_delete.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("phase", ["send", "extraction"])
+    async def test_cancel_during_failing_io_normalizes_and_tears_down(self, phase):
+        signal = asyncio.Event()
+        started = threading.Event()
+        release = threading.Event()
+        raw = RuntimeError(f"{phase} failed")
+        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
+
+        def _block_then_raise(*args, **kwargs):
+            started.set()
+            release.wait(timeout=5)
+            raise raw
+
+        with (
+            create,
+            send as m_send,
+            delete as m_delete,
+            get_output as m_output,
+            exit_cli as m_exit,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}._wait_for_completion",
+                new=AsyncMock(return_value=_CompletionOutcome.COMPLETED),
+            ),
+        ):
+            (m_send if phase == "send" else m_output).side_effect = _block_then_raise
+            task = asyncio.create_task(
+                run_agent_step("kiro_cli", "dev", "x", cancel_signal=signal)
+            )
+            assert await asyncio.to_thread(started.wait, 5)
+            signal.set()
+            release.set()
+            with pytest.raises(StepExecutionError) as exc_info:
+                await task
+
+        assert exc_info.value.kind == "cancelled"
+        assert exc_info.value.__cause__ is raw
+        m_exit.assert_called_once()
+        m_delete.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_blocked_send_normalizes_and_tears_down(self):
+        signal = asyncio.Event()
+        started = threading.Event()
+        release = threading.Event()
+        blocked = TerminalInputBlockedError("input blocked")
+        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
+
+        def _block_then_raise(*args, **kwargs):
+            started.set()
+            release.wait(timeout=5)
+            raise blocked
+
+        with (
+            create,
+            send as m_send,
+            delete as m_delete,
+            get_output,
+            exit_cli as m_exit,
+            wait,
+            status,
+        ):
+            m_send.side_effect = _block_then_raise
+            task = asyncio.create_task(
+                run_agent_step("kiro_cli", "dev", "x", cancel_signal=signal)
+            )
+            assert await asyncio.to_thread(started.wait, 5)
+            signal.set()
+            release.set()
+            with pytest.raises(StepExecutionError) as exc_info:
+                await task
+
+        assert exc_info.value.kind == "cancelled"
+        assert exc_info.value.__cause__ is blocked
+        m_exit.assert_called_once()
+        m_delete.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_extraction_success_wins_concurrent_cancel(self):
+        signal = asyncio.Event()
+        started = threading.Event()
+        release = threading.Event()
+        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
+
+        def _block_then_succeed(*args, **kwargs):
+            started.set()
+            release.wait(timeout=5)
+            return "finished"
+
+        with (
+            create,
+            send,
+            delete as m_delete,
+            get_output as m_output,
+            exit_cli as m_exit,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}._wait_for_completion",
+                new=AsyncMock(return_value=_CompletionOutcome.COMPLETED),
+            ),
+        ):
+            m_output.side_effect = _block_then_succeed
+            task = asyncio.create_task(
+                run_agent_step("kiro_cli", "dev", "x", cancel_signal=signal)
+            )
+            assert await asyncio.to_thread(started.wait, 5)
+            signal.set()
+            release.set()
+            result = await task
+
+        assert result.last_message == "finished"
+        m_exit.assert_called_once()
+        m_delete.assert_called_once()
 
 class TestTeardownIsBestEffort:
     def test_teardown_failure_does_not_fail_successful_step(self):

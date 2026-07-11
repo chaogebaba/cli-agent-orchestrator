@@ -256,8 +256,8 @@ def test_is_resumable_for_tier_cancelled_script_resumable():
     assert _is_resumable_for_tier(_row("cancelled", "script")) is True
 
 
-def test_is_resumable_for_tier_cancelled_yaml_not_resumable():
-    assert _is_resumable_for_tier(_row("cancelled", "yaml")) is False
+def test_is_resumable_for_tier_cancelled_yaml_resumable():
+    assert _is_resumable_for_tier(_row("cancelled", "yaml")) is True
 
 
 def test_is_resumable_for_tier_failed_resumable_both_tiers():

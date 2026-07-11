@@ -11,6 +11,8 @@ no-secret-leak), and the reserved seams raising ``NotBuiltYetError``.
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from typing import List
 from unittest.mock import AsyncMock
 
@@ -44,10 +46,12 @@ def _clean_registry(tmp_path, monkeypatch: pytest.MonkeyPatch):
     )
     ws.run_registry.clear()
     ws._active_drives.clear()
+    ws._cancel_recovery_tasks.clear()
     ws.step_output_store._store.clear()
     yield
     ws.run_registry.clear()
     ws._active_drives.clear()
+    ws._cancel_recovery_tasks.clear()
     ws.step_output_store._store.clear()
 
 
@@ -159,9 +163,11 @@ async def test_trace_c_reprompt_then_crash_consumes_attempt(monkeypatch):
     """Trace C: attempt1 COMPLETED+invalid -> reprompt RAISES -> consumes attempt;
     attempt2 COMPLETED, reprompted already -> COMPLETED_UNVALIDATED."""
     calls = {"n": 0}
+    signals = []
 
     async def _side(*a, **kw):
         calls["n"] += 1
+        signals.append(kw["cancel_signal"])
         run_id = kw["env_vars"]["CAO_WORKFLOW_RUN_ID"]
         step_id = kw["env_vars"]["CAO_WORKFLOW_STEP_ID"]
         if calls["n"] == 1:
@@ -179,6 +185,7 @@ async def test_trace_c_reprompt_then_crash_consumes_attempt(monkeypatch):
     assert res.state == RunState.COMPLETED
     assert res.steps[0].state == StepState.COMPLETED_UNVALIDATED
     assert res.steps[0].attempts == 2  # reprompt crash consumed an attempt
+    assert len(signals) == 3 and signals[0] is signals[1] is signals[2]
 
 
 @pytest.mark.asyncio
@@ -186,7 +193,10 @@ async def test_trace_d_schema_never_met(monkeypatch):
     """Trace D: COMPLETED+invalid, reprompt OK but still invalid -> UNVALIDATED,
     one attempt (the reprompt is the inner loop, not a retry)."""
 
+    signals = []
+
     async def _side(*a, **kw):
+        signals.append(kw["cancel_signal"])
         run_id = kw["env_vars"]["CAO_WORKFLOW_RUN_ID"]
         step_id = kw["env_vars"]["CAO_WORKFLOW_STEP_ID"]
         _put_invalid(run_id, step_id)
@@ -198,18 +208,23 @@ async def test_trace_d_schema_never_met(monkeypatch):
     assert res.state == RunState.COMPLETED
     assert res.steps[0].state == StepState.COMPLETED_UNVALIDATED
     assert res.steps[0].attempts == 1
+    assert len(signals) == 2 and signals[0] is signals[1]
 
 
 @pytest.mark.asyncio
 async def test_trace_d_missing_after_reprompt_is_unvalidated_not_failure(monkeypatch):
     """Decision note D1: a MISSING return after the reprompt is == invalid ->
     COMPLETED_UNVALIDATED, NOT a failure (never raises through B3-BR-4)."""
-    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    mock = AsyncMock(return_value=_ok())
+    monkeypatch.setattr(ws, "run_agent_step", mock)
     # Never put anything into the store -> record stays missing.
     res = await ws.start_run(_spec(schema=_SCHEMA), {}, "runDm")
     assert res.state == RunState.COMPLETED
     assert res.steps[0].state == StepState.COMPLETED_UNVALIDATED
     assert res.steps[0].attempts == 1
+    assert mock.await_count == 2
+    first, second = [call.kwargs["cancel_signal"] for call in mock.await_args_list]
+    assert first is second
 
 
 @pytest.mark.asyncio
@@ -474,25 +489,126 @@ def test_substitute_no_eval_of_input_value():
 # cancel_run
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_cancel_at_boundary_skips_remaining(monkeypatch):
-    """Cancel observed at a step boundary -> CANCELLED + remaining PENDING SKIPPED."""
+async def test_cancel_interrupts_inflight_step_and_skips_remaining(monkeypatch):
+    seen_states = []
 
     async def _side(*a, **kw):
-        # Cancel the run while step s1 is "in flight" so the flag is seen at the
-        # NEXT boundary.
+        signal = kw["cancel_signal"]
         ws.cancel_run("runCancel")
-        return _ok()
+        seen_states.append(ws.get_run_status("runCancel").state)
+        assert signal.is_set()
+        raise StepExecutionError("cancelled", kind="cancelled", terminal_id="tc")
 
-    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    mock = AsyncMock(side_effect=_side)
+    monkeypatch.setattr(ws, "run_agent_step", mock)
     steps = [
         WorkflowStep(id="s1", provider="p", agent="g", prompt="a"),
         WorkflowStep(id="s2", provider="p", agent="g", prompt="b"),
     ]
     res = await ws.start_run(_spec(steps=steps), {}, "runCancel")
     assert res.state == RunState.CANCELLED
+    assert seen_states == [RunState.CANCELLING]
     states = {s.id: s.state for s in res.steps}
-    assert states["s1"] == StepState.COMPLETED  # in-flight step ran to completion
+    assert states["s1"] == StepState.CANCELLED
     assert states["s2"] == StepState.SKIPPED
+    assert mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_step_success_keeps_completed_step(monkeypatch):
+    async def _side(*a, **kw):
+        ws.cancel_run("runCancelDone")
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    result = await ws.start_run(_spec(), {}, "runCancelDone")
+    assert result.state == RunState.CANCELLED
+    assert result.steps[0].state == StepState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_second_cancel_while_cancelling_is_idempotent(monkeypatch):
+    async def _side(*a, **kw):
+        ws.cancel_run("runTwice")
+        first_task = ws.run_registry["runTwice"].cancelling_journal_task
+        ws.cancel_run("runTwice")
+        assert ws.run_registry["runTwice"].cancelling_journal_task is first_task
+        raise StepExecutionError("cancelled", kind="cancelled", terminal_id="tc")
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    result = await ws.start_run(_spec(), {}, "runTwice")
+    assert result.state == RunState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_cancel_plus_flaky_step_does_not_retry(monkeypatch):
+    async def _side(*a, **kw):
+        ws.cancel_run("runFlakyCancel")
+        raise StepExecutionError("flaky failure", kind="error", terminal_id="tf")
+
+    mock = AsyncMock(side_effect=_side)
+    monkeypatch.setattr(ws, "run_agent_step", mock)
+    result = await ws.start_run(_spec(retries=3), {}, "runFlakyCancel")
+    assert result.state == RunState.CANCELLED
+    assert result.steps[0].state == StepState.CANCELLED
+    assert mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_last_step_cancel_cannot_finalize_completed(monkeypatch):
+    async def _side(*a, **kw):
+        ws.cancel_run("runLastCancel")
+        raise StepExecutionError("cancelled", kind="cancelled", terminal_id="tl")
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    result = await ws.start_run(_spec(), {}, "runLastCancel")
+    record = ws.run_registry["runLastCancel"]
+    assert result.state == RunState.CANCELLED
+    assert result.steps[0].state == StepState.CANCELLED
+    assert record.current_step_id is None
+    assert record.finished_at is not None
+
+
+@pytest.mark.asyncio
+async def test_delayed_cancelling_write_precedes_final_cancelled(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    writes = []
+
+    def _delayed(run_id, state, finished_at):
+        if state == RunState.CANCELLING.value:
+            started.set()
+            release.wait(timeout=5)
+        writes.append(state)
+
+    async def _side(*a, **kw):
+        ws.cancel_run("runJournalRace")
+        raise StepExecutionError("cancelled", kind="cancelled", terminal_id="tj")
+
+    monkeypatch.setattr(ws.workflow_journal, "update_run_state", _delayed)
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    drive = asyncio.create_task(ws.start_run(_spec(), {}, "runJournalRace"))
+    assert await asyncio.to_thread(started.wait, 5)
+    release.set()
+    result = await drive
+
+    assert result.state == RunState.CANCELLED
+    assert writes[-2:] == [RunState.CANCELLING.value, RunState.CANCELLED.value]
+
+
+@pytest.mark.asyncio
+async def test_cancel_signal_lifecycle_cleared_after_drive(monkeypatch):
+    seen = []
+
+    async def _side(*a, **kw):
+        seen.append(kw["cancel_signal"])
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    await ws.start_run(_spec(), {}, "runSignal")
+    assert len(seen) == 1 and not seen[0].is_set()
+    assert ws.run_registry["runSignal"].cancel_signal is None
+    assert "runSignal" not in ws._active_drives
 
 
 def test_cancel_unknown_run_404():

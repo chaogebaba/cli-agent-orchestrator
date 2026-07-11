@@ -28,6 +28,7 @@ class StepState(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
     SKIPPED = "skipped"
     COMPLETED_UNVALIDATED = "completed_unvalidated"
 
@@ -37,11 +38,12 @@ class RunState(str, Enum):
 
     Lives in this light module (re-exported by ``models/workflow.py``) so the MCP
     seam can name a run state without pulling the jsonschema/yaml grammar module.
-    Bolt 3 adds ``CANCELLED`` (B3-BR-12) so a user-cancelled run is distinguishable
-    from an engine-``FAILED`` run. Additive enum change — no existing value altered.
+    ``CANCELLING`` exposes an acknowledged cancel request while the owned step
+    tears down; ``CANCELLED`` is the settled terminal state.
     """
 
     RUNNING = "running"
+    CANCELLING = "cancelling"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"

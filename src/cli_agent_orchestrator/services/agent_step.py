@@ -62,12 +62,15 @@ async def _wait_for_completion(
     input_gen: int,
     timeout: float,
     polling_interval: float = 1.0,
+    cancel_signal: Optional[asyncio.Event] = None,
 ) -> _CompletionOutcome:
     """Poll the in-process monitor for a post-input terminal outcome."""
     from cli_agent_orchestrator.services.auto_responder import auto_responder
 
     start = time.time()
     while time.time() - start < timeout:
+        if cancel_signal is not None and cancel_signal.is_set():
+            return _CompletionOutcome.CANCELLED
         current = status_monitor.get_status(terminal_id)
         if current == TerminalStatus.ERROR:
             return _CompletionOutcome.ERROR
@@ -83,7 +86,25 @@ async def _wait_for_completion(
             if status_gen is not None and status_gen >= input_gen:
                 return _CompletionOutcome.IDLE_DONE
         await asyncio.sleep(polling_interval)
+    if cancel_signal is not None and cancel_signal.is_set():
+        return _CompletionOutcome.CANCELLED
     return _CompletionOutcome.TIMEOUT
+
+
+async def _teardown_terminal(terminal_id: str, registry: Optional[PluginRegistry]) -> None:
+    """Best-effort exit-then-delete for a terminal owned by this step."""
+    try:
+        await asyncio.to_thread(terminal_service.exit_terminal_cli, terminal_id)
+    except Exception as exc:  # noqa: BLE001 - teardown is best-effort
+        logger.warning(
+            "run_agent_step: failed to send graceful exit to terminal %s before teardown: %s",
+            terminal_id,
+            exc,
+        )
+    try:
+        await asyncio.to_thread(terminal_service.delete_terminal, terminal_id, registry=registry)
+    except Exception as exc:  # noqa: BLE001 - teardown is best-effort
+        logger.warning("run_agent_step: failed to tear down terminal %s: %s", terminal_id, exc)
 
 
 class StepExecutionError(Exception):
@@ -129,6 +150,7 @@ async def run_agent_step(
     registry: Optional[PluginRegistry] = None,
     env_vars: Optional[dict[str, str]] = None,
     on_terminal_created: Optional[Callable[[str], None]] = None,
+    cancel_signal: Optional[asyncio.Event] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -192,6 +214,10 @@ async def run_agent_step(
             reused terminal (the caller already owns it). A callback exception is
             logged and swallowed — recording a terminal for the sweep must never
             fail the step. Default None = behavior unchanged.
+        cancel_signal: Optional same-loop cooperative cancellation signal. It is
+            checked before send, during the completion poll, and before extraction.
+            Synchronous send/extraction already running in ``to_thread`` cannot be
+            force-cancelled; cancellation is classified when that call returns.
 
     Returns:
         ``AgentStepResult`` with status COMPLETED — ONLY on success.
@@ -264,123 +290,139 @@ async def run_agent_step(
             )
 
     assert terminal_id is not None  # for type-checkers: set in both branches
-
-    # Send the prompt. send_input is synchronous tmux I/O (bracketed paste +
-    # key sends); run it off the event loop so a slow tmux call cannot freeze
-    # the whole server for other requests (same hazard as issue #382, which was
-    # only fixed for DELETE /sessions). Any failure raises and propagates.
+    cleanup = False
+    extraction_succeeded = False
     try:
-        await asyncio.to_thread(
-            terminal_service.send_input,
-            terminal_id,
-            prompt,
-            orchestration_type=OrchestrationType.HANDOFF,
-        )
-    except TerminalInputBlockedError as exc:
-        current = status_monitor.get_status(terminal_id)
-        status_value = current.value if hasattr(current, "value") else str(current)
-        raise StepExecutionError(
-            f"terminal {terminal_id} is waiting on a dialog (status={status_value}); input blocked",
-            kind="input_blocked",
-            terminal_id=terminal_id,
-        ) from exc
-    # A concurrent input event between send and this read only makes the wait
-    # stricter; it cannot admit a stale completion.
-    input_gen = status_monitor.get_input_gen(terminal_id)
+        if cancel_signal is not None and cancel_signal.is_set():
+            cleanup = True
+            raise StepExecutionError(
+                f"step on terminal {terminal_id} was cancelled",
+                kind="cancelled",
+                terminal_id=terminal_id,
+            )
 
-    # Wait in-process: COMPLETED retains FX11's event-inbox None-generation
-    # bypass, while IDLE requires concrete proof that PROCESSING occurred for
-    # this input generation. The reserved CANCELLED outcome is consumed by FX14b.
-    outcome = await _wait_for_completion(terminal_id, input_gen=input_gen, timeout=timeout)
-    if outcome == _CompletionOutcome.ERROR:
-        raise StepExecutionError(
-            f"terminal {terminal_id} reached ERROR status",
-            kind="error",
-            terminal_id=terminal_id,
+        try:
+            await asyncio.to_thread(
+                terminal_service.send_input,
+                terminal_id,
+                prompt,
+                orchestration_type=OrchestrationType.HANDOFF,
+            )
+        except TerminalInputBlockedError as exc:
+            if cancel_signal is not None and cancel_signal.is_set():
+                cleanup = True
+                raise StepExecutionError(
+                    f"step on terminal {terminal_id} was cancelled during send",
+                    kind="cancelled",
+                    terminal_id=terminal_id,
+                ) from exc
+            current = status_monitor.get_status(terminal_id)
+            status_value = current.value if hasattr(current, "value") else str(current)
+            raise StepExecutionError(
+                f"terminal {terminal_id} is waiting on a dialog "
+                f"(status={status_value}); input blocked",
+                kind="input_blocked",
+                terminal_id=terminal_id,
+            ) from exc
+        except Exception as exc:
+            if cancel_signal is not None and cancel_signal.is_set():
+                cleanup = True
+                raise StepExecutionError(
+                    f"step on terminal {terminal_id} was cancelled during send",
+                    kind="cancelled",
+                    terminal_id=terminal_id,
+                ) from exc
+            raise
+
+        if cancel_signal is not None and cancel_signal.is_set():
+            cleanup = True
+            raise StepExecutionError(
+                f"step on terminal {terminal_id} was cancelled",
+                kind="cancelled",
+                terminal_id=terminal_id,
+            )
+
+        input_gen = status_monitor.get_input_gen(terminal_id)
+        outcome = await _wait_for_completion(
+            terminal_id,
+            input_gen=input_gen,
+            timeout=timeout,
+            cancel_signal=cancel_signal,
         )
-    if outcome == _CompletionOutcome.WAITING_USER:
-        raise StepExecutionError(
-            f"terminal {terminal_id} is waiting for user input",
-            kind="waiting_user_input",
-            terminal_id=terminal_id,
-        )
-    if outcome == _CompletionOutcome.TIMEOUT:
-        # Distinguish a hard ERROR end-state (worker crashed) from a plain
-        # timeout (worker ran long): the caller must be able to tell them apart
-        # rather than reporting a 5s crash as a 600s timeout.
-        current = status_monitor.get_status(terminal_id)
-        if current == TerminalStatus.ERROR:
+        if outcome == _CompletionOutcome.CANCELLED:
+            cleanup = True
+            raise StepExecutionError(
+                f"step on terminal {terminal_id} was cancelled",
+                kind="cancelled",
+                terminal_id=terminal_id,
+            )
+        if outcome == _CompletionOutcome.ERROR:
             raise StepExecutionError(
                 f"terminal {terminal_id} reached ERROR status",
                 kind="error",
                 terminal_id=terminal_id,
             )
-        raise StepExecutionError(
-            f"step on terminal {terminal_id} did not complete within {timeout}s",
-            kind="timeout",
-            terminal_id=terminal_id,
-        )
+        if outcome == _CompletionOutcome.WAITING_USER:
+            raise StepExecutionError(
+                f"terminal {terminal_id} is waiting for user input",
+                kind="waiting_user_input",
+                terminal_id=terminal_id,
+            )
+        if outcome == _CompletionOutcome.TIMEOUT:
+            current = status_monitor.get_status(terminal_id)
+            if current == TerminalStatus.ERROR:
+                raise StepExecutionError(
+                    f"terminal {terminal_id} reached ERROR status",
+                    kind="error",
+                    terminal_id=terminal_id,
+                )
+            raise StepExecutionError(
+                f"step on terminal {terminal_id} did not complete within {timeout}s",
+                kind="timeout",
+                terminal_id=terminal_id,
+            )
 
-    # A terminal can reach a transient ERROR state that wait_until_status would
-    # not see as COMPLETED, but defensively re-check before claiming success.
-    final_status = status_monitor.get_status(terminal_id)
-    if final_status == TerminalStatus.ERROR:
-        raise StepExecutionError(
-            f"terminal {terminal_id} reached ERROR status",
-            kind="error",
-            terminal_id=terminal_id,
-        )
+        final_status = status_monitor.get_status(terminal_id)
+        if final_status == TerminalStatus.ERROR:
+            raise StepExecutionError(
+                f"terminal {terminal_id} reached ERROR status",
+                kind="error",
+                terminal_id=terminal_id,
+            )
+        if cancel_signal is not None and cancel_signal.is_set():
+            cleanup = True
+            raise StepExecutionError(
+                f"step on terminal {terminal_id} was cancelled before extraction",
+                kind="cancelled",
+                terminal_id=terminal_id,
+            )
 
-    # Extract the last agent message via the provider-specific path (mirrors
-    # how the handoff caller obtained output: get_output in LAST mode runs the
-    # provider's extract_last_message_from_script under the hood). This does a
-    # blocking tmux capture-pane plus regex extraction over the scrollback —
-    # potentially seconds for a large transcript — so run it off the loop.
-    last_message = await asyncio.to_thread(
-        terminal_service.get_output, terminal_id, OutputMode.LAST
-    )
-
-    result = AgentStepResult(
-        terminal_id=terminal_id,
-        last_message=last_message,
-        status=TerminalStatus.COMPLETED,
-    )
-
-    if teardown and created_here:
-        # Best-effort teardown, exit-then-delete (mirrors the old handoff
-        # lifecycle): first send the provider's graceful exit command, THEN
-        # delete. A failure in either step must not turn a successful step into
-        # a failure (the work is done and already captured). Log it; never
-        # swallow silently.
         try:
-            # Graceful CLI shutdown before kill_window (e.g. "/exit" for Claude
-            # Code, C-d for others). Skipped implicitly for reused terminals
-            # because this whole block is guarded on created_here.
-            # Off the loop: exit_terminal_cli is blocking tmux I/O.
-            await asyncio.to_thread(terminal_service.exit_terminal_cli, terminal_id)
-        except (
-            Exception
-        ) as exc:  # noqa: BLE001 — graceful exit is best-effort; step already succeeded
-            logger.warning(
-                "run_agent_step: failed to send graceful exit to terminal %s "
-                "before teardown: %s",
-                terminal_id,
-                exc,
+            last_message = await asyncio.to_thread(
+                terminal_service.get_output, terminal_id, OutputMode.LAST
             )
-        try:
-            # Thread the registry so post_kill_terminal plugin hooks dispatch
-            # (parity with the DELETE endpoint); None = no hooks (engine path).
-            # Off the loop: delete_terminal does blocking tmux kills, a
-            # full-history scrollback snapshot, and DB writes — the exact
-            # teardown that wedged the server in issue #382.
-            await asyncio.to_thread(
-                terminal_service.delete_terminal, terminal_id, registry=registry
-            )
-        except Exception as exc:  # noqa: BLE001 — teardown is best-effort; step already succeeded
-            logger.warning(
-                "run_agent_step: failed to tear down terminal %s after success: %s",
-                terminal_id,
-                exc,
-            )
+            extraction_succeeded = True
+        except Exception as exc:
+            if cancel_signal is not None and cancel_signal.is_set():
+                cleanup = True
+                raise StepExecutionError(
+                    f"step on terminal {terminal_id} was cancelled during extraction",
+                    kind="cancelled",
+                    terminal_id=terminal_id,
+                ) from exc
+            raise
 
-    return result
+        cleanup = True
+        return AgentStepResult(
+            terminal_id=terminal_id,
+            last_message=last_message,
+            status=TerminalStatus.COMPLETED,
+        )
+    finally:
+        # Extraction success is the success boundary: a concurrent cancel is
+        # handled by the workflow at the next step boundary, while this step
+        # remains successful. All other cleanup classifications were set above.
+        if extraction_succeeded:
+            cleanup = True
+        if cleanup and teardown and created_here:
+            await _teardown_terminal(terminal_id, registry)

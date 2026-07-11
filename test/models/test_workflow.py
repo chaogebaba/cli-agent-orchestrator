@@ -467,12 +467,27 @@ class TestBolt3AdditiveModelChanges:
                 )
             )
 
-    def test_run_state_cancelled_is_purely_additive(self):
-        from cli_agent_orchestrator.models.workflow import RunState
+    def test_cancellation_states_are_purely_additive(self):
+        from cli_agent_orchestrator.models.workflow import RunState, StepState
 
-        # Existing values are unchanged; CANCELLED is the only new member.
         assert RunState.RUNNING.value == "running"
+        assert RunState.CANCELLING.value == "cancelling"
         assert RunState.COMPLETED.value == "completed"
         assert RunState.FAILED.value == "failed"
         assert RunState.CANCELLED.value == "cancelled"
-        assert {s.value for s in RunState} == {"running", "completed", "failed", "cancelled"}
+        assert {s.value for s in RunState} == {
+            "running",
+            "cancelling",
+            "completed",
+            "failed",
+            "cancelled",
+        }
+        assert {s.value for s in StepState} == {
+            "pending",
+            "running",
+            "completed",
+            "failed",
+            "cancelled",
+            "skipped",
+            "completed_unvalidated",
+        }

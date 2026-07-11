@@ -55,10 +55,12 @@ def _patched_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _migrate_workflow_run_step()
     ws.run_registry.clear()
     ws._active_drives.clear()
+    ws._cancel_recovery_tasks.clear()
     ws.step_output_store._store.clear()
     yield db_path
     ws.run_registry.clear()
     ws._active_drives.clear()
+    ws._cancel_recovery_tasks.clear()
     ws.step_output_store._store.clear()
 
 
@@ -498,13 +500,115 @@ async def test_resume_completed_run_rejected(_patched_journal):
 
 
 @pytest.mark.asyncio
-async def test_resume_cancelled_run_rejected(_patched_journal):
-    spec = _spec(step_ids=("s1",))
+async def test_resume_cancelled_run_reopens_with_fresh_signal(monkeypatch, _patched_journal):
+    spec = _spec(step_ids=("s1", "s2"))
     workflow_journal.insert_run(
         "runCx", "wf", spec.model_dump_json(), "{}", RunState.CANCELLED.value, "t"
     )
+    workflow_journal.insert_steps(
+        "runCx", [("s1", StepState.COMPLETED.value), ("s2", StepState.CANCELLED.value)], "t"
+    )
+    seen = []
+
+    async def _side(**kwargs):
+        seen.append(kwargs["cancel_signal"])
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    result = await ws.resume_from_last_completed("runCx")
+
+    assert result.state == RunState.COMPLETED
+    assert [step.state for step in result.steps] == [StepState.COMPLETED, StepState.COMPLETED]
+    assert len(seen) == 1 and not seen[0].is_set()
+    record = ws.run_registry["runCx"]
+    assert record.cancelled is False
+    assert record.cancel_signal is None  # cleared with drive ownership
+    assert workflow_journal.get_run("runCx").state == RunState.COMPLETED.value
+
+
+@pytest.mark.asyncio
+async def test_resume_live_cancelling_run_rejected(_patched_journal):
+    spec = _spec(step_ids=("s1",))
+    workflow_journal.insert_run(
+        "runLiveCx", "wf", spec.model_dump_json(), "{}", RunState.CANCELLING.value, "t"
+    )
+    ws._active_drives.add("runLiveCx")
     with pytest.raises(ws.ResumeNotAllowedError):
-        await ws.resume_from_last_completed("runCx")
+        await ws.resume_from_last_completed("runLiveCx")
+
+
+@pytest.mark.asyncio
+async def test_cold_cancel_settles_stranded_cancelling_run(_patched_journal):
+    spec = _spec(step_ids=("s1",))
+    workflow_journal.insert_run(
+        "runColdCx", "wf", spec.model_dump_json(), "{}", RunState.CANCELLING.value, "t"
+    )
+    workflow_journal.insert_steps("runColdCx", [("s1", StepState.RUNNING.value)], "t")
+    workflow_journal.update_run_current_step("runColdCx", "s1")
+
+    ws.cancel_run("runColdCx")
+
+    record = ws.run_registry["runColdCx"]
+    assert record.state == RunState.CANCELLED
+    assert record.step_states["s1"].state == StepState.CANCELLED
+    task = ws._cancel_recovery_tasks["runColdCx"]
+    await task
+    assert workflow_journal.get_run("runColdCx").state == RunState.CANCELLED.value
+    assert workflow_journal.get_steps("runColdCx")[0].state == StepState.CANCELLED.value
+
+
+@pytest.mark.asyncio
+async def test_resume_stranded_cancelling_settles_then_reopens(monkeypatch, _patched_journal):
+    spec = _spec(step_ids=("s1",))
+    workflow_journal.insert_run(
+        "runStrand", "wf", spec.model_dump_json(), "{}", RunState.CANCELLING.value, "t"
+    )
+    workflow_journal.insert_steps("runStrand", [("s1", StepState.RUNNING.value)], "t")
+    writes = []
+    original = workflow_journal.update_run_state
+
+    def _record_write(run_id, state, finished_at):
+        writes.append(state)
+        return original(run_id, state, finished_at)
+
+    monkeypatch.setattr(workflow_journal, "update_run_state", _record_write)
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    result = await ws.resume_from_last_completed("runStrand")
+
+    assert result.state == RunState.COMPLETED
+    assert writes.index(RunState.CANCELLED.value) < writes.index(RunState.RUNNING.value)
+
+
+@pytest.mark.asyncio
+async def test_delayed_recovery_write_cannot_land_after_resume(monkeypatch, _patched_journal):
+    spec = _spec(step_ids=("s1",))
+    workflow_journal.insert_run(
+        "runRecover", "wf", spec.model_dump_json(), "{}", RunState.CANCELLING.value, "t"
+    )
+    workflow_journal.insert_steps("runRecover", [("s1", StepState.RUNNING.value)], "t")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    original = ws._persist_stranded_cancel
+
+    async def _delayed(record, step_id):
+        started.set()
+        await release.wait()
+        await original(record, step_id)
+
+    monkeypatch.setattr(ws, "_persist_stranded_cancel", _delayed)
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    ws.cancel_run("runRecover")
+    await started.wait()
+
+    resume_task = asyncio.create_task(ws.resume_from_last_completed("runRecover"))
+    await asyncio.sleep(0)
+    assert not resume_task.done()
+    release.set()
+    result = await resume_task
+
+    assert result.state == RunState.COMPLETED
+    assert workflow_journal.get_run("runRecover").state == RunState.COMPLETED.value
+    assert "runRecover" not in ws._cancel_recovery_tasks
 
 
 @pytest.mark.asyncio

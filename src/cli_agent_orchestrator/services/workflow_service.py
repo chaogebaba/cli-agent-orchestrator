@@ -61,7 +61,9 @@ from cli_agent_orchestrator.services.step_output_store import (
     step_output_store,
 )
 
-NON_RETRYABLE_STEP_KINDS = frozenset({"input_blocked", "waiting_user_input"})
+NON_RETRYABLE_STEP_KINDS = frozenset(
+    {"input_blocked", "waiting_user_input", "cancelled"}
+)
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +159,9 @@ class RunRecord:
     step_states: Dict[str, StepRunState] = field(default_factory=dict)
     started_at: str = ""
     finished_at: Optional[str] = None
+    cancel_signal: Optional[asyncio.Event] = None
+    cancel_loop: Optional[asyncio.AbstractEventLoop] = None
+    cancelling_journal_task: Optional[asyncio.Task[None]] = None
 
 
 # Process-local run registry (ADR-8, B3-LC-2 singleton). A process restart loses
@@ -177,6 +182,64 @@ run_registry: Dict[str, Union[RunRecord, "ScriptRunRecord"]] = {}
 # when a drive starts (start_run / _drive_resume), removed in a ``finally`` on
 # EVERY exit path (complete, fail, engine error, cancel).
 _active_drives: Set[str] = set()
+
+# Durable recovery writes for CANCELLING crash remnants. Resume orders behind
+# and removes these tasks before reopening RUNNING, preventing a late CANCELLED.
+_cancel_recovery_tasks: Dict[str, asyncio.Task[None]] = {}
+
+
+def _install_cancel_signal(record: RunRecord) -> asyncio.Event:
+    loop = asyncio.get_running_loop()
+    signal = asyncio.Event()
+    record.cancel_signal = signal
+    record.cancel_loop = loop
+    return signal
+
+
+def _journal_run_state_snapshot(
+    run_id: str, state: RunState, finished_at: Optional[str]
+) -> None:
+    try:
+        workflow_journal.update_run_state(run_id, state.value, finished_at)
+    except Exception as exc:  # noqa: BLE001 - journal is best-effort
+        logger.warning(
+            "journal: state write for '%s' failed (resumability degraded): %s",
+            run_id,
+            exc,
+        )
+
+
+async def _await_cancelling_journal(record: RunRecord) -> None:
+    task = record.cancelling_journal_task
+    if task is None:
+        return
+    try:
+        await task
+    except Exception as exc:  # noqa: BLE001 - journal is best-effort
+        logger.warning("journal: CANCELLING write for '%s' failed: %s", record.run_id, exc)
+    finally:
+        if record.cancelling_journal_task is task:
+            record.cancelling_journal_task = None
+
+
+async def _persist_stranded_cancel(record: RunRecord, step_id: Optional[str]) -> None:
+    if step_id is not None:
+        await _ajournal(_journal_step, record, step_id)
+    await _ajournal(_journal_current_step, record)
+    await _ajournal(_journal_run_state, record)
+
+
+async def _await_cancel_recovery(run_id: str) -> None:
+    task = _cancel_recovery_tasks.get(run_id)
+    if task is None:
+        return
+    try:
+        await task
+    except Exception as exc:  # noqa: BLE001 - recovery journal is best-effort
+        logger.warning("journal: cancel recovery for '%s' failed: %s", run_id, exc)
+    finally:
+        if _cancel_recovery_tasks.get(run_id) is task:
+            _cancel_recovery_tasks.pop(run_id, None)
 
 
 def _now() -> str:
@@ -477,7 +540,11 @@ def _topological_order(spec: WorkflowSpec) -> List[WorkflowStep]:
     return [by_id[sid] for sid in order]
 
 
-async def _collect_structured_output(record: RunRecord, step: WorkflowStep) -> StepState:
+async def _collect_structured_output(
+    record: RunRecord,
+    step: WorkflowStep,
+    cancel_signal: Optional[asyncio.Event],
+) -> StepState:
     """Collect the structured return for a COMPLETED step; reprompt once (§3).
 
     - No ``output_schema`` -> free-form, trivially ``COMPLETED``.
@@ -509,6 +576,7 @@ async def _collect_structured_output(record: RunRecord, step: WorkflowStep) -> S
             prompt=_reprompt_prompt(step),
             teardown=True,
             timeout=WORKFLOW_STEP_TIMEOUT,
+            cancel_signal=cancel_signal,
             env_vars={
                 "CAO_WORKFLOW_RUN_ID": record.run_id,
                 "CAO_WORKFLOW_STEP_ID": step.id,
@@ -550,6 +618,10 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
     # OUTER: run-failure retry loop. attempts range 1..n_retries+1.
     for attempt in range(1, n_retries + 2):
         if record.cancelled:  # boundary check (B3-BR-7)
+            st.state = StepState.CANCELLED
+            st.error = "step cancelled before attempt"
+            await _await_cancelling_journal(record)
+            await _ajournal(_journal_step, record, step.id)
             return
         st.attempts = attempt
         st.error = None
@@ -561,6 +633,7 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
                 prompt=prompt,
                 teardown=True,
                 timeout=WORKFLOW_STEP_TIMEOUT,
+                cancel_signal=record.cancel_signal,
                 env_vars={
                     "CAO_WORKFLOW_RUN_ID": record.run_id,
                     "CAO_WORKFLOW_STEP_ID": step.id,
@@ -570,11 +643,16 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
             # Resolve the structured return INSIDE the try so a crash during the
             # reprompt (§3 re-raises StepExecutionError) is caught below and
             # consumes an attempt (Q6=A, Trace C).
-            outcome = await _collect_structured_output(record, step)
+            outcome = await _collect_structured_output(record, step, record.cancel_signal)
         except StepExecutionError as exc:
             st.error = str(exc)
             if exc.terminal_id is not None:
                 st.terminal_id = exc.terminal_id
+            if exc.kind == "cancelled" or record.cancelled:
+                st.state = StepState.CANCELLED
+                await _await_cancelling_journal(record)
+                await _ajournal(_journal_step, record, step.id)
+                return
             if exc.kind in NON_RETRYABLE_STEP_KINDS:
                 break
             continue  # consume an attempt, retry the same prompt
@@ -653,6 +731,7 @@ async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRes
     try:
         for index, step in enumerate(order):
             if record.cancelled:  # B3-BR-7 — cancel observed at a step boundary
+                await _await_cancelling_journal(record)
                 await _skip_remaining(record, order, from_index=index)
                 record.state = RunState.CANCELLED
                 break
@@ -660,6 +739,13 @@ async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRes
             if st.state in (StepState.COMPLETED, StepState.COMPLETED_UNVALIDATED):
                 continue  # kept on resume (B4-BR-9) — do not re-run a done step
             await _run_step(record, step)
+            # Re-check after EVERY step, including the last. Extraction may have
+            # crossed the success boundary while cancel was requested.
+            if record.cancelled:
+                await _await_cancelling_journal(record)
+                await _skip_remaining(record, order, from_index=index + 1)
+                record.state = RunState.CANCELLED
+                break
             if record.state == RunState.FAILED:  # halt (B3-BR-4 on_failure=halt)
                 await _skip_remaining(record, order, from_index=index + 1)
                 break
@@ -683,7 +769,11 @@ async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRes
         logger.error("drive: run '%s' failed with an engine error", record.run_id)
         raise
 
-    # Finalize.
+    # Finalize. A zero-step run or a cancel landing after the loop body still
+    # must not regress CANCELLING to COMPLETED.
+    if record.cancelled:
+        await _await_cancelling_journal(record)
+        record.state = RunState.CANCELLED
     if record.state not in (RunState.FAILED, RunState.CANCELLED):
         record.state = RunState.COMPLETED
     record.current_step_id = None
@@ -752,6 +842,7 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
         step_states={step.id: StepRunState(step_id=step.id) for step in spec.steps},
         started_at=_now(),
     )
+    _install_cancel_signal(record)
     # 4. Register (in-memory floor) + mark the drive live + journal the run +
     # seed every step (§1). The ``finally`` guarantees the liveness mark is
     # cleared on EVERY exit path (complete, fail, engine error, cancel).
@@ -766,31 +857,68 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
         # 6-8. Sequence, finalize, aggregate — the single shared drive (B4-RD-5).
         return await _drive(record, order)
     finally:
+        await _await_cancelling_journal(record)
         _active_drives.discard(run_id)
+        record.cancel_signal = None
+        record.cancel_loop = None
 
 
 # ---------------------------------------------------------------------------
 # §5 — cancel_run
 # ---------------------------------------------------------------------------
 def cancel_run(run_id: str) -> None:
-    """Cooperatively cancel a running workflow (§5, B3-BR-7).
+    """Signal same-loop cancellation and return without awaiting settlement.
 
-    Sets the ``cancelled`` flag; the engine observes it at the NEXT step boundary
-    (the in-flight step runs to natural completion and self-tears-down its own
-    terminal). Never raises into the engine/worker path. Raises ``KeyError`` (->
-    404) for an unknown run and ``ValueError`` (-> 409) for a run already in a
-    terminal state.
+    Live runs enter CANCELLING synchronously and their step-owned signal wakes the
+    completion poll. A cold CANCELLING remnant is rebuilt and settled by one
+    tracked recovery task. Terminal runs still raise ``ValueError``.
     """
     record = run_registry.get(run_id)
     if record is None:
-        raise KeyError(f"unknown run_id '{run_id}'")
+        record = _rebuild_record_from_journal(run_id)
+        if record is None:
+            raise KeyError(f"unknown run_id '{run_id}'")
+        run_registry[run_id] = record
+    if record.state == RunState.CANCELLING and run_id in _active_drives:
+        return
     if record.state in (RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED):
         raise ValueError(f"run '{run_id}' is already {record.state.value}; cannot cancel")
+
+    loop = asyncio.get_running_loop()
     record.cancelled = True
-    # Best-effort: there is no separate live terminal for cancel to tear down (the
-    # running step owns and releases its own). Any future best-effort cleanup must
-    # be wrapped + logged and must never raise into this path.
-    logger.info("cancel_run: run '%s' flagged for cooperative cancel", run_id)
+    record.state = RunState.CANCELLING
+
+    if run_id in _active_drives:
+        assert record.cancel_loop is loop, "cancel signal must be mutated on its owning loop"
+        assert record.cancel_signal is not None
+        record.cancel_signal.set()
+        if record.cancelling_journal_task is None:
+            record.cancelling_journal_task = loop.create_task(
+                _ajournal(
+                    _journal_run_state_snapshot,
+                    run_id,
+                    RunState.CANCELLING,
+                    None,
+                )
+            )
+        logger.info("cancel_run: run '%s' entered CANCELLING", run_id)
+        return
+
+    # No live drive remains to settle this CANCELLING record. Settle memory now
+    # and track exactly one durable recovery task without blocking the endpoint.
+    step_id = record.current_step_id
+    if step_id is not None and step_id in record.step_states:
+        st = record.step_states[step_id]
+        st.state = StepState.CANCELLED
+        st.error = "step cancelled during stranded-run recovery"
+    record.current_step_id = None
+    record.state = RunState.CANCELLED
+    record.finished_at = _now()
+    if run_id not in _cancel_recovery_tasks:
+        _cancel_recovery_tasks[run_id] = loop.create_task(
+            _persist_stranded_cancel(record, step_id)
+        )
+    logger.info("cancel_run: stranded run '%s' settled CANCELLED", run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -982,30 +1110,14 @@ def update_run_generation(run_id: str, generation: str) -> None:
 def _is_resumable_for_tier(row: workflow_journal.RunRow) -> bool:
     """Tier-aware resumability predicate (DR-7/DR-8, code-generation-plan precision fix).
 
-    **U3 supplies this journal primitive only — wiring it into the actual resume
-    ROUTE (replacing the inline check in ``resume_from_last_completed`` below) is
-    OUT OF SCOPE for U3; that is U4/U5's job.** ``resume_from_last_completed``'s
-    own inline check is untouched by this addition (INV-1): a YAML run's resume
-    behavior is byte-identical to before U3.
-
-    The pinned base tip's inline rule (verified at code-gen against
-    ``resume_from_last_completed``, not a function literally named
-    ``_is_resumable``) is: ``state in (COMPLETED, CANCELLED)`` -> not resumable;
-    everything else (``FAILED``, or a crash-remnant ``RUNNING`` row with no live
-    registry entry) -> resumable. Q3=A / DR-8 extends this for the SCRIPT tier
-    only: a ``CANCELLED`` script run IS resumable (a cancel-then-resume workflow,
-    US-C2) — but a ``CANCELLED`` YAML run stays non-resumable, matching the base
-    exactly. This function carves CANCELLED out of the shared "terminal, not
-    resumable" bucket per-tier; it does NOT relax ``COMPLETED`` for either tier
-    (DR-7 — a successfully finished run is never resumable), and it does NOT
-    perform the liveness-registry check (DR-9, layer 1) — that is the caller's
-    job, same as the base's own two-step check (registry, then journaled state).
+    COMPLETED is never resumable. CANCELLED is resumable for both YAML and script
+    tiers; the caller separately rejects a still-live CANCELLING drive.
     """
     state = RunState(row.state)
     if state == RunState.COMPLETED:
         return False
     if state == RunState.CANCELLED:
-        return row.tier == "script"
+        return True
     return True
 
 
@@ -1042,9 +1154,8 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
        rebuild a crash remnant into the cache as RUNNING with nothing executing,
        and that remnant must stay resumable.
     3. Load the ``workflow_run`` row; absent -> ``KeyError`` (-> 404, F1).
-    4. A ``COMPLETED``/``CANCELLED`` run is terminal and not resumable ->
-       ``ResumeNotAllowedError`` (-> 409, B4-BR-7). A ``FAILED`` run, or a
-       ``RUNNING`` row with NO live record (a crash remnant), IS resumable.
+    4. A ``COMPLETED`` run is not resumable. FAILED, settled CANCELLED, and crash
+       remnants are resumable; live CANCELLING was rejected by the liveness guard.
     5. Deserialize ``spec_snapshot`` (Q2=B, B4-BR-8); a corrupt snapshot ->
        ``ResumeCorruptError`` (-> 422).
     6. Rebuild the ``RunRecord`` cache (§2, seeds all steps), then apply the Q3=A
@@ -1070,6 +1181,10 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
             f"run '{run_id}' is currently executing; cannot resume a live run"
         )
 
+    # A prior cold-cancel recovery owns the durable CANCELLED write. Order
+    # behind and remove it before this resume can publish RUNNING.
+    await _await_cancel_recovery(run_id)
+
     # 3. Load the durable row; absent (or an unreadable journal) -> KeyError -> 404 (F1).
     # Read stays on-loop deliberately: a small point read via the sync helper
     # shared with the sync status path.
@@ -1090,8 +1205,17 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
         state = RunState(row.state)
     except ValueError as e:
         raise ResumeCorruptError(f"run '{run_id}' has corrupt state '{row.state}'") from e
-    if state in (RunState.COMPLETED, RunState.CANCELLED):
+    if state == RunState.COMPLETED:
         raise ResumeNotAllowedError(f"run '{run_id}' is {state.value}; not resumable")
+    if state == RunState.CANCELLING:
+        # No active drive and no pending recovery task means a crash stranded
+        # CANCELLING. Settle durable CANCELLED inline before reopening.
+        await _ajournal(
+            _journal_run_state_snapshot,
+            run_id,
+            RunState.CANCELLED,
+            _now(),
+        )
 
     # 5. Deserialize the snapshotted spec (Q2=B, B4-BR-8); corrupt -> 422.
     try:
@@ -1122,6 +1246,7 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
     record.cancelled = False
     record.current_step_id = None
     record.finished_at = None
+    _install_cancel_signal(record)
     run_registry[run_id] = record
     # Mark the drive live BEFORE the first await: the off-loop journal writes
     # below yield, and a concurrent resume for the same run_id must hit the
@@ -1146,7 +1271,10 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
         # (B4-RD-5).
         return await _drive(record, _topological_order(spec))
     finally:
+        await _await_cancelling_journal(record)
         _active_drives.discard(run_id)
+        record.cancel_signal = None
+        record.cancel_loop = None
 
 
 def _run_parallel(record: Optional[RunRecord], steps: Any) -> None:
