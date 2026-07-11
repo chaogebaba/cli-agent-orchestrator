@@ -4,7 +4,7 @@ import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Callable, Dict, List, Optional, cast
 
 from sqlalchemy import (
     Boolean,
@@ -91,6 +91,44 @@ class InboxModel(Base):
     )
     status = Column(String, nullable=False)  # MessageStatus enum value
     created_at = Column(DateTime, default=datetime.now)
+
+
+class InboxDeliveryAttemptModel(Base):
+    __tablename__ = "inbox_delivery_attempt"
+    attempt_uuid = Column(String, primary_key=True)
+    receiver_terminal_id = Column(String, nullable=False, index=True)
+    provider = Column(String, nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    settled_at = Column(DateTime(timezone=True), nullable=True)
+    outcome = Column(String, nullable=True)
+    reason = Column(Text, nullable=True)
+    error = Column(Text, nullable=True)
+    payload_hash = Column(String, nullable=False)
+    payload_length = Column(Integer, nullable=False)
+    pre_input_gen = Column(Integer, nullable=True)
+    pre_status_gen = Column(Integer, nullable=True)
+    settled_status_gen = Column(Integer, nullable=True)
+    evidence = Column(Text, nullable=False, default="{}", server_default="{}")
+    count = Column(Integer, nullable=False, default=1, server_default="1")
+    last_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    prior_attempt_uuid = Column(String, nullable=True)
+    sender_id = Column(String, nullable=False)
+    orchestration_type = Column(String, nullable=False)
+    __table_args__ = (
+        Index(
+            "uq_inbox_deferred_attempt",
+            "receiver_terminal_id", "payload_hash", "reason",
+            unique=True,
+            sqlite_where=(outcome == "deferred"),
+        ),
+    )
+
+
+class InboxDeliveryAttemptMemberModel(Base):
+    __tablename__ = "inbox_delivery_attempt_member"
+    attempt_uuid = Column(String, primary_key=True)
+    message_id = Column(Integer, primary_key=True, index=True)
+    position = Column(Integer, nullable=False)
 
 
 class MemoryMetadataModel(Base):
@@ -705,14 +743,25 @@ def update_terminal_shell_command(terminal_id: str, shell_command: str) -> bool:
         return False
 
 
-def update_terminal_provider_session_id(terminal_id: str, session_uuid: str) -> bool:
-    with SessionLocal() as db:
+def update_terminal_provider_session_id_if_null(
+    terminal_id: str, session_uuid: str
+) -> str | None:
+    """Claim an unset provider session id and return the persisted winner."""
+    with SessionLocal.begin() as db:
+        db.query(TerminalModel).filter(
+            TerminalModel.id == terminal_id,
+            TerminalModel.provider_session_id.is_(None),
+        ).update({TerminalModel.provider_session_id: session_uuid}, synchronize_session=False)
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
-        if not terminal:
-            return False
-        terminal.provider_session_id = session_uuid
-        db.commit()
-        return True
+        return terminal.provider_session_id if terminal else None
+
+
+def update_terminal_provider_session_id(terminal_id: str, session_uuid: str) -> bool:
+    """Explicitly set a provider session id (base registration/allocated UUID paths)."""
+    with SessionLocal.begin() as db:
+        changed = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).update(
+            {TerminalModel.provider_session_id: session_uuid}, synchronize_session=False)
+        return changed > 0
 
 
 def register_provider_session(**values: Any) -> Dict[str, Any]:
@@ -1010,6 +1059,178 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
             db.commit()
             return True
         return False
+
+
+def begin_delivery_attempt(messages, receiver_terminal_id: str, provider: str, payload_hash: str,
+                           payload_length: int, pre_input_gen=None, pre_status_gen=None,
+                           evidence: str = "{}") -> str:
+    attempt_uuid = str(uuid.uuid4())
+    with SessionLocal.begin() as db:
+        prior = (db.query(InboxDeliveryAttemptModel).join(
+                 InboxDeliveryAttemptMemberModel,
+                 InboxDeliveryAttemptMemberModel.attempt_uuid == InboxDeliveryAttemptModel.attempt_uuid)
+                 .filter(InboxDeliveryAttemptMemberModel.message_id == messages[0].id)
+                 .order_by(InboxDeliveryAttemptModel.started_at.desc()).first())
+        row = InboxDeliveryAttemptModel(
+            attempt_uuid=attempt_uuid, receiver_terminal_id=receiver_terminal_id,
+            provider=provider, payload_hash=payload_hash, payload_length=payload_length,
+            pre_input_gen=pre_input_gen, pre_status_gen=pre_status_gen,
+            prior_attempt_uuid=prior.attempt_uuid if prior else None,
+            sender_id=messages[0].sender_id,
+            orchestration_type=messages[0].orchestration_type.value,
+            evidence=evidence[:2048],
+        )
+        db.add(row)
+        for position, message in enumerate(messages):
+            current = db.query(InboxModel).filter_by(id=message.id).one()
+            current.status = MessageStatus.DELIVERING.value
+            db.add(InboxDeliveryAttemptMemberModel(attempt_uuid=attempt_uuid,
+                                                   message_id=message.id, position=position))
+    return attempt_uuid
+
+
+def settle_delivery_attempt(attempt_uuid: str, status: MessageStatus, outcome: str,
+                            reason: str | None = None, error: str | None = None,
+                            evidence: str = "{}", settled_status_gen=None,
+                            on_confirmed: Callable[[], None] | None = None) -> bool:
+    with SessionLocal.begin() as db:
+        row = db.query(InboxDeliveryAttemptModel).filter_by(attempt_uuid=attempt_uuid).one()
+        if row.settled_at is not None:
+            return False
+        if outcome == "deferred":
+            existing = (db.query(InboxDeliveryAttemptModel).filter(
+                InboxDeliveryAttemptModel.attempt_uuid != attempt_uuid,
+                InboxDeliveryAttemptModel.receiver_terminal_id == row.receiver_terminal_id,
+                InboxDeliveryAttemptModel.payload_hash == row.payload_hash,
+                InboxDeliveryAttemptModel.reason == reason,
+                InboxDeliveryAttemptModel.outcome == "deferred",
+            ).first())
+            if existing is not None:
+                existing.count += 1
+                existing.last_at = _utcnow()
+                members = db.query(InboxDeliveryAttemptMemberModel).filter_by(
+                    attempt_uuid=attempt_uuid).all()
+                existing_ids = {x.message_id for x in db.query(InboxDeliveryAttemptMemberModel)
+                                .filter_by(attempt_uuid=existing.attempt_uuid).all()}
+                for member in members:
+                    if member.message_id not in existing_ids:
+                        member.attempt_uuid = existing.attempt_uuid
+                    else:
+                        db.delete(member)
+                db.delete(row)
+                ids = [m.message_id for m in members]
+                db.query(InboxModel).filter(InboxModel.id.in_(ids)).update(
+                    {InboxModel.status: status.value}, synchronize_session=False)
+                return True
+        row.outcome, row.reason, row.error = outcome, reason, error
+        row.evidence = evidence[:2048]
+        row.settled_at = row.last_at = _utcnow()
+        row.settled_status_gen = settled_status_gen
+        ids = [x.message_id for x in db.query(InboxDeliveryAttemptMemberModel)
+               .filter_by(attempt_uuid=attempt_uuid).all()]
+        query = db.query(InboxModel).filter(InboxModel.id.in_(ids))
+        if status == MessageStatus.DELIVERED:
+            query = query.filter(InboxModel.status == MessageStatus.DELIVERING.value)
+        changed = query.update({InboxModel.status: status.value}, synchronize_session=False)
+        if status == MessageStatus.DELIVERED and changed != len(ids):
+            raise RuntimeError("delivery confirmation compare-and-set lost")
+        if status == MessageStatus.DELIVERED and on_confirmed is not None:
+            on_confirmed()
+        return True
+
+
+def confirm_batch_from_prior_attempt(
+    message_ids: list[int], prior_attempt_uuid: str,
+    on_confirmed: Callable[[], None] | None = None,
+) -> bool:
+    """Atomically confirm a pending batch by an existing authoritative attempt."""
+    with SessionLocal.begin() as db:
+        referenced_ids = {
+            row.message_id for row in db.query(InboxDeliveryAttemptMemberModel).filter(
+                InboxDeliveryAttemptMemberModel.attempt_uuid == prior_attempt_uuid,
+                InboxDeliveryAttemptMemberModel.message_id.in_(message_ids),
+            ).all()
+        }
+        if referenced_ids != set(message_ids):
+            return False
+        changed = db.query(InboxModel).filter(
+            InboxModel.id.in_(message_ids),
+            InboxModel.status == MessageStatus.PENDING.value,
+        ).update({InboxModel.status: MessageStatus.DELIVERED.value}, synchronize_session=False)
+        if changed != len(message_ids):
+            return False
+        if on_confirmed is not None:
+            on_confirmed()
+        return True
+
+
+def get_message_trace(message_id: int) -> Optional[Dict[str, Any]]:
+    with SessionLocal() as db:
+        msg = db.query(InboxModel).filter_by(id=message_id).first()
+        if not msg:
+            return None
+        rows = (db.query(InboxDeliveryAttemptModel, InboxDeliveryAttemptMemberModel.position)
+                .join(InboxDeliveryAttemptMemberModel,
+                      InboxDeliveryAttemptMemberModel.attempt_uuid == InboxDeliveryAttemptModel.attempt_uuid)
+                .filter(InboxDeliveryAttemptMemberModel.message_id == message_id)
+                .order_by(InboxDeliveryAttemptModel.started_at).all())
+        attempts = []
+        for row, position in rows:
+            item = {c.name: getattr(row, c.name) for c in row.__table__.columns}
+            for key in ("started_at", "settled_at", "last_at"):
+                item[key] = item[key].isoformat() if item[key] else None
+            item["position"] = position
+            try: item["evidence"] = __import__("json").loads(item["evidence"])
+            except Exception: item["evidence"] = {}
+            attempts.append(item)
+        return {"message": {"id": msg.id, "sender_id": msg.sender_id,
+                            "receiver_id": msg.receiver_id, "status": msg.status,
+                            "created_at": msg.created_at.isoformat()}, "attempts": attempts}
+
+
+def count_ambiguous_attempts(message_ids: list[int]) -> int:
+    with SessionLocal() as db:
+        return (db.query(InboxDeliveryAttemptModel).join(
+                InboxDeliveryAttemptMemberModel,
+                InboxDeliveryAttemptMemberModel.attempt_uuid == InboxDeliveryAttemptModel.attempt_uuid)
+                .filter(InboxDeliveryAttemptMemberModel.message_id.in_(message_ids),
+                        InboxDeliveryAttemptModel.outcome == "ambiguous").distinct().count())
+
+
+def list_message_attempts(message_ids: list[int]) -> List[Dict[str, Any]]:
+    with SessionLocal() as db:
+        rows = (db.query(InboxDeliveryAttemptModel).join(
+                InboxDeliveryAttemptMemberModel,
+                InboxDeliveryAttemptMemberModel.attempt_uuid == InboxDeliveryAttemptModel.attempt_uuid)
+                .filter(InboxDeliveryAttemptMemberModel.message_id.in_(message_ids))
+                .order_by(InboxDeliveryAttemptModel.started_at).all())
+        return [{c.name: getattr(row, c.name) for c in row.__table__.columns} for row in rows]
+
+
+def list_attempt_member_ids(attempt_uuid: str) -> list[int]:
+    with SessionLocal() as db:
+        rows = (db.query(InboxDeliveryAttemptMemberModel)
+                .filter_by(attempt_uuid=attempt_uuid)
+                .order_by(InboxDeliveryAttemptMemberModel.position).all())
+        return [row.message_id for row in rows]
+
+
+def transition_pending_to_delivery_failed(message_ids: list[int]) -> bool:
+    """Cap transition; True exactly once even across process restarts."""
+    with SessionLocal.begin() as db:
+        changed = (db.query(InboxModel).filter(
+            InboxModel.id.in_(message_ids), InboxModel.status == MessageStatus.PENDING.value)
+            .update({InboxModel.status: MessageStatus.DELIVERY_FAILED.value},
+                    synchronize_session=False))
+        return changed > 0
+
+
+def list_stale_delivering_messages() -> List[InboxMessage]:
+    with SessionLocal() as db:
+        rows = db.query(InboxModel).filter_by(status=MessageStatus.DELIVERING.value).all()
+        return [InboxMessage(id=x.id, sender_id=x.sender_id, receiver_id=x.receiver_id,
+                message=x.message, orchestration_type=OrchestrationType(x.orchestration_type),
+                status=MessageStatus(x.status), created_at=x.created_at) for x in rows]
 
 
 # Flow database functions

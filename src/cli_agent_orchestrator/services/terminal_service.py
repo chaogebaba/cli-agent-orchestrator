@@ -109,7 +109,7 @@ def purge_stale_terminal_records() -> int:
     return purged
 
 
-def inject_memory_context(first_message: str, terminal_id: str) -> str:
+def inject_memory_context(first_message: str, terminal_id: str, *, consume: bool = True) -> str:
     """Prepend <cao-memory> context block to the first user message.
 
     Tracks which terminals have already been injected so that only the very
@@ -122,7 +122,8 @@ def inject_memory_context(first_message: str, terminal_id: str) -> str:
     with _memory_injected_lock:
         if terminal_id in _memory_injected_terminals:
             return first_message
-        _memory_injected_terminals.add(terminal_id)
+        if consume:
+            _memory_injected_terminals.add(terminal_id)
 
     try:
         svc = MemoryService()
@@ -876,6 +877,59 @@ def send_input(
         raise
 
 
+def prepare_input(terminal_id: str, message: str,
+                  orchestration_type: OrchestrationType | None = None) -> str:
+    """Shape inbox input without consuming first-message memory state."""
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata:
+        raise ValueError(f"Terminal '{terminal_id}' not found")
+    value = orchestration_type.value if isinstance(orchestration_type, OrchestrationType) else str(orchestration_type or "")
+    return inject_memory_context(_append_message_contract(message, metadata, value), terminal_id,
+                                 consume=False)
+
+
+def send_prepared_input(terminal_id: str, message: str, *, defer_on_dialog: bool = False,
+                        registry: PluginRegistry | None = None,
+                        sender_id: str | None = None,
+                        orchestration_type: OrchestrationType | None = None,
+                        original_message: str | None = None) -> bool:
+    """Send already-shaped bytes; never apply contract or memory shaping again."""
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata:
+        raise ValueError(f"Terminal '{terminal_id}' not found")
+    provider = provider_manager.get_provider(terminal_id)
+    enter_count = provider.paste_enter_count if provider else 1
+    status_monitor.notify_input_sent(terminal_id)
+    status_monitor.clear_rolling_buffer(terminal_id)
+    backend = get_backend()
+    if isinstance(getattr(provider, "composer_stash_keys", None), list):
+        if stash_draft_before_send(terminal_id, metadata, provider, defer_on_dialog):
+            enter_count = 1
+        preserved = None
+    else:
+        preserved = preserve_draft_before_send(terminal_id, metadata, provider)
+    with _memory_injected_lock:
+        _memory_injected_terminals.add(terminal_id)
+    backend.send_keys(metadata["tmux_session"], metadata["tmux_window"], message,
+                      enter_count=enter_count, force_bracketed_paste=True,
+                      submit_delay=provider.paste_submit_delay if provider else 0.3)
+    if preserved is not None:
+        preserved.restore(backend)
+    if provider:
+        provider.mark_input_received()
+    update_last_active(terminal_id)
+    if registry is not None and sender_id is not None and orchestration_type is not None:
+        dispatch_plugin_event(
+            registry, "post_send_message",
+            PostSendMessageEvent(
+                session_id=metadata["tmux_session"], sender=sender_id,
+                receiver=terminal_id, message=original_message or message,
+                orchestration_type=orchestration_type,
+            ),
+        )
+    return True
+
+
 def send_special_key(terminal_id: str, key: str) -> bool:
     """Send a tmux special key sequence (e.g., C-d, C-c) to terminal.
 
@@ -1208,6 +1262,9 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
         )
 
         stalled_callback_watchdog.clear_terminal(terminal_id)
+        from cli_agent_orchestrator.services.inbox_service import clear_terminal_delivery_state
+
+        clear_terminal_delivery_state(terminal_id)
         try:
             from cli_agent_orchestrator.services.auto_responder import auto_responder
 

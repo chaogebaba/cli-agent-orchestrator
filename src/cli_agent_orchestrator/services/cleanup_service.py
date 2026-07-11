@@ -5,7 +5,10 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from cli_agent_orchestrator.clients.database import InboxModel, SessionLocal, TerminalModel
+from cli_agent_orchestrator.clients.database import (
+    InboxModel, InboxDeliveryAttemptMemberModel, InboxDeliveryAttemptModel,
+    SessionLocal, TerminalModel,
+)
 from cli_agent_orchestrator.constants import (
     LOG_DIR,
     MEMORY_BASE_DIR,
@@ -42,6 +45,25 @@ def cleanup_old_data():
 
         # Clean up old inbox messages
         with SessionLocal() as db:
+            old_ids = [x[0] for x in db.query(InboxModel.id).filter(
+                InboxModel.created_at < cutoff_date).all()]
+            attempt_ids = [x[0] for x in db.query(InboxDeliveryAttemptMemberModel.attempt_uuid)
+                           .filter(InboxDeliveryAttemptMemberModel.message_id.in_(old_ids)).all()]
+            if old_ids:
+                db.query(InboxDeliveryAttemptMemberModel).filter(
+                    InboxDeliveryAttemptMemberModel.message_id.in_(old_ids)).delete(
+                    synchronize_session=False)
+            if attempt_ids:
+                remaining_attempt_ids = {
+                    row[0]
+                    for row in db.query(InboxDeliveryAttemptMemberModel.attempt_uuid)
+                    .filter(InboxDeliveryAttemptMemberModel.attempt_uuid.in_(attempt_ids)).all()
+                }
+                orphaned_attempt_ids = set(attempt_ids) - remaining_attempt_ids
+                if orphaned_attempt_ids:
+                    db.query(InboxDeliveryAttemptModel).filter(
+                        InboxDeliveryAttemptModel.attempt_uuid.in_(orphaned_attempt_ids)).delete(
+                        synchronize_session=False)
             deleted_messages = (
                 db.query(InboxModel).filter(InboxModel.created_at < cutoff_date).delete()
             )

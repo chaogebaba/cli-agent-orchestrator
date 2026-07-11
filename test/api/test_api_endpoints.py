@@ -1208,16 +1208,25 @@ class TestLifespan:
         async def never_returns():
             await asyncio.sleep(3600)
 
-        mock_load = AsyncMock()
+        async def record_registry_load():
+            startup_order.append("registry_load")
+
+        mock_load = AsyncMock(side_effect=record_registry_load)
         mock_teardown = AsyncMock()
+        startup_order = []
 
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
-            patch("cli_agent_orchestrator.api.main.init_db"),
+            patch("cli_agent_orchestrator.api.main.init_db",
+                  side_effect=lambda: startup_order.append("init_db")),
             patch(
                 "cli_agent_orchestrator.api.main.terminal_service.purge_stale_terminal_records",
-                return_value=2,
+                side_effect=lambda: startup_order.append("purge") or 2,
             ) as mock_purge,
+            patch.object(
+                main_module.inbox_service, "recover_stale_deliveries",
+                side_effect=lambda: startup_order.append("recover"),
+            ) as mock_recover,
             patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
             patch("cli_agent_orchestrator.api.main.cleanup_expired_memories", quick_return),
             patch("cli_agent_orchestrator.api.main.flow_daemon", fake_daemon),
@@ -1253,6 +1262,10 @@ class TestLifespan:
                     loop_arg = mock_bus.set_loop.call_args.args[0]
                     assert loop_arg is asyncio.get_running_loop()
                     mock_purge.assert_called_once_with()
+                    mock_recover.assert_called_once_with()
+                    assert startup_order == [
+                        "init_db", "purge", "recover", "registry_load"
+                    ]
 
             assert "purged 2 stale terminals" in caplog.text
 

@@ -71,6 +71,46 @@ class TestCleanupOldData:
         assert mock_db.query.call_count >= 2
         assert mock_db.commit.call_count == 2
 
+    def test_cleanup_old_data_purges_attempt_members_and_orphaned_attempt(
+        self, monkeypatch, tmp_path
+    ):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from cli_agent_orchestrator.clients import database as db_mod
+        from cli_agent_orchestrator.clients.database import (
+            Base, InboxDeliveryAttemptMemberModel, InboxDeliveryAttemptModel, InboxModel,
+            begin_delivery_attempt, create_inbox_message, create_terminal,
+            get_pending_messages, settle_delivery_attempt,
+        )
+        from cli_agent_orchestrator.models.inbox import MessageStatus
+        from cli_agent_orchestrator.services import cleanup_service as cleanup_mod
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(bind=engine)
+        test_db = sessionmaker(bind=engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", test_db)
+        monkeypatch.setattr(cleanup_mod, "SessionLocal", test_db)
+        monkeypatch.setattr(cleanup_mod, "TERMINAL_LOG_DIR", tmp_path / "term-logs")
+        monkeypatch.setattr(cleanup_mod, "LOG_DIR", tmp_path / "logs")
+        create_terminal("sender", "s", "sender", "codex")
+        create_terminal("receiver", "s", "receiver", "claude_code")
+        create_inbox_message("sender", "receiver", "wire")
+        message = get_pending_messages("receiver")[0]
+        attempt = begin_delivery_attempt([message], "receiver", "claude_code", "hash", 4)
+        settle_delivery_attempt(attempt, MessageStatus.DELIVERED, "confirmed")
+        with test_db.begin() as db:
+            db.query(InboxModel).filter_by(id=message.id).update({
+                InboxModel.created_at: datetime.now() - timedelta(days=30)})
+
+        cleanup_old_data()
+
+        with test_db() as db:
+            assert db.query(InboxModel).filter_by(id=message.id).count() == 0
+            assert db.query(InboxDeliveryAttemptMemberModel).filter_by(
+                attempt_uuid=attempt).count() == 0
+            assert db.query(InboxDeliveryAttemptModel).filter_by(
+                attempt_uuid=attempt).count() == 0
+
     @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
     @patch("cli_agent_orchestrator.services.cleanup_service.RETENTION_DAYS", 7)
     def test_cleanup_old_data_deletes_old_terminal_log_files(self, mock_session_local):

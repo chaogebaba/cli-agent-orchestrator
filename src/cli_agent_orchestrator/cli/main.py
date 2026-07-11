@@ -19,6 +19,7 @@ from cli_agent_orchestrator.cli.commands.shutdown import shutdown
 from cli_agent_orchestrator.cli.commands.skills import skills
 from cli_agent_orchestrator.cli.commands.terminal import terminal
 from cli_agent_orchestrator.cli.commands.workflow import workflow
+from cli_agent_orchestrator.cli.commands.messages import messages
 
 try:
     __version__ = version("cli-agent-orchestrator")
@@ -49,6 +50,7 @@ cli.add_command(skills)
 cli.add_command(session)
 cli.add_command(terminal)
 cli.add_command(workflow)
+cli.add_command(messages)
 
 
 if __name__ == "__main__":

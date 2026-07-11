@@ -5,17 +5,27 @@ Consumer: terminal.{id}.status
 
 import asyncio
 import logging
+import json
 import threading
 from itertools import groupby
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
+    begin_delivery_attempt,
+    confirm_batch_from_prior_attempt,
+    count_ambiguous_attempts,
     create_inbox_message,
     get_terminal_metadata,
     get_pending_messages,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
     update_message_status,
+    settle_delivery_attempt,
+    list_stale_delivering_messages,
+    get_message_trace,
+    list_attempt_member_ids,
+    list_message_attempts,
+    transition_pending_to_delivery_failed,
 )
 from cli_agent_orchestrator.constants import (
     EAGER_INBOX_DELIVERY,
@@ -31,12 +41,17 @@ from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import TerminalInputBlockedError
+from cli_agent_orchestrator.services.message_trace_service import (
+    confirm_delivery, resolve_session_transcript, transcript_lookup, transcript_ref, wire_hash,
+)
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
 
 _delivery_locks: dict[str, threading.Lock] = {}
 _delivery_locks_guard = threading.Lock()
+_delivery_wake_seq: dict[str, int] = {}
+_delivery_seq_guard = threading.Lock()
 
 
 def _get_delivery_lock(terminal_id: str) -> threading.Lock:
@@ -46,6 +61,14 @@ def _get_delivery_lock(terminal_id: str) -> threading.Lock:
             lock = threading.Lock()
             _delivery_locks[terminal_id] = lock
         return lock
+
+
+def clear_terminal_delivery_state(terminal_id: str) -> None:
+    """Remove the receiver lock and its wake sequence together on teardown."""
+    with _delivery_locks_guard:
+        _delivery_locks.pop(terminal_id, None)
+        with _delivery_seq_guard:
+            _delivery_wake_seq.pop(terminal_id, None)
 
 
 def _should_defer_waiting(terminal_id: str, provider=None) -> bool:
@@ -132,6 +155,33 @@ class InboxService:
                     exc_info=True,
                 )
 
+    def _notify_delivery_failed(self, terminal_id: str, message_ids: list[int]) -> None:
+        metadata = get_terminal_metadata(terminal_id)
+        caller_id = metadata.get("caller_id") if metadata else None
+        if not caller_id:
+            logger.warning(
+                "Delivery failed after 3 ambiguous attempts for terminal %s message(s) %s; "
+                "no caller_id is available for notification", terminal_id, message_ids)
+            return
+        create_inbox_message(
+            f"message-trace:{terminal_id}", caller_id,
+            f"[message-trace] delivery to terminal {terminal_id} failed after 3 "
+            f"ambiguous attempts for message(s) {message_ids}; inspect cao messages trace.",
+        )
+
+    def _commit_watchdog_ops(self, terminal_id: str, sender_id: str,
+                             orchestration_type: OrchestrationType, metadata: dict) -> None:
+        from cli_agent_orchestrator.services.stalled_callback_watchdog import stalled_callback_watchdog
+        stalled_callback_watchdog.record_callback_if_to_caller(sender_id, terminal_id)
+        if metadata.get("caller_id") and (
+            orchestration_type == OrchestrationType.ASSIGN or
+            (orchestration_type == OrchestrationType.SEND_MESSAGE and
+             sender_id == metadata["caller_id"] and
+             stalled_callback_watchdog.has_episode(terminal_id))
+        ):
+            stalled_callback_watchdog.record_inbound_task(
+                terminal_id, metadata["caller_id"], metadata.get("agent_profile") or "")
+
     async def run(self, registry: PluginRegistry | None = None) -> None:
         queue = bus.subscribe("terminal.*.status")
         logger.info("InboxService started")
@@ -169,7 +219,12 @@ class InboxService:
         ``send_message`` orchestration type are threaded to ``terminal_service``
         so ``PostSendMessageEvent`` hooks fire with correct attribution.
         """
+        with _delivery_seq_guard:
+            captured_wake = _delivery_wake_seq.get(terminal_id, 0)
         with _get_delivery_lock(terminal_id):
+            with _delivery_seq_guard:
+                if _delivery_wake_seq.get(terminal_id, 0) > captured_wake:
+                    return
             limit = num_messages if num_messages > 0 else 100
             messages = get_pending_messages(terminal_id, limit=limit)
             if not messages:
@@ -196,15 +251,6 @@ class InboxService:
                 if not eager_eligible:
                     return
 
-            # Mark DELIVERED before sending (#164). send_input() types into the tmux
-            # pane; that output flows back through the FIFO/StatusMonitor pipeline and
-            # can re-emit an IDLE/COMPLETED status event, re-entering deliver_pending.
-            # If the messages were still PENDING then, they would be delivered twice.
-            # Marking them DELIVERED first closes that window; the except path resets
-            # them to FAILED.
-            for message in messages:
-                update_message_status(message.id, MessageStatus.DELIVERED)
-
             # Deliver in contiguous runs of the same sender and orchestration mode.
             # With the default num_messages=1 this is a single run; when draining
             # all pending messages (num_messages=0) a batch can span multiple groups,
@@ -215,42 +261,111 @@ class InboxService:
             ):
                 batch = list(group)
                 combined = "\n".join(m.message for m in batch)
+                attempt_uuid = None
                 try:
                     if _should_defer_waiting(terminal_id, provider):
                         _defer_messages(terminal_id, messages[sent_count:])
                         return
-                    if registry is None:
-                        if orchestration_type == OrchestrationType.SEND_MESSAGE:
-                            # Preserve the pre-FX12 no-registry SEND_MESSAGE path:
-                            # an absent mode intentionally bypasses contract/watchdog
-                            # behavior used only by the registry-aware path.
-                            terminal_service.send_input(
-                                terminal_id, combined, defer_on_dialog=True
-                            )
-                        else:
-                            terminal_service.send_input(
-                                terminal_id,
-                                combined,
-                                orchestration_type=orchestration_type,
-                                defer_on_dialog=True,
-                            )
-                    else:
-                        terminal_service.send_input(
-                            terminal_id,
-                            combined,
-                            registry=registry,
-                            sender_id=sender_id,
-                            orchestration_type=orchestration_type,
-                            defer_on_dialog=True,
+                    ambiguous_count = count_ambiguous_attempts([m.id for m in batch])
+                    metadata = get_terminal_metadata(terminal_id) or {}
+                    message_ids = [m.id for m in batch]
+                    path = resolve_session_transcript(metadata)
+                    if path is not None:
+                        for prior in list_message_attempts(message_ids):
+                            if prior.get("outcome") in {None, "deferred", "failed", "unresolved"}:
+                                continue
+                            try:
+                                prior_evidence = json.loads(prior.get("evidence") or "{}")
+                            except (TypeError, json.JSONDecodeError):
+                                prior_evidence = {}
+                            result, evidence = transcript_lookup(
+                                path, prior["payload_hash"], prior.get("started_at"),
+                                prior_evidence)
+                            if result == "hit":
+                                won = confirm_batch_from_prior_attempt(
+                                    message_ids,
+                                    prior["attempt_uuid"],
+                                    on_confirmed=lambda: self._commit_watchdog_ops(
+                                        terminal_id, sender_id, orchestration_type, metadata),
+                                )
+                                if not won:
+                                    return
+                                logger.info("Deduplicated delivery for terminal %s using attempt %s",
+                                            terminal_id, prior["attempt_uuid"])
+                                return
+                            if result == "unresolved":
+                                logger.warning(
+                                    "Transcript continuity is uncertain for terminal %s; "
+                                    "deferring retry without paste", terminal_id)
+                                with _delivery_seq_guard:
+                                    _delivery_wake_seq[terminal_id] = (
+                                        _delivery_wake_seq.get(terminal_id, 0) + 1)
+                                return
+                    if ambiguous_count >= 3:
+                        if transition_pending_to_delivery_failed(message_ids):
+                            self._notify_delivery_failed(terminal_id, message_ids)
+                        logger.warning("Delivery ambiguity cap reached for terminal %s messages %s",
+                                       terminal_id, message_ids)
+                        return
+                    shape_type = (
+                        None if registry is None and
+                        orchestration_type == OrchestrationType.SEND_MESSAGE
+                        else orchestration_type
+                    )
+                    prepared = terminal_service.prepare_input(terminal_id, combined, shape_type)
+                    digest = wire_hash(prepared)
+                    provider_name = metadata.get("provider", "unknown")
+                    attempt_uuid = begin_delivery_attempt(
+                        batch, terminal_id, provider_name, digest, len(prepared.encode()),
+                        status_monitor.get_input_gen(terminal_id),
+                        status_monitor.get_status_gen(terminal_id),
+                        evidence=json.dumps(transcript_ref(path)),
+                    )
+                    terminal_service.send_prepared_input(
+                        terminal_id, prepared, defer_on_dialog=True, registry=registry,
+                        sender_id=sender_id, orchestration_type=shape_type,
+                        original_message=combined)
+                    trace = get_message_trace(batch[0].id)
+                    current_attempt = next(x for x in trace["attempts"]
+                                           if x["attempt_uuid"] == attempt_uuid)
+                    outcome, evidence = confirm_delivery(
+                        metadata, digest, current_attempt["started_at"],
+                        current_attempt.get("evidence"))
+                    if outcome in {"hit", "unverified"}:
+                        settle_delivery_attempt(
+                            attempt_uuid, MessageStatus.DELIVERED, "confirmed",
+                            evidence=json.dumps(evidence),
+                            settled_status_gen=status_monitor.get_status_gen(terminal_id),
+                            on_confirmed=lambda: self._commit_watchdog_ops(
+                                terminal_id, sender_id, orchestration_type, metadata),
                         )
+                    else:
+                        settle_delivery_attempt(attempt_uuid, MessageStatus.PENDING,
+                                                "ambiguous", reason="confirmation_timeout",
+                                                evidence=json.dumps(evidence),
+                                                settled_status_gen=status_monitor.get_status_gen(terminal_id))
+                        with _delivery_seq_guard:
+                            _delivery_wake_seq[terminal_id] = _delivery_wake_seq.get(terminal_id, 0) + 1
+                        return
                     logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
                     self._evict_defer_state(batch)
                 except DeliveryDeferredError:
                     self._record_delivery_deferred(terminal_id, batch)
-                    _defer_messages(terminal_id, messages[sent_count:])
+                    if attempt_uuid:
+                        settle_delivery_attempt(attempt_uuid, MessageStatus.PENDING, "deferred",
+                                                reason="delivery_deferred")
+                    else:
+                        _defer_messages(terminal_id, messages[sent_count:])
+                    with _delivery_seq_guard:
+                        _delivery_wake_seq[terminal_id] = _delivery_wake_seq.get(terminal_id, 0) + 1
                     return
                 except TerminalInputBlockedError:
-                    _defer_messages(terminal_id, messages[sent_count:])
+                    if attempt_uuid:
+                        settle_delivery_attempt(attempt_uuid, MessageStatus.PENDING, "deferred",
+                                                reason="input_blocked")
+                    else: _defer_messages(terminal_id, messages[sent_count:])
+                    with _delivery_seq_guard:
+                        _delivery_wake_seq[terminal_id] = _delivery_wake_seq.get(terminal_id, 0) + 1
                     return
                 except TerminalNotFoundError as e:
                     self._evict_defer_state(batch)
@@ -258,19 +373,29 @@ class InboxService:
                     # for this window). Treat as transient: reset to PENDING so the
                     # reconcile sweep retries rather than marking FAILED. These were
                     # optimistically set to DELIVERED above. (#271 semantic.)
-                    for message in batch:
-                        update_message_status(message.id, MessageStatus.PENDING)
+                    if attempt_uuid:
+                        settle_delivery_attempt(attempt_uuid, MessageStatus.PENDING, "interrupted",
+                                                reason="terminal_not_found", error=str(e))
+                    else:
+                        for message in batch: update_message_status(message.id, MessageStatus.PENDING)
                     logger.warning(
                         f"Pane not resolvable for terminal {terminal_id}; leaving "
                         f"{len(batch)} message(s) pending for retry: {e}"
                     )
+                    with _delivery_seq_guard:
+                        _delivery_wake_seq[terminal_id] = _delivery_wake_seq.get(terminal_id, 0) + 1
                 except Exception as e:
                     self._evict_defer_state(batch)
+                    if attempt_uuid:
+                        settle_delivery_attempt(attempt_uuid, MessageStatus.FAILED, "failed",
+                                                reason=type(e).__name__, error=str(e))
                     for message in batch:
                         logger.error(
                             f"Failed to deliver message {message.id} to {terminal_id}: {e}"
                         )
-                        update_message_status(message.id, MessageStatus.FAILED)
+                        if not attempt_uuid: update_message_status(message.id, MessageStatus.FAILED)
+                    with _delivery_seq_guard:
+                        _delivery_wake_seq[terminal_id] = _delivery_wake_seq.get(terminal_id, 0) + 1
                 sent_count += len(batch)
 
     def poll_opencode_pending_messages(self, registry: PluginRegistry | None = None) -> None:
@@ -305,6 +430,60 @@ class InboxService:
                 self.deliver_pending(terminal_id, registry=registry)
             except Exception as e:
                 logger.debug(f"Inbox reconciliation failed for {terminal_id}: {e}")
+
+    def recover_stale_deliveries(self) -> None:
+        """Settle DELIVERING rows left by a process crash before consumers start."""
+        seen_attempts: set[str] = set()
+        for message in list_stale_delivering_messages():
+            trace = get_message_trace(message.id)
+            if not trace or not trace["attempts"]:
+                update_message_status(message.id, MessageStatus.DELIVERY_FAILED)
+                self._notify_delivery_failed(message.receiver_id, [message.id])
+                continue
+            attempt = trace["attempts"][-1]
+            attempt_uuid = attempt["attempt_uuid"]
+            if attempt_uuid in seen_attempts:
+                continue
+            seen_attempts.add(attempt_uuid)
+            message_ids = list_attempt_member_ids(attempt_uuid) or [message.id]
+            metadata = get_terminal_metadata(message.receiver_id)
+            if not metadata:
+                settle_delivery_attempt(attempt_uuid, MessageStatus.FAILED,
+                                        "failed", reason="receiver_metadata_gone")
+                continue
+            try:
+                from cli_agent_orchestrator.backends.registry import get_backend
+                get_backend().get_history(metadata["tmux_session"], metadata["tmux_window"],
+                                          tail_lines=1)
+            except Exception:
+                settle_delivery_attempt(attempt_uuid, MessageStatus.PENDING,
+                                        "interrupted", reason="pane_unresolvable")
+                continue
+            path = resolve_session_transcript(metadata)
+            if path is None:
+                settle_delivery_attempt(attempt_uuid, MessageStatus.PENDING,
+                                        "interrupted", reason="no_oracle")
+                continue
+            result, evidence = transcript_lookup(
+                path, attempt["payload_hash"], attempt.get("started_at"),
+                attempt.get("evidence"))
+            if result == "hit":
+                settle_delivery_attempt(
+                    attempt_uuid, MessageStatus.DELIVERED, "confirmed",
+                    reason="startup_sweep", evidence=json.dumps(evidence),
+                    on_confirmed=lambda: self._commit_watchdog_ops(
+                        message.receiver_id, attempt["sender_id"],
+                        OrchestrationType(attempt["orchestration_type"]), metadata),
+                )
+            elif result == "absent":
+                settle_delivery_attempt(attempt_uuid, MessageStatus.PENDING,
+                                        "interrupted", reason="proven_absent",
+                                        evidence=json.dumps(evidence))
+            else:
+                settle_delivery_attempt(attempt_uuid, MessageStatus.DELIVERY_FAILED,
+                                        "unresolved", reason="continuity_uncertain",
+                                        evidence=json.dumps(evidence))
+                self._notify_delivery_failed(message.receiver_id, message_ids)
 
 
 inbox_service = InboxService()

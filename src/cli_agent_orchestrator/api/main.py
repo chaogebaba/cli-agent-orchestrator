@@ -41,6 +41,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     get_inbox_messages,
+    get_message_trace,
     get_terminal_metadata,
     init_db,
 )
@@ -458,6 +459,7 @@ async def lifespan(app: FastAPI):
     init_db()
     purged = terminal_service.purge_stale_terminal_records()
     logger.info("purged %d stale terminals", purged)
+    inbox_service.recover_stale_deliveries()
     registry = PluginRegistry()
     await registry.load()
     app.state.plugin_registry = registry
@@ -1898,7 +1900,6 @@ async def create_inbox_message_endpoint(
             receiver_id,
             message,
         )
-        stalled_callback_watchdog.record_callback_if_to_caller(sender_id, receiver_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -1936,7 +1937,7 @@ async def get_inbox_messages_endpoint(
     Args:
         terminal_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10, max: 100)
-        status_param: Optional filter by message status ('pending', 'delivered', 'failed')
+        status_param: Optional message status filter
 
     Returns:
         List of inbox messages with sender_id, message, created_at, status
@@ -1950,7 +1951,8 @@ async def get_inbox_messages_endpoint(
             except ValueError:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid status: {status_param}. Valid values: pending, delivered, failed",
+                    detail=("Invalid status: %s. Valid values: pending, delivering, delivered, "
+                            "delivery_failed, failed" % status_param),
                 )
 
         # Get messages using existing database function
@@ -1983,6 +1985,17 @@ async def get_inbox_messages_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve inbox messages: {str(e)}",
         )
+
+
+@app.get("/messages/{message_id}/trace")
+async def get_message_trace_endpoint(
+    message_id: int,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
+) -> Dict:
+    trace = get_message_trace(message_id)
+    if trace is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+    return trace
 
 
 @app.websocket("/terminals/{terminal_id}/ws")

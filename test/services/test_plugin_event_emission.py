@@ -414,7 +414,13 @@ class TestMessagePluginEvents:
 
         registry.dispatch.assert_not_awaited()
 
-    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.confirm_delivery", return_value=("unverified", {"kind": "send_returned_unverified"}))
+    @patch("cli_agent_orchestrator.services.inbox_service.get_message_trace", return_value={"attempts": [{"attempt_uuid": "attempt-1", "started_at": "2026-07-11T00:00:00+00:00", "evidence": {}}]})
+    @patch("cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt", return_value="attempt-1")
+    @patch("cli_agent_orchestrator.services.inbox_service.list_message_attempts", return_value=[])
+    @patch("cli_agent_orchestrator.services.inbox_service.count_ambiguous_attempts", return_value=0)
+    @patch("cli_agent_orchestrator.services.inbox_service.get_terminal_metadata", return_value={"provider": "event"})
+    @patch("cli_agent_orchestrator.services.inbox_service.settle_delivery_attempt")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
@@ -425,9 +431,15 @@ class TestMessagePluginEvents:
         mock_provider_manager,
         mock_status_monitor,
         mock_terminal_service,
-        mock_update_message_status,
+        mock_settle,
+        _mock_metadata,
+        _mock_count,
+        _mock_attempts,
+        _mock_begin,
+        _mock_trace,
+        _mock_confirm,
     ):
-        """Queued inbox delivery should forward sender context and its stored mode."""
+        """No-trace/event-inbox carve-out keeps send bytes and event context unchanged."""
         registry = _registry_mock()
         message = MagicMock()
         message.id = 17
@@ -437,15 +449,20 @@ class TestMessagePluginEvents:
         mock_get_pending_messages.return_value = [message]
         # Status is sourced from the event-driven StatusMonitor, not the provider.
         mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_terminal_service.prepare_input.return_value = "Please review this"
 
         inbox_service.deliver_pending("abcd1234", registry=registry)
 
-        mock_terminal_service.send_input.assert_called_once_with(
+        mock_terminal_service.send_prepared_input.assert_called_once_with(
             "abcd1234",
             "Please review this",
+            original_message="Please review this",
             registry=registry,
             sender_id="supervisor-1",
             orchestration_type=OrchestrationType.SEND_MESSAGE,
             defer_on_dialog=True,
         )
-        mock_update_message_status.assert_called_once_with(17, MessageStatus.DELIVERED)
+        mock_settle.assert_called_once()
+        assert mock_settle.call_args.args[:3] == (
+            "attempt-1", MessageStatus.DELIVERED, "confirmed"
+        )

@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.stalled_callback_watchdog import StalledCallbackWatchdog
 
@@ -220,6 +221,23 @@ def test_watchdog_suppresses_notification_after_callback_to_recorded_caller():
     svc.record_status("worker1", TerminalStatus.IDLE, now=10.0)
 
     assert svc.collect_due_notifications(now=20.0) == []
+
+
+def test_msgtrace_confirmed_commit_performs_watchdog_operations_exactly_once():
+    """FX7 operations are grouped at the confirmed-delivery commit boundary."""
+    from cli_agent_orchestrator.services.inbox_service import InboxService
+
+    service = InboxService()
+    with patch(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.stalled_callback_watchdog"
+    ) as watchdog:
+        watchdog.has_episode.return_value = True
+        service._commit_watchdog_ops(
+            "worker1", "caller1", OrchestrationType.SEND_MESSAGE,
+            {"caller_id": "caller1", "agent_profile": "developer"},
+        )
+        watchdog.record_callback_if_to_caller.assert_called_once_with("caller1", "worker1")
+        watchdog.record_inbound_task.assert_called_once_with("worker1", "caller1", "developer")
 
 
 def test_watchdog_resets_on_new_task_after_firing():

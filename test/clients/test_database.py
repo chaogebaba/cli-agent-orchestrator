@@ -17,22 +17,29 @@ from cli_agent_orchestrator.clients.database import (
     create_flow,
     create_inbox_message,
     create_terminal,
+    begin_delivery_attempt,
+    confirm_batch_from_prior_attempt,
+    count_ambiguous_attempts,
     delete_flow,
     delete_terminal,
     delete_terminals_by_session,
     get_flow,
     get_inbox_messages,
+    get_message_trace,
     get_pending_messages,
     get_terminal_metadata,
     init_db,
     list_flows,
     list_pending_receiver_ids_by_provider,
+    list_pending_receiver_ids,
     list_pending_receiver_ids_older_than,
     list_terminals_by_session,
     update_flow_enabled,
     update_flow_run_times,
     update_last_active,
     update_message_status,
+    settle_delivery_attempt,
+    update_terminal_provider_session_id_if_null,
     update_terminal_shell_command,
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
@@ -63,6 +70,163 @@ class TestTerminalOperations:
         assert result["id"] == "test123"
         mock_session.add.assert_called_once()
         mock_session.commit.assert_called_once()
+
+
+class TestMessageTraceTransactions:
+    def test_confirmed_settle_cas_and_callback_are_exactly_once(self, test_db, monkeypatch):
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        monkeypatch.setattr(db_mod, "SessionLocal", test_db)
+        create_terminal("sender", "s", "sender", "codex")
+        create_terminal("receiver", "s", "receiver", "claude_code")
+        create_inbox_message("sender", "receiver", "wire")
+        message = get_pending_messages("receiver")[0]
+        attempt = begin_delivery_attempt([message], "receiver", "claude_code", "hash", 4)
+        calls = []
+        assert settle_delivery_attempt(
+            attempt, MessageStatus.DELIVERED, "confirmed",
+            on_confirmed=lambda: calls.append("commit"),
+        ) is True
+        assert settle_delivery_attempt(
+            attempt, MessageStatus.DELIVERED, "confirmed",
+            on_confirmed=lambda: calls.append("duplicate"),
+        ) is False
+        assert calls == ["commit"]
+        assert get_inbox_messages("receiver")[0].status == MessageStatus.DELIVERED
+
+    def test_crash_between_watchdog_callback_and_commit_rolls_back_for_recovery(
+        self, test_db, monkeypatch
+    ):
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        monkeypatch.setattr(db_mod, "SessionLocal", test_db)
+        create_terminal("sender", "s", "sender", "codex")
+        create_terminal("receiver", "s", "receiver", "claude_code")
+        create_inbox_message("sender", "receiver", "wire")
+        message = get_pending_messages("receiver")[0]
+        attempt = begin_delivery_attempt([message], "receiver", "claude_code", "hash", 4)
+        with pytest.raises(RuntimeError, match="crash"):
+            settle_delivery_attempt(
+                attempt, MessageStatus.DELIVERED, "confirmed",
+                on_confirmed=lambda: (_ for _ in ()).throw(RuntimeError("crash")),
+            )
+        assert get_inbox_messages("receiver")[0].status == MessageStatus.DELIVERING
+        calls = []
+        assert settle_delivery_attempt(
+            attempt, MessageStatus.DELIVERED, "confirmed",
+            on_confirmed=lambda: calls.append("recovered"),
+        ) is True
+        assert calls == ["recovered"]
+
+    def test_dedup_confirms_whole_batch_by_prior_reference_once(self, test_db, monkeypatch):
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        monkeypatch.setattr(db_mod, "SessionLocal", test_db)
+        create_terminal("sender", "s", "sender", "codex")
+        create_terminal("receiver", "s", "receiver", "claude_code")
+        create_inbox_message("sender", "receiver", "one")
+        create_inbox_message("sender", "receiver", "two")
+        messages = get_pending_messages("receiver", limit=2)
+        attempt = begin_delivery_attempt(messages, "receiver", "claude_code", "hash", 7)
+        settle_delivery_attempt(attempt, MessageStatus.PENDING, "ambiguous")
+        calls = []
+        ids = [message.id for message in messages]
+        assert confirm_batch_from_prior_attempt(
+            ids, attempt, on_confirmed=lambda: calls.append("watchdog")) is True
+        assert confirm_batch_from_prior_attempt(ids, attempt) is False
+        assert calls == ["watchdog"]
+        assert [row.status for row in get_inbox_messages("receiver")] == [
+            MessageStatus.DELIVERED, MessageStatus.DELIVERED]
+
+    def test_codex_session_self_heal_preserves_concurrent_winner(self, test_db, monkeypatch):
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        monkeypatch.setattr(db_mod, "SessionLocal", test_db)
+        create_terminal("term", "s", "w", "codex", provider_session_id="winner")
+        assert update_terminal_provider_session_id_if_null("term", "stale") == "winner"
+        assert get_terminal_metadata("term")["provider_session_id"] == "winner"
+
+    def test_deferred_attempts_coalesce_but_settled_ambiguous_is_immutable(
+        self, test_db, monkeypatch
+    ):
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        monkeypatch.setattr(db_mod, "SessionLocal", test_db)
+        create_terminal("sender", "s", "sender", "codex")
+        create_terminal("receiver", "s", "receiver", "claude_code")
+        create_inbox_message("sender", "receiver", "wire")
+        message = get_pending_messages("receiver")[0]
+        first = begin_delivery_attempt([message], "receiver", "claude_code", "hash", 4)
+        assert settle_delivery_attempt(
+            first, MessageStatus.PENDING, "deferred", reason="composer_unconfirmed")
+        second = begin_delivery_attempt([message], "receiver", "claude_code", "hash", 4)
+        assert settle_delivery_attempt(
+            second, MessageStatus.PENDING, "deferred", reason="composer_unconfirmed")
+        trace = get_message_trace(message.id)
+        assert len(trace["attempts"]) == 1
+        assert trace["attempts"][0]["count"] == 2
+
+        ambiguous = begin_delivery_attempt([message], "receiver", "claude_code", "new", 3)
+        assert settle_delivery_attempt(
+            ambiguous, MessageStatus.PENDING, "ambiguous", evidence='{"kind":"absent"}')
+        assert settle_delivery_attempt(
+            ambiguous, MessageStatus.FAILED, "failed", error="overwrite") is False
+        settled = get_message_trace(message.id)["attempts"][-1]
+        assert settled["outcome"] == "ambiguous"
+        assert settled["evidence"] == {"kind": "absent"}
+
+    def test_multi_attempt_prior_hit_confirms_while_latest_attempt_is_pending(
+        self, test_db, monkeypatch
+    ):
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        monkeypatch.setattr(db_mod, "SessionLocal", test_db)
+        create_terminal("sender", "s", "sender", "codex")
+        create_terminal("receiver", "s", "receiver", "claude_code")
+        create_inbox_message("sender", "receiver", "wire")
+        message = get_pending_messages("receiver")[0]
+        first = begin_delivery_attempt([message], "receiver", "claude_code", "hash-1", 6)
+        settle_delivery_attempt(first, MessageStatus.PENDING, "ambiguous")
+        second = begin_delivery_attempt([message], "receiver", "claude_code", "hash-2", 6)
+        settle_delivery_attempt(second, MessageStatus.PENDING, "ambiguous")
+        assert get_inbox_messages("receiver")[0].status == MessageStatus.PENDING
+        assert confirm_batch_from_prior_attempt([message.id], first) is True
+        trace = get_message_trace(message.id)
+        assert trace["message"]["status"] == MessageStatus.DELIVERED.value
+        assert trace["attempts"][0]["attempt_uuid"] == first
+        assert trace["attempts"][1]["prior_attempt_uuid"] == first
+
+    def test_ambiguity_cap_is_restart_durable_and_ignores_other_outcomes(
+        self, test_db, monkeypatch
+    ):
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        monkeypatch.setattr(db_mod, "SessionLocal", test_db)
+        create_terminal("sender", "s", "sender", "codex")
+        create_terminal("receiver", "s", "receiver", "claude_code")
+        create_inbox_message("sender", "receiver", "wire")
+        message = get_pending_messages("receiver")[0]
+        for outcome in ("ambiguous", "interrupted", "unresolved", "ambiguous"):
+            attempt = begin_delivery_attempt([message], "receiver", "claude_code", outcome, 4)
+            settle_delivery_attempt(attempt, MessageStatus.PENDING, outcome)
+        assert count_ambiguous_attempts([message.id]) == 2
+        # A fresh service/process derives the next count from durable rows.
+        third = begin_delivery_attempt([message], "receiver", "claude_code", "third", 5)
+        settle_delivery_attempt(third, MessageStatus.PENDING, "ambiguous")
+        assert count_ambiguous_attempts([message.id]) == 3
+
+    def test_delivery_failed_is_excluded_from_waiting_inbox_receivers(
+        self, test_db, monkeypatch
+    ):
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        monkeypatch.setattr(db_mod, "SessionLocal", test_db)
+        create_terminal("sender", "s", "sender", "codex")
+        create_terminal("receiver", "s", "receiver", "claude_code")
+        create_inbox_message("sender", "receiver", "wire")
+        message = get_pending_messages("receiver")[0]
+        update_message_status(message.id, MessageStatus.DELIVERY_FAILED)
+        assert list_pending_receiver_ids() == []
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_get_terminal_metadata_found(self, mock_session_class):
@@ -320,6 +484,12 @@ class TestTerminalOperations:
 
 class TestInboxOperations:
     """Tests for inbox database operations."""
+
+    def test_message_status_storage_is_additive_unconstrained_text(self):
+        """Database-facing enum exposes all five honest delivery states."""
+        assert [status.value for status in MessageStatus] == [
+            "pending", "delivering", "delivered", "delivery_failed", "failed"
+        ]
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_update_message_status(self, mock_session_class):

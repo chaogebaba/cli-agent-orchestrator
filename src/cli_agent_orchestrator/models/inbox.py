@@ -18,7 +18,9 @@ class MessageStatus(str, Enum):
     """Message status enumeration."""
 
     PENDING = "pending"
+    DELIVERING = "delivering"
     DELIVERED = "delivered"
+    DELIVERY_FAILED = "delivery_failed"
     FAILED = "failed"
 
 

@@ -115,7 +115,7 @@ class TestGetInboxMessagesEndpoint:
         data = response.json()
         assert "detail" in data
         assert "Invalid status" in data["detail"]
-        assert "pending, delivered, failed" in data["detail"]
+        assert "pending, delivering, delivered, delivery_failed, failed" in data["detail"]
 
     def test_limit_exceeds_maximum(self, client):
         """Test that limit parameter is properly validated."""
@@ -184,7 +184,7 @@ class TestGetInboxMessagesEndpoint:
 
     def test_all_status_values(self, client, sample_inbox_messages):
         """Test filtering by each possible status value."""
-        for status_value in ["pending", "delivered", "failed"]:
+        for status_value in [status.value for status in MessageStatus]:
             filtered_messages = [
                 msg for msg in sample_inbox_messages if msg.status.value == status_value
             ]
@@ -200,6 +200,32 @@ class TestGetInboxMessagesEndpoint:
 
                 for msg_data in data:
                     assert msg_data["status"] == status_value
+
+
+class TestMessageTraceEndpoint:
+    def test_trace_http_golden(self, client):
+        trace = {
+            "message": {
+                "id": 7, "sender_id": "sender", "receiver_id": "receiver",
+                "status": "delivered", "created_at": "2026-07-11T00:00:00",
+            },
+            "attempts": [{
+                "attempt_uuid": "attempt-1", "outcome": "confirmed",
+                "payload_hash": "abc", "payload_length": 3,
+                "evidence": {"kind": "transcript_user_turn", "offset": 12},
+                "position": 0,
+            }],
+        }
+        with patch("cli_agent_orchestrator.api.main.get_message_trace", return_value=trace):
+            response = client.get("/messages/7/trace")
+        assert response.status_code == 200
+        assert response.json() == trace
+
+    def test_trace_http_missing_message_is_404(self, client):
+        with patch("cli_agent_orchestrator.api.main.get_message_trace", return_value=None):
+            response = client.get("/messages/404/trace")
+        assert response.status_code == 404
+        assert response.json() == {"detail": "Message not found"}
 
 
 class TestDatabaseFunctionCompatibility:

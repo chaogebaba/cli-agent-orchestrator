@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import time
+import uuid
 from pathlib import Path
 from typing import List, Optional
 
@@ -171,6 +172,7 @@ class ClaudeCodeProvider(BaseProvider):
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        self.allocated_session_uuid = str(uuid.uuid4())
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
         # lives on BaseProvider and is consumed by _resolve_native_status().
 
@@ -218,6 +220,7 @@ class ClaudeCodeProvider(BaseProvider):
             command_parts = ["claude"]
         else:
             command_parts = ["claude", "--dangerously-skip-permissions"]
+        command_parts.extend(["--session-id", self.allocated_session_uuid])
 
         # Route based on profile state
         native = getattr(profile, "native_agent", None) if profile else None
