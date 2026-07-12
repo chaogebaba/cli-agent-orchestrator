@@ -108,6 +108,44 @@ class TestListSessions:
         assert "N/A" in result.output
 
 
+class TestRecover:
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_recover_json_contract(self, mock_post, runner):
+        mock_post.return_value.json.return_value = {
+            "session": "cao-test",
+            "results": [{
+                "terminal_id": "term-a", "status": "rebound", "retryable": False,
+                "error_code": None, "interrupted_turn": True,
+                "requires_supervisor_reconciliation": True,
+            }],
+            "manifest_error": None,
+        }
+        result = runner.invoke(session, [
+            "recover", "cao-test", "--reason", "provider-reauth",
+            "--terminal", "term-a", "--interrupt", "--json",
+        ])
+        assert result.exit_code == 0
+        assert __import__("json").loads(result.output)["results"][0]["interrupted_turn"] is True
+        assert mock_post.call_args.kwargs["json"] == {
+            "reason": "provider-reauth", "provider": "codex",
+            "terminal_ids": ["term-a"], "interrupt": True,
+            "acknowledge_ownership": False,
+        }
+
+    def test_recover_requires_explicit_reason(self, runner):
+        result = runner.invoke(session, ["recover", "cao-test"])
+        assert result.exit_code != 0
+        assert "--reason" in result.output
+
+    def test_acknowledge_ownership_requires_exactly_one_terminal(self, runner):
+        result = runner.invoke(session, [
+            "recover", "cao-test", "--reason", "provider-reauth",
+            "--acknowledge-ownership",
+        ])
+        assert result.exit_code != 0
+        assert "exactly one --terminal" in result.output
+
+
 class TestStatus:
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
     def test_status_success(self, mock_get, runner):

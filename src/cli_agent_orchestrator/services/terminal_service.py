@@ -81,10 +81,47 @@ _memory_injected_lock = threading.Lock()
 # deferred provider.initialize() + input-send task could be GC'd mid-run,
 # silently leaving a worker uninitialized. Tasks drop themselves on completion.
 _deferred_init_tasks: set = set()
+_deferred_tasks_by_terminal: dict[str, asyncio.Task] = {}
+_deferred_tasks_lock = threading.Lock()
 
 
 class TerminalInputBlockedError(Exception):
     """Raised when orchestrated input would answer an active interactive prompt."""
+
+
+def has_deferred_init(terminal_id: str) -> bool:
+    with _deferred_tasks_lock:
+        task = _deferred_tasks_by_terminal.get(terminal_id)
+        return task is not None and not task.done()
+
+
+def _persist_provider_runtime_identity(provider_instance, terminal_id: str) -> None:
+    """Persist resumable identity after init and before initial task delivery."""
+    if getattr(provider_instance, "supports_reauth_rebind", False) is not True:
+        shell = provider_instance.shell_baseline
+        if isinstance(shell, str) and shell:
+            update_terminal_shell_command(terminal_id, shell)
+        return
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata:
+        raise RuntimeError("terminal_metadata_missing")
+    from cli_agent_orchestrator.clients.database import update_terminal_runtime_identity
+    from cli_agent_orchestrator.services.fork_context_service import pane_launch_epoch, pane_pid
+
+    pid = pane_pid(metadata["tmux_session"], metadata["tmux_window"])
+    cwd = get_backend().get_pane_working_directory(
+        metadata["tmux_session"], metadata["tmux_window"]
+    )
+    allocated = getattr(provider_instance, "allocated_session_uuid", None)
+    session_uuid = allocated or provider_instance.capture_session_uuid(
+        pid, pane_launch_epoch(pid), cwd
+    )
+    provider_instance.validate_session_artifact(session_uuid, cwd)
+    shell = provider_instance.shell_baseline or metadata.get("shell_command")
+    if not shell:
+        raise RuntimeError("shell_baseline_unavailable")
+    if not update_terminal_runtime_identity(terminal_id, session_uuid, shell):
+        raise RuntimeError("terminal_identity_persist_failed")
 
 
 def purge_stale_terminal_records() -> int:
@@ -485,9 +522,6 @@ async def create_terminal(
         allocated_uuid = getattr(provider_instance, "allocated_session_uuid", None)
         if not isinstance(allocated_uuid, str):
             allocated_uuid = None
-        if allocated_uuid:
-            from cli_agent_orchestrator.clients.database import update_terminal_provider_session_id
-            update_terminal_provider_session_id(terminal_id, allocated_uuid)
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
         # block on `provider.initialize()`. The remaining initialize + input
@@ -509,6 +543,7 @@ async def create_terminal(
             )
         else:
             await provider_instance.initialize()
+            _persist_provider_runtime_identity(provider_instance, terminal_id)
 
             # Persist shell_command baseline if the provider captured one
             shell_command = provider_instance.shell_baseline
@@ -666,6 +701,7 @@ def _schedule_deferred_init(
         caller_id: Optional[str] = None
         try:
             await provider_instance.initialize()
+            _persist_provider_runtime_identity(provider_instance, terminal_id)
             shell_command = provider_instance.shell_baseline
             if isinstance(shell_command, str) and shell_command:
                 update_terminal_shell_command(terminal_id, shell_command)
@@ -757,7 +793,16 @@ def _schedule_deferred_init(
         return
     task = loop.create_task(_run())
     _deferred_init_tasks.add(task)
-    task.add_done_callback(_deferred_init_tasks.discard)
+    with _deferred_tasks_lock:
+        _deferred_tasks_by_terminal[terminal_id] = task
+
+    def _done(completed):
+        _deferred_init_tasks.discard(completed)
+        with _deferred_tasks_lock:
+            if _deferred_tasks_by_terminal.get(terminal_id) is completed:
+                _deferred_tasks_by_terminal.pop(terminal_id, None)
+
+    task.add_done_callback(_done)
 
 
 def get_terminal(terminal_id: str) -> Dict:
@@ -1275,7 +1320,27 @@ def provider_session_owner(session_uuid: str) -> dict:
 
 
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
+    from cli_agent_orchestrator.services.rebind_lease import (
+        acquire_rebind_lease,
+        release_rebind_lease,
+    )
+
+    token = acquire_rebind_lease(terminal_id)
+    if token is None:
+        raise RuntimeError("rebind_in_progress")
+    try:
+        return _delete_terminal_under_lease(terminal_id, token, registry=registry)
+    finally:
+        release_rebind_lease(token)
+
+
+def _delete_terminal_under_lease(
+    terminal_id: str, lease_token, registry: PluginRegistry | None = None,
+) -> bool:
     """Delete terminal and kill its tmux window."""
+    from cli_agent_orchestrator.services.rebind_lease import validate_rebind_lease
+
+    validate_rebind_lease(terminal_id, lease_token)
     try:
         # Unregister from herdr inbox service
         svc = get_herdr_inbox_service()

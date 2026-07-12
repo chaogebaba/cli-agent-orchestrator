@@ -103,6 +103,7 @@ def _resolve_string_option(
 
 class GrokCliProvider(BaseProvider):
     supports_fork_context = True
+    supports_reauth_rebind = True
     """Provider for Grok Build's interactive CLI."""
 
     supports_screen_detection = True
@@ -245,12 +246,39 @@ class GrokCliProvider(BaseProvider):
             raise ProviderError("base_session_unset")
         return self.allocated_session_uuid
 
-    async def initialize(self) -> bool:
+    def validate_session_artifact(self, session_uuid: str, cwd: str) -> None:
+        path = Path.home() / ".grok" / "sessions" / quote(cwd, safe="") / session_uuid / "chat_history.jsonl"
+        if not path.is_file() or path.stat().st_size == 0:
+            raise ValueError("session_artifact_missing_or_inert")
+
+    def provider_process_started_at(self, pane_pid: int) -> float | None:
+        from cli_agent_orchestrator.services.fork_context_service import _descendants
+
+        matches = []
+        for pid in _descendants(pane_pid):
+            try:
+                if b"grok" in Path(f"/proc/{pid}/cmdline").read_bytes():
+                    matches.append(pid)
+            except OSError:
+                pass
+        if len(matches) != 1:
+            return None
+        stat = Path(f"/proc/{matches[0]}/stat").read_text().split()
+        btime = next(float(x.split()[1]) for x in Path("/proc/stat").read_text().splitlines() if x.startswith("btime "))
+        return btime + float(stat[21]) / os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+
+    async def initialize(
+        self, *, coordinates: tuple[str, str] | None = None,
+        provider_override=None, raw_status: bool = False,
+    ) -> bool:
         """Start Grok and wait for the prompt/footer to become interactive."""
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         init_timeout = get_server_settings()["provider_init_timeout"]
-        if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
+        shell_kwargs = {"timeout": init_timeout}
+        if coordinates is not None:
+            shell_kwargs["coordinates"] = coordinates
+        if not await wait_for_shell(self.terminal_id, **shell_kwargs):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
         self.shell_baseline = get_backend().get_pane_current_command(
@@ -261,11 +289,16 @@ class GrokCliProvider(BaseProvider):
         status_monitor.notify_input_sent(self.terminal_id)
         get_backend().send_keys(self.session_name, self.window_name, command)
 
+        status_kwargs = dict(
+            timeout=float(get_server_settings()["provider_init_timeout"]),
+            polling_interval=1.0,
+        )
+        if provider_override is not None or raw_status:
+            status_kwargs.update(provider_override=provider_override, raw_status=raw_status)
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=float(get_server_settings()["provider_init_timeout"]),
-            polling_interval=1.0,
+            **status_kwargs,
         ):
             raise TimeoutError(f"Grok CLI initialization timed out after {init_timeout}s")
 

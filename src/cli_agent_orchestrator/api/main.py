@@ -440,6 +440,28 @@ class CreateFlowRequest(BaseModel):
         return v
 
 
+class SessionRecoverRequest(BaseModel):
+    reason: str
+    provider: str = "codex"
+    terminal_ids: List[str] = Field(default_factory=list)
+    interrupt: bool = False
+    acknowledge_ownership: bool = False
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        if value != "provider-reauth":
+            raise ValueError("reason must be 'provider-reauth'")
+        return value
+
+    @field_validator("provider")
+    @classmethod
+    def validate_provider(cls, value: str) -> str:
+        if value not in {"codex", "grok_cli"}:
+            raise ValueError("provider must be codex or grok_cli")
+        return value
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -1113,6 +1135,29 @@ async def get_session_manifest(session_name: str) -> Dict:
         return build_session_manifest(session_name)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+
+@app.post("/sessions/{session_name}/recover")
+async def recover_session(
+    session_name: str,
+    body: SessionRecoverRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Explicitly recover provider-native sessions after provider reauth."""
+    try:
+        validate_tmux_name(session_name, "session_name")
+        from cli_agent_orchestrator.services.provider_rebind_service import (
+            recover_provider_reauth,
+        )
+        return await recover_provider_reauth(
+            session_name,
+            provider=body.provider,
+            terminal_ids=body.terminal_ids or None,
+            interrupt=body.interrupt,
+            acknowledge_ownership=body.acknowledge_ownership,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
 
 @app.delete("/sessions/{session_name}")

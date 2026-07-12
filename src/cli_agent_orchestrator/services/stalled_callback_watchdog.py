@@ -8,6 +8,7 @@ import logging
 import re
 import threading
 import time
+import copy
 from dataclasses import dataclass
 
 from cli_agent_orchestrator.clients.database import (
@@ -70,10 +71,42 @@ class StalledCallbackWatchdog:
         self._episodes: dict[str, _Episode] = {}
         self._waiting_inbox_episodes: dict[str, WaitingInboxEpisode] = {}
         self._waiting_inbox_last_push: dict[str, float] = {}
+        self._paused: set[str] = set()
+
+    def pause_terminal(self, terminal_id: str):
+        with self._lock:
+            self._paused.add(terminal_id)
+            return copy.deepcopy(self._episodes.get(terminal_id)), time.monotonic()
+
+    def resume_terminal(self, terminal_id: str, snapshot) -> None:
+        episode, started = snapshot
+        elapsed = time.monotonic() - started
+        with self._lock:
+            if episode is not None and episode.idle_since is not None:
+                episode.idle_since += elapsed
+            if episode is not None:
+                self._episodes[terminal_id] = episode
+            self._paused.discard(terminal_id)
+
+    def repair_terminal_after_resume_failure(self, terminal_id: str, snapshot) -> None:
+        """Best-effort, non-raising P14 repair used before releasing quarantine locks."""
+        try:
+            episode, started = snapshot
+            elapsed = time.monotonic() - started
+        except Exception:
+            episode, elapsed = None, 0.0
+        with self._lock:
+            if episode is not None and episode.idle_since is not None:
+                episode.idle_since += elapsed
+            if episode is not None:
+                self._episodes[terminal_id] = episode
+            self._paused.discard(terminal_id)
 
     def record_inbound_task(self, terminal_id: str, caller_id: str, profile: str) -> None:
         now = time.monotonic()
         with self._lock:
+            if terminal_id in self._paused:
+                return
             self._episodes[terminal_id] = _Episode(
                 caller_id=caller_id,
                 profile=profile,
@@ -95,6 +128,8 @@ class StalledCallbackWatchdog:
         if not meta or meta.get("caller_id") != receiver_id:
             return
         with self._lock:
+            if sender_id in self._paused:
+                return
             episode = self._episodes.get(sender_id)
             if episode and episode.caller_id == receiver_id:
                 episode.callback_seen = True
@@ -107,6 +142,8 @@ class StalledCallbackWatchdog:
     ) -> None:
         now = time.monotonic() if now is None else now
         with self._lock:
+            if terminal_id in self._paused:
+                return
             episode = self._episodes.get(terminal_id)
             if episode is None:
                 return
@@ -124,7 +161,7 @@ class StalledCallbackWatchdog:
             terminal_ids = [
                 terminal_id
                 for terminal_id, episode in self._episodes.items()
-                if not episode.callback_seen and not episode.fired
+                if terminal_id not in self._paused and not episode.callback_seen and not episode.fired
             ]
 
         if not terminal_ids:
@@ -147,7 +184,8 @@ class StalledCallbackWatchdog:
             terminal_ids = [
                 terminal_id
                 for terminal_id, episode in self._episodes.items()
-                if not episode.callback_seen
+                if terminal_id not in self._paused
+                and not episode.callback_seen
                 and not episode.fired
                 and episode.idle_since is not None
             ]
@@ -205,6 +243,8 @@ class StalledCallbackWatchdog:
         due: list[tuple[str, str, str]] = []
         with self._lock:
             for terminal_id, episode in list(self._episodes.items()):
+                if terminal_id in self._paused:
+                    continue
                 if get_terminal_metadata(terminal_id) is None:
                     self._episodes.pop(terminal_id, None)
                     continue

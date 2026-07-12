@@ -63,6 +63,34 @@ def test_manifest_projection_and_renderer_are_safe_and_deterministic(monkeypatch
     assert "use " not in brief.lower()
 
 
+def test_auth_staleness_current_is_observation_only(monkeypatch, tmp_path):
+    _seed(monkeypatch)
+    marker = tmp_path / "auth.json"
+    marker.write_text("{}")
+    os = __import__("os")
+    os.utime(marker, (100, 100))
+    monkeypatch.setattr(svc, "list_terminals_by_session", lambda _name: [{
+        "id": "term0001", "agent_profile": "supervisor", "provider": "codex",
+        "caller_id": None, "tmux_session": "cao-test", "tmux_window": "w",
+    }])
+    provider = SimpleNamespace(
+        provider_process_started_at=lambda _pid: 200,
+        auth_state_path=lambda: marker,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
+        lambda _tid: provider,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.fork_context_service.pane_pid", lambda *_a: 1
+    )
+    manifest = svc.build_session_manifest("cao-test")
+    assert manifest["terminals"][0]["auth_staleness"] == "current"
+    encoded = json.dumps(manifest).lower()
+    assert "session recover" not in encoded
+    assert "provider-reauth" not in encoded
+
+
 def test_http_endpoint_uses_builder_once_and_preserves_safe_snapshot(monkeypatch):
     from cli_agent_orchestrator.api.main import app
 

@@ -59,6 +59,7 @@ class HerdrInboxService:
         # Managed pane tracking
         self._pane_to_terminal: Dict[str, str] = {}  # pane_id → terminal_id
         self._terminal_to_pane: Dict[str, str] = {}  # terminal_id → pane_id
+        self._native_event_gen: Dict[tuple[str, str], int] = {}
 
         # Kiro-specific tracking for supplement check
         self._kiro_terminals: Set[str] = set()  # terminal_ids using kiro-cli
@@ -104,6 +105,9 @@ class HerdrInboxService:
             pane_id: Current herdr compact pane_id
             is_kiro: Whether this terminal runs kiro-cli (enables supplement check)
         """
+        prior_pane = self._terminal_to_pane.get(terminal_id)
+        if prior_pane and prior_pane != pane_id:
+            self._pane_to_terminal.pop(prior_pane, None)
         self._pane_to_terminal[pane_id] = terminal_id
         self._terminal_to_pane[terminal_id] = pane_id
         if is_kiro:
@@ -568,6 +572,8 @@ class HerdrInboxService:
             terminal_id = self._pane_to_terminal.get(pane_id)
             if not terminal_id:
                 continue
+            key = (terminal_id, pane_id)
+            self._native_event_gen[key] = self._native_event_gen.get(key, 0) + 1
 
             if status in ("idle", "done"):
                 # Clear working timestamp
@@ -580,6 +586,10 @@ class HerdrInboxService:
                 if terminal_id in self._kiro_terminals:
                     if terminal_id not in self._working_since:
                         self._working_since[terminal_id] = time.time()
+
+    def get_native_event_gen(self, terminal_id: str, pane_id: str) -> int:
+        """Return native status events routed from this exact pane incarnation."""
+        return self._native_event_gen.get((terminal_id, pane_id), 0)
 
     def _label_still_live(self, window_name: str) -> bool:
         """Return True if a tab with this label is still live in herdr.

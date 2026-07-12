@@ -171,7 +171,7 @@ class TestGetSession:
 
 
 class TestDeleteSession:
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_under_lease")
     @patch("cli_agent_orchestrator.services.terminal_guard_service.require_delete_allowed")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
@@ -191,7 +191,7 @@ class TestDeleteSession:
 
     """Tests for delete_session function."""
 
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_under_lease")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_success(
@@ -218,10 +218,11 @@ class TestDeleteSession:
         mock_get_backend.return_value.kill_session.assert_called_once_with("cao-test")
         # Each terminal is torn down via the event-driven delete_terminal path.
         assert mock_delete_terminal.call_count == 2
-        mock_delete_terminal.assert_any_call("terminal1", registry=ANY)
-        mock_delete_terminal.assert_any_call("terminal2", registry=ANY)
+        assert [call.args[0] for call in mock_delete_terminal.call_args_list] == [
+            "terminal1", "terminal2"
+        ]
 
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_under_lease")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_when_backend_session_already_gone(
@@ -236,9 +237,9 @@ class TestDeleteSession:
 
         assert result == {"deleted": ["cao-test"], "errors": []}
         mock_get_backend.return_value.kill_session.assert_not_called()
-        mock_delete_terminal.assert_called_once_with("terminal1", registry=ANY)
+        assert mock_delete_terminal.call_args.args[0] == "terminal1"
 
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_under_lease")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_no_terminals(
@@ -264,7 +265,7 @@ class TestDeleteSession:
         with pytest.raises(Exception, match="Database error"):
             delete_session("cao-test")
 
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_under_lease")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_continues_when_terminal_cleanup_fails(
@@ -294,7 +295,7 @@ class TestDeleteSession:
         assert mock_delete_terminal.call_count == 3
 
     @patch("cli_agent_orchestrator.services.session_service.time.sleep")
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_under_lease")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_retries_when_session_survives_initial_kill(
@@ -313,7 +314,7 @@ class TestDeleteSession:
         mock_sleep.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.session_service.time.sleep")
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_under_lease")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_raises_when_session_remains_after_retries(
@@ -329,7 +330,7 @@ class TestDeleteSession:
 
         assert backend.kill_session.call_count == 6
 
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_under_lease")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_cleans_up_each_terminal(
@@ -349,7 +350,6 @@ class TestDeleteSession:
         assert result == {"deleted": ["cao-multi-terminal"], "errors": []}
         # Verify delete_terminal was called for each terminal with the correct ID
         assert mock_delete_terminal.call_count == 4
-        mock_delete_terminal.assert_any_call("term-aaa", registry=ANY)
-        mock_delete_terminal.assert_any_call("term-bbb", registry=ANY)
-        mock_delete_terminal.assert_any_call("term-ccc", registry=ANY)
-        mock_delete_terminal.assert_any_call("term-ddd", registry=ANY)
+        assert [call.args[0] for call in mock_delete_terminal.call_args_list] == [
+            "term-aaa", "term-bbb", "term-ccc", "term-ddd"
+        ]

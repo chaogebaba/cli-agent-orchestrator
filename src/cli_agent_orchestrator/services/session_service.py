@@ -136,6 +136,7 @@ def delete_session(
         Dict with 'deleted' (list of deleted session names) and 'errors' (list of error dicts).
     """
     result: Dict = {"deleted": [], "errors": []}
+    leases = []
     try:
         session_alive = get_backend().session_exists(session_name)
 
@@ -148,11 +149,27 @@ def delete_session(
         for terminal in terminals:
             require_delete_allowed(terminal["id"], force=force)
 
+        from cli_agent_orchestrator.services.rebind_lease import (
+            acquire_rebind_lease,
+            release_rebind_lease,
+        )
+
+        for terminal in sorted(terminals, key=lambda row: row["id"]):
+            token = acquire_rebind_lease(terminal["id"])
+            if token is None:
+                for held in reversed(leases):
+                    release_rebind_lease(held)
+                raise RuntimeError("rebind_in_progress")
+            leases.append(token)
+
         # Clean up each terminal (snapshot, kill window, FIFO reader,
         # status buffer, provider, DB) via the event-driven teardown path.
+        tokens = {token.terminal_id: token for token in leases}
         for terminal in terminals:
             try:
-                terminal_service.delete_terminal(terminal["id"], registry=registry)
+                terminal_service._delete_terminal_under_lease(
+                    terminal["id"], tokens[terminal["id"]], registry=registry
+                )
             except Exception as e:
                 logger.warning(f"Failed to cleanup terminal {terminal['id']}: {e}")
 
@@ -176,6 +193,10 @@ def delete_session(
         if backend.session_exists(session_name):
             raise RuntimeError(f"Session '{session_name}' still exists after teardown")
 
+        for token in reversed(leases):
+            release_rebind_lease(token)
+        leases.clear()
+
         # Drop the per-session forwarded-env mapping (issue #248). Safe
         # even when no vars were forwarded — the helper is a no-op then.
         clear_session_env(session_name)
@@ -190,5 +211,12 @@ def delete_session(
         return result
 
     except Exception as e:
+        if leases:
+            from cli_agent_orchestrator.services.rebind_lease import release_rebind_lease
+            for token in reversed(leases):
+                try:
+                    release_rebind_lease(token)
+                except Exception:
+                    pass
         logger.error(f"Failed to delete session {session_name}: {e}")
         raise

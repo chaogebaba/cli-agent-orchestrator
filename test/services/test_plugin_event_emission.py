@@ -86,7 +86,7 @@ class TestSessionPluginEvents:
 
         registry.dispatch.assert_not_awaited()
 
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_under_lease")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_dispatches_post_kill_session_event_after_cleanup(
@@ -116,7 +116,9 @@ class TestSessionPluginEvents:
         assert result == {"deleted": ["cao-demo"], "errors": []}
         assert call_order == ["delete_terminal", "kill_session", "dispatch"]
         # Each contained terminal is cleaned up via the event-driven teardown path.
-        mock_delete_terminal.assert_called_once_with("abcd1234", registry=registry)
+        assert mock_delete_terminal.call_count == 1
+        assert mock_delete_terminal.call_args.args[0] == "abcd1234"
+        assert mock_delete_terminal.call_args.kwargs["registry"] is registry
         event_type, event = registry.dispatch.await_args.args
         assert event_type == "post_kill_session"
         assert isinstance(event, PostKillSessionEvent)

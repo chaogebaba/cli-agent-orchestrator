@@ -27,6 +27,35 @@ class TestHerdrInboxServiceRegistration:
         assert service._terminal_to_pane["tid1"] == "w1-1"
         assert "tid1" not in service._kiro_terminals
 
+    def test_reregister_removes_old_reverse_mapping_and_old_event_cannot_prove(self):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid1", "pane-old")
+        service.register_terminal("tid1", "pane-new")
+        assert "pane-old" not in service._pane_to_terminal
+        assert service._pane_to_terminal == {"pane-new": "tid1"}
+        assert service.get_native_event_gen("tid1", "pane-old") == 0
+        assert service.get_native_event_gen("tid1", "pane-new") == 0
+
+    def test_late_old_pane_event_does_not_advance_new_pane_proof(self):
+        async def run():
+            service = HerdrInboxService(socket_path="/tmp/test.sock")
+            service.register_terminal("tid1", "pane-old")
+            service.register_terminal("tid1", "pane-new")
+            old_event = json.dumps({
+                "event": "pane.agent_status_changed",
+                "data": {"pane_id": "pane-old", "agent_status": "idle"},
+            }).encode() + b"\n"
+            service._reader = AsyncMock()
+            service._reader.readline.side_effect = [old_event, asyncio.CancelledError()]
+            try:
+                await service._event_loop()
+            except asyncio.CancelledError:
+                pass
+            assert service.get_native_event_gen("tid1", "pane-old") == 0
+            assert service.get_native_event_gen("tid1", "pane-new") == 0
+
+        _run_async(run())
+
     def test_register_kiro_terminal(self):
         """register_terminal with is_kiro=True tracks in kiro set."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")

@@ -5,6 +5,9 @@ import logging
 import re
 import shlex
 import time
+import json
+import os
+from pathlib import Path
 from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -317,6 +320,11 @@ class ProviderError(Exception):
 
 class CodexProvider(BaseProvider):
     supports_fork_context = True
+    supports_reauth_rebind = True
+
+    def capture_shell_baseline(self) -> str | None:
+        """Capture through this module's backend seam before Codex starts."""
+        return get_backend().get_pane_current_command(self.session_name, self.window_name)
     """Provider for Codex CLI tool integration."""
 
     def __init__(
@@ -488,6 +496,37 @@ class CodexProvider(BaseProvider):
         from cli_agent_orchestrator.services.fork_context_service import capture_codex_uuid
         return capture_codex_uuid(pane_pid, launch_time, cwd)
 
+    def validate_session_artifact(self, session_uuid: str, cwd: str) -> None:
+        matches = list((Path.home() / ".codex" / "sessions").glob(
+            f"**/rollout-*{session_uuid}*.jsonl"
+        ))
+        if len(matches) != 1:
+            raise ValueError("session_artifact_missing_or_ambiguous")
+        with matches[0].open(encoding="utf-8") as stream:
+            first = json.loads(stream.readline())
+        if first.get("type") != "session_meta" or first.get("payload", {}).get("id") != session_uuid:
+            raise ValueError("session_artifact_identity_invalid")
+
+    def auth_state_path(self) -> Path | None:
+        return Path.home() / ".codex" / "auth.json"
+
+    def provider_process_started_at(self, pane_pid: int) -> float | None:
+        from cli_agent_orchestrator.services.fork_context_service import _descendants
+
+        matches = []
+        for pid in _descendants(pane_pid):
+            try:
+                cmd = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+                if b"codex" in cmd:
+                    matches.append(pid)
+            except OSError:
+                pass
+        if len(matches) != 1:
+            return None
+        stat = Path(f"/proc/{matches[0]}/stat").read_text().split()
+        btime = next(float(x.split()[1]) for x in Path("/proc/stat").read_text().splitlines() if x.startswith("btime "))
+        return btime + float(stat[21]) / os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+
     async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
         """Auto-accept the workspace trust prompt if it appears.
 
@@ -522,13 +561,22 @@ class CodexProvider(BaseProvider):
             await asyncio.sleep(1.0)
         logger.warning("Codex trust prompt handler timed out")
 
-    async def initialize(self) -> bool:
+    async def initialize(
+        self, *, coordinates: tuple[str, str] | None = None,
+        provider_override=None, raw_status: bool = False,
+    ) -> bool:
         """Initialize Codex provider by starting codex command."""
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         init_timeout = get_server_settings()["provider_init_timeout"]
-        if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
+        shell_kwargs = {"timeout": init_timeout}
+        if coordinates is not None:
+            shell_kwargs["coordinates"] = coordinates
+        if not await wait_for_shell(self.terminal_id, **shell_kwargs):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
+        self.shell_baseline = self.capture_shell_baseline()
+        if not self.shell_baseline:
+            raise ProviderError("shell_baseline_unavailable")
 
         # Send a warm-up command before launching codex.
         # Codex exits immediately in freshly-created tmux sessions where the shell
@@ -552,11 +600,16 @@ class CodexProvider(BaseProvider):
         # Handle workspace trust prompt if it appears (new/untrusted directories)
         await self._handle_trust_prompt(timeout=20.0)
 
+        status_kwargs = dict(
+            timeout=float(get_server_settings()["provider_init_timeout"]),
+            polling_interval=1.0,
+        )
+        if provider_override is not None or raw_status:
+            status_kwargs.update(provider_override=provider_override, raw_status=raw_status)
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=float(get_server_settings()["provider_init_timeout"]),
-            polling_interval=1.0,
+            **status_kwargs,
         ):
             raise TimeoutError("Codex initialization timed out after 60 seconds")
 

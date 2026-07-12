@@ -87,6 +87,7 @@ async def wait_for_shell(
     timeout: float = 10.0,
     stable_duration: float = 2.0,
     polling_interval: float = 0.3,
+    coordinates: tuple[str, str] | None = None,
 ) -> bool:
     """Wait for shell to be ready by checking if the output buffer is stable and non-empty.
 
@@ -110,7 +111,9 @@ async def wait_for_shell(
     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
     backend = get_backend()
-    window = _resolve_window(terminal_id) if backend.supports_event_inbox() else None
+    window = coordinates or (
+        _resolve_window(terminal_id) if backend.supports_event_inbox() else None
+    )
     if backend.supports_event_inbox() and window is None:
         logger.warning(
             f"wait_for_shell [{terminal_id}]: event-inbox backend but no provider "
@@ -163,6 +166,9 @@ async def wait_until_status(
     timeout: float = 30.0,
     polling_interval: float = 1.0,
     min_gen: int | None = None,
+    *,
+    provider_override=None,
+    raw_status: bool = False,
 ) -> bool:
     """Wait until terminal reaches target status by polling status_monitor.
 
@@ -183,7 +189,10 @@ async def wait_until_status(
     )
     start = time.time()
     while time.time() - start < timeout:
-        current = status_monitor.get_status(terminal_id)
+        current = (
+            status_monitor.get_raw_status(terminal_id, provider_override=provider_override)
+            if raw_status else status_monitor.get_status(terminal_id)
+        )
         status_gen = status_monitor.get_status_gen(terminal_id) if min_gen is not None else None
         if current in targets and (min_gen is None or status_gen is None or status_gen >= min_gen):
             logger.info(f"wait_until_status [{terminal_id}]: reached {current.value}")

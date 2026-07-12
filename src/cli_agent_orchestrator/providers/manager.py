@@ -1,6 +1,7 @@
 """Provider manager as module singleton with direct terminal_id → provider mapping."""
 
 import logging
+import threading
 from typing import Dict, List, Optional
 
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
@@ -47,6 +48,7 @@ class ProviderManager:
 
     def __init__(self) -> None:
         self._providers: Dict[str, BaseProvider] = {}
+        self._lock = threading.RLock()
 
     def create_provider(
         self,
@@ -60,7 +62,27 @@ class ProviderManager:
         model: Optional[str] = None,
         fork_context: Optional[ForkContext] = None,
     ) -> BaseProvider:
-        """Create and store provider instance."""
+        """Construct and commit a provider for ordinary terminal creation."""
+        provider = self.construct_provider(
+            provider_type, terminal_id, tmux_session, tmux_window, agent_profile,
+            allowed_tools, skill_prompt, model, fork_context,
+        )
+        self.commit_provider(terminal_id, provider)
+        return provider
+
+    def construct_provider(
+        self,
+        provider_type: str,
+        terminal_id: str,
+        tmux_session: str,
+        tmux_window: str,
+        agent_profile: Optional[str] = None,
+        allowed_tools: Optional[List[str]] = None,
+        skill_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+        fork_context: Optional[ForkContext] = None,
+    ) -> BaseProvider:
+        """Construct without mutating the live terminal mapping."""
         try:
             provider: BaseProvider
             if provider_type == ProviderType.KIRO_CLI.value:
@@ -161,9 +183,6 @@ class ProviderManager:
             else:
                 raise ValueError(f"Unknown provider type: {provider_type}")
 
-            # Store in direct mapping
-            self._providers[terminal_id] = provider
-            logger.info(f"Created {provider_type} provider for terminal: {terminal_id}")
             return provider
 
         except Exception as e:
@@ -171,6 +190,21 @@ class ProviderManager:
                 f"Failed to create provider {provider_type} for terminal {terminal_id}: {e}"
             )
             raise
+
+    def commit_provider(
+        self,
+        terminal_id: str,
+        provider: BaseProvider,
+        expected_current: BaseProvider | None = None,
+    ) -> BaseProvider | None:
+        """Atomically install a staged provider, optionally comparing identity."""
+        with self._lock:
+            current = self._providers.get(terminal_id)
+            if expected_current is not None and current is not expected_current:
+                raise RuntimeError("provider_mapping_changed")
+            self._providers[terminal_id] = provider
+        logger.info("Committed %s provider for terminal: %s", provider.__class__.__name__, terminal_id)
+        return current
 
     def get_provider(self, terminal_id: str) -> Optional[BaseProvider]:
         """Get provider instance, creating on-demand if not found.
@@ -185,7 +219,8 @@ class ProviderManager:
             ValueError: If terminal not found in database or provider creation fails
         """
         # Check if already exists
-        provider = self._providers.get(terminal_id)
+        with self._lock:
+            provider = self._providers.get(terminal_id)
         if provider:
             return provider
 
@@ -193,6 +228,10 @@ class ProviderManager:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal {terminal_id} not found in database")
+        if metadata.get("recovery_state") not in (None, "rebound"):
+            raise RuntimeError(
+                f"provider unavailable during recovery: {metadata['recovery_state']}"
+            )
 
         # Create provider on-demand
         provider = self.create_provider(
@@ -218,7 +257,8 @@ class ProviderManager:
     def cleanup_provider(self, terminal_id: str) -> None:
         """Cleanup provider and remove from map (used when terminal is deleted)."""
         try:
-            provider = self._providers.pop(terminal_id, None)
+            with self._lock:
+                provider = self._providers.pop(terminal_id, None)
             if provider:
                 provider.cleanup()
                 logger.info(f"Cleaned up provider for terminal: {terminal_id}")

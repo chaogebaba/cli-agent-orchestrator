@@ -23,6 +23,7 @@ import logging
 import re
 import time
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 class BaseProvider(ABC):
     supports_fork_context: bool = False
+    supports_reauth_rebind: bool = False
     """Abstract base class for CLI tool providers.
 
     All CLI providers must inherit from this class and implement the abstract methods.
@@ -90,6 +92,20 @@ class BaseProvider(ABC):
 
     def capture_session_uuid(self, pane_pid: int, launch_time: float, cwd: str) -> str:
         raise NotImplementedError
+
+    def validate_session_artifact(self, session_uuid: str, cwd: str) -> None:
+        raise NotImplementedError
+
+    def provider_process_started_at(self, pane_pid: int) -> float | None:
+        return None
+
+    def capture_shell_baseline(self) -> str | None:
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        return get_backend().get_pane_current_command(self.session_name, self.window_name)
+
+    def auth_state_path(self) -> Path | None:
+        return None
 
     @property
     def shell_baseline(self) -> Optional[str]:

@@ -42,6 +42,7 @@ from cli_agent_orchestrator.clients.database import (
     update_last_active,
     update_message_status,
     settle_delivery_attempt,
+    settle_terminal_fallback,
     update_terminal_provider_session_id_if_null,
     update_terminal_shell_command,
 )
@@ -73,6 +74,28 @@ class TestTerminalOperations:
         assert result["id"] == "test123"
         mock_session.add.assert_called_once()
         mock_session.commit.assert_called_once()
+
+    def test_fallback_settlement_moves_only_pending_and_commits_pointer(self, test_db, monkeypatch):
+        monkeypatch.setattr("cli_agent_orchestrator.clients.database.SessionLocal", test_db)
+        with test_db.begin() as db:
+            db.add_all([
+                TerminalModel(id="old", tmux_session="s", tmux_window="w1", provider="codex",
+                              recovery_state="fallback_starting"),
+                TerminalModel(id="new", tmux_session="s", tmux_window="w2", provider="codex"),
+                InboxModel(sender_id="sender", receiver_id="old", message="p",
+                           status=MessageStatus.PENDING.value),
+                InboxModel(sender_id="sender", receiver_id="old", message="d",
+                           status=MessageStatus.DELIVERED.value),
+                InboxModel(sender_id="sender", receiver_id="old", message="f",
+                           status=MessageStatus.DELIVERY_FAILED.value),
+            ])
+        assert settle_terminal_fallback("old", "new") == 1
+        with test_db() as db:
+            old = db.get(TerminalModel, "old")
+            rows = {row.message: row.receiver_id for row in db.query(InboxModel).all()}
+            assert old.fallback_terminal_id == "new"
+            assert old.recovery_state == "fallback_ready"
+            assert rows == {"p": "new", "d": "old", "f": "old"}
 
 
 class TestMessageTraceTransactions:

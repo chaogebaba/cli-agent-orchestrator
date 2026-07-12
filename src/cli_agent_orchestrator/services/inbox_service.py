@@ -54,13 +54,16 @@ _delivery_wake_seq: dict[str, int] = {}
 _delivery_seq_guard = threading.Lock()
 
 
-def _get_delivery_lock(terminal_id: str) -> threading.Lock:
+def get_delivery_lock(terminal_id: str) -> threading.Lock:
     with _delivery_locks_guard:
         lock = _delivery_locks.get(terminal_id)
         if lock is None:
             lock = threading.Lock()
             _delivery_locks[terminal_id] = lock
         return lock
+
+
+_get_delivery_lock = get_delivery_lock
 
 
 def clear_terminal_delivery_state(terminal_id: str) -> None:
@@ -221,7 +224,17 @@ class InboxService:
         """
         with _delivery_seq_guard:
             captured_wake = _delivery_wake_seq.get(terminal_id, 0)
-        with _get_delivery_lock(terminal_id):
+        delivery_lock = get_delivery_lock(terminal_id)
+        if not delivery_lock.acquire(blocking=False):
+            # Rebind owns the exclusion lock. Keep every message PENDING and
+            # advance the wake generation so the next ready event retries.
+            with _delivery_seq_guard:
+                _delivery_wake_seq[terminal_id] = _delivery_wake_seq.get(terminal_id, 0) + 1
+            return
+        try:
+            metadata = get_terminal_metadata(terminal_id) or {}
+            if metadata.get("recovery_state") not in (None, "rebound"):
+                return
             with _delivery_seq_guard:
                 if _delivery_wake_seq.get(terminal_id, 0) > captured_wake:
                     return
@@ -397,7 +410,9 @@ class InboxService:
                         if not attempt_uuid: update_message_status(message.id, MessageStatus.FAILED)
                     with _delivery_seq_guard:
                         _delivery_wake_seq[terminal_id] = _delivery_wake_seq.get(terminal_id, 0) + 1
-                sent_count += len(batch)
+                    sent_count += len(batch)
+        finally:
+            delivery_lock.release()
 
     def poll_opencode_pending_messages(self, registry: PluginRegistry | None = None) -> None:
         """Poll OpenCode terminals for pending inbox messages.

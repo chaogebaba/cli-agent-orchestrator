@@ -72,6 +72,12 @@ class FifoManager:
 
         logger.info(f"Started FIFO reader for terminal {terminal_id}")
 
+    def has_reader(self, terminal_id: str) -> bool:
+        """Return whether the pre-existing reader thread is registered and live."""
+        with self._lock:
+            thread = self._threads.get(terminal_id)
+            return bool(thread and thread.is_alive())
+
     def stop_reader(self, terminal_id: str) -> None:
         """Stop the reader thread (if running) and delete the FIFO file.
 

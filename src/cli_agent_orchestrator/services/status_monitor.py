@@ -82,6 +82,9 @@ class StatusMonitor:
         # a worker thread; if newer chunks arrive before it applies, its result
         # is stale and must not overwrite the newer screen/buffer state.
         self._chunk_seq: Dict[str, int] = {}
+        # Advances exclusively when bytes enter through _process_chunk. Unlike
+        # _chunk_seq, input notifications and reset bookkeeping never touch it.
+        self._fifo_frame_seq: Dict[str, int] = {}
         # Pending quiescence-detect timer handle per terminal (loop.call_later).
         self._quiesce_handle: Dict[str, asyncio.TimerHandle] = {}
         # The event loop that owns the quiescence timers. Captured when the
@@ -169,6 +172,7 @@ class StatusMonitor:
                 buffer = buffer[-STATE_BUFFER_MAX:]
             self._buffers[terminal_id] = buffer
             chunk_seq = self._bump_chunk_seq_locked(terminal_id)
+            self._fifo_frame_seq[terminal_id] = self._fifo_frame_seq.get(terminal_id, 0) + 1
             if use_screen:
                 screen_ready = self._feed_screen_locked(terminal_id, chunk, screen_size)
             else:
@@ -760,6 +764,7 @@ class StatusMonitor:
             self._input_gen.pop(terminal_id, None)
             self._processing_gen.pop(terminal_id, None)
             self._status_gen.pop(terminal_id, None)
+            self._fifo_frame_seq.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
             self._screen_size_deferred_warned.discard(terminal_id)
             self._bursting.pop(terminal_id, None)
@@ -792,22 +797,22 @@ class StatusMonitor:
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
-    def get_status(self, terminal_id: str) -> TerminalStatus:
-        """Get current terminal status — the single source of truth for both backends.
+    def get_raw_status(self, terminal_id: str, provider_override=None) -> TerminalStatus:
+        """Return provider/backend status without the durable recovery overlay.
 
         Pipe-pane backends (tmux) return the last status pushed by the FIFO →
         EventBus → _process_chunk pipeline. Event-inbox backends (herdr) don't
         feed that pipeline (no FIFO reader is started for them), so _last_status
         would stay UNKNOWN forever; for those we derive status on demand from the
-        provider, whose get_status() consults backend.get_native_status(). Doing
-        it here means every caller (API status, init waits, busy checks, curator
-        liveness) works on herdr without each having to special-case the backend.
+        provider, whose get_status() consults backend.get_native_status(). Direct
+        raw reads are internal to rebind; external callers go through get_status(),
+        which applies the durable recovery projection before delegating here.
         """
         from cli_agent_orchestrator.backends.registry import get_backend
 
         if get_backend().supports_event_inbox():
             try:
-                provider = provider_manager.get_provider(terminal_id)
+                provider = provider_override or provider_manager.get_provider(terminal_id)
             except Exception:
                 provider = None
             if provider is not None:
@@ -838,7 +843,13 @@ class StatusMonitor:
                 buffer = ""
 
         if cached == TerminalStatus.PROCESSING and buffer:
-            fresh = self._detect_status(terminal_id, buffer)
+            if provider_override is None:
+                fresh = self._detect_status(terminal_id, buffer)
+            else:
+                try:
+                    fresh = provider_override.get_status(buffer)
+                except Exception:
+                    fresh = TerminalStatus.UNKNOWN
             logger.debug(
                 f"get_status [{terminal_id}]: cached=PROCESSING, "
                 f"fresh={fresh.value}, buffer_len={len(buffer)}"
@@ -848,10 +859,27 @@ class StatusMonitor:
                 return fresh
         return cached
 
+    def get_status(self, terminal_id: str) -> TerminalStatus:
+        """Return externally projected health, quarantining recovery states."""
+        try:
+            from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+            metadata = get_terminal_metadata(terminal_id)
+            if metadata and metadata.get("recovery_state") not in (None, "rebound"):
+                return TerminalStatus.ERROR
+        except Exception:
+            pass
+        return self.get_raw_status(terminal_id)
+
     def get_buffer(self, terminal_id: str) -> str:
         """Get accumulated output buffer for a terminal."""
         with self._lock:
             return self._buffers.get(terminal_id, "")
+
+    def get_fifo_frame_gen(self, terminal_id: str) -> int:
+        """Counter advanced exclusively by frames entering via _process_chunk."""
+        with self._lock:
+            return self._fifo_frame_seq.get(terminal_id, 0)
 
     def force_status(self, terminal_id: str, status: TerminalStatus) -> None:
         """Force-publish a status, going through the normal latch/publish path.

@@ -140,6 +140,52 @@ def list_sessions(as_json):
             click.echo(f"{name:<25} {conductor_id:<12} {status:<15} {terminal_count:<10}")
 
 
+@session.command("recover")
+@click.argument("session_name")
+@click.option("--reason", required=True, type=click.Choice(["provider-reauth"]))
+@click.option("--provider", default="codex", type=click.Choice(["codex", "grok_cli"]))
+@click.option("--terminal", "terminal_ids", multiple=True)
+@click.option("--interrupt", is_flag=True)
+@click.option("--acknowledge-ownership", is_flag=True)
+@click.option("--json", "as_json", is_flag=True)
+def recover(
+    session_name, reason, provider, terminal_ids, interrupt,
+    acknowledge_ownership, as_json,
+):
+    """Explicitly rebind provider sessions after authentication changes."""
+    if acknowledge_ownership and len(terminal_ids) != 1:
+        raise click.ClickException(
+            "--acknowledge-ownership requires exactly one --terminal selector"
+        )
+    payload = {
+        "reason": reason,
+        "provider": provider,
+        "terminal_ids": list(terminal_ids),
+        "interrupt": interrupt,
+        "acknowledge_ownership": acknowledge_ownership,
+    }
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/recover",
+            json=payload,
+        )
+        response.raise_for_status()
+        result = response.json()
+    except requests.RequestException as exc:
+        raise click.ClickException(f"provider recovery failed: {exc}")
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+    click.echo(f"Recovery: {result.get('session', session_name)} ({provider})")
+    for item in result.get("results", []):
+        detail = f" [{item['error_code']}]" if item.get("error_code") else ""
+        reconciliation = " reconciliation-required" if item.get(
+            "requires_supervisor_reconciliation") else ""
+        click.echo(f"{item['terminal_id']}: {item['status']}{detail}{reconciliation}")
+    if result.get("manifest_error"):
+        click.echo(f"manifest: failed [{result['manifest_error']}]", err=True)
+
+
 @session.command()
 @click.argument("session_name")
 @click.option("--terminal", "terminal_id", help="Target a specific terminal ID")

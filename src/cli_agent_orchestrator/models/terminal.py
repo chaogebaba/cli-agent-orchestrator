@@ -8,6 +8,14 @@ from cli_agent_orchestrator.models.provider import ProviderType
 
 # Terminal ID validation (8 character hex string)
 TerminalId = Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{8}$")]
+RecoveryState = Literal[
+    "rebind_starting",
+    "rebind_exiting",
+    "rebind_failed",
+    "rebound",
+    "fallback_starting",
+    "fallback_ready",
+]
 
 
 class TerminalStatus(str, Enum):

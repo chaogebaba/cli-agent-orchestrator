@@ -70,6 +70,21 @@ def build_session_manifest(session_name: str, terminal_id: str | None = None) ->
         from cli_agent_orchestrator.services.terminal_service import get_working_directory
         for item in raw_terminals:
             role = roles.get(item.get("agent_profile"))
+            started_at = auth_mtime = None
+            auth_staleness = "unknown"
+            try:
+                from cli_agent_orchestrator.providers.manager import provider_manager
+                from cli_agent_orchestrator.services.fork_context_service import pane_pid
+                provider = provider_manager.get_provider(item["id"])
+                pid = pane_pid(item["tmux_session"], item["tmux_window"])
+                started_at = provider.provider_process_started_at(pid)
+                auth_path = provider.auth_state_path()
+                if auth_path and auth_path.is_file():
+                    auth_mtime = auth_path.stat().st_mtime
+                    if started_at is not None:
+                        auth_staleness = "stale" if started_at < auth_mtime else "current"
+            except Exception:
+                pass
             rows.append({
                 "id": item["id"], "profile": item.get("agent_profile"),
                 "provider": item.get("provider"),
@@ -77,6 +92,12 @@ def build_session_manifest(session_name: str, terminal_id: str | None = None) ->
                 "caller_id": item.get("caller_id"),
                 "cwd": get_working_directory(item["id"]),
                 "kind": "supervisor" if role == "supervisor" else ("worker" if role in {"developer", "reviewer", "worker"} else "unknown"),
+                "recovery_state": item.get("recovery_state"),
+                "recovery_error": item.get("recovery_error"),
+                "fallback_terminal_id": item.get("fallback_terminal_id"),
+                "provider_process_started_at": started_at,
+                "auth_state_mtime": auth_mtime,
+                "auth_staleness": auth_staleness,
             })
         return sorted(rows, key=lambda r: r["id"])
 

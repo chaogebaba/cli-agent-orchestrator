@@ -23,6 +23,7 @@ from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.terminal import RecoveryState
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,10 @@ class TerminalModel(Base):
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
     provider_session_id = Column(String, nullable=True)
+    recovery_state = Column(String, nullable=True)
+    recovery_error = Column(String, nullable=True)
+    recovery_updated_at = Column(DateTime(timezone=True), nullable=True)
+    fallback_terminal_id = Column(String, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
 
 
@@ -687,6 +692,16 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN provider_session_id TEXT")
             conn.commit()
             logger.info("Migration: added provider_session_id column to terminals table")
+        for name, sql_type in (
+            ("recovery_state", "TEXT"),
+            ("recovery_error", "TEXT"),
+            ("recovery_updated_at", "DATETIME"),
+            ("fallback_terminal_id", "TEXT"),
+        ):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE terminals ADD COLUMN {name} {sql_type}")
+                conn.commit()
+                logger.info("Migration: added %s column to terminals table", name)
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -730,6 +745,10 @@ def create_terminal(
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "provider_session_id": terminal.provider_session_id,
+            "recovery_state": terminal.recovery_state,
+            "recovery_error": terminal.recovery_error,
+            "recovery_updated_at": terminal.recovery_updated_at,
+            "fallback_terminal_id": terminal.fallback_terminal_id,
         }
 
 
@@ -756,6 +775,10 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "provider_session_id": terminal.provider_session_id,
+            "recovery_state": terminal.recovery_state,
+            "recovery_error": terminal.recovery_error,
+            "recovery_updated_at": terminal.recovery_updated_at,
+            "fallback_terminal_id": terminal.fallback_terminal_id,
             "last_active": terminal.last_active,
         }
 
@@ -771,6 +794,17 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "allowed_tools": (
+                    __import__("json").loads(t.allowed_tools)
+                    if isinstance(t.allowed_tools, str) and t.allowed_tools else None
+                ),
+                "shell_command": t.shell_command,
+                "caller_id": t.caller_id,
+                "provider_session_id": t.provider_session_id,
+                "recovery_state": t.recovery_state,
+                "recovery_error": t.recovery_error,
+                "recovery_updated_at": t.recovery_updated_at,
+                "fallback_terminal_id": t.fallback_terminal_id,
                 "last_active": t.last_active,
             }
             for t in terminals
@@ -818,6 +852,83 @@ def update_terminal_provider_session_id(terminal_id: str, session_uuid: str) -> 
         changed = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).update(
             {TerminalModel.provider_session_id: session_uuid}, synchronize_session=False)
         return changed > 0
+
+
+def update_terminal_runtime_identity(
+    terminal_id: str, session_uuid: str, shell_command: str | None,
+) -> bool:
+    """Persist the post-init native identity before any task is delivered."""
+    with SessionLocal.begin() as db:
+        values: dict[str, Any] = {"provider_session_id": session_uuid}
+        if shell_command:
+            values["shell_command"] = shell_command
+        return db.query(TerminalModel).filter_by(id=terminal_id).update(
+            values, synchronize_session=False
+        ) > 0
+
+
+def settle_terminal_rebound(
+    terminal_id: str, session_uuid: str, shell_command: str,
+) -> bool:
+    """Atomically persist proven runtime identity and the healthy projection."""
+    with SessionLocal.begin() as db:
+        changed = db.query(TerminalModel).filter_by(id=terminal_id).update(
+            {
+                "provider_session_id": session_uuid,
+                "shell_command": shell_command,
+                "recovery_state": "rebound",
+                "recovery_error": None,
+                "recovery_updated_at": _utcnow(),
+            },
+            synchronize_session=False,
+        )
+        return changed > 0
+
+
+def set_terminal_recovery_state(
+    terminal_id: str,
+    state: RecoveryState | None,
+    error: str | None = None,
+    fallback_terminal_id: str | None = None,
+) -> bool:
+    """Atomically set the durable recovery projection for one terminal."""
+    with SessionLocal.begin() as db:
+        values = {
+            "recovery_state": state,
+            "recovery_error": error[:2048] if error else None,
+            "recovery_updated_at": _utcnow(),
+        }
+        if fallback_terminal_id is not None:
+            values["fallback_terminal_id"] = fallback_terminal_id
+        return db.query(TerminalModel).filter_by(id=terminal_id).update(
+            values, synchronize_session=False
+        ) > 0
+
+
+def settle_terminal_fallback(old_terminal_id: str, new_terminal_id: str) -> int:
+    """Commit fallback pointer, PENDING rewrites, and ready state together."""
+    with SessionLocal.begin() as db:
+        old = db.query(TerminalModel).filter_by(id=old_terminal_id).one()
+        if old.recovery_state != "fallback_starting":
+            raise RuntimeError("fallback_state_changed")
+        if db.query(TerminalModel).filter_by(id=new_terminal_id).first() is None:
+            raise RuntimeError("fallback_terminal_missing")
+        changed = db.query(InboxModel).filter(
+            InboxModel.receiver_id == old_terminal_id,
+            InboxModel.status == MessageStatus.PENDING.value,
+        ).update({"receiver_id": new_terminal_id}, synchronize_session=False)
+        old.fallback_terminal_id = new_terminal_id
+        old.recovery_state = "fallback_ready"
+        old.recovery_error = None
+        old.recovery_updated_at = _utcnow()
+        return changed
+
+
+def has_unsettled_delivery_attempt(terminal_id: str) -> bool:
+    with SessionLocal() as db:
+        return db.query(InboxDeliveryAttemptModel).filter_by(
+            receiver_terminal_id=terminal_id, settled_at=None
+        ).first() is not None
 
 
 def create_transcript_binding(
