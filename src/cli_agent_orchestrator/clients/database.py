@@ -68,6 +68,7 @@ class ProviderSessionModel(Base):
     summary = Column(Text, nullable=True)
     status = Column(Text, nullable=False)
     source_terminal_id = Column(Text, nullable=True)
+    session_name = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=_utcnow)
     updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
     __table_args__ = (
@@ -77,6 +78,25 @@ class ProviderSessionModel(Base):
         ),
         Index("uq_provider_sessions_ready", "name", unique=True, sqlite_where=(status == "ready")),
     )
+
+
+class WarmIntentModel(Base):
+    __tablename__ = "warm_intents"
+    intent_id = Column(String, primary_key=True)
+    worker_terminal_id = Column(String, nullable=False, unique=True)
+    replaces_worker_terminal_id = Column(String, nullable=True)
+    session_name = Column(String, nullable=False, index=True)
+    worker_profile = Column(String, nullable=False)
+    parent_base_name = Column(String, nullable=False)
+    provider = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class SessionEpochModel(Base):
+    __tablename__ = "session_epochs"
+    session_name = Column(String, primary_key=True)
+    count = Column(Integer, nullable=False, default=0)
+    last_epoch_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class TranscriptBindingModel(Base):
@@ -266,6 +286,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _migrate_transcript_bindings_inode_nullable()
     _migrate_provider_sessions_status()
+    _migrate_provider_sessions_session_name()
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
     _migrate_inbox_orchestration_type()
@@ -300,7 +321,7 @@ def _migrate_provider_sessions_status() -> None:
                 "name TEXT NOT NULL, provider TEXT NOT NULL, session_uuid TEXT NOT NULL, "
                 "cwd TEXT NOT NULL, agent_profile TEXT NOT NULL, git_sha TEXT, "
                 "dirty_hashes TEXT DEFAULT '{}' NOT NULL, summary TEXT, status TEXT NOT NULL, "
-                "source_terminal_id TEXT, created_at DATETIME, updated_at DATETIME, "
+                "source_terminal_id TEXT, session_name TEXT, created_at DATETIME, updated_at DATETIME, "
                 "CONSTRAINT ck_provider_sessions_status "
                 "CHECK (status IN ('ready','superseded','retired')))"
             )
@@ -309,9 +330,9 @@ def _migrate_provider_sessions_status() -> None:
             text(
                 "INSERT INTO provider_sessions "
                 "(id, name, provider, session_uuid, cwd, agent_profile, git_sha, dirty_hashes, "
-                "summary, status, source_terminal_id, created_at, updated_at) "
+                "summary, status, source_terminal_id, session_name, created_at, updated_at) "
                 "SELECT id, name, provider, session_uuid, cwd, agent_profile, git_sha, "
-                "dirty_hashes, summary, status, source_terminal_id, created_at, updated_at "
+                "dirty_hashes, summary, status, source_terminal_id, NULL, created_at, updated_at "
                 "FROM provider_sessions_legacy"
             )
         )
@@ -322,6 +343,15 @@ def _migrate_provider_sessions_status() -> None:
                 "WHERE status = 'ready'"
             )
         )
+
+
+def _migrate_provider_sessions_session_name() -> None:
+    """Add nullable session scope to legacy base registrations."""
+    from sqlalchemy import text
+    with engine.begin() as connection:
+        columns = connection.execute(text("PRAGMA table_info(provider_sessions)")).mappings().all()
+        if columns and not any(column["name"] == "session_name" for column in columns):
+            connection.execute(text("ALTER TABLE provider_sessions ADD COLUMN session_name TEXT"))
 
 
 def _migrate_transcript_bindings_inode_nullable() -> None:
@@ -752,6 +782,74 @@ def create_terminal(
         }
 
 
+class WarmIntentPublishError(RuntimeError):
+    """Terminal and warm-intent publication could not settle atomically."""
+
+
+def create_terminal_with_warm_intent(
+    *, terminal_id: str, tmux_session: str, tmux_window: str, provider: str,
+    agent_profile: Optional[str], allowed_tools: Optional[List[str]],
+    caller_id: Optional[str], parent_base_name: Optional[str],
+    fork_mode: Optional[str], cas_hook=None,
+) -> Dict[str, Any]:
+    """Publish terminal metadata and a fork-only warm intent together."""
+    import json as _json
+    import uuid
+
+    with SessionLocal.begin() as db:
+        db.add(TerminalModel(
+            id=terminal_id, tmux_session=tmux_session, tmux_window=tmux_window,
+            provider=provider, agent_profile=agent_profile,
+            allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
+            caller_id=caller_id,
+        ))
+        if fork_mode == "fork" and parent_base_name and agent_profile:
+            claimed = False
+            for attempt in range(3):
+                dead = (
+                    db.query(WarmIntentModel)
+                    .outerjoin(TerminalModel, TerminalModel.id == WarmIntentModel.worker_terminal_id)
+                    .filter(
+                        WarmIntentModel.session_name == tmux_session,
+                        WarmIntentModel.worker_profile == agent_profile,
+                        WarmIntentModel.parent_base_name == parent_base_name,
+                        TerminalModel.id.is_(None),
+                    )
+                    .order_by(WarmIntentModel.created_at, WarmIntentModel.intent_id)
+                    .first()
+                )
+                if dead is None:
+                    db.add(WarmIntentModel(
+                        intent_id=str(uuid.uuid4()), worker_terminal_id=terminal_id,
+                        session_name=tmux_session, worker_profile=agent_profile,
+                        parent_base_name=parent_base_name, provider=provider,
+                        created_at=_utcnow(),
+                    ))
+                    claimed = True
+                    break
+                old_id = dead.worker_terminal_id
+                if cas_hook and cas_hook(attempt, old_id, db) is False:
+                    db.expire_all()
+                    continue
+                changed = db.query(WarmIntentModel).filter(
+                    WarmIntentModel.intent_id == dead.intent_id,
+                    WarmIntentModel.worker_terminal_id == old_id,
+                    ~db.query(TerminalModel).filter(TerminalModel.id == old_id).exists(),
+                ).update({
+                    "worker_terminal_id": terminal_id,
+                    "replaces_worker_terminal_id": old_id,
+                    "created_at": _utcnow(),
+                }, synchronize_session=False)
+                if changed:
+                    claimed = True
+                    break
+                db.expire_all()
+            if not claimed:
+                raise WarmIntentPublishError("db_publish_failed")
+        db.flush()
+        return {"id": terminal_id, "tmux_session": tmux_session, "tmux_window": tmux_window}
+
+
 def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
     """Get terminal metadata by ID."""
     import json as _json
@@ -905,6 +1003,22 @@ def set_terminal_recovery_state(
         ) > 0
 
 
+def quarantine_terminal_owner(
+    terminal_id: str, session_uuid: str | None, error: str,
+) -> bool:
+    """Atomically retain attempted native ownership and quarantine projection."""
+    with SessionLocal.begin() as db:
+        row = db.query(TerminalModel).filter_by(id=terminal_id).first()
+        if row is None:
+            return False
+        if row.provider_session_id is None and session_uuid:
+            row.provider_session_id = session_uuid
+        row.recovery_state = "rebind_failed"
+        row.recovery_error = error[:2048]
+        row.recovery_updated_at = _utcnow()
+        return True
+
+
 def settle_terminal_fallback(old_terminal_id: str, new_terminal_id: str) -> int:
     """Commit fallback pointer, PENDING rewrites, and ready state together."""
     with SessionLocal.begin() as db:
@@ -993,6 +1107,68 @@ def register_provider_session(**values: Any) -> Dict[str, Any]:
         db.commit()
         db.refresh(row)
         return provider_session_to_dict(row)
+
+
+def get_provider_session_history(name: str) -> Optional[Dict[str, Any]]:
+    with SessionLocal() as db:
+        row = (db.query(ProviderSessionModel).filter_by(name=name)
+               .order_by(ProviderSessionModel.updated_at.desc(), ProviderSessionModel.id.desc())
+               .first())
+        return provider_session_to_dict(row) if row else None
+
+
+def list_ready_provider_sessions_for_session(session_name: str) -> List[Dict[str, Any]]:
+    with SessionLocal() as db:
+        rows = db.query(ProviderSessionModel).filter_by(
+            status="ready", session_name=session_name).order_by(ProviderSessionModel.name).all()
+        return [provider_session_to_dict(row) for row in rows]
+
+
+def delete_warm_intent_for_terminal(terminal_id: str) -> bool:
+    with SessionLocal.begin() as db:
+        return db.query(WarmIntentModel).filter_by(worker_terminal_id=terminal_id).delete() > 0
+
+
+def list_warm_intents(session_name: str) -> List[Dict[str, Any]]:
+    with SessionLocal() as db:
+        rows = db.query(WarmIntentModel).filter_by(session_name=session_name).order_by(
+            WarmIntentModel.created_at, WarmIntentModel.intent_id).all()
+        return [{c.name: getattr(row, c.name) for c in row.__table__.columns} for row in rows]
+
+
+def delete_warm_intents_for_session(session_name: str) -> int:
+    with SessionLocal.begin() as db:
+        return db.query(WarmIntentModel).filter_by(session_name=session_name).delete()
+
+
+def increment_session_epoch(session_name: str) -> Dict[str, Any]:
+    from sqlalchemy.dialects.sqlite import insert
+    now = _utcnow()
+    with SessionLocal.begin() as db:
+        statement = insert(SessionEpochModel).values(
+            session_name=session_name, count=1, last_epoch_at=now,
+        ).on_conflict_do_update(
+            index_elements=[SessionEpochModel.session_name],
+            set_={"count": SessionEpochModel.count + 1, "last_epoch_at": now},
+        ).returning(SessionEpochModel.count, SessionEpochModel.last_epoch_at)
+        count, last_epoch_at = db.execute(statement).one()
+        return {"count": count, "last_epoch_at": last_epoch_at}
+
+
+def get_session_epoch(session_name: str) -> Optional[Dict[str, Any]]:
+    try:
+        with SessionLocal() as db:
+            row = db.query(SessionEpochModel).filter_by(session_name=session_name).first()
+            return ({"count": row.count, "last_epoch_at": row.last_epoch_at} if row else None)
+    except Exception as exc:
+        if "no such table: session_epochs" in str(exc):
+            return None
+        raise
+
+
+def delete_session_epoch(session_name: str) -> bool:
+    with SessionLocal.begin() as db:
+        return db.query(SessionEpochModel).filter_by(session_name=session_name).delete() > 0
 
 
 def retire_provider_session(name: str) -> Optional[Dict[str, Any]]:

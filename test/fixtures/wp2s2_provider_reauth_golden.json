@@ -1,0 +1,1 @@
+{"schema_version":"cao.session-recover/v1","session":"cao-s","reason":"provider-reauth","provider":"codex","started_at":"START","finished_at":"FINISH","results":[{"terminal_id":"deadbeef","status":"rebound","error_code":null,"retryable":false,"interrupted_turn":false,"requires_supervisor_reconciliation":false}],"manifest":{"complete":true},"manifest_error":null}

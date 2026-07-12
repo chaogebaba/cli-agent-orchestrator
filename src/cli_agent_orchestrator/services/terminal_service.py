@@ -31,6 +31,7 @@ from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
+from cli_agent_orchestrator.clients.database import create_terminal_with_warm_intent
 from cli_agent_orchestrator.clients.database import list_terminals_by_provider_session_id
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
@@ -208,6 +209,11 @@ def _rollback_terminal_creation(
     """Single rollback seam preserving pipe-pane -> FIFO -> window/session order."""
     try:
         if db_created:
+            try:
+                from cli_agent_orchestrator.clients.database import delete_warm_intent_for_terminal
+                delete_warm_intent_for_terminal(terminal_id)
+            except Exception:
+                pass
             db_delete_terminal(terminal_id)
     except Exception:
         pass
@@ -278,6 +284,9 @@ async def create_terminal(
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
     fork_context=None,
     allow_incomplete_brief: bool = False,
+    terminal_id: Optional[str] = None,
+    lease_token=None,
+    strict_backend_registration: bool = False,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -341,7 +350,10 @@ async def create_terminal(
     db_created = False
     try:
         # Step 1: Generate unique identifiers
-        terminal_id = generate_terminal_id()
+        terminal_id = terminal_id or generate_terminal_id()
+        if lease_token is not None:
+            from cli_agent_orchestrator.services.rebind_lease import validate_rebind_lease
+            validate_rebind_lease(terminal_id, lease_token)
 
         if not session_name:
             session_name = generate_session_name()
@@ -383,13 +395,15 @@ async def create_terminal(
             if not get_backend().session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
             extra_env = {**get_session_env(session_name), **(env_vars or {})}
-            window_name = get_backend().create_window(
-                session_name,
-                window_name,
-                terminal_id,
-                working_directory,
-                extra_env=extra_env,
-            )
+            try:
+                window_name = get_backend().create_window(
+                    session_name, window_name, terminal_id, working_directory,
+                    extra_env=extra_env,
+                )
+            except Exception as exc:
+                if lease_token is not None:
+                    raise RuntimeError("window_create_failed") from exc
+                raise
             window_created = True
 
         # Step 3: Load the profile once for allowed tool resolution before
@@ -433,15 +447,25 @@ async def create_terminal(
         # rely on the herdr inbox registration below.
         if not get_backend().supports_event_inbox():
             # Reader must exist BEFORE pipe-pane starts so it captures from the start.
-            fifo_manager.create_reader(terminal_id)
-            fifo_attached = True
+            try:
+                fifo_manager.create_reader(terminal_id)
+                fifo_attached = True
+            except Exception as exc:
+                if lease_token is not None:
+                    raise RuntimeError("fifo_create_failed") from exc
+                raise
 
             # Configure pipe-pane to stream output to the FIFO. This enables
             # real-time event-driven processing via StatusMonitor and LogWriter
             # (LogWriter writes TERMINAL_LOG_DIR/{id}.log from the FIFO). A pane
             # has a single pipe-pane target, so we pipe ONLY to the FIFO.
             fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
-            get_backend().pipe_pane(session_name, window_name, str(fifo_path))
+            try:
+                get_backend().pipe_pane(session_name, window_name, str(fifo_path))
+            except Exception as exc:
+                if lease_token is not None:
+                    raise RuntimeError("fifo_create_failed") from exc
+                raise
 
             # Nudge the shell so it re-renders its prompt AFTER pipe-pane attaches.
             # pipe-pane only captures output produced after it starts; on a fast
@@ -453,15 +477,35 @@ async def create_terminal(
         # Step 5: Persist terminal metadata after output capture is attached.
         # The manifest below then sees the new row, while rollback unwinds DB
         # before pipe-pane/FIFO/window in exact reverse acquisition order.
-        db_create_terminal(
-            terminal_id,
-            session_name,
-            window_name,
-            provider,
-            agent_profile,
-            allowed_tools,
-            caller_id=caller_id,
-        )
+        try:
+            if fork_context and fork_context.mode == "fork":
+                create_terminal_with_warm_intent(
+                    terminal_id=terminal_id, tmux_session=session_name, tmux_window=window_name,
+                    provider=provider, agent_profile=agent_profile, allowed_tools=allowed_tools,
+                    caller_id=caller_id, parent_base_name=fork_context.base_name,
+                    fork_mode=fork_context.mode,
+                )
+            else:
+                attempted_resume_uuid = (
+                    fork_context.session_uuid
+                    if lease_token is not None and fork_context and fork_context.mode == "resume"
+                    else None
+                )
+                if attempted_resume_uuid:
+                    db_create_terminal(
+                        terminal_id, session_name, window_name, provider, agent_profile,
+                        allowed_tools, caller_id=caller_id,
+                        provider_session_id=attempted_resume_uuid,
+                    )
+                else:
+                    db_create_terminal(
+                        terminal_id, session_name, window_name, provider, agent_profile,
+                        allowed_tools, caller_id=caller_id,
+                    )
+        except Exception as exc:
+            if lease_token is not None:
+                raise RuntimeError("db_publish_failed") from exc
+            raise
         db_created = True
 
         # The live snapshot is transactional launch context. Build it only after
@@ -492,7 +536,9 @@ async def create_terminal(
                 if brief_mode == "required" and not manifest["complete"]:
                     brief = f"{SESSION_BRIEF_MARKER}\n\n{brief}"
                 skill_prompt = f"{skill_prompt}\n\n{brief}" if skill_prompt else brief
-            except Exception:
+            except Exception as exc:
+                if lease_token is not None:
+                    raise RuntimeError("context_build_failed") from exc
                 if brief_mode == "required" and not relax:
                     raise
                 if brief_mode == "required":
@@ -508,17 +554,16 @@ async def create_terminal(
         # the skill catalog here; Kiro (skill:// resources) and OpenCode
         # (OPENCODE_CONFIG_DIR/skills symlink) discover skills natively;
         # Copilot gets the catalog baked at install time.
-        provider_instance = provider_manager.create_provider(
-            provider,
-            terminal_id,
-            session_name,
-            window_name,
-            agent_profile,
-            allowed_tools,
-            skill_prompt=skill_prompt,
-            model=profile.model if profile else None,
-            fork_context=fork_context,
-        )
+        try:
+            provider_instance = provider_manager.create_provider(
+                provider, terminal_id, session_name, window_name, agent_profile,
+                allowed_tools, skill_prompt=skill_prompt,
+                model=profile.model if profile else None, fork_context=fork_context,
+            )
+        except Exception as exc:
+            if lease_token is not None:
+                raise RuntimeError("provider_construct_failed") from exc
+            raise
         allocated_uuid = getattr(provider_instance, "allocated_session_uuid", None)
         if not isinstance(allocated_uuid, str):
             allocated_uuid = None
@@ -542,8 +587,25 @@ async def create_terminal(
                 registry,
             )
         else:
-            await provider_instance.initialize()
-            _persist_provider_runtime_identity(provider_instance, terminal_id)
+            try:
+                await provider_instance.initialize()
+            except TimeoutError:
+                raise
+            except Exception as exc:
+                if lease_token is not None:
+                    raise RuntimeError("initialize_failed") from exc
+                raise
+            try:
+                _persist_provider_runtime_identity(provider_instance, terminal_id)
+            except Exception as exc:
+                if lease_token is None:
+                    raise
+                message = str(exc)
+                if message in {"session_capture_ambiguous", "session_capture_mismatch"}:
+                    raise
+                if message.startswith("session_artifact_"):
+                    raise RuntimeError("artifact_invalid") from exc
+                raise RuntimeError("identity_persist_failed") from exc
 
             # Persist shell_command baseline if the provider captured one
             shell_command = provider_instance.shell_baseline
@@ -595,16 +657,26 @@ async def create_terminal(
                 is_kiro = provider == ProviderType.KIRO_CLI.value
                 svc.register_terminal(terminal_id, pane_id, is_kiro)
             except Exception as e:
+                if strict_backend_registration:
+                    raise RuntimeError("herdr_register_failed") from e
                 logger.warning(f"Failed to register terminal {terminal_id} with herdr inbox: {e}")
         return terminal
 
     except Exception as e:
         # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
-        _rollback_terminal_creation(
-            terminal_id, session_name, locals().get("window_name"), session_created,
-            window_created, fifo_attached, db_created,
-        )
+        if lease_token is not None and db_created:
+            rollback = _delete_terminal_under_lease(
+                terminal_id, lease_token, registry=registry, require_confirmed_death=True,
+                quarantine_session_uuid=(fork_context.session_uuid if fork_context else None),
+            )
+            if rollback.get("rollback_kill_uncertain"):
+                raise RuntimeError("rollback_kill_uncertain") from e
+        else:
+            _rollback_terminal_creation(
+                terminal_id, session_name, locals().get("window_name"), session_created,
+                window_created, fifo_attached, db_created,
+            )
         try:
             status_monitor.clear_terminal(terminal_id)
         except Exception:
@@ -1329,27 +1401,52 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
     if token is None:
         raise RuntimeError("rebind_in_progress")
     try:
-        return _delete_terminal_under_lease(terminal_id, token, registry=registry)
+        result = _delete_terminal_under_lease(terminal_id, token, registry=registry)
+        return bool(result["terminal_deleted"] if isinstance(result, dict) else result)
     finally:
         release_rebind_lease(token)
 
 
 def _delete_terminal_under_lease(
     terminal_id: str, lease_token, registry: PluginRegistry | None = None,
-) -> bool:
+    preserve_warm_intent: bool = False,
+    require_confirmed_death: bool = False,
+    quarantine_session_uuid: str | None = None,
+) -> Dict:
     """Delete terminal and kill its tmux window."""
     from cli_agent_orchestrator.services.rebind_lease import validate_rebind_lease
 
     validate_rebind_lease(terminal_id, lease_token)
-    try:
-        # Unregister from herdr inbox service
-        svc = get_herdr_inbox_service()
-        if svc:
-            try:
-                svc.unregister_terminal(terminal_id)
-            except Exception as e:
-                logger.warning(f"Failed to unregister terminal {terminal_id} from herdr inbox: {e}")
 
+    def detach_observation(metadata: Dict, *, unregister: bool = True) -> None:
+        if unregister:
+            svc = get_herdr_inbox_service()
+            if svc:
+                try:
+                    svc.unregister_terminal(terminal_id)
+                except Exception as exc:
+                    logger.warning(f"Failed to unregister terminal {terminal_id} from herdr inbox: {exc}")
+        try:
+            get_backend().stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
+        except Exception as exc:
+            logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {exc}")
+        try:
+            fifo_manager.stop_reader(terminal_id)
+        except Exception as exc:
+            logger.warning(f"Failed to stop FIFO reader for {terminal_id}: {exc}")
+        try:
+            status_monitor.clear_terminal(terminal_id)
+        except Exception as exc:
+            logger.warning(f"Failed to clear state detector for {terminal_id}: {exc}")
+
+    try:
+        if not require_confirmed_death:
+            svc = get_herdr_inbox_service()
+            if svc:
+                try:
+                    svc.unregister_terminal(terminal_id)
+                except Exception as exc:
+                    logger.warning(f"Failed to unregister terminal {terminal_id} from herdr inbox: {exc}")
         # Get metadata before deletion
         metadata = get_terminal_metadata(terminal_id)
 
@@ -1385,31 +1482,40 @@ def _delete_terminal_under_lease(
             except Exception as e:
                 logger.warning(f"Failed to snapshot terminal {terminal_id}: {e}")
 
-            # Stop pipe-pane logging
-            try:
-                get_backend().stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
-            except Exception as e:
-                logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
-
-            # Stop FIFO reader and cleanup FIFO file. Must run BEFORE kill_window
-            # so the reader thread (which reopens the FIFO on EOF) unblocks and
-            # joins before the pane disappears.
-            try:
-                fifo_manager.stop_reader(terminal_id)
-            except Exception as e:
-                logger.warning(f"Failed to stop FIFO reader for {terminal_id}: {e}")
-
-            # Clear state detector buffers for this terminal
-            try:
-                status_monitor.clear_terminal(terminal_id)
-            except Exception as e:
-                logger.warning(f"Failed to clear state detector for {terminal_id}: {e}")
+            # Ordinary deletion detaches observation before killing. Confirmed-death
+            # rollback keeps it attached until death is proven so an uncertain live
+            # owner remains observable and diagnostically authoritative.
+            if not require_confirmed_death:
+                detach_observation(metadata, unregister=False)
 
             # Kill the tmux window (this terminates the agent process)
             try:
                 get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
             except Exception as e:
                 logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
+            if require_confirmed_death:
+                try:
+                    death = get_backend().window_liveness(
+                        metadata["tmux_session"], metadata["tmux_window"]
+                    )
+                except Exception:
+                    death = "error"
+                if death != "gone":
+                    from cli_agent_orchestrator.clients.database import quarantine_terminal_owner
+                    try:
+                        quarantined = quarantine_terminal_owner(
+                            terminal_id, quarantine_session_uuid, "rollback_kill_uncertain"
+                        )
+                    except Exception as exc:
+                        raise RuntimeError("quarantine_persist_failed") from exc
+                    if not quarantined:
+                        raise RuntimeError("quarantine_persist_failed")
+                    return {
+                        "terminal_deleted": False, "intent_deleted": False,
+                        "intent_error": None, "intent_retain_reason": None,
+                        "rollback_kill_uncertain": True,
+                    }
+                detach_observation(metadata)
 
         # Cleanup provider state and database record
         provider_manager.cleanup_provider(terminal_id)
@@ -1435,6 +1541,14 @@ def _delete_terminal_under_lease(
 
         _curator_locks.pop(terminal_id, None)
         deleted = db_delete_terminal(terminal_id)
+        intent_deleted = False
+        intent_error = None
+        if deleted and not preserve_warm_intent:
+            try:
+                from cli_agent_orchestrator.clients.database import delete_warm_intent_for_terminal
+                intent_deleted = delete_warm_intent_for_terminal(terminal_id)
+            except Exception as exc:
+                intent_error = str(exc)
         logger.info(f"Deleted terminal: {terminal_id}")
         if deleted and metadata:
             dispatch_plugin_event(
@@ -1446,7 +1560,13 @@ def _delete_terminal_under_lease(
                     agent_name=metadata.get("agent_profile"),
                 ),
             )
-        return deleted
+        return {
+            "terminal_deleted": deleted,
+            "intent_deleted": intent_deleted,
+            "intent_error": intent_error,
+            "intent_retain_reason": "keep_bases" if preserve_warm_intent else None,
+            "rollback_kill_uncertain": False,
+        }
 
     except Exception as e:
         logger.error(f"Failed to delete terminal {terminal_id}: {e}")

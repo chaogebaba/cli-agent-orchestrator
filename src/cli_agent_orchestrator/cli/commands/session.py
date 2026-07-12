@@ -142,21 +142,28 @@ def list_sessions(as_json):
 
 @session.command("recover")
 @click.argument("session_name")
-@click.option("--reason", required=True, type=click.Choice(["provider-reauth"]))
+@click.option("--reason", required=True, type=click.Choice(["provider-reauth", "epoch"]))
 @click.option("--provider", default="codex", type=click.Choice(["codex", "grok_cli"]))
 @click.option("--terminal", "terminal_ids", multiple=True)
 @click.option("--interrupt", is_flag=True)
 @click.option("--acknowledge-ownership", is_flag=True)
+@click.option("--base", "base_names", multiple=True)
 @click.option("--json", "as_json", is_flag=True)
 def recover(
     session_name, reason, provider, terminal_ids, interrupt,
-    acknowledge_ownership, as_json,
+    acknowledge_ownership, base_names, as_json,
 ):
     """Explicitly rebind provider sessions after authentication changes."""
     if acknowledge_ownership and len(terminal_ids) != 1:
         raise click.ClickException(
             "--acknowledge-ownership requires exactly one --terminal selector"
         )
+    if reason == "epoch" and (terminal_ids or interrupt or acknowledge_ownership):
+        raise click.ClickException(
+            "epoch recovery rejects --terminal, --interrupt, and --acknowledge-ownership"
+        )
+    if reason == "provider-reauth" and base_names:
+        raise click.ClickException("provider-reauth rejects --base")
     payload = {
         "reason": reason,
         "provider": provider,
@@ -164,6 +171,8 @@ def recover(
         "interrupt": interrupt,
         "acknowledge_ownership": acknowledge_ownership,
     }
+    if reason == "epoch":
+        payload["base_names"] = list(base_names)
     try:
         response = requests.post(
             f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/recover",
@@ -176,14 +185,52 @@ def recover(
     if as_json:
         click.echo(json.dumps(result, indent=2))
         return
-    click.echo(f"Recovery: {result.get('session', session_name)} ({provider})")
+    if reason == "provider-reauth":
+        click.echo(f"Recovery: {result.get('session', session_name)} ({provider})")
+    else:
+        click.echo(f"Recovery: {result.get('session', session_name)} (epoch)")
     for item in result.get("results", []):
         detail = f" [{item['error_code']}]" if item.get("error_code") else ""
         reconciliation = " reconciliation-required" if item.get(
             "requires_supervisor_reconciliation") else ""
-        click.echo(f"{item['terminal_id']}: {item['status']}{detail}{reconciliation}")
+        label = item.get("terminal_id") or item.get("base")
+        click.echo(f"{label}: {item['status']}{detail}{reconciliation}")
+    if reason == "epoch":
+        for item in result.get("respawn_candidates", []):
+            click.echo(
+                f"offer {item['intent_id']}: {item['profile']} from {item['base']} "
+                f"[{item['base_state']}]"
+            )
     if result.get("manifest_error"):
         click.echo(f"manifest: failed [{result['manifest_error']}]", err=True)
+
+
+@session.command("close")
+@click.argument("session_name")
+@click.option("--keep-bases", is_flag=True)
+@click.option("--force", is_flag=True)
+@click.option("--json", "as_json", is_flag=True)
+def close(session_name, keep_bases, force, as_json):
+    """Close a session and mechanically settle bases and warm intents."""
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/close",
+            params={"keep_bases": str(keep_bases).lower(), "force": str(force).lower()},
+        )
+        response.raise_for_status()
+        result = response.json()
+    except requests.RequestException as exc:
+        raise click.ClickException(f"session close failed: {exc}")
+    if as_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+    click.echo(f"Closed: {session_name} session_closed={str(result['session_closed']).lower()}")
+    for item in result.get("terminals", []):
+        click.echo(f"{item['terminal_id']}: {item['status']}")
+    for item in result.get("bases", []):
+        click.echo(f"base {item['base']}: {item['status']}")
+    intents = result.get("intents", {})
+    click.echo(f"intents: removed={intents.get('removed', 0)} retained={intents.get('retained', 0)}")
 
 
 @session.command()

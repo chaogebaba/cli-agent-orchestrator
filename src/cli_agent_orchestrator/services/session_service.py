@@ -43,6 +43,26 @@ SESSION_TEARDOWN_VERIFY_ATTEMPTS = 5
 SESSION_TEARDOWN_VERIFY_DELAY_SECONDS = 0.2
 
 
+def finalize_session(session_name: str, registry: PluginRegistry | None = None, backend=None) -> None:
+    """Kill/verify a backend session and settle shared session-level side effects."""
+    backend = backend or get_backend()
+    if backend.session_exists(session_name):
+        backend.kill_session(session_name)
+    for attempt in range(SESSION_TEARDOWN_VERIFY_ATTEMPTS):
+        if not backend.session_exists(session_name):
+            break
+        backend.kill_session(session_name)
+        if attempt < SESSION_TEARDOWN_VERIFY_ATTEMPTS - 1:
+            time.sleep(SESSION_TEARDOWN_VERIFY_DELAY_SECONDS)
+    if backend.session_exists(session_name):
+        raise RuntimeError(f"Session '{session_name}' still exists after teardown")
+    clear_session_env(session_name)
+    dispatch_plugin_event(
+        registry, "post_kill_session",
+        PostKillSessionEvent(session_id=session_name, session_name=session_name),
+    )
+
+
 async def create_session(
     provider: str | None,
     agent_profile: str,
@@ -138,8 +158,6 @@ def delete_session(
     result: Dict = {"deleted": [], "errors": []}
     leases = []
     try:
-        session_alive = get_backend().session_exists(session_name)
-
         from cli_agent_orchestrator.services import terminal_service
 
         terminals = list_terminals_by_session(session_name)
@@ -173,41 +191,14 @@ def delete_session(
             except Exception as e:
                 logger.warning(f"Failed to cleanup terminal {terminal['id']}: {e}")
 
-        backend = get_backend()
-        # Kill backend session only if it still exists. Then verify it is
-        # actually gone: terminal-level cleanup can race with tmux session
-        # teardown, and a stale named session blocks immediate relaunch.
-        if session_alive:
-            backend.kill_session(session_name)
-        for attempt in range(SESSION_TEARDOWN_VERIFY_ATTEMPTS):
-            if not backend.session_exists(session_name):
-                break
-            logger.warning(
-                "Session %s still exists after teardown attempt %d; retrying kill",
-                session_name,
-                attempt + 1,
-            )
-            backend.kill_session(session_name)
-            if attempt < SESSION_TEARDOWN_VERIFY_ATTEMPTS - 1:
-                time.sleep(SESSION_TEARDOWN_VERIFY_DELAY_SECONDS)
-        if backend.session_exists(session_name):
-            raise RuntimeError(f"Session '{session_name}' still exists after teardown")
+        finalize_session(session_name, registry)
 
         for token in reversed(leases):
             release_rebind_lease(token)
         leases.clear()
 
-        # Drop the per-session forwarded-env mapping (issue #248). Safe
-        # even when no vars were forwarded — the helper is a no-op then.
-        clear_session_env(session_name)
-
         result["deleted"].append(session_name)
         logger.info(f"Deleted session: {session_name}")
-        dispatch_plugin_event(
-            registry,
-            "post_kill_session",
-            PostKillSessionEvent(session_id=session_name, session_name=session_name),
-        )
         return result
 
     except Exception as e:

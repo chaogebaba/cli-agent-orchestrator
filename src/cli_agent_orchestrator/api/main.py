@@ -446,12 +446,13 @@ class SessionRecoverRequest(BaseModel):
     terminal_ids: List[str] = Field(default_factory=list)
     interrupt: bool = False
     acknowledge_ownership: bool = False
+    base_names: List[str] = Field(default_factory=list)
 
     @field_validator("reason")
     @classmethod
     def validate_reason(cls, value: str) -> str:
-        if value != "provider-reauth":
-            raise ValueError("reason must be 'provider-reauth'")
+        if value not in {"provider-reauth", "epoch"}:
+            raise ValueError("reason must be 'provider-reauth' or 'epoch'")
         return value
 
     @field_validator("provider")
@@ -1143,21 +1144,43 @@ async def recover_session(
     body: SessionRecoverRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    """Explicitly recover provider-native sessions after provider reauth."""
+    """Explicitly run one supported session lifecycle recovery reason."""
     try:
         validate_tmux_name(session_name, "session_name")
-        from cli_agent_orchestrator.services.provider_rebind_service import (
-            recover_provider_reauth,
-        )
+        if body.reason == "epoch":
+            if body.terminal_ids or body.interrupt or body.acknowledge_ownership:
+                raise ValueError("epoch recovery rejects terminal_ids, interrupt, and acknowledge_ownership")
+            from cli_agent_orchestrator.services.epoch_recovery_service import recover_epoch
+            return await recover_epoch(session_name, body.base_names or None)
+        if body.base_names:
+            raise ValueError("provider-reauth rejects base_names")
+        from cli_agent_orchestrator.services.provider_rebind_service import recover_provider_reauth
         return await recover_provider_reauth(
-            session_name,
-            provider=body.provider,
-            terminal_ids=body.terminal_ids or None,
-            interrupt=body.interrupt,
-            acknowledge_ownership=body.acknowledge_ownership,
+            session_name, provider=body.provider, terminal_ids=body.terminal_ids or None,
+            interrupt=body.interrupt, acknowledge_ownership=body.acknowledge_ownership,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@app.post("/sessions/{session_name}/close")
+async def close_session_endpoint(
+    request: Request, session_name: str, keep_bases: bool = False, force: bool = False,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> Dict:
+    try:
+        validate_tmux_name(session_name, "session_name")
+        from cli_agent_orchestrator.services.session_close_service import close_session
+        return await asyncio.to_thread(
+            close_session, session_name, keep_bases=keep_bases, force=force,
+            registry=get_plugin_registry(request),
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except RuntimeError as exc:
+        if str(exc) == "rebind_in_progress":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+        raise
 
 
 @app.delete("/sessions/{session_name}")
@@ -1167,6 +1190,10 @@ async def delete_session(
     force: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
 ) -> Dict:
+    """Raw administrative teardown; does not settle bases, intents, or epochs.
+
+    Lifecycle callers must use POST /sessions/{session_name}/close.
+    """
     try:
         validate_tmux_name(session_name, "session_name")
     except ValueError as e:

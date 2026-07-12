@@ -120,10 +120,14 @@ def build_session_manifest(session_name: str, terminal_id: str | None = None) ->
         activation = {"cli_path": "unknown", "differing_files": None, "server": "unknown", "source_root": None}
         sections["activation"] = "error"
         errors.append({"section": "activation", "code": "source_root_unconfigured", "message": "CAO_SOURCE_REPO is not set"})
+    from cli_agent_orchestrator.clients.database import get_session_epoch
+    epoch_row = get_session_epoch(session_name)
     return {
         "schema_version": SCHEMA_VERSION, "generated_at": datetime.now(timezone.utc).isoformat(),
         "complete": not errors, "errors": errors, "sections": sections,
-        "session": {"name": session_name, "supervisor_terminal_id": raw_terminals[0]["id"] if raw_terminals else terminal_id, "epoch": None, "epoch_started_at": None},
+        "session": {"name": session_name, "supervisor_terminal_id": raw_terminals[0]["id"] if raw_terminals else terminal_id,
+                    "epoch": epoch_row["count"] if epoch_row else 0,
+                    "epoch_started_at": epoch_row["last_epoch_at"] if epoch_row else None},
         "profiles": profile_rows, "ready_bases": base_rows, "skills": skill_rows,
         "workflows": workflow_rows, "tools": None, "terminals": terminal_rows,
         "ledger": {"pending_rows": None}, "activation": activation,

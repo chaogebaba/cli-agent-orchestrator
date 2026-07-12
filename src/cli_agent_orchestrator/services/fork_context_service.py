@@ -239,7 +239,8 @@ def mark_ready(terminal_id: str, name: str, summary: Optional[str]) -> dict[str,
     row = register_provider_session(name=name, provider=provider, session_uuid=session_uuid,
                                     cwd=cwd, agent_profile=terminal["agent_profile"], git_sha=sha,
                                     dirty_hashes=hashes, summary=summary,
-                                    source_terminal_id=terminal_id)
+                                    source_terminal_id=terminal_id,
+                                    session_name=terminal["tmux_session"])
     update_terminal_provider_session_id(terminal_id, session_uuid)
     return row
 

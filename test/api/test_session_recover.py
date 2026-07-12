@@ -57,3 +57,23 @@ def test_recover_rejects_fleet_ownership_ack(client):
         "reason": "provider-reauth", "acknowledge_ownership": True,
     })
     assert response.status_code == 400
+
+
+def test_epoch_route_rejects_reauth_only_fields(client):
+    for field, value in (
+        ("terminal_ids", ["a"]), ("interrupt", True),
+        ("acknowledge_ownership", True),
+    ):
+        response = client.post(
+            "/sessions/cao-test/recover", json={"reason": "epoch", field: value},
+        )
+        assert response.status_code == 400, field
+        assert "epoch recovery rejects" in response.json()["detail"]
+
+
+def test_provider_reauth_route_rejects_epoch_base_names(client):
+    response = client.post("/sessions/cao-test/recover", json={
+        "reason": "provider-reauth", "base_names": ["codex"],
+    })
+    assert response.status_code == 400
+    assert response.json()["detail"] == "provider-reauth rejects base_names"
