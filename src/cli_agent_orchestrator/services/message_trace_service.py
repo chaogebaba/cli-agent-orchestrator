@@ -323,6 +323,15 @@ def _native_user_turn_texts(record: dict) -> list[str]:
     return []
 
 
+def _queued_command_prompt(record: dict) -> str | None:
+    """Return Claude's stable queued-command prompt field, when present."""
+    attachment = record.get("attachment")
+    if not isinstance(attachment, dict) or attachment.get("type") != "queued_command":
+        return None
+    prompt = attachment.get("prompt")
+    return prompt if isinstance(prompt, str) else None
+
+
 def transcript_lookup(path: Path, payload_hash: str, started_at=None,
                       expected_ref: dict | None = None,
                       scan_from_start: bool = False) -> tuple[str, dict]:
@@ -350,12 +359,14 @@ def transcript_lookup(path: Path, payload_hash: str, started_at=None,
         if threshold is not None and threshold.tzinfo is None:
             threshold = threshold.replace(tzinfo=timezone.utc)
         byte_offset = baseline_size
+        queued_command_evidence = None
         for line in raw.splitlines(keepends=True):
             line_offset = byte_offset
             byte_offset += len(line.encode("utf-8"))
             obj = json.loads(line)
             candidates = _native_user_turn_texts(obj)
-            if not candidates:
+            queued_prompt = _queued_command_prompt(obj)
+            if not candidates and queued_prompt is None:
                 continue
             stamp = obj.get("timestamp") or obj.get("created_at")
             if threshold is not None and isinstance(stamp, str):
@@ -379,8 +390,19 @@ def transcript_lookup(path: Path, payload_hash: str, started_at=None,
                     return "hit", {"kind": "transcript_user_turn", "path": str(path),
                                    "offset": line_offset, "inode": after.st_ino,
                                    "size": after.st_size}
+            if (queued_command_evidence is None and queued_prompt is not None and
+                    wire_hash(queued_prompt) == payload_hash):
+                queued_command_evidence = {
+                    "kind": "transcript_queued_command",
+                    "path": str(path),
+                    "offset": line_offset,
+                    "inode": after.st_ino,
+                    "size": after.st_size,
+                }
     except (UnicodeDecodeError, json.JSONDecodeError):
         return "unresolved", {"kind": "transcript_malformed", "path": str(path)}
+    if queued_command_evidence is not None:
+        return "hit", queued_command_evidence
     return "absent", {"kind": "transcript_absent", "path": str(path),
                       "inode": after.st_ino, "size": after.st_size}
 

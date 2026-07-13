@@ -989,6 +989,46 @@ def test_cap_barrier_late_payload_confirmation_wins():
     assert callable(settle.call_args.kwargs["on_confirmed"])
 
 
+def test_ambiguous_attempt_queued_command_confirmation_stops_reinjection(tmp_path):
+    from cli_agent_orchestrator.services.message_trace_service import (
+        transcript_lookup, wire_hash,
+    )
+
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(json.dumps({
+        "type": "attachment",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "attachment": {"type": "queued_command", "prompt": "wire"},
+    }) + "\n", encoding="utf-8")
+    attempt = _gate_attempt(0)
+    attempt["payload_hash"] = wire_hash("wire")
+    svc = InboxService()
+
+    def lookup(_metadata, payload_hash, started_at, _expected_ref):
+        return transcript_lookup(
+            transcript, payload_hash, started_at, scan_from_start=True)
+
+    provider = MagicMock()
+    with (
+        patch.object(svc, "_exact_batch_attempts", return_value=[attempt]),
+        patch("cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
+              return_value=_binding()),
+        patch("cli_agent_orchestrator.services.inbox_service.continuity_aware_lookup",
+              side_effect=lookup),
+        patch("cli_agent_orchestrator.services.inbox_service.settle_wpm1_terminal_batch",
+              return_value="settled") as settle,
+        patch.object(svc, "_commit_watchdog_ops"),
+    ):
+        state, evidence = svc._handle_wpm1_gate(
+            "receiver", [_gate_message()], {"provider": "claude_code"}, provider,
+            "sender", OrchestrationType.SEND_MESSAGE)
+
+    assert (state, evidence) == ("stop", None)
+    settle.assert_called_once()
+    assert settle.call_args.args == ([1], MessageStatus.DELIVERED, "receiver")
+    provider.read_composer_draft_state.assert_not_called()
+
+
 def test_late_confirm_without_prior_stall_creates_no_corrective(wpm1_db, caplog):
     message, _attempt = _ambiguous()
     assert settle_wpm1_terminal_batch(

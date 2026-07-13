@@ -35,6 +35,74 @@ def test_provider_user_turns_match_exact_shaped_hash_after_start(tmp_path, recor
     assert evidence["kind"] == "transcript_user_turn"
 
 
+def test_claude_queued_command_attachment_matches_exact_wire_hash(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    _write(transcript, {
+        "type": "attachment",
+        "timestamp": "2026-07-11T00:00:01Z",
+        "attachment": {"type": "queued_command", "prompt": "exact queued wire"},
+    })
+    result, evidence = transcript_lookup(
+        transcript, wire_hash("exact queued wire"), START)
+    assert result == "hit"
+    assert evidence["kind"] == "transcript_queued_command"
+
+
+def test_native_user_turn_has_priority_over_earlier_queued_command(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    _write(
+        transcript,
+        {
+            "type": "attachment",
+            "timestamp": "2026-07-11T00:00:01Z",
+            "attachment": {"type": "queued_command", "prompt": "same wire"},
+        },
+        {"type": "user", "timestamp": "2026-07-11T00:00:02Z", "message": "same wire"},
+    )
+    result, evidence = transcript_lookup(transcript, wire_hash("same wire"), START)
+    assert result == "hit"
+    assert evidence["kind"] == "transcript_user_turn"
+
+
+def test_queue_operation_record_remains_non_confirming(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    _write(transcript, {
+        "type": "queue-operation",
+        "timestamp": "2026-07-11T00:00:01Z",
+        "operation": "enqueue",
+        "content": "same wire",
+    })
+    assert transcript_lookup(transcript, wire_hash("same wire"), START)[0] == "absent"
+
+
+def test_malformed_unrelated_timestamp_before_valid_native_turn_is_ignored(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    _write(
+        transcript,
+        {"type": "assistant", "timestamp": "not-a-timestamp", "message": "noise"},
+        {"type": "user", "timestamp": "2026-07-11T00:00:01Z", "message": "wire"},
+    )
+    result, evidence = transcript_lookup(transcript, wire_hash("wire"), START)
+    assert result == "hit"
+    assert evidence["kind"] == "transcript_user_turn"
+
+
+def test_malformed_unrelated_timestamp_before_valid_queued_command_is_ignored(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    _write(
+        transcript,
+        {"type": "metadata", "timestamp": "not-a-timestamp", "value": "noise"},
+        {
+            "type": "attachment",
+            "timestamp": "2026-07-11T00:00:01Z",
+            "attachment": {"type": "queued_command", "prompt": "wire"},
+        },
+    )
+    result, evidence = transcript_lookup(transcript, wire_hash("wire"), START)
+    assert result == "hit"
+    assert evidence["kind"] == "transcript_queued_command"
+
+
 def test_grok_type_user_block_list_matches_wire_hash(tmp_path):
     transcript = tmp_path / "chat_history.jsonl"
     _write(transcript, {

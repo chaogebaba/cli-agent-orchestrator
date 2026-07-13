@@ -251,6 +251,12 @@ def test_watchdog_resets_on_new_task_after_firing():
     ):
         assert svc.collect_due_notifications(now=13.0)
 
+        with patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+            return_value={"caller_id": "caller1"},
+        ):
+            svc.record_callback_if_to_caller("worker1", "caller1")
+
         svc.record_inbound_task("worker1", "caller1", "developer")
         svc.record_status("worker1", TerminalStatus.IDLE, now=20.0)
         _mark_screen_sampled(svc)
@@ -262,6 +268,52 @@ def test_watchdog_resets_on_new_task_after_firing():
                 "[watchdog] worker worker1 (developer) idle 3s without callback",
             )
         ]
+
+
+def test_caller_messages_join_fired_episode_without_rearming_alarm():
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    svc.record_inbound_task("worker1", "caller1", "developer")
+    svc.record_status("worker1", TerminalStatus.IDLE, now=10.0)
+    _mark_screen_sampled(svc)
+
+    with patch(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        return_value={"id": "worker1"},
+    ):
+        assert len(svc.collect_due_notifications(now=13.0)) == 1
+        episode = svc._episodes["worker1"]
+        started = episode.episode_started_wall_at
+        for _ in range(3):
+            svc.record_inbound_task("worker1", "caller1", "developer")
+        assert svc._episodes["worker1"] is episode
+        assert episode.fired
+        assert episode.episode_started_wall_at == started
+        assert episode.last_join_wall_at is not None
+        assert svc.collect_due_notifications(now=30.0) == []
+
+
+def test_join_keeps_first_assignment_as_d4_suppression_lower_bound():
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    svc.record_inbound_task("worker1", "caller1", "developer")
+    episode = svc._episodes["worker1"]
+    started = episode.episode_started_wall_at
+    svc.record_status("worker1", TerminalStatus.IDLE, now=10.0)
+    _mark_screen_sampled(svc)
+    svc.record_inbound_task("worker1", "caller1", "developer")
+
+    with (
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+            return_value={"id": "worker1"},
+        ),
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.has_inflight_callback_since",
+            return_value=True,
+        ) as inflight,
+    ):
+        assert svc.collect_due_notifications(now=13.0) == []
+    inflight.assert_called_once_with("worker1", "caller1", started)
+    assert not episode.fired
 
 
 def test_watchdog_prunes_deleted_terminal_without_push():

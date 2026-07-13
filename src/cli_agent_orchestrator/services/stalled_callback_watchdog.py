@@ -48,7 +48,8 @@ class _Episode:
     caller_id: str
     profile: str
     inbound_at: float
-    inbound_wall_at: datetime
+    episode_started_wall_at: datetime
+    last_join_wall_at: datetime | None = None
     callback_seen: bool = False
     fired: bool = False
     idle_since: float | None = None
@@ -107,14 +108,19 @@ class StalledCallbackWatchdog:
 
     def record_inbound_task(self, terminal_id: str, caller_id: str, profile: str) -> None:
         now = time.monotonic()
+        wall_now = datetime.now()
         with self._lock:
             if terminal_id in self._paused:
+                return
+            episode = self._episodes.get(terminal_id)
+            if episode is not None and not episode.callback_seen:
+                episode.last_join_wall_at = wall_now
                 return
             self._episodes[terminal_id] = _Episode(
                 caller_id=caller_id,
                 profile=profile,
                 inbound_at=now,
-                inbound_wall_at=datetime.now(),
+                episode_started_wall_at=wall_now,
             )
 
     def has_episode(self, terminal_id: str) -> bool:
@@ -263,7 +269,7 @@ class StalledCallbackWatchdog:
                 if idle_seconds < self.grace_seconds:
                     continue
                 if has_inflight_callback_since(
-                    terminal_id, episode.caller_id, episode.inbound_wall_at
+                    terminal_id, episode.caller_id, episode.episode_started_wall_at
                 ):
                     continue
                 episode.fired = True
