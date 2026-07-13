@@ -1,7 +1,28 @@
 # WPM2 — delivery soundness for busy receivers + alarm hygiene + seed stderr parse
 
-Status: DRAFT r17 (2026-07-13). Micro-WP, three independent slices sharing one gate
+Status: DRAFT r18 (2026-07-13). Micro-WP, three independent slices sharing one gate
 train. Builds directly on WPM1 (`8afb758`, FROZEN r9 law) and WP2S3 (`7651dc1`).
+
+r17→r18 changelog (folds codex r17 1B; grok r17 was 0/0/0; codex r17 confirmed
+the exception split is proof-safe and outcome-complete WHEN the compensating
+settlement commits, but proved a settlement-transaction failure inside an
+exception handler leaves the attempt DELIVERING with startup-only recovery):
+- **Settlement-failure law (`settlement_pending_recovery`)**: the proof-safe
+  ambiguous-settlement helper uses the existing bounded SQLite busy policy;
+  if begin/write/commit still fails it returns the closed result
+  `settlement_pending_recovery`, leaving the exact attempt/members DELIVERING —
+  it NEVER routes to another terminal arm and NEVER reopens/sends. The nested
+  failure is contained: no duplicate paste, no FAILED, no successor.
+- **Recurring in-process recovery**: stale-open Claude DELIVERING recovery is
+  attached to the existing recurring reconciliation wake, not startup only.
+  Past the age threshold it applies the already-pinned w4/D2-first recovery
+  law (D2 hit → DELIVERED; receiver-gone → terminal; every other live-receiver
+  result → anchor-less PENDING ambiguous/protected), idempotently, via a
+  conditional exact open-attempt/member/status CAS so it can never race a
+  still-running settlement.
+- Settlement-failure injection matrix (BEGIN/evidence UPDATE/member-status
+  UPDATE/COMMIT, both exception handlers) + mutant m17 (startup-only recovery —
+  a settlement failure with no restart must strand DELIVERING forever and die).
 
 r16→r17 changelog (folds codex r16 1B; grok r16.1 was 0/0/0; codex r16
 confirmed the stable-ready matrix total — 72 cases, 0 unclassified — and all
@@ -425,6 +446,30 @@ The current `interrupted/proven_absent → normal retry` route is forbidden for 
 Claude population. Receiver-gone terminal failure and non-Claude recovery remain
 unchanged. Wake selection and D9 gated-PENDING detection semantics are unchanged.
 
+**Recurring stale-open recovery (codex r17 B1 — not startup-only)**: the same
+possibly-submitted recovery law above also runs from the EXISTING recurring
+reconciliation wake (the 30-second reconciliation path at HEAD selects only
+old PENDING receivers, `inbox_service.py:633-651`, and `recover_stale_deliveries`
+is invoked only at server startup, `api/main.py:467-475` — both insufficient
+for a live process). Each reconciliation pass additionally selects open
+`claude_code` DELIVERING attempts older than the stale-age threshold (the same
+threshold `recover_stale_deliveries` already uses; below it, an in-flight
+delivery is presumed still running and is left alone). For each stale row it
+applies the identical w4/D2-first arms: D1.1 receiver-gone settles terminally
+first; S1.a transcript hit confirms DELIVERED; every other live-receiver
+result settles anchor-less PENDING `ambiguous/confirmation_timeout` with
+`crash_recovery`-shaped w4 evidence (permanently protected via
+`anchor_missing`). Recovery is idempotent and race-safe by construction: the
+settling write is a conditional CAS on the exact open attempt UUID, its exact
+member set, and members-still-DELIVERING status; if a concurrently completing
+in-band settlement won, the CAS reports stale and the pass skips the row —
+recovery can never double-settle, resurrect a terminal row, or race a
+still-running settlement into a duplicate. This makes the
+`settlement_pending_recovery` outcome of S1.f self-healing in-process: a
+stranded DELIVERING row is picked up on a later reconciliation wake, without
+requiring a server restart, and late queued-command evidence still lands
+DELIVERED through the standard protected-head exits.
+
 **Permanent D2-only classifier + proof-safe queue release (r7)**:
 `classify_permanently_d2_only(attempt, current_observation_epoch)` is the sole
 internal classifier. Evidence JSON/anchor validation is explicit and total; it
@@ -597,6 +642,22 @@ these additive keys — nothing else; unlisted keys keep raising
   rejection) retain existing deferred/failed semantics. Exits from these
   ambiguous settlements are the standard protected-head exits: S1.a D2 hit or
   D1.1 receiver-gone.
+  **Settlement-failure law (codex r17 B1)**: the compensating proof-safe
+  settlement invoked by arms (i)/(ii) can itself fail (exception-during-
+  exception). The settlement helper uses the existing bounded SQLite busy
+  policy (`_run_wpm1_immediate` 3×1s) where applicable; if BEGIN, any write,
+  or COMMIT still fails, it returns/raises the single closed result
+  `settlement_pending_recovery` and the exception handler stops there: the
+  exact attempt and its members remain DELIVERING, unmodified. No fallback to
+  the generic FAILED/interrupted/deferred arms, no second settlement attempt
+  in the same handler beyond the bounded busy policy, no reopen, and no
+  backend send — the in-memory anchor/busy fact are simply lost with the
+  failed transaction, exactly as under the closed crash rule. Repair is owned
+  EXCLUSIVELY by the recurring stale-open recovery in S1.d: because the row
+  stays DELIVERING it keeps blocking every terminal opener through the global
+  DELIVERING authority (no duplicate is possible while stranded), and the
+  recurring wake — not a server restart — is the forced path back to
+  D2-confirmable state.
 - `kind` gains the new VALUE `transcript_queued_command` (existing key; no new
   key).
 
@@ -699,7 +760,11 @@ ready→PROCESSING-before-paste receiver classifies `normal`, replays the
 shifted-observation false loss, and dies against the coordinated race
 fixture); (m16) restore the generic FAILED arm after the submit marker (a
 post-submit tail exception terminally fails an accepted paste, losing late-D2
-repair — must die against the submit/tail exception matrix).
+repair — must die against the submit/tail exception matrix); (m17) make
+stale-open DELIVERING recovery startup-only (remove/skip the recurring
+reconciliation arm — a settlement-transaction failure with no restart must
+leave the row DELIVERING forever, blocking terminal openers and never reaching
+late-D2 DELIVERED, and die against the settlement-failure matrix).
 
 `advance_wpm2_continuity_cursor(attempt_uuid, exact_message_ids, expected_ref,
 observed_ref)` uses the frozen `_run_wpm1_immediate` 3×1s transaction policy and
@@ -765,7 +830,7 @@ as a residual; any future backfill is its own gated slice.
   the cycle still qualifies (anchor is injection completion, not settlement);
   loss provable on the next evaluation. Anti-test: the same events anchored on
   `last_at` would wrongly disqualify — asserts the ban.
-- **S1.f schema law**: named mutants m1–m16 all die; unlisted-key write raises.
+- **S1.f schema law**: named mutants m1–m17 all die; unlisted-key write raises.
 - **Submit/tail exception matrix (codex r16 B1)** — exception injected at each
   pinned stage with exact status/outcome/evidence assertions:
   `test_wpm2_pre_submit_exception_keeps_deferred_failed_semantics` (error
@@ -781,6 +846,23 @@ as a residual; any future backfill is its own gated slice.
   `busy_initial_submit` persisted atomically, at most one paste, restart cut
   preserves protection, late queued-command suffix hit settles DELIVERED with
   chain length 1. m16 (generic FAILED restored past the submit marker) dies
+  across this matrix.
+- **Settlement-failure matrix (codex r17 B1)** — real-DB failure injected at
+  the compensating settlement's BEGIN, evidence UPDATE, member/status UPDATE,
+  and COMMIT, for BOTH the post-anchor tail handler and the uncertain-submit
+  handler:
+  `test_wpm2_settlement_failure_leaves_delivering_never_terminal` (each
+  injection point → handler returns `settlement_pending_recovery`; attempt +
+  exact members remain DELIVERING; zero second paste; no FAILED/interrupted/
+  deferred write; terminal openers stay blocked by the DELIVERING authority);
+  `test_wpm2_recurring_recovery_repairs_stranded_delivering_without_restart`
+  (stranded row + live receiver → a later reconciliation wake, same process,
+  applies w4/D2-first: absent → anchor-less PENDING ambiguous protected; then
+  a late queued-command suffix hit settles DELIVERED, chain length 1);
+  `test_wpm2_recovery_cas_loses_to_inflight_settlement` (recovery pass racing
+  a still-running settlement → exact-CAS reports stale, recovery skips, no
+  double-settle/duplicate); `test_wpm2_recovery_below_age_threshold_holds`
+  (young DELIVERING row is left alone). m17 (startup-only recovery) dies
   across this matrix.
 - **Busy-initial /compact fixture (codex r14 addendum B1, live trace
   inbox-1956)** — `test_wpm2_busy_initial_compact_cycles_never_exhaust`: one S4
