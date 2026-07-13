@@ -1,7 +1,26 @@
 # WPM2 — delivery soundness for busy receivers + alarm hygiene + seed stderr parse
 
-Status: DRAFT r18 (2026-07-13). Micro-WP, three independent slices sharing one gate
+Status: DRAFT r19 (2026-07-13). Micro-WP, three independent slices sharing one gate
 train. Builds directly on WPM1 (`8afb758`, FROZEN r9 law) and WP2S3 (`7651dc1`).
+
+r18→r19 changelog (folds codex r18 1B/1S; grok r18 was 0/0/0; codex r18
+confirmed CAS feasibility, recovery-vs-recovery, recursive recovery-failure
+retry, and all prior closures, but proved the "existing stale-age threshold"
+r18 cited does not exist at HEAD — `list_stale_delivering_messages()` is an
+unfiltered DELIVERING query, so duration and clock were invented decisions):
+- **Pinned stale-open eligibility (codex r18 B1)**: NEW named constant
+  `WPM2_STALE_OPEN_AGE_SECONDS = 60`; a row is recovery-eligible iff
+  `attempt.started_at <= now_utc − 60s`. The clock is the open ATTEMPT's own
+  `started_at` — NEVER inbox message `created_at` (an old PENDING message may
+  open a fresh attempt and must not be instantly stale). 60s ≥ 4× the worst
+  lawful in-band open lifetime (10s confirmation window + 3×1s settlement
+  busy envelope ≈ 13s) and spans two 30s reconciliation periods. Selector
+  queries attempt rows by provider + open outcome + attempt age.
+- **Return-only control flow (codex r18 S1)**: the settlement helper RETURNS
+  `settlement_pending_recovery`; the triggering exception is consumed and can
+  never escape into a generic terminal arm.
+- Threshold boundary fixtures (−ε / exact / +ε, hours-old message with fresh
+  attempt, slow legitimate settlement racing the first eligible pass).
 
 r17→r18 changelog (folds codex r17 1B; grok r17 was 0/0/0; codex r17 confirmed
 the exception split is proof-safe and outcome-complete WHEN the compensating
@@ -452,9 +471,24 @@ reconciliation wake (the 30-second reconciliation path at HEAD selects only
 old PENDING receivers, `inbox_service.py:633-651`, and `recover_stale_deliveries`
 is invoked only at server startup, `api/main.py:467-475` — both insufficient
 for a live process). Each reconciliation pass additionally selects open
-`claude_code` DELIVERING attempts older than the stale-age threshold (the same
-threshold `recover_stale_deliveries` already uses; below it, an in-flight
-delivery is presumed still running and is left alone). For each stale row it
+`claude_code` DELIVERING attempts past the pinned stale-open age. **Eligibility
+law (codex r18 B1)**: HEAD has NO existing stale-delivery age predicate
+(`list_stale_delivering_messages()` is an unfiltered `status == DELIVERING`
+query, `clients/database.py:1920-1925`) — the threshold is NEW and pinned
+here: named constant `WPM2_STALE_OPEN_AGE_SECONDS = 60`; a row is eligible iff
+`attempt.started_at <= now_utc − WPM2_STALE_OPEN_AGE_SECONDS` (UTC-Z per the
+frozen clock-encoding law). The clock is the open attempt's OWN `started_at`
+(`InboxDeliveryAttemptModel.started_at`); inbox message `created_at` is BANNED
+as the recovery clock — an old PENDING message lawfully opens a fresh attempt
+that must not be instantly stale. The selector queries attempt rows by
+`provider = claude_code`, open outcome (`settled_at IS NULL`), and attempt
+age — never message age. Rationale for 60: it is ≥ 4× the worst lawful
+in-band open lifetime (10-second confirmation window + the 3×1s settlement
+busy envelope ≈ 13s), so a legitimately slow send/confirm/settle can never be
+recovery-eligible on its first reconciliation pass, and it spans two
+30-second reconciliation periods, bounding terminal-wide DELIVERING blockage
+after a settlement failure to roughly 60–90s. Below threshold the row is
+presumed in flight and left alone. For each stale row it
 applies the identical w4/D2-first arms: D1.1 receiver-gone settles terminally
 first; S1.a transcript hit confirms DELIVERED; every other live-receiver
 result settles anchor-less PENDING `ambiguous/confirmation_timeout` with
@@ -646,8 +680,11 @@ these additive keys — nothing else; unlisted keys keep raising
   settlement invoked by arms (i)/(ii) can itself fail (exception-during-
   exception). The settlement helper uses the existing bounded SQLite busy
   policy (`_run_wpm1_immediate` 3×1s) where applicable; if BEGIN, any write,
-  or COMMIT still fails, it returns/raises the single closed result
-  `settlement_pending_recovery` and the exception handler stops there: the
+  or COMMIT still fails, it RETURNS the single closed result
+  `settlement_pending_recovery` (return-only contract, codex r18 S1: the
+  triggering exception is consumed inside the helper and MUST NOT propagate —
+  an escaping exception could reach a generic terminal arm) and the exception
+  handler stops there: the
   exact attempt and its members remain DELIVERING, unmodified. No fallback to
   the generic FAILED/interrupted/deferred arms, no second settlement attempt
   in the same handler beyond the bounded busy policy, no reopen, and no
@@ -864,6 +901,17 @@ as a residual; any future backfill is its own gated slice.
   double-settle/duplicate); `test_wpm2_recovery_below_age_threshold_holds`
   (young DELIVERING row is left alone). m17 (startup-only recovery) dies
   across this matrix.
+- **Threshold boundary fixtures (codex r18 B1)** —
+  `test_wpm2_stale_open_threshold_boundaries`: attempt age threshold−ε → not
+  selected; exactly `WPM2_STALE_OPEN_AGE_SECONDS` → selected; threshold+ε →
+  selected (comparison is `<=` on `started_at`, pinned exactly);
+  `test_wpm2_old_message_fresh_attempt_not_stale`: an hours-old PENDING inbox
+  message whose open attempt just started → NOT recovery-eligible (message
+  `created_at` as the clock must die);
+  `test_wpm2_slow_inband_settlement_vs_first_eligible_pass`: a legitimate
+  settlement still inside its 10s-confirm + 3×1s busy envelope is never
+  eligible on the first pass; if it runs anomalously past 60s, the exact-CAS
+  arm (not the threshold) is what prevents double settlement.
 - **Busy-initial /compact fixture (codex r14 addendum B1, live trace
   inbox-1956)** — `test_wpm2_busy_initial_compact_cycles_never_exhaust`: one S4
   paste admitted while PROCESSING (accepted into the native queue,
