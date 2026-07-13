@@ -1,7 +1,33 @@
 # WPM2 — delivery soundness for busy receivers + alarm hygiene + seed stderr parse
 
-Status: DRAFT r19 (2026-07-13). Micro-WP, three independent slices sharing one gate
+Status: DRAFT r20 (2026-07-13). Micro-WP, three independent slices sharing one gate
 train. Builds directly on WPM1 (`8afb758`, FROZEN r9 law) and WP2S3 (`7651dc1`).
+
+r19→r20 changelog (folds codex r19 1B/1S; grok r19 was 0/0/0; codex r19
+confirmed clock source, boundary algebra, and return-only contract, but proved
+the 60s rationale's premise false at HEAD: the attempt opens BEFORE
+`send_prepared_input`, and Claude's draft-stash path (`composer_stash_keys =
+["C-s"]`, 3 retries × (30.0s stability timeout + 0.3s delay) = 90.9s budget)
+lawfully holds a never-pasted attempt DELIVERING past 60s — age-based recovery
+could steal it into permanently-D2-only undeliverable limbo):
+- **Delivery-lock exclusion (codex r19 B1)**: recurring recovery must
+  NON-BLOCKINGLY acquire the same per-terminal delivery lock that
+  `deliver_pending` holds across attempt open, draft/stash, submit,
+  confirmation, and settlement. Lock held ⇒ the in-band owner is authoritative
+  REGARDLESS of age; recovery skips that terminal this wake. Only a lock-free
+  row past the age threshold may be recovered. The DB exact-CAS remains as
+  cross-thread/process failure atomicity, not as the in-flight authority.
+  60s rationale rewritten: a bounded grace for LOCK-FREE STRANDED attempts,
+  not a proof that no lawful attempt runs longer.
+- **SQLAlchemy datetime comparison (codex r19 S1)**: selector pinned as
+  `InboxDeliveryAttemptModel.started_at <= _utcnow() − timedelta(seconds=60)`
+  — a DB datetime bound (SQLite reloads naive UTC; grok probe confirmed
+  stored values are naive, no Z). ISO-8601-Z stays reserved for JSON evidence
+  clocks only.
+- Held-lock fixtures (>60s pre-submit draft-stability skip, >60s tail/
+  settlement skip, recovery on first eligible wake after release) + mutant
+  m18 (recovery ignoring the delivery lock steals a never-submitted attempt
+  and must die).
 
 r18→r19 changelog (folds codex r18 1B/1S; grok r18 was 0/0/0; codex r18
 confirmed CAS feasibility, recovery-vs-recovery, recursive recovery-failure
@@ -475,20 +501,41 @@ for a live process). Each reconciliation pass additionally selects open
 law (codex r18 B1)**: HEAD has NO existing stale-delivery age predicate
 (`list_stale_delivering_messages()` is an unfiltered `status == DELIVERING`
 query, `clients/database.py:1920-1925`) — the threshold is NEW and pinned
-here: named constant `WPM2_STALE_OPEN_AGE_SECONDS = 60`; a row is eligible iff
-`attempt.started_at <= now_utc − WPM2_STALE_OPEN_AGE_SECONDS` (UTC-Z per the
-frozen clock-encoding law). The clock is the open attempt's OWN `started_at`
-(`InboxDeliveryAttemptModel.started_at`); inbox message `created_at` is BANNED
-as the recovery clock — an old PENDING message lawfully opens a fresh attempt
-that must not be instantly stale. The selector queries attempt rows by
+here: named constant `WPM2_STALE_OPEN_AGE_SECONDS = 60`; the selector
+expression is pinned as the SQLAlchemy datetime bound
+`InboxDeliveryAttemptModel.started_at <= _utcnow() − timedelta(seconds=60)`
+(codex r19 S1: `started_at` is `DateTime(timezone=True)` populated by
+`_utcnow()` but SQLite reloads it NAIVE — never compare ISO-8601-Z text here;
+Z-encoding stays reserved for JSON evidence clocks). The clock is the open
+attempt's OWN `started_at`; inbox message `created_at` is BANNED as the
+recovery clock — an old PENDING message lawfully opens a fresh attempt that
+must not be instantly stale. The selector queries attempt rows by
 `provider = claude_code`, open outcome (`settled_at IS NULL`), and attempt
-age — never message age. Rationale for 60: it is ≥ 4× the worst lawful
-in-band open lifetime (10-second confirmation window + the 3×1s settlement
-busy envelope ≈ 13s), so a legitimately slow send/confirm/settle can never be
-recovery-eligible on its first reconciliation pass, and it spans two
-30-second reconciliation periods, bounding terminal-wide DELIVERING blockage
-after a settlement failure to roughly 60–90s. Below threshold the row is
-presumed in flight and left alone. For each stale row it
+age — never message age.
+**In-flight authority is the delivery lock, NOT age (codex r19 B1)**: age
+alone is unsound — the attempt row opens BEFORE `send_prepared_input`
+(`inbox_service.py:531-542`), and Claude's pre-submit draft-stash path
+(`composer_stash_keys = ["C-s"]`, 3 snapshot retries each entering
+`_wait_for_stable_draft` with a 30.0s stability timeout + 0.3s delay) has a
+lawful pre-submit budget ≥ 90.9s, so a never-pasted attempt can lawfully be
+open past any reasonable threshold. Recovery therefore NON-BLOCKINGLY
+attempts the same per-terminal delivery lock `deliver_pending` holds across
+attempt open, draft/stash, backend submit, confirmation, and settlement. Lock
+held ⇒ the in-band owner is still authoritative regardless of age; recovery
+skips that terminal for this wake (no CAS attempted). Only when the lock is
+free AND the age bound holds may the selector/CAS recover the row. The DB
+exact-CAS remains the cross-thread/process failure-atomicity backstop, not
+the in-flight authority: stealing an active pre-submit attempt would settle
+it anchor-less D2-only while no paste exists for D2 to ever find — a
+proof-safe but permanently undeliverable message, forbidden. Rationale for
+60: a bounded grace for LOCK-FREE STRANDED rows only — it spans two
+30-second reconciliation periods, comfortably exceeds the post-submit
+confirm+settle envelope (10s window + 3×1s busy retries; live-DB probe: max
+settled open duration ever recorded 12.884s, zero rows >60s), and bounds
+terminal-wide DELIVERING blockage after a settlement failure to roughly
+60–90s. It is NOT a claim about the maximum lawful in-band lifetime; the
+lock, not the threshold, excludes live owners. Below threshold, or while the
+lock is held, the row is left alone. For each stale row it
 applies the identical w4/D2-first arms: D1.1 receiver-gone settles terminally
 first; S1.a transcript hit confirms DELIVERED; every other live-receiver
 result settles anchor-less PENDING `ambiguous/confirmation_timeout` with
@@ -801,7 +848,11 @@ repair — must die against the submit/tail exception matrix); (m17) make
 stale-open DELIVERING recovery startup-only (remove/skip the recurring
 reconciliation arm — a settlement-transaction failure with no restart must
 leave the row DELIVERING forever, blocking terminal openers and never reaching
-late-D2 DELIVERED, and die against the settlement-failure matrix).
+late-D2 DELIVERED, and die against the settlement-failure matrix); (m18)
+recover on age alone, ignoring the per-terminal delivery lock (a >60s lawful
+pre-submit draft-stability owner loses its never-pasted attempt to an
+anchor-less D2-only settlement no transcript can ever confirm — a permanently
+undeliverable message; must die against the held-lock fixtures).
 
 `advance_wpm2_continuity_cursor(attempt_uuid, exact_message_ids, expected_ref,
 observed_ref)` uses the frozen `_run_wpm1_immediate` 3×1s transaction policy and
@@ -867,7 +918,7 @@ as a residual; any future backfill is its own gated slice.
   the cycle still qualifies (anchor is injection completion, not settlement);
   loss provable on the next evaluation. Anti-test: the same events anchored on
   `last_at` would wrongly disqualify — asserts the ban.
-- **S1.f schema law**: named mutants m1–m17 all die; unlisted-key write raises.
+- **S1.f schema law**: named mutants m1–m18 all die; unlisted-key write raises.
 - **Submit/tail exception matrix (codex r16 B1)** — exception injected at each
   pinned stage with exact status/outcome/evidence assertions:
   `test_wpm2_pre_submit_exception_keeps_deferred_failed_semantics` (error
@@ -910,8 +961,21 @@ as a residual; any future backfill is its own gated slice.
   `created_at` as the clock must die);
   `test_wpm2_slow_inband_settlement_vs_first_eligible_pass`: a legitimate
   settlement still inside its 10s-confirm + 3×1s busy envelope is never
-  eligible on the first pass; if it runs anomalously past 60s, the exact-CAS
-  arm (not the threshold) is what prevents double settlement.
+  eligible on the first pass; if it runs anomalously past 60s, the
+  delivery-lock exclusion (primary) and the exact-CAS (backstop) prevent
+  recovery from stealing it.
+- **Held-lock exclusion fixtures (codex r19 B1)** —
+  `test_wpm2_recovery_skips_held_lock_presubmit`: an attempt held >60s inside
+  the lawful pre-submit draft-stability path (no paste yet, delivery lock
+  held) → recovery skips the terminal, no CAS attempted, the in-band owner
+  later completes normally (submit → confirm/settle) with correct
+  submitted-semantics; `test_wpm2_recovery_skips_held_lock_tail`: same with
+  the owner >60s in post-submit tail/settlement work;
+  `test_wpm2_recovery_after_lock_release`: owner crashes/returns and frees
+  the lock → the FIRST subsequent eligible wake recovers the row through the
+  w4/D2-first arms. m18 (age-only recovery ignoring the lock) dies here: the
+  stolen never-pasted attempt becomes anchor-less D2-only with no transcript
+  ever able to confirm.
 - **Busy-initial /compact fixture (codex r14 addendum B1, live trace
   inbox-1956)** — `test_wpm2_busy_initial_compact_cycles_never_exhaust`: one S4
   paste admitted while PROCESSING (accepted into the native queue,
