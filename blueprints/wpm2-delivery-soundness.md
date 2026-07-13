@@ -1,7 +1,19 @@
 # WPM2 — delivery soundness for busy receivers + alarm hygiene + seed stderr parse
 
-Status: DRAFT r13 (2026-07-13). Micro-WP, three independent slices sharing one gate
+Status: DRAFT r14 (2026-07-13). Micro-WP, three independent slices sharing one gate
 train. Builds directly on WPM1 (`8afb758`, FROZEN r9 law) and WP2S3 (`7651dc1`).
+
+r13→r14 changelog (folds codex r13 2S; codex r13 was BUILDABLE YES 0B/2S/0N
+zero-decision, grok r13 0B/0S/0N — evidence hardening only, no design change):
+- Scan-origin table gains two explicit unsupported-provenance rows: malformed
+  nested + otherwise-valid top-level, and `cursor_version` present but not
+  integer `1` + valid top-level. Both are `unresolved`/non-open — never a
+  "nested absent" top-level fallback, never an unversioned origin-0 migration.
+- Provenance-stripping pinned as a mutant: HEAD's activity merge writing
+  `last_observed_ref` (which would overwrite a versioned cursor with an
+  unversioned four-field observation on the next wake) is mutant m12 and a
+  named survival test asserts the five-field versioned cursor is byte-equivalent
+  across status/transcript activity merges.
 
 r12→r13 changelog (folds codex r12 1B/1S; grok r12 remained 0B/0S/0N YES):
 - Cursor provenance pinned: the canonical nested cursor gains `cursor_version: 1`,
@@ -492,6 +504,14 @@ rule), with a closed scan-origin table:
   origin 0 (full rescan, still subject to the refresh path's own bounds);
 - top-level alone (nested key absent) → the one-wake seed: scan origin
   `top_level.size`;
+- malformed nested (structurally invalid object under the key) + otherwise-valid
+  top-level → `unresolved`/non-open — a present-but-broken nested cursor is
+  unsupported provenance, NOT "nested absent", so the top-level seed arm never
+  applies;
+- nested `cursor_version` present but not integer `1` (any other type or value)
+  + valid top-level → `unresolved`/non-open — an unknown version is neither
+  versioned authority nor legacy unversioned state; future version handling must
+  extend this table explicitly, never silently reinterpret;
 - identity conflict between any two sources, or all sources missing/malformed →
   `unresolved`/non-open — never fallback.
 A hit found during any of these scans may settle immediately; an absent scan
@@ -540,7 +560,10 @@ and normal reinjection; (m8) mutate a cursor only in memory; (m9) directly UPDAT
 attempt evidence instead of using w5; (m10) trust an unversioned nested size as a
 scan baseline (must skip the unparsed interval, duplicate, and die); (m11)
 substitute a newer cursor into an already-built AdmissionProof instead of
-rebuilding the full proof.
+rebuilding the full proof; (m12) restore HEAD's activity-merge cursor write
+(`updates["last_observed_ref"] = observation`, `inbox_service.py:271-296`) —
+the unversioned four-field observation overwrites a versioned cursor on the
+next wake, stripping provenance; must die against the cursor-survival test.
 
 `advance_wpm2_continuity_cursor(attempt_uuid, exact_message_ids, expected_ref,
 observed_ref)` uses the frozen `_run_wpm1_immediate` 3×1s transaction policy and
@@ -606,7 +629,7 @@ as a residual; any future backfill is its own gated slice.
   the cycle still qualifies (anchor is injection completion, not settlement);
   loss provable on the next evaluation. Anti-test: the same events anchored on
   `last_at` would wrongly disqualify — asserts the ban.
-- **S1.f schema law**: named mutants m1–m11 all die; unlisted-key write raises.
+- **S1.f schema law**: named mutants m1–m12 all die; unlisted-key write raises.
 - **Cursor compatibility + writer matrix**:
   `test_wpm2_versioned_nested_cursor_wins_over_conflicting_legacy_top_level`,
   `test_wpm2_legacy_top_level_cursor_migrates_once`, and
@@ -620,6 +643,19 @@ as a residual; any future backfill is its own gated slice.
   `test_wpm2_unversioned_nested_alone_full_rescan` pins the origin-0 arm and
   `test_wpm2_version_upgrade_writes_smaller_size` pins the monotonic-floor
   exemption (versioned result smaller than the unversioned state commits).
+  **Unsupported provenance rows (codex r13 S1)** —
+  `test_wpm2_malformed_nested_with_valid_top_level_unresolved` and
+  `test_wpm2_unknown_cursor_version_with_valid_top_level_unresolved`: both
+  fixtures carry a valid legacy top-level cursor and must return
+  `unresolved`/non-open — asserting neither the top-level seed arm nor the
+  unversioned origin-0 arm fires when a nested object is present but broken or
+  carries an unsupported version.
+  **Provenance survival (codex r13 S2)** —
+  `test_wpm2_versioned_cursor_survives_status_and_transcript_activity_merge`:
+  after a versioned cursor is persisted, ordinary activity processing updates
+  `last_observed_status`/`last_activity_at` while the five-field versioned
+  cursor stays byte-equivalent; m12 (restoring the HEAD activity-merge
+  `last_observed_ref` write) must die here.
   `test_wpm2_advance_cursor_ambiguous_and_interrupted_rows` covers both eligible
   populations and proves failed/open/terminal rows are stale.
   `test_wpm2_advance_cursor_rowcount_stale_and_busy_results` pins the four result
