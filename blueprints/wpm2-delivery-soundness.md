@@ -1,7 +1,15 @@
 # WPM2 — delivery soundness for busy receivers + alarm hygiene + seed stderr parse
 
-Status: DRAFT r11 (2026-07-13). Micro-WP, three independent slices sharing one gate
+Status: DRAFT r12 (2026-07-13). Micro-WP, three independent slices sharing one gate
 train. Builds directly on WPM1 (`8afb758`, FROZEN r9 law) and WP2S3 (`7651dc1`).
+
+r11→r12 changelog (folds codex r11 1B; grok r11 remained 0B/0S/0N YES):
+- `last_observed_ref` is now the sole canonical durable WPM2 continuity cursor;
+  nested-first legacy migration is pinned and every D2/admission read uses it.
+- `advance_wpm2_continuity_cursor` is the only refresh writer: exact PENDING
+  members, same identity, monotonic size, tagged stale/busy/idempotent results.
+- Ambiguous and ordinary prior outcomes, concurrent advancement, crash cuts, and
+  restart durability after an absent overflow refresh now have named evidence.
 
 r10→r11 changelog (folds codex r10 1B/1S; grok r10 remained 0B/0S/0N YES):
 - Transcript admission authority now separates exact identity from append cursor:
@@ -213,7 +221,8 @@ The MSGTRACE RESIDUAL-2 carve-out (no binding → no oracle) is unchanged: S1.a
 widens recognized record shapes WITHIN a resolved binding, never the binding
 authority itself. S1.a lookups inherit the existing lookup parameters unchanged:
 the attempt's `started_at` scan window and the `last_observed_ref`
-(path/inode/size) continuity machinery — no new scan-origin or continuity rules.
+(path/inode/size/resolution-kind) continuity machinery. Scan origin is unchanged;
+the canonical nested storage and legacy precedence rules are pinned in S1.f.
 
 ### S1.b — loss-boundary predicate (closes codex B2, grok B1; replaces r1's deferred pin)
 
@@ -442,6 +451,33 @@ these additive keys — nothing else; unlisted keys keep raising
 - `kind` gains the new VALUE `transcript_queued_command` (existing key; no new
   key).
 
+**Canonical WPM2 continuity cursor (no schema addition)**:
+`last_observed_ref` is THE sole durable cursor object and has the closed shape
+`{path, inode, size, resolution_kind}`. Every WPM2 D2 lookup, corrective or
+ordinary `AdmissionProof`, bounded in-transaction recheck, and out-of-transaction
+refresh extracts its baseline from this nested object; passing the containing
+evidence object as `expected_ref` or reading top-level `path`/`inode`/`size` is
+forbidden. `size` is a non-negative integer monotonic cursor; the other three
+fields are its identity and compare exactly.
+
+Legacy read precedence is closed. A valid `last_observed_ref` always wins and
+top-level cursor fields are ignored even when they conflict. Only when the nested
+key is ABSENT may a row with a complete valid legacy top-level
+`{path,inode,size,resolution_kind}` be normalized as a one-wake seed. A hit may
+settle immediately; an absent scan must persist the returned cursor through
+`advance_wpm2_continuity_cursor` before any AdmissionProof/open. Missing/invalid
+legacy fields, a present-but-malformed nested object, or identity conflict is
+`unresolved`/non-open — never fallback. Once nested state is persisted, legacy
+top-level fields are never consulted again.
+
+All WPM2 settlement paths initialize the nested cursor from the attempt's captured
+continuity reference: w1 covers normal ambiguous and ordinary non-success
+settlement, and w4 covers crash recovery when no normal settlement committed.
+If no valid authority can be captured they persist no cursor and the row remains
+unresolved/non-open. HEAD's activity merge may still write
+`last_observed_status`/`last_activity_at`, but it MUST NOT write
+`last_observed_ref`; a fully parsed absent lookup delegates that write to w5.
+
 **Confirmation-evidence destination (closes codex r3 B4)**: the terminal
 settlement seam (`settle_wpm1_terminal_batch`) gains a closed
 `confirmation_evidence` argument. Target rule: the winning lookup evidence
@@ -453,21 +489,56 @@ apply to both writes; lookup evidence is never discarded (`_handle_wpm1_gate`'s
 current `lookup_result, _` discard is corrected as part of this wiring).
 
 Lawful writers, complete list: (w1) `settle_delivery_attempt` extended to
-persist the in-memory anchor with ambiguous settlement; (w2) the existing
-settled-attempt conditional-merge seam for `boundary_snapshot`/
+persist the in-memory anchor and initialize the canonical cursor with settlement;
+(w2) the existing settled-attempt conditional-merge seam for `boundary_snapshot`/
 `queue_corroboration`; (w3) the extended terminal-settlement transaction for
 confirmation evidence; (w4) `recover_stale_deliveries` writing `crash_recovery`
-in the same settlement transaction that creates the closed anchor-less
-ambiguous row. No other writer, no direct row UPDATE; HEAD
+and initializing the cursor in the same settlement transaction that creates the
+closed anchor-less ambiguous row; (w5) `advance_wpm2_continuity_cursor` updating
+ONLY the existing `last_observed_ref` key under the cursor transaction below. No
+other writer, no direct row UPDATE; HEAD
 PENDING/member-set/rowcount/busy semantics unchanged everywhere except as
-stated in w1/w3/w4. Named mutants (must die): (m1) write a new key bypassing the
+stated in w1–w5. Named mutants (must die): (m1) write a new key bypassing the
 allowlist; (m2) write anchor or `boundary_snapshot` to a different attempt row
 than the injecting/exhausting one; (m3) write `boundary_exhausted_at` without
 `boundary_snapshot` in the same transaction; (m4) restore the pre-settlement
 merge predicate for the anchor (must fail the anchor-persist lifecycle test);
 (m5) authorize a loss from an anchor-less attempt; (m6) compare sequences
 across epochs; (m7) restore stale-Claude `interrupted/proven_absent` recovery
-and normal reinjection.
+and normal reinjection; (m8) mutate a cursor only in memory; (m9) directly UPDATE
+attempt evidence instead of using w5.
+
+`advance_wpm2_continuity_cursor(attempt_uuid, exact_message_ids, expected_ref,
+observed_ref)` uses the frozen `_run_wpm1_immediate` 3×1s transaction policy and
+returns the closed tag `advanced | already_advanced | stale | busy_aborted`.
+Inside `BEGIN IMMEDIATE` it re-reads the named attempt and its EXACT member set,
+requires every member still PENDING, and requires a settled, non-success attempt
+currently eligible as either (a) any `ambiguous` row, including WPM1
+confirmation-timeout/crash recovery, or (b) an ordinary prior-outcome row named
+by the current WPM2 read-set, including `interrupted` and proven-never-submitted
+`deferred`. Delivered/confirmed rows, ALL failed-send rows, open attempts,
+unrelated outcomes, changed members, non-PENDING members, or changed rowcount
+return `stale`; no row is written and the caller stops this candidate for the
+wake.
+
+The transaction decodes the stored canonical cursor (or the one-wake valid legacy
+seed) and requires observed identity `{path,inode,resolution_kind}` to equal both
+stored and expected identity with observed `size >= expected size`. Normally the
+stored object equals `expected_ref`. If a concurrent writer already moved the same
+identity beyond expected, stored size >= observed size returns `already_advanced`;
+stored size between expected and observed advances to observed. Identity change,
+stored size below expected, malformed state, or observed regression is `stale`.
+The successful read-modify-write changes only `evidence.last_observed_ref` and
+preserves every other evidence key/value. Concurrent writers therefore converge
+on max size and can never move the cursor backward or across identity.
+
+For grouped ordinary reads, call w5 oldest-first once per eligible attempt whose
+full out-of-transaction scan returned absent. Any `stale`/`busy_aborted` stops
+opening on that wake; already-committed earlier advances remain safe and the next
+wake resumes the rest. `advanced`/`already_advanced` permit fresh preflight only —
+they never themselves authorize send or absence. Crash before commit leaves the
+old cursor and causes a safe rescan; crash after commit reloads the new cursor on
+restart. No backend send occurs between refresh scan and cursor commit.
 
 ### S1.e — historical backfill: OUT (closes codex S1, grok S4)
 
@@ -493,7 +564,20 @@ as a residual; any future backfill is its own gated slice.
   the cycle still qualifies (anchor is injection completion, not settlement);
   loss provable on the next evaluation. Anti-test: the same events anchored on
   `last_at` would wrongly disqualify — asserts the ban.
-- **S1.f schema law**: named mutants m1–m7 all die; unlisted-key write raises.
+- **S1.f schema law**: named mutants m1–m9 all die; unlisted-key write raises.
+- **Cursor compatibility + writer matrix**:
+  `test_wpm2_nested_cursor_wins_over_conflicting_legacy_top_level`,
+  `test_wpm2_legacy_top_level_cursor_migrates_once`, and
+  `test_wpm2_malformed_nested_cursor_never_falls_back` pin precedence.
+  `test_wpm2_advance_cursor_ambiguous_and_interrupted_rows` covers both eligible
+  populations and proves failed/open/terminal rows are stale.
+  `test_wpm2_advance_cursor_rowcount_stale_and_busy_results` pins the four result
+  tags, exact members, all-PENDING predicate, and 3×1s busy stop.
+  `test_wpm2_concurrent_cursor_advances_converge_on_max_size` coordinates two DB
+  connections in both commit orders; identity never changes and size never
+  regresses. Crash fixtures before and after the cursor commit prove respectively
+  safe rescan and durable restart reuse. In-memory-only mutation and direct
+  evidence-UPDATE mutants must fail this matrix.
 - **Anchor lifecycle (codex r3 B1)**: begin → submit-seam mark → ambiguous
   settlement persists anchor atomically; m4 (pre-settlement merge predicate
   restored) fails this test. Crash-cut: kill between submit and settlement →
@@ -727,8 +811,9 @@ preflight again and admit it lawfully):
   NO attempt whose `prior_attempt_uuid` points to that source. The proof also
   fingerprints that source's exact `payload_hash`, `started_at` scan window,
   and `TranscriptAuthorityIdentity` (binding row id, session id, path, inode,
-  resolution kind). It carries continuity `baseline_size` separately as a cursor,
-  NOT as an exact-match identity/fingerprint field.
+  resolution kind). It carries `baseline_size` from the source attempt's durable
+  `evidence.last_observed_ref.size`, separately from identity and NOT as an
+  exact-match field against live file size.
   Inside the transaction, after DB source/no-successor revalidation and BEFORE
   candidate CAS, re-resolve/fingerprint that authority and run ONE non-polling,
   continuity-aware D2 lookup for the source hash/window. Missing/changed source,
@@ -747,10 +832,13 @@ preflight again and admit it lawfully):
 
 - Exact identity comparison covers ONLY binding row id/session/path/inode/
   resolution kind plus the applicable source payload hash and `started_at`
-  window. `baseline_size` is the preflight scan cursor stored separately. The
-  durable proof baseline itself must still equal the attempt/read-reference
-  baseline recomputed in-transaction (a changed baseline is stale), but live file
-  `current_size` is expected to grow and is NEVER compared for equality with it.
+  window. `baseline_size` is read from the canonical durable
+  `evidence.last_observed_ref` cursor and stored separately in the proof. The
+  durable nested baseline itself must still equal the proof baseline recomputed
+  in-transaction; a concurrent w5 advance makes this invocation
+  `stale_admission` and a later wake builds a fresh proof. Live file
+  `current_size` is expected to grow and is NEVER compared for equality with the
+  baseline.
 - `MAX_IN_TXN_TRANSCRIPT_DELTA_BYTES = 1_048_576` (1 MiB). A proof without a
   valid continuity baseline cannot trigger an in-transaction full scan; it is
   immediately `stale_admission` for out-of-transaction refresh.
@@ -922,11 +1010,17 @@ Evidence bar:
   epoch, scans the complete growth, finds the hit, settles DELIVERED, and never
   calls the opener/backend. `test_wpm2_overflow_absent_refresh_advances_baseline_then_opens`
   supplies >1 MiB valid absent JSONL; the next service D2 scans it outside the
-  write transaction and atomically advances the attempt's continuity baseline to
-  current size. A later AdmissionProof uses that advanced cursor (zero/new bounded
-  delta) and may open once if all other admission facts remain true. Reusing the
-  old cursor, treating cap overflow as permanent stale, or failing to persist the
-  absent refresh baseline must starve these continuations and die.
+  write transaction and atomically advances the attempt's canonical
+  `last_observed_ref` to current size through w5. The test closes the service and
+  DB handles, constructs a fresh service/process fixture, reloads the attempt from
+  SQLite, and asserts the later AdmissionProof uses that durable advanced cursor
+  (zero/new bounded delta) and may open once if all other admission facts remain
+  true. Parameterized ambiguous and ordinary-`interrupted` prior rows take this
+  same restart path. `test_wpm2_overflow_cursor_crash_before_and_after_commit`
+  proves before-commit rescan and after-commit restart reuse. Reusing the old
+  cursor, treating cap overflow as permanent stale, mutating only the caller's
+  evidence dict, or directly UPDATEing evidence outside w5 must starve/violate
+  these continuations and die.
 - Mixed-writer closure (codex r6 B3): two-connection races
   `test_wpm2_s4_vs_ordinary_initial_share_atomic_delivering_opener` and
   `test_wpm2_s4_vs_corrective_share_atomic_delivering_opener` coordinate both
