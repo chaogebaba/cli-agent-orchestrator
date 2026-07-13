@@ -1,7 +1,21 @@
 # WPM2 — delivery soundness for busy receivers + alarm hygiene + seed stderr parse
 
-Status: DRAFT r6 (2026-07-13). Micro-WP, three independent slices sharing one gate
+Status: DRAFT r7 (2026-07-13). Micro-WP, three independent slices sharing one gate
 train. Builds directly on WPM1 (`8afb758`, FROZEN r9 law) and WP2S3 (`7651dc1`).
+
+r6→r7 changelog (folds codex r6 3B/1S; grok r6 S1 converged with codex B1):
+- One internal `classify_permanently_d2_only` authority covers ambiguous heads
+  with no durable anchor AND anchored heads whose token differs from the current
+  monitor token. Both retain PENDING/D2-only proof safety and use the identical
+  protected-member notice + skip/release path.
+- `skip_d2_only` is emitted only AFTER the protected head's lawful D1.3/D8
+  stalled-notice evaluation. Busy-aborted notice transactions stop the wake;
+  later D2 confirmation retains the frozen corrective-notice transaction.
+- `begin_delivery_attempt_if_no_other_delivering` is now the single attempt-open
+  primitive for S4 initial, ordinary initial, and WPM1 corrective injection;
+  behavior-specific admission stays outside. Mixed legacy writers are forbidden.
+- Release evidence now covers multiple protected sets before multiple disjoint
+  rows under default-one and limit-100/grouping selection.
 
 r5→r6 changelog (folds codex r5 3B/2S/1N + grok r5 1S; supervisor
 direction pin = proof-safe queue release, not strict-FIFO starvation):
@@ -258,9 +272,25 @@ The current `interrupted/proven_absent → normal retry` route is forbidden for 
 Claude population. Receiver-gone terminal failure and non-Claude recovery remain
 unchanged. Wake selection and D9 gated-PENDING detection semantics are unchanged.
 
-**Proof-safe queue release (r6 direction pin)**: a recovered anchor-less attempt
-carrying `crash_recovery` remains the immutable D2-only head for ITS member set,
-but no longer owns the whole terminal queue. Mechanics are closed:
+**Permanent D2-only classifier + proof-safe queue release (r7)**:
+`classify_permanently_d2_only(attempt, current_observation_epoch)` is the sole
+internal classifier. It reads settled attempt outcome/reason/evidence and the
+current atomic monitor snapshot, returning one of:
+
+- `anchor_missing`: attempt is `ambiguous/confirmation_timeout` and has no valid
+  persisted `injection_completed_seq` `{observation_epoch, seq}`. This includes
+  every crash-recovered anchor-less attempt; `crash_recovery` is explanatory
+  evidence, not a requirement for protection.
+- `epoch_mismatch`: attempt is `ambiguous/confirmation_timeout`, has a valid
+  persisted anchor, and its literal `observation_epoch` token differs from the
+  monitor snapshot's CURRENT token (construction restart, reset, or rebind).
+- `None`: otherwise. Same-token anchored attempts retain normal S1 boundary
+  evaluation; malformed/unavailable token evidence fails closed with generic
+  `stop` and never authorizes loss/reinject.
+
+Both non-None reasons are **permanently D2-only for that epoch/attempt**: never
+exhaust, never reinject, remain PENDING until D2 hit/receiver-gone, and share the
+same immutable protected-member-set release below. Mechanics are closed:
 
 1. The DB layer adds an oldest-first, cursor/paginated pending scan for one
    receiver that accepts an `excluded_message_ids` set. Unlike
@@ -271,11 +301,17 @@ but no longer owns the whole terminal queue. Mechanics are closed:
    existing contiguous sender/orchestration grouping applies only after this
    filtered selection.
 2. Under the delivery lock, `deliver_pending` first evaluates each oldest
-   crash-recovered D2-only attempt using its durable, immutable member set from
+   classifier-positive D2-only attempt using its durable, immutable member set from
    `inbox_delivery_attempt_member`. `_handle_wpm1_gate` runs D2 first. A hit
-   settles that set normally; a miss returns the NEW internal control result
-   `skip_d2_only(attempt_uuid, member_ids)` instead of generic `stop`. This is
-   control vocabulary only, not a persisted outcome/status.
+   settles that set normally. On a miss, the gate updates the existing D1.3
+   activity/stall evidence and evaluates D8 exactly-once notice eligibility
+   BEFORE returning. If `record_wpm1_stalled_notice` returns `busy_aborted`, the
+   whole wake returns generic `stop` so its atomic pair retries; no later batch
+   runs on that wake. Otherwise (notice not due, recorded, or already recorded),
+   it returns `skip_d2_only(attempt_uuid, member_ids)` instead of generic `stop`.
+   This is control vocabulary only, not a persisted outcome/status. Exhaustion,
+   terminal-failure, successor-begin, and backend-send arms are bypassed for the
+   protected set.
 3. On `skip_d2_only`, `deliver_pending` adds exactly those member IDs to the
    pass-local exclusion set and selects again. It performs NO `begin_delivery_attempt`,
    no exhaustion write, no status transition, and no backend send for the
@@ -287,9 +323,10 @@ but no longer owns the whole terminal queue. Mechanics are closed:
    The protected head stays PENDING in original created-at order and is D2-checked
    again on later reconciliation wakes.
 
-This explicitly supersedes strict terminal-wide FIFO only for crash-recovered
-D2-only heads. It preserves WPM1's one-injection law per durable member set while
-preventing an uncertain permanently-absent head from starving later callbacks.
+This explicitly supersedes strict terminal-wide FIFO only for classifier-positive
+permanent D2-only heads. It preserves WPM1's one-injection and notice/corrective
+laws per durable member set while preventing an uncertain permanently-absent head
+from starving later callbacks.
 
 ### S1.f — closed additive evidence schema + sole lawful writer (closes codex r2 B2)
 
@@ -400,6 +437,13 @@ as a residual; any future backfill is its own gated slice.
   `test_wpm2_rebind_reset_cycle_with_absent_payload_stays_d2_only`. All three are
   old-token/current-token mismatch pins; the last uses the real rebind/reset
   ordering and kills authorization from its initialization cycle.
+- **Mismatch release liveness (codex r6 B1/grok S1)**:
+  `test_wpm2_construction_restart_protects_mismatch_and_releases_disjoint_callback`
+  and `test_wpm2_rebind_reset_protects_mismatch_and_releases_disjoint_callback`
+  persist an anchored ambiguous head under the old token, open the new monitor
+  token, keep the head PENDING with zero reinjection/loss, and inject a later
+  disjoint callback exactly once. Mutating either classifier reason to generic
+  `stop` must starve the later row and die.
 - **Crash recovery (codex r4 B1)**: real injection submit succeeds, process dies
   before anchor settlement, startup recovery runs, then multiple reconciliation
   wakes occur before queued-command confirmation → exactly ONE total injection,
@@ -419,6 +463,23 @@ as a residual; any future backfill is its own gated slice.
   one-injection chain. Removing SQL exclusion-before-limit, mapping
   `skip_d2_only` back to generic `stop`, or calling begin/send for excluded IDs
   must fail these tests.
+- **Protected-head notice ordering (codex r6 B2)**:
+  `test_wpm2_protected_head_stalled_notice_once_before_skip` crosses both D1.3
+  thresholds across repeated wakes and records exactly one D8 notice before
+  release; `test_wpm2_protected_head_notice_busy_abort_stops_whole_wake` forces
+  `record_wpm1_stalled_notice=busy_aborted` and proves no later callback runs on
+  that wake; `test_wpm2_protected_head_late_delivery_emits_corrective_notice`
+  first records the stall, then adds a D2 queued-command hit and verifies the
+  frozen delivered-after-stall corrective notice transaction exactly once.
+  Returning `skip_d2_only` before D1.3/D8 must kill all three.
+- **Multi-head release and limits (codex r6 S1)**: two protected durable member
+  sets precede multiple disjoint rows. Named tests
+  `test_wpm2_default_one_skips_all_protected_sets_before_each_disjoint_row` and
+  `test_wpm2_limit_all_excludes_protected_sets_before_grouping` exercise
+  `num_messages=1` across repeated calls and `num_messages=0`/limit-100 with
+  contiguous sender/orchestration grouping. Every protected member stays out of
+  later candidate groups; every disjoint row injects once. One-exclusion-only,
+  exclusion-after-LIMIT, and protected-member-regrouping mutants must die.
 - **Confirmation destination (codex r3 B4)**: initial-hit, late-hit with one
   attempt, late-hit landing on an OLDER attempt than the newest settlement
   target — evidence rows land per the S1.f target rule in all three.
@@ -523,24 +584,32 @@ relaxes loss proofs or reinjection, only the first paste.
   neither required nor sufficient; overlap is the authority. Thus regrouping
   `[m1,m2] → [m1]` and `[m1] → [m1,m2]` cannot repaste `m1`.
 
-**Concurrency and DELIVERING authority**: the existing per-terminal delivery
-lock is the process-local injection lease, but it is never sufficient alone.
-While holding that lock and BEFORE `begin_delivery_attempt` or any other attempt/
-message mutation, S4 calls `list_delivering_attempts_for_terminal(terminal_id)`,
-which joins DELIVERING inbox rows to attempt members. Any row blocks admission.
-Opening uses `begin_delivery_attempt_if_no_other_delivering(...)` on the existing
-bounded `_run_wpm1_immediate` / `BEGIN IMMEDIATE` spine: re-run the same
-no-DELIVERING query, insert the candidate
+**Global concurrency and DELIVERING authority**: the existing per-terminal
+delivery lock is the process-local injection lease, but it is never sufficient
+alone. EVERY path that can open a DELIVERING attempt for a terminal — S4 busy
+initial, ordinary ready initial, and WPM1 corrective reinjection — uses the SAME
+`begin_delivery_attempt_if_no_other_delivering(...)` primitive. Behavior-specific
+admission (S4 overlap/D5, ordinary ready/dialog gates, corrective S1 boundary)
+is evaluated outside and before this common opener; none may call legacy
+`begin_delivery_attempt` directly.
+
+While holding the delivery lock and BEFORE any attempt/message mutation, the
+common seam calls `list_delivering_attempts_for_terminal(terminal_id)`, which
+joins DELIVERING inbox rows to attempt members. Any row blocks opening. The
+primitive then uses the existing bounded `_run_wpm1_immediate` /
+`BEGIN IMMEDIATE` spine: re-run the same no-DELIVERING query, insert the candidate
 attempt/members, mark them DELIVERING, then post-open query before commit. The
 post-open result must be exactly `{just_created_attempt_uuid}` with exactly the
 candidate member set. Any precheck conflict or post-open mismatch rolls back the
 whole helper transaction, leaves candidate messages PENDING, and performs no
 paste; the caller returns/retries on a later wake. Therefore the just-created
 attempt is the sole DELIVERING exception only AFTER the atomic open succeeds.
+`begin_delivery_attempt` may remain as a lower-level/test compatibility symbol,
+but no production inbox writer routes through it after WPM2.
 
 Distinct durable ambiguous batches follow the proof-safe release policy in
-S1.d: crash-recovered D2-only member sets are skipped without paste, and later
-DISJOINT batches may proceed. Ordinary non-protected ambiguous batches retain
+S1.d: classifier-positive permanent D2-only member sets are skipped without
+paste, and later DISJOINT batches may proceed. Ordinary non-protected ambiguous batches retain
 their S1/WPM1 gate behavior. No batch is collapsed into another payload or cap;
 this gives one concurrent paste maximum and one proof chain per member set.
 
@@ -586,8 +655,15 @@ Evidence bar:
   post-open set is exact-self. A coordinated second-connection test attempts a
   conflicting open. Mutations removing the DB QUERY (outer preflight or atomic
   helper query), retaining only the process lock, or omitting the post-open query
-  must die. Crash-recovered protected head + later disjoint candidate remains
-  admissible because the head is PENDING, not DELIVERING.
+  must die. Any classifier-positive protected head + later disjoint candidate
+  remains admissible because the head is PENDING, not DELIVERING.
+- Mixed-writer closure (codex r6 B3): two-connection races
+  `test_wpm2_s4_vs_ordinary_initial_share_atomic_delivering_opener` and
+  `test_wpm2_s4_vs_corrective_share_atomic_delivering_opener` coordinate both
+  admission paths against one terminal; exactly one DELIVERING attempt commits
+  and the loser stays PENDING/no-paste. Mutations routing the ordinary or
+  corrective peer through legacy `begin_delivery_attempt` must reproduce the
+  live-probe `[legacy,s4]` dual-DELIVERING state and die.
 - `EAGER_INBOX_DELIVERY=false` still permits the exact Claude S4 initial arm;
   non-Claude behavior remains flag-gated. Mutants making the flag disable S4 or
   making S4 supersede the flag globally must die.
