@@ -1,7 +1,27 @@
 # WPM2 — delivery soundness for busy receivers + alarm hygiene + seed stderr parse
 
-Status: DRAFT r20 (2026-07-13). Micro-WP, three independent slices sharing one gate
+Status: DRAFT r21 (2026-07-13). Micro-WP, three independent slices sharing one gate
 train. Builds directly on WPM1 (`8afb758`, FROZEN r9 law) and WP2S3 (`7651dc1`).
+
+r20→r21 changelog (folds codex r20 2S; codex r20 was BUILDABLE YES 0B/2S/0N
+zero-decision YES — first empirical YES since r13 — verifying the lock spans
+the full open→settle range under one outer `finally`, cancellation cannot leak
+it via `asyncio.to_thread` thread continuation, and non-blocking acquire is
+HEAD's exact API; grok r20 was 0/0/0):
+- **Recovery-owned lock release pinned (codex r20 S1)**: recovery uses
+  `acquired = lock.acquire(blocking=False); if not acquired: skip;
+  try: recover; finally: lock.release()` — release exactly once on EVERY arm
+  (hit/absent/receiver-gone/stale/busy/error). `deliver_pending`'s existing
+  outer `finally` (`inbox_service.py:419-426`) is named PRESERVED law, so a
+  handler returning `settlement_pending_recovery` necessarily releases before
+  recurring recovery can acquire. New fixture: recovery-transaction-failure/
+  cancellation proves exactly-once release.
+- **Single-server-process scope pinned (codex r20 S2)**: WPM2's supported
+  runtime is ONE CAO server process per SQLite database (HEAD reality:
+  process-local `threading.Lock`, single-worker uvicorn). A second process
+  sharing the DB would not see the held lock and could steal a live
+  pre-submit attempt after 60s; multi-process deployment REQUIRES a durable
+  DB-backed in-flight lease first and is out of scope for this slice.
 
 r19→r20 changelog (folds codex r19 1B/1S; grok r19 was 0/0/0; codex r19
 confirmed clock source, boundary algebra, and return-only contract, but proved
@@ -535,7 +555,26 @@ settled open duration ever recorded 12.884s, zero rows >60s), and bounds
 terminal-wide DELIVERING blockage after a settlement failure to roughly
 60–90s. It is NOT a claim about the maximum lawful in-band lifetime; the
 lock, not the threshold, excludes live owners. Below threshold, or while the
-lock is held, the row is left alone. For each stale row it
+lock is held, the row is left alone.
+**Recovery lock lifecycle (codex r20 S1)**: the recovery pass follows exactly
+`acquired = lock.acquire(blocking=False); if not acquired: skip terminal;
+try: recover; finally: lock.release()` — the recovery owner releases exactly
+once on every return arm (D2 hit, absent, receiver-gone, CAS stale,
+busy-aborted, or any error), never leaking a lock that would permanently
+block inbox delivery, rebind, and later recovery. `deliver_pending`'s
+existing outer `finally` (`inbox_service.py:419-426`) is PRESERVED law: every
+in-band path — including a handler returning `settlement_pending_recovery` —
+releases the lock on exit, so a stranded DELIVERING row is always eventually
+lock-free and recoverable.
+**Runtime scope (codex r20 S2)**: the delivery lock is a process-local
+`threading.Lock` and the supported WPM2 runtime is ONE CAO server process per
+SQLite database (HEAD reality: single-worker uvicorn). A second server
+process sharing the DB cannot see the first process's held lock and could
+recover an actively pre-submit attempt after 60s; the DB CAS would prevent
+double settlement but cannot distinguish that live owner. Multi-process or
+multi-server deployment therefore REQUIRES a durable DB-backed in-flight
+lease and is explicitly out of scope for this slice — recorded as scope law,
+not a build change. For each stale row it
 applies the identical w4/D2-first arms: D1.1 receiver-gone settles terminally
 first; S1.a transcript hit confirms DELIVERED; every other live-receiver
 result settles anchor-less PENDING `ambiguous/confirmation_timeout` with
@@ -976,6 +1015,10 @@ as a residual; any future backfill is its own gated slice.
   w4/D2-first arms. m18 (age-only recovery ignoring the lock) dies here: the
   stolen never-pasted attempt becomes anchor-less D2-only with no transcript
   ever able to confirm.
+  `test_wpm2_recovery_lock_released_exactly_once` (codex r20 S1): a recovery
+  pass whose settlement transaction fails, and one that is cancelled
+  mid-pass, both release the recovery-owned lock exactly once via `finally`;
+  the next in-band delivery and the next recovery wake can both acquire it.
 - **Busy-initial /compact fixture (codex r14 addendum B1, live trace
   inbox-1956)** — `test_wpm2_busy_initial_compact_cycles_never_exhaust`: one S4
   paste admitted while PROCESSING (accepted into the native queue,
