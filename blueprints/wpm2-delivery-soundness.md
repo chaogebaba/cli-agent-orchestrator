@@ -1,7 +1,18 @@
 # WPM2 — delivery soundness for busy receivers + alarm hygiene + seed stderr parse
 
-Status: DRAFT r8 (2026-07-13). Micro-WP, three independent slices sharing one gate
+Status: DRAFT r9 (2026-07-13). Micro-WP, three independent slices sharing one gate
 train. Builds directly on WPM1 (`8afb758`, FROZEN r9 law) and WP2S3 (`7651dc1`).
+
+r8→r9 changelog (folds codex r8 2B; grok r8 remained 0B/0S/0N YES):
+- After D1.1, D2 now ALWAYS precedes monitor-snapshot classification. A D2 miss
+  plus transient snapshot failure becomes pass-local protection: no permanent
+  classification/exhaust/reinject, but D1.3/D8 and disjoint queue release still
+  run; the next wake reclassifies from scratch.
+- The atomic opener now receives a tagged behavior-specific durable admission
+  proof and recomputes its read-set inside the SAME `BEGIN IMMEDIATE` before
+  candidate CAS. S4 overlap history, corrective exhausted-source/no-successor,
+  and ordinary prior-attempt/transcript authority cannot go stale between
+  preflight and open; mismatch returns non-open `stale_admission`.
 
 r7→r8 changelog (folds codex r7 4B; grok r7 remained 0B/0S/0N YES):
 - Permanent-D2 classification is total over persisted anchor validation:
@@ -298,10 +309,12 @@ state table is:
   missing, empty, or non-string; OR `seq` is missing or not an integer (boolean
   explicitly rejected). This includes every crash-recovered anchor-less attempt;
   `crash_recovery` is explanatory evidence, not required for protection.
-- `transient_snapshot_unavailable` (NOT permanent, generic stop/retry): anchor is
+- `transient_snapshot_unavailable` (NOT permanent; pass-local protection): anchor is
   valid but the current atomic monitor snapshot/token cannot presently be read.
-  It never exhausts, reinjects, notices-as-permanent, or releases members on that
-  wake. A later wake re-runs classification from scratch.
+  It never exhausts, reinjects, or becomes durably classified. After the D2-first
+  ordering below, its members are protected/excluded for THIS wake only, ordinary
+  D1.3/D8 longevity processing runs, and later disjoint work may proceed. A later
+  wake re-runs D2 and classification from scratch.
 - `epoch_mismatch` (permanent/protected): anchor is valid, current snapshot/token
   is available, and the literal anchor token differs from the monitor's CURRENT
   token (construction restart, reset, or rebind).
@@ -320,7 +333,13 @@ same immutable protected-member-set release below. Mechanics are closed:
    `DELIVERY_FAILED/receiver_gone` through the frozen terminal-settlement seam and
    sends its existing caller notice exactly once. No protected-path operation runs.
 
-1. The DB layer adds an oldest-first, cursor/paginated pending scan for one
+1. **D2 is always second and monitor-independent.** For every still-live batch,
+   decode evidence fail-closed and run the S1.a transcript lookup BEFORE reading
+   the monitor snapshot or calling the classifier. A queued-command/native hit
+   settles immediately (including frozen delivered-after-stall corrective notice),
+   even when every snapshot read would fail. Only a D2 miss proceeds to snapshot
+   read/classification.
+2. The DB layer adds an oldest-first, cursor/paginated pending scan for one
    receiver that accepts an `excluded_message_ids` set. Unlike
    `get_pending_messages(..., limit=1)`, the scan applies the exclusion in SQL
    BEFORE its requested result limit, so default `num_messages=1` returns the
@@ -328,33 +347,40 @@ same immutable protected-member-set release below. Mechanics are closed:
    non-excluded rows. Pagination continues past any number of protected heads;
    existing contiguous sender/orchestration grouping applies only after this
    filtered selection.
-2. Under the delivery lock, `deliver_pending` first evaluates each oldest
-   classifier-positive D2-only attempt using its durable, immutable member set from
-   `inbox_delivery_attempt_member`. `_handle_wpm1_gate` runs D2 first. A hit
-   settles that set normally. On a miss, the gate updates the existing D1.3
-   activity/stall evidence and evaluates D8 exactly-once notice eligibility
-   BEFORE returning. If `record_wpm1_stalled_notice` returns `busy_aborted`, the
+3. Under the delivery lock, `deliver_pending` evaluates each oldest ambiguous
+   attempt using its durable, immutable member set from
+   `inbox_delivery_attempt_member`. After D2 miss, permanent classifier-positive
+   heads and `transient_snapshot_unavailable` both enter the non-authorizing
+   branch. The gate updates the existing D1.3 activity/stall evidence and
+   evaluates D8 exactly-once notice eligibility BEFORE returning. On transient
+   snapshot failure no progress observation is invented: preserve durable
+   `last_activity_at`, evaluate the absolute-age arm normally, and retry any
+   snapshot-dependent idle-age arm next wake. If `record_wpm1_stalled_notice`
+   returns `busy_aborted`, the
    whole wake returns generic `stop` so its atomic pair retries; no later batch
    runs on that wake. Otherwise (notice not due, recorded, or already recorded),
-   it returns `skip_d2_only(attempt_uuid, member_ids)` instead of generic `stop`.
-   This is control vocabulary only, not a persisted outcome/status. Exhaustion,
-   terminal-failure, successor-begin, and backend-send arms are bypassed for the
-   protected set.
-3. On `skip_d2_only`, `deliver_pending` adds exactly those member IDs to the
+   it returns `skip_d2_only(attempt_uuid, member_ids, protection_reason)` instead
+   of generic `stop`, where reason is `anchor_missing`, `epoch_mismatch`, or
+   `transient_snapshot_unavailable`. This is control vocabulary only, not a
+   persisted outcome/status. Exhaustion, terminal-failure, successor-begin, and
+   backend-send arms are bypassed for the protected set.
+4. On `skip_d2_only`, `deliver_pending` adds exactly those member IDs to the
    pass-local exclusion set and selects again. It performs NO `begin_delivery_attempt`,
    no exhaustion write, no status transition, and no backend send for the
    protected set. Generic `stop` retains HEAD's return behavior.
-4. A later candidate may proceed only when its member set is DISJOINT from every
+   For the transient reason, exclusion expires at the end of this call and no
+   durable permanent/protected marker is written.
+5. A later candidate may proceed only when its member set is DISJOINT from every
    protected set and passes the overlap/S4 and DELIVERING preflights below. Its
    attempt chain, cap, hash, and confirmation are independent; servicing it does
    not confirm, exhaust, reorder, or consume the older head's injection budget.
    The protected head stays PENDING in original created-at order and is D2-checked
    again on later reconciliation wakes.
 
-This explicitly supersedes strict terminal-wide FIFO only for classifier-positive
-permanent D2-only heads. It preserves WPM1's one-injection and notice/corrective
-laws per durable member set while preventing an uncertain permanently-absent head
-from starving later callbacks.
+This explicitly supersedes strict terminal-wide FIFO for classifier-positive
+permanent D2-only heads and for snapshot-unavailable heads on that wake only. It
+preserves WPM1's one-injection and notice/corrective laws per durable member set
+while preventing observation failure from starving later callbacks.
 
 ### S1.f — closed additive evidence schema + sole lawful writer (closes codex r2 B2)
 
@@ -471,8 +497,16 @@ as a residual; any future backfill is its own gated slice.
   epoch empty/non-string; seq missing; seq non-integer/bool → `anchor_missing`;
   valid anchor + unavailable monitor snapshot → `transient_snapshot_unavailable`;
   valid mismatch → `epoch_mismatch`; valid same-token → `normal`. Separate
-  `test_wpm2_transient_snapshot_unavailable_stops_then_retries` proves it never
-  enters the protected exclusion set and can classify normally on the next wake.
+  ordering/liveness tests close its behavior:
+  `test_wpm2_transient_snapshot_failure_d2_hit_confirms_immediately` supplies an
+  existing queued-command hit and proves snapshot/classifier are never called;
+  `test_wpm2_repeated_transient_snapshot_failures_release_disjoint_callbacks`
+  proves repeated failures write no exhaustion/attempt/cap state for the head,
+  run longevity, and let later disjoint callbacks inject once; and
+  `test_wpm2_transient_recovery_same_token_resumes_without_cap_consumption`
+  restores the snapshot on a later wake and resumes normal same-token evaluation
+  with the original attempt count/exhaustion budget unchanged. Mutations reading
+  snapshot before D2 or mapping transient to generic terminal-wide `stop` die.
 - **Receiver-gone precedence (codex r7 B2)**:
   `test_wpm2_receiver_gone_precedes_malformed_protected_evidence` and
   `test_wpm2_receiver_gone_precedes_ordinary_protected_evidence` remove receiver
@@ -639,6 +673,36 @@ While holding the delivery lock and BEFORE any attempt/message mutation, the
 common seam calls `list_delivering_attempts_for_terminal(terminal_id)`, which
 joins DELIVERING inbox rows to attempt members. Any row blocks opening.
 
+**Behavior-specific durable admission proof**: preflight produces one tagged
+`AdmissionProof` and passes it to the common opener. The proof records candidate
+IDs plus a canonical fingerprint of its named DB read-set; it is diagnostic/
+comparison input, not authority by itself. Inside the SAME `BEGIN IMMEDIATE`,
+BEFORE candidate CAS or attempt insertion, the opener authoritatively re-runs
+the corresponding read-set and admission predicate. For EVERY tag, both the
+canonical read-set fingerprint and the predicate must still match; even a new
+proven-never-submitted deferred row makes this invocation stale (a later wake may
+preflight again and admit it lawfully):
+
+- `s4_initial`: re-query ALL attempt-member histories overlapping candidate IDs
+  and re-apply the closed S4 rule (none or only proven-never-submitted deferred
+  reasons). Any new/open/ambiguous/confirmed/failed/interrupted overlap is stale.
+- `corrective`: re-read the exact `prior_attempt_uuid` named by gate evidence;
+  require its exact candidate member set, `ambiguous/confirmation_timeout`,
+  persisted anchor + `boundary_exhausted_at`/authorizing `boundary_snapshot`, and
+  NO attempt whose `prior_attempt_uuid` points to that source. Missing/changed
+  source or any successor is stale.
+- `ordinary`: re-fingerprint all overlapping prior attempts (UUID, exact members,
+  outcome, reason, payload hash, prior UUID, and evidence hash) plus the current
+  durable transcript-binding identity/read reference used by preflight. Re-run a
+  single non-polling continuity-aware D2 lookup for applicable prior payload hashes
+  against that authority. New/changed history, binding/reference change,
+  unresolved continuity, or a hit requiring D2 settlement makes admission stale;
+  it returns to the service gate rather than pasting.
+
+Any read-set/predicate mismatch returns `stale_admission`. Non-durable status,
+dialog, and D5 checks remain behavior-specific preflight gates, but can only
+narrow admission; they never substitute for the transactional durable recheck.
+
 **Closed opener result protocol**: `begin_delivery_attempt_if_no_other_delivering`
 returns a tagged `AttemptOpenResult`, never a bare UUID or status string:
 
@@ -649,6 +713,8 @@ returns a tagged `AttemptOpenResult`, never a bare UUID or status string:
   BEGIN, any write/flush, or COMMIT; the literal `_run_wpm1_immediate`
   `"busy_aborted"` is mapped to this tag and can never be interpreted as a UUID.
 - `stale_candidate` — candidate IDs/receiver/PENDING CAS no longer match.
+- `stale_admission` — behavior-specific durable admission read-set/predicate
+  changed after preflight (including a peer attempt settled back to PENDING).
 
 Every non-open tag returns from the service path BEFORE backend send, leaves the
 entire candidate set PENDING through no-write or rollback, creates no durable
@@ -657,7 +723,8 @@ attempt/member rows, and never falls into generic FAILED settlement.
 **Atomic candidate CAS/open**: the primitive uses the existing bounded
 `_run_wpm1_immediate` / `BEGIN IMMEDIATE` spine and, inside that ONE transaction:
 
-1. Re-run the no-other-DELIVERING query.
+1. Re-run the no-other-DELIVERING query and the tagged durable admission proof
+   above; any mismatch exits before row mutation.
 2. Load the sorted unique candidate IDs and require the exact set to exist with
    `receiver_id == terminal_id` and `status == PENDING`.
 3. Conditionally UPDATE exactly those rows with predicates `(id IN candidate) ∧
@@ -743,6 +810,18 @@ Evidence bar:
   occurs and no terminal status is resurrected. Mutations removing the PENDING
   predicate or accepting changed-rowcount != exact candidate cardinality must
   produce resurrection/dual ownership and die.
+- Admission-history races (codex r8 B2): parameterized across `s4_initial`,
+  `corrective`, and `ordinary` proofs,
+  `test_wpm2_preflight_vs_peer_ambiguous_settle_both_commit_orders` and
+  `test_wpm2_preflight_vs_peer_deferred_settle_both_commit_orders` reproduce the
+  live sequence where a peer opens then settles back to PENDING between preflight
+  and opener. Peer-first → caller returns `stale_admission`, zero send; caller
+  first → caller is the sole opened/send winner and the peer's transactional
+  revalidation/conflict path cannot create a second paste. Final history never
+  contains two admitted attempts for the same submission opportunity. Mutations
+  accepting only the pre-transaction `AdmissionProof` fingerprint, skipping the
+  in-transaction overlap/source/transcript requery, must reproduce duplicate
+  paste and die.
 - Mixed-writer closure (codex r6 B3): two-connection races
   `test_wpm2_s4_vs_ordinary_initial_share_atomic_delivering_opener` and
   `test_wpm2_s4_vs_corrective_share_atomic_delivering_opener` coordinate both
