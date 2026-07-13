@@ -1,7 +1,18 @@
 # WPM2 — delivery soundness for busy receivers + alarm hygiene + seed stderr parse
 
-Status: DRAFT r10 (2026-07-13). Micro-WP, three independent slices sharing one gate
+Status: DRAFT r11 (2026-07-13). Micro-WP, three independent slices sharing one gate
 train. Builds directly on WPM1 (`8afb758`, FROZEN r9 law) and WP2S3 (`7651dc1`).
+
+r10→r11 changelog (folds codex r10 1B/1S; grok r10 remained 0B/0S/0N YES):
+- Transcript admission authority now separates exact identity from append cursor:
+  binding/session/path/inode/resolution + payload/window compare exactly;
+  `baseline_size` is monotonic and live size growth is parsed, not treated as
+  rotation. Truncation, cursor mutation, and real identity change remain stale.
+- The hit-between-preflight test proves the appended queued-command bytes are
+  actually parsed; size-inequality short-circuit mutants die.
+- >1 MiB overflow is explicitly one-wake deferral: out-of-transaction refresh
+  either confirms a beyond-cap hit or advances an absent baseline so a later
+  opener can proceed. Cap overflow cannot create permanent stale admission.
 
 r9→r10 changelog (folds codex r9 1B/2S; grok r9 remained 0B/0S/0N YES):
 - Corrective `AdmissionProof` now fingerprints source payload hash/start window,
@@ -715,8 +726,9 @@ preflight again and admit it lawfully):
   persisted anchor + `boundary_exhausted_at`/authorizing `boundary_snapshot`, and
   NO attempt whose `prior_attempt_uuid` points to that source. The proof also
   fingerprints that source's exact `payload_hash`, `started_at` scan window,
-  durable transcript-binding identity (binding row/session/path/inode), and the
-  continuity reference `{path, inode, size, resolution_kind}` used by preflight.
+  and `TranscriptAuthorityIdentity` (binding row id, session id, path, inode,
+  resolution kind). It carries continuity `baseline_size` separately as a cursor,
+  NOT as an exact-match identity/fingerprint field.
   Inside the transaction, after DB source/no-successor revalidation and BEFORE
   candidate CAS, re-resolve/fingerprint that authority and run ONE non-polling,
   continuity-aware D2 lookup for the source hash/window. Missing/changed source,
@@ -733,14 +745,25 @@ preflight again and admit it lawfully):
 
 **Bounded transcript work under `BEGIN IMMEDIATE`** (corrective + ordinary):
 
+- Exact identity comparison covers ONLY binding row id/session/path/inode/
+  resolution kind plus the applicable source payload hash and `started_at`
+  window. `baseline_size` is the preflight scan cursor stored separately. The
+  durable proof baseline itself must still equal the attempt/read-reference
+  baseline recomputed in-transaction (a changed baseline is stale), but live file
+  `current_size` is expected to grow and is NEVER compared for equality with it.
 - `MAX_IN_TXN_TRANSCRIPT_DELTA_BYTES = 1_048_576` (1 MiB). A proof without a
   valid continuity baseline cannot trigger an in-transaction full scan; it is
   immediately `stale_admission` for out-of-transaction refresh.
-- Open/fstat the exact bound path, verify inode and `current_size >= baseline_size`,
-  `seek(baseline_size)`, and read at most `min(delta, cap + 1)` bytes. Delta above
-  cap, truncation, replacement, malformed bytes/JSON, or binding change returns
-  `stale_admission`. Calling `Path.read_bytes()` or reading prefix bytes before
-  the continuity offset while the write transaction is open is forbidden.
+- Open/fstat the exact bound path, require the same identity and
+  `current_size >= baseline_size`, then inspect `[baseline_size,current_size)`:
+  `seek(baseline_size)` and read at most `min(delta, cap + 1)` bytes. When
+  `delta <= cap`, parse that exact complete interval. Same-identity size growth
+  is the input to D2, not `stale_admission`. When `delta > cap`, the `cap + 1`
+  read establishes overflow and returns `stale_admission` without treating the
+  partial interval as absence. Truncation, replacement, malformed bytes/JSON, or
+  binding change also returns `stale_admission`. Calling `Path.read_bytes()` or
+  reading prefix bytes before the continuity offset while the write transaction
+  is open is forbidden.
 - Group applicable hashes by identical binding/path/inode/baseline. Read and parse
   each suffix ONCE, then compare the closed set of payload hashes/windows in that
   one pass; never rescan the suffix per prior attempt. Native-turn priority and
@@ -876,7 +899,10 @@ Evidence bar:
   `test_wpm2_corrective_d2_hit_between_preflight_and_open_is_stale_admission`
   appends a real queued-command hit after proof creation; the in-transaction
   lookup returns `stale_admission`, zero send, and the next service wake confirms
-  DELIVERED. `test_wpm2_corrective_binding_rotation_between_preflight_and_open_is_stale_admission`
+  DELIVERED. A read/parser spy asserts the appended byte range was ACTUALLY read
+  and the queued-command record matched; a mutant returning stale solely because
+  `current_size != baseline_size`, before parsing, must die.
+  `test_wpm2_corrective_binding_rotation_between_preflight_and_open_is_stale_admission`
   rotates the binding/path/inode and proves zero send plus defer/re-resolve next
   wake. Mutations deleting the corrective lookup or trusting only its preflight
   hit/miss/reference must paste and die.
@@ -889,6 +915,18 @@ Evidence bar:
   transaction duration stays below one 1s busy-attempt envelope. A >1 MiB delta
   case returns `stale_admission` without send. Whole-file, per-hash-rescan, and
   cap-removal mutants must die.
+- Cap-overflow recovery (codex r10 S1):
+  `test_wpm2_overflow_then_service_refresh_finds_hit_without_open` places a valid
+  queued-command hit beyond the first 1 MiB delta. The opener stales once; the
+  next OUT-OF-TRANSACTION service D2 refresh uses the SAME identity/continuity
+  epoch, scans the complete growth, finds the hit, settles DELIVERED, and never
+  calls the opener/backend. `test_wpm2_overflow_absent_refresh_advances_baseline_then_opens`
+  supplies >1 MiB valid absent JSONL; the next service D2 scans it outside the
+  write transaction and atomically advances the attempt's continuity baseline to
+  current size. A later AdmissionProof uses that advanced cursor (zero/new bounded
+  delta) and may open once if all other admission facts remain true. Reusing the
+  old cursor, treating cap overflow as permanent stale, or failing to persist the
+  absent refresh baseline must starve these continuations and die.
 - Mixed-writer closure (codex r6 B3): two-connection races
   `test_wpm2_s4_vs_ordinary_initial_share_atomic_delivering_opener` and
   `test_wpm2_s4_vs_corrective_share_atomic_delivering_opener` coordinate both
