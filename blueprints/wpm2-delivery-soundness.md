@@ -1,7 +1,19 @@
 # WPM2 — delivery soundness for busy receivers + alarm hygiene + seed stderr parse
 
-Status: DRAFT r12 (2026-07-13). Micro-WP, three independent slices sharing one gate
+Status: DRAFT r13 (2026-07-13). Micro-WP, three independent slices sharing one gate
 train. Builds directly on WPM1 (`8afb758`, FROZEN r9 law) and WP2S3 (`7651dc1`).
+
+r12→r13 changelog (folds codex r12 1B/1S; grok r12 remained 0B/0S/0N YES):
+- Cursor provenance pinned: the canonical nested cursor gains `cursor_version: 1`,
+  written ONLY by w1/w4/w5. Nested-first authority applies to versioned cursors
+  only; unversioned nested state (HEAD liveness writes past unresolved lookups)
+  is never an in-transaction baseline and migrates through the out-of-transaction
+  refresh (same-identity `min(top_level.size, nested.size)` origin; full rescan
+  when only unversioned nested exists). Version-upgrade writes are exempt from
+  the unversioned size's monotonic floor. Mutant m10 + over-advanced-legacy
+  migration fixture added.
+- AdmissionProof-vs-w5 races pinned directly: both commit orders + a
+  cursor-substitution-into-stale-proof mutant.
 
 r11→r12 changelog (folds codex r11 1B; grok r11 remained 0B/0S/0N YES):
 - `last_observed_ref` is now the sole canonical durable WPM2 continuity cursor;
@@ -453,26 +465,45 @@ these additive keys — nothing else; unlisted keys keep raising
 
 **Canonical WPM2 continuity cursor (no schema addition)**:
 `last_observed_ref` is THE sole durable cursor object and has the closed shape
-`{path, inode, size, resolution_kind}`. Every WPM2 D2 lookup, corrective or
-ordinary `AdmissionProof`, bounded in-transaction recheck, and out-of-transaction
-refresh extracts its baseline from this nested object; passing the containing
-evidence object as `expected_ref` or reading top-level `path`/`inode`/`size` is
-forbidden. `size` is a non-negative integer monotonic cursor; the other three
-fields are its identity and compare exactly.
+`{path, inode, size, resolution_kind, cursor_version}` with `cursor_version: 1`.
+Every WPM2 D2 lookup, corrective or ordinary `AdmissionProof`, bounded
+in-transaction recheck, and out-of-transaction refresh extracts its baseline from
+this nested object; passing the containing evidence object as `expected_ref` or
+reading top-level `path`/`inode`/`size` is forbidden. `size` is a non-negative
+integer monotonic cursor; `path`/`inode`/`resolution_kind` are its identity and
+compare exactly. `cursor_version` is provenance: ONLY w1/w4/w5 write it, always
+atomically with the other four fields, and only a cursor carrying
+`cursor_version: 1` is a WPM2 parse-authorized baseline. A nested object WITHOUT
+`cursor_version` is legacy liveness state (HEAD's activity merge stats the
+transcript and writes `last_observed_ref` even after an UNRESOLVED lookup —
+`inbox_service.py:258-296` — so its size may sit past bytes D2 never parsed) and
+is NEVER an in-transaction baseline; structural validity does not establish
+provenance.
 
-Legacy read precedence is closed. A valid `last_observed_ref` always wins and
-top-level cursor fields are ignored even when they conflict. Only when the nested
-key is ABSENT may a row with a complete valid legacy top-level
-`{path,inode,size,resolution_kind}` be normalized as a one-wake seed. A hit may
-settle immediately; an absent scan must persist the returned cursor through
-`advance_wpm2_continuity_cursor` before any AdmissionProof/open. Missing/invalid
-legacy fields, a present-but-malformed nested object, or identity conflict is
-`unresolved`/non-open — never fallback. Once nested state is persisted, legacy
-top-level fields are never consulted again.
+Legacy read precedence is closed BY PROVENANCE, not structure. A VERSIONED
+`last_observed_ref` always wins and every other cursor source is ignored even
+when it conflicts. All unversioned states route to the out-of-transaction
+refresh (in-transaction they are `stale_admission`, per the no-valid-baseline
+rule), with a closed scan-origin table:
+- unversioned nested + complete valid legacy top-level, SAME
+  `{path,inode,resolution_kind}` identity → scan origin
+  `min(top_level.size, nested.size)`;
+- unversioned nested alone (top-level absent/invalid), identity intact → scan
+  origin 0 (full rescan, still subject to the refresh path's own bounds);
+- top-level alone (nested key absent) → the one-wake seed: scan origin
+  `top_level.size`;
+- identity conflict between any two sources, or all sources missing/malformed →
+  `unresolved`/non-open — never fallback.
+A hit found during any of these scans may settle immediately; an absent scan
+must persist the returned VERSIONED cursor through
+`advance_wpm2_continuity_cursor` before any AdmissionProof/open. Once a
+versioned cursor is persisted, legacy top-level fields and unversioned nested
+state are never consulted again.
 
-All WPM2 settlement paths initialize the nested cursor from the attempt's captured
-continuity reference: w1 covers normal ambiguous and ordinary non-success
-settlement, and w4 covers crash recovery when no normal settlement committed.
+All WPM2 settlement paths initialize the nested cursor (versioned, atomically
+with all five fields) from the attempt's captured continuity reference: w1
+covers normal ambiguous and ordinary non-success settlement, and w4 covers
+crash recovery when no normal settlement committed.
 If no valid authority can be captured they persist no cursor and the row remains
 unresolved/non-open. HEAD's activity merge may still write
 `last_observed_status`/`last_activity_at`, but it MUST NOT write
@@ -506,7 +537,10 @@ merge predicate for the anchor (must fail the anchor-persist lifecycle test);
 (m5) authorize a loss from an anchor-less attempt; (m6) compare sequences
 across epochs; (m7) restore stale-Claude `interrupted/proven_absent` recovery
 and normal reinjection; (m8) mutate a cursor only in memory; (m9) directly UPDATE
-attempt evidence instead of using w5.
+attempt evidence instead of using w5; (m10) trust an unversioned nested size as a
+scan baseline (must skip the unparsed interval, duplicate, and die); (m11)
+substitute a newer cursor into an already-built AdmissionProof instead of
+rebuilding the full proof.
 
 `advance_wpm2_continuity_cursor(attempt_uuid, exact_message_ids, expected_ref,
 observed_ref)` uses the frozen `_run_wpm1_immediate` 3×1s transaction policy and
@@ -521,16 +555,24 @@ unrelated outcomes, changed members, non-PENDING members, or changed rowcount
 return `stale`; no row is written and the caller stops this candidate for the
 wake.
 
-The transaction decodes the stored canonical cursor (or the one-wake valid legacy
-seed) and requires observed identity `{path,inode,resolution_kind}` to equal both
-stored and expected identity with observed `size >= expected size`. Normally the
-stored object equals `expected_ref`. If a concurrent writer already moved the same
-identity beyond expected, stored size >= observed size returns `already_advanced`;
-stored size between expected and observed advances to observed. Identity change,
+The transaction decodes the stored canonical cursor (or an unversioned/legacy
+state under migration) and requires observed identity `{path,inode,
+resolution_kind}` to equal both stored and expected identity with observed
+`size >= expected size`. Normally the stored object equals `expected_ref`. If a
+concurrent writer already moved the same identity beyond expected, a VERSIONED
+stored size >= observed size returns `already_advanced`; versioned stored size
+between expected and observed advances to observed. Identity change, versioned
 stored size below expected, malformed state, or observed regression is `stale`.
-The successful read-modify-write changes only `evidence.last_observed_ref` and
-preserves every other evidence key/value. Concurrent writers therefore converge
-on max size and can never move the cursor backward or across identity.
+VERSION-UPGRADE writes are the one pinned exemption: when the stored state is
+unversioned (or a top-level-only seed), its size is NOT a monotonic floor — the
+migration scan's `expected_ref` derives from the closed scan-origin table above,
+and w5 overwrites the unversioned state with the versioned result even when the
+new size is smaller (an unversioned size may be over-advanced past unparsed
+bytes; trusting it as a floor would re-skip them). Monotonicity binds strictly
+WITHIN versioned cursors. The successful read-modify-write changes only
+`evidence.last_observed_ref` and preserves every other evidence key/value.
+Concurrent versioned writers therefore converge on max size and can never move
+the cursor backward or across identity.
 
 For grouped ordinary reads, call w5 oldest-first once per eligible attempt whose
 full out-of-transaction scan returned absent. Any `stale`/`busy_aborted` stops
@@ -564,11 +606,20 @@ as a residual; any future backfill is its own gated slice.
   the cycle still qualifies (anchor is injection completion, not settlement);
   loss provable on the next evaluation. Anti-test: the same events anchored on
   `last_at` would wrongly disqualify — asserts the ban.
-- **S1.f schema law**: named mutants m1–m9 all die; unlisted-key write raises.
+- **S1.f schema law**: named mutants m1–m11 all die; unlisted-key write raises.
 - **Cursor compatibility + writer matrix**:
-  `test_wpm2_nested_cursor_wins_over_conflicting_legacy_top_level`,
+  `test_wpm2_versioned_nested_cursor_wins_over_conflicting_legacy_top_level`,
   `test_wpm2_legacy_top_level_cursor_migrates_once`, and
   `test_wpm2_malformed_nested_cursor_never_falls_back` pin precedence.
+  `test_wpm2_unversioned_nested_over_advanced_by_unresolved_lookup_migrates`
+  (codex r12 B1 fixture): a HEAD-style activity merge advanced the unversioned
+  nested size past a valid queued-command record while top-level stayed earlier
+  on the same identity → migration scans from `min(top_level.size, nested.size)`,
+  parses the skipped interval, and CONFIRMS the hit; m10 (trusting the
+  unversioned nested size) misses the record, duplicates, and dies.
+  `test_wpm2_unversioned_nested_alone_full_rescan` pins the origin-0 arm and
+  `test_wpm2_version_upgrade_writes_smaller_size` pins the monotonic-floor
+  exemption (versioned result smaller than the unversioned state commits).
   `test_wpm2_advance_cursor_ambiguous_and_interrupted_rows` covers both eligible
   populations and proves failed/open/terminal rows are stale.
   `test_wpm2_advance_cursor_rowcount_stale_and_busy_results` pins the four result
@@ -578,6 +629,14 @@ as a residual; any future backfill is its own gated slice.
   regresses. Crash fixtures before and after the cursor commit prove respectively
   safe rescan and durable restart reuse. In-memory-only mutation and direct
   evidence-UPDATE mutants must fail this matrix.
+  **Proof-vs-w5 races (codex r12 S1)** —
+  `test_wpm2_admission_proof_vs_w5_advance_both_commit_orders`: (a) proof
+  captured at baseline N, concurrent w5 advances the durable cursor to M before
+  the opener transaction commits → opener revalidation returns `stale_admission`,
+  zero send, a later wake rebuilds a fresh proof; (b) opener commits first →
+  the later w5 sees the candidate no longer PENDING and returns `stale` with no
+  cursor mutation. m11 (splicing the newer cursor into the stale proof instead
+  of rebuilding) must die in arm (a).
 - **Anchor lifecycle (codex r3 B1)**: begin → submit-seam mark → ambiguous
   settlement persists anchor atomically; m4 (pre-settlement merge predicate
   restored) fails this test. Crash-cut: kill between submit and settlement →
@@ -812,8 +871,9 @@ preflight again and admit it lawfully):
   fingerprints that source's exact `payload_hash`, `started_at` scan window,
   and `TranscriptAuthorityIdentity` (binding row id, session id, path, inode,
   resolution kind). It carries `baseline_size` from the source attempt's durable
-  `evidence.last_observed_ref.size`, separately from identity and NOT as an
-  exact-match field against live file size.
+  VERSIONED `evidence.last_observed_ref.size`, separately from identity and NOT
+  as an exact-match field against live file size; an unversioned or absent
+  cursor is no baseline — `stale_admission`, out-of-transaction migration first.
   Inside the transaction, after DB source/no-successor revalidation and BEFORE
   candidate CAS, re-resolve/fingerprint that authority and run ONE non-polling,
   continuity-aware D2 lookup for the source hash/window. Missing/changed source,
@@ -832,7 +892,7 @@ preflight again and admit it lawfully):
 
 - Exact identity comparison covers ONLY binding row id/session/path/inode/
   resolution kind plus the applicable source payload hash and `started_at`
-  window. `baseline_size` is read from the canonical durable
+  window. `baseline_size` is read from the canonical durable VERSIONED
   `evidence.last_observed_ref` cursor and stored separately in the proof. The
   durable nested baseline itself must still equal the proof baseline recomputed
   in-transaction; a concurrent w5 advance makes this invocation
