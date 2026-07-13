@@ -1,7 +1,18 @@
 # WPM2 — delivery soundness for busy receivers + alarm hygiene + seed stderr parse
 
-Status: DRAFT r9 (2026-07-13). Micro-WP, three independent slices sharing one gate
+Status: DRAFT r10 (2026-07-13). Micro-WP, three independent slices sharing one gate
 train. Builds directly on WPM1 (`8afb758`, FROZEN r9 law) and WP2S3 (`7651dc1`).
+
+r9→r10 changelog (folds codex r9 1B/2S; grok r9 remained 0B/0S/0N YES):
+- Corrective `AdmissionProof` now fingerprints source payload hash/start window,
+  durable binding identity, and continuity reference, then reruns one non-polling
+  continuity-aware D2 lookup inside the opener before CAS. Hit, unresolved, or
+  authority rotation returns `stale_admission` and never pastes.
+- Mixed release evidence puts `anchor_missing`, `epoch_mismatch`, and transient
+  heads in one pass ahead of multiple disjoint rows under both selection limits.
+- In-transaction transcript work is continuity-offset bounded: one suffix read
+  per authority, one parse for all hashes, hard 1 MiB delta cap. Overflow/invalid
+  continuity returns stale; whole-transcript scans under `BEGIN IMMEDIATE` are banned.
 
 r8→r9 changelog (folds codex r8 2B; grok r8 remained 0B/0S/0N YES):
 - After D1.1, D2 now ALWAYS precedes monitor-snapshot classification. A D2 miss
@@ -556,6 +567,19 @@ as a residual; any future backfill is its own gated slice.
   contiguous sender/orchestration grouping. Every protected member stays out of
   later candidate groups; every disjoint row injects once. One-exclusion-only,
   exclusion-after-LIMIT, and protected-member-regrouping mutants must die.
+- **Mixed permanent/transient single-pass release (codex r9 S1)**: one queue has
+  interleaved `anchor_missing`, `epoch_mismatch`, and
+  `transient_snapshot_unavailable` heads before multiple disjoint rows. Named
+  tests `test_wpm2_default_one_mixed_protection_checks_and_releases_in_order` and
+  `test_wpm2_limit_all_mixed_protection_excludes_before_grouping` exercise
+  default `num_messages=1` and `num_messages=0`/limit-100 in a SINGLE call/pass.
+  They assert every head receives D2 oldest-first; all three member sets are
+  excluded before selection/grouping; no protected member enters any later group;
+  every disjoint row injects exactly once; only the transient exclusion disappears
+  at call end while permanent classification remains derivable on the next wake.
+  Mutants partitioning permanent/transient scans, expiring every exclusion,
+  retaining transient exclusion across calls, or grouping before all exclusions
+  must die.
 - **Confirmation destination (codex r3 B4)**: initial-hit, late-hit with one
   attempt, late-hit landing on an OLDER attempt than the newest settlement
   target — evidence rows land per the S1.f target rule in all three.
@@ -689,8 +713,16 @@ preflight again and admit it lawfully):
 - `corrective`: re-read the exact `prior_attempt_uuid` named by gate evidence;
   require its exact candidate member set, `ambiguous/confirmation_timeout`,
   persisted anchor + `boundary_exhausted_at`/authorizing `boundary_snapshot`, and
-  NO attempt whose `prior_attempt_uuid` points to that source. Missing/changed
-  source or any successor is stale.
+  NO attempt whose `prior_attempt_uuid` points to that source. The proof also
+  fingerprints that source's exact `payload_hash`, `started_at` scan window,
+  durable transcript-binding identity (binding row/session/path/inode), and the
+  continuity reference `{path, inode, size, resolution_kind}` used by preflight.
+  Inside the transaction, after DB source/no-successor revalidation and BEFORE
+  candidate CAS, re-resolve/fingerprint that authority and run ONE non-polling,
+  continuity-aware D2 lookup for the source hash/window. Missing/changed source,
+  successor, binding/reference rotation, unresolved continuity, or D2 hit is
+  `stale_admission`; the service gate confirms the hit or defer-retries unresolved
+  authority on the next wake. The opener never settles from inside this branch.
 - `ordinary`: re-fingerprint all overlapping prior attempts (UUID, exact members,
   outcome, reason, payload hash, prior UUID, and evidence hash) plus the current
   durable transcript-binding identity/read reference used by preflight. Re-run a
@@ -698,6 +730,24 @@ preflight again and admit it lawfully):
   against that authority. New/changed history, binding/reference change,
   unresolved continuity, or a hit requiring D2 settlement makes admission stale;
   it returns to the service gate rather than pasting.
+
+**Bounded transcript work under `BEGIN IMMEDIATE`** (corrective + ordinary):
+
+- `MAX_IN_TXN_TRANSCRIPT_DELTA_BYTES = 1_048_576` (1 MiB). A proof without a
+  valid continuity baseline cannot trigger an in-transaction full scan; it is
+  immediately `stale_admission` for out-of-transaction refresh.
+- Open/fstat the exact bound path, verify inode and `current_size >= baseline_size`,
+  `seek(baseline_size)`, and read at most `min(delta, cap + 1)` bytes. Delta above
+  cap, truncation, replacement, malformed bytes/JSON, or binding change returns
+  `stale_admission`. Calling `Path.read_bytes()` or reading prefix bytes before
+  the continuity offset while the write transaction is open is forbidden.
+- Group applicable hashes by identical binding/path/inode/baseline. Read and parse
+  each suffix ONCE, then compare the closed set of payload hashes/windows in that
+  one pass; never rescan the suffix per prior attempt. Native-turn priority and
+  queued-command semantics remain S1.a.
+- No polling/sleep occurs in the transaction. The 1 MiB cap bounds file I/O/parser
+  work independently of total transcript size; contention still uses the frozen
+  3 attempts × 1s busy policy.
 
 Any read-set/predicate mismatch returns `stale_admission`. Non-durable status,
 dialog, and D5 checks remain behavior-specific preflight gates, but can only
@@ -822,6 +872,23 @@ Evidence bar:
   accepting only the pre-transaction `AdmissionProof` fingerprint, skipping the
   in-transaction overlap/source/transcript requery, must reproduce duplicate
   paste and die.
+- Corrective transcript-authority races (codex r9 B1):
+  `test_wpm2_corrective_d2_hit_between_preflight_and_open_is_stale_admission`
+  appends a real queued-command hit after proof creation; the in-transaction
+  lookup returns `stale_admission`, zero send, and the next service wake confirms
+  DELIVERED. `test_wpm2_corrective_binding_rotation_between_preflight_and_open_is_stale_admission`
+  rotates the binding/path/inode and proves zero send plus defer/re-resolve next
+  wake. Mutations deleting the corrective lookup or trusting only its preflight
+  hit/miss/reference must paste and die.
+- Bounded in-transaction transcript evidence (codex r9 S2):
+  `test_wpm2_large_transcript_multi_hash_admission_reads_one_bounded_suffix`
+  creates a large sparse/real transcript prefix, a continuity baseline at its
+  tail, a <=1 MiB appended suffix, and multiple prior hashes sharing that
+  authority. Read spies assert zero prefix/full-file reads, one suffix read,
+  bytes read <= `cap + 1`, and one parsed pass for all hashes; measured opener
+  transaction duration stays below one 1s busy-attempt envelope. A >1 MiB delta
+  case returns `stale_admission` without send. Whole-file, per-hash-rescan, and
+  cap-removal mutants must die.
 - Mixed-writer closure (codex r6 B3): two-connection races
   `test_wpm2_s4_vs_ordinary_initial_share_atomic_delivering_opener` and
   `test_wpm2_s4_vs_corrective_share_atomic_delivering_opener` coordinate both
