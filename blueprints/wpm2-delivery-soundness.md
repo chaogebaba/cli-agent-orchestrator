@@ -1,7 +1,24 @@
 # WPM2 — delivery soundness for busy receivers + alarm hygiene + seed stderr parse
 
-Status: DRAFT r4 (2026-07-13). Micro-WP, three independent slices sharing one gate
+Status: DRAFT r5 (2026-07-13). Micro-WP, three independent slices sharing one gate
 train. Builds directly on WPM1 (`8afb758`, FROZEN r9 law) and WP2S3 (`7651dc1`).
+
+r4→r5 changelog (folds codex r4 4B/1S; grok r4 already BUILDABLE YES):
+- Startup recovery joins the S1 proof-only seam: every stale open Claude
+  DELIVERING attempt is conservatively treated as possibly submitted, recovers
+  to anchor-less `ambiguous/confirmation_timeout` + `crash_recovery` evidence,
+  and remains D2-only PENDING. The old `interrupted/proven_absent` normal-retry
+  route is forbidden for this population.
+- `observation_epoch` is now an opaque fresh token (UUID) per monitor
+  construction and reset/rebind boundary. Tokens are equality-only: same-token
+  integer comparisons are lawful; different-token qualification requires a
+  complete PROCESSING→ready pair in the monitor's CURRENT token.
+- S4 is zero-decision: exact initial-attempt classification, delivery-lock /
+  DELIVERING authority, durable-ambiguous FIFO policy, and unconditional
+  supersession of `EAGER_INBOX_DELIVERY` for Claude initial delivery are pinned.
+  Real busy-Claude D5 captures and an unmocked end-to-end parser test are required.
+- S4 uses the real D5 vocabulary `empty | nonempty | unresolved`; capture failure
+  and parser ambiguity are separately pinned to the fail-closed arm.
 
 r3→r4 changelog (folds codex r3 4B/1S + grok r3 1B; grok B1 ≡ codex B1
 convergent — the r3 anchor-writer seam was unlawful at HEAD):
@@ -14,12 +31,12 @@ convergent — the r3 anchor-writer seam was unlawful at HEAD):
   unsettled attempt, DELIVERING members, merge returns False). Closed crash rule:
   an ambiguous attempt persisted WITHOUT an anchor can NEVER authorize a loss
   (fail-closed pending; D2 poll continues).
-- Sequence epochs (codex B2): every persisted/compared sequence is an
-  `{observation_epoch, seq}` pair; monitor construction, `reset_buffer`,
-  `clear_terminal`, and rebind each open a new epoch; cross-epoch integer
-  comparison BANNED; a complete same-epoch PROCESSING→ready cycle in an epoch
-  NEWER than the anchor's qualifies as post-injection (a level-ready recovery
-  sample never does).
+- Sequence epochs (codex B2, superseded/closed by r5 token law): every
+  persisted/compared sequence is an `{observation_epoch, seq}` pair; monitor
+  construction, `reset_buffer`, `clear_terminal`, and rebind each open a fresh
+  opaque token; cross-token integer comparison/order is BANNED; a complete
+  PROCESSING→ready cycle in the monitor's CURRENT token may qualify after a
+  token change (a level-ready recovery sample never does).
 - Late-D2 destination (codex B4): terminal-settlement seam gains a closed
   `confirmation_evidence` argument — winning lookup evidence merges into the
   attempt that produced the hit; `terminal_settled_at` into the frozen newest
@@ -142,15 +159,21 @@ claude_code attempt ONLY when ALL hold:
    `clients/database.py:1593`), ~13s after `started_at`, and the incident's real
    queue enqueue/popAll events fell INSIDE that interval — a `> last_at` rule
    would exclude legitimate cycles forever.
-   Cycle proof (epoch-aware, codex r3 B2): all sequence comparisons are lawful
-   ONLY within one `observation_epoch`. Same epoch as anchor: latches satisfy
+   Cycle proof (epoch-aware, codex r3 B2/r4 B2): `observation_epoch` is an
+   opaque UUID/token generated as `str(uuid.uuid4())` on monitor construction and on every
+   `reset_buffer`, `clear_terminal`, and rebind. Tokens support equality only;
+   there is NO ordered/newer-than comparison between epochs anywhere. All
+   integer sequence comparisons are lawful ONLY when their token strings are
+   equal. Same token as anchor: latches satisfy
    `last_non_ready_seq > injection_completed_seq` AND
-   `last_ready_seq > last_non_ready_seq`. Latch epoch NEWER than anchor epoch
-   (restart/reset/rebind between injection and now): a COMPLETE same-epoch
-   PROCESSING→ready cycle in the newer epoch qualifies as post-injection; a
-   level-ready recovery sample never does. Cross-epoch integer comparison is
-   BANNED. Epoch boundaries: monitor construction, `reset_buffer`,
-   `clear_terminal`, rebind (`status_monitor.py:758-798` reset surfaces).
+   `last_ready_seq > last_non_ready_seq`. Different token from anchor
+   (construction/reset/rebind between injection and now): qualification requires
+   a COMPLETE PROCESSING→ready pair whose two latches and sampled snapshot all
+   carry the monitor's CURRENT token; latches reset when that token opens. A
+   stale old-token pair, a mixed old/current pair, and a level-ready current-token
+   sample never qualify. Cross-token integer comparison is BANNED. Both the
+   anchor and boundary snapshot persist the literal token string, never a hash,
+   counter projection, timestamp, or derived ordering key.
    Closed non-ready set: {PROCESSING}
    only — UNKNOWN and WAITING_USER_ANSWER never start a qualifying cycle (they
    are not turn evidence; loss proofs stay conservative). A level sample of
@@ -169,7 +192,8 @@ untouched.
 ### S1.c — atomic boundary observation + wake law (closes codex B3)
 
 - One **boundary-observation snapshot object** sampled under a single
-  lock/version, with these named fields (grok r2 S1): `observation_epoch`,
+  lock/version, with these named fields (grok r2 S1): `observation_epoch`
+  (the monitor's CURRENT opaque token string),
   `status`, `status_gen`, `input_gen`, `seq` (monotonic observation sequence),
   plus two transition latches maintained under the SAME lock at observation time:
   `last_non_ready_seq` (seq of the most recent PROCESSING observation) and
@@ -192,14 +216,27 @@ untouched.
   batch) + D9 exempt retention** (NOT the S2 assignment watchdog, which is a
   separate alarm class on worker assignment episodes).
 
-### S1.d — attempt lifecycle: option A, no new vocabulary (closes grok B2)
+### S1.d — attempt lifecycle + startup recovery (closes grok B2, codex r4 B1)
 
 The confirm window may still settle an attempt `ambiguous`/`confirmation_timeout`
 on wall-clock exactly as at HEAD. S1 narrows ONLY D1 step-5 exhaustion
 eligibility (S1.b) and step-6 reinject eligibility (exclusively the step-6 path,
 now gated on S1.b). No new outcome values, no new message statuses, no new
-columns; the only durable additions are the S1.f evidence keys (D7 honored). `recover_stale_deliveries`,
-wake selection, and D9 gated-PENDING detection semantics are unchanged.
+columns; the only durable additions are the S1.f evidence keys (D7 honored).
+
+`recover_stale_deliveries` is the one widened seam. An open stale DELIVERING
+attempt with `provider=claude_code` and no durably settled anchor is
+indistinguishable after a crash from one whose backend submit succeeded, because
+the submit marker is intentionally in-memory until settlement. Recovery therefore
+treats the whole population as **possibly submitted**: transcript hit confirms as
+today; every non-hit arm (absent, unresolved/no oracle, or pane temporarily
+unresolvable while receiver metadata still exists) settles the attempt and members
+to PENDING `ambiguous/confirmation_timeout`, with `crash_recovery` evidence per
+S1.f. `_handle_wpm1_gate` recognizes that row as anchor-less and D2-only: it may
+confirm later, but can never write exhaustion or authorize a successor paste.
+The current `interrupted/proven_absent → normal retry` route is forbidden for this
+Claude population. Receiver-gone terminal failure and non-Claude recovery remain
+unchanged. Wake selection and D9 gated-PENDING detection semantics are unchanged.
 
 ### S1.f — closed additive evidence schema + sole lawful writer (closes codex r2 B2)
 
@@ -218,6 +255,13 @@ these additive keys — nothing else; unlisted keys keep raising
   between submit and settlement, the attempt settles (or is recovered) WITHOUT
   an anchor, and an anchor-less ambiguous attempt can NEVER authorize a loss —
   fail-closed pending; S1.a/D2 confirmation remains the only exit.
+- `crash_recovery` (object `{kind, recovered_at, lookup_kind}`): written only by
+  `recover_stale_deliveries` while atomically settling a stale open Claude
+  DELIVERING attempt to PENDING `ambiguous/confirmation_timeout`. `kind` is the
+  literal `possibly_submitted_without_anchor`; `recovered_at` is the server
+  recovery timestamp; `lookup_kind` is the actual startup lookup evidence kind
+  (or `transcript_unresolved` when no authority exists). This evidence never acts
+  as an anchor and never authorizes loss/reinjection.
 - `boundary_snapshot` (object: `{observation_epoch, status, status_gen,
   input_gen, seq, last_non_ready_seq, last_ready_seq}`): written only in the
   transaction that writes `boundary_exhausted_at`, same attempt row, via the
@@ -246,15 +290,18 @@ Lawful writers, complete list: (w1) `settle_delivery_attempt` extended to
 persist the in-memory anchor with ambiguous settlement; (w2) the existing
 settled-attempt conditional-merge seam for `boundary_snapshot`/
 `queue_corroboration`; (w3) the extended terminal-settlement transaction for
-confirmation evidence. No other writer, no direct row UPDATE; HEAD
+confirmation evidence; (w4) `recover_stale_deliveries` writing `crash_recovery`
+in the same settlement transaction that creates the closed anchor-less
+ambiguous row. No other writer, no direct row UPDATE; HEAD
 PENDING/member-set/rowcount/busy semantics unchanged everywhere except as
-stated in w1/w3. Named mutants (must die): (m1) write a new key bypassing the
+stated in w1/w3/w4. Named mutants (must die): (m1) write a new key bypassing the
 allowlist; (m2) write anchor or `boundary_snapshot` to a different attempt row
 than the injecting/exhausting one; (m3) write `boundary_exhausted_at` without
 `boundary_snapshot` in the same transaction; (m4) restore the pre-settlement
 merge predicate for the anchor (must fail the anchor-persist lifecycle test);
 (m5) authorize a loss from an anchor-less attempt; (m6) compare sequences
-across epochs.
+across epochs; (m7) restore stale-Claude `interrupted/proven_absent` recovery
+and normal reinjection.
 
 ### S1.e — historical backfill: OUT (closes codex S1, grok S4)
 
@@ -280,7 +327,7 @@ as a residual; any future backfill is its own gated slice.
   the cycle still qualifies (anchor is injection completion, not settlement);
   loss provable on the next evaluation. Anti-test: the same events anchored on
   `last_at` would wrongly disqualify — asserts the ban.
-- **S1.f schema law**: named mutants m1–m6 all die; unlisted-key write raises.
+- **S1.f schema law**: named mutants m1–m7 all die; unlisted-key write raises.
 - **Anchor lifecycle (codex r3 B1)**: begin → submit-seam mark → ambiguous
   settlement persists anchor atomically; m4 (pre-settlement merge predicate
   restored) fails this test. Crash-cut: kill between submit and settlement →
@@ -289,8 +336,22 @@ as a residual; any future backfill is its own gated slice.
   backend submit but BEFORE `send_prepared_input` returns → cycle still
   qualifies (anchor marked at submit seam, not at return).
 - **Epoch law (codex r3 B2)**: restart between anchor and cycle → new-epoch
-  complete cycle authorizes; level-ready recovery sample does not;
-  reset_buffer/rebind open epochs; m6 (cross-epoch compare) dies.
+  complete current-token cycle authorizes; level-ready recovery sample does not;
+  construction/reset_buffer/rebind open fresh opaque tokens; same token permits
+  integer comparison, different tokens never do. Old-token snapshot against a
+  current-token monitor and mixed old/current latch pairs do not qualify; m6
+  (ordered/cross-token compare) dies.
+- Named token tests: `test_wpm2_old_token_snapshot_cannot_qualify_current_monitor`,
+  `test_wpm2_mixed_token_latches_cannot_qualify`, and
+  `test_wpm2_current_token_complete_cycle_qualifies_after_reset`. The first two
+  are the required old-token/current-token mismatch pins.
+- **Crash recovery (codex r4 B1)**: real injection submit succeeds, process dies
+  before anchor settlement, startup recovery runs, then multiple reconciliation
+  wakes occur before queued-command confirmation → exactly ONE total injection,
+  no loss proof, closed PENDING until D2 confirms. m7 restoring
+  `interrupted/proven_absent → normal reinject` must produce a second paste and die.
+  Named test: `test_wpm2_crash_recovery_stays_d2_only_across_reconcile_wakes`;
+  the m7 mutation is killed by that same injection-count assertion.
 - **Confirmation destination (codex r3 B4)**: initial-hit, late-hit with one
   attempt, late-hit landing on an OLDER attempt than the newest settlement
   target — evidence rows land per the S1.f target rule in all three.
@@ -358,15 +419,48 @@ the codex r3 gate verdict). The receiver's harness has a NATIVE mid-turn queue
 unnecessary for claude_code.
 
 **Law**: for claude_code receivers, INITIAL injection of a message no longer
-requires receiver status ∈ {IDLE, COMPLETED}. It requires only: D5 composer
-tri-state == `empty` (inherited unchanged — never paste over a draft; `unknown`
-holds, fail-closed) AND no other injection in flight to that terminal. This is
-an EXPLICIT, NARROW SUPERSESSION of WPM1 D1.4's ready-status requirement,
+requires receiver status ∈ {IDLE, COMPLETED}. It requires D5 composer tri-state
+== `empty` (inherited unchanged — never paste over a draft; `nonempty` and
+`unresolved` hold fail-closed) and the concurrency/queue authorities below.
+This is an EXPLICIT, NARROW SUPERSESSION of WPM1 D1.4's ready-status requirement,
 scoped to initial injection on claude_code only. Justification: D1.4's ready
 gate existed because busy delivery was unconfirmable under the proof-only law;
 S1.a makes it confirmable (queued_command evidence). CORRECTIVE re-injection
 (the D1 step-6 path) keeps the FULL S1.b boundary discipline — S4 never
 relaxes loss proofs or reinjection, only the first paste.
+
+**Exact `initial` classification** (per exact member-set/batch attempt history):
+
+- No prior attempt, or only `deferred` attempts whose reasons prove input was
+  never submitted (`delivery_deferred` / `input_blocked`) → initial; retry may
+  use S4 after D5 returns `empty`.
+- An r5 startup-recovered `ambiguous/confirmation_timeout` attempt carrying
+  S1.f `crash_recovery` → NOT initial; possibly submitted, permanently D2-only
+  until confirmation. Any legacy/other startup-recovered `interrupted` history
+  is likewise NOT initial and never gains S4 eligibility.
+- Any `ambiguous/confirmation_timeout` attempt, any confirmed attempt, or any
+  attempt carrying a successful-submit anchor → NOT initial; it follows S1/WPM1.
+- `failed` send/tail attempts are NOT initial because the generic exception arm
+  cannot prove the backend rejected the paste before acceptance; they retain
+  existing terminal failure handling and are never silently retried by S4.
+- Other `interrupted` reasons retain HEAD behavior and do not gain S4 eligibility;
+  only the two proven-never-submitted deferred reasons above can re-enter initial.
+
+**Concurrency and queue authority**: the existing per-terminal delivery lock is
+the exclusive injection lease. An initial paste may occur only while this call
+owns that lock and there is no OTHER DELIVERING transaction for the terminal;
+the attempt opened for this same batch is not "other." Distinct durable
+`ambiguous/confirmation_timeout` batches impose FIFO head-of-line blocking:
+the oldest batch remains the only D2/reconciliation subject until it confirms or
+reaches a lawful terminal arm; later distinct PENDING batches do not paste around
+it. They are not collapsed into the older payload and do not consume its cap.
+This policy gives one concurrent paste maximum and one proof chain per batch.
+
+**Eager flag interaction**: S4 SUPERSEDES `EAGER_INBOX_DELIVERY` for this exact
+Claude initial-delivery arm. A Claude PROCESSING receiver with D5 `empty` is
+eligible whether the environment flag is true or false. The flag continues to
+govern its existing generic/provider eager path and every non-Claude path; it
+does not disable or broaden S4.
 
 Expected behavior: first injection within one scheduler pass (≤ ~30s
 reconciliation period) regardless of receiver busyness; confirmation typically
@@ -376,7 +470,30 @@ boundary; attempt chain length stays 1.
 Evidence bar:
 - Busy receiver, message sent → injection within one pass, exactly 1 injection,
   confirm via queued_command on flush, DELIVERED, chain length 1.
-- Composer `nonempty`/`unknown` → hold (unchanged D5 behavior), no injection.
+- Composer `nonempty`/`unresolved` → hold (unchanged D5 behavior), no injection.
+  `unresolved` has two separate mandatory fixtures: capture failure and
+  parser ambiguity; both reach the same fail-closed no-paste arm.
+- **Real D5 substrate**: commit byte-exact captured busy-Claude PROCESSING
+  artifacts at `test/fixtures/claude_busy_processing/{empty,nonempty,
+  parser_ambiguous}.txt` plus `capture_failure.json`. Provider parser tests
+  consume those captures, not synthetic strings. Named end-to-end test
+  `test_wpm2_busy_claude_real_empty_frame_reaches_initial_paste` feeds the real
+  empty PROCESSING frame through `ClaudeCodeProvider.read_composer_draft_state`
+  and reaches the backend paste without mocking D5. Named fail-closed tests
+  `test_wpm2_busy_claude_real_nonempty_frame_holds`,
+  `test_wpm2_busy_claude_parser_ambiguity_is_unresolved`, and
+  `test_wpm2_busy_claude_capture_failure_is_unresolved` never paste.
+- Initial-history matrix: no-attempt and deferred-never-pasted are S4-eligible;
+  crash-recovered ambiguous, startup-recovered interrupted, ordinary ambiguous,
+  confirmed/anchored, generic failed, and other interrupted histories are not.
+  Mutation treating crash-recovered/interrupted or failed as initial must die.
+- Two distinct messages while the first is DELIVERING/ambiguous: delivery lock
+  admits at most one concurrent paste; after ambiguous settlement the second
+  stays FIFO-blocked while D2 reconciles the first. Mutation bypassing the lock
+  or allowing the second batch to paste around the first must die.
+- `EAGER_INBOX_DELIVERY=false` still permits the exact Claude S4 initial arm;
+  non-Claude behavior remains flag-gated. Mutants making the flag disable S4 or
+  making S4 supersede the flag globally must die.
 - Non-claude receivers → HEAD gating byte-unchanged.
 - Corrective path unaffected: a reinjection-eligible batch still requires the
   full S1.b cycle proof (wiring mutant: S4 gate applied to step-6 must die).
