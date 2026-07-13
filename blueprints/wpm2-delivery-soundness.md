@@ -1,7 +1,28 @@
 # WPM2 — delivery soundness for busy receivers + alarm hygiene + seed stderr parse
 
-Status: DRAFT r14 (2026-07-13). Micro-WP, three independent slices sharing one gate
+Status: DRAFT r15 (2026-07-13). Micro-WP, three independent slices sharing one gate
 train. Builds directly on WPM1 (`8afb758`, FROZEN r9 law) and WP2S3 (`7651dc1`).
+
+r14→r15 changelog (folds codex r14 ADDENDUM 1B — live fixture
+`tmp/orch/live-trace-inbox1956-compact-triple-delivery.md`: a /compact
+PROCESSING→ready cycle satisfied S1.b while an accepted busy paste sat
+queued-but-untranscripted, producing 3 re-pastes + false terminal
+delivery_failed on the live server; grok r14 and codex r14 pre-addendum were
+both 0/0/0):
+- NEW protected class `busy_initial`: every Claude S4 INITIAL injection
+  submitted while receiver status ∉ {IDLE, COMPLETED} is, after ambiguous
+  settlement, a durable permanently-protected D2-only head. It may exit ONLY by
+  S1.a D2 hit (DELIVERED) or D1.1 receiver-gone; it never writes
+  `boundary_exhausted_at`, never creates a successor, never consumes cap, never
+  terminally fails for absence. Pane status cycles alone are empirically
+  insufficient to prove a queued busy paste lost — the S1.b predicate carries no
+  cycle-kind fact and compact/lifecycle work is indistinguishable from payload
+  consumption.
+- New S1.f additive key `busy_initial_submit`, persisted atomically with the
+  ambiguous settlement (same transaction as the anchor); crash-before-settlement
+  degrades to the anchor-less protected class, so restart cannot lose protection.
+- Classifier gains the `busy_initial` permanent reason; protected release law
+  unchanged in shape. Exact /compact fixture + mutants m13/m14 pinned.
 
 r13→r14 changelog (folds codex r13 2S; codex r13 was BUILDABLE YES 0B/2S/0N
 zero-decision, grok r13 0B/0S/0N — evidence hardening only, no design change):
@@ -303,6 +324,18 @@ Wall-clock expiry alone NEVER writes exhaustion and NEVER authorizes injection.
 Non-claude providers: S1 does not apply; their existing WPM1 semantics are
 untouched.
 
+**Busy-initial exclusion (codex r14 addendum B1, live trace inbox-1956)**: an
+attempt carrying S1.f `busy_initial_submit` NEVER satisfies this predicate —
+no same-epoch cycle count, latch state, or absent-at-boundary result can
+authorize its loss. Empirical basis: the paste was ACCEPTED into the receiver's
+native mid-turn queue while non-ready, but the hash-matching `queued_command`
+transcript record is flushed only when the in-flight operation (e.g. /compact)
+finishes; meanwhile the operation itself emits same-epoch PROCESSING→ready
+cycles with an empty composer and D2 absent — the full r14 predicate — so
+status-only turn-cycle proof cannot distinguish lifecycle work from payload
+consumption for a busy-admitted paste. Any future relaxation requires a
+separately pinned payload-specific queue-invalidation proof; WPM2 defines none.
+
 ### S1.c — atomic boundary observation + wake law (closes codex B3)
 
 - One **boundary-observation snapshot object** sampled under a single
@@ -373,11 +406,19 @@ state table is:
 - `epoch_mismatch` (permanent/protected): anchor is valid, current snapshot/token
   is available, and the literal anchor token differs from the monitor's CURRENT
   token (construction restart, reset, or rebind).
-- `normal`: anchor is valid, current token is available, and tokens are equal;
-  normal same-token S1 boundary evaluation applies.
+- `busy_initial` (permanent/protected; checked BEFORE the `normal` arm,
+  independent of anchor validity/token equality): evidence carries a
+  structurally valid `busy_initial_submit` object. The paste was admitted by S4
+  while the receiver was non-ready; per the S1.b busy-initial exclusion no
+  boundary evidence for this attempt is ever sufficient. Exits: S1.a D2 hit or
+  D1.1 receiver-gone only. A malformed `busy_initial_submit` object fails closed
+  into this same protected reason (never into `normal`).
+- `normal`: anchor is valid, current token is available, tokens are equal, and
+  no `busy_initial_submit` key is present; normal same-token S1 boundary
+  evaluation applies.
 
-Both permanent reasons (`anchor_missing`, `epoch_mismatch`) are **permanently
-D2-only for that epoch/attempt**: never
+All permanent reasons (`anchor_missing`, `epoch_mismatch`, `busy_initial`) are
+**permanently D2-only for that epoch/attempt**: never
 exhaust, never reinject, remain PENDING until D2 hit/receiver-gone, and share the
 same immutable protected-member-set release below. Mechanics are closed:
 
@@ -415,8 +456,8 @@ same immutable protected-member-set release below. Mechanics are closed:
    whole wake returns generic `stop` so its atomic pair retries; no later batch
    runs on that wake. Otherwise (notice not due, recorded, or already recorded),
    it returns `skip_d2_only(attempt_uuid, member_ids, protection_reason)` instead
-   of generic `stop`, where reason is `anchor_missing`, `epoch_mismatch`, or
-   `transient_snapshot_unavailable`. This is control vocabulary only, not a
+   of generic `stop`, where reason is `anchor_missing`, `epoch_mismatch`,
+   `busy_initial`, or `transient_snapshot_unavailable`. This is control vocabulary only, not a
    persisted outcome/status. Exhaustion, terminal-failure, successor-begin, and
    backend-send arms are bypassed for the protected set.
 4. On `skip_d2_only`, `deliver_pending` adds exactly those member IDs to the
@@ -472,6 +513,19 @@ these additive keys — nothing else; unlisted keys keep raising
   lookup scan; `observed_at` = the native record's own timestamp when present
   and parseable, else null (named rule — never synthesized from the observation
   clock). Merged during D1/D2 evaluation on settled attempts, existing seam.
+- `busy_initial_submit` (object `{status_at_submit, observation_epoch, seq}`):
+  captured in memory at the S4 admission snapshot when INITIAL injection is
+  admitted with receiver status ∉ {IDLE, COMPLETED} (`status_at_submit` is the
+  literal observed status, e.g. `PROCESSING`; epoch/seq are the admission
+  snapshot's token and sequence), carried by the delivery path, and persisted
+  ATOMICALLY WITH the ambiguous settlement in the SAME
+  `settle_delivery_attempt` transaction as the anchor. Written for busy
+  admissions only — a ready-admitted initial paste never carries it. **Closed
+  crash rule**: death between submit and settlement loses this fact together
+  with the anchor, and the anchor-less attempt is already permanently protected
+  (`anchor_missing`), so protection is never lost across restart. This evidence
+  never acts as an anchor and never authorizes loss/reinjection; its sole
+  effect is the `busy_initial` protected classification.
 - `kind` gains the new VALUE `transcript_queued_command` (existing key; no new
   key).
 
@@ -563,7 +617,12 @@ substitute a newer cursor into an already-built AdmissionProof instead of
 rebuilding the full proof; (m12) restore HEAD's activity-merge cursor write
 (`updates["last_observed_ref"] = observation`, `inbox_service.py:271-296`) —
 the unversioned four-field observation overwrites a versioned cursor on the
-next wake, stripping provenance; must die against the cursor-survival test.
+next wake, stripping provenance; must die against the cursor-survival test;
+(m13) treat a same-epoch PROCESSING→ready cycle as loss proof for an attempt
+carrying `busy_initial_submit` (must replay the inbox-1956 triple-paste +
+false terminal failure and die against the /compact fixture); (m14) carry the
+busy-initial fact in memory only / skip persisting it in the settlement
+transaction (restart must forget protection, exhaust, and die).
 
 `advance_wpm2_continuity_cursor(attempt_uuid, exact_message_ids, expected_ref,
 observed_ref)` uses the frozen `_run_wpm1_immediate` 3×1s transaction policy and
@@ -629,7 +688,22 @@ as a residual; any future backfill is its own gated slice.
   the cycle still qualifies (anchor is injection completion, not settlement);
   loss provable on the next evaluation. Anti-test: the same events anchored on
   `last_at` would wrongly disqualify — asserts the ban.
-- **S1.f schema law**: named mutants m1–m12 all die; unlisted-key write raises.
+- **S1.f schema law**: named mutants m1–m14 all die; unlisted-key write raises.
+- **Busy-initial /compact fixture (codex r14 addendum B1, live trace
+  inbox-1956)** — `test_wpm2_busy_initial_compact_cycles_never_exhaust`: one S4
+  paste admitted while PROCESSING (accepted into the native queue,
+  `queued_command` record deferred), then repeated same-epoch PROCESSING→ready
+  cycles with empty composer and D2 absent across multiple wakes → NO
+  `boundary_exhausted_at`, NO successor attempt, NO cap consumption, NO
+  terminal failure; then a late queued-command suffix hit settles DELIVERED
+  with attempt-chain length exactly 1. m13 replays the recorded live outcome
+  (3 pastes + `delivery_failed`) and dies. m14 (in-memory-only busy fact) dies
+  across a restart cut between settlement and the next wake.
+  `test_wpm2_busy_initial_receiver_gone_exit` pins the only other exit;
+  `test_wpm2_ready_admitted_initial_keeps_normal_discipline` asserts a
+  ready-admitted S4 paste carries no `busy_initial_submit` and remains subject
+  to normal S1.b loss proof; a malformed `busy_initial_submit` object
+  classifies protected (fail-closed), never `normal`.
 - **Cursor compatibility + writer matrix**:
   `test_wpm2_versioned_nested_cursor_wins_over_conflicting_legacy_top_level`,
   `test_wpm2_legacy_top_level_cursor_migrates_once`, and
@@ -848,6 +922,20 @@ busy delivery was unconfirmable under the proof-only law; S1.a makes it
 confirmable (queued_command evidence). CORRECTIVE re-injection
 (the D1 step-6 path) keeps the FULL S1.b boundary discipline — S4 never
 relaxes loss proofs or reinjection, only the first paste.
+
+**Busy-initial protection (codex r14 addendum B1)**: when S4 admits an INITIAL
+injection while receiver status ∉ {IDLE, COMPLETED}, the delivery path captures
+the S1.f `busy_initial_submit` fact at the admission snapshot and persists it
+atomically with the ambiguous settlement. Such an attempt is, from settlement
+on, a permanent `busy_initial` protected D2-only head: confirmable by S1.a,
+settleable by D1.1 receiver-gone, subject to ordinary D1.3/D8 stalled-notice
+longevity — but it never writes `boundary_exhausted_at`, never begins a
+successor, never consumes injection cap, and never settles terminally for
+absence. The `queued_command` transcript record may be flushed arbitrarily late
+(only when the receiver's in-flight operation completes), so absence during
+that window is not evidence. A READY-admitted S4 initial paste (D1.4-equivalent
+gate held at admission) carries no `busy_initial_submit` and keeps the full
+normal S1 discipline.
 
 **`Initial` classification with overlap safety**:
 
