@@ -1,7 +1,21 @@
 # WPM2 — delivery soundness for busy receivers + alarm hygiene + seed stderr parse
 
-Status: DRAFT r7 (2026-07-13). Micro-WP, three independent slices sharing one gate
+Status: DRAFT r8 (2026-07-13). Micro-WP, three independent slices sharing one gate
 train. Builds directly on WPM1 (`8afb758`, FROZEN r9 law) and WP2S3 (`7651dc1`).
+
+r7→r8 changelog (folds codex r7 4B; grok r7 remained 0B/0S/0N YES):
+- Permanent-D2 classification is total over persisted anchor validation:
+  absent/malformed anchors → `anchor_missing`; valid mismatched anchor →
+  `epoch_mismatch`; valid same-token → normal; unavailable current monitor
+  snapshot → distinct transient stop/retry, never permanent classification.
+- Frozen D1.1 receiver-gone settlement is explicitly FIRST for every batch,
+  before evidence parsing, classifier, D2, activity/notice, or release scanning.
+- The common attempt opener returns a closed tagged result
+  `opened(uuid) | delivering_conflict | busy_aborted | stale_candidate`; only
+  `opened` may reach backend send. Bare strings/UUID ambiguity is forbidden.
+- The opener transaction conditionally CASes the exact receiver-owned candidate
+  set PENDING→DELIVERING with rowcount equality before attempt insertion, then
+  verifies exact-self. D2/terminal-settlement races cannot resurrect terminal rows.
 
 r6→r7 changelog (folds codex r6 3B/1S; grok r6 S1 converged with codex B1):
 - One internal `classify_permanently_d2_only` authority covers ambiguous heads
@@ -274,23 +288,37 @@ unchanged. Wake selection and D9 gated-PENDING detection semantics are unchanged
 
 **Permanent D2-only classifier + proof-safe queue release (r7)**:
 `classify_permanently_d2_only(attempt, current_observation_epoch)` is the sole
-internal classifier. It reads settled attempt outcome/reason/evidence and the
-current atomic monitor snapshot, returning one of:
+internal classifier. Evidence JSON/anchor validation is explicit and total; it
+never raises into delivery. For attempts other than
+`ambiguous/confirmation_timeout`, return `normal`. For that outcome, the closed
+state table is:
 
-- `anchor_missing`: attempt is `ambiguous/confirmation_timeout` and has no valid
-  persisted `injection_completed_seq` `{observation_epoch, seq}`. This includes
-  every crash-recovered anchor-less attempt; `crash_recovery` is explanatory
-  evidence, not a requirement for protection.
-- `epoch_mismatch`: attempt is `ambiguous/confirmation_timeout`, has a valid
-  persisted anchor, and its literal `observation_epoch` token differs from the
-  monitor snapshot's CURRENT token (construction restart, reset, or rebind).
-- `None`: otherwise. Same-token anchored attempts retain normal S1 boundary
-  evaluation; malformed/unavailable token evidence fails closed with generic
-  `stop` and never authorizes loss/reinject.
+- `anchor_missing` (permanent/protected): evidence JSON is malformed/non-object;
+  `injection_completed_seq` is absent/null/non-object; `observation_epoch` is
+  missing, empty, or non-string; OR `seq` is missing or not an integer (boolean
+  explicitly rejected). This includes every crash-recovered anchor-less attempt;
+  `crash_recovery` is explanatory evidence, not required for protection.
+- `transient_snapshot_unavailable` (NOT permanent, generic stop/retry): anchor is
+  valid but the current atomic monitor snapshot/token cannot presently be read.
+  It never exhausts, reinjects, notices-as-permanent, or releases members on that
+  wake. A later wake re-runs classification from scratch.
+- `epoch_mismatch` (permanent/protected): anchor is valid, current snapshot/token
+  is available, and the literal anchor token differs from the monitor's CURRENT
+  token (construction restart, reset, or rebind).
+- `normal`: anchor is valid, current token is available, and tokens are equal;
+  normal same-token S1 boundary evaluation applies.
 
-Both non-None reasons are **permanently D2-only for that epoch/attempt**: never
+Both permanent reasons (`anchor_missing`, `epoch_mismatch`) are **permanently
+D2-only for that epoch/attempt**: never
 exhaust, never reinject, remain PENDING until D2 hit/receiver-gone, and share the
 same immutable protected-member-set release below. Mechanics are closed:
+
+0. **D1.1 receiver-gone is always first.** Before decoding attempt evidence,
+   reading the monitor, classifying, resolving/looking up a transcript, merging
+   activity, evaluating D8, or scanning/releasing later rows, verify live receiver
+   metadata. Missing metadata atomically settles the exact batch
+   `DELIVERY_FAILED/receiver_gone` through the frozen terminal-settlement seam and
+   sends its existing caller notice exactly once. No protected-path operation runs.
 
 1. The DB layer adds an oldest-first, cursor/paginated pending scan for one
    receiver that accepts an `excluded_message_ids` set. Unlike
@@ -437,6 +465,20 @@ as a residual; any future backfill is its own gated slice.
   `test_wpm2_rebind_reset_cycle_with_absent_payload_stays_d2_only`. All three are
   old-token/current-token mismatch pins; the last uses the real rebind/reset
   ordering and kills authorization from its initialization cycle.
+- **Classifier totality (codex r7 B1)**: table-driven
+  `test_wpm2_permanent_d2_classifier_validation_matrix` names and asserts every
+  row: evidence JSON malformed; anchor absent; anchor non-object; epoch missing;
+  epoch empty/non-string; seq missing; seq non-integer/bool → `anchor_missing`;
+  valid anchor + unavailable monitor snapshot → `transient_snapshot_unavailable`;
+  valid mismatch → `epoch_mismatch`; valid same-token → `normal`. Separate
+  `test_wpm2_transient_snapshot_unavailable_stops_then_retries` proves it never
+  enters the protected exclusion set and can classify normally on the next wake.
+- **Receiver-gone precedence (codex r7 B2)**:
+  `test_wpm2_receiver_gone_precedes_malformed_protected_evidence` and
+  `test_wpm2_receiver_gone_precedes_ordinary_protected_evidence` remove receiver
+  metadata before the wake. Each settles `receiver_gone` exactly once and asserts
+  classifier, transcript/D2, activity merge, stalled notice, and release scan are
+  never called. Moving D1.1 after any protected operation must die.
 - **Mismatch release liveness (codex r6 B1/grok S1)**:
   `test_wpm2_construction_restart_protects_mismatch_and_releases_disjoint_callback`
   and `test_wpm2_rebind_reset_protects_mismatch_and_releases_disjoint_callback`
@@ -595,22 +637,49 @@ is evaluated outside and before this common opener; none may call legacy
 
 While holding the delivery lock and BEFORE any attempt/message mutation, the
 common seam calls `list_delivering_attempts_for_terminal(terminal_id)`, which
-joins DELIVERING inbox rows to attempt members. Any row blocks opening. The
-primitive then uses the existing bounded `_run_wpm1_immediate` /
-`BEGIN IMMEDIATE` spine: re-run the same no-DELIVERING query, insert the candidate
-attempt/members, mark them DELIVERING, then post-open query before commit. The
-post-open result must be exactly `{just_created_attempt_uuid}` with exactly the
-candidate member set. Any precheck conflict or post-open mismatch rolls back the
-whole helper transaction, leaves candidate messages PENDING, and performs no
-paste; the caller returns/retries on a later wake. Therefore the just-created
-attempt is the sole DELIVERING exception only AFTER the atomic open succeeds.
+joins DELIVERING inbox rows to attempt members. Any row blocks opening.
+
+**Closed opener result protocol**: `begin_delivery_attempt_if_no_other_delivering`
+returns a tagged `AttemptOpenResult`, never a bare UUID or status string:
+
+- `opened(attempt_uuid)` — the ONLY result that allows backend send.
+- `delivering_conflict` — outer preflight or in-transaction exact-self check saw
+  another DELIVERING attempt for the terminal.
+- `busy_aborted` — the bounded immediate transaction exhausted contention at
+  BEGIN, any write/flush, or COMMIT; the literal `_run_wpm1_immediate`
+  `"busy_aborted"` is mapped to this tag and can never be interpreted as a UUID.
+- `stale_candidate` — candidate IDs/receiver/PENDING CAS no longer match.
+
+Every non-open tag returns from the service path BEFORE backend send, leaves the
+entire candidate set PENDING through no-write or rollback, creates no durable
+attempt/member rows, and never falls into generic FAILED settlement.
+
+**Atomic candidate CAS/open**: the primitive uses the existing bounded
+`_run_wpm1_immediate` / `BEGIN IMMEDIATE` spine and, inside that ONE transaction:
+
+1. Re-run the no-other-DELIVERING query.
+2. Load the sorted unique candidate IDs and require the exact set to exist with
+   `receiver_id == terminal_id` and `status == PENDING`.
+3. Conditionally UPDATE exactly those rows with predicates `(id IN candidate) ∧
+   receiver_id == terminal_id ∧ status == PENDING` to DELIVERING. The changed
+   rowcount MUST equal candidate cardinality. Missing/wrong-receiver/non-PENDING
+   or rowcount mismatch → rollback + `stale_candidate`.
+4. Only after the successful CAS, insert the attempt and exact member rows, then
+   flush. Before commit, query the terminal's DELIVERING attempts; the result must
+   be exactly `{just_created_attempt_uuid}` with exactly the candidate member set.
+   An extra attempt → rollback + `delivering_conflict`; candidate/self mismatch →
+   rollback + `stale_candidate`.
+
+Therefore the just-created attempt is the sole DELIVERING exception only AFTER
+the atomic open commits. No terminal arm can be resurrected from DELIVERED or
+DELIVERY_FAILED because those rows fail the PENDING predicate and rowcount gate.
 `begin_delivery_attempt` may remain as a lower-level/test compatibility symbol,
 but no production inbox writer routes through it after WPM2.
 
 Distinct durable ambiguous batches follow the proof-safe release policy in
 S1.d: classifier-positive permanent D2-only member sets are skipped without
-paste, and later DISJOINT batches may proceed. Ordinary non-protected ambiguous batches retain
-their S1/WPM1 gate behavior. No batch is collapsed into another payload or cap;
+paste, and later DISJOINT batches may proceed. Ordinary non-protected ambiguous
+batches retain their S1/WPM1 gate behavior. No batch is collapsed into another payload or cap;
 this gives one concurrent paste maximum and one proof chain per member set.
 
 **Eager flag interaction**: S4 SUPERSEDES `EAGER_INBOX_DELIVERY` for this exact
@@ -657,6 +726,23 @@ Evidence bar:
   helper query), retaining only the process lock, or omitting the post-open query
   must die. Any classifier-positive protected head + later disjoint candidate
   remains admissible because the head is PENDING, not DELIVERING.
+- Opener tags/service exits (codex r7 B3):
+  `test_wpm2_opener_outer_preflight_conflict_never_sends`,
+  `test_wpm2_opener_busy_at_begin_write_or_commit_never_sends` (three injection
+  points), and `test_wpm2_opener_post_open_invariant_failure_never_sends` assert
+  the exact non-open tag, all candidate rows PENDING, no attempt/members, zero
+  backend calls, and no generic FAILED transition. A mutant returning the bare
+  `_run_wpm1_immediate` string and treating it as `attempt_uuid` must die.
+- Candidate CAS races (codex r7 B4): two-connection tests
+  `test_wpm2_d2_confirm_vs_open_both_commit_orders` and
+  `test_wpm2_terminal_settlement_vs_open_both_commit_orders` coordinate the
+  common opener against D2 DELIVERED settlement and terminal
+  DELIVERED/DELIVERY_FAILED settlement. Settlement-first → opener
+  `stale_candidate`, zero send, terminal status preserved. Open-first → opener is
+  sole DELIVERING winner and settlement CAS reports stale; at most its one send
+  occurs and no terminal status is resurrected. Mutations removing the PENDING
+  predicate or accepting changed-rowcount != exact candidate cardinality must
+  produce resurrection/dual ownership and die.
 - Mixed-writer closure (codex r6 B3): two-connection races
   `test_wpm2_s4_vs_ordinary_initial_share_atomic_delivering_opener` and
   `test_wpm2_s4_vs_corrective_share_atomic_delivering_opener` coordinate both
