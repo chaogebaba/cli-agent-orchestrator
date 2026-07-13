@@ -7,6 +7,8 @@ Publisher: terminal.{id}.status
 import asyncio
 import logging
 import threading
+import uuid
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
@@ -44,6 +46,17 @@ _STICKY_READY_STATUSES = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class BoundaryObservation:
+    observation_epoch: str
+    status: TerminalStatus
+    status_gen: Optional[int]
+    input_gen: int
+    seq: int
+    last_non_ready_seq: Optional[int]
+    last_ready_seq: Optional[int]
+
+
 class StatusMonitor:
     """Accumulates terminal output into rolling buffers and detects status changes."""
 
@@ -69,6 +82,10 @@ class StatusMonitor:
         self._input_gen: Dict[str, int] = {}
         self._processing_gen: Dict[str, int] = {}
         self._status_gen: Dict[str, int] = {}
+        self._observation_epoch: Dict[str, str] = {}
+        self._observation_seq: Dict[str, int] = {}
+        self._last_non_ready_seq: Dict[str, int] = {}
+        self._last_ready_seq: Dict[str, int] = {}
         # --- pyte rendered-screen detection state (only used when CAO_PYTE_STATUS
         # is on AND the provider opts in via supports_screen_detection) ---
         # Per-terminal pyte Screen+Stream that composites the raw byte stream
@@ -106,6 +123,25 @@ class StatusMonitor:
         chunk_seq = self._chunk_seq.get(terminal_id, 0) + 1
         self._chunk_seq[terminal_id] = chunk_seq
         return chunk_seq
+
+    def _epoch_locked(self, terminal_id: str) -> str:
+        return self._observation_epoch.setdefault(terminal_id, str(uuid.uuid4()))
+
+    def _new_epoch_locked(self, terminal_id: str) -> None:
+        self._observation_epoch[terminal_id] = str(uuid.uuid4())
+        self._observation_seq[terminal_id] = 0
+        self._last_non_ready_seq.pop(terminal_id, None)
+        self._last_ready_seq.pop(terminal_id, None)
+
+    def _observe_locked(self, terminal_id: str, status: TerminalStatus) -> int:
+        self._epoch_locked(terminal_id)
+        seq = self._observation_seq.get(terminal_id, 0) + 1
+        self._observation_seq[terminal_id] = seq
+        if status == TerminalStatus.PROCESSING:
+            self._last_non_ready_seq[terminal_id] = seq
+        elif status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}:
+            self._last_ready_seq[terminal_id] = seq
+        return seq
 
     async def run(self) -> None:
         """Subscribe to output events and detect status changes.
@@ -218,6 +254,7 @@ class StatusMonitor:
             ):
                 return
             last = self._last_status.get(terminal_id)
+            self._observe_locked(terminal_id, detected)
 
             # UNKNOWN is "no signal", not a state: never let it overwrite a known
             # status. Mid-turn the screen can momentarily show neither a spinner
@@ -729,6 +766,33 @@ class StatusMonitor:
         with self._lock:
             return self._status_gen.get(terminal_id, 0)
 
+    def get_boundary_observation(self, terminal_id: str) -> BoundaryObservation:
+        """Return one status/cycle snapshot sampled under the monitor lock."""
+        with self._lock:
+            status = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            return BoundaryObservation(
+                observation_epoch=self._epoch_locked(terminal_id),
+                status=status,
+                status_gen=self._status_gen.get(terminal_id, 0),
+                input_gen=self._input_gen.get(terminal_id, 0),
+                seq=self._observation_seq.get(terminal_id, 0),
+                last_non_ready_seq=self._last_non_ready_seq.get(terminal_id),
+                last_ready_seq=self._last_ready_seq.get(terminal_id),
+            )
+
+    def mark_injection_completed(self, terminal_id: str) -> BoundaryObservation:
+        """Anchor a successful backend submit in the observation sequence."""
+        with self._lock:
+            status = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            seq = self._observe_locked(terminal_id, status)
+            return BoundaryObservation(
+                observation_epoch=self._epoch_locked(terminal_id), status=status,
+                status_gen=self._status_gen.get(terminal_id, 0),
+                input_gen=self._input_gen.get(terminal_id, 0), seq=seq,
+                last_non_ready_seq=self._last_non_ready_seq.get(terminal_id),
+                last_ready_seq=self._last_ready_seq.get(terminal_id),
+            )
+
     def clear_rolling_buffer(self, terminal_id: str) -> None:
         """Clear ONLY the rolling byte buffer for a terminal — preserves
         ``_last_status`` and ``_allow_processing_revert``.
@@ -764,6 +828,7 @@ class StatusMonitor:
             self._input_gen.pop(terminal_id, None)
             self._processing_gen.pop(terminal_id, None)
             self._status_gen.pop(terminal_id, None)
+            self._new_epoch_locked(terminal_id)
             self._fifo_frame_seq.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
             self._screen_size_deferred_warned.discard(terminal_id)
@@ -788,6 +853,7 @@ class StatusMonitor:
             self._input_gen.pop(terminal_id, None)
             self._processing_gen.pop(terminal_id, None)
             self._status_gen.pop(terminal_id, None)
+            self._new_epoch_locked(terminal_id)
             # Drop the rendered screen too so the relaunched CLI mode is
             # detected against a fresh viewport, not the failed attempt's.
             self._screens.pop(terminal_id, None)

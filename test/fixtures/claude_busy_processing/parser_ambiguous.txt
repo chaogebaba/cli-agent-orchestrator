@@ -1,0 +1,5 @@
+Working... (esc to interrupt)
+  Processing a long-running tool call
+  ────────────────────────────────────────────────────────────
+  ❯ partial composer with no lower rail
+  status bar redraw interrupted the capture

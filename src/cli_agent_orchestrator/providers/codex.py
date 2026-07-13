@@ -375,7 +375,8 @@ class CodexProvider(BaseProvider):
         argv.append("Reply exactly: SEED_OK then stop.")
         try:
             completed = subprocess.run(
-                argv, capture_output=True, text=True, timeout=90, check=False,
+                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=90, check=False,
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("seed_timeout") from exc
@@ -383,13 +384,13 @@ class CodexProvider(BaseProvider):
             raise RuntimeError("seed_exec_failed") from exc
         if completed.returncode != 0:
             raise RuntimeError("seed_exec_failed")
-        matches = re.findall(
+        matches = set(re.findall(
             r"(?im)^\s*session id:\s*([0-9a-f]{8}-[0-9a-f-]{27,})\s*$",
-            completed.stdout,
-        )
+            completed.stdout or "",
+        ))
         if len(matches) != 1:
             raise RuntimeError("seed_uuid_unparseable")
-        session_uuid = matches[0]
+        session_uuid = next(iter(matches))
         validator = cls("seed", "seed", "seed", agent_profile)
         try:
             validator.validate_session_artifact(session_uuid, cwd)

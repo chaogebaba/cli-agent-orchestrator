@@ -1359,7 +1359,8 @@ def send_prepared_input(terminal_id: str, message: str, *, defer_on_dialog: bool
                         registry: PluginRegistry | None = None,
                         sender_id: str | None = None,
                         orchestration_type: OrchestrationType | None = None,
-                        original_message: str | None = None) -> bool:
+                        original_message: str | None = None,
+                        on_submitted=None):
     """Send already-shaped bytes; never apply contract or memory shaping again."""
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:
@@ -1380,6 +1381,9 @@ def send_prepared_input(terminal_id: str, message: str, *, defer_on_dialog: bool
     backend.send_keys(metadata["tmux_session"], metadata["tmux_window"], message,
                       enter_count=enter_count, force_bracketed_paste=True,
                       submit_delay=provider.paste_submit_delay if provider else 0.3)
+    injection_observation = status_monitor.mark_injection_completed(terminal_id)
+    if on_submitted is not None:
+        on_submitted(injection_observation)
     if preserved is not None:
         preserved.restore(backend)
     if provider:
@@ -1394,7 +1398,7 @@ def send_prepared_input(terminal_id: str, message: str, *, defer_on_dialog: bool
                 orchestration_type=orchestration_type,
             ),
         )
-    return True
+    return injection_observation
 
 
 def send_special_key(terminal_id: str, key: str) -> bool:

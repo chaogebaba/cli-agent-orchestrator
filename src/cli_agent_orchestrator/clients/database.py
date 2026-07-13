@@ -4,7 +4,10 @@ import logging
 import os
 import json
 import uuid
+import hashlib
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, cast
 
 from sqlalchemy import (
@@ -1392,9 +1395,40 @@ def create_inbox_message(
         )
 
 
-def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]:
+def get_pending_messages(
+    receiver_id: str, limit: int = 1, excluded_message_ids: set[int] | None = None,
+) -> List[InboxMessage]:
     """Get pending messages ordered by created_at ASC (oldest first)."""
-    return get_inbox_messages(receiver_id, limit=limit, status=MessageStatus.PENDING)
+    excluded = set(excluded_message_ids or ())
+    with SessionLocal() as db:
+        query = db.query(InboxModel).filter(
+            InboxModel.receiver_id == receiver_id,
+            InboxModel.status == MessageStatus.PENDING.value,
+        )
+        if excluded:
+            query = query.filter(~InboxModel.id.in_(excluded))
+        rows = query.order_by(InboxModel.created_at.asc(), InboxModel.id.asc()).limit(limit).all()
+        return [InboxMessage(
+            id=row.id, sender_id=row.sender_id, receiver_id=row.receiver_id,
+            message=row.message, orchestration_type=OrchestrationType(row.orchestration_type),
+            status=MessageStatus(row.status), created_at=row.created_at,
+        ) for row in rows]
+
+
+def get_pending_messages_by_ids(receiver_id: str, message_ids: list[int]) -> List[InboxMessage]:
+    ids = sorted(set(message_ids))
+    if not ids:
+        return []
+    with SessionLocal() as db:
+        rows = db.query(InboxModel).filter(
+            InboxModel.receiver_id == receiver_id, InboxModel.id.in_(ids),
+            InboxModel.status == MessageStatus.PENDING.value,
+        ).order_by(InboxModel.created_at, InboxModel.id).all()
+        return [InboxMessage(
+            id=row.id, sender_id=row.sender_id, receiver_id=row.receiver_id,
+            message=row.message, orchestration_type=OrchestrationType(row.orchestration_type),
+            status=MessageStatus(row.status), created_at=row.created_at,
+        ) for row in rows]
 
 
 def get_inbox_messages(
@@ -1502,7 +1536,239 @@ WPM1_EVIDENCE_KEYS = frozenset({
     "boundary_authorized", "boundary_exhausted_at", "idle_observed_at",
     "last_activity_at", "last_observed_status", "last_observed_ref",
     "stalled_notified_at", "terminal_settled_at",
+    "injection_completed_seq", "crash_recovery", "boundary_snapshot",
+    "queue_corroboration", "busy_initial_submit",
 })
+
+WPM2_CURSOR_VERSION = 1
+
+
+@dataclass(frozen=True)
+class AdmissionProof:
+    kind: str
+    candidate_ids: tuple[int, ...]
+    fingerprint: str
+    prior_attempt_uuid: str | None = None
+    transcript_checks: tuple[
+        tuple[str, object, tuple[tuple[str, Any], ...], tuple[tuple[str, Any], ...]], ...
+    ] = ()
+
+
+@dataclass(frozen=True)
+class AttemptOpenResult:
+    kind: str
+    attempt_uuid: str | None = None
+
+    @classmethod
+    def opened(cls, attempt_uuid: str) -> "AttemptOpenResult":
+        return cls("opened", attempt_uuid)
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _attempt_history_in_db(db, message_ids: list[int]) -> list[dict[str, Any]]:
+    rows = (db.query(InboxDeliveryAttemptModel).join(
+        InboxDeliveryAttemptMemberModel,
+        InboxDeliveryAttemptMemberModel.attempt_uuid == InboxDeliveryAttemptModel.attempt_uuid,
+    ).filter(InboxDeliveryAttemptMemberModel.message_id.in_(message_ids))
+      .order_by(InboxDeliveryAttemptModel.started_at, InboxDeliveryAttemptModel.attempt_uuid).distinct().all())
+    result = []
+    for row in rows:
+        members = sorted(x.message_id for x in db.query(InboxDeliveryAttemptMemberModel)
+                         .filter_by(attempt_uuid=row.attempt_uuid).all())
+        result.append({
+            "attempt_uuid": row.attempt_uuid, "members": members, "outcome": row.outcome,
+            "reason": row.reason, "payload_hash": row.payload_hash,
+            "prior_attempt_uuid": row.prior_attempt_uuid,
+            "receiver_terminal_id": row.receiver_terminal_id,
+            "started_at": row.started_at,
+            "evidence_hash": hashlib.sha256((row.evidence or "{}").encode()).hexdigest(),
+        })
+    return result
+
+
+def _history_fingerprint(history: list[dict[str, Any]]) -> str:
+    return hashlib.sha256(_canonical_json(history).encode()).hexdigest()
+
+
+def list_overlapping_attempts(message_ids: list[int]) -> list[dict[str, Any]]:
+    with SessionLocal() as db:
+        return _attempt_history_in_db(db, sorted(set(message_ids)))
+
+
+def make_admission_proof(
+    kind: str, message_ids: list[int], prior_attempt_uuid: str | None = None,
+) -> AdmissionProof:
+    ids = sorted(set(message_ids))
+    history = list_overlapping_attempts(ids)
+    checks = []
+    for row in list_message_attempts(ids):
+        if kind == "corrective" and row["attempt_uuid"] != prior_attempt_uuid:
+            continue
+        try:
+            evidence = json.loads(row.get("evidence") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            evidence = {}
+        cursor = _valid_cursor(evidence.get("last_observed_ref"))
+        if cursor is not None and row.get("outcome") not in {None, "confirmed", "failed"}:
+            binding = get_current_transcript_binding(row["receiver_terminal_id"])
+            authority = {
+                "binding_id": binding.get("id") if binding else None,
+                "session_id": binding.get("session_id") if binding else None,
+                "path": cursor["path"], "inode": cursor["inode"],
+                "resolution_kind": cursor["resolution_kind"],
+            }
+            checks.append((row["payload_hash"], row.get("started_at"),
+                           tuple(sorted(cursor.items())), tuple(sorted(authority.items()))))
+    return AdmissionProof(kind, tuple(ids), _history_fingerprint(history),
+                          prior_attempt_uuid, tuple(checks))
+
+
+def _delivering_authority_in_db(db, terminal_id: str) -> list[dict[str, Any]]:
+    """Map each DELIVERING inbox row to its newest durable attempt owner."""
+    messages = db.query(InboxModel).filter(
+        InboxModel.receiver_id == terminal_id,
+        InboxModel.status == MessageStatus.DELIVERING.value,
+    ).all()
+    owners: dict[str, set[int]] = {}
+    for message in messages:
+        owner = (db.query(InboxDeliveryAttemptModel).join(
+            InboxDeliveryAttemptMemberModel,
+            InboxDeliveryAttemptMemberModel.attempt_uuid == InboxDeliveryAttemptModel.attempt_uuid,
+        ).filter(InboxDeliveryAttemptMemberModel.message_id == message.id).order_by(
+            InboxDeliveryAttemptModel.started_at.desc(),
+            InboxDeliveryAttemptModel.attempt_uuid.desc(),
+        ).first())
+        if owner is not None:
+            owners.setdefault(owner.attempt_uuid, set()).add(message.id)
+    return [{"attempt_uuid": attempt_uuid, "message_ids": sorted(message_ids)}
+            for attempt_uuid, message_ids in sorted(owners.items())]
+
+
+def list_delivering_attempts_for_terminal(terminal_id: str) -> list[dict[str, Any]]:
+    with SessionLocal() as db:
+        return _delivering_authority_in_db(db, terminal_id)
+
+
+def _admission_valid(kind: str, history: list[dict[str, Any]], prior_uuid: str | None) -> bool:
+    if kind == "s4_initial":
+        return all(row["outcome"] == "deferred" and row["reason"] in {
+            "delivery_deferred", "input_blocked"} for row in history)
+    if kind == "corrective":
+        prior = next((row for row in history if row["attempt_uuid"] == prior_uuid), None)
+        return bool(prior and prior["outcome"] == "ambiguous" and
+                    prior["reason"] == "confirmation_timeout" and
+                    not any(row["prior_attempt_uuid"] == prior_uuid for row in history))
+    return True
+
+
+def begin_delivery_attempt_if_no_other_delivering(
+    messages, receiver_terminal_id: str, provider: str, payload_hash: str,
+    payload_length: int, pre_input_gen=None, pre_status_gen=None, evidence: str = "{}",
+    prior_attempt_uuid: str | None = None, admission_proof: AdmissionProof | None = None,
+) -> AttemptOpenResult:
+    ids = sorted({int(message.id) for message in messages})
+    proof = admission_proof or make_admission_proof(
+        "corrective" if prior_attempt_uuid else "ordinary", ids, prior_attempt_uuid)
+    if tuple(ids) != proof.candidate_ids:
+        return AttemptOpenResult("stale_candidate")
+    attempt_uuid = str(uuid.uuid4())
+
+    def operation(db) -> str:
+        open_rows = _delivering_authority_in_db(db, receiver_terminal_id)
+        if open_rows:
+            db.rollback()
+            return "delivering_conflict"
+        history = _attempt_history_in_db(db, ids)
+        if (_history_fingerprint(history) != proof.fingerprint or
+                not _admission_valid(proof.kind, history, proof.prior_attempt_uuid)):
+            db.rollback()
+            return "stale_admission"
+        if proof.transcript_checks:
+            from cli_agent_orchestrator.services.message_trace_service import (
+                bounded_transcript_suffix_lookup,
+            )
+            grouped: dict[tuple[tuple[str, Any], ...], list[tuple[str, object]]] = {}
+            authority_by_cursor = {}
+            for payload, started_at, cursor_items, authority_items in proof.transcript_checks:
+                grouped.setdefault(cursor_items, []).append((payload, started_at))
+                authority_by_cursor[cursor_items] = dict(authority_items)
+            for cursor_items, payloads in grouped.items():
+                authority = authority_by_cursor[cursor_items]
+                cursor = dict(cursor_items)
+                binding = (db.query(TranscriptBindingModel).filter_by(
+                    terminal_id=receiver_terminal_id).order_by(
+                        TranscriptBindingModel.received_at.desc(),
+                        TranscriptBindingModel.id.desc()).first())
+                if authority["binding_id"] is None and binding is None:
+                    current_authority = dict(authority)
+                else:
+                    live_path = Path(binding.transcript_path) if binding else Path(cursor["path"])
+                    try:
+                        live_inode = live_path.stat().st_ino
+                    except OSError:
+                        db.rollback()
+                        return "stale_admission"
+                    current_authority = {
+                        "binding_id": binding.id if binding else None,
+                        "session_id": binding.session_id if binding else None,
+                        "path": str(live_path), "inode": live_inode,
+                        "resolution_kind": "binding" if binding else cursor["resolution_kind"],
+                    }
+                if current_authority != authority:
+                    db.rollback()
+                    return "stale_admission"
+                outcome, _ = bounded_transcript_suffix_lookup(cursor, payloads)
+                if outcome != "absent":
+                    db.rollback()
+                    return "stale_admission"
+        candidates = db.query(InboxModel).filter(
+            InboxModel.id.in_(ids), InboxModel.receiver_id == receiver_terminal_id,
+            InboxModel.status == MessageStatus.PENDING.value,
+        ).all()
+        if sorted(row.id for row in candidates) != ids:
+            db.rollback()
+            return "stale_candidate"
+        changed = db.query(InboxModel).filter(
+            InboxModel.id.in_(ids), InboxModel.receiver_id == receiver_terminal_id,
+            InboxModel.status == MessageStatus.PENDING.value,
+        ).update({InboxModel.status: MessageStatus.DELIVERING.value}, synchronize_session=False)
+        if changed != len(ids):
+            db.rollback()
+            return "stale_candidate"
+        first = sorted(messages, key=lambda item: item.id)[0]
+        row = InboxDeliveryAttemptModel(
+            attempt_uuid=attempt_uuid, receiver_terminal_id=receiver_terminal_id,
+            provider=provider, payload_hash=payload_hash, payload_length=payload_length,
+            pre_input_gen=pre_input_gen, pre_status_gen=pre_status_gen,
+            prior_attempt_uuid=prior_attempt_uuid,
+            sender_id=first.sender_id, orchestration_type=first.orchestration_type.value,
+            evidence=evidence if _is_wpm1_evidence(evidence) else evidence[:2048],
+        )
+        db.add(row)
+        for position, message_id in enumerate(ids):
+            db.add(InboxDeliveryAttemptMemberModel(
+                attempt_uuid=attempt_uuid, message_id=message_id, position=position))
+        db.flush()
+        terminal_open = _delivering_authority_in_db(db, receiver_terminal_id)
+        if {row["attempt_uuid"] for row in terminal_open} != {attempt_uuid}:
+            db.rollback()
+            return "delivering_conflict"
+        self_members = sorted(x.message_id for x in db.query(InboxDeliveryAttemptMemberModel)
+                              .filter_by(attempt_uuid=attempt_uuid).all())
+        if self_members != ids:
+            db.rollback()
+            return "stale_candidate"
+        return "opened"
+
+    result = _run_wpm1_immediate(operation)
+    if result == "opened":
+        return AttemptOpenResult.opened(attempt_uuid)
+    if result == "busy_aborted":
+        return AttemptOpenResult("busy_aborted")
+    return AttemptOpenResult(result)
 
 
 def _is_wpm1_evidence(value: str | None) -> bool:
@@ -1511,6 +1777,34 @@ def _is_wpm1_evidence(value: str | None) -> bool:
     except (TypeError, json.JSONDecodeError):
         return False
     return isinstance(parsed, dict) and bool(WPM1_EVIDENCE_KEYS.intersection(parsed))
+
+
+def _valid_cursor(value: Any, *, versioned: bool = True) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    if versioned and (type(value.get("cursor_version")) is not int or
+                      value.get("cursor_version") != WPM2_CURSOR_VERSION):
+        return None
+    required = ("path", "inode", "size", "resolution_kind")
+    if (not all(key in value for key in required) or not isinstance(value["path"], str)
+            or not value["path"] or type(value["size"]) is not int or value["size"] < 0
+            or not isinstance(value["resolution_kind"], str)
+            or (value["inode"] is not None and type(value["inode"]) is not int)):
+        return None
+    return {key: value[key] for key in required} | ({"cursor_version": 1} if versioned else {})
+
+
+def _initialize_wpm2_cursor(evidence: dict[str, Any]) -> dict[str, Any]:
+    nested = _valid_cursor(evidence.get("last_observed_ref"))
+    if nested is not None:
+        evidence["last_observed_ref"] = nested
+        return evidence
+    if "last_observed_ref" in evidence:
+        return evidence
+    legacy = _valid_cursor(evidence, versioned=False)
+    if legacy is not None:
+        evidence["last_observed_ref"] = {**legacy, "cursor_version": 1}
+    return evidence
 
 
 def begin_delivery_attempt(messages, receiver_terminal_id: str, provider: str, payload_hash: str,
@@ -1586,10 +1880,13 @@ def settle_delivery_attempt(attempt_uuid: str, status: MessageStatus, outcome: s
                     {InboxModel.status: status.value}, synchronize_session=False)
                 return True
         row.outcome, row.reason, row.error = outcome, reason, error
-        row.evidence = evidence if (
+        evidence_value = evidence
+        if row.provider == "claude_code" and outcome not in {"confirmed", "failed"}:
+            evidence_value = _canonical_json(_initialize_wpm2_cursor(_evidence_object(evidence)))
+        row.evidence = evidence_value if (
             outcome == "ambiguous" and reason == "confirmation_timeout"
-            and _is_wpm1_evidence(evidence)
-        ) else evidence[:2048]
+            and _is_wpm1_evidence(evidence_value)
+        ) else evidence_value[:2048]
         row.settled_at = row.last_at = _utcnow()
         row.settled_status_gen = settled_status_gen
         ids = [x.message_id for x in db.query(InboxDeliveryAttemptMemberModel)
@@ -1603,6 +1900,45 @@ def settle_delivery_attempt(attempt_uuid: str, status: MessageStatus, outcome: s
         if status == MessageStatus.DELIVERED and on_confirmed is not None:
             on_confirmed()
         return True
+
+
+def settle_delivery_attempt_proof_safe(
+    attempt_uuid: str, evidence: dict[str, Any], settled_status_gen=None,
+) -> str:
+    """Compensating post-submit settlement; never leaks into generic failure."""
+    def operation(db) -> str:
+        row = db.query(InboxDeliveryAttemptModel).filter_by(
+            attempt_uuid=attempt_uuid, settled_at=None).one_or_none()
+        if row is None:
+            return "stale"
+        members = db.query(InboxDeliveryAttemptMemberModel).filter_by(
+            attempt_uuid=attempt_uuid).all()
+        ids = [member.message_id for member in members]
+        delivering = db.query(InboxModel).filter(
+            InboxModel.id.in_(ids), InboxModel.status == MessageStatus.DELIVERING.value,
+        ).count()
+        if delivering != len(ids):
+            return "stale"
+        row.outcome = "ambiguous"
+        row.reason = "confirmation_timeout"
+        safe_evidence = dict(evidence)
+        if row.provider == "claude_code":
+            safe_evidence = _initialize_wpm2_cursor(safe_evidence)
+        row.evidence = _canonical_json(safe_evidence)
+        row.settled_at = row.last_at = _utcnow()
+        row.settled_status_gen = settled_status_gen
+        changed = db.query(InboxModel).filter(
+            InboxModel.id.in_(ids), InboxModel.status == MessageStatus.DELIVERING.value,
+        ).update({InboxModel.status: MessageStatus.PENDING.value}, synchronize_session=False)
+        if changed != len(ids):
+            raise RuntimeError("proof-safe settlement compare-and-set lost")
+        return "settled"
+    try:
+        result = _run_wpm1_immediate(operation)
+    except Exception:
+        logger.exception("WPM2 proof-safe settlement failed for %s", attempt_uuid)
+        return "settlement_pending_recovery"
+    return result if result != "busy_aborted" else "settlement_pending_recovery"
 
 
 def confirm_batch_from_prior_attempt(
@@ -1715,12 +2051,66 @@ def _run_wpm1_immediate(operation: Callable[[Any], str]) -> str:
     return "busy_aborted"
 
 
+def advance_wpm2_continuity_cursor(
+    attempt_uuid: str, exact_message_ids: list[int], expected_ref: dict[str, Any],
+    observed_ref: dict[str, Any],
+) -> str:
+    expected = _valid_cursor(expected_ref) or _valid_cursor(expected_ref, versioned=False)
+    observed = _valid_cursor(observed_ref) or _valid_cursor(observed_ref, versioned=False)
+    if expected is None or observed is None:
+        return "stale"
+    identity = ("path", "inode", "resolution_kind")
+    if (any(expected[key] != observed[key] for key in identity) or
+            observed["size"] < expected["size"]):
+        return "stale"
+    ids = sorted(set(exact_message_ids))
+
+    def operation(db) -> str:
+        row = db.query(InboxDeliveryAttemptModel).filter_by(
+            attempt_uuid=attempt_uuid).one_or_none()
+        if row is None or row.settled_at is None or row.outcome not in {
+            "ambiguous", "interrupted", "deferred"}:
+            return "stale"
+        if row.outcome == "deferred" and row.reason not in {"delivery_deferred", "input_blocked"}:
+            return "stale"
+        members = sorted(x.message_id for x in db.query(InboxDeliveryAttemptMemberModel)
+                         .filter_by(attempt_uuid=attempt_uuid).all())
+        pending = db.query(InboxModel).filter(
+            InboxModel.id.in_(ids), InboxModel.status == MessageStatus.PENDING.value).count()
+        if members != ids or pending != len(ids):
+            return "stale"
+        evidence = _evidence_object(row.evidence)
+        stored_raw = evidence.get("last_observed_ref")
+        stored = _valid_cursor(stored_raw)
+        upgrade = stored is None and isinstance(stored_raw, dict) and "cursor_version" not in stored_raw
+        if stored is not None:
+            if any(stored[key] != expected[key] for key in identity):
+                return "stale"
+            if stored["size"] > expected["size"]:
+                if stored["size"] >= observed["size"]:
+                    return "already_advanced"
+            if stored["size"] < expected["size"]:
+                return "stale"
+        elif not upgrade and stored_raw is not None:
+            return "stale"
+        evidence["last_observed_ref"] = {
+            **{key: observed[key] for key in identity}, "size": observed["size"],
+            "cursor_version": WPM2_CURSOR_VERSION,
+        }
+        row.evidence = _canonical_json(evidence)
+        return "advanced"
+
+    return _run_wpm1_immediate(operation)
+
+
 def merge_wpm1_attempt_evidence(
     attempt_uuid: str, message_ids: list[int], updates: dict[str, Any]
 ) -> bool | str:
     """Conditionally merge WPM1 evidence; contention is a closed retry stop."""
     if not set(updates) <= WPM1_EVIDENCE_KEYS:
         raise ValueError("non-WPM1 evidence key")
+    if "boundary_exhausted_at" in updates and "boundary_snapshot" not in updates:
+        raise ValueError("boundary exhaustion requires atomic snapshot")
 
     def operation(db) -> str:
         row = db.query(InboxDeliveryAttemptModel).filter_by(
@@ -1817,6 +2207,7 @@ def record_wpm1_stalled_notice(
 def settle_wpm1_terminal_batch(
     message_ids: list[int], status: MessageStatus, receiver_terminal_id: str,
     *, reason: str | None = None, on_confirmed: Callable[[], None] | None = None,
+    confirmation_evidence: tuple[str, dict[str, Any]] | None = None,
 ) -> str:
     """Merge the terminal clock before the exact-batch CAS, with corrective notice."""
     ids = sorted(set(message_ids))
@@ -1847,6 +2238,17 @@ def settle_wpm1_terminal_batch(
         evidence = _evidence_object(target.evidence)
         evidence["terminal_settled_at"] = clock
         target.evidence = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+        if confirmation_evidence is not None:
+            hit_uuid, hit_evidence = confirmation_evidence
+            hit_target = next((row for row in attempts if row.attempt_uuid == hit_uuid), None)
+            if hit_target is None:
+                db.rollback()
+                return "stale"
+            hit_value = _evidence_object(hit_target.evidence)
+            hit_value.update(hit_evidence)
+            if hit_target is target:
+                hit_value["terminal_settled_at"] = clock
+            hit_target.evidence = _canonical_json(hit_value)
         if reason == "receiver_gone":
             target.reason = reason
         changed = db.query(InboxModel).filter(
@@ -1923,6 +2325,51 @@ def list_stale_delivering_messages() -> List[InboxMessage]:
         return [InboxMessage(id=x.id, sender_id=x.sender_id, receiver_id=x.receiver_id,
                 message=x.message, orchestration_type=OrchestrationType(x.orchestration_type),
                 status=MessageStatus(x.status), created_at=x.created_at) for x in rows]
+
+
+def list_stale_open_claude_attempts(age_seconds: int) -> list[dict[str, Any]]:
+    bound = _utcnow() - timedelta(seconds=age_seconds)
+    with SessionLocal() as db:
+        rows = db.query(InboxDeliveryAttemptModel).filter(
+            InboxDeliveryAttemptModel.provider == "claude_code",
+            InboxDeliveryAttemptModel.settled_at.is_(None),
+            InboxDeliveryAttemptModel.started_at <= bound,
+        ).order_by(InboxDeliveryAttemptModel.started_at).all()
+        return [{c.name: getattr(row, c.name) for c in row.__table__.columns} | {
+            "message_ids": sorted(x.message_id for x in db.query(
+                InboxDeliveryAttemptMemberModel).filter_by(
+                    attempt_uuid=row.attempt_uuid).all())
+        } for row in rows]
+
+
+def recover_wpm2_stale_attempt(
+    attempt_uuid: str, exact_message_ids: list[int], status: MessageStatus,
+    outcome: str, reason: str, evidence: dict[str, Any],
+) -> str:
+    ids = sorted(set(exact_message_ids))
+
+    def operation(db) -> str:
+        row = db.query(InboxDeliveryAttemptModel).filter_by(
+            attempt_uuid=attempt_uuid, settled_at=None, provider="claude_code").one_or_none()
+        if row is None:
+            return "stale"
+        members = sorted(x.message_id for x in db.query(InboxDeliveryAttemptMemberModel)
+                         .filter_by(attempt_uuid=attempt_uuid).all())
+        delivering = db.query(InboxModel).filter(
+            InboxModel.id.in_(ids), InboxModel.status == MessageStatus.DELIVERING.value).count()
+        if members != ids or delivering != len(ids):
+            return "stale"
+        row.outcome, row.reason = outcome, reason
+        row.evidence = _canonical_json(_initialize_wpm2_cursor(dict(evidence)))
+        row.settled_at = row.last_at = _utcnow()
+        changed = db.query(InboxModel).filter(
+            InboxModel.id.in_(ids), InboxModel.status == MessageStatus.DELIVERING.value,
+        ).update({InboxModel.status: status.value}, synchronize_session=False)
+        if changed != len(ids):
+            raise RuntimeError("stale recovery compare-and-set lost")
+        return "settled"
+
+    return _run_wpm1_immediate(operation)
 
 
 # Flow database functions

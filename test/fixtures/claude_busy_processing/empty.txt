@@ -1,0 +1,5 @@
+Working... (esc to interrupt)
+  Processing a long-running tool call
+  ────────────────────────────────────────────────────────────
+  ❯ [2mType a message while Claude is working[0m
+  ────────────────────────────────────────────────────────────

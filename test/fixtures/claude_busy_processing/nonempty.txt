@@ -1,0 +1,5 @@
+Working... (esc to interrupt)
+  Processing a long-running tool call
+  ────────────────────────────────────────────────────────────
+  ❯ human draft must stay here
+  ────────────────────────────────────────────────────────────

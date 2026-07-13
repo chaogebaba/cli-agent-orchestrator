@@ -829,6 +829,8 @@ def test_successor_restart_after_exhaustion_merge_injects_once(wpm1_db):
         as send,
         patch("cli_agent_orchestrator.services.inbox_service.confirm_delivery",
               return_value=("absent", {"resolution_kind": "binding"})),
+        patch("cli_agent_orchestrator.services.message_trace_service."
+              "bounded_transcript_suffix_lookup", return_value=("absent", {})),
     ):
         monitor.get_input_gen.return_value = 1
         monitor.get_status_gen.return_value = 1
@@ -877,7 +879,10 @@ def test_successor_restart_after_begin_commit_recovers_and_never_respawns(wpm1_d
     with wpm1_db() as db:
         attempts = db.query(InboxDeliveryAttemptModel).all()
         assert len(attempts) == 2
-        assert db.get(InboxDeliveryAttemptModel, successor).outcome == "interrupted"
+        recovered = db.get(InboxDeliveryAttemptModel, successor)
+        assert recovered.outcome == "ambiguous"
+        assert recovered.reason == "confirmation_timeout"
+        assert json.loads(recovered.evidence)["crash_recovery"]
 
 
 def test_successor_restart_after_paste_return_recovers_and_never_respawns(wpm1_db):
@@ -901,6 +906,8 @@ def test_successor_restart_after_paste_return_recovers_and_never_respawns(wpm1_d
               return_value="prepared"),
         patch("cli_agent_orchestrator.services.inbox_service.terminal_service.send_prepared_input",
               pasted),
+        patch("cli_agent_orchestrator.services.message_trace_service."
+              "bounded_transcript_suffix_lookup", return_value=("absent", {})),
     ):
         monitor.get_input_gen.return_value = 1
         monitor.get_status_gen.return_value = 1
@@ -930,7 +937,9 @@ def test_successor_restart_after_paste_return_recovers_and_never_respawns(wpm1_d
         attempts = db.query(InboxDeliveryAttemptModel).all()
         assert len(attempts) == 2
         successor = next(row for row in attempts if row.attempt_uuid != exhausted)
-        assert successor.outcome == "interrupted"
+        assert successor.outcome == "ambiguous"
+        assert successor.reason == "confirmation_timeout"
+        assert json.loads(successor.evidence)["crash_recovery"]
         assert successor.prior_attempt_uuid == exhausted
 
 

@@ -40,6 +40,8 @@ class TranscriptResolution:
     inode: int | None = None
     stale_note: str | None = None
     live_reference: TranscriptLiveReference | None = None
+    binding_id: int | None = None
+    binding_session_id: str | None = None
 
     def __eq__(self, other) -> bool:
         if isinstance(other, TranscriptResolution):
@@ -149,6 +151,9 @@ def resolve_session_transcript(metadata: dict) -> TranscriptResolution | None:
                 "binding",
                 inode=(live_reference.inode if deferred_inode else int(binding["inode"])),
                 live_reference=live_reference,
+                binding_id=(int(binding["id"]) if binding.get("id") is not None else None),
+                binding_session_id=(str(binding["session_id"])
+                                    if binding.get("session_id") is not None else None),
             )
         stale_note = f"binding_stale:{stale_reason}"
         if stale_reason in {"inert", "unreadable"}:
@@ -167,6 +172,10 @@ def resolve_session_transcript(metadata: dict) -> TranscriptResolution | None:
                 return TranscriptResolution(
                     binding_path, "binding", inode=reference.inode,
                     stale_note=stale_note, live_reference=reference,
+                    binding_id=(int(binding["id"])
+                                if binding.get("id") is not None else None),
+                    binding_session_id=(str(binding["session_id"])
+                                        if binding.get("session_id") is not None else None),
                 )
             return None
         if screen_fallback and (
@@ -332,6 +341,24 @@ def _queued_command_prompt(record: dict) -> str | None:
     return prompt if isinstance(prompt, str) else None
 
 
+def _queue_operation(record: dict, payload_hash: str) -> dict | None:
+    if record.get("type") != "queue-operation" or record.get("operation") not in {
+        "enqueue", "popAll", "remove"}:
+        return None
+    content = record.get("content")
+    if not isinstance(content, str) or wire_hash(content) != payload_hash:
+        return None
+    stamp = record.get("timestamp") or record.get("created_at")
+    if isinstance(stamp, str):
+        try:
+            datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        except ValueError:
+            stamp = None
+    else:
+        stamp = None
+    return {"op": record["operation"], "observed_at": stamp}
+
+
 def transcript_lookup(path: Path, payload_hash: str, started_at=None,
                       expected_ref: dict | None = None,
                       scan_from_start: bool = False) -> tuple[str, dict]:
@@ -360,13 +387,15 @@ def transcript_lookup(path: Path, payload_hash: str, started_at=None,
             threshold = threshold.replace(tzinfo=timezone.utc)
         byte_offset = baseline_size
         queued_command_evidence = None
+        queue_corroboration = None
         for line in raw.splitlines(keepends=True):
             line_offset = byte_offset
             byte_offset += len(line.encode("utf-8"))
             obj = json.loads(line)
             candidates = _native_user_turn_texts(obj)
             queued_prompt = _queued_command_prompt(obj)
-            if not candidates and queued_prompt is None:
+            queue_op = _queue_operation(obj, payload_hash)
+            if not candidates and queued_prompt is None and queue_op is None:
                 continue
             stamp = obj.get("timestamp") or obj.get("created_at")
             if threshold is not None and isinstance(stamp, str):
@@ -399,12 +428,138 @@ def transcript_lookup(path: Path, payload_hash: str, started_at=None,
                     "inode": after.st_ino,
                     "size": after.st_size,
                 }
+            if queue_op is not None:
+                queue_corroboration = {**queue_op, "offset": line_offset}
     except (UnicodeDecodeError, json.JSONDecodeError):
         return "unresolved", {"kind": "transcript_malformed", "path": str(path)}
     if queued_command_evidence is not None:
+        if queue_corroboration is not None:
+            queued_command_evidence["queue_corroboration"] = queue_corroboration
         return "hit", queued_command_evidence
+    absent = {"kind": "transcript_absent", "path": str(path),
+              "inode": after.st_ino, "size": after.st_size}
+    if queue_corroboration is not None:
+        absent["queue_corroboration"] = queue_corroboration
+    return "absent", absent
+
+
+def wpm2_cursor_baseline(evidence: dict) -> tuple[str, dict | None]:
+    """Resolve WPM2's nested versioned cursor or a closed legacy refresh origin."""
+    nested_present = "last_observed_ref" in evidence
+    nested = evidence.get("last_observed_ref")
+
+    def valid(value, version=None):
+        if not isinstance(value, dict):
+            return None
+        if version is not None and (type(value.get("cursor_version")) is not int or
+                                    value.get("cursor_version") != version):
+            return None
+        if (not isinstance(value.get("path"), str) or not value.get("path") or
+                type(value.get("size")) is not int or value["size"] < 0 or
+                not isinstance(value.get("resolution_kind"), str) or
+                (value.get("inode") is not None and type(value.get("inode")) is not int)):
+            return None
+        result = {key: value.get(key) for key in ("path", "inode", "size", "resolution_kind")}
+        if version is not None:
+            result["cursor_version"] = version
+        return result
+
+    if isinstance(nested, dict) and "cursor_version" in nested:
+        parsed = valid(nested, 1)
+        return ("versioned", parsed) if parsed is not None else ("unresolved", None)
+    top = valid(evidence)
+    if nested_present:
+        unversioned = valid(nested)
+        if unversioned is None:
+            return "unresolved", None
+        identity = ("path", "inode", "resolution_kind")
+        if top is not None:
+            if any(top[key] != unversioned[key] for key in identity):
+                return "unresolved", None
+            unversioned["size"] = min(top["size"], unversioned["size"])
+        else:
+            unversioned["size"] = 0
+        return "migration", unversioned
+    if top is not None:
+        return "migration", top
+    return "unresolved", None
+
+
+def wpm2_continuity_lookup(
+    metadata: dict, payload_hash: str, started_at, evidence: dict,
+) -> tuple[str, dict]:
+    mode, baseline = wpm2_cursor_baseline(evidence)
+    if baseline is None:
+        return "unresolved", {"kind": "transcript_continuity_uncertain"}
+    outcome, observed = continuity_aware_lookup(
+        metadata, payload_hash, started_at, baseline)
+    if outcome in {"hit", "absent"} and all(key in observed for key in (
+            "path", "inode", "size", "resolution_kind")):
+        observed["last_observed_ref"] = {
+            key: observed[key] for key in ("path", "inode", "size", "resolution_kind")
+        } | {"cursor_version": 1}
+        observed["cursor_mode"] = mode
+    return outcome, observed
+
+
+MAX_IN_TXN_TRANSCRIPT_DELTA_BYTES = 1_048_576
+
+
+def bounded_transcript_suffix_lookup(
+    expected_ref: dict, payloads: list[tuple[str, object]],
+) -> tuple[str, dict]:
+    """One non-polling, offset-bounded lookup for an admission transaction."""
+    path = Path(str(expected_ref.get("path") or ""))
+    baseline = expected_ref.get("size")
+    if type(baseline) is not int or baseline < 0:
+        return "unresolved", {"kind": "transcript_continuity_uncertain"}
+    try:
+        with path.open("rb") as stream:
+            stat = os.fstat(stream.fileno())
+            if (expected_ref.get("inode") not in (None, stat.st_ino) or
+                    stat.st_size < baseline):
+                return "unresolved", {"kind": "transcript_continuity_uncertain"}
+            delta = stat.st_size - baseline
+            stream.seek(baseline)
+            raw = stream.read(min(delta, MAX_IN_TXN_TRANSCRIPT_DELTA_BYTES + 1))
+        if delta > MAX_IN_TXN_TRANSCRIPT_DELTA_BYTES:
+            return "overflow", {"kind": "transcript_delta_overflow", "size": stat.st_size}
+        records = [json.loads(line) for line in raw.decode("utf-8").splitlines() if line]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return "unresolved", {"kind": "transcript_malformed"}
+    parsed_payloads = []
+    for payload_hash, started_at in payloads:
+        threshold = started_at
+        try:
+            if isinstance(threshold, str):
+                threshold = datetime.fromisoformat(threshold.replace("Z", "+00:00"))
+            if threshold is not None and threshold.tzinfo is None:
+                threshold = threshold.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return "unresolved", {"kind": "transcript_malformed_timestamp"}
+        parsed_payloads.append((payload_hash, threshold))
+    for payload_hash, threshold in parsed_payloads:
+        for record in records:
+            candidates = _native_user_turn_texts(record)
+            queued = _queued_command_prompt(record)
+            if not candidates and queued is None:
+                continue
+            stamp = record.get("timestamp") or record.get("created_at")
+            if threshold is not None and isinstance(stamp, str):
+                try:
+                    when = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                    if when.tzinfo is None:
+                        when = when.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    return "unresolved", {"kind": "transcript_malformed_timestamp"}
+                if when < threshold:
+                    continue
+            if any(wire_hash(value) == payload_hash for value in candidates) or (
+                    queued is not None and wire_hash(queued) == payload_hash):
+                return "hit", {"kind": "transcript_suffix_hit", "size": stat.st_size}
     return "absent", {"kind": "transcript_absent", "path": str(path),
-                      "inode": after.st_ino, "size": after.st_size}
+                      "inode": stat.st_ino, "size": stat.st_size,
+                      "resolution_kind": expected_ref.get("resolution_kind")}
 
 
 def continuity_aware_lookup(
