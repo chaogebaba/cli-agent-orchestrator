@@ -1,7 +1,24 @@
 # WPM2 — delivery soundness for busy receivers + alarm hygiene + seed stderr parse
 
-Status: DRAFT r21 (2026-07-13). Micro-WP, three independent slices sharing one gate
+Status: FROZEN r21 (2026-07-13). Micro-WP, three independent slices sharing one gate
 train. Builds directly on WPM1 (`8afb758`, FROZEN r9 law) and WP2S3 (`7651dc1`).
+
+FREEZE record (2026-07-13): dual zero-decision at r21 — codex empirical MAIN
+0B/0S/0N zero-decision YES FREEZE-ready (tmp/orch/codex-bpgate-wpm2-r21.md),
+grok design double-check 0B/0S/0N FREEZE-ready (grok-bpgate-wpm2-r21.md).
+Gate train r13→r21: the live inbox-1956 triple-delivery incident (user report
+2026-07-13, /compact receiver) broke the r13 YES and drove five successive
+empirical blockers, each in the immediately prior fold's new text (fold-delta
+law confirmed): r14 compact-cycle false loss → busy_initial protected class
+(r15); admission-to-submit race → either-observation rule at the submit seam
+(r16); post-submit tail exceptions reaching generic FAILED → submit-authority
+exception split (r17); settlement-transaction failure stranding DELIVERING →
+settlement_pending_recovery + recurring in-process recovery (r18); invented
+age threshold → pinned WPM2_STALE_OPEN_AGE_SECONDS=60 on attempt.started_at
+(r19); age stealing lawful 90.9s pre-submit owners → delivery-lock in-flight
+authority (r20); lock-release + one-process-per-DB scope evidence (r21).
+Live-DB probe evidence: grok-probe-wpm2-stale-age.md. No further edits except
+through a new gate round.
 
 r20→r21 changelog (folds codex r20 2S; codex r20 was BUILDABLE YES 0B/2S/0N
 zero-decision YES — first empirical YES since r13 — verifying the lock spans
