@@ -1,7 +1,27 @@
 # WPM2 — delivery soundness for busy receivers + alarm hygiene + seed stderr parse
 
-Status: DRAFT r16 (2026-07-13). Micro-WP, three independent slices sharing one gate
+Status: DRAFT r17 (2026-07-13). Micro-WP, three independent slices sharing one gate
 train. Builds directly on WPM1 (`8afb758`, FROZEN r9 law) and WP2S3 (`7651dc1`).
+
+r16→r17 changelog (folds codex r16 1B; grok r16.1 was 0/0/0; codex r16
+confirmed the stable-ready matrix total — 72 cases, 0 unclassified — and all
+r15 closures, but proved post-submit tail exceptions still reach the generic
+FAILED arm):
+- **Submit-authority exception split**: the successful-submit seam is the
+  authority boundary for claude_code exception routing. After a valid
+  anchor/snapshot exists, EVERY later exception (draft restore, provider mark,
+  last-active DB write, plugin dispatch, any tail work) settles PENDING
+  `ambiguous/confirmation_timeout` persisting the anchor + busy fact
+  atomically — the generic FAILED/interrupted/deferred arms are unreachable
+  past the submit marker. An exception from the backend submit call itself
+  with uncertain acceptance settles anchor-less ambiguous (protected), never
+  terminal FAILED; only errors proven to occur before any possible acceptance
+  (explicit backend rejection / proven-never-submitted results) retain
+  deferred/failed semantics.
+- Exception-injection fixture matrix (pre-submit, at-submit uncertain, each
+  tail stage) + mutant m16 (restore the generic FAILED arm after the submit
+  marker — must terminally fail an accepted paste, lose late-D2 repair, and
+  die).
 
 r15→r16 changelog (folds codex r15 1B; grok r15 was 0/0/0; codex r15 confirmed
 inbox-1956 itself fully closed but found the adjacent admission-to-submit race):
@@ -302,8 +322,10 @@ claude_code attempt ONLY when ALL hold:
    paste/Enter is accepted by the backend, BEFORE the provider-marking/DB/plugin
    tail work inside `send_prepared_input` (codex r3 B3: a fast receiver can
    enter PROCESSING during that tail — the anchor must precede it).
-   `send_prepared_input` returns the anchor; if paste/Enter raises, no anchor is
-   marked (existing failure handling; see the S1.f no-anchor fail-closed rule).
+   `send_prepared_input` returns the anchor; if paste/Enter raises with
+   acceptance uncertain, no anchor is marked and the attempt settles
+   anchor-less PENDING ambiguous per the S1.f submit-authority exception
+   split — never terminal FAILED.
    Persistence per S1.f (settlement-time, never pre-settlement).
    Attempt `last_at` is BANNED as the anchor: at HEAD it is timeout-settlement
    time (`settle_delivery_attempt` sets `settled_at = last_at`,
@@ -556,6 +578,25 @@ these additive keys — nothing else; unlisted keys keep raising
   lost across restart. This evidence never acts as an anchor and never
   authorizes loss/reinjection; its sole effect is the `busy_initial` protected
   classification.
+  **Submit-authority exception split (codex r16 B1)**: the successful-submit
+  seam is the authority boundary for ALL claude_code delivery exception
+  routing. (i) Once `mark_injection_completed()` has produced a valid
+  anchor/snapshot, EVERY later exception in the delivery path — draft restore,
+  provider marking, last-active DB write, plugin dispatch
+  (`terminal_service.py:1380-1396`), or any other post-submit tail work —
+  settles the attempt PENDING `ambiguous/confirmation_timeout`, persisting the
+  anchor and any `busy_initial_submit` fact atomically in that settlement; the
+  generic FAILED arm (`inbox_service.py:604-613`) and the interrupted/deferred
+  arms are UNREACHABLE after the submit marker. (ii) An exception raised by
+  the backend submit call itself, where acceptance is uncertain, settles
+  anchor-less PENDING `ambiguous/confirmation_timeout` (permanently protected
+  via `anchor_missing`) — never terminal FAILED — unless the backend supplies
+  an explicit proven-never-submitted result. (iii) Only errors proven to occur
+  BEFORE any possible acceptance (the closed proven-never-submitted deferred
+  reasons `delivery_deferred`/`input_blocked`, or an explicit backend
+  rejection) retain existing deferred/failed semantics. Exits from these
+  ambiguous settlements are the standard protected-head exits: S1.a D2 hit or
+  D1.1 receiver-gone.
 - `kind` gains the new VALUE `transcript_queued_command` (existing key; no new
   key).
 
@@ -656,7 +697,9 @@ transaction (restart must forget protection, exhaust, and die); (m15) decide
 `busy_initial_submit` from the admission observation ONLY (a
 ready→PROCESSING-before-paste receiver classifies `normal`, replays the
 shifted-observation false loss, and dies against the coordinated race
-fixture).
+fixture); (m16) restore the generic FAILED arm after the submit marker (a
+post-submit tail exception terminally fails an accepted paste, losing late-D2
+repair — must die against the submit/tail exception matrix).
 
 `advance_wpm2_continuity_cursor(attempt_uuid, exact_message_ids, expected_ref,
 observed_ref)` uses the frozen `_run_wpm1_immediate` 3×1s transaction policy and
@@ -722,7 +765,23 @@ as a residual; any future backfill is its own gated slice.
   the cycle still qualifies (anchor is injection completion, not settlement);
   loss provable on the next evaluation. Anti-test: the same events anchored on
   `last_at` would wrongly disqualify — asserts the ban.
-- **S1.f schema law**: named mutants m1–m15 all die; unlisted-key write raises.
+- **S1.f schema law**: named mutants m1–m16 all die; unlisted-key write raises.
+- **Submit/tail exception matrix (codex r16 B1)** — exception injected at each
+  pinned stage with exact status/outcome/evidence assertions:
+  `test_wpm2_pre_submit_exception_keeps_deferred_failed_semantics` (error
+  proven before any possible acceptance → existing deferred/failed arms
+  unchanged);
+  `test_wpm2_submit_exception_uncertain_acceptance_settles_anchorless_ambiguous`
+  (raise inside/at return from the backend submit call → anchor-less PENDING
+  ambiguous, `anchor_missing` protected, never FAILED; if the paste actually
+  landed, late D2 confirms DELIVERED);
+  `test_wpm2_tail_exception_after_anchor_settles_ambiguous_with_fact` — one
+  test per tail stage (draft restore, provider mark, last-active DB write,
+  plugin dispatch): attempt settles PENDING ambiguous with anchor +
+  `busy_initial_submit` persisted atomically, at most one paste, restart cut
+  preserves protection, late queued-command suffix hit settles DELIVERED with
+  chain length 1. m16 (generic FAILED restored past the submit marker) dies
+  across this matrix.
 - **Busy-initial /compact fixture (codex r14 addendum B1, live trace
   inbox-1956)** — `test_wpm2_busy_initial_compact_cycles_never_exhaust`: one S4
   paste admitted while PROCESSING (accepted into the native queue,
@@ -1008,9 +1067,13 @@ PENDING until late D2 confirmation or receiver-gone).
   is likewise NOT initial and never gains S4 eligibility.
 - Any `ambiguous/confirmation_timeout` attempt, any confirmed attempt, or any
   attempt carrying a successful-submit anchor → NOT initial; it follows S1/WPM1.
-- `failed` send/tail attempts are NOT initial because the generic exception arm
-  cannot prove the backend rejected the paste before acceptance; they retain
-  existing terminal failure handling and are never silently retried by S4.
+- `failed` attempts are NOT initial. Under the S1.f submit-authority exception
+  split, post-acceptance exceptions can no longer produce them: FAILED is
+  reachable only from errors proven to occur before any possible acceptance
+  (explicit backend rejection / the closed proven-never-submitted results);
+  uncertain-acceptance submit exceptions settle anchor-less ambiguous instead.
+  Remaining `failed` rows retain existing terminal handling and are never
+  silently retried by S4.
 - Other `interrupted` reasons retain HEAD behavior and do not gain S4 eligibility;
   only the two proven-never-submitted deferred reasons above can re-enter initial.
 - Any other overlapping attempt — including open/outcome-null, crash-recovered,
