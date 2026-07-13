@@ -28,6 +28,7 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
+from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -1074,13 +1075,16 @@ async def create_session(
             async def _spawn_sidecar() -> None:
                 try:
                     from cli_agent_orchestrator.services import terminal_service
-
+                    sidecar_context = terminal_service.seed_resume_bootstrap(
+                        "memory_manager", sidecar_provider, working_directory or os.getcwd()
+                    )
                     await terminal_service.create_terminal(
                         provider=sidecar_provider,
                         agent_profile="memory_manager",
                         session_name=sidecar_session,
                         working_directory=working_directory,
                         registry=registry,
+                        fork_context=sidecar_context,
                     )
                 except Exception as e:
                     logger.warning(f"Failed to spawn memory_manager sidecar: {e}")
@@ -1096,6 +1100,54 @@ async def create_session(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create session: {str(e)}",
         )
+
+
+@app.post("/sessions/start")
+async def start_session_endpoint(
+    request: Request, background_tasks: BackgroundTasks, agent_profile: str,
+    provider: Optional[str] = None, session_name: Optional[str] = None,
+    working_directory: Optional[str] = None, allowed_tools: Optional[str] = None,
+    memory: bool = False,
+    env_vars: Optional[Dict[str, str]] = Body(default=None, embed=True),
+    allow_incomplete_brief: bool = False,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Canonical lifecycle start endpoint."""
+    try:
+        result = await session_service.start_session(
+            provider=provider, agent_profile=agent_profile, session_name=session_name,
+            working_directory=working_directory,
+            allowed_tools=allowed_tools.split(",") if allowed_tools else None,
+            registry=get_plugin_registry(request), env_vars=env_vars,
+            allow_incomplete_brief=allow_incomplete_brief,
+        )
+    except RuntimeError as exc:
+        code = str(exc)
+        if code in {"seed_timeout", "seed_exec_failed", "seed_uuid_unparseable", "seed_artifact_invalid"}:
+            return JSONResponse(status_code=422, content={
+                "schema_version": "cao.session-start/v1", "session": None,
+                "supervisor_terminal": None,
+                "bootstrap": {"mode": "seed_resume", "status": "seed_failed", "error_code": code},
+                "manifest": None, "manifest_error": None,
+            })
+        raise
+    if memory:
+        terminal = result["supervisor_terminal"]
+        sidecar_provider = provider or DEFAULT_PROVIDER
+        async def _spawn_start_sidecar() -> None:
+            try:
+                context = terminal_service.seed_resume_bootstrap(
+                    "memory_manager", sidecar_provider, working_directory or os.getcwd()
+                )
+                await terminal_service.create_terminal(
+                    provider=sidecar_provider, agent_profile="memory_manager",
+                    session_name=terminal["session_name"], working_directory=working_directory,
+                    registry=get_plugin_registry(request), fork_context=context,
+                )
+            except Exception as exc:
+                logger.warning("Failed to spawn memory_manager sidecar: %s", exc)
+        background_tasks.add_task(_spawn_start_sidecar)
+    return result
 
 
 @app.get("/sessions")
@@ -1138,6 +1190,19 @@ async def get_session_manifest(session_name: str) -> Dict:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
 
+@app.get("/sessions/{session_name}/status")
+async def get_session_status_endpoint(session_name: str) -> Dict:
+    """Return the read-only lifecycle status/v1 projection."""
+    try:
+        validate_tmux_name(session_name, "session_name")
+        from cli_agent_orchestrator.services.session_status_service import build_session_status
+        return build_session_status(session_name)
+    except ValueError as exc:
+        if str(exc) == "session_missing":
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
 @app.post("/sessions/{session_name}/recover")
 async def recover_session(
     session_name: str,
@@ -1178,7 +1243,7 @@ async def close_session_endpoint(
     except PermissionError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     except RuntimeError as exc:
-        if str(exc) == "rebind_in_progress":
+        if str(exc) in {"rebind_in_progress", "resume_in_progress"}:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
         raise
 
@@ -1215,6 +1280,13 @@ async def delete_session(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RuntimeError as e:
+        if str(e) == "resume_in_progress":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete session: {str(e)}",
+        )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1305,6 +1377,11 @@ async def create_terminal_in_session(
                     ),
                 )
 
+        fork_context = body.fork_context if body else None
+        if fork_context is None:
+            fork_context = terminal_service.seed_resume_bootstrap(
+                agent_profile, resolved_provider, working_directory or os.getcwd()
+            )
         result = await terminal_service.create_terminal(
             provider=resolved_provider,
             agent_profile=agent_profile,
@@ -1317,7 +1394,7 @@ async def create_terminal_in_session(
             defer_init=defer_init,
             initial_message=initial_message,
             initial_message_orchestration_type=orch_type,
-            fork_context=body.fork_context if body else None,
+            fork_context=fork_context,
         )
         return result
     except HTTPException:
@@ -1945,6 +2022,13 @@ async def delete_terminal(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except RuntimeError as e:
+        if str(e) == "resume_in_progress":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete terminal: {str(e)}",
+        )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

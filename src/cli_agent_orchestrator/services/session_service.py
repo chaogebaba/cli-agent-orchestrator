@@ -20,6 +20,7 @@ Session Lifecycle:
 """
 
 import logging
+import os
 import time
 from typing import Dict, List
 
@@ -84,6 +85,10 @@ async def create_session(
     else:
         resolved_provider = provider
 
+    from cli_agent_orchestrator.services.terminal_service import seed_resume_bootstrap
+    fork_context = seed_resume_bootstrap(
+        agent_profile, resolved_provider, working_directory or os.getcwd()
+    )
     terminal = await create_terminal(
         provider=resolved_provider,
         agent_profile=agent_profile,
@@ -94,6 +99,7 @@ async def create_session(
         registry=registry,
         env_vars=env_vars,
         allow_incomplete_brief=allow_incomplete_brief,
+        fork_context=fork_context,
     )
     dispatch_plugin_event(
         registry,
@@ -104,6 +110,36 @@ async def create_session(
         ),
     )
     return terminal
+
+
+async def start_session(**kwargs) -> dict:
+    """Canonical lifecycle start over the existing create-session transaction."""
+    provider = kwargs.get("provider")
+    profile = kwargs["agent_profile"]
+    resolved = provider or resolve_provider(profile, fallback_provider="kiro_cli")
+    from cli_agent_orchestrator.providers.manager import get_provider_class
+
+    seed_mode = get_provider_class(resolved).supports_seed_resume_identity is True
+    terminal = await create_session(**kwargs)
+    manifest = None
+    manifest_error = None
+    try:
+        from cli_agent_orchestrator.services.session_manifest_service import build_session_manifest
+        manifest = build_session_manifest(terminal.session_name)
+    except Exception:
+        manifest_error = "build_failed"
+    return {
+        "schema_version": "cao.session-start/v1",
+        "session": {"name": terminal.session_name},
+        "supervisor_terminal": terminal.model_dump(mode="json"),
+        "bootstrap": {
+            "mode": "seed_resume" if seed_mode else "not_applicable",
+            "status": "seeded" if seed_mode else "not_required",
+            **({"session_uuid": terminal.provider_session_id} if seed_mode else {}),
+        },
+        "manifest": manifest,
+        "manifest_error": manifest_error,
+    }
 
 
 def list_sessions() -> List[Dict]:
@@ -129,6 +165,7 @@ def get_session(session_name: str) -> Dict:
             raise ValueError(f"Session '{session_name}' not found")
 
         terminals = list_terminals_by_session(session_name)
+
         # Enrich each terminal with its live status. list_terminals_by_session
         # reads only the DB row (no status column), but callers monitoring an
         # orchestration — the web UI, and the cao-ops-mcp get_session_info tool
@@ -157,8 +194,20 @@ def delete_session(
     """
     result: Dict = {"deleted": [], "errors": []}
     leases = []
+    lifecycle_lease = None
     try:
         from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.rebind_lease import (
+            acquire_rebind_lease,
+            release_rebind_lease,
+        )
+        from cli_agent_orchestrator.services.session_lifecycle_lease import (
+            acquire_session_lifecycle_exclusive,
+        )
+
+        lifecycle_lease = acquire_session_lifecycle_exclusive(session_name)
+        if lifecycle_lease is None:
+            raise RuntimeError("resume_in_progress")
 
         terminals = list_terminals_by_session(session_name)
 
@@ -167,11 +216,6 @@ def delete_session(
         for terminal in terminals:
             require_delete_allowed(terminal["id"], force=force)
 
-        from cli_agent_orchestrator.services.rebind_lease import (
-            acquire_rebind_lease,
-            release_rebind_lease,
-        )
-
         for terminal in sorted(terminals, key=lambda row: row["id"]):
             token = acquire_rebind_lease(terminal["id"])
             if token is None:
@@ -179,6 +223,8 @@ def delete_session(
                     release_rebind_lease(held)
                 raise RuntimeError("rebind_in_progress")
             leases.append(token)
+
+        terminal_service.preflight_session_teardown(terminals)
 
         # Clean up each terminal (snapshot, kill window, FIFO reader,
         # status buffer, provider, DB) via the event-driven teardown path.
@@ -189,6 +235,8 @@ def delete_session(
                     terminal["id"], tokens[terminal["id"]], registry=registry
                 )
             except Exception as e:
+                if str(e) == "resume_in_progress":
+                    raise
                 logger.warning(f"Failed to cleanup terminal {terminal['id']}: {e}")
 
         finalize_session(session_name, registry)
@@ -196,6 +244,12 @@ def delete_session(
         for token in reversed(leases):
             release_rebind_lease(token)
         leases.clear()
+
+        from cli_agent_orchestrator.services.session_lifecycle_lease import (
+            release_session_lifecycle_lease,
+        )
+        release_session_lifecycle_lease(lifecycle_lease)
+        lifecycle_lease = None
 
         result["deleted"].append(session_name)
         logger.info(f"Deleted session: {session_name}")
@@ -209,5 +263,10 @@ def delete_session(
                     release_rebind_lease(token)
                 except Exception:
                     pass
+        if lifecycle_lease is not None:
+            from cli_agent_orchestrator.services.session_lifecycle_lease import (
+                release_session_lifecycle_lease,
+            )
+            release_session_lifecycle_lease(lifecycle_lease)
         logger.error(f"Failed to delete session {session_name}: {e}")
         raise

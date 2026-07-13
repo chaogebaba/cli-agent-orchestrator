@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import re
 import subprocess
 from datetime import datetime
@@ -259,11 +260,14 @@ async def execute_flow(name: str) -> bool:
                     logger.warning(f"Failed to clear status buffers for {t['id']}: {e}")
             get_backend().kill_session(session_name)
             delete_terminals_by_session(session_name)
+        from cli_agent_orchestrator.services.terminal_service import seed_resume_bootstrap
+        fork_context = seed_resume_bootstrap(flow.agent_profile, flow.provider, os.getcwd())
         terminal = await create_terminal(
             session_name=session_name,
             provider=flow.provider,
             agent_profile=flow.agent_profile,
             new_session=True,
+            fork_context=fork_context,
         )
 
         # Send rendered prompt to terminal

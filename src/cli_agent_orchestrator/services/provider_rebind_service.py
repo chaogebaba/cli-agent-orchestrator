@@ -186,7 +186,7 @@ def _launch_context(metadata: dict) -> str | None:
     return prompt or None
 
 
-async def _fallback(metadata: dict, session_uuid: str) -> dict:
+async def _fallback(metadata: dict, session_uuid: str, source_lease, lifecycle_lease) -> dict:
     from cli_agent_orchestrator.services.terminal_service import create_terminal
 
     set_terminal_recovery_state(metadata["id"], "fallback_starting")
@@ -201,6 +201,9 @@ async def _fallback(metadata: dict, session_uuid: str) -> dict:
             metadata["tmux_session"], metadata["tmux_window"]),
         allowed_tools=metadata.get("allowed_tools"), caller_id=metadata.get("caller_id"),
         fork_context=context,
+        fallback_source_terminal_id=metadata["id"],
+        fallback_source_lease_token=source_lease,
+        session_lifecycle_lease_token=lifecycle_lease,
     )
     moved = settle_terminal_fallback(metadata["id"], replacement.id)
     return {"status": "respawned", "new_terminal_id": replacement.id,
@@ -210,8 +213,18 @@ async def _fallback(metadata: dict, session_uuid: str) -> dict:
 async def rebind_terminal(
     terminal_id: str, *, interrupt: bool = False, acknowledge_ownership: bool = False,
 ) -> dict:
+    initial_metadata = get_terminal_metadata(terminal_id)
+    if not initial_metadata:
+        return _result(terminal_id, "unresumable", error_code="terminal_missing", interrupt=interrupt)
+    from cli_agent_orchestrator.services.session_lifecycle_lease import (
+        acquire_session_lifecycle_shared, release_session_lifecycle_lease,
+    )
+    lifecycle_lease = acquire_session_lifecycle_shared(initial_metadata["tmux_session"])
+    if lifecycle_lease is None:
+        return _result(terminal_id, "skipped_busy", error_code="rebind_in_progress", interrupt=interrupt)
     lease = acquire_rebind_lease(terminal_id)
     if lease is None:
+        release_session_lifecycle_lease(lifecycle_lease)
         return _result(terminal_id, "skipped_busy", error_code="rebind_in_progress", interrupt=interrupt)
     guard = DeliveryGuard(terminal_id, asyncio.get_running_loop())
     watchdog_snapshot = None
@@ -376,7 +389,7 @@ async def rebind_terminal(
                         ownership_error = candidate_death
                         set_terminal_recovery_state(terminal_id, "rebind_failed", candidate_death)
                 if session_uuid and candidate_death_confirmed:
-                    fallback = await _fallback(metadata, session_uuid)
+                    fallback = await _fallback(metadata, session_uuid, lease, lifecycle_lease)
             except Exception as fallback_exc:
                 set_terminal_recovery_state(terminal_id, "rebind_failed", str(fallback_exc))
                 fallback = {"status": "failed", "new_terminal_id": None}
@@ -409,7 +422,10 @@ async def rebind_terminal(
             if not guard_released:
                 await guard.close()
         finally:
-            release_rebind_lease(lease)
+            try:
+                release_rebind_lease(lease)
+            finally:
+                release_session_lifecycle_lease(lifecycle_lease)
 
 
 async def recover_provider_reauth(

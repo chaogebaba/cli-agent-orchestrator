@@ -50,7 +50,7 @@ from cli_agent_orchestrator.plugins import (
     PostKillTerminalEvent,
     PostSendMessageEvent,
 )
-from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.providers.manager import get_provider_class, provider_manager
 from cli_agent_orchestrator.services.draft_guard import preserve_draft_before_send, stash_draft_before_send
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
@@ -90,13 +90,29 @@ class TerminalInputBlockedError(Exception):
     """Raised when orchestrated input would answer an active interactive prompt."""
 
 
+def seed_resume_bootstrap(agent_profile: str, provider_name: str, cwd: str):
+    """Return an authoritative resume ForkContext for seed-capable providers."""
+    provider_class = get_provider_class(provider_name)
+    if provider_class.supports_seed_resume_identity is not True:
+        return None
+    from cli_agent_orchestrator.models.terminal import ForkContext
+
+    session_uuid = provider_class.seed_resume_identity(cwd, agent_profile)
+    return ForkContext(
+        mode="resume", session_uuid=session_uuid, base_name="seed",
+        provider=provider_name, initial_preamble="",
+    )
+
+
 def has_deferred_init(terminal_id: str) -> bool:
     with _deferred_tasks_lock:
         task = _deferred_tasks_by_terminal.get(terminal_id)
         return task is not None and not task.done()
 
 
-def _persist_provider_runtime_identity(provider_instance, terminal_id: str) -> None:
+def _persist_provider_runtime_identity(
+    provider_instance, terminal_id: str, *, settlement_form: str = "first_time",
+) -> None:
     """Persist resumable identity after init and before initial task delivery."""
     if getattr(provider_instance, "supports_reauth_rebind", False) is not True:
         shell = provider_instance.shell_baseline
@@ -114,14 +130,30 @@ def _persist_provider_runtime_identity(provider_instance, terminal_id: str) -> N
         metadata["tmux_session"], metadata["tmux_window"]
     )
     allocated = getattr(provider_instance, "allocated_session_uuid", None)
-    session_uuid = allocated or provider_instance.capture_session_uuid(
+    try:
+        hint = provider_instance.resume_session_uuid()
+    except Exception as exc:
+        raise RuntimeError("identity_persist_failed") from exc
+    if hint is not None and not isinstance(hint, str):
+        raise RuntimeError("identity_persist_failed")
+    session_uuid = allocated or hint or provider_instance.capture_session_uuid(
         pid, pane_launch_epoch(pid), cwd
     )
     provider_instance.validate_session_artifact(session_uuid, cwd)
     shell = provider_instance.shell_baseline or metadata.get("shell_command")
     if not shell:
         raise RuntimeError("shell_baseline_unavailable")
-    if not update_terminal_runtime_identity(terminal_id, session_uuid, shell):
+    if settlement_form == "resume":
+        persisted = update_terminal_runtime_identity(
+            terminal_id, session_uuid, shell, supersede_other_claims=True,
+        )
+    elif settlement_form == "fallback":
+        persisted = update_terminal_runtime_identity(
+            terminal_id, session_uuid, shell, require_published_uuid=True,
+        )
+    else:
+        persisted = update_terminal_runtime_identity(terminal_id, session_uuid, shell)
+    if not persisted:
         raise RuntimeError("terminal_identity_persist_failed")
 
 
@@ -236,6 +268,48 @@ def _rollback_terminal_creation(
     except Exception:
         pass
 
+
+def _settle_published_creation_failure(
+    terminal_id: str, session_uuid: str, uuid_lease_token,
+    registry: PluginRegistry | None, *, existing_rebind_lease=None,
+) -> dict:
+    """Settle a provisional resume owner truthfully under the global lock order."""
+    from cli_agent_orchestrator.clients.database import quarantine_terminal_owner
+    from cli_agent_orchestrator.services.rebind_lease import (
+        acquire_rebind_lease, release_rebind_lease,
+    )
+
+    lease = existing_rebind_lease
+    acquired_here = False
+    if lease is None:
+        # A public teardown may momentarily own the new-terminal lease. It will
+        # observe resume_in_progress and release; retry without dropping UUID
+        # authority or claiming a deletion that has not settled.
+        for _ in range(100):
+            lease = acquire_rebind_lease(terminal_id)
+            if lease is not None:
+                acquired_here = True
+                break
+            time.sleep(0.01)
+    if lease is None:
+        if get_terminal_metadata(terminal_id) is None:
+            return {"status": "deleted", "error_code": None}
+        try:
+            quarantine_terminal_owner(terminal_id, session_uuid, "rollback_kill_uncertain")
+        except Exception as exc:
+            raise RuntimeError("quarantine_persist_failed") from exc
+        return {"status": "retained", "error_code": "rollback_kill_uncertain"}
+    try:
+        outcome = _delete_terminal_under_lease(
+            terminal_id, lease, registry=registry, require_confirmed_death=True,
+            quarantine_session_uuid=session_uuid, uuid_lease_token=uuid_lease_token,
+        )
+        if outcome.get("rollback_kill_uncertain"):
+            return {"status": "retained", "error_code": "rollback_kill_uncertain"}
+        return {"status": "deleted", "error_code": None}
+    finally:
+        if acquired_here:
+            release_rebind_lease(lease)
 # Providers whose tool restrictions are prompt-level text only (no native
 # blocking mechanism) — a restricted policy on these is advisory, not enforced.
 SOFT_ENFORCEMENT_PROVIDERS = {
@@ -269,6 +343,77 @@ def _append_message_contract(message: str, metadata: Dict, orchestration_value: 
     return f"{message}\n\n[Contract: {profile.messageContract}]"
 
 
+def _acquire_resume_creation_authority(
+    session_name: str, resume_uuid: str, uuid_lease_token,
+    session_lifecycle_lease_token, fallback_source_terminal_id,
+    fallback_source_lease_token,
+):
+    """Acquire and preflight resume authority, releasing local tokens on any error."""
+    from cli_agent_orchestrator.services.provider_session_lease import (
+        acquire_provider_session_lease, release_provider_session_lease,
+        validate_provider_session_lease,
+    )
+    from cli_agent_orchestrator.services.session_lifecycle_lease import (
+        acquire_session_lifecycle_shared, release_session_lifecycle_lease,
+        validate_session_lifecycle_shared,
+    )
+
+    owned_lifecycle = False
+    owned_uuid = False
+    try:
+        if session_lifecycle_lease_token is None:
+            session_lifecycle_lease_token = acquire_session_lifecycle_shared(session_name)
+            if session_lifecycle_lease_token is None:
+                raise RuntimeError("resume_in_progress")
+            owned_lifecycle = True
+        else:
+            validate_session_lifecycle_shared(session_name, session_lifecycle_lease_token)
+        if uuid_lease_token is None:
+            uuid_lease_token = acquire_provider_session_lease(resume_uuid)
+            if uuid_lease_token is None:
+                raise RuntimeError("resume_in_progress")
+            owned_uuid = True
+        else:
+            validate_provider_session_lease(resume_uuid, uuid_lease_token)
+
+        owners = list_terminals_by_provider_session_id(resume_uuid)
+        if fallback_source_terminal_id:
+            from cli_agent_orchestrator.services.rebind_lease import validate_rebind_lease
+            try:
+                validate_rebind_lease(
+                    fallback_source_terminal_id, fallback_source_lease_token
+                )
+                source = get_terminal_metadata(fallback_source_terminal_id)
+                if (
+                    not source
+                    or source.get("provider_session_id") != resume_uuid
+                    or source.get("recovery_state") != "fallback_starting"
+                ):
+                    raise RuntimeError("owner_conflict")
+            except Exception as exc:
+                raise RuntimeError("owner_conflict") from exc
+            owners = [row for row in owners if row["id"] != fallback_source_terminal_id]
+        for owner in owners:
+            try:
+                state = get_backend().window_liveness(
+                    owner["tmux_session"], owner["tmux_window"]
+                )
+            except Exception:
+                state = "error"
+            if state in {"live", "error"}:
+                raise RuntimeError("owner_conflict")
+        return (
+            uuid_lease_token, owned_uuid,
+            session_lifecycle_lease_token, owned_lifecycle,
+        )
+    except Exception:
+        if owned_uuid:
+            release_provider_session_lease(uuid_lease_token)
+        if owned_lifecycle:
+            release_session_lifecycle_lease(session_lifecycle_lease_token)
+        raise
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -287,6 +432,10 @@ async def create_terminal(
     terminal_id: Optional[str] = None,
     lease_token=None,
     strict_backend_registration: bool = False,
+    uuid_lease_token=None,
+    session_lifecycle_lease_token=None,
+    fallback_source_terminal_id: str | None = None,
+    fallback_source_lease_token=None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -322,15 +471,6 @@ async def create_terminal(
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
         TimeoutError: If provider initialization times out
     """
-    try:
-        early_profile = load_agent_profile(agent_profile)
-    except FileNotFoundError:
-        early_profile = None
-    candidate_brief_mode = early_profile.sessionBrief if early_profile else None
-    brief_mode = candidate_brief_mode if candidate_brief_mode in ("required", "optional") else None
-    if brief_mode and provider not in RUNTIME_SKILL_PROMPT_PROVIDERS:
-        raise ValueError(f"sessionBrief requires a runtime-context provider; resolved provider={provider}")
-
     if working_directory is not None:
         if not os.path.isabs(os.path.expanduser(working_directory)):
             raise ValueError(
@@ -343,6 +483,47 @@ async def create_terminal(
             )
         except ValueError as exc:
             raise ValueError(f"invalid_working_directory: {exc}") from exc
+    provider_class = get_provider_class(provider)
+    if provider_class.supports_seed_resume_identity is True and fork_context is None:
+        raise RuntimeError("seed_required")
+    resume_uuid = (
+        fork_context.session_uuid
+        if fork_context is not None and fork_context.mode == "resume"
+        else None
+    )
+    if not session_name:
+        session_name = generate_session_name()
+    if new_session and not session_name.startswith(SESSION_PREFIX):
+        session_name = f"{SESSION_PREFIX}{session_name}"
+    owned_lifecycle_lease = False
+    owned_uuid_lease = False
+    if resume_uuid:
+        (
+            uuid_lease_token, owned_uuid_lease,
+            session_lifecycle_lease_token, owned_lifecycle_lease,
+        ) = _acquire_resume_creation_authority(
+            session_name, resume_uuid, uuid_lease_token,
+            session_lifecycle_lease_token, fallback_source_terminal_id,
+            fallback_source_lease_token,
+        )
+
+    try:
+        try:
+            early_profile = load_agent_profile(agent_profile)
+        except FileNotFoundError:
+            early_profile = None
+        candidate_brief_mode = early_profile.sessionBrief if early_profile else None
+        brief_mode = candidate_brief_mode if candidate_brief_mode in ("required", "optional") else None
+        if brief_mode and provider not in RUNTIME_SKILL_PROMPT_PROVIDERS:
+            raise ValueError(f"sessionBrief requires a runtime-context provider; resolved provider={provider}")
+    except Exception:
+        if owned_uuid_lease:
+            from cli_agent_orchestrator.services.provider_session_lease import release_provider_session_lease
+            release_provider_session_lease(uuid_lease_token)
+        if owned_lifecycle_lease:
+            from cli_agent_orchestrator.services.session_lifecycle_lease import release_session_lifecycle_lease
+            release_session_lifecycle_lease(session_lifecycle_lease_token)
+        raise
 
     session_created = False  # tracks whether THIS call created the tmux session
     window_created = False
@@ -355,17 +536,11 @@ async def create_terminal(
             from cli_agent_orchestrator.services.rebind_lease import validate_rebind_lease
             validate_rebind_lease(terminal_id, lease_token)
 
-        if not session_name:
-            session_name = generate_session_name()
-
         window_name = generate_window_name(agent_profile)
 
         # Step 2: Create tmux session or window
         if new_session:
             # Ensure session name has the CAO prefix for identification
-            if not session_name.startswith(SESSION_PREFIX):
-                session_name = f"{SESSION_PREFIX}{session_name}"
-
             # Prevent duplicate sessions
             if get_backend().session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' already exists")
@@ -486,11 +661,7 @@ async def create_terminal(
                     fork_mode=fork_context.mode,
                 )
             else:
-                attempted_resume_uuid = (
-                    fork_context.session_uuid
-                    if lease_token is not None and fork_context and fork_context.mode == "resume"
-                    else None
-                )
+                attempted_resume_uuid = resume_uuid
                 if attempted_resume_uuid:
                     db_create_terminal(
                         terminal_id, session_name, window_name, provider, agent_profile,
@@ -585,6 +756,14 @@ async def create_terminal(
                 initial_message,
                 initial_message_orchestration_type,
                 registry,
+                uuid_lease_token=uuid_lease_token,
+                owns_uuid_lease=owned_uuid_lease,
+                session_lifecycle_lease_token=session_lifecycle_lease_token,
+                owns_lifecycle_lease=owned_lifecycle_lease,
+                settlement_form=(
+                    "fallback" if fallback_source_terminal_id else
+                    "resume" if resume_uuid else "first_time"
+                ),
             )
         else:
             try:
@@ -596,7 +775,13 @@ async def create_terminal(
                     raise RuntimeError("initialize_failed") from exc
                 raise
             try:
-                _persist_provider_runtime_identity(provider_instance, terminal_id)
+                _persist_provider_runtime_identity(
+                    provider_instance, terminal_id,
+                    settlement_form=(
+                        "fallback" if fallback_source_terminal_id else
+                        "resume" if resume_uuid else "first_time"
+                    ),
+                )
             except Exception as exc:
                 if lease_token is None:
                     raise
@@ -632,7 +817,7 @@ async def create_terminal(
             shell_command=shell_command,
             status=initial_status,
             last_active=datetime.now(),
-            provider_session_id=allocated_uuid,
+            provider_session_id=resume_uuid or allocated_uuid,
         )
 
         logger.info(
@@ -660,31 +845,68 @@ async def create_terminal(
                 if strict_backend_registration:
                     raise RuntimeError("herdr_register_failed") from e
                 logger.warning(f"Failed to register terminal {terminal_id} with herdr inbox: {e}")
+        if resume_uuid and not defer_init and owned_uuid_lease:
+            from cli_agent_orchestrator.services.provider_session_lease import release_provider_session_lease
+            release_provider_session_lease(uuid_lease_token)
+        if resume_uuid and not defer_init and owned_lifecycle_lease:
+            from cli_agent_orchestrator.services.session_lifecycle_lease import release_session_lifecycle_lease
+            release_session_lifecycle_lease(session_lifecycle_lease_token)
         return terminal
 
     except Exception as e:
         # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
-        if lease_token is not None and db_created:
+        settlement_error = None
+        settlement_retained = False
+        if resume_uuid and db_created:
+            try:
+                settlement = _settle_published_creation_failure(
+                    terminal_id, resume_uuid, uuid_lease_token, registry,
+                    existing_rebind_lease=lease_token,
+                )
+                settlement_error = settlement.get("error_code")
+                settlement_retained = settlement.get("status") == "retained"
+            except Exception as settle_exc:
+                settlement_error = str(settle_exc)
+        elif lease_token is not None and db_created:
             rollback = _delete_terminal_under_lease(
                 terminal_id, lease_token, registry=registry, require_confirmed_death=True,
                 quarantine_session_uuid=(fork_context.session_uuid if fork_context else None),
+                uuid_lease_token=uuid_lease_token,
             )
-            if rollback.get("rollback_kill_uncertain"):
-                raise RuntimeError("rollback_kill_uncertain") from e
+            settlement_error = (
+                "rollback_kill_uncertain" if rollback.get("rollback_kill_uncertain") else None
+            )
+            settlement_retained = bool(rollback.get("rollback_kill_uncertain"))
         else:
             _rollback_terminal_creation(
                 terminal_id, session_name, locals().get("window_name"), session_created,
                 window_created, fifo_attached, db_created,
             )
-        try:
-            status_monitor.clear_terminal(terminal_id)
-        except Exception:
-            pass  # Ignore cleanup errors
-        try:
-            provider_manager.cleanup_provider(terminal_id)
-        except Exception:
-            pass  # Ignore cleanup errors
+        if not settlement_retained:
+            try:
+                status_monitor.clear_terminal(terminal_id)
+            except Exception:
+                pass  # Ignore cleanup errors
+        if not ((resume_uuid or lease_token is not None) and db_created):
+            try:
+                provider_manager.cleanup_provider(terminal_id)
+            except Exception:
+                pass
+        if resume_uuid and uuid_lease_token is not None and owned_uuid_lease:
+            from cli_agent_orchestrator.services.provider_session_lease import release_provider_session_lease
+            try:
+                release_provider_session_lease(uuid_lease_token)
+            except RuntimeError:
+                pass
+        if resume_uuid and session_lifecycle_lease_token is not None and owned_lifecycle_lease:
+            from cli_agent_orchestrator.services.session_lifecycle_lease import release_session_lifecycle_lease
+            try:
+                release_session_lifecycle_lease(session_lifecycle_lease_token)
+            except RuntimeError:
+                pass
+        if settlement_error:
+            raise RuntimeError(settlement_error) from e
         raise
 
 
@@ -753,6 +975,11 @@ def _schedule_deferred_init(
     initial_message: Optional[str],
     orchestration_type: Optional[OrchestrationType],
     registry: PluginRegistry | None,
+    uuid_lease_token=None,
+    owns_uuid_lease: bool = False,
+    session_lifecycle_lease_token=None,
+    owns_lifecycle_lease: bool = False,
+    settlement_form: str = "first_time",
 ) -> None:
     """Kick off provider.initialize() in the background and, on success,
     deliver the initial message via send_input.
@@ -773,7 +1000,9 @@ def _schedule_deferred_init(
         caller_id: Optional[str] = None
         try:
             await provider_instance.initialize()
-            _persist_provider_runtime_identity(provider_instance, terminal_id)
+            _persist_provider_runtime_identity(
+                provider_instance, terminal_id, settlement_form=settlement_form,
+            )
             shell_command = provider_instance.shell_baseline
             if isinstance(shell_command, str) and shell_command:
                 update_terminal_shell_command(terminal_id, shell_command)
@@ -849,14 +1078,42 @@ def _schedule_deferred_init(
                 e,
                 exc_info=True,
             )
-            await asyncio.to_thread(
-                _notify_caller_of_deferred_failure,
-                terminal_id,
-                f"Worker {terminal_id} failed to initialize: {e!r}. It has been "
-                f"deleted — re-assign the task or report the failure.",
-                registry,
-                delete_worker=True,
+            settlement = None
+            metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
+            if metadata and metadata.get("provider_session_id") and uuid_lease_token is not None:
+                settlement = await asyncio.to_thread(
+                    _settle_published_creation_failure,
+                    terminal_id, metadata["provider_session_id"], uuid_lease_token, registry,
+                )
+            if settlement is None and get_terminal_metadata(terminal_id) is not None:
+                # Non-published legacy deferred failures retain the old path.
+                await asyncio.to_thread(delete_terminal, terminal_id, registry=registry)
+                settlement = {"status": "deleted", "error_code": None}
+            settlement = settlement or {"status": "deleted", "error_code": None}
+            notice = (
+                f"Worker {terminal_id} failed to initialize: {e!r}. Retained in quarantine "
+                f"[{settlement['error_code']}] for recovery."
+                if settlement["status"] == "retained" else
+                f"Worker {terminal_id} failed to initialize: {e!r}. It has been deleted — "
+                f"re-assign the task or report the failure."
             )
+            await asyncio.to_thread(
+                _notify_caller_of_deferred_failure, terminal_id, notice, registry,
+                delete_worker=False,
+            )
+        finally:
+            if owns_uuid_lease and uuid_lease_token is not None:
+                from cli_agent_orchestrator.services.provider_session_lease import release_provider_session_lease
+                try:
+                    release_provider_session_lease(uuid_lease_token)
+                except RuntimeError:
+                    pass
+            if owns_lifecycle_lease and session_lifecycle_lease_token is not None:
+                from cli_agent_orchestrator.services.session_lifecycle_lease import release_session_lifecycle_lease
+                try:
+                    release_session_lifecycle_lease(session_lifecycle_lease_token)
+                except RuntimeError:
+                    pass
 
     try:
         loop = asyncio.get_running_loop()
@@ -1407,16 +1664,45 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
         release_rebind_lease(token)
 
 
+def preflight_session_teardown(terminals: list[dict]) -> None:
+    """Reject a session teardown before mutation when any UUID owner is provisional."""
+    from cli_agent_orchestrator.services.provider_session_lease import (
+        provider_session_lease_held,
+    )
+
+    for terminal in terminals:
+        metadata = get_terminal_metadata(terminal["id"])
+        session_uuid = metadata.get("provider_session_id") if metadata else None
+        if session_uuid and provider_session_lease_held(session_uuid):
+            raise RuntimeError("resume_in_progress")
+
+
 def _delete_terminal_under_lease(
     terminal_id: str, lease_token, registry: PluginRegistry | None = None,
     preserve_warm_intent: bool = False,
     require_confirmed_death: bool = False,
     quarantine_session_uuid: str | None = None,
+    uuid_lease_token=None,
 ) -> Dict:
     """Delete terminal and kill its tmux window."""
     from cli_agent_orchestrator.services.rebind_lease import validate_rebind_lease
 
     validate_rebind_lease(terminal_id, lease_token)
+
+    provisional = get_terminal_metadata(terminal_id)
+    provisional_uuid = provisional.get("provider_session_id") if provisional else None
+    if provisional_uuid:
+        from cli_agent_orchestrator.services.provider_session_lease import (
+            provider_session_lease_held,
+            validate_provider_session_lease,
+        )
+        if provider_session_lease_held(provisional_uuid):
+            try:
+                validate_provider_session_lease(provisional_uuid, uuid_lease_token)
+            except Exception as exc:
+                raise RuntimeError("resume_in_progress") from exc
+            if not require_confirmed_death:
+                raise RuntimeError("resume_in_progress")
 
     def detach_observation(metadata: Dict, *, unregister: bool = True) -> None:
         if unregister:
@@ -1447,8 +1733,9 @@ def _delete_terminal_under_lease(
                     svc.unregister_terminal(terminal_id)
                 except Exception as exc:
                     logger.warning(f"Failed to unregister terminal {terminal_id} from herdr inbox: {exc}")
-        # Get metadata before deletion
-        metadata = get_terminal_metadata(terminal_id)
+        # Reuse the provisional-owner read so rollback ordering does not add a
+        # second observation read before kill.
+        metadata = provisional
 
         if metadata:
             # Snapshot scrollback + metadata before killing (for debugging/restore)

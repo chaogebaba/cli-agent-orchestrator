@@ -146,226 +146,90 @@ class TestRecover:
         assert "exactly one --terminal" in result.output
 
 
-class TestStatus:
+class TestLegacyStatus:
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
-    def test_status_success(self, mock_get, runner):
-        terminals_resp = MagicMock(status_code=200)
-        terminals_resp.json.return_value = [{"id": "abc12345"}]
-        terminal_resp = MagicMock(status_code=200)
-        terminal_resp.json.return_value = {
-            "id": "abc12345",
-            "agent_profile": "dev",
-            "provider": "kiro_cli",
-            "status": "completed",
+    def test_status_v1_json(self, mock_get, runner):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "schema_version": "cao.session-status/v1",
+            "session": {"name": "cao-test"}, "backend_present": True,
+            "epoch": None, "ready_bases": [], "warm_intents": [],
+            "quarantined": [], "ledger": {"available": False, "count": None},
         }
-        output_resp = MagicMock(status_code=200)
-        output_resp.json.return_value = {"output": "Hello world"}
-        mock_get.side_effect = [terminals_resp, terminal_resp, output_resp]
-
-        result = runner.invoke(session, ["status", "cao-test"])
-
-        assert result.exit_code == 0
-        assert "abc12345" in result.output
-        assert "completed" in result.output
-        assert "Hello world" in result.output
-
-    @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
-    def test_status_json(self, mock_get, runner):
-        terminals_resp = MagicMock(status_code=200)
-        terminals_resp.json.return_value = [{"id": "abc12345"}]
-        terminal_resp = MagicMock(status_code=200)
-        terminal_resp.json.return_value = {
-            "id": "abc12345",
-            "agent_profile": "dev",
-            "provider": "kiro_cli",
-            "status": "idle",
-        }
-        output_resp = MagicMock(status_code=200)
-        output_resp.json.return_value = {"output": "test output"}
-        mock_get.side_effect = [terminals_resp, terminal_resp, output_resp]
-
+        mock_get.return_value = response
         result = runner.invoke(session, ["status", "cao-test", "--json"])
-
         assert result.exit_code == 0
-        assert '"status": "idle"' in result.output
+        assert '"schema_version": "cao.session-status/v1"' in result.output
+
+    @pytest.mark.parametrize("removed", ["--terminal", "--workers"])
+    def test_removed_legacy_selectors_are_usage_errors(self, runner, removed):
+        args = ["status", "cao-test", removed]
+        if removed == "--terminal":
+            args.append("abc12345")
+        assert runner.invoke(session, args).exit_code == 2
 
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
-    def test_status_specific_terminal(self, mock_get, runner):
-        terminal_resp = MagicMock(status_code=200)
-        terminal_resp.json.return_value = {
-            "id": "xyz99999",
-            "agent_profile": "dev",
-            "provider": "kiro_cli",
-            "status": "idle",
+    def test_human_render_is_v1_not_conductor_output(self, mock_get, runner):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "session": {"name": "cao-test"}, "backend_present": False,
+            "epoch": {"count": 2}, "ready_bases": [{}], "warm_intents": [],
+            "quarantined": [{}, {}], "ledger": {"available": False, "count": None},
         }
-        output_resp = MagicMock(status_code=200)
-        output_resp.json.return_value = {"output": None}
-        mock_get.side_effect = [terminal_resp, output_resp]
-
-        result = runner.invoke(session, ["status", "cao-test", "--terminal", "xyz99999"])
-
-        assert result.exit_code == 0
-        assert "xyz99999" in result.output
-
-    @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
-    def test_status_specific_terminal_json(self, mock_get, runner):
-        """--terminal --json: workers key absent (--workers not set)."""
-        terminal_resp = MagicMock(status_code=200)
-        terminal_resp.json.return_value = {
-            "id": "xyz99999",
-            "agent_profile": "dev",
-            "provider": "kiro_cli",
-            "status": "idle",
-        }
-        output_resp = MagicMock(status_code=200)
-        output_resp.json.return_value = {"output": "some output"}
-        mock_get.side_effect = [terminal_resp, output_resp]
-
-        result = runner.invoke(session, ["status", "cao-test", "--terminal", "xyz99999", "--json"])
-
-        assert result.exit_code == 0
-        data = __import__("json").loads(result.output)
-        assert data["conductor"]["id"] == "xyz99999"
-        assert "workers" not in data
-
-    @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
-    def test_status_with_workers(self, mock_get, runner):
-        terminals_resp = MagicMock(status_code=200)
-        terminals_resp.json.return_value = [
-            {
-                "id": "cond1234",
-                "agent_profile": "conductor",
-                "provider": "kiro_cli",
-                "status": "idle",
-            },
-            {
-                "id": "work5678",
-                "agent_profile": "dev",
-                "provider": "kiro_cli",
-                "status": "processing",
-            },
-        ]
-        terminal_resp = MagicMock(status_code=200)
-        terminal_resp.json.return_value = {
-            "id": "cond1234",
-            "agent_profile": "conductor",
-            "provider": "kiro_cli",
-            "status": "idle",
-        }
-        output_resp = MagicMock(status_code=200)
-        output_resp.json.return_value = {"output": None}
-        mock_get.side_effect = [terminals_resp, terminal_resp, output_resp]
-
-        result = runner.invoke(session, ["status", "cao-test", "--workers"])
-
-        assert result.exit_code == 0
-        assert "work5678" in result.output
-
-    @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
-    def test_status_workers_json(self, mock_get, runner):
-        """--workers --json includes workers array in output."""
-        terminals_resp = MagicMock(status_code=200)
-        terminals_resp.json.return_value = [
-            {
-                "id": "cond1234",
-                "agent_profile": "conductor",
-                "provider": "kiro_cli",
-                "status": "idle",
-            },
-            {
-                "id": "work5678",
-                "agent_profile": "dev",
-                "provider": "kiro_cli",
-                "status": "processing",
-            },
-        ]
-        terminal_resp = MagicMock(status_code=200)
-        terminal_resp.json.return_value = {
-            "id": "cond1234",
-            "agent_profile": "conductor",
-            "provider": "kiro_cli",
-            "status": "idle",
-        }
-        output_resp = MagicMock(status_code=200)
-        output_resp.json.return_value = {"output": None}
-        mock_get.side_effect = [terminals_resp, terminal_resp, output_resp]
-
-        result = runner.invoke(session, ["status", "cao-test", "--workers", "--json"])
-
-        assert result.exit_code == 0
-        data = __import__("json").loads(result.output)
-        assert "workers" in data
-        assert data["workers"][0]["id"] == "work5678"
-
-    @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
-    def test_status_no_workers(self, mock_get, runner):
-        terminals_resp = MagicMock(status_code=200)
-        terminals_resp.json.return_value = [
-            {
-                "id": "cond1234",
-                "agent_profile": "conductor",
-                "provider": "kiro_cli",
-                "status": "idle",
-            },
-        ]
-        terminal_resp = MagicMock(status_code=200)
-        terminal_resp.json.return_value = {
-            "id": "cond1234",
-            "agent_profile": "conductor",
-            "provider": "kiro_cli",
-            "status": "idle",
-        }
-        output_resp = MagicMock(status_code=200)
-        output_resp.json.return_value = {"output": None}
-        mock_get.side_effect = [terminals_resp, terminal_resp, output_resp]
-
-        result = runner.invoke(session, ["status", "cao-test", "--workers"])
-
-        assert result.exit_code == 0
-        assert "No worker terminals" in result.output
-
-    @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
-    def test_status_output_fetch_error(self, mock_get, runner):
-        terminals_resp = MagicMock(status_code=200)
-        terminals_resp.json.return_value = [{"id": "abc12345"}]
-        terminal_resp = MagicMock(status_code=200)
-        terminal_resp.json.return_value = {
-            "id": "abc12345",
-            "agent_profile": "dev",
-            "provider": "kiro_cli",
-            "status": "idle",
-        }
-        mock_get.side_effect = [
-            terminals_resp,
-            terminal_resp,
-            requests.exceptions.ConnectionError("refused"),
-        ]
-
+        mock_get.return_value = response
         result = runner.invoke(session, ["status", "cao-test"])
-
         assert result.exit_code == 0
-        assert "No last response available" in result.output
+        assert "Backend present: false" in result.output
+        assert "Epoch: 2" in result.output
+        assert "Terminal:" not in result.output
 
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
-    def test_status_output_truncated(self, mock_get, runner):
-        terminals_resp = MagicMock(status_code=200)
-        terminals_resp.json.return_value = [{"id": "abc12345"}]
-        terminal_resp = MagicMock(status_code=200)
-        terminal_resp.json.return_value = {
-            "id": "abc12345",
-            "agent_profile": "dev",
-            "provider": "kiro_cli",
-            "status": "completed",
+    def test_status_uses_single_v1_endpoint(self, mock_get, runner):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "session": {"name": "cao-test"}, "backend_present": True,
+            "epoch": None, "ready_bases": [], "warm_intents": [],
+            "quarantined": [], "ledger": {"available": False, "count": None},
         }
-        output_resp = MagicMock(status_code=200)
-        long_output = "\n".join(f"line {i}" for i in range(25))
-        output_resp.json.return_value = {"output": long_output}
-        mock_get.side_effect = [terminals_resp, terminal_resp, output_resp]
+        mock_get.return_value = response
+        assert runner.invoke(session, ["status", "cao-test"]).exit_code == 0
+        assert mock_get.call_count == 1
+        assert mock_get.call_args.args[0].endswith("/sessions/cao-test/status")
 
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
+    def test_status_http_error_is_visible(self, mock_get, runner):
+        mock_get.side_effect = requests.ConnectionError("refused")
         result = runner.invoke(session, ["status", "cao-test"])
+        assert result.exit_code == 1
+        assert "failed to fetch session status" in result.output
 
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
+    def test_durable_only_json_is_preserved(self, mock_get, runner):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "schema_version": "cao.session-status/v1",
+            "session": {"name": "cao-test"}, "backend_present": False,
+            "manifest": None, "manifest_error": "no_terminals", "epoch": None,
+            "ready_bases": [{"base_name": "codex"}], "warm_intents": [],
+            "quarantined": [], "ledger": {"available": False, "count": None},
+        }
+        mock_get.return_value = response
+        result = runner.invoke(session, ["status", "cao-test", "--json"])
         assert result.exit_code == 0
-        assert "5 more lines" in result.output
+        assert '"manifest_error": "no_terminals"' in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
+    def test_human_ledger_never_renders_zero(self, mock_get, runner):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "session": {"name": "cao-test"}, "backend_present": True,
+            "epoch": None, "ready_bases": [], "warm_intents": [],
+            "quarantined": [], "ledger": {"available": False, "count": None},
+        }
+        mock_get.return_value = response
+        result = runner.invoke(session, ["status", "cao-test"])
+        assert "Ledger: unavailable" in result.output
+        assert "Ledger: 0" not in result.output
 
 
 class TestSend:

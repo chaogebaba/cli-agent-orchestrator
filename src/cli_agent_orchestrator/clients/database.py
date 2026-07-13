@@ -954,15 +954,31 @@ def update_terminal_provider_session_id(terminal_id: str, session_uuid: str) -> 
 
 def update_terminal_runtime_identity(
     terminal_id: str, session_uuid: str, shell_command: str | None,
+    *, supersede_other_claims: bool = False, require_published_uuid: bool = False,
 ) -> bool:
-    """Persist the post-init native identity before any task is delivered."""
+    """Confirm identity and optionally transfer the UUID claim atomically.
+
+    The conditional new-row UPDATE runs first and establishes SQLite write
+    intent before the claimant update; no deferred read snapshot is trusted.
+    """
     with SessionLocal.begin() as db:
         values: dict[str, Any] = {"provider_session_id": session_uuid}
         if shell_command:
             values["shell_command"] = shell_command
-        return db.query(TerminalModel).filter_by(id=terminal_id).update(
-            values, synchronize_session=False
-        ) > 0
+        query = db.query(TerminalModel).filter(TerminalModel.id == terminal_id)
+        if supersede_other_claims or require_published_uuid:
+            query = query.filter(TerminalModel.provider_session_id == session_uuid)
+        else:
+            query = query.filter(TerminalModel.provider_session_id.is_(None))
+        changed = query.update(values, synchronize_session=False)
+        if changed != 1:
+            return False
+        if supersede_other_claims:
+            db.query(TerminalModel).filter(
+                TerminalModel.provider_session_id == session_uuid,
+                TerminalModel.id != terminal_id,
+            ).update({"provider_session_id": None}, synchronize_session=False)
+        return True
 
 
 def settle_terminal_rebound(
@@ -1005,18 +1021,27 @@ def set_terminal_recovery_state(
 
 def quarantine_terminal_owner(
     terminal_id: str, session_uuid: str | None, error: str,
-) -> bool:
+) -> str:
     """Atomically retain attempted native ownership and quarantine projection."""
     with SessionLocal.begin() as db:
         row = db.query(TerminalModel).filter_by(id=terminal_id).first()
         if row is None:
-            return False
+            return ""
+        association = "skipped_existing_owner"
         if row.provider_session_id is None and session_uuid:
-            row.provider_session_id = session_uuid
+            associated = db.query(TerminalModel).filter(
+                TerminalModel.id == terminal_id,
+                TerminalModel.provider_session_id.is_(None),
+                ~db.query(TerminalModel.id).filter(
+                    TerminalModel.provider_session_id == session_uuid,
+                    TerminalModel.id != terminal_id,
+                ).exists(),
+            ).update({"provider_session_id": session_uuid}, synchronize_session=False)
+            association = "associated" if associated == 1 else "skipped_existing_owner"
         row.recovery_state = "rebind_failed"
         row.recovery_error = error[:2048]
         row.recovery_updated_at = _utcnow()
-        return True
+        return association
 
 
 def settle_terminal_fallback(old_terminal_id: str, new_terminal_id: str) -> int:
@@ -1025,8 +1050,11 @@ def settle_terminal_fallback(old_terminal_id: str, new_terminal_id: str) -> int:
         old = db.query(TerminalModel).filter_by(id=old_terminal_id).one()
         if old.recovery_state != "fallback_starting":
             raise RuntimeError("fallback_state_changed")
-        if db.query(TerminalModel).filter_by(id=new_terminal_id).first() is None:
+        new = db.query(TerminalModel).filter_by(id=new_terminal_id).first()
+        if new is None:
             raise RuntimeError("fallback_terminal_missing")
+        if not new.provider_session_id:
+            raise RuntimeError("fallback_terminal_identity_missing")
         changed = db.query(InboxModel).filter(
             InboxModel.receiver_id == old_terminal_id,
             InboxModel.status == MessageStatus.PENDING.value,
@@ -1035,6 +1063,10 @@ def settle_terminal_fallback(old_terminal_id: str, new_terminal_id: str) -> int:
         old.recovery_state = "fallback_ready"
         old.recovery_error = None
         old.recovery_updated_at = _utcnow()
+        db.query(TerminalModel).filter(
+            TerminalModel.provider_session_id == new.provider_session_id,
+            TerminalModel.id != new_terminal_id,
+        ).update({"provider_session_id": None}, synchronize_session=False)
         return changed
 
 

@@ -165,6 +165,11 @@ def launch(
 ):
     """Launch cao session with specified agent profile."""
     try:
+        click.echo(
+            "WARNING: cao launch is deprecated; use cao session start; "
+            "cao launch will be removed in the next major release",
+            err=True,
+        )
         display_dir = working_directory or os.path.realpath(os.getcwd())
         explicit_provider = provider is not None  # True only when --provider was passed
         forwarded_env = _parse_env_pairs(env_pairs) if env_pairs else {}
@@ -275,7 +280,7 @@ def launch(
 
         # Call API to create session — pass working_directory only if explicitly
         # provided. When omitted, the server defaults to its own CWD.
-        url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions"
+        url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions/start"
         params = {
             "agent_profile": agents,
             "working_directory": working_directory or os.getcwd(),
@@ -288,7 +293,7 @@ def launch(
             # Pass as comma-separated string for query param
             params["allowed_tools"] = ",".join(resolved_allowed_tools)
         if memory:
-            params["memory_manager"] = "true"
+            params["memory"] = "true"
         if allow_incomplete_brief:
             params["allow_incomplete_brief"] = "true"
 
@@ -303,7 +308,10 @@ def launch(
         response = requests.post(url, **post_kwargs)
         response.raise_for_status()
 
-        terminal = response.json()
+        start_payload = response.json()
+        # Preserve wrapper behavior for legacy-compatible/mocked servers while
+        # the real create call delegates to /sessions/start.
+        terminal = start_payload.get("supervisor_terminal", start_payload)
 
         click.echo(f"Session created: {terminal['session_name']}")
         click.echo(f"Terminal created: {terminal['name']}")

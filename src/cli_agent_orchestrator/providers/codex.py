@@ -7,6 +7,7 @@ import shlex
 import time
 import json
 import os
+import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
@@ -289,6 +290,24 @@ def _toml_override(key: str, value: Any) -> str:
         raise TypeError(f"codexConfig key '{key}': {exc}") from exc
 
 
+def _resolved_codex_profile_config(profile) -> tuple[str | None, dict[str, Any]]:
+    """Single model/config resolver shared by interactive and seed launches."""
+    defaults = get_provider_defaults("codex")
+    default_model = defaults.get("model")
+    if "model" in defaults and isinstance(default_model, str):
+        model = default_model or None
+    else:
+        model = profile.model if profile and profile.model else None
+    config = dict(getattr(profile, "codexConfig", None) or {})
+    effort = defaults.get("reasoning_effort")
+    if "reasoning_effort" in defaults and isinstance(effort, str):
+        if effort:
+            config["model_reasoning_effort"] = effort
+        else:
+            config.pop("model_reasoning_effort", None)
+    return model, config
+
+
 def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
     """Find the first ASSISTANT_PREFIX_PATTERN match in ``text`` whose line
     is not an MCP tool-call marker.
@@ -320,6 +339,7 @@ class ProviderError(Exception):
 
 class CodexProvider(BaseProvider):
     supports_fork_context = True
+    supports_seed_resume_identity = True
     supports_reauth_rebind = True
 
     def capture_shell_baseline(self) -> str | None:
@@ -341,6 +361,41 @@ class CodexProvider(BaseProvider):
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt, fork_context)
         self._initialized = False
         self._agent_profile = agent_profile
+
+    @classmethod
+    def seed_resume_identity(cls, cwd: str, agent_profile: str) -> str:
+        """Create and validate a native Codex rollout without CAO coordinates."""
+        profile = load_agent_profile(agent_profile)
+        argv = ["codex", "exec", "--skip-git-repo-check", "-C", cwd]
+        model, config = _resolved_codex_profile_config(profile)
+        if isinstance(model, str) and model:
+            argv.extend(["--model", model])
+        for key, value in config.items():
+            argv.extend(["-c", _toml_override(key, value)])
+        argv.append("Reply exactly: SEED_OK then stop.")
+        try:
+            completed = subprocess.run(
+                argv, capture_output=True, text=True, timeout=90, check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("seed_timeout") from exc
+        except OSError as exc:
+            raise RuntimeError("seed_exec_failed") from exc
+        if completed.returncode != 0:
+            raise RuntimeError("seed_exec_failed")
+        matches = re.findall(
+            r"(?im)^\s*session id:\s*([0-9a-f]{8}-[0-9a-f-]{27,})\s*$",
+            completed.stdout,
+        )
+        if len(matches) != 1:
+            raise RuntimeError("seed_uuid_unparseable")
+        session_uuid = matches[0]
+        validator = cls("seed", "seed", "seed", agent_profile)
+        try:
+            validator.validate_session_artifact(session_uuid, cwd)
+        except Exception as exc:
+            raise RuntimeError("seed_artifact_invalid") from exc
+        return session_uuid
 
     def _build_codex_command(self) -> str:
         """Build Codex command with agent profile if provided.
@@ -370,14 +425,7 @@ class CodexProvider(BaseProvider):
             command_parts = ["codex", "--yolo"]
         command_parts.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
 
-        provider_defaults = get_provider_defaults("codex")
-        default_model = provider_defaults.get("model")
-        if "model" in provider_defaults and isinstance(default_model, str):
-            model = default_model or None
-        elif profile and profile.model:
-            model = profile.model
-        else:
-            model = None
+        model, codex_config = _resolved_codex_profile_config(profile)
         if isinstance(model, str) and model:
             command_parts.extend(["--model", model])
 
@@ -452,15 +500,6 @@ class CodexProvider(BaseProvider):
             # (e.g. "features.fast_mode"); values are serialized to TOML
             # scalars. Emitted before providers.toml defaults so per-key TOML
             # settings can take precedence while other profile keys remain.
-        codex_config: dict[str, Any] = {}
-        if profile is not None and isinstance(getattr(profile, "codexConfig", None), dict):
-            codex_config.update(profile.codexConfig)
-        reasoning_effort = provider_defaults.get("reasoning_effort")
-        if "reasoning_effort" in provider_defaults and isinstance(reasoning_effort, str):
-            if reasoning_effort:
-                codex_config["model_reasoning_effort"] = reasoning_effort
-            else:
-                codex_config.pop("model_reasoning_effort", None)
         for key, value in codex_config.items():
             command_parts.extend(["-c", _toml_override(key, value)])
 
@@ -495,6 +534,9 @@ class CodexProvider(BaseProvider):
     def capture_session_uuid(self, pane_pid: int, launch_time: float, cwd: str) -> str:
         from cli_agent_orchestrator.services.fork_context_service import capture_codex_uuid
         return capture_codex_uuid(pane_pid, launch_time, cwd)
+
+    def resume_session_uuid(self) -> str | None:
+        return None
 
     def validate_session_artifact(self, session_uuid: str, cwd: str) -> None:
         matches = list((Path.home() / ".codex" / "sessions").glob(

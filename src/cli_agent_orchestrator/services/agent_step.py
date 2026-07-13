@@ -23,6 +23,7 @@ retry policy (FR-5.3); the HTTP handler maps it to an ``HTTPException``.
 
 import asyncio
 import logging
+import os
 import time
 from enum import Enum
 from typing import Callable, Optional
@@ -254,6 +255,9 @@ async def run_agent_step(
 
         # create_terminal already runs provider.initialize() (which waits for
         # IDLE); a failure raises (ValueError/TimeoutError) and propagates.
+        fork_context = terminal_service.seed_resume_bootstrap(
+            agent, provider, working_directory or os.getcwd()
+        )
         terminal = await terminal_service.create_terminal(
             provider,
             agent,
@@ -263,6 +267,7 @@ async def run_agent_step(
             allowed_tools=allowed_tools,
             caller_id=caller_id,
             env_vars=env_vars,
+            fork_context=fork_context,
         )
         terminal_id = terminal.id
 

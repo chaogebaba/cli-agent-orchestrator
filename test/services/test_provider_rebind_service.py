@@ -52,6 +52,7 @@ async def test_delivery_guard_cancelled_while_waiting_does_not_orphan_lock(monke
 
 @pytest.mark.asyncio
 async def test_duplicate_rebind_returns_deterministic_busy(monkeypatch):
+    monkeypatch.setattr(service, "get_terminal_metadata", lambda _tid: {"tmux_session": "cao-test"})
     held = acquire_rebind_lease("busy-a")
     try:
         result = await service.rebind_terminal("busy-a")
@@ -77,6 +78,7 @@ async def test_duplicate_rebind_returns_deterministic_busy(monkeypatch):
 async def test_quiescence_policy(monkeypatch, raw, interrupt, allowed):
     monkeypatch.setattr(service, "get_terminal_metadata", lambda _tid: {
         "id": "q-a", "recovery_state": None, "shell_command": None,
+        "tmux_session": "cao-test",
     })
     monkeypatch.setattr(service, "has_unsettled_delivery_attempt", lambda _tid: False)
     monkeypatch.setattr(
@@ -823,6 +825,7 @@ def test_eager_identity_helper_orders_capture_validate_then_atomic_persist(monke
     order = []
     provider = MagicMock(supports_reauth_rebind=True, allocated_session_uuid=None)
     provider.shell_baseline = "bash"
+    provider.resume_session_uuid.return_value = None
     provider.capture_session_uuid.side_effect = lambda *_a: order.append("capture") or "uuid"
     provider.validate_session_artifact.side_effect = lambda *_a: order.append("validate")
     monkeypatch.setattr(

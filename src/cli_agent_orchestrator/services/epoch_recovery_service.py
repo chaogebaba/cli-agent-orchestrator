@@ -58,6 +58,7 @@ def _normalize_creation_error(exc: Exception) -> str:
         "identity_persist_failed", "herdr_register_failed",
         "rollback_kill_uncertain",
         "quarantine_persist_failed",
+        "resume_in_progress", "owner_conflict",
     ):
         if code in message:
             return code
@@ -108,9 +109,26 @@ async def _recover_row(row, session_name):
     failed = _preflight(row, session_name)
     if failed:
         return failed, None
+    from cli_agent_orchestrator.services.session_lifecycle_lease import (
+        acquire_session_lifecycle_shared, release_session_lifecycle_lease,
+    )
+    lifecycle_lease = acquire_session_lifecycle_shared(session_name)
+    if lifecycle_lease is None:
+        return _result(row["name"], "skipped_busy", error_code="rebind_in_progress",
+                       unscoped=row.get("session_name") is None), None
+    from cli_agent_orchestrator.services.provider_session_lease import (
+        acquire_provider_session_lease, release_provider_session_lease,
+    )
+    uuid_lease = acquire_provider_session_lease(row["session_uuid"])
+    if uuid_lease is None:
+        release_session_lifecycle_lease(lifecycle_lease)
+        return _result(row["name"], "skipped_busy", error_code="rebind_in_progress",
+                       unscoped=row.get("session_name") is None), None
     terminal_id = generate_terminal_id()
     lease = acquire_rebind_lease(terminal_id)
     if lease is None:
+        release_provider_session_lease(uuid_lease)
+        release_session_lifecycle_lease(lifecycle_lease)
         return _result(row["name"], "skipped_busy", error_code="rebind_in_progress",
                        unscoped=row.get("session_name") is None), None
     try:
@@ -123,10 +141,19 @@ async def _recover_row(row, session_name):
                 session_name=session_name, new_session=False, working_directory=row["cwd"],
                 defer_init=False, fork_context=context, terminal_id=terminal_id,
                 lease_token=lease, strict_backend_registration=True,
+                uuid_lease_token=uuid_lease,
+                session_lifecycle_lease_token=lifecycle_lease,
             )
         except Exception as exc:
+            code = _normalize_creation_error(exc)
+            if code == "resume_in_progress":
+                return _result(row["name"], "skipped_busy", terminal_id,
+                               "rebind_in_progress", row.get("session_name") is None), None
+            if code == "owner_conflict":
+                return _result(row["name"], "skipped_live_owner", terminal_id,
+                               None, row.get("session_name") is None), None
             return _result(row["name"], "resume_failed", terminal_id,
-                           _normalize_creation_error(exc),
+                           code,
                            row.get("session_name") is None), None
         remark_error = None
         try:
@@ -142,6 +169,8 @@ async def _recover_row(row, session_name):
                        row.get("session_name") is None), source
     finally:
         release_rebind_lease(lease)
+        release_provider_session_lease(uuid_lease)
+        release_session_lifecycle_lease(lifecycle_lease)
 
 
 async def recover_epoch(session_name: str, base_names: list[str] | None = None) -> dict:

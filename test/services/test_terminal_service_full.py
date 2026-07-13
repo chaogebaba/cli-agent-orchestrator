@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.services import terminal_service as terminal_service_module
+
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -22,6 +24,14 @@ from cli_agent_orchestrator.services.terminal_service import (
     peek_terminal,
     send_input,
 )
+
+
+@pytest.fixture(autouse=True)
+def _legacy_direct_create_is_not_a_seed_capability(monkeypatch):
+    monkeypatch.setattr(
+        terminal_service_module, "get_provider_class",
+        lambda _name: type("Capability", (), {"supports_seed_resume_identity": False}),
+    )
 
 
 @pytest.mark.asyncio

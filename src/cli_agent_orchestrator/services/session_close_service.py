@@ -21,38 +21,45 @@ def close_session(session_name: str, *, keep_bases: bool = False, force: bool = 
                   registry=None) -> dict:
     from cli_agent_orchestrator.services import terminal_service
 
-    terminals = list_terminals_by_session(session_name)
-    registrations = list_ready_provider_sessions_for_session(session_name)
-    source_snapshot = {
-        row.get("source_terminal_id"): (
-            get_terminal_metadata(row["source_terminal_id"])
-            if row.get("source_terminal_id") else None
-        )
-        for row in registrations
-    }
-    scoped_base_sources = {row.get("source_terminal_id") for row in registrations}
-    intents_before = list_warm_intents(session_name)
-    for terminal in terminals:
-        owner = get_ready_provider_session_by_source_terminal(terminal["id"])
-        if owner is not None and terminal["id"] not in scoped_base_sources and not force:
-            raise PermissionError(
-                f"ready base '{owner['name']}' is not scoped to session {session_name}"
-            )
-        try:
-            profile = load_agent_profile(terminal.get("agent_profile"))
-        except (FileNotFoundError, TypeError):
-            profile = None
-        if profile is not None and profile.protected is True and not force:
-            raise PermissionError(f"protected profile '{profile.name}' requires force")
-
     leases = []
+    lifecycle_lease = None
     try:
+        from cli_agent_orchestrator.services.session_lifecycle_lease import (
+            acquire_session_lifecycle_exclusive,
+        )
+        lifecycle_lease = acquire_session_lifecycle_exclusive(session_name)
+        if lifecycle_lease is None:
+            raise RuntimeError("resume_in_progress")
+        terminals = list_terminals_by_session(session_name)
+        registrations = list_ready_provider_sessions_for_session(session_name)
+        source_snapshot = {
+            row.get("source_terminal_id"): (
+                get_terminal_metadata(row["source_terminal_id"])
+                if row.get("source_terminal_id") else None
+            )
+            for row in registrations
+        }
+        scoped_base_sources = {row.get("source_terminal_id") for row in registrations}
+        intents_before = list_warm_intents(session_name)
+        for terminal in terminals:
+            owner = get_ready_provider_session_by_source_terminal(terminal["id"])
+            if owner is not None and terminal["id"] not in scoped_base_sources and not force:
+                raise PermissionError(
+                    f"ready base '{owner['name']}' is not scoped to session {session_name}"
+                )
+            try:
+                profile = load_agent_profile(terminal.get("agent_profile"))
+            except (FileNotFoundError, TypeError):
+                profile = None
+            if profile is not None and profile.protected is True and not force:
+                raise PermissionError(f"protected profile '{profile.name}' requires force")
         for terminal in sorted(terminals, key=lambda row: row["id"]):
             token = acquire_rebind_lease(terminal["id"])
             if token is None:
                 raise RuntimeError("rebind_in_progress")
             leases.append(token)
         tokens = {token.terminal_id: token for token in leases}
+        terminal_service.preflight_session_teardown(terminals)
         terminal_outcomes = []
         delete_by_id = {}
         removed_stage1 = 0
@@ -70,6 +77,8 @@ def close_session(session_name: str, *, keep_bases: bool = False, force: bool = 
                 if mechanical.get("intent_error"):
                     intent_errors.append(mechanical["intent_error"])
             except Exception as exc:
+                if str(exc) == "resume_in_progress":
+                    raise
                 deleted = False
                 status = "delete_failed"
                 mechanical = {"intent_deleted": False, "intent_error": str(exc)}
@@ -138,3 +147,8 @@ def close_session(session_name: str, *, keep_bases: bool = False, force: bool = 
                 release_rebind_lease(token)
             except Exception:
                 pass
+        if lifecycle_lease is not None:
+            from cli_agent_orchestrator.services.session_lifecycle_lease import (
+                release_session_lifecycle_lease,
+            )
+            release_session_lifecycle_lease(lifecycle_lease)

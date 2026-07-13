@@ -246,6 +246,11 @@ class GrokCliProvider(BaseProvider):
             raise ProviderError("base_session_unset")
         return self.allocated_session_uuid
 
+    def resume_session_uuid(self) -> str | None:
+        if self._fork_context and self._fork_context.mode == "resume":
+            return self._fork_context.session_uuid
+        return None
+
     def validate_session_artifact(self, session_uuid: str, cwd: str) -> None:
         path = Path.home() / ".grok" / "sessions" / quote(cwd, safe="") / session_uuid / "chat_history.jsonl"
         if not path.is_file() or path.stat().st_size == 0:

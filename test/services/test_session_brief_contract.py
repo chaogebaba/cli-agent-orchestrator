@@ -10,6 +10,15 @@ from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.services import terminal_service as svc
 
 
+@pytest.fixture(autouse=True)
+def _legacy_direct_create_is_not_a_seed_capability(monkeypatch):
+    monkeypatch.delenv("CAO_SESSION_BRIEF_RELAX", raising=False)
+    monkeypatch.setattr(
+        svc, "get_provider_class",
+        lambda _name: type("Capability", (), {"supports_seed_resume_identity": False}),
+    )
+
+
 def _complete_manifest():
     return {
         "schema_version": "cao.session-manifest/v1", "generated_at": "now",

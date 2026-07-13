@@ -80,10 +80,10 @@ class TestMemoryFlag:
                 catch_exceptions=False,
             )
 
-            # Verify memory_manager param was sent
+            # WP2S3 start owns the boolean memory parameter.
             call_kwargs = mock_requests.post.call_args
             params = call_kwargs.kwargs.get("params") or call_kwargs[1].get("params", {})
-            assert params.get("memory_manager") == "true"
+            assert params.get("memory") == "true"
 
 
 # ---------------------------------------------------------------------------

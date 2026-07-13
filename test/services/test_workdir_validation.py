@@ -6,6 +6,14 @@ import pytest
 from cli_agent_orchestrator.services.terminal_service import create_terminal
 
 
+@pytest.fixture(autouse=True)
+def _legacy_direct_create_is_not_a_seed_capability(monkeypatch):
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.get_provider_class",
+        lambda _name: type("Capability", (), {"supports_seed_resume_identity": False}),
+    )
+
+
 @pytest.mark.parametrize("path", ["relative/path", "/does/not/exist", "/tmp"])
 def test_invalid_workdir_rejected_before_identifier_backend_or_db(path):
     with patch(

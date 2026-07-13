@@ -55,6 +55,53 @@ def session():
     """Manage CAO sessions."""
 
 
+@session.command("start")
+@click.argument("session_name", required=False)
+@click.option("--agents", required=True)
+@click.option("--provider")
+@click.option("--cwd", "working_directory")
+@click.option("--tools", "allowed_tools")
+@click.option("--env", "env_pairs", multiple=True)
+@click.option("--allow-incomplete-brief", is_flag=True)
+@click.option("--memory", is_flag=True)
+@click.option("--json", "as_json", is_flag=True)
+def start(session_name, agents, provider, working_directory, allowed_tools,
+          env_pairs, allow_incomplete_brief, memory, as_json):
+    """Start a CAO session through the canonical lifecycle API."""
+    from cli_agent_orchestrator.cli.commands.launch import _parse_env_pairs
+    params = {"agent_profile": agents}
+    if session_name:
+        params["session_name"] = session_name
+    if provider:
+        params["provider"] = provider
+    if working_directory:
+        params["working_directory"] = working_directory
+    if allowed_tools:
+        params["allowed_tools"] = allowed_tools
+    if allow_incomplete_brief:
+        params["allow_incomplete_brief"] = "true"
+    if memory:
+        params["memory"] = "true"
+    kwargs = {"params": params}
+    if env_pairs:
+        kwargs["json"] = {"env_vars": _parse_env_pairs(env_pairs)}
+    response = requests.post(f"{API_BASE_URL}/sessions/start", **kwargs)
+    payload = response.json()
+    if response.status_code == 422 and payload.get("bootstrap", {}).get("status") == "seed_failed":
+        click.echo(json.dumps(payload, indent=2) if as_json else
+                   f"bootstrap failed [{payload['bootstrap']['error_code']}]", err=True)
+        raise click.exceptions.Exit(2)
+    try:
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise click.ClickException(f"session start failed: {exc}")
+    if as_json:
+        click.echo(json.dumps(payload, indent=2))
+    else:
+        click.echo(f"Session created: {payload['session']['name']}")
+        click.echo(f"Terminal created: {payload['supervisor_terminal']['name']}")
+
+
 @session.command("manifest")
 @click.option("--session", "session_name")
 @click.option("--json", "as_json", is_flag=True)
@@ -235,83 +282,27 @@ def close(session_name, keep_bases, force, as_json):
 
 @session.command()
 @click.argument("session_name")
-@click.option("--terminal", "terminal_id", help="Target a specific terminal ID")
-@click.option(
-    "--workers",
-    is_flag=True,
-    help="Show all non-conductor terminals (ignored when --terminal is set)",
-)
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
-def status(session_name, terminal_id, workers, as_json):
-    """Show status of a session's conductor (or specific terminal)."""
+def status(session_name, as_json):
+    """Show the lifecycle status/v1 projection."""
     try:
-        if terminal_id:
-            target = _get_terminal(terminal_id)
-            all_terminals = []
-        else:
-            conductor_raw, all_terminals = _resolve_conductor(session_name)
-            target = _get_terminal(conductor_raw["id"])
+        response = requests.get(
+            f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/status"
+        )
+        response.raise_for_status()
+        result = response.json()
     except requests.exceptions.RequestException as e:
-        raise click.ClickException(f"Failed to connect to cao-server: {e}")
-
-    try:
-        output_data = _get_terminal_output(target["id"])
-        last_output = output_data.get("output")
-    except requests.exceptions.RequestException:
-        last_output = None
-
+        raise click.ClickException(f"failed to fetch session status: {e}")
     if as_json:
-        result = {
-            "session": session_name,
-            "conductor": {
-                "id": target["id"],
-                "agent_profile": target.get("agent_profile"),
-                "provider": target.get("provider"),
-                "status": target.get("status"),
-                "last_output": last_output,
-            },
-        }
-        if workers and not terminal_id:
-            result["workers"] = [
-                {
-                    "id": t["id"],
-                    "agent_profile": t.get("agent_profile"),
-                    "provider": t.get("provider"),
-                    "status": t.get("status"),
-                }
-                for t in all_terminals[1:]
-            ]
         click.echo(json.dumps(result, indent=2))
         return
-
-    click.echo(f"Session:  {session_name}")
-    click.echo(f"Terminal: {target['id']}")
-    click.echo(f"Agent:    {target.get('agent_profile', 'N/A')}")
-    click.echo(f"Provider: {target.get('provider', 'N/A')}")
-    click.echo(f"Status:   {target.get('status', 'N/A')}")
-
-    if last_output:
-        lines = last_output.splitlines()
-        truncated = lines[:20]
-        click.echo("\nLast response:")
-        click.echo("\n".join(truncated))
-        if len(lines) > 20:
-            click.echo(f"... ({len(lines) - 20} more lines)")
-    else:
-        click.echo("\nNo last response available")
-
-    if workers and not terminal_id:
-        worker_terminals = all_terminals[1:]
-        if worker_terminals:
-            click.echo(f"\n{'ID':<12} {'AGENT':<20} {'PROVIDER':<15} {'STATUS':<15}")
-            click.echo("-" * 65)
-            for t in worker_terminals:
-                click.echo(
-                    f"{t['id']:<12} {t.get('agent_profile', 'N/A'):<20} "
-                    f"{t.get('provider', 'N/A'):<15} {t.get('status', 'N/A'):<15}"
-                )
-        else:
-            click.echo("\nNo worker terminals")
+    click.echo(f"Session: {result['session']['name']}")
+    click.echo(f"Backend present: {str(result['backend_present']).lower()}")
+    click.echo(f"Epoch: {result['epoch']['count'] if result['epoch'] else 'none'}")
+    click.echo(f"Ready bases: {len(result['ready_bases'])}")
+    click.echo(f"Warm intents: {len(result['warm_intents'])}")
+    click.echo(f"Quarantined: {len(result['quarantined'])}")
+    click.echo("Ledger: unavailable")
 
 
 @session.command()

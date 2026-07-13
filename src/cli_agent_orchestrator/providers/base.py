@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 class BaseProvider(ABC):
     supports_fork_context: bool = False
     supports_reauth_rebind: bool = False
+    supports_seed_resume_identity: bool = False
     """Abstract base class for CLI tool providers.
 
     All CLI providers must inherit from this class and implement the abstract methods.
@@ -92,6 +93,9 @@ class BaseProvider(ABC):
 
     def capture_session_uuid(self, pane_pid: int, launch_time: float, cwd: str) -> str:
         raise NotImplementedError
+
+    def resume_session_uuid(self) -> str | None:
+        return None
 
     def validate_session_artifact(self, session_uuid: str, cwd: str) -> None:
         raise NotImplementedError

@@ -80,8 +80,9 @@ class TestTerminalOperations:
         with test_db.begin() as db:
             db.add_all([
                 TerminalModel(id="old", tmux_session="s", tmux_window="w1", provider="codex",
-                              recovery_state="fallback_starting"),
-                TerminalModel(id="new", tmux_session="s", tmux_window="w2", provider="codex"),
+                              recovery_state="fallback_starting", provider_session_id="uuid"),
+                TerminalModel(id="new", tmux_session="s", tmux_window="w2", provider="codex",
+                              provider_session_id="uuid"),
                 InboxModel(sender_id="sender", receiver_id="old", message="p",
                            status=MessageStatus.PENDING.value),
                 InboxModel(sender_id="sender", receiver_id="old", message="d",
