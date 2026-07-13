@@ -830,6 +830,29 @@ class ClaudeCodeProvider(BaseProvider):
                 return "\n".join(lines)
         return None
 
+    def read_composer_draft_state(self) -> str:
+        """Return empty/nonempty/unresolved without changing the composer."""
+        try:
+            from cli_agent_orchestrator.backends.registry import get_backend
+            from cli_agent_orchestrator.constants import PYTE_SCREEN_ROWS
+
+            backend = get_backend()
+            first = backend.get_history(
+                self.session_name, self.window_name,
+                tail_lines=PYTE_SCREEN_ROWS, strip_escapes=False,
+            )
+            second = backend.get_history(
+                self.session_name, self.window_name,
+                tail_lines=PYTE_SCREEN_ROWS, strip_escapes=False,
+            )
+            one = self.read_composer_draft(first.splitlines())
+            two = self.read_composer_draft(second.splitlines())
+            if one is None or two is None or one != two:
+                return "unresolved"
+            return "empty" if two == "" else "nonempty"
+        except Exception:
+            return "unresolved"
+
     @property
     def paste_submit_delay(self) -> float:
         # The newest Claude Code Ink TUI needs noticeably longer than the 0.3s

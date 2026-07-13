@@ -2,6 +2,7 @@
 
 import logging
 import os
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, cast
@@ -17,6 +18,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Index,
     create_engine,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
@@ -1496,16 +1498,42 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
         return False
 
 
+WPM1_EVIDENCE_KEYS = frozenset({
+    "boundary_authorized", "boundary_exhausted_at", "idle_observed_at",
+    "last_activity_at", "last_observed_status", "last_observed_ref",
+    "stalled_notified_at", "terminal_settled_at",
+})
+
+
+def _is_wpm1_evidence(value: str | None) -> bool:
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return isinstance(parsed, dict) and bool(WPM1_EVIDENCE_KEYS.intersection(parsed))
+
+
 def begin_delivery_attempt(messages, receiver_terminal_id: str, provider: str, payload_hash: str,
                            payload_length: int, pre_input_gen=None, pre_status_gen=None,
-                           evidence: str = "{}") -> str:
+                           evidence: str = "{}", prior_attempt_uuid: str | None = None) -> str:
     attempt_uuid = str(uuid.uuid4())
     with SessionLocal.begin() as db:
-        prior = (db.query(InboxDeliveryAttemptModel).join(
-                 InboxDeliveryAttemptMemberModel,
-                 InboxDeliveryAttemptMemberModel.attempt_uuid == InboxDeliveryAttemptModel.attempt_uuid)
-                 .filter(InboxDeliveryAttemptMemberModel.message_id == messages[0].id)
-                 .order_by(InboxDeliveryAttemptModel.started_at.desc()).first())
+        if prior_attempt_uuid is not None:
+            prior = db.query(InboxDeliveryAttemptModel).filter_by(
+                attempt_uuid=prior_attempt_uuid).one_or_none()
+            prior_members = {
+                member.message_id
+                for member in db.query(InboxDeliveryAttemptMemberModel).filter_by(
+                    attempt_uuid=prior_attempt_uuid).all()
+            }
+            if prior is None or prior_members != {message.id for message in messages}:
+                raise ValueError("WPM1 successor prior attempt does not match exact batch")
+        else:
+            prior = (db.query(InboxDeliveryAttemptModel).join(
+                     InboxDeliveryAttemptMemberModel,
+                     InboxDeliveryAttemptMemberModel.attempt_uuid == InboxDeliveryAttemptModel.attempt_uuid)
+                     .filter(InboxDeliveryAttemptMemberModel.message_id == messages[0].id)
+                     .order_by(InboxDeliveryAttemptModel.started_at.desc()).first())
         row = InboxDeliveryAttemptModel(
             attempt_uuid=attempt_uuid, receiver_terminal_id=receiver_terminal_id,
             provider=provider, payload_hash=payload_hash, payload_length=payload_length,
@@ -1513,7 +1541,7 @@ def begin_delivery_attempt(messages, receiver_terminal_id: str, provider: str, p
             prior_attempt_uuid=prior.attempt_uuid if prior else None,
             sender_id=messages[0].sender_id,
             orchestration_type=messages[0].orchestration_type.value,
-            evidence=evidence[:2048],
+            evidence=evidence if _is_wpm1_evidence(evidence) else evidence[:2048],
         )
         db.add(row)
         for position, message in enumerate(messages):
@@ -1558,7 +1586,10 @@ def settle_delivery_attempt(attempt_uuid: str, status: MessageStatus, outcome: s
                     {InboxModel.status: status.value}, synchronize_session=False)
                 return True
         row.outcome, row.reason, row.error = outcome, reason, error
-        row.evidence = evidence[:2048]
+        row.evidence = evidence if (
+            outcome == "ambiguous" and reason == "confirmation_timeout"
+            and _is_wpm1_evidence(evidence)
+        ) else evidence[:2048]
         row.settled_at = row.last_at = _utcnow()
         row.settled_status_gen = settled_status_gen
         ids = [x.message_id for x in db.query(InboxDeliveryAttemptMemberModel)
@@ -1648,6 +1679,232 @@ def list_attempt_member_ids(attempt_uuid: str) -> list[int]:
                 .filter_by(attempt_uuid=attempt_uuid)
                 .order_by(InboxDeliveryAttemptMemberModel.position).all())
         return [row.message_id for row in rows]
+
+
+def _evidence_object(value: str | None) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+
+def _run_wpm1_immediate(operation: Callable[[Any], str]) -> str:
+    """Run a paired WPM1 write with the frozen 3x1s busy policy."""
+    for _ in range(3):
+        db = SessionLocal()
+        prior_timeout = None
+        try:
+            prior_timeout = int(db.execute(text("PRAGMA busy_timeout")).scalar() or 0)
+            db.execute(text("PRAGMA busy_timeout=1000"))
+            db.execute(text("BEGIN IMMEDIATE"))
+            result = operation(db)
+            db.commit()
+            return result
+        except Exception as exc:
+            db.rollback()
+            message = str(exc).lower()
+            if "locked" not in message and "busy" not in message:
+                raise
+        finally:
+            try:
+                if prior_timeout is not None:
+                    db.execute(text(f"PRAGMA busy_timeout={prior_timeout}"))
+            finally:
+                db.close()
+    return "busy_aborted"
+
+
+def merge_wpm1_attempt_evidence(
+    attempt_uuid: str, message_ids: list[int], updates: dict[str, Any]
+) -> bool | str:
+    """Conditionally merge WPM1 evidence; contention is a closed retry stop."""
+    if not set(updates) <= WPM1_EVIDENCE_KEYS:
+        raise ValueError("non-WPM1 evidence key")
+
+    def operation(db) -> str:
+        row = db.query(InboxDeliveryAttemptModel).filter_by(
+            attempt_uuid=attempt_uuid, outcome="ambiguous", reason="confirmation_timeout"
+        ).first()
+        if row is None:
+            return "stale"
+        members = [x.message_id for x in db.query(InboxDeliveryAttemptMemberModel).filter_by(
+            attempt_uuid=attempt_uuid).all()]
+        if set(members) != set(message_ids):
+            return "stale"
+        pending = db.query(InboxModel).filter(
+            InboxModel.id.in_(message_ids), InboxModel.status == MessageStatus.PENDING.value
+        ).count()
+        if pending != len(message_ids):
+            return "stale"
+        evidence = _evidence_object(row.evidence)
+        evidence.update(updates)
+        row.evidence = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+        return "merged"
+
+    result = _run_wpm1_immediate(operation)
+    if result == "merged":
+        return True
+    if result == "stale":
+        return False
+    return result
+
+
+def _wpm1_batch_key(message_ids: list[int]) -> str:
+    return ",".join(str(value) for value in sorted(set(message_ids)))
+
+
+def _resolve_wpm1_recipient(db, sender_id: str, receiver_terminal_id: str) -> str | None:
+    if db.query(TerminalModel).filter_by(id=sender_id).first() is not None:
+        return sender_id
+    receiver = db.query(TerminalModel).filter_by(id=receiver_terminal_id).first()
+    caller_id = receiver.caller_id if receiver is not None else None
+    if caller_id and db.query(TerminalModel).filter_by(id=caller_id).first() is not None:
+        return cast(str, caller_id)
+    return None
+
+
+def record_wpm1_stalled_notice(
+    attempt_uuid: str, message_ids: list[int], receiver_terminal_id: str,
+    notified_at: str,
+) -> str:
+    """Atomically mark a stalled batch and enqueue its exactly-once notice."""
+    ids = sorted(set(message_ids))
+    header = f"wpm1-notice kind=stalled batch={_wpm1_batch_key(ids)}\n"
+
+    def operation(db) -> str:
+        row = db.query(InboxDeliveryAttemptModel).filter_by(
+            attempt_uuid=attempt_uuid, outcome="ambiguous", reason="confirmation_timeout"
+        ).first()
+        if row is None:
+            db.rollback()
+            return "stale"
+        members = {x.message_id for x in db.query(InboxDeliveryAttemptMemberModel).filter_by(
+            attempt_uuid=attempt_uuid).all()}
+        pending = db.query(InboxModel).filter(
+            InboxModel.id.in_(ids), InboxModel.status == MessageStatus.PENDING.value).count()
+        if members != set(ids) or pending != len(ids):
+            db.rollback()
+            return "stale"
+        evidence = _evidence_object(row.evidence)
+        if evidence.get("stalled_notified_at"):
+            return "already_recorded"
+        original = db.query(InboxModel).filter_by(id=ids[0]).one()
+        evidence["stalled_notified_at"] = notified_at
+        row.evidence = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+        recipient = _resolve_wpm1_recipient(db, original.sender_id, receiver_terminal_id)
+        if recipient is None:
+            logger.warning("WPM1 stalled notice has no live recipient for batch %s", ids)
+            return "logged_only"
+        sender = f"message-trace:{receiver_terminal_id}"
+        existing = db.query(InboxModel).filter(
+            InboxModel.sender_id == sender, InboxModel.receiver_id == recipient,
+            text("substr(message, 1, :n) = :header").bindparams(n=len(header), header=header),
+        ).first()
+        if existing is None:
+            db.add(InboxModel(
+                sender_id=sender, receiver_id=recipient,
+                message=header + "delivery stalled: receiver shows no progress / payload not yet "
+                "confirmed; no reinjection will occur while unproven; will confirm if consumed",
+                orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+                status=MessageStatus.PENDING.value,
+            ))
+        return "recorded"
+
+    return _run_wpm1_immediate(operation)
+
+
+def settle_wpm1_terminal_batch(
+    message_ids: list[int], status: MessageStatus, receiver_terminal_id: str,
+    *, reason: str | None = None, on_confirmed: Callable[[], None] | None = None,
+) -> str:
+    """Merge the terminal clock before the exact-batch CAS, with corrective notice."""
+    ids = sorted(set(message_ids))
+    clock = _utcnow().isoformat().replace("+00:00", "Z")
+    stalled_header = f"wpm1-notice kind=stalled batch={_wpm1_batch_key(ids)}\n"
+    corrective_header = f"wpm1-notice kind=corrective batch={_wpm1_batch_key(ids)}\n"
+
+    def operation(db) -> str:
+        attempts = (db.query(InboxDeliveryAttemptModel)
+                    .join(InboxDeliveryAttemptMemberModel,
+                          InboxDeliveryAttemptMemberModel.attempt_uuid ==
+                          InboxDeliveryAttemptModel.attempt_uuid)
+                    .filter(InboxDeliveryAttemptMemberModel.message_id.in_(ids),
+                            InboxDeliveryAttemptModel.outcome == "ambiguous",
+                            InboxDeliveryAttemptModel.reason == "confirmation_timeout")
+                    .order_by(InboxDeliveryAttemptModel.started_at.desc()).all())
+        target = next((row for row in attempts if {
+            x.message_id for x in db.query(InboxDeliveryAttemptMemberModel).filter_by(
+                attempt_uuid=row.attempt_uuid).all()} == set(ids)), None)
+        if target is None:
+            db.rollback()
+            return "stale"
+        pending = db.query(InboxModel).filter(
+            InboxModel.id.in_(ids), InboxModel.status == MessageStatus.PENDING.value).count()
+        if pending != len(ids):
+            db.rollback()
+            return "stale"
+        evidence = _evidence_object(target.evidence)
+        evidence["terminal_settled_at"] = clock
+        target.evidence = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+        if reason == "receiver_gone":
+            target.reason = reason
+        changed = db.query(InboxModel).filter(
+            InboxModel.id.in_(ids), InboxModel.status == MessageStatus.PENDING.value
+        ).update({InboxModel.status: status.value}, synchronize_session=False)
+        if changed != len(ids):
+            db.rollback()
+            return "stale"
+        if status == MessageStatus.DELIVERED:
+            any_stalled = any(_evidence_object(row.evidence).get("stalled_notified_at")
+                              for row in attempts)
+            if any_stalled:
+                sender = f"message-trace:{receiver_terminal_id}"
+                stalled = db.query(InboxModel).filter(
+                    InboxModel.sender_id == sender,
+                    text("substr(message, 1, :n) = :header").bindparams(
+                        n=len(stalled_header), header=stalled_header),
+                ).first()
+                if stalled is not None and db.query(TerminalModel).filter_by(
+                        id=stalled.receiver_id).first() is not None:
+                    existing = db.query(InboxModel).filter(
+                        InboxModel.sender_id == sender,
+                        InboxModel.receiver_id == stalled.receiver_id,
+                        text("substr(message, 1, :n) = :header").bindparams(
+                            n=len(corrective_header), header=corrective_header),
+                    ).first()
+                    if existing is None:
+                        db.add(InboxModel(
+                            sender_id=sender, receiver_id=stalled.receiver_id,
+                            message=corrective_header + "previously-stalled message was delivered",
+                            orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+                            status=MessageStatus.PENDING.value,
+                        ))
+                else:
+                    logger.warning("WPM1 corrective notice recipient is no longer available for batch %s", ids)
+            if on_confirmed is not None:
+                on_confirmed()
+        return "settled"
+
+    return _run_wpm1_immediate(operation)
+
+
+def has_inflight_callback_since(sender_id: str, receiver_id: str, since: datetime) -> bool:
+    """Whether this watchdog episode has a newer deferred/ambiguous callback."""
+    with SessionLocal() as db:
+        return db.query(InboxModel.id).join(
+            InboxDeliveryAttemptMemberModel,
+            InboxDeliveryAttemptMemberModel.message_id == InboxModel.id,
+        ).join(
+            InboxDeliveryAttemptModel,
+            InboxDeliveryAttemptModel.attempt_uuid == InboxDeliveryAttemptMemberModel.attempt_uuid,
+        ).filter(
+            InboxModel.sender_id == sender_id,
+            InboxModel.receiver_id == receiver_id,
+            InboxModel.created_at > since,
+            InboxModel.status == MessageStatus.PENDING.value,
+            InboxDeliveryAttemptModel.outcome.in_(("deferred", "ambiguous")),
+        ).first() is not None
 
 
 def transition_pending_to_delivery_failed(message_ids: list[int]) -> bool:

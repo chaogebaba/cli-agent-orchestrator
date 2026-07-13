@@ -2,6 +2,7 @@
 
 import logging
 import re
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -45,8 +46,72 @@ def cleanup_old_data():
 
         # Clean up old inbox messages
         with SessionLocal() as db:
-            old_ids = [x[0] for x in db.query(InboxModel.id).filter(
-                InboxModel.created_at < cutoff_date).all()]
+            old_rows = db.query(InboxModel).filter(InboxModel.created_at < cutoff_date).all()
+            old_ids_all = {row.id for row in old_rows}
+            gated_rows = (db.query(InboxDeliveryAttemptModel, InboxDeliveryAttemptMemberModel)
+                          .join(InboxDeliveryAttemptMemberModel,
+                                InboxDeliveryAttemptMemberModel.attempt_uuid ==
+                                InboxDeliveryAttemptModel.attempt_uuid)
+                          .filter(InboxDeliveryAttemptModel.outcome == "ambiguous",
+                                  InboxDeliveryAttemptModel.reason.in_((
+                                      "confirmation_timeout", "receiver_gone")))
+                          .all())
+            batch_by_attempt: dict[str, set[int]] = {}
+            for attempt, member in gated_rows:
+                batch_by_attempt.setdefault(attempt.attempt_uuid, set()).add(member.message_id)
+            attempts_by_batch: dict[tuple[int, ...], list] = {}
+            for attempt, _member in gated_rows:
+                key = tuple(sorted(batch_by_attempt[attempt.attempt_uuid]))
+                if attempt not in attempts_by_batch.setdefault(key, []):
+                    attempts_by_batch[key].append(attempt)
+            retained_ids: set[int] = set()
+            exempt_batches = 0
+            now_cutoff = cutoff_date.replace(tzinfo=timezone.utc)
+            for key, attempts in attempts_by_batch.items():
+                rows = db.query(InboxModel).filter(InboxModel.id.in_(key)).all()
+                if len(rows) != len(key):
+                    continue
+                clocks: list[datetime] = []
+                malformed = False
+                for attempt in attempts:
+                    try:
+                        evidence = json.loads(attempt.evidence or "{}")
+                        value = evidence.get("terminal_settled_at")
+                        if value is None:
+                            continue
+                        if not isinstance(value, str):
+                            malformed = True
+                            break
+                        clock = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                        clocks.append(clock if clock.tzinfo else clock.replace(tzinfo=timezone.utc))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        malformed = True
+                        break
+                pending = any(row.status == "pending" for row in rows)
+                retain = pending
+                if malformed:
+                    logger.warning("Malformed WPM1 terminal_settled_at for batch %s; retaining", key)
+                    retain = True
+                elif not clocks:
+                    logger.warning("Absent WPM1 terminal_settled_at for batch %s; retaining", key)
+                    retain = True
+                elif clocks and max(clocks) >= now_cutoff:
+                    retain = True
+                if retain:
+                    exempt_batches += 1
+                    retained_ids.update(key)
+
+            # Durable notice keys live exactly as long as their referenced batch.
+            notice_pattern = re.compile(
+                r"^wpm1-notice kind=(?:stalled|corrective) batch=([0-9]+(?:,[0-9]+)*)\n")
+            for row in old_rows:
+                if not row.sender_id.startswith("message-trace:"):
+                    continue
+                match = notice_pattern.match(row.message)
+                if match and set(map(int, match.group(1).split(","))) <= retained_ids:
+                    retained_ids.add(row.id)
+            old_ids = list(old_ids_all - retained_ids)
+            logger.info("Exempted %s gated WPM1 batch(es) from inbox cleanup", exempt_batches)
             attempt_ids = [x[0] for x in db.query(InboxDeliveryAttemptMemberModel.attempt_uuid)
                            .filter(InboxDeliveryAttemptMemberModel.message_id.in_(old_ids)).all()]
             if old_ids:
@@ -65,7 +130,8 @@ def cleanup_old_data():
                         InboxDeliveryAttemptModel.attempt_uuid.in_(orphaned_attempt_ids)).delete(
                         synchronize_session=False)
             deleted_messages = (
-                db.query(InboxModel).filter(InboxModel.created_at < cutoff_date).delete()
+                db.query(InboxModel).filter(InboxModel.id.in_(old_ids)).delete(
+                    synchronize_session=False)
             )
             db.commit()
             logger.info(f"Deleted {deleted_messages} old inbox messages from database")

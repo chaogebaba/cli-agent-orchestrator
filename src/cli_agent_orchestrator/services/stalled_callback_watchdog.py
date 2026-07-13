@@ -10,10 +10,12 @@ import threading
 import time
 import copy
 from dataclasses import dataclass
+from datetime import datetime
 
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     get_terminal_metadata,
+    has_inflight_callback_since,
     list_pending_receiver_ids,
 )
 from cli_agent_orchestrator.constants import (
@@ -46,6 +48,7 @@ class _Episode:
     caller_id: str
     profile: str
     inbound_at: float
+    inbound_wall_at: datetime
     callback_seen: bool = False
     fired: bool = False
     idle_since: float | None = None
@@ -111,6 +114,7 @@ class StalledCallbackWatchdog:
                 caller_id=caller_id,
                 profile=profile,
                 inbound_at=now,
+                inbound_wall_at=datetime.now(),
             )
 
     def has_episode(self, terminal_id: str) -> bool:
@@ -257,6 +261,10 @@ class StalledCallbackWatchdog:
                     continue
                 idle_seconds = int(now - episode.idle_since)
                 if idle_seconds < self.grace_seconds:
+                    continue
+                if has_inflight_callback_since(
+                    terminal_id, episode.caller_id, episode.inbound_wall_at
+                ):
                     continue
                 episode.fired = True
                 due.append(

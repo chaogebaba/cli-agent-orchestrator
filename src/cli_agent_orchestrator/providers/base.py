@@ -229,6 +229,10 @@ class BaseProvider(ABC):
         """
         return None
 
+    def read_composer_draft_state(self) -> str:
+        """Read-only WPM1 gate; unsupported providers fail closed."""
+        return "unresolved"
+
     @property
     def paste_submit_delay(self) -> float:
         """Seconds to wait after a bracketed paste before sending the Enter key.

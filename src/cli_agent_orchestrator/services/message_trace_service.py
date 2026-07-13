@@ -385,6 +385,43 @@ def transcript_lookup(path: Path, payload_hash: str, started_at=None,
                       "inode": after.st_ino, "size": after.st_size}
 
 
+def continuity_aware_lookup(
+    metadata: dict, payload_hash: str, started_at=None,
+    expected_ref: dict | None = None,
+) -> tuple[str, dict]:
+    """Resolve and search one transcript epoch without cross-epoch size comparison."""
+    resolution = resolve_session_transcript(metadata)
+    if resolution is None:
+        return "unresolved", {"kind": "transcript_unresolved"}
+    if isinstance(resolution, Path):
+        resolution = TranscriptResolution(resolution, "exact_id")
+    continuity_ref = dict(expected_ref or {})
+    current_path = continuity_ref.get("path")
+    reseed = (
+        resolution.resolution_kind == "binding"
+        and resolution.live_reference is not None
+        and bool(current_path)
+        and Path(str(current_path)) != resolution.path
+    )
+    extra: dict[str, str] = {}
+    if reseed:
+        old_path = str(current_path)
+        reference = resolution.live_reference
+        continuity_ref = {
+            "path": str(reference.path), "inode": reference.inode, "size": reference.size,
+        }
+        extra = {
+            "continuity_reseed": "binding_epoch",
+            "continuity_reseed_old_path": old_path,
+            "continuity_reseed_new_path": str(reference.path),
+        }
+    outcome, evidence = transcript_lookup(
+        resolution.path, payload_hash, started_at, continuity_ref,
+        scan_from_start=reseed,
+    )
+    return outcome, _with_resolution_evidence({**evidence, **extra}, resolution)
+
+
 def confirm_delivery(metadata: dict, payload_hash: str, started_at=None,
                      expected_ref: dict | None = None,
                      timeout: float = 10.0) -> tuple[str, dict]:
@@ -410,29 +447,9 @@ def confirm_delivery(metadata: dict, payload_hash: str, started_at=None,
         if isinstance(resolution, Path):
             resolution = TranscriptResolution(resolution, "exact_id")
         saw_resolution = True
-        path = resolution.path
-        current_path = continuity_ref.get("path")
-        if (resolution.resolution_kind == "binding" and
-                resolution.live_reference is not None and current_path and
-                Path(current_path) != path):
-            old_path = str(current_path)
-            reference = resolution.live_reference
-            continuity_ref = {
-                "path": str(reference.path), "inode": reference.inode,
-                "size": reference.size,
-            }
-            reseed_evidence = {
-                "continuity_reseed": "binding_epoch",
-                "continuity_reseed_old_path": old_path,
-                "continuity_reseed_new_path": str(reference.path),
-            }
-        else:
-            reseed_evidence = {}
-        outcome, evidence = transcript_lookup(
-            path, payload_hash, started_at, continuity_ref,
-            scan_from_start=bool(reseed_evidence),
-        )
-        last = (outcome, _with_resolution_evidence({**evidence, **reseed_evidence}, resolution))
+        outcome, evidence = continuity_aware_lookup(
+            metadata, payload_hash, started_at, continuity_ref)
+        last = (outcome, evidence)
         if last[0] == "hit":
             return last
         if last[0] == "absent":
@@ -441,7 +458,7 @@ def confirm_delivery(metadata: dict, payload_hash: str, started_at=None,
             # manufacture authoritative evidence under the same attempt.
             continuity_ref = {
                 **continuity_ref,
-                "path": last[1].get("path", str(path)),
+                    "path": last[1].get("path", str(resolution.path)),
                 "inode": last[1].get("inode"),
                 "size": last[1].get("size", 0),
             }
