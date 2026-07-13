@@ -1,6 +1,14 @@
 # WPM3 — WPM2 residual hardening (structure-enforce existing law; no new delivery semantics)
 
-Status: DRAFT r2 (2026-07-13). Micro-WP. Law base: WPM2 FROZEN r21 (`8ebd7ca`),
+Status: FROZEN r2 (2026-07-13). Micro-WP. Law base: WPM2 FROZEN r21 (`8ebd7ca`),
+
+FREEZE record (2026-07-13): dual zero-decision at r2 — codex empirical MAIN
+0B/0S/0N zero-decision YES (tmp/orch/codex-bpgate-wpm3-r2.md; focused
+WPM1+WPM2 161 passed), grok design double-check 0B/0S/1N YES
+(grok-bpgate-wpm3-r2.md; NIT = tombstone citation, fixed pre-freeze after
+supervisor verification against the frozen file). r1→r2: codex 3B/3S + grok
+2S/1N all folded; H5 withdrawn on frozen-law conflict. No further edits
+except through a new gate round.
 implemented at inner `7b8fc6d`, activated + drained-pass 2026-07-13
 (`tmp/orch/drain-wpm2.md`). WPM3 adds **no new delivery semantics**: every item
 enforces already-frozen WPM2 law where the r21 implementation satisfies it only
@@ -148,9 +156,10 @@ byte-identical; a migration that weakens an assertion is a gate blocker.
 ## H5 — WITHDRAWN at r2 (frozen-law conflict; codex r1 B1)
 
 r1 proposed always stamping `injection_completed_seq` across an S4
-admission→submit epoch mismatch. Frozen WPM2 S1.f states the OPPOSITE twice
-(frozen lines 750–756, 1296–1301): on token mismatch NO valid anchor is
-marked; the row settles anchor-less and stays permanently protected via
+admission→submit epoch mismatch. Frozen WPM2 states the OPPOSITE twice
+(frozen lines 446–449 fail-closed arms; 996–997 closed crash rule): on token
+mismatch or unavailable submit-seam snapshot NO valid anchor is marked; the
+attempt settles anchor-less and stays permanently protected via
 `anchor_missing`. Codex classifier check: current mismatch settlement →
 `anchor_missing` (permanent D2-only); the r1 proposal → `normal` (row could
 later exhaust/reinject — reopens the compact false-loss class). The grok S6
