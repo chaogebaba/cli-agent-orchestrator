@@ -426,8 +426,9 @@ state table is:
   token (construction restart, reset, or rebind).
 - `busy_initial` (permanent/protected; checked BEFORE the `normal` arm,
   independent of anchor validity/token equality): evidence carries a
-  structurally valid `busy_initial_submit` object. The paste was admitted by S4
-  while the receiver was non-ready; per the S1.b busy-initial exclusion no
+  structurally valid `busy_initial_submit` object. The paste was observed
+  non-ready at the S4 admission snapshot OR at the backend-submit seam
+  (either-observation rule, S1.f); per the S1.b busy-initial exclusion no
   boundary evidence for this attempt is ever sufficient. Exits: S1.a D2 hit or
   D1.1 receiver-gone only. A malformed `busy_initial_submit` object fails closed
   into this same protected reason (never into `normal`).
