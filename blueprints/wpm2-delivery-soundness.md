@@ -1,7 +1,36 @@
 # WPM2 — delivery soundness for busy receivers + alarm hygiene + seed stderr parse
 
-Status: DRAFT r3 (2026-07-13). Micro-WP, three independent slices sharing one gate
+Status: DRAFT r4 (2026-07-13). Micro-WP, three independent slices sharing one gate
 train. Builds directly on WPM1 (`8afb758`, FROZEN r9 law) and WP2S3 (`7651dc1`).
+
+r3→r4 changelog (folds codex r3 4B/1S + grok r3 1B; grok B1 ≡ codex B1
+convergent — the r3 anchor-writer seam was unlawful at HEAD):
+- S1.b/S1.f anchor lifecycle rebuilt (codex B1+B3, grok B1): anchor is marked by
+  `mark_injection_completed()` INSIDE the status-lock sequence domain at the
+  successful backend-submit seam (post-Enter, before provider/DB/plugin tail);
+  `send_prepared_input` returns it; it is carried in memory and persisted
+  atomically WITH the ambiguous settlement in `settle_delivery_attempt` (the
+  merge helper is NOT used pre-settlement — codex proved that write impossible:
+  unsettled attempt, DELIVERING members, merge returns False). Closed crash rule:
+  an ambiguous attempt persisted WITHOUT an anchor can NEVER authorize a loss
+  (fail-closed pending; D2 poll continues).
+- Sequence epochs (codex B2): every persisted/compared sequence is an
+  `{observation_epoch, seq}` pair; monitor construction, `reset_buffer`,
+  `clear_terminal`, and rebind each open a new epoch; cross-epoch integer
+  comparison BANNED; a complete same-epoch PROCESSING→ready cycle in an epoch
+  NEWER than the anchor's qualifies as post-injection (a level-ready recovery
+  sample never does).
+- Late-D2 destination (codex B4): terminal-settlement seam gains a closed
+  `confirmation_evidence` argument — winning lookup evidence merges into the
+  attempt that produced the hit; `terminal_settled_at` into the frozen newest
+  target; one transaction; same-row collapse + rowcount/member checks defined.
+- `queue_corroboration` encoding closed (codex S1): latest by transcript byte
+  offset; `op` ∈ {enqueue, popAll, remove}; `observed_at` = native record
+  timestamp when valid, else null (named rule, never invented).
+- New tests/mutants: anchor-persist lifecycle, submit→outer-return PROCESSING
+  race, restart-between-anchor-and-cycle, reset/rebind epoch, stale-old-epoch
+  mutant, old-predicate-restore mutant, initial-hit/late-hit/older-attempt-hit
+  trio.
 
 r2→r3 changelog (folds codex r2 3B + grok r2 2S/1N; codex verified S1.a hash
 stability, gen-exclusion, 30s reconciliation wake spine, S2 machine, S3):
@@ -99,17 +128,30 @@ claude_code attempt ONLY when ALL hold:
    D5 composer tri-state == `empty` (full D1.4/D5 inheritance — mandatory, not
    reopened).
 2. **Post-injection turn-cycle evidence** (excludes the incident's false-COMPLETED
-   class). Anchor: `injection_completed_seq` — a monotonic observation sequence
-   value captured atomically (same seq domain as S1.c snapshots) immediately
-   after `send_prepared_input` returns for this attempt, and persisted per S1.f.
+   class). Anchor: `injection_completed_seq` — an `{observation_epoch, seq}`
+   pair marked by `mark_injection_completed()` INSIDE the S1.c status-lock
+   sequence domain at the successful backend-submit seam: immediately after the
+   paste/Enter is accepted by the backend, BEFORE the provider-marking/DB/plugin
+   tail work inside `send_prepared_input` (codex r3 B3: a fast receiver can
+   enter PROCESSING during that tail — the anchor must precede it).
+   `send_prepared_input` returns the anchor; if paste/Enter raises, no anchor is
+   marked (existing failure handling; see the S1.f no-anchor fail-closed rule).
+   Persistence per S1.f (settlement-time, never pre-settlement).
    Attempt `last_at` is BANNED as the anchor: at HEAD it is timeout-settlement
    time (`settle_delivery_attempt` sets `settled_at = last_at`,
    `clients/database.py:1593`), ~13s after `started_at`, and the incident's real
    queue enqueue/popAll events fell INSIDE that interval — a `> last_at` rule
    would exclude legitimate cycles forever.
-   Cycle proof: the S1.c snapshot's transition latches satisfy
+   Cycle proof (epoch-aware, codex r3 B2): all sequence comparisons are lawful
+   ONLY within one `observation_epoch`. Same epoch as anchor: latches satisfy
    `last_non_ready_seq > injection_completed_seq` AND
-   `last_ready_seq > last_non_ready_seq`. Closed non-ready set: {PROCESSING}
+   `last_ready_seq > last_non_ready_seq`. Latch epoch NEWER than anchor epoch
+   (restart/reset/rebind between injection and now): a COMPLETE same-epoch
+   PROCESSING→ready cycle in the newer epoch qualifies as post-injection; a
+   level-ready recovery sample never does. Cross-epoch integer comparison is
+   BANNED. Epoch boundaries: monitor construction, `reset_buffer`,
+   `clear_terminal`, rebind (`status_monitor.py:758-798` reset surfaces).
+   Closed non-ready set: {PROCESSING}
    only — UNKNOWN and WAITING_USER_ANSWER never start a qualifying cycle (they
    are not turn evidence; loss proofs stay conservative). A level sample of
    COMPLETED after injection — the exact incident state — is NOT boundary
@@ -127,9 +169,9 @@ untouched.
 ### S1.c — atomic boundary observation + wake law (closes codex B3)
 
 - One **boundary-observation snapshot object** sampled under a single
-  lock/version, with these named fields (grok r2 S1): `status`, `status_gen`,
-  `input_gen`, `seq` (monotonic observation sequence), plus two transition
-  latches maintained under the SAME lock at observation time:
+  lock/version, with these named fields (grok r2 S1): `observation_epoch`,
+  `status`, `status_gen`, `input_gen`, `seq` (monotonic observation sequence),
+  plus two transition latches maintained under the SAME lock at observation time:
   `last_non_ready_seq` (seq of the most recent PROCESSING observation) and
   `last_ready_seq` (seq of the most recent {IDLE, COMPLETED} observation).
   Mixed reads of `get_status()` and `get_status_gen()` from different detections
@@ -165,27 +207,54 @@ wake selection, and D9 gated-PENDING detection semantics are unchanged.
 these additive keys — nothing else; unlisted keys keep raising
 `ValueError("non-WPM1 evidence key")`:
 
-- `injection_completed_seq` (int): written once, by the delivery path, via the
-  existing `merge_wpm1_attempt_evidence` conditional-merge seam, immediately
-  after `send_prepared_input` returns, targeting THE attempt row that performed
-  this injection (the row `begin_delivery_attempt` created for it).
-- `boundary_snapshot` (object: `{status, status_gen, input_gen, seq,
-  last_non_ready_seq, last_ready_seq}`): written only in the transaction that
-  writes `boundary_exhausted_at`, same attempt row, same merge seam — a loss
-  without its authorizing snapshot is unlawful.
-- `queue_corroboration` (object, latest-wins scalar — never an unbounded list:
-  `{op, offset, observed_at}` for the most recent hash-matching queue-operation
-  record): merged during D1/D2 evaluation, same seam.
+- `injection_completed_seq` (object `{observation_epoch, seq}`): marked in
+  memory per S1.b at the backend-submit seam, carried by the delivery path, and
+  persisted ATOMICALLY WITH the ambiguous settlement inside
+  `settle_delivery_attempt` — one transaction, targeting THE attempt row that
+  performed this injection. The `merge_wpm1_attempt_evidence` seam is NOT used
+  pre-settlement (codex r3 B1 proved that write impossible at HEAD: attempt
+  `outcome=None`, members DELIVERING, merge requires settled ambiguous +
+  all-PENDING and returns False). **Closed crash rule**: if the process dies
+  between submit and settlement, the attempt settles (or is recovered) WITHOUT
+  an anchor, and an anchor-less ambiguous attempt can NEVER authorize a loss —
+  fail-closed pending; S1.a/D2 confirmation remains the only exit.
+- `boundary_snapshot` (object: `{observation_epoch, status, status_gen,
+  input_gen, seq, last_non_ready_seq, last_ready_seq}`): written only in the
+  transaction that writes `boundary_exhausted_at`, same attempt row, via the
+  existing settled-attempt merge seam — a loss without its authorizing snapshot
+  is unlawful.
+- `queue_corroboration` (object, latest-wins scalar — never an unbounded list):
+  `{op, offset, observed_at}` where `op` ∈ closed set {enqueue, popAll, remove};
+  "latest" = greatest transcript byte offset among hash-matching records in the
+  lookup scan; `observed_at` = the native record's own timestamp when present
+  and parseable, else null (named rule — never synthesized from the observation
+  clock). Merged during D1/D2 evaluation on settled attempts, existing seam.
 - `kind` gains the new VALUE `transcript_queued_command` (existing key; no new
   key).
 
-Sole lawful writer: the existing WPM1 conditional-merge/settlement seams with
-their HEAD PENDING/member-set/rowcount/busy semantics unchanged — no second
-writer, no direct row UPDATE. Named mutants (must die): (m1) write a new key
-bypassing the allowlist; (m2) write `injection_completed_seq` or
-`boundary_snapshot` to a different attempt row than the injecting/exhausting
-one; (m3) write `boundary_exhausted_at` without `boundary_snapshot` in the same
-transaction.
+**Confirmation-evidence destination (closes codex r3 B4)**: the terminal
+settlement seam (`settle_wpm1_terminal_batch`) gains a closed
+`confirmation_evidence` argument. Target rule: the winning lookup evidence
+(including `kind=transcript_queued_command`) merges into the exact attempt that
+produced the hit; `terminal_settled_at` merges into the frozen newest-attempt
+target — both in the SAME transaction. When hit-attempt == newest target, the
+two merges collapse into one row update. Existing rowcount/member-set checks
+apply to both writes; lookup evidence is never discarded (`_handle_wpm1_gate`'s
+current `lookup_result, _` discard is corrected as part of this wiring).
+
+Lawful writers, complete list: (w1) `settle_delivery_attempt` extended to
+persist the in-memory anchor with ambiguous settlement; (w2) the existing
+settled-attempt conditional-merge seam for `boundary_snapshot`/
+`queue_corroboration`; (w3) the extended terminal-settlement transaction for
+confirmation evidence. No other writer, no direct row UPDATE; HEAD
+PENDING/member-set/rowcount/busy semantics unchanged everywhere except as
+stated in w1/w3. Named mutants (must die): (m1) write a new key bypassing the
+allowlist; (m2) write anchor or `boundary_snapshot` to a different attempt row
+than the injecting/exhausting one; (m3) write `boundary_exhausted_at` without
+`boundary_snapshot` in the same transaction; (m4) restore the pre-settlement
+merge predicate for the anchor (must fail the anchor-persist lifecycle test);
+(m5) authorize a loss from an anchor-less attempt; (m6) compare sequences
+across epochs.
 
 ### S1.e — historical backfill: OUT (closes codex S1, grok S4)
 
@@ -211,8 +280,20 @@ as a residual; any future backfill is its own gated slice.
   the cycle still qualifies (anchor is injection completion, not settlement);
   loss provable on the next evaluation. Anti-test: the same events anchored on
   `last_at` would wrongly disqualify — asserts the ban.
-- **S1.f schema law**: named mutants m1–m3 (allowlist bypass, wrong-attempt
-  write, exhaustion-without-snapshot) all die; unlisted-key write raises.
+- **S1.f schema law**: named mutants m1–m6 all die; unlisted-key write raises.
+- **Anchor lifecycle (codex r3 B1)**: begin → submit-seam mark → ambiguous
+  settlement persists anchor atomically; m4 (pre-settlement merge predicate
+  restored) fails this test. Crash-cut: kill between submit and settlement →
+  anchor-less attempt → no loss ever authorized (m5 dies).
+- **Submit race (codex r3 B3)**: PROCESSING observation injected AFTER
+  backend submit but BEFORE `send_prepared_input` returns → cycle still
+  qualifies (anchor marked at submit seam, not at return).
+- **Epoch law (codex r3 B2)**: restart between anchor and cycle → new-epoch
+  complete cycle authorizes; level-ready recovery sample does not;
+  reset_buffer/rebind open epochs; m6 (cross-epoch compare) dies.
+- **Confirmation destination (codex r3 B4)**: initial-hit, late-hit with one
+  attempt, late-hit landing on an OLDER attempt than the newest settlement
+  target — evidence rows land per the S1.f target rule in all three.
 - **Never-cycling receiver**: no delivery_failed within any horizon; D1.3/D8
   stalled notice exactly once; D9 retention holds.
 - **Oracle priority**: native user-turn AND queued_command both present → one
@@ -267,6 +348,39 @@ Evidence bar:
 - **Wiring mutant (named)**: re-enable `fired` reset on caller SEND_MESSAGE
   (the HEAD bug) — the PRIMARY test must fail (kill).
 
+## S4 — claude_code delivery latency (busy-injection, NEW in r4)
+
+Origin (user pain, 2026-07-13, same session as incident-1858): worker callbacks
+to a busy supervisor arrive minutes late — the delivery gate waits for ready
+status, so total latency ≈ the receiver's own turn length (observed ~9 min for
+the codex r3 gate verdict). The receiver's harness has a NATIVE mid-turn queue
+(the queued_command mechanism S1.a confirms against); waiting for ready is
+unnecessary for claude_code.
+
+**Law**: for claude_code receivers, INITIAL injection of a message no longer
+requires receiver status ∈ {IDLE, COMPLETED}. It requires only: D5 composer
+tri-state == `empty` (inherited unchanged — never paste over a draft; `unknown`
+holds, fail-closed) AND no other injection in flight to that terminal. This is
+an EXPLICIT, NARROW SUPERSESSION of WPM1 D1.4's ready-status requirement,
+scoped to initial injection on claude_code only. Justification: D1.4's ready
+gate existed because busy delivery was unconfirmable under the proof-only law;
+S1.a makes it confirmable (queued_command evidence). CORRECTIVE re-injection
+(the D1 step-6 path) keeps the FULL S1.b boundary discipline — S4 never
+relaxes loss proofs or reinjection, only the first paste.
+
+Expected behavior: first injection within one scheduler pass (≤ ~30s
+reconciliation period) regardless of receiver busyness; confirmation typically
+arrives late via `transcript_queued_command` at the receiver's next turn
+boundary; attempt chain length stays 1.
+
+Evidence bar:
+- Busy receiver, message sent → injection within one pass, exactly 1 injection,
+  confirm via queued_command on flush, DELIVERED, chain length 1.
+- Composer `nonempty`/`unknown` → hold (unchanged D5 behavior), no injection.
+- Non-claude receivers → HEAD gating byte-unchanged.
+- Corrective path unaffected: a reinjection-eligible batch still requires the
+  full S1.b cycle proof (wiring mutant: S4 gate applied to step-6 must die).
+
 ## S3 — WP2S3 C1: seed UUID capture reads stderr
 
 **Impl pinned (single)**: the seed invocation runs with `stderr=subprocess.STDOUT`
@@ -299,6 +413,15 @@ Evidence bar:
   S2 seam = assignment stalled-callback alarm hygiene only).
 - Upstream v2.3.0 merge content (`7148c58`, inner) — same activation train, not
   gated here beyond the standard full suite.
+
+## Expedited subset (shipped ahead under user priority, 2026-07-13)
+
+S1.a oracle widen + the S2 fired-latch/immutable-D4-bound subset are being
+built and single-round-reviewed AHEAD of this blueprint's freeze (live token
+burn; both pieces individually dual-lane-ratified by r2/r3 reviews). The WPM2
+build proper rebases on that patched tree; this blueprint remains the law for
+the full feature, and the diff gate verifies the subset's final form against
+it like any other code.
 
 ## Gate plan
 
