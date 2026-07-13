@@ -1,7 +1,25 @@
 # WPM2 — delivery soundness for busy receivers + alarm hygiene + seed stderr parse
 
-Status: DRAFT r5 (2026-07-13). Micro-WP, three independent slices sharing one gate
+Status: DRAFT r6 (2026-07-13). Micro-WP, three independent slices sharing one gate
 train. Builds directly on WPM1 (`8afb758`, FROZEN r9 law) and WP2S3 (`7651dc1`).
+
+r5→r6 changelog (folds codex r5 3B/2S/1N + grok r5 1S; supervisor
+direction pin = proof-safe queue release, not strict-FIFO starvation):
+- Anchor-less/crash-recovered D2-only batches remain permanently non-reinjectable,
+  but `_handle_wpm1_gate` returns a dedicated `skip_d2_only` result after a D2
+  miss; `deliver_pending` excludes that durable member set for the pass and may
+  service the next DISJOINT batch. Default-one selection and restart behavior are
+  closed below; uncertain heads no longer starve all later callbacks.
+- S4 initial admission now searches ALL prior attempt-member sets that overlap
+  the candidate. Any overlap not proven never submitted blocks initial paste;
+  exact-set regrouping can no longer bypass submission history.
+- Epoch tokens are causal only by equality: token mismatch is unconditionally
+  D2-only in this slice. Reset/rebind PROCESSING→ready is lifecycle activity, not
+  loss proof; no queue-invalidation fact is introduced.
+- DELIVERING exclusion is a DB-backed preflight under the delivery lock before
+  attempt mutation, plus an atomic open and post-open exact-self invariant.
+- Expedited subset wording now records committed SHA `f309165`; S4 explicitly
+  supersedes only the Claude initial-readiness seam, never WPM1 D1.4 wholesale.
 
 r4→r5 changelog (folds codex r4 4B/1S; grok r4 already BUILDABLE YES):
 - Startup recovery joins the S1 proof-only seam: every stale open Claude
@@ -11,10 +29,11 @@ r4→r5 changelog (folds codex r4 4B/1S; grok r4 already BUILDABLE YES):
   route is forbidden for this population.
 - `observation_epoch` is now an opaque fresh token (UUID) per monitor
   construction and reset/rebind boundary. Tokens are equality-only: same-token
-  integer comparisons are lawful; different-token qualification requires a
-  complete PROCESSING→ready pair in the monitor's CURRENT token.
+  integer comparisons are lawful. r5's former different-token/current-cycle
+  qualification is superseded by r6's unconditional D2-only mismatch law.
 - S4 is zero-decision: exact initial-attempt classification, delivery-lock /
-  DELIVERING authority, durable-ambiguous FIFO policy, and unconditional
+  DELIVERING authority, durable-ambiguous FIFO policy (superseded by r6's
+  proof-safe release for crash-recovered D2-only heads), and unconditional
   supersession of `EAGER_INBOX_DELIVERY` for Claude initial delivery are pinned.
   Real busy-Claude D5 captures and an unmocked end-to-end parser test are required.
 - S4 uses the real D5 vocabulary `empty | nonempty | unresolved`; capture failure
@@ -31,12 +50,11 @@ convergent — the r3 anchor-writer seam was unlawful at HEAD):
   unsettled attempt, DELIVERING members, merge returns False). Closed crash rule:
   an ambiguous attempt persisted WITHOUT an anchor can NEVER authorize a loss
   (fail-closed pending; D2 poll continues).
-- Sequence epochs (codex B2, superseded/closed by r5 token law): every
+- Sequence epochs (codex B2, superseded/closed by r5/r6 token law): every
   persisted/compared sequence is an `{observation_epoch, seq}` pair; monitor
   construction, `reset_buffer`, `clear_terminal`, and rebind each open a fresh
-  opaque token; cross-token integer comparison/order is BANNED; a complete
-  PROCESSING→ready cycle in the monitor's CURRENT token may qualify after a
-  token change (a level-ready recovery sample never does).
+  opaque token; cross-token integer comparison/order is BANNED. r6 further pins
+  every token mismatch D2-only; lifecycle cycles never qualify after a change.
 - Late-D2 destination (codex B4): terminal-settlement seam gains a closed
   `confirmation_evidence` argument — winning lookup evidence merges into the
   attempt that produced the hit; `terminal_settled_at` into the frozen newest
@@ -166,10 +184,12 @@ claude_code attempt ONLY when ALL hold:
    integer sequence comparisons are lawful ONLY when their token strings are
    equal. Same token as anchor: latches satisfy
    `last_non_ready_seq > injection_completed_seq` AND
-   `last_ready_seq > last_non_ready_seq`. Different token from anchor
-   (construction/reset/rebind between injection and now): qualification requires
-   a COMPLETE PROCESSING→ready pair whose two latches and sampled snapshot all
-   carry the monitor's CURRENT token; latches reset when that token opens. A
+   `last_ready_seq > last_non_ready_seq`. **Different token from anchor is
+   unconditionally D2-only in this slice**: no PROCESSING→ready pair in a reset,
+   reconstructed, or rebound monitor can authorize loss or reinjection, because
+   the epoch-opening lifecycle itself can generate that pair. A future exception
+   would require a separately gated, durable proof-bearing queue-invalidation
+   fact emitted by the epoch-opening operation; WPM2 defines no such fact. A
    stale old-token pair, a mixed old/current pair, and a level-ready current-token
    sample never qualify. Cross-token integer comparison is BANNED. Both the
    anchor and boundary snapshot persist the literal token string, never a hash,
@@ -237,6 +257,39 @@ confirm later, but can never write exhaustion or authorize a successor paste.
 The current `interrupted/proven_absent → normal retry` route is forbidden for this
 Claude population. Receiver-gone terminal failure and non-Claude recovery remain
 unchanged. Wake selection and D9 gated-PENDING detection semantics are unchanged.
+
+**Proof-safe queue release (r6 direction pin)**: a recovered anchor-less attempt
+carrying `crash_recovery` remains the immutable D2-only head for ITS member set,
+but no longer owns the whole terminal queue. Mechanics are closed:
+
+1. The DB layer adds an oldest-first, cursor/paginated pending scan for one
+   receiver that accepts an `excluded_message_ids` set. Unlike
+   `get_pending_messages(..., limit=1)`, the scan applies the exclusion in SQL
+   BEFORE its requested result limit, so default `num_messages=1` returns the
+   oldest non-excluded row; `num_messages=0` returns up to the existing 100
+   non-excluded rows. Pagination continues past any number of protected heads;
+   existing contiguous sender/orchestration grouping applies only after this
+   filtered selection.
+2. Under the delivery lock, `deliver_pending` first evaluates each oldest
+   crash-recovered D2-only attempt using its durable, immutable member set from
+   `inbox_delivery_attempt_member`. `_handle_wpm1_gate` runs D2 first. A hit
+   settles that set normally; a miss returns the NEW internal control result
+   `skip_d2_only(attempt_uuid, member_ids)` instead of generic `stop`. This is
+   control vocabulary only, not a persisted outcome/status.
+3. On `skip_d2_only`, `deliver_pending` adds exactly those member IDs to the
+   pass-local exclusion set and selects again. It performs NO `begin_delivery_attempt`,
+   no exhaustion write, no status transition, and no backend send for the
+   protected set. Generic `stop` retains HEAD's return behavior.
+4. A later candidate may proceed only when its member set is DISJOINT from every
+   protected set and passes the overlap/S4 and DELIVERING preflights below. Its
+   attempt chain, cap, hash, and confirmation are independent; servicing it does
+   not confirm, exhaust, reorder, or consume the older head's injection budget.
+   The protected head stays PENDING in original created-at order and is D2-checked
+   again on later reconciliation wakes.
+
+This explicitly supersedes strict terminal-wide FIFO only for crash-recovered
+D2-only heads. It preserves WPM1's one-injection law per durable member set while
+preventing an uncertain permanently-absent head from starving later callbacks.
 
 ### S1.f — closed additive evidence schema + sole lawful writer (closes codex r2 B2)
 
@@ -335,16 +388,18 @@ as a residual; any future backfill is its own gated slice.
 - **Submit race (codex r3 B3)**: PROCESSING observation injected AFTER
   backend submit but BEFORE `send_prepared_input` returns → cycle still
   qualifies (anchor marked at submit seam, not at return).
-- **Epoch law (codex r3 B2)**: restart between anchor and cycle → new-epoch
-  complete current-token cycle authorizes; level-ready recovery sample does not;
-  construction/reset_buffer/rebind open fresh opaque tokens; same token permits
-  integer comparison, different tokens never do. Old-token snapshot against a
+- **Epoch law (codex r3 B2/r5 B3)**: construction/reset_buffer/rebind open fresh
+  opaque tokens; same-token integer comparison may authorize only the complete
+  anchored cycle above, while every token mismatch is D2-only. Rebind/reset
+  initialization may complete PROCESSING→ready with the payload transcript-absent
+  and still writes NO loss/reinject authorization. Old-token snapshot against a
   current-token monitor and mixed old/current latch pairs do not qualify; m6
-  (ordered/cross-token compare) dies.
+  (ordered/cross-token compare or mismatch-cycle authorization) dies.
 - Named token tests: `test_wpm2_old_token_snapshot_cannot_qualify_current_monitor`,
   `test_wpm2_mixed_token_latches_cannot_qualify`, and
-  `test_wpm2_current_token_complete_cycle_qualifies_after_reset`. The first two
-  are the required old-token/current-token mismatch pins.
+  `test_wpm2_rebind_reset_cycle_with_absent_payload_stays_d2_only`. All three are
+  old-token/current-token mismatch pins; the last uses the real rebind/reset
+  ordering and kills authorization from its initialization cycle.
 - **Crash recovery (codex r4 B1)**: real injection submit succeeds, process dies
   before anchor settlement, startup recovery runs, then multiple reconciliation
   wakes occur before queued-command confirmation → exactly ONE total injection,
@@ -352,6 +407,18 @@ as a residual; any future backfill is its own gated slice.
   `interrupted/proven_absent → normal reinject` must produce a second paste and die.
   Named test: `test_wpm2_crash_recovery_stays_d2_only_across_reconcile_wakes`;
   the m7 mutation is killed by that same injection-count assertion.
+- **Crash cuts + queue release (codex r5 B1/S1)**:
+  `test_wpm2_crash_before_submit_protects_head_and_releases_disjoint_callback`
+  kills the process after `begin_delivery_attempt` but before backend submit;
+  `test_wpm2_crash_after_submit_protects_head_and_releases_disjoint_callback`
+  kills after submit but before settlement. Both recover the head D2-only, never
+  paste it again, and inject a later disjoint callback exactly once. Named liveness
+  test `test_wpm2_permanently_absent_head_does_not_starve_later_callbacks` runs
+  multiple reconciliation wakes: the head remains PENDING/absent with one total
+  injection maximum, while each later disjoint callback progresses under its own
+  one-injection chain. Removing SQL exclusion-before-limit, mapping
+  `skip_d2_only` back to generic `stop`, or calling begin/send for excluded IDs
+  must fail these tests.
 - **Confirmation destination (codex r3 B4)**: initial-hit, late-hit with one
   attempt, late-hit landing on an OLDER attempt than the newest settlement
   target — evidence rows land per the S1.f target rule in all three.
@@ -422,19 +489,24 @@ unnecessary for claude_code.
 requires receiver status ∈ {IDLE, COMPLETED}. It requires D5 composer tri-state
 == `empty` (inherited unchanged — never paste over a draft; `nonempty` and
 `unresolved` hold fail-closed) and the concurrency/queue authorities below.
-This is an EXPLICIT, NARROW SUPERSESSION of WPM1 D1.4's ready-status requirement,
-scoped to initial injection on claude_code only. Justification: D1.4's ready
-gate existed because busy delivery was unconfirmable under the proof-only law;
-S1.a makes it confirmable (queued_command evidence). CORRECTIVE re-injection
+This supersedes ONLY the WPM1 D1.4 **initial-injection readiness seam** in HEAD
+`deliver_pending` for the first Claude paste; it does NOT supersede D1.4
+wholesale. S1.b.1's ready ∩ empty gate for loss proof and corrective reinjection
+remains mandatory and byte-law intact. The initial ready gate existed because
+busy delivery was unconfirmable under the proof-only law; S1.a makes it
+confirmable (queued_command evidence). CORRECTIVE re-injection
 (the D1 step-6 path) keeps the FULL S1.b boundary discipline — S4 never
 relaxes loss proofs or reinjection, only the first paste.
 
-**Exact `initial` classification** (per exact member-set/batch attempt history):
+**`Initial` classification with overlap safety**:
 
-- No prior attempt, or only `deferred` attempts whose reasons prove input was
-  never submitted (`delivery_deferred` / `input_blocked`) → initial; retry may
-  use S4 after D5 returns `empty`.
-- An r5 startup-recovered `ambiguous/confirmation_timeout` attempt carrying
+- Before S4 admission, `list_overlapping_attempts(candidate_message_ids)` queries
+  durable attempt membership for ALL prior attempts
+  whose member set intersects the candidate member set. No overlaps, or overlaps
+  consisting ONLY of `deferred` attempts with the closed proven-never-submitted
+  reasons `delivery_deferred` / `input_blocked` → initial; retry may use S4 after
+  D5 returns `empty`.
+- A WPM2 startup-recovered `ambiguous/confirmation_timeout` attempt carrying
   S1.f `crash_recovery` → NOT initial; possibly submitted, permanently D2-only
   until confirmation. Any legacy/other startup-recovered `interrupted` history
   is likewise NOT initial and never gains S4 eligibility.
@@ -445,16 +517,32 @@ relaxes loss proofs or reinjection, only the first paste.
   existing terminal failure handling and are never silently retried by S4.
 - Other `interrupted` reasons retain HEAD behavior and do not gain S4 eligibility;
   only the two proven-never-submitted deferred reasons above can re-enter initial.
+- Any other overlapping attempt — including open/outcome-null, crash-recovered,
+  ambiguous, confirmed, failed, unresolved, anchored, or interrupted — blocks
+  S4 initial eligibility for the ENTIRE candidate batch. Exact-set equality is
+  neither required nor sufficient; overlap is the authority. Thus regrouping
+  `[m1,m2] → [m1]` and `[m1] → [m1,m2]` cannot repaste `m1`.
 
-**Concurrency and queue authority**: the existing per-terminal delivery lock is
-the exclusive injection lease. An initial paste may occur only while this call
-owns that lock and there is no OTHER DELIVERING transaction for the terminal;
-the attempt opened for this same batch is not "other." Distinct durable
-`ambiguous/confirmation_timeout` batches impose FIFO head-of-line blocking:
-the oldest batch remains the only D2/reconciliation subject until it confirms or
-reaches a lawful terminal arm; later distinct PENDING batches do not paste around
-it. They are not collapsed into the older payload and do not consume its cap.
-This policy gives one concurrent paste maximum and one proof chain per batch.
+**Concurrency and DELIVERING authority**: the existing per-terminal delivery
+lock is the process-local injection lease, but it is never sufficient alone.
+While holding that lock and BEFORE `begin_delivery_attempt` or any other attempt/
+message mutation, S4 calls `list_delivering_attempts_for_terminal(terminal_id)`,
+which joins DELIVERING inbox rows to attempt members. Any row blocks admission.
+Opening uses `begin_delivery_attempt_if_no_other_delivering(...)` on the existing
+bounded `_run_wpm1_immediate` / `BEGIN IMMEDIATE` spine: re-run the same
+no-DELIVERING query, insert the candidate
+attempt/members, mark them DELIVERING, then post-open query before commit. The
+post-open result must be exactly `{just_created_attempt_uuid}` with exactly the
+candidate member set. Any precheck conflict or post-open mismatch rolls back the
+whole helper transaction, leaves candidate messages PENDING, and performs no
+paste; the caller returns/retries on a later wake. Therefore the just-created
+attempt is the sole DELIVERING exception only AFTER the atomic open succeeds.
+
+Distinct durable ambiguous batches follow the proof-safe release policy in
+S1.d: crash-recovered D2-only member sets are skipped without paste, and later
+DISJOINT batches may proceed. Ordinary non-protected ambiguous batches retain
+their S1/WPM1 gate behavior. No batch is collapsed into another payload or cap;
+this gives one concurrent paste maximum and one proof chain per member set.
 
 **Eager flag interaction**: S4 SUPERSEDES `EAGER_INBOX_DELIVERY` for this exact
 Claude initial-delivery arm. A Claude PROCESSING receiver with D5 `empty` is
@@ -487,10 +575,19 @@ Evidence bar:
   crash-recovered ambiguous, startup-recovered interrupted, ordinary ambiguous,
   confirmed/anchored, generic failed, and other interrupted histories are not.
   Mutation treating crash-recovered/interrupted or failed as initial must die.
-- Two distinct messages while the first is DELIVERING/ambiguous: delivery lock
-  admits at most one concurrent paste; after ambiguous settlement the second
-  stays FIFO-blocked while D2 reconciles the first. Mutation bypassing the lock
-  or allowing the second batch to paste around the first must die.
+- Overlap regrouping: named tests
+  `test_wpm2_superset_attempt_blocks_subset_initial_repaste` (`[m1,m2]→[m1]`)
+  and `test_wpm2_subset_attempt_blocks_superset_initial_repaste`
+  (`[m1]→[m1,m2]`) cover every non-proven-never-submitted outcome class. Mutants
+  restoring exact-member-set-only lookup or ignoring overlap must die.
+- DELIVERING atomicity: named test
+  `test_wpm2_s4_preflight_and_post_open_allow_only_created_attempt` asserts the
+  preflight occurs under the held delivery lock before mutation and the committed
+  post-open set is exact-self. A coordinated second-connection test attempts a
+  conflicting open. Mutations removing the DB QUERY (outer preflight or atomic
+  helper query), retaining only the process lock, or omitting the post-open query
+  must die. Crash-recovered protected head + later disjoint candidate remains
+  admissible because the head is PENDING, not DELIVERING.
 - `EAGER_INBOX_DELIVERY=false` still permits the exact Claude S4 initial arm;
   non-Claude behavior remains flag-gated. Mutants making the flag disable S4 or
   making S4 supersede the flag globally must die.
@@ -531,14 +628,14 @@ Evidence bar:
 - Upstream v2.3.0 merge content (`7148c58`, inner) — same activation train, not
   gated here beyond the standard full suite.
 
-## Expedited subset (shipped ahead under user priority, 2026-07-13)
+## Expedited subset (committed ahead under user priority, 2026-07-13)
 
-S1.a oracle widen + the S2 fired-latch/immutable-D4-bound subset are being
-built and single-round-reviewed AHEAD of this blueprint's freeze (live token
-burn; both pieces individually dual-lane-ratified by r2/r3 reviews). The WPM2
-build proper rebases on that patched tree; this blueprint remains the law for
-the full feature, and the diff gate verifies the subset's final form against
-it like any other code.
+Commit `f309165` contains the S1.a oracle widen plus the S2 fired-latch /
+immutable-D4-bound subset after its expedited build and review (live token burn;
+both pieces individually dual-lane-ratified by r2/r3 reviews). It is an ancestor
+of the WPM2 build baseline. The full build extends those committed bytes; this
+blueprint remains the law for the complete feature, and the diff gate reviews
+the combined baseline-relative WPM2 diff normally.
 
 ## Gate plan
 
