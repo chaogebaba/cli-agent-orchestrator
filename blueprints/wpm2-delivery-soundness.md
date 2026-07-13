@@ -1,7 +1,24 @@
 # WPM2 — delivery soundness for busy receivers + alarm hygiene + seed stderr parse
 
-Status: DRAFT r2 (2026-07-13). Micro-WP, three independent slices sharing one gate
+Status: DRAFT r3 (2026-07-13). Micro-WP, three independent slices sharing one gate
 train. Builds directly on WPM1 (`8afb758`, FROZEN r9 law) and WP2S3 (`7651dc1`).
+
+r2→r3 changelog (folds codex r2 3B + grok r2 2S/1N; codex verified S1.a hash
+stability, gen-exclusion, 30s reconciliation wake spine, S2 machine, S3):
+- S1.b: injection anchor corrected — `injection_completed_seq` captured atomically
+  after `send_prepared_input` returns; attempt `last_at` BANNED as boundary (it is
+  timeout-settlement time at HEAD, `clients/database.py:1593`); closed non-ready
+  set = {PROCESSING}; cycle proof via persisted transition-latch seqs; new
+  cycle-during-confirm-window true-loss test (codex B1).
+- S1.f NEW: closed additive evidence schema + sole lawful writer through the
+  existing `WPM1_EVIDENCE_KEYS` conditional-merge seam; named bypass/wrong-attempt
+  mutants (codex B2).
+- S1.a: lookups inherit existing continuity-ref semantics (started_at window,
+  inode/size continuity) unchanged (grok S2).
+- S2: immutable `episode_started_wall_at` pinned as D4 query lower bound; JOIN
+  never touches D4 scope, `fired`, `idle_since`, or grace; ordering suppression
+  test added (codex B3).
+- Snapshot latch keys named explicitly (grok S1).
 
 r1→r2 changelog (folds codex r1 4B/2S + grok r1 3B/4S/2N, both lanes):
 - S1 rebuilt: pinned Claude-native consumption oracle (queued_command attachment
@@ -69,7 +86,9 @@ order, for the exact wire payload hash:
 
 The MSGTRACE RESIDUAL-2 carve-out (no binding → no oracle) is unchanged: S1.a
 widens recognized record shapes WITHIN a resolved binding, never the binding
-authority itself.
+authority itself. S1.a lookups inherit the existing lookup parameters unchanged:
+the attempt's `started_at` scan window and the `last_observed_ref`
+(path/inode/size) continuity machinery — no new scan-origin or continuity rules.
 
 ### S1.b — loss-boundary predicate (closes codex B2, grok B1; replaces r1's deferred pin)
 
@@ -80,10 +99,20 @@ claude_code attempt ONLY when ALL hold:
    D5 composer tri-state == `empty` (full D1.4/D5 inheritance — mandatory, not
    reopened).
 2. **Post-injection turn-cycle evidence** (excludes the incident's false-COMPLETED
-   class): one atomic boundary observation (S1.c) shows a non-ready
-   (PROCESSING-class) observation followed by a ready observation, BOTH sequenced
-   strictly after this attempt's injection completion (`last_at`). A level sample
-   of COMPLETED after injection — the exact incident state — is NOT boundary
+   class). Anchor: `injection_completed_seq` — a monotonic observation sequence
+   value captured atomically (same seq domain as S1.c snapshots) immediately
+   after `send_prepared_input` returns for this attempt, and persisted per S1.f.
+   Attempt `last_at` is BANNED as the anchor: at HEAD it is timeout-settlement
+   time (`settle_delivery_attempt` sets `settled_at = last_at`,
+   `clients/database.py:1593`), ~13s after `started_at`, and the incident's real
+   queue enqueue/popAll events fell INSIDE that interval — a `> last_at` rule
+   would exclude legitimate cycles forever.
+   Cycle proof: the S1.c snapshot's transition latches satisfy
+   `last_non_ready_seq > injection_completed_seq` AND
+   `last_ready_seq > last_non_ready_seq`. Closed non-ready set: {PROCESSING}
+   only — UNKNOWN and WAITING_USER_ANSWER never start a qualifying cycle (they
+   are not turn evidence; loss proofs stay conservative). A level sample of
+   COMPLETED after injection — the exact incident state — is NOT boundary
    evidence. Generation comparisons over `pre_input_gen`/`pre_status_gen`/
    `settled_status_gen` are NOT sufficient substitutes (empirically falsified:
    tuples above advanced across three false losses).
@@ -98,16 +127,22 @@ untouched.
 ### S1.c — atomic boundary observation + wake law (closes codex B3)
 
 - One **boundary-observation snapshot object** sampled under a single
-  lock/version: (status, status_gen, input_gen, monotonic observation seq).
+  lock/version, with these named fields (grok r2 S1): `status`, `status_gen`,
+  `input_gen`, `seq` (monotonic observation sequence), plus two transition
+  latches maintained under the SAME lock at observation time:
+  `last_non_ready_seq` (seq of the most recent PROCESSING observation) and
+  `last_ready_seq` (seq of the most recent {IDLE, COMPLETED} observation).
   Mixed reads of `get_status()` and `get_status_gen()` from different detections
-  are forbidden on this path; the snapshot (or its relevant fields) is persisted
-  into the attempt evidence when it authorizes a loss.
+  are forbidden on this path; the snapshot fields are persisted into the attempt
+  evidence (S1.f) when and only when they authorize a loss.
 - **Wake law**: loss-boundary evaluation is wake-driven as today (published
   status events). Because a same-status ready redraw does not publish
   (`status_monitor.py:257-269`), and queued deliveries flush at receiver turn
   boundaries invisible to the bus, D2 RE-CONFIRMATION (S1.a lookup only, never
-  loss-writing) additionally runs on the existing periodic wake/poll spine that
-  drives WPM1 D1 today — every wake re-runs D2 before any other arm (D1.2
+  loss-writing) additionally runs on the existing 30-second
+  `inbox_reconciliation_daemon` spine (`api/main.py:167-182`,
+  `constants.py:140-146` → `reconcile_orphaned_messages` → `deliver_pending`;
+  codex r2-verified real) — every wake re-runs D2 before any other arm (D1.2
   ordering unchanged). Liveness clock: confirmation advances on transcript
   flush; loss advances only on observed turn cycles. A receiver that never
   exhibits a post-injection turn cycle keeps the message pending — lawful;
@@ -121,8 +156,36 @@ The confirm window may still settle an attempt `ambiguous`/`confirmation_timeout
 on wall-clock exactly as at HEAD. S1 narrows ONLY D1 step-5 exhaustion
 eligibility (S1.b) and step-6 reinject eligibility (exclusively the step-6 path,
 now gated on S1.b). No new outcome values, no new message statuses, no new
-columns beyond attempt evidence JSON keys (D7 honored). `recover_stale_deliveries`,
+columns; the only durable additions are the S1.f evidence keys (D7 honored). `recover_stale_deliveries`,
 wake selection, and D9 gated-PENDING detection semantics are unchanged.
+
+### S1.f — closed additive evidence schema + sole lawful writer (closes codex r2 B2)
+
+`WPM1_EVIDENCE_KEYS` (`clients/database.py:1501-1505`) is extended by EXACTLY
+these additive keys — nothing else; unlisted keys keep raising
+`ValueError("non-WPM1 evidence key")`:
+
+- `injection_completed_seq` (int): written once, by the delivery path, via the
+  existing `merge_wpm1_attempt_evidence` conditional-merge seam, immediately
+  after `send_prepared_input` returns, targeting THE attempt row that performed
+  this injection (the row `begin_delivery_attempt` created for it).
+- `boundary_snapshot` (object: `{status, status_gen, input_gen, seq,
+  last_non_ready_seq, last_ready_seq}`): written only in the transaction that
+  writes `boundary_exhausted_at`, same attempt row, same merge seam — a loss
+  without its authorizing snapshot is unlawful.
+- `queue_corroboration` (object, latest-wins scalar — never an unbounded list:
+  `{op, offset, observed_at}` for the most recent hash-matching queue-operation
+  record): merged during D1/D2 evaluation, same seam.
+- `kind` gains the new VALUE `transcript_queued_command` (existing key; no new
+  key).
+
+Sole lawful writer: the existing WPM1 conditional-merge/settlement seams with
+their HEAD PENDING/member-set/rowcount/busy semantics unchanged — no second
+writer, no direct row UPDATE. Named mutants (must die): (m1) write a new key
+bypassing the allowlist; (m2) write `injection_completed_seq` or
+`boundary_snapshot` to a different attempt row than the injecting/exhausting
+one; (m3) write `boundary_exhausted_at` without `boundary_snapshot` in the same
+transaction.
 
 ### S1.e — historical backfill: OUT (closes codex S1, grok S4)
 
@@ -143,6 +206,13 @@ as a residual; any future backfill is its own gated slice.
 - **True loss**: observed non-ready→ready cycle post-injection, S1.a lookup
   absent at that boundary → exactly one proven loss; WPM1 cap algebra proceeds
   unchanged to its existing arms.
+- **Cycle-during-confirm-window true loss (codex r2 B1)**: real cycle occurs
+  after `injection_completed_seq` but BEFORE the confirmation window expires →
+  the cycle still qualifies (anchor is injection completion, not settlement);
+  loss provable on the next evaluation. Anti-test: the same events anchored on
+  `last_at` would wrongly disqualify — asserts the ban.
+- **S1.f schema law**: named mutants m1–m3 (allowlist bypass, wrong-attempt
+  write, exhaustion-without-snapshot) all die; unlisted-key write raises.
 - **Never-cycling receiver**: no delivery_failed within any horizon; D1.3/D8
   stalled notice exactly once; D9 retention holds.
 - **Oracle priority**: native user-turn AND queued_command both present → one
@@ -164,11 +234,16 @@ Laws:
 
 1. **Episode identity (kills the replacement-spam class)**: an assignment
    episode spans from the FIRST `record_inbound_task` until callback observed or
-   explicit clear. A caller SEND_MESSAGE arriving while an episode is active and
-   unanswered JOINS the episode (may update `inbound_wall_at` for grace-timing)
-   but does NOT reset `fired` and does NOT create a fresh alarm-eligible
-   episode. A new episode (and thus new alarm eligibility) begins only after the
-   prior episode ended (callback/clear).
+   explicit clear. The episode carries an IMMUTABLE `episode_started_wall_at`
+   (set once at episode start), and the frozen D4 suppression query's lower
+   bound is pinned to THAT field — so a PENDING callback created any time after
+   the first assignment stays visible to D4 for the episode's whole life
+   (codex r2 B3). A caller SEND_MESSAGE arriving while the episode is active
+   and unanswered JOINS it: recorded as informational `last_join_wall_at` only;
+   it does NOT reset `fired`, does NOT move the D4 bound, does NOT reset
+   `idle_since` or the grace clock, and does NOT create a fresh alarm-eligible
+   episode. A new episode (and thus new alarm eligibility) begins only after
+   the prior episode ended (callback/clear).
 2. **`fired` latch**: at most one alarm per episode, latched until episode end.
    No active→idle re-fire within an episode (HEAD's observed behavior — codex
    probe: first=1, after_active_idle=0 — is RATIFIED as law). **Escalation arm:
@@ -186,6 +261,9 @@ Evidence bar:
 - Busy/fingerprint suppression: unstable screen_fp or non-ready status → 0.
 - D4 precedence: PENDING in-episode callback → 0 (existing D4 tests remain
   green, unmodified).
+- **Join-ordering suppression (codex r2 B3)**: callback row created AFTER first
+  assignment but BEFORE a later joined SEND_MESSAGE → D4 still suppresses (the
+  immutable `episode_started_wall_at` bound holds).
 - **Wiring mutant (named)**: re-enable `fired` reset on caller SEND_MESSAGE
   (the HEAD bug) — the PRIMARY test must fail (kill).
 
