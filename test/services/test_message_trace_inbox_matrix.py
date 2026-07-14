@@ -59,7 +59,7 @@ def test_prior_attempt_hit_deduplicates_without_paste(monkeypatch, delivery):
         "attempt_uuid": "old", "outcome": "ambiguous", "payload_hash": "hash",
         "started_at": datetime.now(), "evidence": "{}",
     }])
-    monkeypatch.setattr(module, "transcript_lookup", lambda *_a, **_k: ("hit", {}))
+    monkeypatch.setattr(module, "_wpm2_lookup", lambda *_a, **_k: ("hit", {}))
     confirm = MagicMock(return_value=True)
     monkeypatch.setattr(module, "confirm_batch_from_prior_attempt", confirm)
     InboxService().deliver_pending("receiver")
@@ -98,7 +98,7 @@ def test_prior_attempt_miss_performs_retry_paste(monkeypatch, delivery):
         "attempt_uuid": "old", "outcome": "ambiguous", "payload_hash": "hash",
         "started_at": datetime.now(), "evidence": "{}",
     }])
-    monkeypatch.setattr(module, "transcript_lookup", lambda *_a, **_k: ("absent", {}))
+    monkeypatch.setattr(module, "_wpm2_lookup", lambda *_a, **_k: ("absent", {}))
     monkeypatch.setattr(module, "confirm_delivery", lambda *_a, **_k: ("unverified", {}))
     InboxService().deliver_pending("receiver")
     send.assert_called_once()

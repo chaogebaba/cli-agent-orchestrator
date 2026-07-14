@@ -30,6 +30,7 @@ from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.models.inbox import InboxMessage, OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.inbox_service import InboxService
+from cli_agent_orchestrator.services.status_monitor import BoundaryObservation
 from cli_agent_orchestrator.services.stalled_callback_watchdog import StalledCallbackWatchdog
 from cli_agent_orchestrator.services.message_trace_service import (
     TranscriptLiveReference, TranscriptResolution, transcript_ref,
@@ -204,7 +205,7 @@ def test_wpm1_service_merge_busy_aborted_never_flips_pending_failed(wpm1_db):
         with (
             patch("cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
                   return_value=_binding()),
-            patch("cli_agent_orchestrator.services.inbox_service.continuity_aware_lookup",
+            patch("cli_agent_orchestrator.services.message_trace_service.continuity_aware_lookup",
                   return_value=("absent", {})),
             patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
         ):
@@ -490,6 +491,36 @@ def _gate_attempt(number=0, *, exhausted=False, age_minutes=1):
     }
 
 
+def lawful_boundary_observation(
+    status: TerminalStatus, *, attempt: dict | None = None,
+    evidence: dict | None = None, epoch: str = "lawful-epoch",
+    anchor_seq: int = 1, seq: int = 4, exhausted: bool = False,
+) -> BoundaryObservation:
+    """Seed one lawful atomic observation and its matching durable evidence."""
+    ready = status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
+    non_ready_seq = anchor_seq + 1
+    ready_seq = seq if ready else None
+    observation = BoundaryObservation(
+        epoch, status, 3, 1, seq, non_ready_seq, ready_seq)
+    target = evidence
+    if attempt is not None:
+        target = json.loads(attempt["evidence"])
+    if target is not None:
+        target["injection_completed_seq"] = {
+            "observation_epoch": epoch, "seq": anchor_seq}
+        if exhausted:
+            target["boundary_exhausted_at"] = "2026-07-13T00:00:00Z"
+            target["boundary_snapshot"] = {
+                "observation_epoch": epoch, "status": status.value,
+                "status_gen": 3, "input_gen": 1, "seq": seq,
+                "last_non_ready_seq": non_ready_seq,
+                "last_ready_seq": ready_seq,
+            }
+    if attempt is not None:
+        attempt["evidence"] = json.dumps(target)
+    return observation
+
+
 def _binding():
     return TranscriptResolution(
         path=__import__("pathlib").Path("/trace"), resolution_kind="binding",
@@ -505,7 +536,7 @@ def test_incident2_replay_growth_injects_once_then_d2_confirms(wpm1_db):
     with (
         patch("cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
               return_value=resolution),
-        patch("cli_agent_orchestrator.services.inbox_service.continuity_aware_lookup",
+        patch("cli_agent_orchestrator.services.message_trace_service.continuity_aware_lookup",
               side_effect=[("absent", {"size": 999}), ("absent", {"size": 1999}),
                            ("hit", {})]),
         patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
@@ -537,17 +568,18 @@ def test_loss_boundary_marks_exhaustion_before_authorizing_successor():
     provider = MagicMock()
     provider.read_composer_draft_state.return_value = "empty"
     attempt = _gate_attempt()
+    observation = lawful_boundary_observation(TerminalStatus.IDLE, attempt=attempt)
     with (
         patch.object(svc, "_exact_batch_attempts", return_value=[attempt]),
         patch("cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
               return_value=_binding()),
-        patch("cli_agent_orchestrator.services.inbox_service.continuity_aware_lookup",
+        patch("cli_agent_orchestrator.services.message_trace_service.continuity_aware_lookup",
               return_value=("absent", {})),
         patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
         patch("cli_agent_orchestrator.services.inbox_service.merge_wpm1_attempt_evidence",
               return_value=True) as merge,
     ):
-        monitor.get_status.return_value = TerminalStatus.IDLE
+        monitor.get_boundary_observation.return_value = observation
         state, evidence = svc._handle_wpm1_gate(
             "receiver", [_gate_message()], {"provider": "claude_code"}, provider,
             "sender", OrchestrationType.SEND_MESSAGE)
@@ -562,18 +594,22 @@ def test_busy_wake_after_third_injection_cannot_cap():
     provider.read_composer_draft_state.return_value = "empty"
     attempts = [_gate_attempt(0, exhausted=True), _gate_attempt(1, exhausted=True),
                 _gate_attempt(2)]
+    observation = lawful_boundary_observation(TerminalStatus.PROCESSING)
+    for index, attempt in enumerate(attempts):
+        lawful_boundary_observation(
+            TerminalStatus.COMPLETED, attempt=attempt, exhausted=index < 2)
     with (
         patch.object(svc, "_exact_batch_attempts", return_value=attempts),
         patch("cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
               return_value=_binding()),
-        patch("cli_agent_orchestrator.services.inbox_service.continuity_aware_lookup",
+        patch("cli_agent_orchestrator.services.message_trace_service.continuity_aware_lookup",
               return_value=("absent", {})),
         patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
         patch("cli_agent_orchestrator.services.inbox_service.merge_wpm1_attempt_evidence",
               return_value=True),
         patch("cli_agent_orchestrator.services.inbox_service.settle_wpm1_terminal_batch") as settle,
     ):
-        monitor.get_status.return_value = TerminalStatus.PROCESSING
+        monitor.get_boundary_observation.return_value = observation
         assert svc._handle_wpm1_gate(
             "receiver", [_gate_message()], {"provider": "claude_code"}, provider,
             "sender", OrchestrationType.SEND_MESSAGE)[0] == "stop"
@@ -586,11 +622,15 @@ def test_third_exhaustion_proof_caps_without_fourth_injection():
     provider.read_composer_draft_state.return_value = "empty"
     attempts = [_gate_attempt(0, exhausted=True), _gate_attempt(1, exhausted=True),
                 _gate_attempt(2)]
+    observation = lawful_boundary_observation(TerminalStatus.COMPLETED)
+    for index, attempt in enumerate(attempts):
+        lawful_boundary_observation(
+            TerminalStatus.COMPLETED, attempt=attempt, exhausted=index < 2)
     with (
         patch.object(svc, "_exact_batch_attempts", return_value=attempts),
         patch("cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
               return_value=_binding()),
-        patch("cli_agent_orchestrator.services.inbox_service.continuity_aware_lookup",
+        patch("cli_agent_orchestrator.services.message_trace_service.continuity_aware_lookup",
               return_value=("absent", {})),
         patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
         patch("cli_agent_orchestrator.services.inbox_service.merge_wpm1_attempt_evidence",
@@ -599,7 +639,7 @@ def test_third_exhaustion_proof_caps_without_fourth_injection():
               return_value="settled") as settle,
         patch.object(svc, "_notify_delivery_failed"),
     ):
-        monitor.get_status.return_value = TerminalStatus.COMPLETED
+        monitor.get_boundary_observation.return_value = observation
         assert svc._handle_wpm1_gate(
             "receiver", [_gate_message()], {"provider": "claude_code"}, provider,
             "sender", OrchestrationType.SEND_MESSAGE)[0] == "stop"
@@ -611,18 +651,19 @@ def test_threshold_plus_idle_proof_sends_no_stalled_notice():
     provider = MagicMock()
     provider.read_composer_draft_state.return_value = "empty"
     attempt = _gate_attempt(age_minutes=241)
+    observation = lawful_boundary_observation(TerminalStatus.IDLE, attempt=attempt)
     with (
         patch.object(svc, "_exact_batch_attempts", return_value=[attempt]),
         patch("cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
               return_value=_binding()),
-        patch("cli_agent_orchestrator.services.inbox_service.continuity_aware_lookup",
+        patch("cli_agent_orchestrator.services.message_trace_service.continuity_aware_lookup",
               return_value=("absent", {})),
         patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
         patch("cli_agent_orchestrator.services.inbox_service.merge_wpm1_attempt_evidence",
               return_value=True),
         patch("cli_agent_orchestrator.services.inbox_service.record_wpm1_stalled_notice") as notice,
     ):
-        monitor.get_status.return_value = TerminalStatus.IDLE
+        monitor.get_boundary_observation.return_value = observation
         assert svc._handle_wpm1_gate(
             "receiver", [_gate_message()], {"provider": "claude_code"}, provider,
             "sender", OrchestrationType.SEND_MESSAGE)[0] == "inject"
@@ -644,11 +685,12 @@ def test_stalled_notice_fires_at_30min_idle_or_4h_absolute(age_minutes, activity
         "last_observed_ref": transcript_ref(_binding()),
     })
     attempt["evidence"] = json.dumps(evidence)
+    observation = lawful_boundary_observation(TerminalStatus.PROCESSING, attempt=attempt)
     with (
         patch.object(svc, "_exact_batch_attempts", return_value=[attempt]),
         patch("cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
               return_value=_binding()),
-        patch("cli_agent_orchestrator.services.inbox_service.continuity_aware_lookup",
+        patch("cli_agent_orchestrator.services.message_trace_service.continuity_aware_lookup",
               return_value=("unresolved", {})),
         patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
         patch("cli_agent_orchestrator.services.inbox_service.merge_wpm1_attempt_evidence",
@@ -656,7 +698,7 @@ def test_stalled_notice_fires_at_30min_idle_or_4h_absolute(age_minutes, activity
         patch("cli_agent_orchestrator.services.inbox_service.record_wpm1_stalled_notice",
               return_value="recorded") as notice,
     ):
-        monitor.get_status.return_value = TerminalStatus.PROCESSING
+        monitor.get_boundary_observation.return_value = observation
         assert svc._handle_wpm1_gate(
             "receiver", [_gate_message()], {"provider": "claude_code"}, provider,
             "sender", OrchestrationType.SEND_MESSAGE)[0] == "stop"
@@ -670,7 +712,7 @@ def test_wpm1_rowcount_zero_merge_aborts_wake_before_gate_or_settlement():
         patch.object(svc, "_exact_batch_attempts", return_value=[_gate_attempt()]),
         patch("cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
               return_value=_binding()),
-        patch("cli_agent_orchestrator.services.inbox_service.continuity_aware_lookup",
+        patch("cli_agent_orchestrator.services.message_trace_service.continuity_aware_lookup",
               return_value=("absent", {})),
         patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
         patch("cli_agent_orchestrator.services.inbox_service.merge_wpm1_attempt_evidence",
@@ -741,7 +783,7 @@ def test_wpm1_paste_without_submit_blocks_reinject_then_consumption_d2_confirms(
     with (
         patch("cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
               return_value=_binding()),
-        patch("cli_agent_orchestrator.services.inbox_service.continuity_aware_lookup",
+        patch("cli_agent_orchestrator.services.message_trace_service.continuity_aware_lookup",
               side_effect=[("absent", {}), ("hit", {})]),
         patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
         patch("cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
@@ -808,17 +850,20 @@ def test_successor_writer_pins_exact_exhausted_source_despite_newer_overlap(wpm1
 
 
 def test_successor_restart_after_exhaustion_merge_injects_once(wpm1_db):
-    message, exhausted = _ambiguous({
+    prior_evidence = {
         "resolution_kind": "binding", "path": "/trace", "inode": 1, "size": 10,
         "boundary_exhausted_at": "2026-07-13T00:00:00Z",
-    })
+    }
+    observation = lawful_boundary_observation(
+        TerminalStatus.IDLE, evidence=prior_evidence, exhausted=True)
+    message, exhausted = _ambiguous(prior_evidence)
     svc = InboxService()
     provider = MagicMock()
     provider.read_composer_draft_state.return_value = "empty"
     with (
         patch("cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
               return_value=_binding()),
-        patch("cli_agent_orchestrator.services.inbox_service.continuity_aware_lookup",
+        patch("cli_agent_orchestrator.services.message_trace_service.continuity_aware_lookup",
               return_value=("absent", {})),
         patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
         patch("cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
@@ -834,7 +879,7 @@ def test_successor_restart_after_exhaustion_merge_injects_once(wpm1_db):
     ):
         monitor.get_input_gen.return_value = 1
         monitor.get_status_gen.return_value = 1
-        monitor.get_status.return_value = TerminalStatus.IDLE
+        monitor.get_boundary_observation.return_value = observation
         svc.deliver_pending("receiver")
     assert send.call_count == 1
     with wpm1_db() as db:
@@ -865,7 +910,7 @@ def test_successor_restart_after_begin_commit_recovers_and_never_respawns(wpm1_d
     with (
         patch("cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
               return_value=_binding()),
-        patch("cli_agent_orchestrator.services.inbox_service.continuity_aware_lookup",
+        patch("cli_agent_orchestrator.services.message_trace_service.continuity_aware_lookup",
               return_value=("absent", {})),
         patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
         patch("cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
@@ -886,10 +931,13 @@ def test_successor_restart_after_begin_commit_recovers_and_never_respawns(wpm1_d
 
 
 def test_successor_restart_after_paste_return_recovers_and_never_respawns(wpm1_db):
-    message, exhausted = _ambiguous({
+    prior_evidence = {
         "resolution_kind": "binding", "path": "/trace", "inode": 1, "size": 10,
         "boundary_exhausted_at": "2026-07-13T00:00:00Z",
-    })
+    }
+    observation = lawful_boundary_observation(
+        TerminalStatus.IDLE, evidence=prior_evidence, exhausted=True)
+    message, exhausted = _ambiguous(prior_evidence)
     svc = InboxService()
     provider = MagicMock()
     provider.read_composer_draft_state.return_value = "empty"
@@ -897,7 +945,7 @@ def test_successor_restart_after_paste_return_recovers_and_never_respawns(wpm1_d
     with (
         patch("cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
               return_value=_binding()),
-        patch("cli_agent_orchestrator.services.inbox_service.continuity_aware_lookup",
+        patch("cli_agent_orchestrator.services.message_trace_service.continuity_aware_lookup",
               return_value=("absent", {})),
         patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
         patch("cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
@@ -911,7 +959,7 @@ def test_successor_restart_after_paste_return_recovers_and_never_respawns(wpm1_d
     ):
         monitor.get_input_gen.return_value = 1
         monitor.get_status_gen.return_value = 1
-        monitor.get_status.return_value = TerminalStatus.IDLE
+        monitor.get_boundary_observation.return_value = observation
         with pytest.raises(KeyboardInterrupt, match="crash after paste"):
             svc.deliver_pending("receiver")
     pasted.assert_called_once()
@@ -922,7 +970,7 @@ def test_successor_restart_after_paste_return_recovers_and_never_respawns(wpm1_d
     with (
         patch("cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
               return_value=_binding()),
-        patch("cli_agent_orchestrator.services.inbox_service.continuity_aware_lookup",
+        patch("cli_agent_orchestrator.services.message_trace_service.continuity_aware_lookup",
               return_value=("absent", {})),
         patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
         patch("cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
@@ -930,7 +978,7 @@ def test_successor_restart_after_paste_return_recovers_and_never_respawns(wpm1_d
         patch("cli_agent_orchestrator.services.inbox_service.terminal_service.send_prepared_input")
         as send,
     ):
-        monitor.get_status.return_value = TerminalStatus.IDLE
+        monitor.get_boundary_observation.return_value = observation
         svc.deliver_pending("receiver")
     send.assert_not_called()
     with wpm1_db() as db:
@@ -949,19 +997,22 @@ def test_interrupted_successor_blocks_duplicate_respawn():
     interrupted = _gate_attempt(1)
     interrupted.update(outcome="interrupted", reason="pane_unresolvable",
                        prior_attempt_uuid=exhausted["attempt_uuid"])
+    observation = lawful_boundary_observation(TerminalStatus.IDLE)
+    lawful_boundary_observation(
+        TerminalStatus.IDLE, attempt=exhausted, exhausted=True)
     provider = MagicMock()
     provider.read_composer_draft_state.return_value = "empty"
     with (
         patch.object(svc, "_exact_batch_attempts", return_value=[exhausted, interrupted]),
         patch("cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
               return_value=_binding()),
-        patch("cli_agent_orchestrator.services.inbox_service.continuity_aware_lookup",
+        patch("cli_agent_orchestrator.services.message_trace_service.continuity_aware_lookup",
               return_value=("absent", {})),
         patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
         patch("cli_agent_orchestrator.services.inbox_service.merge_wpm1_attempt_evidence",
               return_value=True),
     ):
-        monitor.get_status.return_value = TerminalStatus.IDLE
+        monitor.get_boundary_observation.return_value = observation
         state, _ = svc._handle_wpm1_gate(
             "receiver", [_gate_message()], {"provider": "claude_code"}, provider,
             "sender", OrchestrationType.SEND_MESSAGE)
@@ -974,13 +1025,17 @@ def test_cap_barrier_late_payload_confirmation_wins():
     provider.read_composer_draft_state.return_value = "empty"
     attempts = [_gate_attempt(0, exhausted=True), _gate_attempt(1, exhausted=True),
                 _gate_attempt(2)]
+    observation = lawful_boundary_observation(TerminalStatus.IDLE)
+    for index, attempt in enumerate(attempts):
+        lawful_boundary_observation(
+            TerminalStatus.COMPLETED, attempt=attempt, exhausted=index < 2)
     # Three initial newest-first checks, boundary check, then pre-settlement barrier.
     lookups = [("absent", {})] * 4 + [("hit", {})]
     with (
         patch.object(svc, "_exact_batch_attempts", return_value=attempts),
         patch("cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
               return_value=_binding()),
-        patch("cli_agent_orchestrator.services.inbox_service.continuity_aware_lookup",
+        patch("cli_agent_orchestrator.services.message_trace_service.continuity_aware_lookup",
               side_effect=lookups),
         patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
         patch("cli_agent_orchestrator.services.inbox_service.merge_wpm1_attempt_evidence",
@@ -989,7 +1044,7 @@ def test_cap_barrier_late_payload_confirmation_wins():
               return_value="settled") as settle,
         patch.object(svc, "_commit_watchdog_ops"),
     ):
-        monitor.get_status.return_value = TerminalStatus.IDLE
+        monitor.get_boundary_observation.return_value = observation
         svc._handle_wpm1_gate(
             "receiver", [_gate_message()], {"provider": "claude_code"}, provider,
             "sender", OrchestrationType.SEND_MESSAGE)
@@ -1022,7 +1077,7 @@ def test_ambiguous_attempt_queued_command_confirmation_stops_reinjection(tmp_pat
         patch.object(svc, "_exact_batch_attempts", return_value=[attempt]),
         patch("cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
               return_value=_binding()),
-        patch("cli_agent_orchestrator.services.inbox_service.continuity_aware_lookup",
+        patch("cli_agent_orchestrator.services.message_trace_service.continuity_aware_lookup",
               side_effect=lookup),
         patch("cli_agent_orchestrator.services.inbox_service.settle_wpm1_terminal_batch",
               return_value="settled") as settle,

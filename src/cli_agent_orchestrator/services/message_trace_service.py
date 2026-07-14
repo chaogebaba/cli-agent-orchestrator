@@ -485,11 +485,19 @@ def wpm2_cursor_baseline(evidence: dict) -> tuple[str, dict | None]:
     return "unresolved", None
 
 
-def wpm2_continuity_lookup(
+def wpm2_lookup(
     metadata: dict, payload_hash: str, started_at, evidence: dict,
 ) -> tuple[str, dict]:
+    """Canonical WPM2 lookup; containing evidence is never the continuity ref."""
     mode, baseline = wpm2_cursor_baseline(evidence)
     if baseline is None:
+        if (evidence.get("resolution_kind") == "binding"
+                and "last_observed_ref" not in evidence
+                and not any(key in evidence for key in ("path", "inode", "size"))):
+            outcome, observed = continuity_aware_lookup(
+                metadata, payload_hash, started_at, {})
+            if outcome == "hit":
+                return outcome, observed
         return "unresolved", {"kind": "transcript_continuity_uncertain"}
     outcome, observed = continuity_aware_lookup(
         metadata, payload_hash, started_at, baseline)

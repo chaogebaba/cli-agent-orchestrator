@@ -28,7 +28,7 @@ from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
-from cli_agent_orchestrator.models.terminal import RecoveryState
+from cli_agent_orchestrator.models.terminal import RecoveryState, TerminalStatus
 
 logger = logging.getLogger(__name__)
 
@@ -1584,6 +1584,7 @@ def _attempt_history_in_db(db, message_ids: list[int]) -> list[dict[str, Any]]:
             "prior_attempt_uuid": row.prior_attempt_uuid,
             "receiver_terminal_id": row.receiver_terminal_id,
             "started_at": row.started_at,
+            "evidence": row.evidence,
             "evidence_hash": hashlib.sha256((row.evidence or "{}").encode()).hexdigest(),
         })
     return result
@@ -1652,7 +1653,44 @@ def list_delivering_attempts_for_terminal(terminal_id: str) -> list[dict[str, An
         return _delivering_authority_in_db(db, terminal_id)
 
 
-def _admission_valid(kind: str, history: list[dict[str, Any]], prior_uuid: str | None) -> bool:
+def _corrective_evidence_valid(prior: dict[str, Any], candidate_ids: list[int]) -> bool:
+    if prior["members"] != candidate_ids:
+        return False
+    evidence = _evidence_object(prior.get("evidence"))
+    if _valid_cursor(evidence.get("last_observed_ref")) is None:
+        return False
+    anchor = evidence.get("injection_completed_seq")
+    exhausted_at = evidence.get("boundary_exhausted_at")
+    snapshot = evidence.get("boundary_snapshot")
+    if (not isinstance(anchor, dict) or not isinstance(exhausted_at, str)
+            or not exhausted_at or not isinstance(snapshot, dict)):
+        return False
+    epoch, anchor_seq = anchor.get("observation_epoch"), anchor.get("seq")
+    required = {
+        "observation_epoch", "status", "status_gen", "input_gen", "seq",
+        "last_non_ready_seq", "last_ready_seq",
+    }
+    if (set(snapshot) != required or not isinstance(epoch, str) or not epoch
+            or type(anchor_seq) is not int
+            or snapshot.get("observation_epoch") != epoch
+            or snapshot.get("status") not in {
+                TerminalStatus.IDLE.value, TerminalStatus.COMPLETED.value}
+            or type(snapshot.get("input_gen")) is not int
+            or (snapshot.get("status_gen") is not None
+                and type(snapshot.get("status_gen")) is not int)
+            or type(snapshot.get("seq")) is not int
+            or type(snapshot.get("last_non_ready_seq")) is not int
+            or type(snapshot.get("last_ready_seq")) is not int):
+        return False
+    non_ready = snapshot["last_non_ready_seq"]
+    ready = snapshot["last_ready_seq"]
+    return anchor_seq < non_ready < ready <= snapshot["seq"]
+
+
+def _admission_valid(
+    kind: str, history: list[dict[str, Any]], prior_uuid: str | None,
+    candidate_ids: list[int],
+) -> bool:
     if kind == "s4_initial":
         return all(row["outcome"] == "deferred" and row["reason"] in {
             "delivery_deferred", "input_blocked"} for row in history)
@@ -1660,6 +1698,7 @@ def _admission_valid(kind: str, history: list[dict[str, Any]], prior_uuid: str |
         prior = next((row for row in history if row["attempt_uuid"] == prior_uuid), None)
         return bool(prior and prior["outcome"] == "ambiguous" and
                     prior["reason"] == "confirmation_timeout" and
+                    _corrective_evidence_valid(prior, candidate_ids) and
                     not any(row["prior_attempt_uuid"] == prior_uuid for row in history))
     return True
 
@@ -1683,7 +1722,7 @@ def begin_delivery_attempt_if_no_other_delivering(
             return "delivering_conflict"
         history = _attempt_history_in_db(db, ids)
         if (_history_fingerprint(history) != proof.fingerprint or
-                not _admission_valid(proof.kind, history, proof.prior_attempt_uuid)):
+                not _admission_valid(proof.kind, history, proof.prior_attempt_uuid, ids)):
             db.rollback()
             return "stale_admission"
         if proof.transcript_checks:

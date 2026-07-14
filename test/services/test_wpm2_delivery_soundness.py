@@ -387,16 +387,21 @@ def test_wpm2_corrective_d2_hit_between_preflight_and_open_is_stale_admission(
     cursor = {"path": str(path), "inode": path.stat().st_ino,
               "size": path.stat().st_size, "resolution_kind": "binding",
               "cursor_version": 1}
-    message, attempt = _settled(wpm2_db, evidence={"last_observed_ref": cursor})
+    evidence = {
+        "last_observed_ref": cursor,
+        "injection_completed_seq": {"observation_epoch": "epoch", "seq": 1},
+        "boundary_exhausted_at": "2030-01-01T00:00:00Z",
+        "boundary_snapshot": {
+            "observation_epoch": "epoch", "status": "completed", "status_gen": 3,
+            "input_gen": 1, "seq": 4, "last_non_ready_seq": 2,
+            "last_ready_seq": 4,
+        },
+    }
+    message, attempt = _settled(wpm2_db, evidence=evidence)
     proof = make_admission_proof("corrective", [message.id], attempt)
     with path.open("a") as stream:
         stream.write(json.dumps({"type": "user", "timestamp": "2030-01-01T00:00:01Z",
                                  "message": "payload"}) + "\n")
-    with wpm2_db.begin() as db:
-        db.get(InboxDeliveryAttemptModel, attempt).started_at = datetime(
-            2030, 1, 1, tzinfo=timezone.utc)
-    # Rebuild proof after changing the durable window, then append the hit.
-    proof = make_admission_proof("corrective", [message.id], attempt)
     result = begin_delivery_attempt_if_no_other_delivering(
         [message], "receiver", "claude_code", "new", 3,
         prior_attempt_uuid=attempt, admission_proof=proof)
@@ -603,10 +608,10 @@ def test_wpm2_bounded_suffix_enforces_started_at(tmp_path):
 
 def test_wpm2_binding_only_without_cursor_is_hits_only():
     evidence = {"resolution_kind": "binding"}
-    with patch("cli_agent_orchestrator.services.inbox_service.continuity_aware_lookup",
+    with patch("cli_agent_orchestrator.services.message_trace_service.continuity_aware_lookup",
                return_value=("absent", {"kind": "transcript_absent"})):
         assert _wpm2_lookup({}, "hash", None, evidence)[0] == "unresolved"
-    with patch("cli_agent_orchestrator.services.inbox_service.continuity_aware_lookup",
+    with patch("cli_agent_orchestrator.services.message_trace_service.continuity_aware_lookup",
                return_value=("hit", {"kind": "transcript_queued_command"})):
         assert _wpm2_lookup({}, "hash", None, evidence)[0] == "hit"
 
@@ -635,10 +640,11 @@ def test_wpm2_confirmation_evidence_targets_hit_attempt(wpm2_db):
     assert "kind" not in second_evidence and "terminal_settled_at" in second_evidence
 
 
-def _open_old_attempt(sessions, age=61):
+def _open_old_attempt(sessions, age=61, evidence=None):
     message = create_inbox_message("sender", "receiver", "payload")
     attempt = begin_delivery_attempt(
-        [message], "receiver", "claude_code", wire_hash("payload"), 7)
+        [message], "receiver", "claude_code", wire_hash("payload"), 7,
+        evidence=json.dumps(evidence or {}))
     with sessions.begin() as db:
         db.get(InboxDeliveryAttemptModel, attempt).started_at = (
             datetime.now(timezone.utc) - timedelta(seconds=age))
@@ -710,8 +716,9 @@ def test_wpm2_recovery_after_lock_release(wpm2_db, tmp_path):
 
 def test_wpm2_recurring_recovery_repairs_stranded_delivering_without_restart(
         wpm2_db, tmp_path):
-    message, attempt = _open_old_attempt(wpm2_db)
     path, resolution = _recovery_absent_context(tmp_path)
+    message, attempt = _open_old_attempt(
+        wpm2_db, evidence=transcript_ref(resolution))
     create_transcript_binding("receiver", "session", str(path), path.stat().st_ino, "test")
     with patch("cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
                return_value=resolution):
@@ -1258,8 +1265,22 @@ def test_wpm2_s4_vs_ordinary_initial_share_atomic_delivering_opener(wpm2_db):
     assert len(list_delivering_attempts_for_terminal("receiver")) == 1
 
 
-def test_wpm2_s4_vs_corrective_share_atomic_delivering_opener(wpm2_db):
-    corrective, prior = _settled(wpm2_db, text="corrective")
+def test_wpm2_s4_vs_corrective_share_atomic_delivering_opener(wpm2_db, tmp_path):
+    path = tmp_path / "corrective-race.jsonl"
+    path.write_text(json.dumps({"type": "user", "message": "other"}) + "\n")
+    create_transcript_binding("receiver", "session", str(path), path.stat().st_ino, "test")
+    evidence = {
+        "last_observed_ref": {
+            "path": str(path), "inode": path.stat().st_ino, "size": path.stat().st_size,
+            "resolution_kind": "binding", "cursor_version": 1},
+        "injection_completed_seq": {"observation_epoch": "epoch", "seq": 1},
+        "boundary_exhausted_at": "2030-01-01T00:00:00Z",
+        "boundary_snapshot": {
+            "observation_epoch": "epoch", "status": "completed", "status_gen": 3,
+            "input_gen": 1, "seq": 4, "last_non_ready_seq": 2,
+            "last_ready_seq": 4},
+    }
+    corrective, prior = _settled(wpm2_db, text="corrective", evidence=evidence)
     fresh = create_inbox_message("sender", "receiver", "fresh")
     results = _race_open(wpm2_db, [
         (fresh, make_admission_proof("s4_initial", [fresh.id]), None),
