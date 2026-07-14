@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -191,6 +192,7 @@ _SERVER_DEFAULTS = {
     "event_bus_max_queue_size": 1024,
     "provider_init_timeout": 60,
     "startup_prompt_handler_timeout": 20,
+    "artifact_validate_deadline_s": 60.0,
 }
 
 # Env-var overrides for server settings. Precedence: env var > settings.json > default.
@@ -199,6 +201,7 @@ _SERVER_ENV_VARS = {
     "event_bus_max_queue_size": "CAO_EVENT_BUS_MAX_QUEUE_SIZE",
     "provider_init_timeout": "CAO_PROVIDER_INIT_TIMEOUT",
     "startup_prompt_handler_timeout": "CAO_STARTUP_PROMPT_HANDLER_TIMEOUT",
+    "artifact_validate_deadline_s": "CAO_ARTIFACT_VALIDATE_DEADLINE_S",
 }
 
 
@@ -250,7 +253,16 @@ def get_server_settings() -> Dict[str, Any]:
     # Env-var overlay: CAO_* env var beats settings.json value.
     for key, env_name in _SERVER_ENV_VARS.items():
         raw = os.environ.get(env_name)
-        if raw is not None and raw.strip() != "":
+        if raw is not None and key == "artifact_validate_deadline_s":
+            try:
+                parsed = float(raw.strip())
+                if not math.isfinite(parsed) or not 1.0 <= parsed <= 600.0:
+                    raise ValueError
+                result[key] = parsed
+            except (TypeError, ValueError):
+                logger.warning("Invalid %s=%r; using default 60.0", env_name, raw)
+                result[key] = 60.0
+        elif raw is not None and raw.strip() != "":
             try:
                 result[key] = int(raw)
             except ValueError:
@@ -262,7 +274,12 @@ def get_server_settings() -> Dict[str, Any]:
     # Validate types and ranges; coerce to int for queue size
     for key, default in _SERVER_DEFAULTS.items():
         val = result[key]
-        if isinstance(val, bool) or not isinstance(val, (int, float)) or val <= 0:
+        invalid = isinstance(val, bool) or not isinstance(val, (int, float))
+        if key == "artifact_validate_deadline_s":
+            invalid = invalid or not math.isfinite(float(val)) or not 1.0 <= float(val) <= 600.0
+        else:
+            invalid = invalid or val <= 0
+        if invalid:
             logger.warning(f"Invalid server setting {key}={val!r}, using default {default}")
             result[key] = default
     result["event_bus_max_queue_size"] = int(result["event_bus_max_queue_size"])

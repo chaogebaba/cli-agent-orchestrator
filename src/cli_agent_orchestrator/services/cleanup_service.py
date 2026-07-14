@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from cli_agent_orchestrator.clients.database import (
+    delete_terminal_and_warm_intent,
     InboxModel, InboxDeliveryAttemptMemberModel, InboxDeliveryAttemptModel,
     SessionLocal, TerminalModel,
 )
@@ -33,16 +34,27 @@ def cleanup_old_data():
         # Clean up old terminals (stop FIFO readers and clear state first)
         with SessionLocal() as db:
             old_terminals = (
-                db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).all()
+                db.query(TerminalModel).filter(
+                    (TerminalModel.last_active < cutoff_date)
+                    & (TerminalModel.init_state == "ready"),
+                ).all()
             )
             for terminal in old_terminals:
                 fifo_manager.stop_reader(terminal.id)
                 status_monitor.clear_terminal(terminal.id)
-            deleted_terminals = (
-                db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).delete()
-            )
-            db.commit()
-            logger.info(f"Deleted {deleted_terminals} old terminals from database")
+            skipped = db.query(TerminalModel).filter(
+                (TerminalModel.last_active < cutoff_date)
+                & (TerminalModel.init_state != "ready"),
+            ).count()
+        deleted_terminals = sum(
+            delete_terminal_and_warm_intent(
+                terminal.id, preserve_warm_intent=False,
+            )["terminal_deleted"]
+            for terminal in old_terminals
+        )
+        logger.info(f"Deleted {deleted_terminals} old terminals from database")
+        if skipped:
+            logger.warning("retention_cleanup_skipped_non_ready count=%d", skipped)
 
         # Clean up old inbox messages
         with SessionLocal() as db:

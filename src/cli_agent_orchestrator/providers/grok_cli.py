@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
-from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.base import BaseProvider, RetryableArtifactValidation
 from cli_agent_orchestrator.services.settings_service import (
     get_provider_defaults,
     get_server_settings,
@@ -254,7 +254,7 @@ class GrokCliProvider(BaseProvider):
     def validate_session_artifact(self, session_uuid: str, cwd: str) -> None:
         path = Path.home() / ".grok" / "sessions" / quote(cwd, safe="") / session_uuid / "chat_history.jsonl"
         if not path.is_file() or path.stat().st_size == 0:
-            raise ValueError("session_artifact_missing_or_inert")
+            raise RetryableArtifactValidation("session_artifact_missing_or_inert")
 
     def provider_process_started_at(self, pane_pid: int) -> float | None:
         from cli_agent_orchestrator.services.fork_context_service import _descendants

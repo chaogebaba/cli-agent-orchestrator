@@ -13,7 +13,9 @@ from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
-from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.base import (
+    BaseProvider, RetryableArtifactValidation, TerminalArtifactValidation,
+)
 from cli_agent_orchestrator.services.settings_service import (
     get_provider_defaults,
     get_server_settings,
@@ -546,12 +548,14 @@ class CodexProvider(BaseProvider):
         matches = list((Path.home() / ".codex" / "sessions").glob(
             f"**/rollout-*{session_uuid}*.jsonl"
         ))
-        if len(matches) != 1:
-            raise ValueError("session_artifact_missing_or_ambiguous")
+        if not matches:
+            raise RetryableArtifactValidation("session_artifact_missing")
+        if len(matches) > 1:
+            raise TerminalArtifactValidation("session_artifact_ambiguous")
         with matches[0].open(encoding="utf-8") as stream:
             first = json.loads(stream.readline())
         if first.get("type") != "session_meta" or first.get("payload", {}).get("id") != session_uuid:
-            raise ValueError("session_artifact_identity_invalid")
+            raise TerminalArtifactValidation("session_artifact_identity_invalid")
 
     def auth_state_path(self) -> Path | None:
         return Path.home() / ".codex" / "auth.json"

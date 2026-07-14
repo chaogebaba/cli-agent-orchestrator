@@ -27,6 +27,7 @@ def close_session(session_name: str, *, keep_bases: bool = False, force: bool = 
         from cli_agent_orchestrator.services.session_lifecycle_lease import (
             acquire_session_lifecycle_exclusive,
         )
+        terminal_service.quiesce_deferred_session_sync(session_name)
         lifecycle_lease = acquire_session_lifecycle_exclusive(session_name)
         if lifecycle_lease is None:
             raise RuntimeError("resume_in_progress")

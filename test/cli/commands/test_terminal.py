@@ -20,7 +20,7 @@ class TestSnapshotOnDelete:
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     def test_snapshot_written_on_delete(
         self, mock_log_dir, mock_db_delete, mock_pm, mock_meta, mock_tmux, tmp_path
@@ -39,7 +39,7 @@ class TestSnapshotOnDelete:
         }
         mock_tmux.get_history.return_value = "line1\nline2\nline3"
         mock_tmux.get_pane_working_directory.return_value = "/home/user/project"
-        mock_db_delete.return_value = True
+        mock_db_delete.return_value = {"terminal_deleted": True, "intent_deleted": False}
 
         delete_terminal("abc12345")
 
@@ -58,7 +58,7 @@ class TestSnapshotOnDelete:
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     def test_snapshot_failure_is_nonfatal(
         self, mock_log_dir, mock_db_delete, mock_pm, mock_meta, mock_tmux, tmp_path
@@ -76,7 +76,7 @@ class TestSnapshotOnDelete:
             "allowed_tools": None,
         }
         mock_tmux.get_history.side_effect = RuntimeError("tmux error")
-        mock_db_delete.return_value = True
+        mock_db_delete.return_value = {"terminal_deleted": True, "intent_deleted": False}
 
         # Should not raise
         result = delete_terminal("abc12345")

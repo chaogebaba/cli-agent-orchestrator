@@ -212,8 +212,10 @@ class TestCreateTerminalHerdrRegistration:
                 "cli_agent_orchestrator.services.rebind_lease.validate_rebind_lease"
             ))
             get_metadata = stack.enter_context(patch(_TS + "get_terminal_metadata", return_value=metadata))
-            delete_row = stack.enter_context(patch(_TS + "db_delete_terminal", return_value=True))
-            stack.enter_context(patch(_TS + "delete_warm_intent_for_terminal", create=True))
+            delete_row = stack.enter_context(patch(
+                _TS + "delete_terminal_and_warm_intent",
+                return_value={"terminal_deleted": True, "intent_deleted": False},
+            ))
             fifo = stack.enter_context(patch(_TS + "fifo_manager"))
             persist = stack.enter_context(patch(_TS + "_persist_provider_runtime_identity"))
 
@@ -263,7 +265,7 @@ class TestCreateTerminalHerdrRegistration:
         assert epoch_recovery_service._normalize_creation_error(caught.value) == code
         if post_publish:
             get_metadata.assert_called_once_with(TERMINAL_ID)
-            delete_row.assert_called_once_with(TERMINAL_ID)
+            delete_row.assert_called_once_with(TERMINAL_ID, preserve_warm_intent=False)
         else:
             delete_row.assert_not_called()
 
@@ -281,7 +283,7 @@ class TestCreateTerminalHerdrRegistration:
         m.provider_manager.get_provider.return_value = m.provider_manager.create_provider.return_value
         with patch(_TS + "get_terminal_metadata", return_value=metadata) as get_metadata, \
              patch(_TS + "status_monitor") as monitor, \
-             patch(_TS + "db_delete_terminal") as delete_row, \
+             patch(_TS + "delete_terminal_and_warm_intent") as delete_row, \
              patch(_TS + "list_terminals_by_provider_session_id",
                    return_value=[metadata]), \
              patch("cli_agent_orchestrator.services.rebind_lease.validate_rebind_lease"), \
@@ -318,7 +320,10 @@ class TestCreateTerminalHerdrRegistration:
         m.db_create_terminal.side_effect = database.create_terminal
         m.backend.window_liveness.return_value = "live"
         with patch(_TS + "get_terminal_metadata", side_effect=database.get_terminal_metadata), \
-             patch(_TS + "db_delete_terminal", side_effect=database.delete_terminal) as delete_row, \
+            patch(
+                _TS + "delete_terminal_and_warm_intent",
+                side_effect=database.delete_terminal_and_warm_intent,
+            ) as delete_row, \
              patch(_TS + "_persist_provider_runtime_identity",
                    side_effect=RuntimeError("session_capture_ambiguous")), \
              patch("cli_agent_orchestrator.services.rebind_lease.validate_rebind_lease"):
@@ -368,7 +373,10 @@ class TestCreateTerminalHerdrRegistration:
         m.provider_manager.create_provider.side_effect = fail_provider
         m.backend.window_liveness.return_value = "gone"
         with patch(_TS + "get_terminal_metadata", side_effect=database.get_terminal_metadata), \
-             patch(_TS + "db_delete_terminal", side_effect=database.delete_terminal), \
+             patch(
+                 _TS + "delete_terminal_and_warm_intent",
+                 side_effect=database.delete_terminal_and_warm_intent,
+             ), \
              patch("cli_agent_orchestrator.services.rebind_lease.validate_rebind_lease"):
             with pytest.raises(RuntimeError, match="provider_construct_failed"):
                 await create_terminal(
@@ -391,7 +399,10 @@ class TestCreateTerminalHerdrRegistration:
         m.db_create_terminal.side_effect = database.create_terminal
         m.backend.window_liveness.return_value = "live"
         with patch(_TS + "get_terminal_metadata", side_effect=database.get_terminal_metadata), \
-             patch(_TS + "db_delete_terminal", side_effect=database.delete_terminal) as delete_row, \
+             patch(
+                 _TS + "delete_terminal_and_warm_intent",
+                 side_effect=database.delete_terminal_and_warm_intent,
+             ) as delete_row, \
              patch(_TS + "_persist_provider_runtime_identity",
                    side_effect=RuntimeError("session_capture_ambiguous")), \
              patch("cli_agent_orchestrator.services.rebind_lease.validate_rebind_lease"), \
@@ -451,12 +462,14 @@ def delete_mocks():
             get_herdr_inbox_service=p("get_herdr_inbox_service"),
             get_terminal_metadata=p("get_terminal_metadata"),
             provider_manager=p("provider_manager"),
-            db_delete_terminal=p("db_delete_terminal"),
+            db_delete_terminal=p("delete_terminal_and_warm_intent"),
             dispatch_plugin_event=p("dispatch_plugin_event"),
         )
 
         m.get_terminal_metadata.return_value = None
-        m.db_delete_terminal.return_value = True
+        m.db_delete_terminal.return_value = {
+            "terminal_deleted": True, "intent_deleted": False,
+        }
 
         service = MagicMock()
         m.get_herdr_inbox_service.return_value = service

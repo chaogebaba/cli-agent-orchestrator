@@ -53,22 +53,20 @@ async def test_blocked_deferred_assign_queues_verbatim_once_and_notifies_once():
         patch(
             "cli_agent_orchestrator.services.terminal_service.create_inbox_message"
         ) as create_message,
-        patch(
-            "cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure"
-        ) as notify,
     ):
         _schedule_deferred_init(
             provider, "worker99", shaped, OrchestrationType.ASSIGN, registry=None
         )
         await asyncio.gather(*list(_deferred_init_tasks))
 
-    create_message.assert_called_once_with(
+    assert create_message.call_count == 2
+    create_message.assert_any_call(
         "caller01", "worker99", shaped, OrchestrationType.ASSIGN
     )
-    notify.assert_called_once()
-    assert "queued" in notify.call_args.args[1]
-    assert "will deliver when the dialog clears" in notify.call_args.args[1]
-    assert notify.call_args.kwargs["delete_worker"] is False
+    notice_call = create_message.call_args_list[-1]
+    assert notice_call.args[:2] == ("worker99", "caller01")
+    assert "queued" in notice_call.args[2]
+    assert "will deliver when the dialog clears" in notice_call.args[2]
 
 
 @pytest.mark.asyncio
@@ -91,21 +89,17 @@ async def test_blocked_deferred_assign_enqueue_failure_reports_undelivered():
             side_effect=RuntimeError("db down"),
         ),
         patch(
-            "cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure"
-        ) as notify,
+            "cli_agent_orchestrator.services.terminal_service._claim_and_settle_deferred_failure",
+            new_callable=AsyncMock,
+        ) as claim_and_settle,
     ):
         _schedule_deferred_init(
             provider, "worker99", "assigned task", OrchestrationType.ASSIGN, registry=None
         )
         await asyncio.gather(*list(_deferred_init_tasks))
 
-    notify.assert_called_once()
-    notice = notify.call_args.args[1]
-    assert "not queued" in notice
-    assert "undelivered" in notice
-    assert "still alive" in notice
-    assert "will deliver" not in notice
-    assert notify.call_args.kwargs["delete_worker"] is False
+    claim_and_settle.assert_awaited_once()
+    assert claim_and_settle.call_args.args[3] == "deferred_init_internal"
 
 
 class TestCreateTerminal:
@@ -1535,7 +1529,7 @@ class TestDeleteTerminal:
 
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
@@ -1553,7 +1547,7 @@ class TestDeleteTerminal:
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
         }
-        mock_db_delete.return_value = True
+        mock_db_delete.return_value = {"terminal_deleted": True, "intent_deleted": True}
 
         result = delete_terminal("test1234")
 
@@ -1563,7 +1557,7 @@ class TestDeleteTerminal:
 
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
@@ -1582,7 +1576,7 @@ class TestDeleteTerminal:
             "tmux_window": "developer-abcd",
         }
         mock_tmux.stop_pipe_pane.side_effect = Exception("Pipe error")
-        mock_db_delete.return_value = True
+        mock_db_delete.return_value = {"terminal_deleted": True, "intent_deleted": True}
 
         # Should not raise, just warn
         result = delete_terminal("test1234")
@@ -1591,7 +1585,7 @@ class TestDeleteTerminal:
 
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_delete_terminal_no_metadata(
@@ -1604,7 +1598,7 @@ class TestDeleteTerminal:
     ):
         """Test deleting terminal when metadata not found."""
         mock_get_metadata.return_value = None
-        mock_db_delete.return_value = True
+        mock_db_delete.return_value = {"terminal_deleted": True, "intent_deleted": True}
 
         result = delete_terminal("test1234")
 
@@ -1612,91 +1606,65 @@ class TestDeleteTerminal:
 
 
 class TestDeferredInitFailureNotification:
-    """PR #390 must-fixes #1/#3: a deferred-init failure must be OBSERVABLE to
-    the supervisor (assign already returned success=True), teardown must pass
-    the registry (post_kill_terminal parity), and TerminalInputBlockedError
-    must NOT delete the worker.
-    """
+    """Deferred failures use one H3 claim before settlement."""
 
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_notify_enqueues_inbox_to_caller_and_deletes_with_registry(
-        self, mock_meta, mock_create_inbox, mock_delete
-    ):
-        from cli_agent_orchestrator.services.terminal_service import (
-            _notify_caller_of_deferred_failure,
-        )
+    @staticmethod
+    def _snapshot(caller_id="super123"):
+        return {
+            "caller_id": caller_id,
+            "agent_profile": "developer",
+            "provider": "codex",
+            "init_deadline_s": 60.0,
+        }
 
-        mock_meta.return_value = {"caller_id": "super123"}
+    @pytest.mark.asyncio
+    async def test_claimed_failure_settles_with_registry(self):
         registry = MagicMock()
+        tracked = AsyncMock(side_effect=[
+            ({"status": "claimed_notified", "init_state": "init_failed_notified"}, 0.0),
+            ({"status": "deleted"}, 0.0),
+        ])
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service._tracked_blocking", tracked,
+        ):
+            await terminal_service_module._claim_and_settle_deferred_failure(
+                "worker99", "generation", self._snapshot(), "worker_vanished", registry,
+            )
+        assert tracked.await_count == 2
+        assert tracked.await_args_list[1].args[6] is registry
 
-        _notify_caller_of_deferred_failure(
-            "worker99", "init failed: boom", registry, delete_worker=True
-        )
+    @pytest.mark.asyncio
+    async def test_caller_gone_claim_still_settles(self):
+        tracked = AsyncMock(side_effect=[
+            ({"status": "claimed_caller_gone", "init_state": "init_failed_caller_gone"}, 0.0),
+            ({"status": "deleted"}, 0.0),
+        ])
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service._tracked_blocking", tracked,
+        ):
+            await terminal_service_module._claim_and_settle_deferred_failure(
+                "worker99", "generation", self._snapshot(None), "worker_vanished", None,
+            )
+        assert tracked.await_count == 2
 
-        # Caller notified via inbox (sender = the failed worker, receiver = caller)
-        mock_create_inbox.assert_called_once()
-        _, kwargs = mock_create_inbox.call_args
-        assert kwargs["receiver_id"] == "super123"
-        assert kwargs["sender_id"] == "worker99"
-        assert "init failed: boom" in kwargs["message"]
-        # Teardown passes the registry so post_kill_terminal hooks fire.
-        mock_delete.assert_called_once_with("worker99", registry=registry)
+    @pytest.mark.asyncio
+    async def test_claim_failure_does_not_settle(self):
+        tracked = AsyncMock(side_effect=RuntimeError("db down"))
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service._tracked_blocking", tracked,
+        ):
+            await terminal_service_module._claim_and_settle_deferred_failure(
+                "worker99", "generation", self._snapshot(), "worker_vanished", None,
+            )
+        tracked.assert_awaited_once()
 
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_notify_without_delete_leaves_worker_alive(
-        self, mock_meta, mock_create_inbox, mock_delete
-    ):
-        """delete_worker=False (the WAITING_USER_ANSWER case) must notify but
-        NOT tear the worker down."""
-        from cli_agent_orchestrator.services.terminal_service import (
-            _notify_caller_of_deferred_failure,
-        )
-
-        mock_meta.return_value = {"caller_id": "super123"}
-
-        _notify_caller_of_deferred_failure(
-            "worker99", "waiting on prompt", None, delete_worker=False
-        )
-
-        mock_create_inbox.assert_called_once()
-        mock_delete.assert_not_called()
-
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_notify_inbox_failure_does_not_block_teardown(
-        self, mock_meta, mock_create_inbox, mock_delete
-    ):
-        """If the inbox enqueue fails, teardown must still happen (independent
-        best-effort steps)."""
-        from cli_agent_orchestrator.services.terminal_service import (
-            _notify_caller_of_deferred_failure,
-        )
-
-        mock_meta.return_value = {"caller_id": "super123"}
-        mock_create_inbox.side_effect = Exception("db down")
-
-        _notify_caller_of_deferred_failure("worker99", "boom", None, delete_worker=True)
-
-        mock_delete.assert_called_once()
-
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_notify_no_caller_id_is_log_only(self, mock_meta, mock_create_inbox, mock_delete):
-        """No caller_id (e.g. operator-launched) → no inbox attempt, still tears
-        down."""
-        from cli_agent_orchestrator.services.terminal_service import (
-            _notify_caller_of_deferred_failure,
-        )
-
-        mock_meta.return_value = {"caller_id": None}
-
-        _notify_caller_of_deferred_failure("worker99", "boom", None, delete_worker=True)
-
-        mock_create_inbox.assert_not_called()
-        mock_delete.assert_called_once()
+    @pytest.mark.asyncio
+    async def test_row_missing_claim_does_not_settle(self):
+        tracked = AsyncMock(return_value=({"status": "row_missing", "init_state": None}, 0.0))
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service._tracked_blocking", tracked,
+        ):
+            await terminal_service_module._claim_and_settle_deferred_failure(
+                "worker99", "generation", self._snapshot(), "worker_vanished", None,
+            )
+        tracked.assert_awaited_once()

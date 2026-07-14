@@ -31,6 +31,26 @@ from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
 logger = logging.getLogger(__name__)
 
 
+class ArtifactValidationError(Exception):
+    """Base for stable, locally classified session-artifact failures."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self._code = code
+
+    @property
+    def code(self) -> str:
+        return self._code
+
+
+class RetryableArtifactValidation(ArtifactValidationError):
+    """The provider artifact can lawfully appear before the H1 deadline."""
+
+
+class TerminalArtifactValidation(ArtifactValidationError):
+    """The observed artifact is terminally invalid for this init attempt."""
+
+
 class BaseProvider(ABC):
     supports_fork_context: bool = False
     supports_reauth_rebind: bool = False

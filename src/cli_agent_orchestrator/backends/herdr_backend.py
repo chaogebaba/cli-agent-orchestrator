@@ -233,6 +233,14 @@ class HerdrBackend(TerminalBackend):
             if ws.get("label") == session_name:
                 ws_id = str(ws["workspace_id"])
                 self._workspace_cache[session_name] = (ws_id, time.time())
+                try:
+                    from cli_agent_orchestrator.clients.database import record_workspace_mapping
+                    record_workspace_mapping(ws_id, session_name)
+                except Exception:
+                    logger.exception(
+                        "herdr_workspace_map_backfill_failed workspace=%s session=%s",
+                        ws_id, session_name,
+                    )
                 return ws_id
 
         raise TerminalBackendError(f"Workspace with label '{session_name}' not found")
@@ -268,6 +276,14 @@ class HerdrBackend(TerminalBackend):
             root_tab_id = str(root_pane.get("tab_id", ""))
             if workspace_id:
                 self._workspace_cache[session_name] = (workspace_id, time.time())
+                try:
+                    from cli_agent_orchestrator.clients.database import record_workspace_mapping
+                    record_workspace_mapping(workspace_id, session_name)
+                except Exception:
+                    logger.exception(
+                        "herdr_workspace_map_write_failed workspace=%s session=%s",
+                        workspace_id, session_name,
+                    )
         except (json.JSONDecodeError, KeyError):
             pass  # Non-fatal; we can resolve later
 
@@ -325,7 +341,41 @@ class HerdrBackend(TerminalBackend):
         except TerminalBackendError:
             logger.warning(f"kill_session: workspace '{session_name}' not found")
             return False
-        result = self._run_herdr(["workspace", "close", workspace_id], check=False)
+        intent = None
+        try:
+            from cli_agent_orchestrator.clients.database import begin_teardown_intent
+            intent = begin_teardown_intent(workspace_id, session_name)
+        except Exception:
+            logger.exception(
+                "herdr_teardown_intent_begin_failed workspace=%s session=%s",
+                workspace_id, session_name,
+            )
+        try:
+            result = self._run_herdr(["workspace", "close", workspace_id], check=False)
+        except Exception:
+            if intent is not None:
+                try:
+                    from cli_agent_orchestrator.clients.database import settle_teardown_intent
+                    settle_teardown_intent(
+                        workspace_id, intent["generation"], issued=False,
+                    )
+                except Exception:
+                    logger.exception(
+                        "herdr_teardown_intent_void_failed workspace=%s generation=%s",
+                        workspace_id, intent["generation"],
+                    )
+            raise
+        if intent is not None:
+            try:
+                from cli_agent_orchestrator.clients.database import settle_teardown_intent
+                settle_teardown_intent(
+                    workspace_id, intent["generation"], issued=result.returncode == 0,
+                )
+            except Exception:
+                logger.exception(
+                    "herdr_teardown_intent_settle_failed workspace=%s generation=%s",
+                    workspace_id, intent["generation"],
+                )
         if result.returncode == 0:
             self._workspace_cache.pop(session_name, None)
             logger.info(f"Killed herdr workspace: {session_name}")

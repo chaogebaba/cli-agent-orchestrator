@@ -205,6 +205,7 @@ def delete_session(
             acquire_session_lifecycle_exclusive,
         )
 
+        terminal_service.quiesce_deferred_session_sync(session_name)
         lifecycle_lease = acquire_session_lifecycle_exclusive(session_name)
         if lifecycle_lease is None:
             raise RuntimeError("resume_in_progress")

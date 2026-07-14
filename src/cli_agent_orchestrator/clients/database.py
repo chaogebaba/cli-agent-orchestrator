@@ -5,6 +5,7 @@ import os
 import json
 import uuid
 import hashlib
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,15 +16,18 @@ from sqlalchemy import (
     CheckConstraint,
     Column,
     DateTime,
+    Float,
     Integer,
     String,
     Text,
     UniqueConstraint,
     Index,
     create_engine,
+    event,
     text,
 )
-from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Session, declarative_base, sessionmaker
+from sqlalchemy.exc import OperationalError
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.flow import Flow
@@ -57,7 +61,38 @@ class TerminalModel(Base):
     recovery_error = Column(String, nullable=True)
     recovery_updated_at = Column(DateTime(timezone=True), nullable=True)
     fallback_terminal_id = Column(String, nullable=True)
+    init_state = Column(String, nullable=False, default="ready", server_default="ready")
+    init_started_at = Column(DateTime(timezone=True), nullable=True)
+    init_owner_epoch = Column(String, nullable=True)
+    init_failure_token = Column(String, nullable=True, unique=True)
+    init_deadline_s = Column(Float, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
+    __table_args__ = (
+        CheckConstraint(
+            "init_state IN ('init_pending','ready','init_failed_notified',"
+            "'init_failed_caller_gone')",
+            name="ck_terminals_init_state",
+        ),
+        CheckConstraint(
+            "init_state != 'init_pending' OR "
+            "(init_started_at IS NOT NULL AND init_owner_epoch IS NOT NULL AND "
+            "length(init_owner_epoch) = 36 AND init_owner_epoch = lower(init_owner_epoch) AND "
+            "substr(init_owner_epoch,9,1) = '-' AND substr(init_owner_epoch,14,1) = '-' AND "
+            "substr(init_owner_epoch,19,1) = '-' AND substr(init_owner_epoch,24,1) = '-' AND "
+            "init_deadline_s IS NOT NULL AND init_deadline_s >= 1.0 AND "
+            "init_deadline_s <= 600.0 AND init_deadline_s = init_deadline_s)",
+            name="ck_terminals_pending_init_fields",
+        ),
+        CheckConstraint(
+            "init_failure_token IS NULL OR (length(init_failure_token) = 36 AND "
+            "init_failure_token = lower(init_failure_token) AND "
+            "substr(init_failure_token,9,1) = '-' AND "
+            "substr(init_failure_token,14,1) = '-' AND "
+            "substr(init_failure_token,19,1) = '-' AND "
+            "substr(init_failure_token,24,1) = '-')",
+            name="ck_terminals_init_failure_token_uuid",
+        ),
+    )
 
 
 class ProviderSessionModel(Base):
@@ -95,6 +130,33 @@ class WarmIntentModel(Base):
     parent_base_name = Column(String, nullable=False)
     provider = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class TeardownIntentModel(Base):
+    """Durable proof that CAO issued a Herdr workspace close."""
+
+    __tablename__ = "herdr_teardown_intents"
+    workspace_id = Column(String, primary_key=True)
+    session_name = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    state = Column(String, nullable=False)
+    generation = Column(Integer, nullable=False, default=1)
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('issuing','issued_ok','void','consumed')",
+            name="ck_herdr_teardown_intent_state",
+        ),
+    )
+
+
+class WorkspaceMapModel(Base):
+    """Durable Herdr workspace-to-session routing with retirement history."""
+
+    __tablename__ = "herdr_workspace_map"
+    workspace_id = Column(String, primary_key=True)
+    session_name = Column(String, nullable=False, index=True)
+    active = Column(Boolean, nullable=False, default=True, server_default="1")
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 
 class SessionEpochModel(Base):
@@ -283,6 +345,16 @@ def _ensure_db_dir() -> None:
 _ensure_db_dir()
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+_READY_COMMIT_CALLBACK = "_cao_ready_commit_callback"
+
+
+@event.listens_for(Session, "after_commit", insert=True)
+def _publish_ready_commit(session: Session) -> None:
+    """Publish the ready winner before later after_commit observers run."""
+    callback = session.info.pop(_READY_COMMIT_CALLBACK, None)
+    if callback is not None:
+        callback()
 
 
 def init_db() -> None:
@@ -702,44 +774,118 @@ def _migrate_workflow_run_step() -> None:
 
 
 def _migrate_terminals_schema() -> None:
-    """Add allowed_tools and shell_command columns to terminals table if missing (schema migration)."""
+    """Atomically rebuild legacy terminals with the frozen init lifecycle.
+
+    This migration is deliberately fatal: startup cannot safely run H3/H5 on
+    a partial schema.  The rename, rebuild, copy, constraints, and index land
+    in one rollback-capable transaction.
+    """
     import sqlite3
 
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
+    conn = sqlite3.connect(str(DATABASE_FILE), isolation_level=None)
     try:
-        conn = sqlite3.connect(str(DATABASE_FILE))
-        cursor = conn.execute("PRAGMA table_info(terminals)")
-        columns = {row[1] for row in cursor.fetchall()}
-        if "allowed_tools" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN allowed_tools TEXT")
-            conn.commit()
-            logger.info("Migration: added allowed_tools column to terminals table")
-        if "shell_command" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN shell_command TEXT")
-            conn.commit()
-            logger.info("Migration: added shell_command column to terminals table")
-        if "caller_id" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN caller_id TEXT")
-            conn.commit()
-            logger.info("Migration: added caller_id column to terminals table")
-        if "provider_session_id" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN provider_session_id TEXT")
-            conn.commit()
-            logger.info("Migration: added provider_session_id column to terminals table")
-        for name, sql_type in (
-            ("recovery_state", "TEXT"),
-            ("recovery_error", "TEXT"),
-            ("recovery_updated_at", "DATETIME"),
-            ("fallback_terminal_id", "TEXT"),
-        ):
-            if name not in columns:
-                conn.execute(f"ALTER TABLE terminals ADD COLUMN {name} {sql_type}")
-                conn.commit()
-                logger.info("Migration: added %s column to terminals table", name)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(terminals)")}
+        table_sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='terminals'"
+        ).fetchone()
+        table_sql = table_sql_row[0] if table_sql_row else ""
+        init_columns = {
+            "init_state", "init_started_at", "init_owner_epoch",
+            "init_failure_token", "init_deadline_s",
+        }
+        has_token_unique = any(
+            bool(row[2]) and any(
+                detail[2] == "init_failure_token"
+                for detail in conn.execute(f"PRAGMA index_info('{row[1]}')")
+            )
+            for row in conn.execute("PRAGMA index_list('terminals')")
+        )
+        trigger_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND "
+            "name='terminals_init_failure_token_immutable'"
+        ).fetchone() is not None
+        schema_current = (
+            init_columns.issubset(columns)
+            and "init_state IN" in table_sql
+            and "init_deadline_s >= 1.0" in table_sql
+            and has_token_unique
+        )
+        if not columns:
+            return
+        if schema_current:
+            if not trigger_exists:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "CREATE TRIGGER terminals_init_failure_token_immutable "
+                    "BEFORE UPDATE OF init_failure_token ON terminals "
+                    "WHEN OLD.init_failure_token IS NOT NULL AND "
+                    "NEW.init_failure_token IS NOT OLD.init_failure_token "
+                    "BEGIN SELECT RAISE(ABORT, 'init_failure_token_immutable'); END"
+                )
+                conn.execute("COMMIT")
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("ALTER TABLE terminals RENAME TO terminals_wpm4a_legacy")
+        conn.execute(
+            "CREATE TABLE terminals ("
+            "id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL, tmux_window TEXT NOT NULL, "
+            "provider TEXT NOT NULL, agent_profile TEXT, allowed_tools TEXT, "
+            "shell_command TEXT, caller_id TEXT, provider_session_id TEXT, "
+            "recovery_state TEXT, recovery_error TEXT, recovery_updated_at DATETIME, "
+            "fallback_terminal_id TEXT, "
+            "init_state TEXT NOT NULL DEFAULT 'ready' "
+            "CHECK (init_state IN ('init_pending','ready','init_failed_notified',"
+            "'init_failed_caller_gone')), "
+            "init_started_at DATETIME, init_owner_epoch TEXT, "
+            "init_failure_token TEXT UNIQUE, init_deadline_s REAL, "
+            "last_active DATETIME, "
+            "CHECK (init_state != 'init_pending' OR "
+            "(init_started_at IS NOT NULL AND init_owner_epoch IS NOT NULL AND "
+            "length(init_owner_epoch) = 36 AND init_owner_epoch = lower(init_owner_epoch) AND "
+            "substr(init_owner_epoch,9,1) = '-' AND substr(init_owner_epoch,14,1) = '-' AND "
+            "substr(init_owner_epoch,19,1) = '-' AND substr(init_owner_epoch,24,1) = '-' AND "
+            "init_deadline_s IS NOT NULL AND init_deadline_s >= 1.0 AND "
+            "init_deadline_s <= 600.0 AND init_deadline_s = init_deadline_s)), "
+            "CHECK (init_failure_token IS NULL OR "
+            "(length(init_failure_token) = 36 AND init_failure_token = lower(init_failure_token) AND "
+            "substr(init_failure_token,9,1) = '-' AND substr(init_failure_token,14,1) = '-' AND "
+            "substr(init_failure_token,19,1) = '-' AND substr(init_failure_token,24,1) = '-')))"
+        )
+        legacy_columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(terminals_wpm4a_legacy)"
+        )}
+        destination = [
+            "id", "tmux_session", "tmux_window", "provider", "agent_profile",
+            "allowed_tools", "shell_command", "caller_id", "provider_session_id",
+            "recovery_state", "recovery_error", "recovery_updated_at",
+            "fallback_terminal_id", "last_active",
+            "init_state", "init_started_at", "init_owner_epoch",
+            "init_failure_token", "init_deadline_s",
+        ]
+        copied = [name for name in destination if name in legacy_columns]
+        conn.execute(
+            f"INSERT INTO terminals ({','.join(copied)}) "
+            f"SELECT {','.join(copied)} FROM terminals_wpm4a_legacy"
+        )
+        conn.execute("DROP TABLE terminals_wpm4a_legacy")
+        conn.execute(
+            "CREATE TRIGGER terminals_init_failure_token_immutable "
+            "BEFORE UPDATE OF init_failure_token ON terminals "
+            "WHEN OLD.init_failure_token IS NOT NULL AND "
+            "NEW.init_failure_token IS NOT OLD.init_failure_token "
+            "BEGIN SELECT RAISE(ABORT, 'init_failure_token_immutable'); END"
+        )
+        conn.execute("COMMIT")
+        logger.info("Migration: atomically installed deferred-init terminal schema")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        logger.exception("Fatal deferred-init terminal schema migration failure")
+        raise
+    finally:
         conn.close()
-    except Exception as e:
-        logger.warning(f"Migration check for terminals schema failed: {e}")
 
 
 def create_terminal(
@@ -752,6 +898,10 @@ def create_terminal(
     shell_command: Optional[str] = None,
     caller_id: Optional[str] = None,
     provider_session_id: Optional[str] = None,
+    init_state: str = "ready",
+    init_started_at: Optional[datetime] = None,
+    init_owner_epoch: Optional[str] = None,
+    init_deadline_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -767,6 +917,10 @@ def create_terminal(
             shell_command=shell_command,
             caller_id=caller_id,
             provider_session_id=provider_session_id,
+            init_state=init_state,
+            init_started_at=init_started_at,
+            init_owner_epoch=init_owner_epoch,
+            init_deadline_s=init_deadline_s,
         )
         db.add(terminal)
         db.commit()
@@ -784,6 +938,11 @@ def create_terminal(
             "recovery_error": terminal.recovery_error,
             "recovery_updated_at": terminal.recovery_updated_at,
             "fallback_terminal_id": terminal.fallback_terminal_id,
+            "init_state": terminal.init_state,
+            "init_started_at": terminal.init_started_at,
+            "init_owner_epoch": terminal.init_owner_epoch,
+            "init_failure_token": terminal.init_failure_token,
+            "init_deadline_s": terminal.init_deadline_s,
         }
 
 
@@ -795,7 +954,10 @@ def create_terminal_with_warm_intent(
     *, terminal_id: str, tmux_session: str, tmux_window: str, provider: str,
     agent_profile: Optional[str], allowed_tools: Optional[List[str]],
     caller_id: Optional[str], parent_base_name: Optional[str],
-    fork_mode: Optional[str], cas_hook=None,
+    fork_mode: Optional[str], cas_hook=None, init_state: str = "ready",
+    init_started_at: Optional[datetime] = None,
+    init_owner_epoch: Optional[str] = None,
+    init_deadline_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Publish terminal metadata and a fork-only warm intent together."""
     import json as _json
@@ -807,6 +969,8 @@ def create_terminal_with_warm_intent(
             provider=provider, agent_profile=agent_profile,
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
             caller_id=caller_id,
+            init_state=init_state, init_started_at=init_started_at,
+            init_owner_epoch=init_owner_epoch, init_deadline_s=init_deadline_s,
         ))
         if fork_mode == "fork" and parent_base_name and agent_profile:
             claimed = False
@@ -882,6 +1046,11 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "recovery_error": terminal.recovery_error,
             "recovery_updated_at": terminal.recovery_updated_at,
             "fallback_terminal_id": terminal.fallback_terminal_id,
+            "init_state": terminal.init_state,
+            "init_started_at": terminal.init_started_at,
+            "init_owner_epoch": terminal.init_owner_epoch,
+            "init_failure_token": terminal.init_failure_token,
+            "init_deadline_s": terminal.init_deadline_s,
             "last_active": terminal.last_active,
         }
 
@@ -908,6 +1077,11 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "recovery_error": t.recovery_error,
                 "recovery_updated_at": t.recovery_updated_at,
                 "fallback_terminal_id": t.fallback_terminal_id,
+                "init_state": t.init_state,
+                "init_started_at": t.init_started_at,
+                "init_owner_epoch": t.init_owner_epoch,
+                "init_failure_token": t.init_failure_token,
+                "init_deadline_s": t.init_deadline_s,
                 "last_active": t.last_active,
             }
             for t in terminals
@@ -1161,9 +1335,25 @@ def list_ready_provider_sessions_for_session(session_name: str) -> List[Dict[str
         return [provider_session_to_dict(row) for row in rows]
 
 
-def delete_warm_intent_for_terminal(terminal_id: str) -> bool:
+def delete_terminal_and_warm_intent(
+    terminal_id: str, *, preserve_warm_intent: bool = False,
+) -> Dict[str, bool]:
+    """Delete the terminal and, unless retained, its warm intent atomically."""
     with SessionLocal.begin() as db:
-        return db.query(WarmIntentModel).filter_by(worker_terminal_id=terminal_id).delete() > 0
+        intent_deleted = False
+        if not preserve_warm_intent:
+            intent_deleted = (
+                db.query(WarmIntentModel)
+                .filter_by(worker_terminal_id=terminal_id)
+                .delete() > 0
+            )
+        terminal_deleted = (
+            db.query(TerminalModel).filter_by(id=terminal_id).delete() > 0
+        )
+        return {
+            "terminal_deleted": terminal_deleted,
+            "intent_deleted": intent_deleted,
+        }
 
 
 def list_warm_intents(session_name: str) -> List[Dict[str, Any]]:
@@ -1278,9 +1468,309 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
                 "last_active": t.last_active,
+                "caller_id": t.caller_id,
+                "provider_session_id": t.provider_session_id,
+                "recovery_state": t.recovery_state,
+                "init_state": t.init_state,
+                "init_started_at": t.init_started_at,
+                "init_owner_epoch": t.init_owner_epoch,
+                "init_failure_token": t.init_failure_token,
+                "init_deadline_s": t.init_deadline_s,
             }
             for t in terminals
         ]
+
+
+class ReadyCommitInvariantBreach(RuntimeError):
+    """A ready commit failed after in-memory ownership became irrevocable."""
+
+
+class _ReadyCommitVeto(RuntimeError):
+    pass
+
+
+def mark_terminal_init_ready(
+    terminal_id: str,
+    *,
+    should_commit: Optional[Callable[[], bool]] = None,
+    decide_commit: Optional[Callable[[], bool]] = None,
+    commit_is_decided: Optional[Callable[[], bool]] = None,
+    on_committed: Optional[Callable[[], None]] = None,
+) -> bool:
+    """Commit pending-to-ready only while the abandonment fence owns it.
+
+    SQLite's progress handler is part of the transaction execution path.  It
+    closes the interval between the last Python guard and the real COMMIT: a
+    quiesce winner interrupts and rolls back that transaction instead of
+    allowing a late ready write to become durable.
+    """
+    with SessionLocal() as db:
+        if should_commit is not None and not should_commit():
+            return False
+        connection = db.connection()
+        driver_connection = connection.connection.driver_connection
+        progress_fence = getattr(driver_connection, "set_progress_handler", None)
+        if should_commit is not None and progress_fence is not None:
+            progress_fence(lambda: int(not should_commit()), 1)
+        try:
+            changed = db.query(TerminalModel).filter(
+                TerminalModel.id == terminal_id,
+                TerminalModel.init_state == "init_pending",
+            ).update({
+                "init_state": "ready",
+                "init_owner_epoch": None,
+                "init_failure_token": None,
+            }, synchronize_session=False) == 1
+            if should_commit is not None and not should_commit():
+                if progress_fence is not None:
+                    progress_fence(None, 0)
+                db.rollback()
+                return False
+
+            def resolve_commit_winner(_connection) -> None:
+                if decide_commit is not None and not decide_commit():
+                    raise _ReadyCommitVeto("ready_commit_timeout_won")
+
+            if changed:
+                event.listen(connection, "commit", resolve_commit_winner, once=True)
+            if changed and on_committed is not None:
+                db.info[_READY_COMMIT_CALLBACK] = on_committed
+            db.commit()
+        except _ReadyCommitVeto:
+            db.info.pop(_READY_COMMIT_CALLBACK, None)
+            if progress_fence is not None:
+                progress_fence(None, 0)
+            db.rollback()
+            return False
+        except Exception as exc:
+            decided = commit_is_decided is not None and commit_is_decided()
+            abandoned = should_commit is not None and not should_commit()
+            if decided:
+                logger.critical(
+                    "ready_commit_invariant_breach terminal=%s", terminal_id,
+                    exc_info=True,
+                )
+            db.info.pop(_READY_COMMIT_CALLBACK, None)
+            if progress_fence is not None:
+                if decided:
+                    try:
+                        progress_fence(None, 0)
+                    except Exception:
+                        logger.error(
+                            "ready_commit_fence_cleanup_failed terminal=%s",
+                            terminal_id,
+                            exc_info=True,
+                        )
+                    progress_fence = None
+                else:
+                    progress_fence(None, 0)
+            if decided:
+                try:
+                    db.rollback()
+                except Exception:
+                    logger.error(
+                        "ready_commit_rollback_failed terminal=%s", terminal_id,
+                        exc_info=True,
+                    )
+                raise ReadyCommitInvariantBreach(
+                    "ready_commit_failed_after_decision"
+                ) from exc
+            db.rollback()
+            if (
+                isinstance(exc, OperationalError)
+                and abandoned
+                and "interrupted" in str(exc).lower()
+            ):
+                return False
+            raise
+        finally:
+            if progress_fence is not None:
+                progress_fence(None, 0)
+            db.info.pop(_READY_COMMIT_CALLBACK, None)
+        return changed
+
+
+def claim_deferred_init_failure(
+    terminal_id: str,
+    *,
+    caller_id: Optional[str],
+    failure_token: str,
+    notice: str,
+    busy_attempts: int = 4,
+    busy_delay_s: float = 0.025,
+) -> Dict[str, Any]:
+    """Atomically claim a pending init and, when possible, enqueue its notice.
+
+    The immediate write lock is the first database observation.  A present
+    receiver gets the notice and terminal state in the same transaction; any
+    insertion/flush/commit error rolls the whole claim back.
+    """
+    for attempt in range(busy_attempts):
+        with SessionLocal() as db:
+            try:
+                db.execute(text("BEGIN IMMEDIATE"))
+                row = db.query(TerminalModel).filter(
+                    TerminalModel.id == terminal_id,
+                    TerminalModel.init_state == "init_pending",
+                ).first()
+                if row is None:
+                    existing = db.query(TerminalModel).filter_by(id=terminal_id).first()
+                    db.rollback()
+                    return {
+                        "status": "row_missing" if existing is None else "already_claimed",
+                        "init_state": existing.init_state if existing is not None else None,
+                        "token": existing.init_failure_token if existing is not None else None,
+                    }
+                receiver_exists = bool(caller_id) and db.query(TerminalModel.id).filter(
+                    TerminalModel.id == caller_id
+                ).first() is not None
+                row.init_failure_token = failure_token
+                if receiver_exists:
+                    row.init_state = "init_failed_notified"
+                    db.add(InboxModel(
+                        sender_id=terminal_id,
+                        receiver_id=cast(str, caller_id),
+                        message=notice,
+                        orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+                        status=MessageStatus.PENDING.value,
+                    ))
+                    status = "claimed_notified"
+                else:
+                    row.init_state = "init_failed_caller_gone"
+                    status = "claimed_caller_gone"
+                db.flush()
+                db.commit()
+                return {"status": status, "init_state": row.init_state, "token": failure_token}
+            except OperationalError as exc:
+                db.rollback()
+                if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                    raise
+                if attempt + 1 >= busy_attempts:
+                    raise RuntimeError("deferred_init_claim_busy_exhausted") from exc
+            except Exception:
+                db.rollback()
+                raise
+        time.sleep(busy_delay_s)
+    raise RuntimeError("deferred_init_claim_busy_exhausted")
+
+
+def list_deferred_init_recovery_rows(current_owner_epoch: str) -> List[Dict[str, Any]]:
+    """Return only durable init rows owned by the H5 startup sweep."""
+    with SessionLocal() as db:
+        rows = db.query(TerminalModel).filter(
+            ((TerminalModel.init_state == "init_pending") &
+             ((TerminalModel.init_owner_epoch != current_owner_epoch) |
+              TerminalModel.init_owner_epoch.is_(None))) |
+            TerminalModel.init_state.in_((
+                "init_failed_notified", "init_failed_caller_gone"
+            ))
+        ).all()
+        return [
+            {column.name: getattr(row, column.name) for column in row.__table__.columns}
+            for row in rows
+        ]
+
+
+def begin_teardown_intent(workspace_id: str, session_name: str) -> Dict[str, Any]:
+    """Create or supersede the single active close authority for a workspace."""
+    now = _utcnow()
+    with SessionLocal.begin() as db:
+        row = db.get(TeardownIntentModel, workspace_id)
+        if row is None:
+            row = TeardownIntentModel(
+                workspace_id=workspace_id, session_name=session_name,
+                created_at=now, state="issuing", generation=1,
+            )
+            db.add(row)
+        else:
+            row.session_name = session_name
+            row.created_at = now
+            row.state = "issuing"
+            row.generation += 1
+        db.flush()
+        return {"workspace_id": workspace_id, "session_name": session_name,
+                "state": row.state, "generation": row.generation,
+                "created_at": row.created_at}
+
+
+def settle_teardown_intent(workspace_id: str, generation: int, *, issued: bool) -> bool:
+    with SessionLocal.begin() as db:
+        return db.query(TeardownIntentModel).filter(
+            TeardownIntentModel.workspace_id == workspace_id,
+            TeardownIntentModel.generation == generation,
+            TeardownIntentModel.state == "issuing",
+        ).update({"state": "issued_ok" if issued else "void"},
+                 synchronize_session=False) == 1
+
+
+def get_teardown_intent(workspace_id: str) -> Optional[Dict[str, Any]]:
+    with SessionLocal() as db:
+        row = db.get(TeardownIntentModel, workspace_id)
+        if row is None:
+            return None
+        return {column.name: getattr(row, column.name) for column in row.__table__.columns}
+
+
+def consume_current_teardown_intent(
+    workspace_id: str, *, ttl_s: float, now: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    """Consume only the current issued, unexpired generation exactly once."""
+    cutoff = (now or _utcnow()) - timedelta(seconds=ttl_s)
+    with SessionLocal.begin() as db:
+        row = db.query(TeardownIntentModel).filter(
+            TeardownIntentModel.workspace_id == workspace_id,
+            TeardownIntentModel.state == "issued_ok",
+            TeardownIntentModel.created_at >= cutoff,
+        ).first()
+        if row is None:
+            return None
+        result = {column.name: getattr(row, column.name) for column in row.__table__.columns}
+        row.state = "consumed"
+        return result
+
+
+def record_workspace_mapping(workspace_id: str, session_name: str) -> None:
+    """Make a workspace current and retire older generations for its session."""
+    with SessionLocal.begin() as db:
+        db.query(WorkspaceMapModel).filter(
+            WorkspaceMapModel.session_name == session_name,
+            WorkspaceMapModel.workspace_id != workspace_id,
+            WorkspaceMapModel.active.is_(True),
+        ).update({"active": False, "updated_at": _utcnow()}, synchronize_session=False)
+        row = db.get(WorkspaceMapModel, workspace_id)
+        if row is None:
+            db.add(WorkspaceMapModel(
+                workspace_id=workspace_id, session_name=session_name,
+                active=True, updated_at=_utcnow(),
+            ))
+        else:
+            row.session_name = session_name
+            row.active = True
+            row.updated_at = _utcnow()
+
+
+def resolve_workspace_mapping(workspace_id: str) -> Optional[str]:
+    with SessionLocal() as db:
+        row = db.query(WorkspaceMapModel).filter_by(
+            workspace_id=workspace_id, active=True
+        ).first()
+        return cast(Optional[str], row.session_name) if row else None
+
+
+def current_workspace_for_session(session_name: str) -> Optional[str]:
+    with SessionLocal() as db:
+        row = db.query(WorkspaceMapModel).filter_by(
+            session_name=session_name, active=True
+        ).order_by(WorkspaceMapModel.updated_at.desc()).first()
+        return cast(Optional[str], row.workspace_id) if row else None
+
+
+def retire_workspace_mapping(workspace_id: str) -> bool:
+    with SessionLocal.begin() as db:
+        return db.query(WorkspaceMapModel).filter_by(
+            workspace_id=workspace_id, active=True
+        ).update({"active": False, "updated_at": _utcnow()},
+                 synchronize_session=False) == 1
 
 
 def list_pending_receiver_ids_by_provider(provider: str) -> List[str]:
@@ -1343,21 +1833,25 @@ def list_pending_receiver_ids() -> List[str]:
 
 
 def delete_terminal(terminal_id: str) -> bool:
-    """Delete terminal metadata."""
-    with SessionLocal() as db:
-        deleted = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).delete()
-        db.commit()
-        return deleted > 0
+    """Delete terminal metadata and its warm intent through the universal seam."""
+    return delete_terminal_and_warm_intent(
+        terminal_id, preserve_warm_intent=False,
+    )["terminal_deleted"]
 
 
 def delete_terminals_by_session(tmux_session: str) -> int:
-    """Delete all terminals in a session."""
+    """Delete all session terminals and their warm intents through the universal seam."""
     with SessionLocal() as db:
-        deleted = (
-            db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).delete()
-        )
-        db.commit()
-        return deleted
+        terminal_ids = [
+            terminal_id for terminal_id, in
+            db.query(TerminalModel.id).filter(TerminalModel.tmux_session == tmux_session).all()
+        ]
+    return sum(
+        delete_terminal_and_warm_intent(
+            terminal_id, preserve_warm_intent=False,
+        )["terminal_deleted"]
+        for terminal_id in terminal_ids
+    )
 
 
 def create_inbox_message(

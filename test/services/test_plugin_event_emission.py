@@ -278,7 +278,10 @@ class TestTerminalPluginEvents:
 
         registry.dispatch.assert_not_awaited()
 
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal", return_value=True)
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent",
+        return_value={"terminal_deleted": True, "intent_deleted": False},
+    )
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
@@ -298,7 +301,10 @@ class TestTerminalPluginEvents:
             "agent_profile": "developer",
         }
         mock_provider_manager.cleanup_provider.side_effect = lambda *_: call_order.append("cleanup")
-        mock_db_delete_terminal.side_effect = lambda *_: call_order.append("db_delete") or True
+        mock_db_delete_terminal.side_effect = lambda *_a, **_k: (
+            call_order.append("db_delete") or
+            {"terminal_deleted": True, "intent_deleted": False}
+        )
         registry.dispatch.side_effect = record_dispatch
 
         deleted = delete_terminal("abcd1234", registry=registry)
@@ -312,7 +318,7 @@ class TestTerminalPluginEvents:
         assert event.terminal_id == "abcd1234"
         assert event.agent_name == "developer"
 
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")

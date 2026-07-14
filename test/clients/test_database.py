@@ -421,38 +421,27 @@ class TestMessageTraceTransactions:
 
         assert result is False
 
-    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
-    def test_delete_terminal(self, mock_session_class):
-        """Test deleting a terminal."""
-        mock_session = MagicMock()
-        mock_session.__enter__ = MagicMock(return_value=mock_session)
-        mock_session.__exit__ = MagicMock(return_value=False)
-
-        mock_query = MagicMock()
-        mock_query.filter.return_value.delete.return_value = 1
-        mock_session.query.return_value = mock_query
-        mock_session_class.return_value = mock_session
-
+    @patch(
+        "cli_agent_orchestrator.clients.database.delete_terminal_and_warm_intent",
+        return_value={"terminal_deleted": True, "intent_deleted": True},
+    )
+    def test_delete_terminal(self, atomic_delete):
+        """The compatibility wrapper delegates to the atomic deletion seam."""
         result = delete_terminal("test123")
 
         assert result is True
-        mock_session.commit.assert_called_once()
+        atomic_delete.assert_called_once_with("test123", preserve_warm_intent=False)
 
-    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
-    def test_delete_terminal_not_found(self, mock_session_class):
+    @patch(
+        "cli_agent_orchestrator.clients.database.delete_terminal_and_warm_intent",
+        return_value={"terminal_deleted": False, "intent_deleted": False},
+    )
+    def test_delete_terminal_not_found(self, atomic_delete):
         """Test deleting a terminal that doesn't exist."""
-        mock_session = MagicMock()
-        mock_session.__enter__ = MagicMock(return_value=mock_session)
-        mock_session.__exit__ = MagicMock(return_value=False)
-
-        mock_query = MagicMock()
-        mock_query.filter.return_value.delete.return_value = 0
-        mock_session.query.return_value = mock_query
-        mock_session_class.return_value = mock_session
-
         result = delete_terminal("nonexistent")
 
         assert result is False
+        atomic_delete.assert_called_once_with("nonexistent", preserve_warm_intent=False)
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_list_terminals_by_session(self, mock_session_class):
@@ -566,19 +555,28 @@ class TestMessageTraceTransactions:
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_delete_terminals_by_session(self, mock_session_class):
-        """Test deleting all terminals in a session."""
+        """Session deletion routes every terminal through the atomic helper."""
         mock_session = MagicMock()
         mock_session.__enter__ = MagicMock(return_value=mock_session)
         mock_session.__exit__ = MagicMock(return_value=False)
 
         mock_query = MagicMock()
-        mock_query.filter.return_value.delete.return_value = 2
+        mock_query.filter.return_value.all.return_value = [("t1",), ("t2",)]
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
-        result = delete_terminals_by_session("cao-session")
+        with patch(
+            "cli_agent_orchestrator.clients.database.delete_terminal_and_warm_intent",
+            return_value={"terminal_deleted": True, "intent_deleted": True},
+        ) as atomic_delete:
+            result = delete_terminals_by_session("cao-session")
 
         assert result == 2
+        assert [item.args for item in atomic_delete.call_args_list] == [("t1",), ("t2",)]
+        assert all(
+            item.kwargs == {"preserve_warm_intent": False}
+            for item in atomic_delete.call_args_list
+        )
 
 
 class TestInboxOperations:

@@ -1250,6 +1250,9 @@ class TestLifespan:
         async def record_registry_load():
             startup_order.append("registry_load")
 
+        async def recover_deferred(_registry):
+            startup_order.append("recover_deferred")
+
         mock_load = AsyncMock(side_effect=record_registry_load)
         mock_teardown = AsyncMock()
         startup_order = []
@@ -1266,6 +1269,10 @@ class TestLifespan:
                 main_module.inbox_service, "recover_stale_deliveries",
                 side_effect=lambda: startup_order.append("recover"),
             ) as mock_recover,
+            patch(
+                "cli_agent_orchestrator.api.main.terminal_service.recover_deferred_inits",
+                side_effect=recover_deferred,
+            ),
             patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
             patch("cli_agent_orchestrator.api.main.cleanup_expired_memories", quick_return),
             patch("cli_agent_orchestrator.api.main.flow_daemon", fake_daemon),
@@ -1303,7 +1310,7 @@ class TestLifespan:
                     mock_purge.assert_called_once_with()
                     mock_recover.assert_called_once_with()
                     assert startup_order == [
-                        "init_db", "purge", "recover", "registry_load"
+                        "init_db", "recover", "registry_load", "recover_deferred", "purge"
                     ]
 
             assert "purged 2 stale terminals" in caplog.text

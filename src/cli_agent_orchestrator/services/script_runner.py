@@ -336,7 +336,7 @@ async def _reconcile_orphans(run_id: str) -> None:
 
         for terminal_id in terminal_ids:
             try:
-                terminal_service.delete_terminal(terminal_id)
+                await asyncio.to_thread(terminal_service.delete_terminal, terminal_id)
             except (
                 Exception
             ) as exc:  # noqa: BLE001 — teardown is best-effort; never fail the run (INV-4)

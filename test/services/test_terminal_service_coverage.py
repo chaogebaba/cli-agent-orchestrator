@@ -20,7 +20,7 @@ class TestCreateTerminalCleanup:
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch(
         "cli_agent_orchestrator.services.terminal_service.generate_window_name", return_value="w1"
@@ -67,7 +67,7 @@ class TestCreateTerminalCleanup:
 
         mock_pm.cleanup_provider.assert_called_once_with("tid1")
         mock_tmux.kill_session.assert_called_once()
-        mock_db_delete.assert_called_once_with("tid1")
+        mock_db_delete.assert_called_once_with("tid1", preserve_warm_intent=False)
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
@@ -75,7 +75,7 @@ class TestCreateTerminalCleanup:
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch(
         "cli_agent_orchestrator.services.terminal_service.generate_window_name", return_value="w1"
@@ -122,7 +122,7 @@ class TestCreateTerminalCleanup:
             )
 
         mock_pm.cleanup_provider.assert_called_once()
-        mock_db_delete.assert_called_once_with("tid1")
+        mock_db_delete.assert_called_once_with("tid1", preserve_warm_intent=False)
         mock_tmux.kill_session.assert_not_called()
 
     @pytest.mark.asyncio
@@ -131,7 +131,7 @@ class TestCreateTerminalCleanup:
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch(
         "cli_agent_orchestrator.services.terminal_service.generate_window_name", return_value="w1"
@@ -181,7 +181,7 @@ class TestCreateTerminalCleanup:
             )
 
         # DB rollback runs even though cleanup_provider raised first.
-        mock_db_delete.assert_called_once_with("tid1")
+        mock_db_delete.assert_called_once_with("tid1", preserve_warm_intent=False)
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
@@ -339,7 +339,10 @@ class TestCreateTerminalSessionCleanupGuard:
 class TestDeleteTerminal:
     """Test delete_terminal coverage including pipe-pane and kill_window."""
 
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal", return_value=True)
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent",
+        return_value={"terminal_deleted": True, "intent_deleted": True},
+    )
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
@@ -356,7 +359,10 @@ class TestDeleteTerminal:
         mock_tmux.kill_window.assert_called_once_with("ses", "win")
         mock_pm.cleanup_provider.assert_called_once_with("tid1")
 
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal", return_value=True)
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent",
+        return_value={"terminal_deleted": True, "intent_deleted": True},
+    )
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
@@ -374,7 +380,10 @@ class TestDeleteTerminal:
         assert result is True
         mock_tmux.kill_window.assert_called_once()
 
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal", return_value=True)
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent",
+        return_value={"terminal_deleted": True, "intent_deleted": True},
+    )
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
@@ -392,7 +401,7 @@ class TestDeleteTerminal:
         assert result is True
         mock_pm.cleanup_provider.assert_called_once()
 
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")

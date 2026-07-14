@@ -93,8 +93,8 @@ def mock_db():
             side_effect=_get,
         ),
         patch(
-            "cli_agent_orchestrator.services.terminal_service.db_delete_terminal",
-            return_value=True,
+            "cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent",
+            return_value={"terminal_deleted": True, "intent_deleted": False},
         ),
         patch(
             "cli_agent_orchestrator.services.terminal_service.update_last_active",

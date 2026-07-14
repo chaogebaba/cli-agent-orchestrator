@@ -3,7 +3,8 @@
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -14,17 +15,24 @@ class TestCleanupOldData:
     """Tests for cleanup_old_data function."""
 
     @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
+    @patch("cli_agent_orchestrator.services.cleanup_service.delete_terminal_and_warm_intent")
     @patch("cli_agent_orchestrator.services.cleanup_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.cleanup_service.LOG_DIR")
     @patch("cli_agent_orchestrator.services.cleanup_service.RETENTION_DAYS", 7)
     def test_cleanup_old_data_deletes_old_terminals(
-        self, mock_log_dir, mock_terminal_log_dir, mock_session_local
+        self, mock_log_dir, mock_terminal_log_dir, mock_delete, mock_session_local
     ):
         """Test that cleanup deletes old terminals from database."""
         # Setup mock database session
         mock_db = MagicMock()
         mock_session_local.return_value.__enter__.return_value = mock_db
-        mock_db.query.return_value.filter.return_value.delete.return_value = 5
+        mock_db.query.return_value.filter.return_value.all.side_effect = [
+            [SimpleNamespace(id="old-1"), SimpleNamespace(id="old-2")],
+            [],
+        ]
+        mock_db.query.return_value.filter.return_value.count.return_value = 0
+        mock_db.query.return_value.filter.return_value.delete.return_value = 0
+        mock_delete.return_value = {"terminal_deleted": True, "intent_deleted": True}
 
         # Setup mock directories (non-existent)
         mock_log_dir.exists.return_value = False
@@ -33,9 +41,10 @@ class TestCleanupOldData:
         # Execute
         cleanup_old_data()
 
-        # Verify terminal cleanup was called
-        assert mock_db.query.called
-        assert mock_db.commit.called
+        assert mock_delete.call_args_list == [
+            call("old-1", preserve_warm_intent=False),
+            call("old-2", preserve_warm_intent=False),
+        ]
 
     @patch("cli_agent_orchestrator.services.cleanup_service.status_monitor")
     @patch("cli_agent_orchestrator.services.cleanup_service.fifo_manager")
@@ -65,11 +74,10 @@ class TestCleanupOldData:
         # Execute
         cleanup_old_data()
 
-        # Verify cleanup was called:
-        # Session 1: query.all() for terminal iteration + query.delete() for terminal deletion
-        # Session 2: query.delete() for inbox deletion
+        # Terminal candidates are enumerated in one session; inbox retention
+        # performs the only bulk delete and commit in this mocked path.
         assert mock_db.query.call_count >= 2
-        assert mock_db.commit.call_count == 2
+        assert mock_db.commit.call_count == 1
 
     def test_cleanup_old_data_purges_attempt_members_and_orphaned_attempt(
         self, monkeypatch, tmp_path

@@ -495,12 +495,13 @@ async def lifespan(app: FastAPI):
     logger.info("Starting CLI Agent Orchestrator server...")
     setup_logging()
     init_db()
-    purged = terminal_service.purge_stale_terminal_records()
-    logger.info("purged %d stale terminals", purged)
     inbox_service.recover_stale_deliveries()
     registry = PluginRegistry()
     await registry.load()
     app.state.plugin_registry = registry
+    await terminal_service.recover_deferred_inits(registry)
+    purged = terminal_service.purge_stale_terminal_records()
+    logger.info("purged %d stale terminals", purged)
 
     # Run cleanup in background
     asyncio.create_task(asyncio.to_thread(cleanup_old_data))
@@ -593,6 +594,7 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
+    await terminal_service.shutdown_deferred_tasks()
     await registry.teardown()
     logger.info("Shutting down CLI Agent Orchestrator server...")
 

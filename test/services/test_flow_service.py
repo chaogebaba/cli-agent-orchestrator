@@ -4,7 +4,7 @@ import json
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -661,14 +661,19 @@ Prompt.
         # Conductor terminal reports PROCESSING via the status monitor → busy.
         mock_status_monitor.get_status.return_value = TerminalStatus.PROCESSING
 
-        result = await execute_flow("busy-flow")
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service.quiesce_deferred_terminals",
+            new_callable=AsyncMock,
+        ) as mock_quiesce:
+            result = await execute_flow("busy-flow")
 
         assert result is False
+        mock_quiesce.assert_not_awaited()
         mock_create_terminal.assert_not_called()
         mock_get_backend.return_value.kill_session.assert_not_called()
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_core")
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
@@ -722,7 +727,7 @@ Prompt.
         mock_create_terminal.assert_called_once()
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_core")
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
@@ -776,7 +781,7 @@ Prompt.
         mock_create_terminal.assert_called_once()
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_core")
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.provider_manager")

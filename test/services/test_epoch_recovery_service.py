@@ -59,7 +59,7 @@ def test_d3_distinct_live_forks_and_oldest_dead_consume(epoch_db):
     _publish(database, "live-a")
     _publish(database, "live-b")
     assert len(database.list_warm_intents("cao-s")) == 2
-    database.delete_terminal("live-a")
+    database.delete_terminal_and_warm_intent("live-a", preserve_warm_intent=True)
     old = next(r for r in database.list_warm_intents("cao-s") if r["worker_terminal_id"] == "live-a")
     _publish(database, "new-a")
     rows = database.list_warm_intents("cao-s")
@@ -72,8 +72,8 @@ def test_d3_distinct_live_forks_and_oldest_dead_consume(epoch_db):
 def test_d3_oldest_dead_intent_ordering_and_cas_predicates(epoch_db):
     _publish(database, "dead-a")
     _publish(database, "dead-b")
-    database.delete_terminal("dead-a")
-    database.delete_terminal("dead-b")
+    database.delete_terminal_and_warm_intent("dead-a", preserve_warm_intent=True)
+    database.delete_terminal_and_warm_intent("dead-b", preserve_warm_intent=True)
     rows = database.list_warm_intents("cao-s")
     assert len(rows) == 2
     oldest = rows[0]
@@ -107,11 +107,11 @@ def test_d2_unscoped_default_exclusion_and_mark_ready_rescope(epoch_db, monkeypa
 
 def test_d3_cas_barrier_miss_recomputes_and_exhaustion_rolls_back(epoch_db):
     _publish(database, "dead")
-    database.delete_terminal("dead")
+    database.delete_terminal_and_warm_intent("dead", preserve_warm_intent=True)
     attempts = []
     _publish(database, "winner", hook=lambda attempt, _old, _db: attempts.append(attempt) or attempt > 0)
     assert attempts == [0, 1]
-    database.delete_terminal("winner")
+    database.delete_terminal_and_warm_intent("winner", preserve_warm_intent=True)
     with pytest.raises(database.WarmIntentPublishError, match="db_publish_failed"):
         _publish(database, "rolled-back", hook=lambda *_: False)
     assert database.get_terminal_metadata("rolled-back") is None
@@ -120,7 +120,7 @@ def test_d3_cas_barrier_miss_recomputes_and_exhaustion_rolls_back(epoch_db):
 
 def test_d3_cas_old_id_predicate_preserves_concurrent_replacement(epoch_db):
     _publish(database, "dead")
-    database.delete_terminal("dead")
+    database.delete_terminal_and_warm_intent("dead", preserve_warm_intent=True)
     def replace_once(attempt, _old, db):
         if attempt:
             return True
@@ -138,7 +138,7 @@ def test_d3_cas_old_id_predicate_preserves_concurrent_replacement(epoch_db):
 
 def test_d3_cas_no_live_predicate_preserves_resurrected_owner(epoch_db):
     _publish(database, "dead")
-    database.delete_terminal("dead")
+    database.delete_terminal_and_warm_intent("dead", preserve_warm_intent=True)
     def resurrect_once(attempt, old, db):
         if attempt:
             return True
@@ -373,7 +373,10 @@ def test_addendum_rollback_requires_confirmed_death(
     monkeypatch.setattr(terminal_service.fifo_manager, "stop_reader", lambda _: detached.append("fifo"))
     monkeypatch.setattr(terminal_service.status_monitor, "clear_terminal", lambda _: detached.append("status"))
     monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", lambda _: None)
-    monkeypatch.setattr(terminal_service, "db_delete_terminal", lambda _: True)
+    monkeypatch.setattr(
+        terminal_service, "delete_terminal_and_warm_intent",
+        lambda *_a, **_k: {"terminal_deleted": True, "intent_deleted": False},
+    )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.rebind_lease.validate_rebind_lease",
         lambda *_: None,

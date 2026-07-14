@@ -41,7 +41,11 @@ def test_rollback_order_stops_pipe_before_fifo_and_window(monkeypatch):
     backend.stop_pipe_pane.side_effect = lambda *_: calls.append("pipe")
     backend.kill_window.side_effect = lambda *_: calls.append("window")
     monkeypatch.setattr(svc, "get_backend", lambda: backend)
-    monkeypatch.setattr(svc, "db_delete_terminal", lambda *_: calls.append("db"))
+    monkeypatch.setattr(
+        svc, "delete_terminal_and_warm_intent",
+        lambda *_a, **_k: calls.append("db") or
+        {"terminal_deleted": True, "intent_deleted": False},
+    )
     monkeypatch.setattr(svc.fifo_manager, "stop_reader", lambda *_: calls.append("fifo"))
     svc._rollback_terminal_creation(
         "term0001", "cao-test", "worker-1", False, True, True, True
@@ -187,7 +191,11 @@ def _install_failure_harness(monkeypatch, tmp_path, *, build_effect):
     monkeypatch.setattr(svc, "get_backend", lambda: backend)
     monkeypatch.setattr(svc, "clear_session_env", lambda *_: None)
     monkeypatch.setattr(svc, "db_create_terminal", lambda *_args, **_kwargs: calls.append("db"))
-    monkeypatch.setattr(svc, "db_delete_terminal", lambda *_args: calls.append("delete-db"))
+    monkeypatch.setattr(
+        svc, "delete_terminal_and_warm_intent",
+        lambda *_args, **_kwargs: calls.append("delete-db") or
+        {"terminal_deleted": True, "intent_deleted": False},
+    )
     monkeypatch.setattr(svc.fifo_manager, "create_reader", lambda *_: None)
     monkeypatch.setattr(svc.fifo_manager, "stop_reader", lambda *_: calls.append("stop-fifo"))
     monkeypatch.setattr(svc, "FIFO_DIR", tmp_path)

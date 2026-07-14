@@ -42,7 +42,7 @@ def test_provisional_owner_race_reaches_service_and_has_zero_teardown_effects(
     monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda _id: row)
     monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
     monkeypatch.setattr(terminal_service, "fifo_manager", fifo)
-    monkeypatch.setattr(terminal_service, "db_delete_terminal", db_delete)
+    monkeypatch.setattr(terminal_service, "delete_terminal_and_warm_intent", db_delete)
     monkeypatch.setattr(terminal_service, "dispatch_plugin_event", plugin_dispatch)
     monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", cleanup)
     monkeypatch.setattr(session_service, "list_terminals_by_session", lambda _s: [row])
@@ -95,7 +95,7 @@ def test_session_teardown_preflights_all_rows_before_deleting_any(
     monkeypatch.setattr(terminal_service, "get_terminal_metadata", by_id.get)
     monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
     monkeypatch.setattr(terminal_service, "fifo_manager", fifo)
-    monkeypatch.setattr(terminal_service, "db_delete_terminal", deleted)
+    monkeypatch.setattr(terminal_service, "delete_terminal_and_warm_intent", deleted)
     monkeypatch.setattr(terminal_service, "dispatch_plugin_event", plugin)
     monkeypatch.setattr(session_service, "list_terminals_by_session", lambda _s: rows)
     monkeypatch.setattr(session_service, "finalize_session", MagicMock())
@@ -153,7 +153,7 @@ def test_session_lifecycle_contention_keeps_every_row_untouched(
     monkeypatch.setattr(session_close_service, "load_agent_profile", lambda _p: None)
     monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
     monkeypatch.setattr(terminal_service, "fifo_manager", fifo)
-    monkeypatch.setattr(terminal_service, "db_delete_terminal", db_delete)
+    monkeypatch.setattr(terminal_service, "delete_terminal_and_warm_intent", db_delete)
     monkeypatch.setattr(terminal_service, "dispatch_plugin_event", plugin)
 
     def pause_and_abort():

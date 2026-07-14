@@ -338,6 +338,7 @@ class TestGetServerSettings:
             "event_bus_max_queue_size": 1024,
             "provider_init_timeout": 60,
             "startup_prompt_handler_timeout": 20,
+            "artifact_validate_deadline_s": 60.0,
         }
 
     def test_reads_custom_values(self, settings_file):

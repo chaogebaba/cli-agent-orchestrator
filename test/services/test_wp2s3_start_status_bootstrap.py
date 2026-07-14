@@ -702,16 +702,17 @@ async def test_deferred_failure_racing_session_teardown_holder_notifies_after_se
     provider.initialize = AsyncMock(side_effect=RuntimeError("deferred failed"))
     monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda _tid: {
         "id": terminal_id, "provider_session_id": uuid, "caller_id": "caller",
+        "agent_profile": "dev", "provider": "grok_cli", "init_deadline_s": 60.0,
     })
     deleted, notices = [], []
     monkeypatch.setattr(
         terminal_service, "_delete_terminal_under_lease",
         lambda *_a, **_k: deleted.append("settled") or {"terminal_deleted": True},
     )
-    monkeypatch.setattr(
-        terminal_service, "_notify_caller_of_deferred_failure",
-        lambda _tid, message, _registry, delete_worker: notices.append((message, delete_worker)),
-    )
+    monkeypatch.setattr(terminal_service, "claim_deferred_init_failure", lambda *_a, **kwargs: (
+        notices.append(kwargs["notice"])
+        or {"status": "claimed_notified", "init_state": "init_failed_notified"}
+    ))
     release_thread = threading.Thread(
         target=lambda: (time.sleep(0.03), release_rebind_lease(public))
     )
@@ -723,6 +724,5 @@ async def test_deferred_failure_racing_session_teardown_holder_notifies_after_se
     await asyncio.gather(*list(terminal_service._deferred_init_tasks))
     release_thread.join(1)
     assert deleted == ["settled"]
-    assert notices and "has been deleted" in notices[0][0]
-    assert notices[0][1] is False
+    assert notices and "code=deferred_init_internal" in notices[0]
     assert not provider_session_lease_held(uuid)

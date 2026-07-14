@@ -7,12 +7,20 @@ import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
 
 
 def _run_async(coro):
     """Run an async coroutine synchronously."""
     return asyncio.run(coro)
+
+
+def _writer_mock():
+    writer = MagicMock()
+    writer.drain = AsyncMock()
+    return writer
 
 
 class TestHerdrInboxServiceRegistration:
@@ -185,7 +193,7 @@ class TestHerdrInboxServiceSubscription:
         """_subscribe_all_events should send exactly one events.subscribe containing
         every managed pane's agent-status subscription plus the lifecycle events."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _writer_mock()
         service._pane_to_terminal = {"pane-1": "tid1", "pane-2": "tid2"}
         service._terminal_to_pane = {"tid1": "pane-1", "tid2": "pane-2"}
 
@@ -211,7 +219,7 @@ class TestHerdrInboxServiceSubscription:
     def test_subscribe_all_events_with_no_panes_still_includes_lifecycle(self):
         """With no managed panes, the single subscribe still covers lifecycle events."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _writer_mock()
 
         _run_async(service._subscribe_all_events())
 
@@ -338,7 +346,7 @@ class TestHerdrInboxServiceReconnect:
         N panes must be one combined call, not N separate calls.
         """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _writer_mock()
         # Register two terminals with their current pane_ids
         service._terminal_to_pane["tid1"] = "pane-1"
         service._pane_to_terminal["pane-1"] = "tid1"
@@ -427,7 +435,7 @@ class TestHerdrInboxServiceReconcile:
         assert inspect.iscoroutinefunction(service._subscribe_all_events)
 
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_core")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     def test_reconcile_prunes_stale_pane(self, mock_meta, mock_delete, mock_run):
         """Stale pane_ids (not in live herdr list) are pruned from maps and DB."""
@@ -448,7 +456,10 @@ class TestHerdrInboxServiceReconcile:
             return m
 
         mock_run.side_effect = subprocess_side_effect
-        mock_meta.return_value = None  # No session tracking needed
+        mock_meta.return_value = {
+            "id": "tid2", "init_state": "ready",
+            "tmux_session": "", "tmux_window": "",
+        }
 
         _run_async(service._reconcile())
 
@@ -506,7 +517,7 @@ class TestHerdrInboxServiceReconcile:
         assert "pane-a" in service._pane_to_terminal
 
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_core")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
     def test_reconcile_deletes_ghost_db_terminals(self, mock_list_terminals, mock_delete, mock_run):
         """Ghost DB terminals (tab not in herdr) are deleted; live terminals are kept."""
@@ -541,8 +552,8 @@ class TestHerdrInboxServiceReconcile:
         mock_run.side_effect = subprocess_side_effect
 
         mock_list_terminals.return_value = [
-            {"id": "tid-live", "tmux_window": "live-window"},
-            {"id": "tid-ghost", "tmux_window": "ghost-window"},
+            {"id": "tid-live", "tmux_window": "live-window", "init_state": "ready"},
+            {"id": "tid-ghost", "tmux_window": "ghost-window", "init_state": "ready"},
         ]
 
         _run_async(service._reconcile())
@@ -582,7 +593,7 @@ class TestHerdrInboxServiceReconcile:
         mock_list_terminals.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_core")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
     def test_reconcile_no_ghost_when_all_tabs_match(
         self, mock_list_terminals, mock_delete, mock_run
@@ -645,7 +656,7 @@ class TestHerdrInboxServiceStartupDbCleanup:
         return side_effect
 
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_core")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
     def test_startup_cleanup_deletes_ghost_terminals(self, mock_list, mock_delete, mock_run):
         """Ghost terminals (window not in live herdr tabs) are deleted at startup."""
@@ -665,8 +676,8 @@ class TestHerdrInboxServiceStartupDbCleanup:
         )
         mock_run.side_effect = self._make_subprocess_side_effect(ws_response, tab_response)
         mock_list.return_value = [
-            {"id": "tid-live", "tmux_window": "live-window"},
-            {"id": "tid-ghost", "tmux_window": "dead-window"},
+            {"id": "tid-live", "tmux_window": "live-window", "init_state": "ready"},
+            {"id": "tid-ghost", "tmux_window": "dead-window", "init_state": "ready"},
         ]
 
         _run_async(service._startup_db_cleanup())
@@ -685,7 +696,7 @@ class TestHerdrInboxServiceStartupDbCleanup:
         mock_list.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_core")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
     def test_startup_cleanup_no_deletes_when_all_live(self, mock_list, mock_delete, mock_run):
         """No deletions when all DB terminals have matching live tabs."""
@@ -733,7 +744,7 @@ class TestHerdrInboxServiceSingleSubscribePerConnection:
     def test_socket_setup_issues_exactly_one_subscribe(self):
         """A full connect cycle (reconcile already done) writes exactly one subscribe."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _writer_mock()
         service._pane_to_terminal = {"pane-1": "tid1"}
         service._terminal_to_pane = {"tid1": "pane-1"}
 
@@ -745,14 +756,17 @@ class TestHerdrInboxServiceSingleSubscribePerConnection:
 class TestHerdrInboxServiceLifecycleEvents:
     """Test _handle_lifecycle_event for pane.closed and workspace.closed."""
 
-    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_core")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     def test_pane_closed_removes_from_maps(self, mock_meta, mock_delete):
         """pane.closed should remove the terminal from tracking maps and delete DB record."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.register_terminal("tid1", "pane-a", is_kiro=True)
         service._working_since["tid1"] = time.time()
-        mock_meta.return_value = None  # No session → no kill_session
+        mock_meta.return_value = {
+            "id": "tid1", "init_state": "ready",
+            "tmux_session": "", "tmux_window": "",
+        }
 
         service._handle_lifecycle_event("pane.closed", {"pane_id": "pane-a"})
 
@@ -762,7 +776,7 @@ class TestHerdrInboxServiceLifecycleEvents:
         assert "tid1" not in service._working_since
         mock_delete.assert_called_once_with("tid1")
 
-    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_core")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     def test_pane_closed_unknown_pane_is_noop(self, mock_meta, mock_delete):
         """pane.closed for unregistered pane_id should be silent no-op."""
@@ -774,7 +788,7 @@ class TestHerdrInboxServiceLifecycleEvents:
         mock_meta.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_core")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     def test_pane_closed_skips_delete_when_label_still_live(self, mock_meta, mock_delete, mock_run):
         """Replayed close for a reused compact pane_id must NOT delete a live terminal.
@@ -792,6 +806,8 @@ class TestHerdrInboxServiceLifecycleEvents:
         # fresh unique label.
         service.register_terminal("9d00610c", "pane-3", is_kiro=False)
         mock_meta.return_value = {
+            "id": "9d00610c",
+            "init_state": "ready",
             "tmux_session": "cao-investigation",
             "tmux_window": "sherlock-e8dc",
         }
@@ -817,7 +833,7 @@ class TestHerdrInboxServiceLifecycleEvents:
         assert service._terminal_to_pane.get("9d00610c") == "pane-3"
 
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_core")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     def test_pane_closed_deletes_when_label_gone(self, mock_meta, mock_delete, mock_run):
         """Genuine close (label absent from herdr) still deletes the terminal.
@@ -829,6 +845,8 @@ class TestHerdrInboxServiceLifecycleEvents:
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.register_terminal("9d00610c", "pane-3", is_kiro=False)
         mock_meta.return_value = {
+            "id": "9d00610c",
+            "init_state": "ready",
             "tmux_session": "cao-investigation",
             "tmux_window": "sherlock-e8dc",
         }
@@ -853,7 +871,7 @@ class TestHerdrInboxServiceLifecycleEvents:
         assert "9d00610c" not in service._terminal_to_pane
 
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_core")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     def test_pane_closed_deletes_when_herdr_query_fails(self, mock_meta, mock_delete, mock_run):
         """If herdr cannot be queried, fall back to deleting (fail toward cleanup).
@@ -864,6 +882,8 @@ class TestHerdrInboxServiceLifecycleEvents:
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.register_terminal("9d00610c", "pane-3", is_kiro=False)
         mock_meta.return_value = {
+            "id": "9d00610c",
+            "init_state": "ready",
             "tmux_session": "cao-investigation",
             "tmux_window": "sherlock-e8dc",
         }
@@ -882,11 +902,7 @@ class TestHerdrInboxServiceLifecycleEvents:
         mock_delete.assert_called_once_with("9d00610c")
         assert "pane-3" not in service._pane_to_terminal
 
-    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.clients.database.delete_terminals_by_session")
-    def test_workspace_closed_removes_all_terminals_for_session(
-        self, mock_delete_by_session, mock_meta
-    ):
+    def test_workspace_closed_removes_all_terminals_for_session(self):
         """workspace.closed prunes terminals by their DB session, not by a
         pane_id/workspace_id string prefix.
 
@@ -900,36 +916,54 @@ class TestHerdrInboxServiceLifecycleEvents:
         service.register_terminal("tid3", "p-9")  # Different session
         service._workspace_to_session["ws-abc"] = "my-session"
 
-        session_by_terminal = {
-            "tid1": {"tmux_session": "my-session"},
-            "tid2": {"tmux_session": "my-session"},
-            "tid3": {"tmux_session": "other-session"},
-        }
-        mock_meta.side_effect = lambda tid: session_by_terminal.get(tid)
+        terminals = [
+            {"id": "tid1", "init_state": "ready"},
+            {"id": "tid2", "init_state": "ready"},
+        ]
+        with (
+            patch(
+                "cli_agent_orchestrator.clients.database.get_teardown_intent",
+                return_value={"state": "issued_ok"},
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.consume_current_teardown_intent",
+                return_value={"session_name": "my-session"},
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.current_workspace_for_session",
+                return_value="ws-abc",
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.list_terminals_by_session",
+                return_value=terminals,
+            ),
+            patch("cli_agent_orchestrator.clients.database.retire_workspace_mapping") as retire,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.quiesce_deferred_terminals",
+                new_callable=AsyncMock,
+            ) as quiesce,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service._delete_terminal_core",
+            ) as delete,
+        ):
+            service._handle_lifecycle_event("workspace.closed", {"workspace_id": "ws-abc"})
 
-        service._handle_lifecycle_event("workspace.closed", {"workspace_id": "ws-abc"})
-
-        # my-session terminals pruned despite no pane_id/workspace_id prefix match
-        assert "p-7" not in service._pane_to_terminal
-        assert "p-8" not in service._pane_to_terminal
-        assert "tid1" not in service._terminal_to_pane
-        assert "tid2" not in service._terminal_to_pane
-        # Terminal owned by a different session is untouched
-        assert "p-9" in service._pane_to_terminal
-        assert "tid3" in service._terminal_to_pane
-        # Workspace entry cleaned up
+        quiesce.assert_awaited_once_with(terminals)
+        assert [item.args for item in delete.call_args_list] == [("tid1",), ("tid2",)]
+        retire.assert_called_once_with("ws-abc")
         assert "ws-abc" not in service._workspace_to_session
-        # DB cleanup called
-        mock_delete_by_session.assert_called_once_with("my-session")
 
-    @patch("cli_agent_orchestrator.clients.database.delete_terminals_by_session")
-    def test_workspace_closed_unknown_workspace_is_noop(self, mock_delete):
+    def test_workspace_closed_unknown_workspace_is_noop(self):
         """workspace.closed for workspace_id not in _workspace_to_session is silent no-op."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
 
-        service._handle_lifecycle_event("workspace.closed", {"workspace_id": "unknown-ws"})
-
-        mock_delete.assert_not_called()
+        with (
+            patch("cli_agent_orchestrator.clients.database.get_teardown_intent", return_value=None),
+            patch("cli_agent_orchestrator.clients.database.resolve_workspace_mapping", return_value=None),
+            patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_core") as delete,
+        ):
+            service._handle_lifecycle_event("workspace.closed", {"workspace_id": "unknown-ws"})
+        delete.assert_not_called()
 
     def test_event_loop_routes_lifecycle_events(self):
         """_event_loop must route herdr's real lifecycle event wire format.
@@ -993,13 +1027,16 @@ class TestHerdrInboxServiceLifecycleEvents:
         assert "pane.closed" in handled
         assert "workspace.closed" in handled
 
-    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_core")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     def test_event_loop_pane_closed_real_shape_cleans_up(self, mock_meta, mock_delete):
         """End-to-end: a real-shape pane_closed event removes the managed terminal."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.register_terminal("tid-x", "pane-x", is_kiro=False)
-        mock_meta.return_value = None  # no session → no kill_session
+        mock_meta.return_value = {
+            "id": "tid-x", "init_state": "ready",
+            "tmux_session": "", "tmux_window": "",
+        }
 
         event = (
             json.dumps(
@@ -1024,6 +1061,7 @@ class TestHerdrInboxServiceLifecycleEvents:
                 await service._event_loop()
             except ConnectionError:
                 pass
+            await asyncio.gather(*service._lifecycle_tasks)
 
         _run_async(run())
 
@@ -1080,7 +1118,7 @@ class TestHerdrInboxServiceReconcileLiveTerminal:
 
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_core")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     def test_reconcile_remaps_renumbered_but_live_pane(
         self, mock_meta, mock_delete, mock_run, mock_get_backend
@@ -1128,7 +1166,7 @@ class TestHerdrInboxServiceReconcileLiveTerminal:
 
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_core")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     def test_reconcile_deletes_when_tab_label_gone(
         self, mock_meta, mock_delete, mock_run, mock_get_backend
@@ -1137,7 +1175,10 @@ class TestHerdrInboxServiceReconcileLiveTerminal:
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.register_terminal("tid1", "pane-old")
         service._working_since["tid1"] = time.time()
-        mock_meta.return_value = {"tmux_session": "sess", "tmux_window": "win-gone"}
+        mock_meta.return_value = {
+            "id": "tid1", "init_state": "ready",
+            "tmux_session": "sess", "tmux_window": "win-gone",
+        }
 
         pane_list_response = json.dumps({"result": {"panes": [{"pane_id": "pane-other"}]}})
         ws_list_response = json.dumps({"result": {"workspaces": []}})
@@ -1170,7 +1211,7 @@ class TestHerdrInboxServiceReconcileLiveTerminal:
 
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_core")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     def test_reconcile_does_not_kill_live_workspace_on_pane_diff(
@@ -1223,69 +1264,47 @@ class TestHerdrInboxServiceReconcileLiveTerminal:
 
 
 class TestHerdrInboxServiceWorkspaceClosedLiveResolution:
-    """workspace.closed cleanup must not depend on _workspace_to_session having
-    been populated by a prior _reconcile(). It must resolve session identity from
-    live herdr state at event time so a real workspace close always cleans up.
-    """
+    """Uncached close events resolve only through the durable workspace map."""
 
-    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.clients.database.delete_terminals_by_session")
-    def test_workspace_closed_resolves_uncached_workspace_from_live_herdr(
-        self, mock_delete_by_session, mock_meta, mock_run
-    ):
-        """workspace_id NOT in the in-memory map is resolved via herdr workspace
-        list, then the session's terminals are deleted."""
+    def test_workspace_closed_resolves_uncached_workspace_from_durable_map(self):
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        # Map is empty — the workspace closed before any reconcile cached it.
         assert service._workspace_to_session == {}
-        service.register_terminal("tid1", "p-1")
-        mock_meta.side_effect = lambda tid: {"tmux_session": "sess-new"} if tid == "tid1" else None
+        terminal = {"id": "tid1", "init_state": "ready"}
+        with (
+            patch("cli_agent_orchestrator.clients.database.get_teardown_intent", return_value=None),
+            patch(
+                "cli_agent_orchestrator.clients.database.resolve_workspace_mapping",
+                return_value="sess-new",
+            ) as resolve,
+            patch(
+                "cli_agent_orchestrator.clients.database.current_workspace_for_session",
+                return_value="ws-new",
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.list_terminals_by_session",
+                return_value=[terminal],
+            ),
+            patch("cli_agent_orchestrator.clients.database.retire_workspace_mapping"),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service._delete_terminal_core",
+            ) as delete,
+        ):
+            service._handle_lifecycle_event("workspace.closed", {"workspace_id": "ws-new"})
+        resolve.assert_called_once_with("ws-new")
+        delete.assert_called_once_with("tid1")
 
-        # Live herdr resolves ws-new -> sess-new.
-        ws_list_response = json.dumps(
-            {"result": {"workspaces": [{"workspace_id": "ws-new", "label": "sess-new"}]}}
-        )
-
-        def subprocess_side_effect(cmd, **_):
-            m = MagicMock()
-            m.returncode = 0
-            m.stdout = ws_list_response
-            return m
-
-        mock_run.side_effect = subprocess_side_effect
-
-        service._handle_lifecycle_event("workspace.closed", {"workspace_id": "ws-new"})
-
-        # Resolved live -> session terminals deleted despite empty in-memory map.
-        mock_delete_by_session.assert_called_once_with("sess-new")
-        # Map pruned for the closed session's terminal.
-        assert "p-1" not in service._pane_to_terminal
-        assert "tid1" not in service._terminal_to_pane
-
-    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.clients.database.delete_terminals_by_session")
-    def test_workspace_closed_unresolvable_is_safe_noop(self, mock_delete_by_session, mock_run):
-        """workspace_id absent from both the map and live herdr state -> no deletions."""
+    def test_workspace_closed_unresolvable_is_safe_noop(self):
+        """workspace_id absent from the durable map causes no deletion."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-
-        # Live herdr does not know this workspace either.
-        ws_list_response = json.dumps(
-            {"result": {"workspaces": [{"workspace_id": "ws-other", "label": "sess-other"}]}}
-        )
-
-        def subprocess_side_effect(cmd, **_):
-            m = MagicMock()
-            m.returncode = 0
-            m.stdout = ws_list_response
-            return m
-
-        mock_run.side_effect = subprocess_side_effect
-
-        service._handle_lifecycle_event("workspace.closed", {"workspace_id": "ws-ghost"})
-
-        # Nothing destructive happens.
-        mock_delete_by_session.assert_not_called()
+        with (
+            patch("cli_agent_orchestrator.clients.database.get_teardown_intent", return_value=None),
+            patch("cli_agent_orchestrator.clients.database.resolve_workspace_mapping", return_value=None),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service._delete_terminal_core",
+            ) as delete,
+        ):
+            service._handle_lifecycle_event("workspace.closed", {"workspace_id": "ws-ghost"})
+        delete.assert_not_called()
 
 
 class TestHerdrInboxServiceSocketPath:

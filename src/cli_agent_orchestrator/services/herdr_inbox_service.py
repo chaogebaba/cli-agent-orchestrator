@@ -28,6 +28,8 @@ _BACKOFF_MULTIPLIER = 2.0
 
 # Kiro supplement check: how long in "working" before we check pane read
 _KIRO_WORKING_THRESHOLD = 30.0  # seconds
+INTENT_ACK_WAIT_S = 5.0
+TEARDOWN_INTENT_TTL_S = 60.0
 
 
 class HerdrInboxService:
@@ -67,6 +69,8 @@ class HerdrInboxService:
 
         # Workspace tracking for lifecycle events
         self._workspace_to_session: Dict[str, str] = {}  # workspace_id → session_name
+        self._lifecycle_tasks: Set[asyncio.Task] = set()
+        self._workspace_close_routes: Dict[str, asyncio.Task] = {}
 
         # Connection state
         self._connected = False
@@ -154,6 +158,11 @@ class HerdrInboxService:
             await self._socket_loop()
         finally:
             kiro_task.cancel()
+            tasks = list(self._lifecycle_tasks)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _startup_db_cleanup(self) -> None:
         """Delete ghost DB terminals whose herdr tabs no longer exist.
@@ -163,10 +172,8 @@ class HerdrInboxService:
         (populated later by _reconcile).  Builds the workspace map directly
         from herdr workspace list.
         """
-        from cli_agent_orchestrator.clients.database import (
-            delete_terminal,
-            list_terminals_by_session,
-        )
+        from cli_agent_orchestrator.clients.database import list_terminals_by_session
+        from cli_agent_orchestrator.services import terminal_service
 
         ws_result = subprocess.run(
             ["herdr", "--session", self._herdr_session, "workspace", "list"],
@@ -216,12 +223,18 @@ class HerdrInboxService:
             for term in db_terminals:
                 window = term.get("tmux_window", "")
                 if window and window not in live_labels:
+                    if term.get("init_state") != "ready":
+                        logger.warning(
+                            "herdr_startup_cleanup_skipped_non_ready terminal=%s init_state=%r",
+                            term["id"], term.get("init_state"),
+                        )
+                        continue
                     logger.info(
                         f"Startup DB cleanup: deleting ghost terminal {term['id']} "
                         f"({session_name}:{window}) — tab not in herdr"
                     )
                     try:
-                        delete_terminal(term["id"])
+                        terminal_service._delete_terminal_core(term["id"])
                         deleted += 1
                     except Exception as e:
                         logger.warning(
@@ -289,10 +302,7 @@ class HerdrInboxService:
         and kills workspaces with zero live terminals.
         """
         from cli_agent_orchestrator.backends.registry import get_backend
-        from cli_agent_orchestrator.clients.database import (
-            delete_terminal,
-            get_terminal_metadata,
-        )
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
 
         # Get live panes from herdr
         result = subprocess.run(
@@ -325,6 +335,15 @@ class HerdrInboxService:
                 ws_data = json.loads(ws_result.stdout)
                 workspaces = ws_data.get("result", {}).get("workspaces", [])
                 self._workspace_to_session = {ws["workspace_id"]: ws["label"] for ws in workspaces}
+                from cli_agent_orchestrator.clients.database import record_workspace_mapping
+                for ws_id, session_name in self._workspace_to_session.items():
+                    try:
+                        record_workspace_mapping(ws_id, session_name)
+                    except Exception:
+                        logger.exception(
+                            "herdr_workspace_map_backfill_failed workspace=%s session=%s",
+                            ws_id, session_name,
+                        )
             except (json.JSONDecodeError, KeyError):
                 pass
 
@@ -349,10 +368,7 @@ class HerdrInboxService:
                     if ws_id and label:
                         live_tabs_by_workspace.setdefault(ws_id, set()).add(label)
 
-                from cli_agent_orchestrator.clients.database import (
-                    delete_terminal,
-                    list_terminals_by_session,
-                )
+                from cli_agent_orchestrator.clients.database import list_terminals_by_session
 
                 for ws_id, session_name in self._workspace_to_session.items():
                     live_labels = live_tabs_by_workspace.get(ws_id, set())
@@ -365,7 +381,7 @@ class HerdrInboxService:
                                 f"({session_name}:{window}) — tab not in herdr"
                             )
                             try:
-                                delete_terminal(term["id"])
+                                await self._route_spontaneous_terminal(term)
                             except Exception as e:
                                 logger.warning(
                                     f"Reconcile: failed to delete ghost terminal "
@@ -448,8 +464,8 @@ class HerdrInboxService:
             self._working_since.pop(terminal_id, None)
 
             try:
-                delete_terminal(terminal_id)
-                deleted += 1
+                if meta and await self._route_spontaneous_terminal(meta):
+                    deleted += 1
             except Exception as e:
                 logger.warning(f"Reconcile: failed to delete terminal {terminal_id}: {e}")
 
@@ -623,47 +639,131 @@ class HerdrInboxService:
             logger.warning("_label_still_live: could not query herdr (%s)", e)
             return False
 
-    def _resolve_session_from_herdr(self, workspace_id: str) -> Optional[str]:
-        """Resolve a workspace_id to its session name from live herdr state.
-
-        Used by workspace.closed handling when the in-memory _workspace_to_session
-        map (populated only by _reconcile) does not contain the closed
-        workspace_id. Queries herdr workspace list, refreshes the whole map from
-        the result, and returns the label for workspace_id if found.
-
-        Returns None when herdr cannot be queried or the workspace_id is not in
-        the live list, so the caller can treat the event as unresolvable and take
-        no destructive action.
-        """
-        try:
-            result = subprocess.run(
-                ["herdr", "--session", self._herdr_session, "workspace", "list"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode != 0:
-                logger.warning(
-                    "_resolve_session_from_herdr: herdr workspace list failed (rc=%s): %s",
-                    result.returncode,
-                    result.stderr.strip(),
-                )
-                return None
-            ws_data = json.loads(result.stdout)
-            workspaces = ws_data.get("result", {}).get("workspaces", [])
-            self._workspace_to_session = {ws["workspace_id"]: ws["label"] for ws in workspaces}
-            return self._workspace_to_session.get(workspace_id)
-        except (subprocess.SubprocessError, json.JSONDecodeError, KeyError, OSError) as e:
-            logger.warning("_resolve_session_from_herdr: could not query herdr (%s)", e)
-            return None
-
     def _handle_lifecycle_event(self, event_type: str, data: dict) -> None:
-        """Handle pane.closed and workspace.closed events."""
-        from cli_agent_orchestrator.backends.registry import get_backend
+        """Schedule lifecycle cleanup without blocking the socket readline task."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self._handle_lifecycle_event_async(event_type, dict(data)))
+            return
+        if event_type == "workspace.closed":
+            workspace_id = data.get("workspace_id", "")
+            if not workspace_id or workspace_id in self._workspace_close_routes:
+                return
+            task = loop.create_task(self._handle_workspace_close_owned(dict(data)))
+            self._workspace_close_routes[workspace_id] = task
+        else:
+            task = loop.create_task(self._handle_lifecycle_event_async(event_type, dict(data)))
+        self._lifecycle_tasks.add(task)
+        task.add_done_callback(self._lifecycle_tasks.discard)
+
+    async def _handle_workspace_close_owned(self, data: dict) -> None:
+        workspace_id = data.get("workspace_id", "")
+        try:
+            await self._handle_lifecycle_event_async("workspace.closed", data)
+        finally:
+            current = asyncio.current_task()
+            if self._workspace_close_routes.get(workspace_id) is current:
+                self._workspace_close_routes.pop(workspace_id, None)
+
+    async def _route_spontaneous_terminal(self, metadata: dict) -> bool:
+        """Apply class 1/2/settlement routing to one vanished terminal."""
+        from cli_agent_orchestrator.services import terminal_service
+
+        terminal_id = metadata["id"]
+        state = metadata.get("init_state")
+        if state == "init_pending":
+            try:
+                await terminal_service.quiesce_deferred_terminal(terminal_id)
+            except Exception as exc:
+                logger.error(
+                    "herdr_class2_quiesce_failed terminal=%s code=%s", terminal_id, exc
+                )
+                return False
+            await terminal_service._claim_and_settle_deferred_failure(
+                terminal_id, f"herdr-{time.monotonic_ns()}", metadata,
+                "worker_vanished", None,
+            )
+            return True
+        if state == "ready":
+            terminal_service._delete_terminal_core(terminal_id)
+            return True
+        if state in {"init_failed_notified", "init_failed_caller_gone"}:
+            await terminal_service.dispatcher.run(
+                terminal_id, "herdr-settle", "mutating", "settlement",
+                terminal_service._settle_deferred_failure_sync, terminal_id,
+            )
+            return True
+        logger.error(
+            "herdr_cleanup_skipped_invalid_init_state terminal=%s init_state=%r",
+            terminal_id, state,
+        )
+        return False
+
+    async def _resolve_issuing_intent(self, workspace_id: str) -> None:
+        from cli_agent_orchestrator.clients.database import get_teardown_intent
+
+        deadline = time.monotonic() + INTENT_ACK_WAIT_S
+        while time.monotonic() < deadline:
+            intent = get_teardown_intent(workspace_id)
+            if intent is None or intent.get("state") == "void":
+                await self._route_workspace_close(workspace_id, proven=False)
+                return
+            if intent.get("state") == "issued_ok":
+                await self._route_workspace_close(workspace_id, proven=True)
+                return
+            await asyncio.sleep(min(0.05, deadline - time.monotonic()))
+        await self._route_workspace_close(workspace_id, proven=False)
+
+    async def _route_workspace_close(self, workspace_id: str, *, proven: bool) -> None:
         from cli_agent_orchestrator.clients.database import (
-            delete_terminal,
-            delete_terminals_by_session,
-            get_terminal_metadata,
+            consume_current_teardown_intent,
+            current_workspace_for_session,
+            get_teardown_intent,
+            list_terminals_by_session,
+            resolve_workspace_mapping,
+            retire_workspace_mapping,
+        )
+        from cli_agent_orchestrator.services import terminal_service
+
+        intent = None
+        if proven:
+            intent = consume_current_teardown_intent(
+                workspace_id, ttl_s=TEARDOWN_INTENT_TTL_S,
+            )
+            if intent is None:
+                proven = False
+        session_name = intent.get("session_name") if intent else resolve_workspace_mapping(workspace_id)
+        if not session_name:
+            logger.error("workspace_close_unroutable workspace=%s", workspace_id)
+            return
+        if current_workspace_for_session(session_name) != workspace_id:
+            logger.warning(
+                "workspace_close_stale_generation workspace=%s session=%s",
+                workspace_id, session_name,
+            )
+            retire_workspace_mapping(workspace_id)
+            return
+        terminals = list_terminals_by_session(session_name)
+        completed = False
+        try:
+            if proven:
+                await terminal_service.quiesce_deferred_terminals(terminals)
+                for terminal in terminals:
+                    terminal_service._delete_terminal_core(terminal["id"])
+            else:
+                for terminal in terminals:
+                    if not await self._route_spontaneous_terminal(terminal):
+                        return
+            completed = True
+        finally:
+            if completed:
+                retire_workspace_mapping(workspace_id)
+                self._workspace_to_session.pop(workspace_id, None)
+
+    async def _handle_lifecycle_event_async(self, event_type: str, data: dict) -> None:
+        from cli_agent_orchestrator.clients.database import (
+            get_teardown_intent, get_terminal_metadata,
         )
 
         if event_type == "pane.closed":
@@ -671,105 +771,40 @@ class HerdrInboxService:
             terminal_id = self._pane_to_terminal.get(pane_id)
             if not terminal_id:
                 return
-
-            # Get session before cleanup
-            meta = get_terminal_metadata(terminal_id)
-            session_name = meta["tmux_session"] if meta else None
-
-            # Guard against herdr's compact pane_id reuse + event replay.
-            #
-            # herdr (0.6.8) reuses compact pane_ids when a tab is killed and a
-            # new tab takes the same index, AND replays the ENTIRE pane_closed
-            # history on every fresh events.subscribe (which register_terminal
-            # triggers via _force_reconnect). So a replayed close for an OLD
-            # incarnation of this pane_id arrives mapped to the terminal that now
-            # occupies the reused index — deleting a live terminal.
-            #
-            # The tab label (tmux_window) is unique per incarnation, so confirm
-            # the label is genuinely gone from herdr before deleting. If the
-            # label is still live, this close is stale (replayed) — ignore it.
-            # If herdr can't be queried, fall toward delete: never leave a
-            # terminal we think is open when it may actually be closed.
-            window_name = meta["tmux_window"] if meta else None
+            metadata = get_terminal_metadata(terminal_id)
+            if metadata is None:
+                return
+            window_name = metadata.get("tmux_window")
             if window_name and self._label_still_live(window_name):
                 logger.info(
-                    "pane.closed: ignoring stale close for %s (pane=%s) — "
-                    "label %s still live in herdr (compact pane_id reused)",
-                    terminal_id,
-                    pane_id,
-                    window_name,
+                    "pane.closed: ignoring stale close for %s (pane=%s)",
+                    terminal_id, pane_id,
                 )
                 return
-
-            # Remove from maps
+            if not await self._route_spontaneous_terminal(metadata):
+                return
             self._pane_to_terminal.pop(pane_id, None)
             self._terminal_to_pane.pop(terminal_id, None)
             self._kiro_terminals.discard(terminal_id)
             self._working_since.pop(terminal_id, None)
+            return
 
-            # Delete DB record
-            try:
-                delete_terminal(terminal_id)
-            except Exception as e:
-                logger.warning(f"pane.closed: failed to delete terminal {terminal_id}: {e}")
-
-            logger.info(f"pane.closed: cleaned up terminal {terminal_id} (pane={pane_id})")
-
-            # If session has no more terminals in our map, kill workspace
-            remaining_in_session = [
-                t
-                for t in self._pane_to_terminal.values()
-                if (m := get_terminal_metadata(t)) and m.get("tmux_session") == session_name
-            ]
-            if session_name and not remaining_in_session:
-                try:
-                    get_backend().kill_session(session_name)
-                    logger.info(f"pane.closed: killed empty workspace {session_name}")
-                except Exception as e:
-                    logger.warning(f"pane.closed: failed to kill workspace {session_name}: {e}")
-
-        elif event_type == "workspace.closed":
-            workspace_id = data.get("workspace_id", "")
-            session_name = self._workspace_to_session.get(workspace_id)
-            if not session_name:
-                # The in-memory map is populated only by _reconcile(); a workspace
-                # that closed before any reconcile cached it would otherwise be a
-                # silent no-op, leaking the session's terminals as orphan rows.
-                # Resolve the session identity from live herdr state instead of
-                # trusting the map. Only treat the event as unresolvable after the
-                # live query also fails to identify a session.
-                session_name = self._resolve_session_from_herdr(workspace_id)
-                if not session_name:
-                    return
-
-            # Delete all DB terminals for this session
-            try:
-                delete_terminals_by_session(session_name)
-            except Exception as e:
-                logger.warning(
-                    f"workspace.closed: failed to delete terminals for {session_name}: {e}"
-                )
-
-            # Prune maps for terminals belonging to this session. Match on each
-            # terminal's DB session rather than a pane_id/workspace_id string
-            # prefix: herdr renumbers compact pane_ids and does not guarantee
-            # they begin with the workspace_id, so a prefix test is unreliable.
-            # This mirrors the session match used in the pane.closed handler.
-            to_remove = [
-                (pid, tid)
-                for pid, tid in self._pane_to_terminal.items()
-                if (m := get_terminal_metadata(tid)) and m.get("tmux_session") == session_name
-            ]
-            for pid, tid in to_remove:
-                self._pane_to_terminal.pop(pid, None)
-                self._terminal_to_pane.pop(tid, None)
-                self._kiro_terminals.discard(tid)
-                self._working_since.pop(tid, None)
-
-            self._workspace_to_session.pop(workspace_id, None)
-            logger.info(
-                f"workspace.closed: cleaned up session {session_name} ({len(to_remove)} terminals)"
-            )
+        if event_type != "workspace.closed":
+            return
+        workspace_id = data.get("workspace_id", "")
+        if not workspace_id:
+            return
+        try:
+            intent = get_teardown_intent(workspace_id)
+        except Exception:
+            logger.exception("workspace_close_intent_store_unavailable workspace=%s", workspace_id)
+            intent = None
+        if intent and intent.get("state") == "issuing":
+            await self._resolve_issuing_intent(workspace_id)
+            return
+        await self._route_workspace_close(
+            workspace_id, proven=bool(intent and intent.get("state") == "issued_ok")
+        )
 
     # TODO: _deliver() calls callback synchronously — if callback is async,
     # this will need a threadsafe bridge (out of scope for this change).

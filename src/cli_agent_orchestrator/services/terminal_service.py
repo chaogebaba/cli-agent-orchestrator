@@ -18,22 +18,28 @@ Terminal Workflow:
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 import threading
 import time
-from datetime import datetime
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Dict, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
+    claim_deferred_init_failure,
+    delete_terminal_and_warm_intent,
+    list_deferred_init_recovery_rows,
+    mark_terminal_init_ready,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import create_terminal_with_warm_intent
 from cli_agent_orchestrator.clients.database import list_terminals_by_provider_session_id
-from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
     list_all_terminals as db_list_all_terminals,
@@ -51,6 +57,12 @@ from cli_agent_orchestrator.plugins import (
     PostSendMessageEvent,
 )
 from cli_agent_orchestrator.providers.manager import get_provider_class, provider_manager
+from cli_agent_orchestrator.providers.base import (
+    RetryableArtifactValidation, TerminalArtifactValidation,
+)
+from cli_agent_orchestrator.services.deferred_dispatcher import (
+    DeferredCall, DeferredExecutorSaturated, dispatcher,
+)
 from cli_agent_orchestrator.services.draft_guard import preserve_draft_before_send, stash_draft_before_send
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
@@ -82,8 +94,25 @@ _memory_injected_lock = threading.Lock()
 # deferred provider.initialize() + input-send task could be GC'd mid-run,
 # silently leaving a worker uninitialized. Tasks drop themselves on completion.
 _deferred_init_tasks: set = set()
-_deferred_tasks_by_terminal: dict[str, asyncio.Task] = {}
+_deferred_reconciler_tasks: set[asyncio.Task] = set()
 _deferred_tasks_lock = threading.Lock()
+
+POLL_INTERVAL = 2.0
+DEFERRED_TASK_QUIESCE_S = 10.0
+SERVER_INIT_OWNER_EPOCH = str(uuid.uuid4())
+
+
+@dataclass
+class _DeferredTaskRecord:
+    task: asyncio.Task
+    loop: asyncio.AbstractEventLoop
+    generation: str
+    session_name: str | None = None
+    current_call: DeferredCall | None = None
+    abandoned: bool = False
+
+
+_deferred_tasks_by_terminal: dict[str, _DeferredTaskRecord] = {}
 
 
 class TerminalInputBlockedError(Exception):
@@ -106,23 +135,30 @@ def seed_resume_bootstrap(agent_profile: str, provider_name: str, cwd: str):
 
 def has_deferred_init(terminal_id: str) -> bool:
     with _deferred_tasks_lock:
-        task = _deferred_tasks_by_terminal.get(terminal_id)
-        return task is not None and not task.done()
+        record = _deferred_tasks_by_terminal.get(terminal_id)
+        return record is not None and not record.task.done()
 
 
-def _persist_provider_runtime_identity(
-    provider_instance, terminal_id: str, *, settlement_form: str = "first_time",
-) -> None:
-    """Persist resumable identity after init and before initial task delivery."""
+@dataclass(frozen=True)
+class _PreparedRuntimeIdentity:
+    session_uuid: str
+    cwd: str
+    shell: str
+    settlement_form: str
+
+
+def _prepare_provider_runtime_identity(
+    provider_instance, terminal_id: str, *, settlement_form: str,
+) -> _PreparedRuntimeIdentity | None:
+    """Perform one-time blocking capture without validating or persisting."""
     if getattr(provider_instance, "supports_reauth_rebind", False) is not True:
         shell = provider_instance.shell_baseline
         if isinstance(shell, str) and shell:
             update_terminal_shell_command(terminal_id, shell)
-        return
+        return None
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:
         raise RuntimeError("terminal_metadata_missing")
-    from cli_agent_orchestrator.clients.database import update_terminal_runtime_identity
     from cli_agent_orchestrator.services.fork_context_service import pane_launch_epoch, pane_pid
 
     pid = pane_pid(metadata["tmux_session"], metadata["tmux_window"])
@@ -139,22 +175,46 @@ def _persist_provider_runtime_identity(
     session_uuid = allocated or hint or provider_instance.capture_session_uuid(
         pid, pane_launch_epoch(pid), cwd
     )
-    provider_instance.validate_session_artifact(session_uuid, cwd)
     shell = provider_instance.shell_baseline or metadata.get("shell_command")
     if not shell:
         raise RuntimeError("shell_baseline_unavailable")
-    if settlement_form == "resume":
+    return _PreparedRuntimeIdentity(session_uuid, cwd, shell, settlement_form)
+
+
+def _commit_provider_runtime_identity(
+    terminal_id: str, prepared: _PreparedRuntimeIdentity,
+) -> None:
+    from cli_agent_orchestrator.clients.database import update_terminal_runtime_identity
+
+    if prepared.settlement_form == "resume":
         persisted = update_terminal_runtime_identity(
-            terminal_id, session_uuid, shell, supersede_other_claims=True,
+            terminal_id, prepared.session_uuid, prepared.shell,
+            supersede_other_claims=True,
         )
-    elif settlement_form == "fallback":
+    elif prepared.settlement_form == "fallback":
         persisted = update_terminal_runtime_identity(
-            terminal_id, session_uuid, shell, require_published_uuid=True,
+            terminal_id, prepared.session_uuid, prepared.shell,
+            require_published_uuid=True,
         )
     else:
-        persisted = update_terminal_runtime_identity(terminal_id, session_uuid, shell)
+        persisted = update_terminal_runtime_identity(
+            terminal_id, prepared.session_uuid, prepared.shell
+        )
     if not persisted:
         raise RuntimeError("terminal_identity_persist_failed")
+
+
+def _persist_provider_runtime_identity(
+    provider_instance, terminal_id: str, *, settlement_form: str = "first_time",
+) -> None:
+    """Persist resumable identity after init and before initial task delivery."""
+    prepared = _prepare_provider_runtime_identity(
+        provider_instance, terminal_id, settlement_form=settlement_form,
+    )
+    if prepared is None:
+        return
+    provider_instance.validate_session_artifact(prepared.session_uuid, prepared.cwd)
+    _commit_provider_runtime_identity(terminal_id, prepared)
 
 
 def purge_stale_terminal_records() -> int:
@@ -163,6 +223,12 @@ def purge_stale_terminal_records() -> int:
     purged = 0
     for metadata in db_list_all_terminals():
         terminal_id = metadata["id"]
+        if metadata.get("init_state") != "ready":
+            logger.warning(
+                "stale_terminal_cleanup_skipped_non_ready terminal=%s init_state=%r",
+                terminal_id, metadata.get("init_state"),
+            )
+            continue
         try:
             backend.get_history(
                 metadata["tmux_session"],
@@ -170,7 +236,9 @@ def purge_stale_terminal_records() -> int:
                 tail_lines=1,
             )
         except Exception:
-            if db_delete_terminal(terminal_id):
+            if delete_terminal_and_warm_intent(
+                terminal_id, preserve_warm_intent=False
+            )["terminal_deleted"]:
                 purged += 1
                 logger.debug(
                     "Purged stale terminal record %s for missing window %s:%s",
@@ -239,16 +307,16 @@ def _rollback_terminal_creation(
     session_created: bool, window_created: bool, fifo_attached: bool, db_created: bool,
 ) -> None:
     """Single rollback seam preserving pipe-pane -> FIFO -> window/session order."""
-    try:
-        if db_created:
-            try:
-                from cli_agent_orchestrator.clients.database import delete_warm_intent_for_terminal
-                delete_warm_intent_for_terminal(terminal_id)
-            except Exception:
-                pass
-            db_delete_terminal(terminal_id)
-    except Exception:
-        pass
+    if db_created:
+        try:
+            delete_terminal_and_warm_intent(
+                terminal_id, preserve_warm_intent=False
+            )
+        except Exception as exc:
+            logger.error(
+                "create_rollback_cleanup_failed terminal=%s error=%s",
+                terminal_id, type(exc).__name__,
+            )
     try:
         if fifo_attached and session_name and window_name:
             get_backend().stop_pipe_pane(session_name, window_name)
@@ -653,12 +721,25 @@ async def create_terminal(
         # The manifest below then sees the new row, while rollback unwinds DB
         # before pipe-pane/FIFO/window in exact reverse acquisition order.
         try:
+            init_fields = {}
+            if defer_init:
+                from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+                init_fields = {
+                    "init_state": "init_pending",
+                    "init_started_at": datetime.now(timezone.utc),
+                    "init_owner_epoch": SERVER_INIT_OWNER_EPOCH,
+                    "init_deadline_s": float(
+                        get_server_settings()["artifact_validate_deadline_s"]
+                    ),
+                }
             if fork_context and fork_context.mode == "fork":
                 create_terminal_with_warm_intent(
                     terminal_id=terminal_id, tmux_session=session_name, tmux_window=window_name,
                     provider=provider, agent_profile=agent_profile, allowed_tools=allowed_tools,
                     caller_id=caller_id, parent_base_name=fork_context.base_name,
                     fork_mode=fork_context.mode,
+                    **init_fields,
                 )
             else:
                 attempted_resume_uuid = resume_uuid
@@ -667,11 +748,13 @@ async def create_terminal(
                         terminal_id, session_name, window_name, provider, agent_profile,
                         allowed_tools, caller_id=caller_id,
                         provider_session_id=attempted_resume_uuid,
+                        **init_fields,
                     )
                 else:
                     db_create_terminal(
                         terminal_id, session_name, window_name, provider, agent_profile,
                         allowed_tools, caller_id=caller_id,
+                        **init_fields,
                     )
         except Exception as exc:
             if lease_token is not None:
@@ -750,6 +833,9 @@ async def create_terminal(
             shell_command = None  # unknown until initialize() runs
             if fork_context and initial_message:
                 initial_message = f"{fork_context.initial_preamble}\n\n{initial_message}"
+            published_snapshot = get_terminal_metadata(terminal_id)
+            if published_snapshot is None:
+                raise RuntimeError("terminal_metadata_missing")
             _schedule_deferred_init(
                 provider_instance,
                 terminal_id,
@@ -764,6 +850,7 @@ async def create_terminal(
                     "fallback" if fallback_source_terminal_id else
                     "resume" if resume_uuid else "first_time"
                 ),
+                caller_snapshot=published_snapshot,
             )
         else:
             try:
@@ -856,9 +943,18 @@ async def create_terminal(
     except Exception as e:
         # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
+        quiesce_error = None
+        if defer_init and has_deferred_init(terminal_id):
+            try:
+                await quiesce_deferred_terminal(terminal_id)
+            except Exception as exc:
+                quiesce_error = str(exc)
         settlement_error = None
         settlement_retained = False
-        if resume_uuid and db_created:
+        if quiesce_error is not None:
+            settlement_error = quiesce_error
+            settlement_retained = True
+        elif resume_uuid and db_created:
             try:
                 settlement = _settle_published_creation_failure(
                     terminal_id, resume_uuid, uuid_lease_token, registry,
@@ -910,63 +1006,527 @@ async def create_terminal(
         raise
 
 
-def _notify_caller_of_deferred_failure(
-    terminal_id: str,
-    message: str,
-    registry: "PluginRegistry | None",
-    delete_worker: bool,
-) -> None:
-    """Make a deferred-init failure observable to the supervisor that assigned
-    the worker, then optionally tear the worker down.
+_PERSIST_FAILURE_CODES = {
+    "terminal_metadata_missing", "identity_persist_failed",
+    "shell_baseline_unavailable", "terminal_identity_persist_failed",
+}
 
-    Runs in a worker thread (blocking DB + tmux I/O). The supervisor is the
-    worker's ``caller_id``; we enqueue a PENDING inbox message to it so the
-    failure surfaces as the supervisor's next input instead of leaving it to
-    wait forever on a callback that will never come. Every step is best-effort
-    and independently guarded — a failure to notify must not prevent teardown,
-    and a failure to tear down must not crash the background task.
-    """
-    caller_id = None
+
+class _DeferredInitFailure(RuntimeError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def _failure_code(exc: BaseException) -> str:
+    if isinstance(exc, (RetryableArtifactValidation, TerminalArtifactValidation)):
+        return exc.code
+    if isinstance(exc, (DeferredExecutorSaturated, _DeferredInitFailure)):
+        return exc.code
+    if isinstance(exc, RuntimeError) and str(exc) in _PERSIST_FAILURE_CODES:
+        return str(exc)
+    return "deferred_init_internal"
+
+
+def _notice_text(
+    *, code: str, deadline_s: float, token: str, worker: str,
+    profile: str, provider: str,
+) -> str:
+    fields = (code, token, worker, profile, provider)
+    if any(
+        not isinstance(value, str) or not value or
+        any(character.isspace() or ord(character) < 32 or ord(character) == 127
+            for character in value)
+        for value in fields
+    ):
+        raise ValueError("deferred_notice_identifier_invalid")
+    return (
+        f"code={code} deadline_s={repr(float(deadline_s))} token={token} "
+        f"worker={worker} profile={profile} provider={provider}"
+    )
+
+
+def _register_deferred_call(terminal_id: str, generation: str, call: DeferredCall) -> None:
+    with _deferred_tasks_lock:
+        record = _deferred_tasks_by_terminal.get(terminal_id)
+        if record is None or record.generation != generation:
+            call.quiesce_failed = True
+            return
+        record.current_call = call
+
+    def finished(_future: concurrent.futures.Future) -> None:
+        def cleanup_closed_loop_record() -> None:
+            with _deferred_tasks_lock:
+                current = _deferred_tasks_by_terminal.get(terminal_id)
+                if (
+                    current is not None
+                    and current.generation == generation
+                    and current.current_call is call
+                    and current.task.done()
+                ):
+                    _deferred_tasks_by_terminal.pop(terminal_id, None)
+
+        def cleanup_completed_record() -> None:
+            current = _deferred_tasks_by_terminal.get(terminal_id)
+            if (
+                current is not None
+                and current.generation == generation
+                and current.current_call is call
+                and current.task.done()
+            ):
+                _deferred_tasks_by_terminal.pop(terminal_id, None)
+
+        if record.loop.is_closed():
+            cleanup_closed_loop_record()
+            return
+        try:
+            record.loop.call_soon_threadsafe(cleanup_completed_record)
+        except RuntimeError:
+            cleanup_closed_loop_record()
+
+    call.future.add_done_callback(finished)
+
+
+def _claim_deferred_call_result(call: DeferredCall, owner: str) -> bool:
+    if call.result_owner != "open":
+        return False
+    call.result_owner = owner
+    return True
+
+
+def _clear_consumed_deferred_call(
+    terminal_id: str, generation: str, call: DeferredCall,
+) -> bool:
+    """Clear a call only after its owning asyncio task consumed the result."""
+    owns_result = _claim_deferred_call_result(call, "task")
+    current = _deferred_tasks_by_terminal.get(terminal_id)
+    if (
+        current is not None
+        and current.generation == generation
+        and current.current_call is call
+    ):
+        current.current_call = None
+    return owns_result
+
+
+async def _tracked_blocking(
+    terminal_id: str, generation: str, call_type: str, operation: str,
+    function, *args, deadline: float | None = None, **kwargs,
+):
+    with _deferred_tasks_lock:
+        record = _deferred_tasks_by_terminal.get(terminal_id)
+        if record is not None and (
+            record.generation != generation or record.abandoned
+        ):
+            raise asyncio.CancelledError
+    registered_call: DeferredCall | None = None
+
+    def register(call: DeferredCall) -> None:
+        nonlocal registered_call
+        registered_call = call
+        _register_deferred_call(terminal_id, generation, call)
+
     try:
-        metadata = get_terminal_metadata(terminal_id)
-        if metadata:
-            caller_id = metadata.get("caller_id")
-    except Exception as exc:  # noqa: BLE001 — notification is best-effort
-        logger.warning(
-            "Deferred-init failure notify: could not read metadata for %s: %s",
-            terminal_id,
-            exc,
+        result, grant = await dispatcher.run(
+            terminal_id, generation, call_type, operation, function, *args,
+            deadline=deadline, on_registered=register, **kwargs,
+        )
+    except asyncio.CancelledError:
+        # Quiescence owns observation of a retained call after cancellation.
+        raise
+    except BaseException:
+        if registered_call is not None and not _clear_consumed_deferred_call(
+            terminal_id, generation, registered_call,
+        ):
+            raise asyncio.CancelledError
+        raise
+    if registered_call is not None and not _clear_consumed_deferred_call(
+        terminal_id, generation, registered_call,
+    ):
+        raise asyncio.CancelledError
+    return result, grant
+
+
+def _commit_ready_if_generation_current(terminal_id: str, generation: str) -> bool:
+    """Run the DB ready CAS behind the quiesce-owned abandonment fence."""
+    record = _deferred_tasks_by_terminal.get(terminal_id)
+    if record is None or record.generation != generation:
+        return False
+    call = record.current_call
+    if call is None:
+        return False
+
+    def still_current() -> bool:
+        with call.ready_winner_lock:
+            if call.ready_winner == "commit_decided":
+                return True
+        current = _deferred_tasks_by_terminal.get(terminal_id)
+        return bool(
+            current is record
+            and current.generation == generation
+            and not current.abandoned
+            and not call.quiesce_failed
+            and call.abandon_event is not None
+            and not call.abandon_event.is_set()
         )
 
-    if caller_id:
+    def decide_commit() -> bool:
+        with call.ready_winner_lock:
+            if call.ready_winner == "timeout":
+                return False
+            call.ready_winner = "commit_decided"
+            return True
+
+    def commit_is_decided() -> bool:
+        with call.ready_winner_lock:
+            return call.ready_winner == "commit_decided"
+
+    committed = mark_terminal_init_ready(
+        terminal_id,
+        should_commit=still_current,
+        decide_commit=decide_commit,
+        commit_is_decided=commit_is_decided,
+        on_committed=lambda: setattr(call, "ready_committed", True),
+    )
+    if committed:
+        call.ready_committed = True
+    return committed
+
+
+async def _mark_ready_if_generation_current(terminal_id: str, generation: str) -> bool:
+    committed, _ = await _tracked_blocking(
+        terminal_id,
+        generation,
+        "abandonable",
+        "ready_commit",
+        _commit_ready_if_generation_current,
+        terminal_id,
+        generation,
+    )
+    return bool(committed)
+
+
+def _deferred_worker_live(terminal_id: str) -> bool:
+    metadata = get_terminal_metadata(terminal_id)
+    if metadata is None or metadata.get("init_state") != "init_pending":
+        return False
+    try:
+        return get_backend().window_liveness(
+            metadata["tmux_session"], metadata["tmux_window"]
+        ) == "live"
+    except Exception:
+        return False
+
+
+async def _validate_deferred_artifact(
+    provider_instance, prepared: _PreparedRuntimeIdentity,
+    terminal_id: str, generation: str, deadline_s: float,
+) -> None:
+    origin = time.monotonic()
+    deadline = origin + deadline_s
+    while True:
         try:
-            create_inbox_message(sender_id=terminal_id, receiver_id=caller_id, message=message)
-        except Exception as exc:  # noqa: BLE001 — best-effort
-            logger.warning(
-                "Deferred-init failure notify: could not enqueue inbox message to "
-                "caller %s for worker %s: %s",
-                caller_id,
-                terminal_id,
-                exc,
+            _result, _grant = await _tracked_blocking(
+                terminal_id, generation, "abandonable", "validate",
+                provider_instance.validate_session_artifact,
+                prepared.session_uuid, prepared.cwd, deadline=deadline,
             )
+            return
+        except RetryableArtifactValidation as exc:
+            if time.monotonic() >= deadline:
+                raise exc
+            live, _ = await _tracked_blocking(
+                terminal_id, generation, "abandonable", "metadata_read",
+                _deferred_worker_live, terminal_id, deadline=deadline,
+            )
+            if not live:
+                raise _DeferredInitFailure("worker_vanished")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise exc
+            await asyncio.sleep(min(POLL_INTERVAL, remaining))
+
+
+def _delete_terminal_core(
+    terminal_id: str, registry: PluginRegistry | None = None,
+    *, preserve_warm_intent: bool = False,
+) -> bool:
+    from cli_agent_orchestrator.services.rebind_lease import (
+        acquire_rebind_lease, release_rebind_lease,
+    )
+
+    token = acquire_rebind_lease(terminal_id)
+    if token is None:
+        raise RuntimeError("rebind_in_progress")
+    try:
+        kwargs = {"preserve_warm_intent": True} if preserve_warm_intent else {}
+        result = _delete_terminal_under_lease(
+            terminal_id, token, registry=registry, **kwargs,
+        )
+        return bool(result["terminal_deleted"] if isinstance(result, dict) else result)
+    finally:
+        release_rebind_lease(token)
+
+
+def _settle_deferred_failure_sync(
+    terminal_id: str, registry: PluginRegistry | None = None,
+    uuid_lease_token=None,
+) -> dict:
+    metadata = get_terminal_metadata(terminal_id)
+    if metadata is None:
+        return {"status": "deleted", "error_code": None}
+    session_uuid = metadata.get("provider_session_id")
+    if session_uuid:
+        return _settle_published_creation_failure(
+            terminal_id, session_uuid, uuid_lease_token, registry,
+        )
+    deleted = _delete_terminal_core(terminal_id, registry=registry)
+    return {"status": "deleted" if deleted else "retained", "error_code": None}
+
+
+async def _claim_and_settle_deferred_failure(
+    terminal_id: str, generation: str, snapshot: dict, code: str,
+    registry: PluginRegistry | None, uuid_lease_token=None,
+    *, fatal_claim_failure: bool = False,
+) -> None:
+    deadline_s = snapshot.get("init_deadline_s")
+    if not isinstance(deadline_s, (int, float)) or not 1.0 <= float(deadline_s) <= 600.0:
+        logger.error("deferred_init_internal terminal=%s invalid_stored_deadline", terminal_id)
+        return
+    token = str(uuid.uuid4())
+    try:
+        notice = _notice_text(
+            code=code, deadline_s=float(deadline_s), token=token,
+            worker=terminal_id,
+            profile=snapshot.get("agent_profile"),
+            provider=snapshot.get("provider"),
+        )
+    except ValueError:
+        logger.error("deferred_init_internal terminal=%s notice_rejected", terminal_id)
+        return
+    try:
+        claim, _ = await _tracked_blocking(
+            terminal_id, generation, "mutating", "h3_claim",
+            claim_deferred_init_failure,
+            terminal_id,
+            caller_id=snapshot.get("caller_id"),
+            failure_token=token,
+            notice=notice,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error(
+            "deferred_init_claim_failed terminal=%s code=%s error=%s",
+            terminal_id, code, type(exc).__name__,
+        )
+        if fatal_claim_failure and str(exc) == "deferred_init_claim_busy_exhausted":
+            raise
+        return
+    if claim["status"] == "claimed_caller_gone":
+        logger.error("caller_gone_zero_notice terminal=%s token=%s", terminal_id, token)
+    if claim["status"] == "row_missing":
+        return
+    if claim.get("init_state") not in {
+        "init_failed_notified", "init_failed_caller_gone",
+    }:
+        return
+    try:
+        await _tracked_blocking(
+            terminal_id, generation, "mutating", "settlement",
+            _settle_deferred_failure_sync, terminal_id, registry, uuid_lease_token,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("deferred_init_settlement_failed terminal=%s", terminal_id)
+
+
+async def _late_mutation_reconciler(
+    terminal_id: str, operation: str, future: concurrent.futures.Future,
+) -> None:
+    if operation == "h3_claim":
+        try:
+            result = future.result()
+        except Exception:
+            logger.error("reconcile_h3_rolled_back terminal=%s", terminal_id)
+            return
+        if result.get("init_state") in {
+            "init_failed_notified", "init_failed_caller_gone",
+        }:
+            try:
+                await dispatcher.run(
+                    terminal_id, "reconciler", "mutating", "settlement",
+                    _settle_deferred_failure_sync, terminal_id,
+                )
+            except Exception:
+                logger.exception("reconcile_h3_committed terminal=%s settlement=failed", terminal_id)
+            else:
+                logger.error("reconcile_h3_committed terminal=%s", terminal_id)
+        else:
+            logger.error("reconcile_h3_rolled_back terminal=%s", terminal_id)
+    elif operation == "delete":
+        try:
+            future.result()
+            logger.error("reconcile_delete_result terminal=%s", terminal_id)
+        except Exception as exc:
+            logger.error("reconcile_delete_result terminal=%s error=%s", terminal_id, type(exc).__name__)
     else:
-        logger.warning(
-            "Deferred-init failure for %s has no caller_id to notify; failure is " "log-only.",
-            terminal_id,
-        )
-
-    if delete_worker:
         try:
-            # Pass registry so post_kill_terminal hooks fire — parity with the
-            # DELETE endpoint and agent_step teardown.
-            delete_terminal(terminal_id, registry=registry)
-        except Exception as exc:  # noqa: BLE001 — teardown is best-effort
-            logger.warning(
-                "Deferred-init failure: teardown of worker %s failed (zombie "
-                "window may remain): %s",
-                terminal_id,
-                exc,
+            future.result()
+            logger.error("reconcile_settlement_result terminal=%s", terminal_id)
+        except Exception as exc:
+            logger.error("reconcile_settlement_result terminal=%s error=%s", terminal_id, type(exc).__name__)
+
+
+def _schedule_late_reconciler(
+    record: _DeferredTaskRecord, terminal_id: str, call: DeferredCall,
+) -> None:
+    def spawn(_future: concurrent.futures.Future) -> None:
+        if record.loop.is_closed():
+            return
+        def create() -> None:
+            task = record.loop.create_task(
+                _late_mutation_reconciler(terminal_id, call.operation, call.future)
             )
+            setattr(task, "_cao_terminal_id", terminal_id)
+            setattr(task, "_cao_operation", call.operation)
+            _deferred_reconciler_tasks.add(task)
+            task.add_done_callback(_deferred_reconciler_tasks.discard)
+        record.loop.call_soon_threadsafe(create)
+    call.future.add_done_callback(spawn)
+
+
+async def quiesce_deferred_terminal(
+    terminal_id: str, *, timeout_s: float = DEFERRED_TASK_QUIESCE_S,
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    # Reads and winner flags are atomic object operations under CPython. Avoid
+    # acquiring the registry's threading.Lock on the event-loop thread: a
+    # blocking ready DB call must not be able to postpone this deadline.
+    record = _deferred_tasks_by_terminal.get(terminal_id)
+    if record is None:
+        return
+    call = record.current_call
+    record.loop.call_soon_threadsafe(record.task.cancel)
+    try:
+        remaining = max(0.0, deadline - time.monotonic())
+        await asyncio.wait_for(asyncio.shield(record.task), remaining)
+    except asyncio.CancelledError:
+        pass
+    except asyncio.TimeoutError:
+        pass
+    while call is not None and not call.future.done() and time.monotonic() < deadline:
+        await asyncio.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+    if call is not None and not call.future.done():
+        mutation_in_flight = call.call_type == "mutating"
+        if call.operation == "ready_commit":
+            winner_acquired = call.ready_winner_lock.acquire(blocking=False)
+            if not winner_acquired:
+                mutation_in_flight = True
+            else:
+                try:
+                    if call.ready_winner == "commit_decided":
+                        mutation_in_flight = True
+                    else:
+                        call.ready_winner = "timeout"
+                finally:
+                    call.ready_winner_lock.release()
+        record.abandoned = True
+        call.quiesce_failed = True
+        if call.abandon_event is not None:
+            call.abandon_event.set()
+        if mutation_in_flight:
+            if _claim_deferred_call_result(call, "reconciler"):
+                _schedule_late_reconciler(record, terminal_id, call)
+            raise RuntimeError("quiesce_timeout_mutation_in_flight")
+        _claim_deferred_call_result(call, "quiesce")
+        raise RuntimeError("deferred_task_quiesce_timeout")
+    if call is not None and _claim_deferred_call_result(call, "quiesce"):
+        call.future.result()
+    if not record.task.done():
+        record.abandoned = True
+        raise RuntimeError("deferred_task_quiesce_timeout")
+
+
+def quiesce_deferred_terminal_sync(
+    terminal_id: str, *, timeout_s: float = DEFERRED_TASK_QUIESCE_S,
+) -> None:
+    with _deferred_tasks_lock:
+        record = _deferred_tasks_by_terminal.get(terminal_id)
+    if record is None:
+        return
+    try:
+        if asyncio.get_running_loop() is record.loop:
+            raise RuntimeError("deferred_quiesce_requires_async_call")
+    except RuntimeError as exc:
+        if str(exc) == "deferred_quiesce_requires_async_call":
+            raise
+    future = asyncio.run_coroutine_threadsafe(
+        quiesce_deferred_terminal(terminal_id, timeout_s=timeout_s), record.loop
+    )
+    try:
+        future.result(timeout=timeout_s + 1.0)
+    except concurrent.futures.TimeoutError as exc:
+        raise RuntimeError("deferred_task_quiesce_timeout") from exc
+
+
+async def shutdown_deferred_tasks(
+    *, timeout_s: float = DEFERRED_TASK_QUIESCE_S,
+) -> None:
+    with _deferred_tasks_lock:
+        terminal_ids = list(_deferred_tasks_by_terminal)
+    for terminal_id in terminal_ids:
+        try:
+            await quiesce_deferred_terminal(terminal_id, timeout_s=timeout_s)
+        except Exception as exc:
+            logger.error("deferred_shutdown_timeout terminal=%s code=%s", terminal_id, exc)
+    tasks = list(_deferred_reconciler_tasks)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    for task in tasks:
+        if getattr(task, "_cao_operation", None) == "delete":
+            terminal_id = getattr(task, "_cao_terminal_id", "unknown")
+            if get_terminal_metadata(terminal_id) is None:
+                logger.error("reconcile_audit_lost_row_gone terminal=%s", terminal_id)
+
+
+async def recover_deferred_inits(
+    registry: PluginRegistry | None = None,
+    *, owner_epoch: str = SERVER_INIT_OWNER_EPOCH,
+) -> None:
+    rows = list_deferred_init_recovery_rows(owner_epoch)
+    for row in rows:
+        terminal_id = row["id"]
+        state = row.get("init_state")
+        if row.get("recovery_state") == "rollback_kill_uncertain":
+            logger.warning("deferred_init_recovery_quarantined terminal=%s", terminal_id)
+            continue
+        if state == "init_pending":
+            try:
+                owner = row.get("init_owner_epoch")
+                if str(uuid.UUID(owner)) != owner or row.get("init_started_at") is None:
+                    raise ValueError
+            except (TypeError, ValueError, AttributeError):
+                logger.error("deferred_init_corrupt_pending terminal=%s", terminal_id)
+                continue
+            await _claim_and_settle_deferred_failure(
+                terminal_id, f"h5-{owner_epoch}", row,
+                "server_restart_during_deferred_init", registry,
+                fatal_claim_failure=True,
+            )
+        elif state in {"init_failed_notified", "init_failed_caller_gone"}:
+            if state == "init_failed_caller_gone":
+                logger.error("caller_gone_zero_notice terminal=%s", terminal_id)
+            try:
+                await dispatcher.run(
+                    terminal_id, f"h5-{owner_epoch}", "mutating", "settlement",
+                    _settle_deferred_failure_sync, terminal_id, registry,
+                )
+            except Exception:
+                logger.exception("deferred_init_settlement_failed terminal=%s", terminal_id)
 
 
 def _schedule_deferred_init(
@@ -980,6 +1540,7 @@ def _schedule_deferred_init(
     session_lifecycle_lease_token=None,
     owns_lifecycle_lease: bool = False,
     settlement_form: str = "first_time",
+    caller_snapshot: dict | None = None,
 ) -> None:
     """Kick off provider.initialize() in the background and, on success,
     deliver the initial message via send_input.
@@ -996,16 +1557,32 @@ def _schedule_deferred_init(
     answerable via answer_user_prompt, so we leave it in place and only log.
     """
 
+    snapshot = dict(caller_snapshot or get_terminal_metadata(terminal_id) or {})
+    generation = str(uuid.uuid4())
+
     async def _run() -> None:
-        caller_id: Optional[str] = None
         try:
             await provider_instance.initialize()
-            _persist_provider_runtime_identity(
+            prepared, _ = await _tracked_blocking(
+                terminal_id, generation, "abandonable", "capture_persist",
+                _prepare_provider_runtime_identity,
                 provider_instance, terminal_id, settlement_form=settlement_form,
             )
+            if prepared is not None:
+                await _validate_deferred_artifact(
+                    provider_instance, prepared, terminal_id, generation,
+                    float(snapshot["init_deadline_s"]),
+                )
+                await _tracked_blocking(
+                    terminal_id, generation, "abandonable", "capture_persist",
+                    _commit_provider_runtime_identity, terminal_id, prepared,
+                )
             shell_command = provider_instance.shell_baseline
             if isinstance(shell_command, str) and shell_command:
-                update_terminal_shell_command(terminal_id, shell_command)
+                await _tracked_blocking(
+                    terminal_id, generation, "abandonable", "capture_persist",
+                    update_terminal_shell_command, terminal_id, shell_command,
+                )
             if initial_message:
                 # For assign/handoff the sender is the CALLER (the supervisor),
                 # not this MCP server. But the deferred path is used only via
@@ -1013,19 +1590,16 @@ def _schedule_deferred_init(
                 # embedded the callback instructions into initial_message.
                 # We still pass sender_id=caller_id if present in DB metadata
                 # so plugin events see it.
-                metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
-                if metadata:
-                    caller_id = metadata.get("caller_id")
-                # send_input is blocking tmux I/O — off the loop so it can't
-                # freeze the server for concurrent requests.
-                await asyncio.to_thread(
+                await _tracked_blocking(
+                    terminal_id, generation, "abandonable", "send_input",
                     send_input,
                     terminal_id,
                     initial_message,
                     registry=registry,
-                    sender_id=caller_id,
+                    sender_id=snapshot.get("caller_id"),
                     orchestration_type=orchestration_type,
                 )
+            await _mark_ready_if_generation_current(terminal_id, generation)
         except TerminalInputBlockedError as e:
             # The worker initialized but is parked on an interactive prompt
             # (WAITING_USER_ANSWER). It is alive and can be driven via
@@ -1040,9 +1614,10 @@ def _schedule_deferred_init(
             )
             queued = False
             try:
-                await asyncio.to_thread(
+                await _tracked_blocking(
+                    terminal_id, generation, "abandonable", "blocked_queue",
                     create_inbox_message,
-                    caller_id or "unknown",
+                    snapshot.get("caller_id") or "unknown",
                     terminal_id,
                     initial_message,
                     OrchestrationType.ASSIGN,
@@ -1052,21 +1627,28 @@ def _schedule_deferred_init(
                 logger.exception(
                     "Could not queue blocked assigned task for terminal %s", terminal_id
                 )
+            if not queued:
+                await _claim_and_settle_deferred_failure(
+                    terminal_id, generation, snapshot,
+                    "deferred_init_internal", registry, uuid_lease_token,
+                )
+                return
+            await _mark_ready_if_generation_current(terminal_id, generation)
             notice = (
                 f"Worker {terminal_id} is waiting on a dialog; the assigned task is "
                 f"queued and will deliver when the dialog clears."
-                if queued
-                else f"Worker {terminal_id} is waiting on a dialog; the assigned task "
-                f"was not queued and remains undelivered. The worker is still alive; "
-                f"clear the dialog and re-assign the task or recover it manually."
             )
-            await asyncio.to_thread(
-                _notify_caller_of_deferred_failure,
-                terminal_id,
-                notice,
-                registry,
-                delete_worker=False,
-            )
+            if snapshot.get("caller_id"):
+                try:
+                    await _tracked_blocking(
+                        terminal_id, generation, "mutating", "notice",
+                        create_inbox_message, terminal_id,
+                        snapshot["caller_id"], notice,
+                    )
+                except Exception:
+                    logger.exception("Deferred blocked notice failed terminal=%s", terminal_id)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             # exc_info=True preserves the traceback for debugging; {e!r} avoids
             # newline/control-character injection into logs and the inbox message
@@ -1078,28 +1660,9 @@ def _schedule_deferred_init(
                 e,
                 exc_info=True,
             )
-            settlement = None
-            metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
-            if metadata and metadata.get("provider_session_id") and uuid_lease_token is not None:
-                settlement = await asyncio.to_thread(
-                    _settle_published_creation_failure,
-                    terminal_id, metadata["provider_session_id"], uuid_lease_token, registry,
-                )
-            if settlement is None and get_terminal_metadata(terminal_id) is not None:
-                # Non-published legacy deferred failures retain the old path.
-                await asyncio.to_thread(delete_terminal, terminal_id, registry=registry)
-                settlement = {"status": "deleted", "error_code": None}
-            settlement = settlement or {"status": "deleted", "error_code": None}
-            notice = (
-                f"Worker {terminal_id} failed to initialize: {e!r}. Retained in quarantine "
-                f"[{settlement['error_code']}] for recovery."
-                if settlement["status"] == "retained" else
-                f"Worker {terminal_id} failed to initialize: {e!r}. It has been deleted — "
-                f"re-assign the task or report the failure."
-            )
-            await asyncio.to_thread(
-                _notify_caller_of_deferred_failure, terminal_id, notice, registry,
-                delete_worker=False,
+            await _claim_and_settle_deferred_failure(
+                terminal_id, generation, snapshot, _failure_code(e), registry,
+                uuid_lease_token,
             )
         finally:
             if owns_uuid_lease and uuid_lease_token is not None:
@@ -1123,12 +1686,19 @@ def _schedule_deferred_init(
     task = loop.create_task(_run())
     _deferred_init_tasks.add(task)
     with _deferred_tasks_lock:
-        _deferred_tasks_by_terminal[terminal_id] = task
+        _deferred_tasks_by_terminal[terminal_id] = _DeferredTaskRecord(
+            task=task, loop=loop, generation=generation,
+            session_name=snapshot.get("tmux_session"),
+        )
 
     def _done(completed):
         _deferred_init_tasks.discard(completed)
         with _deferred_tasks_lock:
-            if _deferred_tasks_by_terminal.get(terminal_id) is completed:
+            record = _deferred_tasks_by_terminal.get(terminal_id)
+            if (
+                record is not None and record.task is completed and
+                (record.current_call is None or record.current_call.future.done())
+            ):
                 _deferred_tasks_by_terminal.pop(terminal_id, None)
 
     task.add_done_callback(_done)
@@ -1653,19 +2223,30 @@ def provider_session_owner(session_uuid: str) -> dict:
 
 
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
-    from cli_agent_orchestrator.services.rebind_lease import (
-        acquire_rebind_lease,
-        release_rebind_lease,
-    )
+    quiesce_deferred_terminal_sync(terminal_id)
+    return _delete_terminal_core(terminal_id, registry=registry)
 
-    token = acquire_rebind_lease(terminal_id)
-    if token is None:
-        raise RuntimeError("rebind_in_progress")
-    try:
-        result = _delete_terminal_under_lease(terminal_id, token, registry=registry)
-        return bool(result["terminal_deleted"] if isinstance(result, dict) else result)
-    finally:
-        release_rebind_lease(token)
+
+def quiesce_deferred_terminals_sync(terminals: list[dict]) -> None:
+    for terminal in terminals:
+        quiesce_deferred_terminal_sync(terminal["id"])
+
+
+def quiesce_deferred_session_sync(session_name: str) -> None:
+    """Quiesce schedule-time session members before the leased DB snapshot."""
+    with _deferred_tasks_lock:
+        terminal_ids = [
+            terminal_id
+            for terminal_id, record in _deferred_tasks_by_terminal.items()
+            if record.session_name == session_name
+        ]
+    for terminal_id in terminal_ids:
+        quiesce_deferred_terminal_sync(terminal_id)
+
+
+async def quiesce_deferred_terminals(terminals: list[dict]) -> None:
+    for terminal in terminals:
+        await quiesce_deferred_terminal(terminal["id"])
 
 
 def preflight_session_teardown(terminals: list[dict]) -> None:
@@ -1831,15 +2412,12 @@ def _delete_terminal_under_lease(
         from cli_agent_orchestrator.services.memory_service import _curator_locks
 
         _curator_locks.pop(terminal_id, None)
-        deleted = db_delete_terminal(terminal_id)
-        intent_deleted = False
+        deletion = delete_terminal_and_warm_intent(
+            terminal_id, preserve_warm_intent=preserve_warm_intent,
+        )
+        deleted = deletion["terminal_deleted"]
+        intent_deleted = deletion["intent_deleted"]
         intent_error = None
-        if deleted and not preserve_warm_intent:
-            try:
-                from cli_agent_orchestrator.clients.database import delete_warm_intent_for_terminal
-                intent_deleted = delete_warm_intent_for_terminal(terminal_id)
-            except Exception as exc:
-                intent_error = str(exc)
         logger.info(f"Deleted terminal: {terminal_id}")
         if deleted and metadata:
             dispatch_plugin_event(
