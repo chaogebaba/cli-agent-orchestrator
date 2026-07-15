@@ -12,6 +12,8 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 from cli_agent_orchestrator.constants import SERVER_PORT
 
@@ -213,8 +215,43 @@ def installed_package_root() -> Path | None:
     return Path(result.stdout.strip()).resolve() if result.returncode == 0 else None
 
 
-def compare_installed(root: Path, installed: Path) -> tuple[str, int, float | None]:
+def installed_source_root(installed: Path) -> Path | None:
+    """Return the local source recorded by the installed wheel, when available."""
+    direct_urls = installed.parent.glob("cli_agent_orchestrator-*.dist-info/direct_url.json")
+    for path in sorted(direct_urls):
+        try:
+            url = json.loads(path.read_text(encoding="utf-8"))["url"]
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(url, str):
+            continue
+        parsed = urlparse(url)
+        if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+            continue
+        root = Path(url2pathname(parsed.path)).resolve()
+        if (root / "src" / "cli_agent_orchestrator").is_dir():
+            return root
+    return None
+
+
+def cli_deploy_root(repo_root: Path) -> Path:
+    """Resolve the CLI comparison root, using local install provenance as fallback."""
+    root = repo_root.resolve()
+    if (root / "src" / "cli_agent_orchestrator").is_dir():
+        return root
+    installed = installed_package_root()
+    if installed is not None and installed.is_dir():
+        return installed_source_root(installed) or root
+    return root
+
+
+def compare_installed(
+    root: Path, installed: Path
+) -> tuple[str, int | None, float | None]:
     source = root / "src" / "cli_agent_orchestrator"
+    newest = max((p.stat().st_mtime for p in installed.rglob("*.py")), default=None)
+    if not source.is_dir():
+        return "source-not-found", None, newest
     repo_files = {p.relative_to(source) for p in source.rglob("*.py")}
     installed_files = {p.relative_to(installed) for p in installed.rglob("*.py")}
     differing = 0
@@ -222,7 +259,6 @@ def compare_installed(root: Path, installed: Path) -> tuple[str, int, float | No
         left, right = source / rel, installed / rel
         if not left.is_file() or not right.is_file() or left.read_bytes() != right.read_bytes():
             differing += 1
-    newest = max((p.stat().st_mtime for p in installed.rglob("*.py")), default=None)
     return ("current" if differing == 0 else "stale"), differing, newest
 
 
@@ -249,18 +285,24 @@ def process_start_time(pid: int) -> float | None:
 
 def deployment_status(repo_root: Path) -> dict:
     """Return structured deploy truth for an explicit source root."""
+    source_root = repo_root.resolve()
     installed = installed_package_root()
     if installed is None or not installed.is_dir():
         state, count, newest = "not-found", None, None
     else:
-        state, count, newest = compare_installed(repo_root, installed)
+        state, count, newest = compare_installed(source_root, installed)
     pid = listening_pid(SERVER_PORT)
     if pid is None:
         server = "not-running"
     else:
         started = process_start_time(pid)
         server = "unknown" if started is None or newest is None else ("restart-needed" if newest > started else "current")
-    return {"cli_path": state, "differing_files": count, "server": server, "source_root": str(repo_root.resolve())}
+    return {
+        "cli_path": state,
+        "differing_files": count,
+        "server": server,
+        "source_root": str(source_root),
+    }
 
 
 def find_workspace_file(start: Path, name: str) -> Path | None:

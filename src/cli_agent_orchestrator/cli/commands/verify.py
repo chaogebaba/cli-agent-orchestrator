@@ -6,7 +6,7 @@ from pathlib import Path
 import click
 
 from cli_agent_orchestrator.services.verification_service import (
-    changed_files, deployment_status, git_root, verify_suite_log,
+    changed_files, cli_deploy_root, deployment_status, git_root, verify_suite_log,
 )
 
 
@@ -32,14 +32,14 @@ def suite_log(path: Path) -> None:
 def deploy() -> None:
     """Compare the installed CLI and running server with this working tree."""
     try:
-        root = git_root()
+        root = cli_deploy_root(git_root())
     except subprocess.CalledProcessError as exc:
         raise click.ClickException(str(exc))
     status = deployment_status(root)
     state = status["cli_path"]
     count = status["differing_files"]
-    if state == "not-found":
-        click.echo("CLI path: not-found")
+    if count is None:
+        click.echo(f"CLI path: {state}")
     else:
         click.echo(f"CLI path: {state} ({count} files differ)")
     server_state = status["server"]

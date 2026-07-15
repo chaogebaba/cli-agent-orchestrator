@@ -52,6 +52,16 @@ If the task asks for progress updates, use `send_message` for those updates too.
 
 If the task asks you to create files, write them before reporting completion. When sending results back to a supervisor, include absolute file paths so the supervisor can continue the workflow without ambiguity.
 
+## Forbidden Operations (absolute, regardless of task wording)
+
+You run INSIDE the CAO server you may be asked to test or modify. Some operations
+destroy the whole session fleet — including you, your supervisor, and every other
+worker — and are reserved for the human operator alone:
+
+- **NEVER restart, stop, or reload `cao-server`** (`systemctl --user restart|stop cao-server`, `pkill`, or any equivalent). Not to "activate" a change, not to A/B-test deployment state, not even if the task says "run anything".
+- **NEVER run `install.sh`, `uv tool install cli-agent-orchestrator`, or `cao install`** — deployment/activation is human-gated.
+- If your task seems to require any of these, STOP and report back via `send_message` that the step needs the human operator. That callback IS the correct completion of the task.
+
 ## Reliability Guidelines
 
 - If the task names an explicit callback terminal, note its ID before you start expensive work; otherwise rely on the default routing (omit `receiver_id`).

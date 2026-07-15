@@ -288,6 +288,71 @@ def test_structured_deployment_status_current_stale_and_restart(tmp_path, monkey
     assert svc.deployment_status(root)["server"] == "restart-needed"
 
 
+def test_cli_deploy_uses_installed_source_when_cwd_git_root_is_parent(
+    tmp_path, monkeypatch,
+):
+    import cli_agent_orchestrator.cli.commands.verify as command
+
+    workspace = tmp_path / "workspace"
+    root = workspace / "cli-agent-orchestrator"
+    source = root / "src" / "cli_agent_orchestrator"
+    installed = tmp_path / "site-packages" / "cli_agent_orchestrator"
+    dist_info = installed.parent / "cli_agent_orchestrator-2.3.0.dist-info"
+    source.mkdir(parents=True)
+    installed.mkdir(parents=True)
+    dist_info.mkdir()
+    (source / "module.py").write_text("same\n", encoding="utf-8")
+    (installed / "module.py").write_text("same\n", encoding="utf-8")
+    (dist_info / "direct_url.json").write_text(
+        '{"url": "' + root.as_uri() + '", "dir_info": {}}', encoding="utf-8"
+    )
+    monkeypatch.setattr(svc, "installed_package_root", lambda: installed)
+    monkeypatch.setattr(svc, "listening_pid", lambda _port: 42)
+    monkeypatch.setattr(command, "git_root", lambda: workspace)
+    newest = (installed / "module.py").stat().st_mtime
+    monkeypatch.setattr(svc, "process_start_time", lambda _pid: newest + 10)
+
+    result = CliRunner().invoke(cli, ["verify", "deploy"])
+
+    assert result.exit_code == 0
+    assert result.stdout == "CLI path: current (0 files differ)\nserver: current\n"
+    assert svc.cli_deploy_root(workspace) == root.resolve()
+
+
+def test_cli_deploy_non_string_direct_url_is_source_not_found(tmp_path, monkeypatch):
+    import cli_agent_orchestrator.cli.commands.verify as command
+
+    workspace = tmp_path / "workspace"
+    installed = tmp_path / "site-packages" / "cli_agent_orchestrator"
+    dist_info = installed.parent / "cli_agent_orchestrator-2.3.0.dist-info"
+    workspace.mkdir()
+    installed.mkdir(parents=True)
+    dist_info.mkdir()
+    (installed / "module.py").write_text("installed\n", encoding="utf-8")
+    (dist_info / "direct_url.json").write_text('{"url": 7}', encoding="utf-8")
+    monkeypatch.setattr(svc, "installed_package_root", lambda: installed)
+    monkeypatch.setattr(svc, "listening_pid", lambda _port: None)
+    monkeypatch.setattr(command, "git_root", lambda: workspace)
+
+    result = CliRunner().invoke(cli, ["verify", "deploy"])
+
+    assert result.exit_code == 1
+    assert result.stdout == "CLI path: source-not-found\nserver: not-running\n"
+    assert svc.cli_deploy_root(workspace) == workspace.resolve()
+
+
+def test_compare_installed_does_not_call_missing_source_tree_stale(tmp_path):
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    (installed / "module.py").write_text("installed\n", encoding="utf-8")
+
+    state, count, newest = svc.compare_installed(tmp_path / "wrong-root", installed)
+
+    assert state == "source-not-found"
+    assert count is None
+    assert newest is not None
+
+
 def test_verify_deploy_cli_golden_bytes(monkeypatch):
     import cli_agent_orchestrator.cli.commands.verify as command
 
