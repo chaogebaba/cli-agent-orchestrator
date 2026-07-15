@@ -30,6 +30,7 @@ from cli_agent_orchestrator.clients.database import (
     get_message_trace,
     get_pending_messages,
     get_terminal_metadata,
+    terminal_exists,
     get_current_transcript_binding,
     init_db,
     list_flows,
@@ -74,6 +75,17 @@ class TestTerminalOperations:
         assert result["id"] == "test123"
         mock_session.add.assert_called_once()
         mock_session.commit.assert_called_once()
+
+    def test_terminal_exists_is_quiet_on_miss(self, test_db, monkeypatch, caplog):
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.SessionLocal", test_db
+        )
+        create_terminal("present", "cao-session", "window-0", "codex")
+
+        caplog.clear()
+        assert terminal_exists("present") is True
+        assert terminal_exists("missing") is False
+        assert not any("Terminal metadata not found" in record.message for record in caplog.records)
 
     def test_fallback_settlement_moves_only_pending_and_commits_pointer(self, test_db, monkeypatch):
         monkeypatch.setattr("cli_agent_orchestrator.clients.database.SessionLocal", test_db)

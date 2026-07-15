@@ -37,6 +37,7 @@ from cli_agent_orchestrator.clients.database import (
     get_ready_provider_session,
     list_deferred_init_recovery_rows,
     mark_terminal_init_ready,
+    terminal_exists,
     update_provider_session_snapshot,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
@@ -1575,6 +1576,7 @@ def _dispatch_base_refresh(
         registry=registry,
         sender_id=sender_id,
         orchestration_type=OrchestrationType.SEND_MESSAGE,
+        expect_callback=False,
     )
 
 
@@ -1587,6 +1589,10 @@ async def _wait_for_base_ready(
     while time.monotonic() < deadline:
         status = status_monitor.get_status(base_terminal_id)
         if status == TerminalStatus.ERROR:
+            return False
+        if status in {None, TerminalStatus.UNKNOWN} and not terminal_exists(
+            base_terminal_id
+        ):
             return False
         if status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}:
             if input_gen is None:
@@ -1633,6 +1639,14 @@ async def _prepare_fork_refresh(
         if not base_terminal_id:
             return stale_preamble
         if not await _wait_for_base_ready(base_terminal_id, deadline):
+            if not terminal_exists(base_terminal_id):
+                logger.warning(
+                    "Fork refresh source terminal is gone; using stale base. "
+                    "base=%s source_terminal_id=%s. Re-register the base to restore "
+                    "fresh auto-refresh.",
+                    base_name,
+                    base_terminal_id,
+                )
             return stale_preamble
         dispatched, _ = await _tracked_blocking(
             terminal_id, generation, "abandonable", "fork_refresh_send",
@@ -1649,6 +1663,14 @@ async def _prepare_fork_refresh(
         if not await _wait_for_base_ready(
             base_terminal_id, deadline, input_gen=input_gen
         ):
+            if not terminal_exists(base_terminal_id):
+                logger.warning(
+                    "Fork refresh source terminal is gone; using stale base. "
+                    "base=%s source_terminal_id=%s. Re-register the base to restore "
+                    "fresh auto-refresh.",
+                    base_name,
+                    base_terminal_id,
+                )
             return stale_preamble
         snapshot_result, _ = await _tracked_blocking(
             terminal_id, generation, "abandonable", "fork_refresh_snapshot",
@@ -1954,6 +1976,8 @@ def send_input(
     sender_id: str | None = None,
     orchestration_type: OrchestrationType | None = None,
     defer_on_dialog: bool = False,
+    *,
+    expect_callback: bool = True,
 ) -> bool:
     """Send input to terminal via tmux paste buffer.
 
@@ -2055,7 +2079,7 @@ def send_input(
             provider.mark_input_received()
 
         update_last_active(terminal_id)
-        if metadata.get("caller_id") and orchestration_value in {
+        if expect_callback and metadata.get("caller_id") and orchestration_value in {
             OrchestrationType.ASSIGN.value,
             OrchestrationType.SEND_MESSAGE.value,
         }:

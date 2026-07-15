@@ -1088,6 +1088,17 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
         }
 
 
+def terminal_exists(terminal_id: str) -> bool:
+    """Return whether a terminal row exists without logging on a miss."""
+    with SessionLocal() as db:
+        return (
+            db.query(TerminalModel.id)
+            .filter(TerminalModel.id == terminal_id)
+            .first()
+            is not None
+        )
+
+
 def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
     """List all terminals in a tmux session."""
     with SessionLocal() as db:
