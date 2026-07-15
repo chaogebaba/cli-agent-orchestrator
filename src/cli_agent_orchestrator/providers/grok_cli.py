@@ -109,6 +109,7 @@ class GrokCliProvider(BaseProvider):
     supports_screen_detection = True
     supports_draft_preservation = True
     composer_clear_keys = ["C-a", "C-k"]
+    clear_immune_ghosts = False
 
     def __init__(
         self,

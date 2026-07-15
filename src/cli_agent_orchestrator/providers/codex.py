@@ -804,6 +804,7 @@ class CodexProvider(BaseProvider):
 
     supports_draft_preservation = True
     composer_clear_keys = ["C-a", "C-k"]
+    clear_immune_ghosts = True
     # Dim-SGR ghost detection needs escape-preserving capture-pane (-e).
     composer_parse_accepts_escapes = True
     liveness_exclude_patterns = [

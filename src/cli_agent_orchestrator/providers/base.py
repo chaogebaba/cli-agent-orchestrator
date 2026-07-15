@@ -232,6 +232,10 @@ class BaseProvider(ABC):
     # clear-key iteration in composer_clear_keys.
     supports_draft_preservation: bool = False
     composer_clear_keys: List[str] = []
+    # Some TUIs render non-editable composer suggestions that remain unchanged
+    # after clear keys. Only providers that have proven this behavior may treat
+    # unchanged text as a ghost rather than an unconfirmed clear.
+    clear_immune_ghosts: bool = False
     # Non-None selects native composer stashing before delivery. Native stashes
     # auto-restore after submit, so callers must never send restore keys.
     composer_stash_keys: List[str] | None = None

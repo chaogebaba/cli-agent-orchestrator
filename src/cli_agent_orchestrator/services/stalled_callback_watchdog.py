@@ -17,6 +17,7 @@ from cli_agent_orchestrator.clients.database import (
     get_callback_status_since,
     get_terminal_metadata,
     list_pending_receiver_ids,
+    list_ready_backlog_observations,
 )
 from cli_agent_orchestrator.constants import (
     CAO_WAITING_INBOX_GRACE_SECONDS,
@@ -69,6 +70,13 @@ class WaitingInboxEpisode:
     fired: bool = False
 
 
+@dataclass
+class ReadyBacklogEpisode:
+    started_at: float
+    fingerprint: tuple[object, ...]
+    fired: bool = False
+
+
 class StalledCallbackWatchdog:
     def __init__(self, grace_seconds: int = STALLED_CALLBACK_GRACE_SECONDS) -> None:
         self.grace_seconds = grace_seconds
@@ -76,6 +84,7 @@ class StalledCallbackWatchdog:
         self._episodes: dict[str, _Episode] = {}
         self._waiting_inbox_episodes: dict[str, WaitingInboxEpisode] = {}
         self._waiting_inbox_last_push: dict[str, float] = {}
+        self._ready_backlog_episodes: dict[str, ReadyBacklogEpisode] = {}
         self._paused: set[str] = set()
 
     def pause_terminal(self, terminal_id: str):
@@ -133,6 +142,7 @@ class StalledCallbackWatchdog:
             self._episodes.pop(terminal_id, None)
             self._waiting_inbox_episodes.pop(terminal_id, None)
             self._waiting_inbox_last_push.pop(terminal_id, None)
+            self._ready_backlog_episodes.pop(terminal_id, None)
 
     def record_callback_if_to_caller(self, sender_id: str, receiver_id: str) -> None:
         meta = get_terminal_metadata(sender_id)
@@ -384,6 +394,80 @@ class StalledCallbackWatchdog:
                     exc_info=True,
                 )
 
+    def tick_ready_backlog(
+        self,
+        registry: PluginRegistry | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Alert on an idle, aged pending backlog whose attempts make no progress."""
+        from cli_agent_orchestrator.services.inbox_service import inbox_service
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        now = time.monotonic() if now is None else now
+        observations = {
+            item.receiver_id: item for item in list_ready_backlog_observations()
+        }
+        with self._lock:
+            for terminal_id in set(self._ready_backlog_episodes) - set(observations):
+                self._ready_backlog_episodes.pop(terminal_id, None)
+
+        for terminal_id, observation in observations.items():
+            metadata = get_terminal_metadata(terminal_id)
+            if metadata is None:
+                with self._lock:
+                    self._ready_backlog_episodes.pop(terminal_id, None)
+                continue
+            status = status_monitor.get_status(terminal_id)
+            if (
+                status not in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
+                or observation.oldest_pending_age_seconds
+                <= CAO_WAITING_INBOX_GRACE_SECONDS
+                or observation.has_open_delivering_attempt
+            ):
+                with self._lock:
+                    self._ready_backlog_episodes.pop(terminal_id, None)
+                continue
+
+            fingerprint = tuple(observation.attempt_fingerprint)
+            with self._lock:
+                episode = self._ready_backlog_episodes.get(terminal_id)
+                if episode is None or episode.fingerprint != fingerprint:
+                    self._ready_backlog_episodes[terminal_id] = ReadyBacklogEpisode(
+                        started_at=now,
+                        fingerprint=fingerprint,
+                    )
+                    continue
+                if episode.fired or now - episode.started_at < CAO_WAITING_INBOX_GRACE_SECONDS:
+                    continue
+
+                caller_id = metadata.get("caller_id")
+                if not caller_id or caller_id == terminal_id:
+                    logger.warning(
+                        "ready-backlog watchdog: refusing invalid caller for terminal %s",
+                        terminal_id,
+                    )
+                    episode.fired = True
+                    continue
+                episode.fired = True
+
+            age = int(observation.oldest_pending_age_seconds)
+            message_id = observation.oldest_message_id
+            message = (
+                f"[ready-backlog watchdog] terminal {terminal_id} has pending message "
+                f"{message_id} aged {age}s while status={status.value} with no open "
+                "delivery attempt or attempt progress; inspect "
+                f"`cao messages trace {message_id}`. Reconciliation remains the retry owner."
+            )
+            try:
+                create_inbox_message(f"watchdog:{terminal_id}", caller_id, message)
+                inbox_service.deliver_pending(caller_id, registry=registry)
+            except Exception:
+                logger.warning(
+                    "Failed to push ready-backlog watchdog notification for %s",
+                    terminal_id,
+                    exc_info=True,
+                )
+
     async def run(self, registry: PluginRegistry | None = None) -> None:
         queue = bus.subscribe("terminal.*.status")
         logger.info("StalledCallbackWatchdog started")
@@ -404,6 +488,7 @@ class StalledCallbackWatchdog:
                 await asyncio.to_thread(self.refresh_screen_fingerprints)
                 await asyncio.to_thread(self.notify_due, registry)
                 await asyncio.to_thread(self.tick_waiting_inbox, registry)
+                await asyncio.to_thread(self.tick_ready_backlog, registry)
             except Exception:
                 logger.exception("StalledCallbackWatchdog error")
 

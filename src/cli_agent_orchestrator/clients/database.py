@@ -41,6 +41,17 @@ Base: Any = declarative_base()
 _ImmediateResult = TypeVar("_ImmediateResult")
 
 
+@dataclass(frozen=True)
+class ReadyBacklogObservation:
+    receiver_id: str
+    oldest_message_id: int
+    oldest_pending_age_seconds: float
+    has_open_delivering_attempt: bool
+    attempt_fingerprint: tuple[
+        int, datetime | None, datetime | None, datetime | None
+    ]
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -1899,6 +1910,75 @@ def list_pending_receiver_ids() -> List[str]:
         return [row[0] for row in rows]
 
 
+def list_ready_backlog_observations() -> list[ReadyBacklogObservation]:
+    """Snapshot pending backlogs and delivery-attempt progress in one DB session."""
+    with SessionLocal() as db:
+        pending = (
+            db.query(InboxModel)
+            .join(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
+            .filter(InboxModel.status == MessageStatus.PENDING.value)
+            .order_by(InboxModel.receiver_id, InboxModel.created_at, InboxModel.id)
+            .all()
+        )
+        oldest_by_receiver: dict[str, InboxModel] = {}
+        for message in pending:
+            oldest_by_receiver.setdefault(message.receiver_id, message)
+        if not oldest_by_receiver:
+            return []
+
+        receiver_ids = list(oldest_by_receiver)
+        attempts = db.query(InboxDeliveryAttemptModel).filter(
+            InboxDeliveryAttemptModel.receiver_terminal_id.in_(receiver_ids)
+        ).all()
+        progress: dict[
+            str, tuple[int, datetime | None, datetime | None, datetime | None, bool]
+        ] = {}
+
+        def latest(
+            left: datetime | None, right: datetime | None
+        ) -> datetime | None:
+            if left is None:
+                return right
+            if right is None:
+                return left
+            return max(left, right)
+
+        for attempt in attempts:
+            receiver_id = cast(str, attempt.receiver_terminal_id)
+            count, started, settled, last, has_open = progress.get(
+                receiver_id, (0, None, None, None, False)
+            )
+            attempt_started = cast(datetime, attempt.started_at)
+            attempt_settled = cast(datetime | None, attempt.settled_at)
+            attempt_last = cast(datetime, attempt.last_at)
+            progress[receiver_id] = (
+                count + 1,
+                latest(started, attempt_started),
+                latest(settled, attempt_settled),
+                latest(last, attempt_last),
+                has_open or attempt_settled is None,
+            )
+
+        now = datetime.now()
+        result = []
+        for receiver_id, oldest in oldest_by_receiver.items():
+            count, started, settled, last, has_open = progress.get(
+                receiver_id, (0, None, None, None, False)
+            )
+            result.append(
+                ReadyBacklogObservation(
+                    receiver_id=receiver_id,
+                    oldest_message_id=oldest.id,
+                    oldest_pending_age_seconds=max(
+                        0.0, (now - oldest.created_at).total_seconds()
+                    ),
+                    has_open_delivering_attempt=has_open,
+                    attempt_fingerprint=(count, started, settled, last),
+                )
+            )
+        return result
+
+
 def delete_terminal(terminal_id: str) -> bool:
     """Delete terminal metadata and its warm intent through the universal seam."""
     return delete_terminal_and_warm_intent(
@@ -2280,6 +2360,21 @@ def _admission_valid(
                     _corrective_evidence_valid(prior, candidate_ids) and
                     not any(row["prior_attempt_uuid"] == prior_uuid and
                             not attempt_proven_pre_paste(row) for row in history))
+    if kind == "tagged_replay":
+        exact = [row for row in history if row["members"] == candidate_ids]
+        prior = next((row for row in exact if row["attempt_uuid"] == prior_uuid), None)
+        ambiguous_count = sum(row["outcome"] == "ambiguous" for row in exact)
+        return bool(
+            prior
+            and prior["outcome"] == "ambiguous"
+            and prior["reason"] == "confirmation_timeout"
+            and ambiguous_count < 3
+            and not any(
+                row["prior_attempt_uuid"] == prior_uuid
+                and not attempt_proven_pre_paste(row)
+                for row in exact
+            )
+        )
     return True
 
 

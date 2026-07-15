@@ -83,7 +83,7 @@ def stash_draft_before_send(
         if snapshot is None:
             continue
         draft = snapshot.draft
-        if draft not in (None, ""):
+        if isinstance(draft, str) and draft:
             draft = _wait_for_stable_draft(terminal_id, metadata, provider, draft)
             if not draft:
                 continue
@@ -204,21 +204,20 @@ def preserve_draft_before_send(
         return None
 
     draft = _read_provider_draft(terminal_id, metadata, provider)
-    if not draft:
+    if draft is None:
+        raise DeliveryDeferredError(
+            f"Composer state is unreadable for terminal {terminal_id}"
+        )
+    if draft == "":
         return None
 
     draft = _wait_for_stable_draft(terminal_id, metadata, provider, draft)
-    if not draft:
+    if draft == "":
         return None
 
-    # Ghost-text discrimination: TUI composer "ghost" suggestions (e.g.
-    # codex's rotating '› Summarize recent commits' hint, rendered dim) parse
-    # exactly like a typed draft, but they are not real text. Codex ghosts were
-    # empirically clear-immune across 50 clear attempts. Send ONE clear
-    # iteration and re-read: unchanged ⇒ ghost ⇒ nothing to preserve. Changed
-    # ⇒ a real draft, whose full text we already captured above. Residual risk:
-    # a provider whose ghost hint dismisses on keypress can look like a real
-    # draft, but preserving a human draft is the safer failure mode.
+    # Ghost-text discrimination is provider-authorized. Codex has empirically
+    # clear-immune suggestions; an unchanged clear on any other provider is an
+    # unconfirmed mutation and must defer rather than authorize a paste.
     if not _clear_step_changed_draft(terminal_id, metadata, provider, draft):
         logger.info(
             "Composer text for terminal %s unaffected by clear keys (ghost suggestion); "
@@ -228,11 +227,12 @@ def preserve_draft_before_send(
         return None
 
     _append_draft_log(terminal_id, draft)
-    cleared = _clear_composer(terminal_id, metadata, provider)
-    if not cleared:
+    if not _clear_composer(terminal_id, metadata, provider):
         # Never restore what we could not clear: re-pasting on top of the
         # leftover text would duplicate it in the composer.
-        return None
+        raise DeliveryDeferredError(
+            f"Could not confirm composer clear for terminal {terminal_id}"
+        )
     return PreservedDraft(
         terminal_id=terminal_id,
         session_name=metadata["tmux_session"],
@@ -251,7 +251,9 @@ def _wait_for_stable_draft(
     time.sleep(DRAFT_STABILITY_INITIAL_DELAY_SECONDS)
     latest = _read_provider_draft(terminal_id, metadata, provider)
     if latest is None:
-        return first_draft
+        raise DeliveryDeferredError(
+            f"Composer state became unreadable for terminal {terminal_id}"
+        )
     if latest == first_draft:
         return latest
 
@@ -261,7 +263,9 @@ def _wait_for_stable_draft(
         time.sleep(DRAFT_STABILITY_RECHECK_SECONDS)
         latest = _read_provider_draft(terminal_id, metadata, provider)
         if latest is None:
-            return previous
+            raise DeliveryDeferredError(
+                f"Composer state became unreadable for terminal {terminal_id}"
+            )
         if latest == previous:
             return latest
         previous = latest
@@ -290,17 +294,13 @@ def _clear_step_changed_draft(
     """One clear iteration, then re-read: did the composer text change?
 
     True  ⇒ real draft (clear keys affected it).
-    False ⇒ ghost suggestion text (immune to clear keys) or no clear keys.
-    A None re-read is retried a few times (transient capture glitches); only
-    after retries fail do we take the conservative "changed" verdict so a
-    human draft is not discarded.
+    False ⇒ provider-authorized clear-immune ghost suggestion.
+    Missing keys, exhausted None re-reads, and unchanged non-ghost text defer.
     """
     if not _send_clear_keys(terminal_id, metadata, provider):
-        logger.info(
-            "clear-probe terminal=%s path=no_clear_keys verdict=unchanged(ghost_or_unconfigured)",
-            terminal_id,
+        raise DeliveryDeferredError(
+            f"Composer clear keys are unavailable for terminal {terminal_id}"
         )
-        return False
     time.sleep(DRAFT_CLEAR_PROBE_RECHECK_DELAY_SECONDS)
     current: Optional[str] = None
     attempts = 1 + DRAFT_CLEAR_PROBE_NONE_RETRIES
@@ -310,6 +310,10 @@ def _clear_step_changed_draft(
         current = _read_draft_via_capture(metadata, provider)
         if current is not None:
             changed = current != draft
+            if not changed and getattr(provider, "clear_immune_ghosts", False) is not True:
+                raise DeliveryDeferredError(
+                    f"Composer clear was not confirmed for terminal {terminal_id}"
+                )
             logger.info(
                 "clear-probe terminal=%s path=reread attempt=%d/%d current=%r "
                 "verdict=%s",
@@ -326,13 +330,9 @@ def _clear_step_changed_draft(
             attempt + 1,
             attempts,
         )
-    logger.info(
-        "clear-probe terminal=%s path=none_after_retries attempts=%d "
-        "verdict=changed(real_draft_conservative)",
-        terminal_id,
-        attempts,
+    raise DeliveryDeferredError(
+        f"Composer state is unreadable after clear for terminal {terminal_id}"
     )
-    return True
 
 
 def _provider_accepts_escapes(provider: Any) -> bool:

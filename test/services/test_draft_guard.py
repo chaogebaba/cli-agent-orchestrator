@@ -1,11 +1,14 @@
 """Tests for composer draft preservation before input injection."""
 
+import pytest
+
 from cli_agent_orchestrator.services import draft_guard
 
 
 class FakeProvider:
     supports_draft_preservation = True
     composer_clear_keys = ["C-a", "C-k"]
+    clear_immune_ghosts = True
     paste_submit_delay = 0.1
 
     def read_composer_draft(self, screen_lines):
@@ -114,8 +117,8 @@ def test_clear_immune_text_returns_none_as_ghost(monkeypatch, tmp_path):
     assert not (tmp_path / "term1.log").exists()
 
 
-def test_clear_probe_capture_failure_preserves_as_real_draft(monkeypatch, tmp_path):
-    """After clear keys, None re-reads (exhausted retries) ⇒ conservative real draft."""
+def test_clear_probe_capture_failure_defers(monkeypatch, tmp_path):
+    """After clear keys, exhausted None re-reads cannot authorize delivery."""
     _fast_guard(monkeypatch, tmp_path)
     metadata = {"tmux_session": "cao-test", "tmux_window": "win"}
     # Initial reads succeed; clear-probe re-reads raise → None after retries;
@@ -137,12 +140,10 @@ def test_clear_probe_capture_failure_preserves_as_real_draft(monkeypatch, tmp_pa
     monkeypatch.setattr(draft_guard.status_monitor, "get_rendered_screen", lambda _: None)
     monkeypatch.setattr(draft_guard, "get_backend", lambda: backend)
 
-    preserved = draft_guard.preserve_draft_before_send("term1", metadata, FakeProvider())
+    with pytest.raises(draft_guard.DeliveryDeferredError, match="unreadable after clear"):
+        draft_guard.preserve_draft_before_send("term1", metadata, FakeProvider())
 
-    assert preserved is not None
-    assert preserved.text == "draft"
-    # 2 successful + probe None retries + at least one clear-loop empty read
-    assert phase["n"] >= 2 + probe_attempts + 1
+    assert phase["n"] == 2 + probe_attempts
 
 
 def test_clear_probe_none_retry_then_ghost(monkeypatch, tmp_path):
@@ -182,7 +183,7 @@ def test_clear_probe_none_retry_then_ghost(monkeypatch, tmp_path):
     assert not (tmp_path / "term1.log").exists()
 
 
-def test_clear_loop_cap_never_restores_when_exhausted(monkeypatch, tmp_path):
+def test_clear_loop_cap_defers_when_exhausted(monkeypatch, tmp_path):
     _fast_guard(monkeypatch, tmp_path)
     monkeypatch.setattr(draft_guard, "DRAFT_CLEAR_MAX_ITERATIONS", 2)
     metadata = {"tmux_session": "cao-test", "tmux_window": "win"}
@@ -205,9 +206,9 @@ def test_clear_loop_cap_never_restores_when_exhausted(monkeypatch, tmp_path):
     monkeypatch.setattr(draft_guard.status_monitor, "get_rendered_screen", lambda _: None)
     monkeypatch.setattr(draft_guard, "get_backend", lambda: backend)
 
-    preserved = draft_guard.preserve_draft_before_send("term1", metadata, FakeProvider())
+    with pytest.raises(draft_guard.DeliveryDeferredError, match="confirm composer clear"):
+        draft_guard.preserve_draft_before_send("term1", metadata, FakeProvider())
 
-    assert preserved is None
     assert calls == [
         ("cao-test", "win", "C-a"),
         ("cao-test", "win", "C-k"),
@@ -216,6 +217,55 @@ def test_clear_loop_cap_never_restores_when_exhausted(monkeypatch, tmp_path):
         ("cao-test", "win", "C-a"),
         ("cao-test", "win", "C-k"),
     ]
+
+
+class NonGhostProvider(FakeProvider):
+    clear_immune_ghosts = False
+
+
+def test_non_ghost_provider_unchanged_clear_defers(monkeypatch, tmp_path):
+    _fast_guard(monkeypatch, tmp_path)
+    metadata = {"tmux_session": "cao-test", "tmux_window": "win"}
+    backend = type("Backend", (), {})()
+    backend.send_special_key = lambda *args: None
+    backend.get_history = lambda *args, **kwargs: "human draft\n"
+    monkeypatch.setattr(draft_guard.status_monitor, "get_rendered_screen", lambda _: None)
+    monkeypatch.setattr(draft_guard, "get_backend", lambda: backend)
+
+    with pytest.raises(draft_guard.DeliveryDeferredError, match="not confirmed"):
+        draft_guard.preserve_draft_before_send("term1", metadata, NonGhostProvider())
+
+
+def test_initial_unreadable_composer_defers(monkeypatch, tmp_path):
+    _fast_guard(monkeypatch, tmp_path)
+    metadata = {"tmux_session": "cao-test", "tmux_window": "win"}
+    backend = type("Backend", (), {})()
+    backend.get_history = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("gone"))
+    monkeypatch.setattr(draft_guard.status_monitor, "get_rendered_screen", lambda _: None)
+    monkeypatch.setattr(draft_guard, "get_backend", lambda: backend)
+
+    with pytest.raises(draft_guard.DeliveryDeferredError, match="unreadable"):
+        draft_guard.preserve_draft_before_send("term1", metadata, NonGhostProvider())
+
+
+def test_stability_loss_to_unreadable_composer_defers(monkeypatch, tmp_path):
+    _fast_guard(monkeypatch, tmp_path)
+    metadata = {"tmux_session": "cao-test", "tmux_window": "win"}
+    captures = iter(["human draft\n", RuntimeError("geometry changed")])
+
+    def get_history(*args, **kwargs):
+        item = next(captures)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    backend = type("Backend", (), {})()
+    backend.get_history = get_history
+    monkeypatch.setattr(draft_guard.status_monitor, "get_rendered_screen", lambda _: None)
+    monkeypatch.setattr(draft_guard, "get_backend", lambda: backend)
+
+    with pytest.raises(draft_guard.DeliveryDeferredError, match="became unreadable"):
+        draft_guard.preserve_draft_before_send("term1", metadata, NonGhostProvider())
 
 
 def test_falls_back_to_capture_pane_when_rendered_screen_missing(monkeypatch, tmp_path):

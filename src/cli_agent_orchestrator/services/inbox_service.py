@@ -653,50 +653,88 @@ class InboxService:
                                 return
                     ambiguous_count = count_ambiguous_attempts(message_ids)
                     resolution = resolve_session_transcript(metadata)
-                    if gate_state == "normal" and resolution is not None:
-                        for prior in list_message_attempts(message_ids):
-                            if prior.get("outcome") in {None, "deferred", "failed", "unresolved"}:
+                    exact_attempts = (
+                        list_message_attempts(message_ids)
+                        if legacy_test_seam
+                        else self._exact_batch_attempts(message_ids)
+                    )
+                    successor_source = None
+                    persisted_evidence = (
+                        dict(gate_evidence)
+                        if gate_state == "inject" and isinstance(gate_evidence, dict)
+                        else transcript_ref(resolution)
+                    )
+                    if gate_state == "normal":
+                        # A hit wins across the entire exact-batch history. An
+                        # unresolved older row must not hide a later hit or the
+                        # durable ambiguity cap.
+                        for prior in exact_attempts:
+                            if prior.get("outcome") is None:
                                 continue
                             try:
                                 prior_evidence = json.loads(prior.get("evidence") or "{}")
                             except (TypeError, json.JSONDecodeError):
                                 prior_evidence = {}
-                            result, evidence = _wpm2_lookup(
+                            if not isinstance(prior_evidence, dict):
+                                prior_evidence = {}
+                            result, _ = _wpm2_lookup(
                                 metadata, prior["payload_hash"], prior.get("started_at"),
                                 prior_evidence)
-                            if result == "hit":
-                                won = confirm_batch_from_prior_attempt(
-                                    message_ids,
-                                    prior["attempt_uuid"],
-                                    on_confirmed=lambda: self._commit_watchdog_ops(
-                                        terminal_id, sender_id, orchestration_type, metadata),
-                                )
-                                if not won:
-                                    return
-                                logger.info("Deduplicated delivery for terminal %s using attempt %s",
-                                            terminal_id, prior["attempt_uuid"])
+                            if result != "hit":
+                                continue
+                            won = confirm_batch_from_prior_attempt(
+                                message_ids,
+                                prior["attempt_uuid"],
+                                on_confirmed=lambda: self._commit_watchdog_ops(
+                                    terminal_id, sender_id, orchestration_type, metadata),
+                            )
+                            if not won:
                                 return
-                            if result == "unresolved":
-                                logger.warning(
-                                    "Transcript continuity is uncertain for terminal %s; "
-                                    "deferring retry without paste", terminal_id)
-                                with _delivery_seq_guard:
-                                    _delivery_wake_seq[terminal_id] = (
-                                        _delivery_wake_seq.get(terminal_id, 0) + 1)
+                            logger.info(
+                                "Deduplicated delivery for terminal %s using attempt %s",
+                                terminal_id, prior["attempt_uuid"],
+                            )
+                            return
+
+                        if ambiguous_count >= 3:
+                            if transition_pending_to_delivery_failed(message_ids):
+                                self._notify_delivery_failed(terminal_id, message_ids)
+                            logger.warning(
+                                "Delivery ambiguity cap reached for terminal %s messages %s",
+                                terminal_id, message_ids,
+                            )
+                            return
+
+                        ambiguous = [
+                            prior for prior in exact_attempts
+                            if prior.get("outcome") == "ambiguous"
+                            and prior.get("reason") == "confirmation_timeout"
+                        ]
+                        if metadata.get("provider") != "claude_code":
+                            for prior in reversed(ambiguous):
+                                successors = [
+                                    item for item in exact_attempts
+                                    if item.get("prior_attempt_uuid")
+                                    == prior["attempt_uuid"]
+                                ]
+                                if all(
+                                    attempt_proven_pre_paste(item) for item in successors
+                                ):
+                                    successor_source = prior["attempt_uuid"]
+                                    admission_kind = "tagged_replay"
+                                    persisted_evidence["redelivery_tag"] = {
+                                        "version": REDELIVERY_TAG_VERSION,
+                                        "prior_attempt_uuid": successor_source,
+                                    }
+                                    break
+                            if ambiguous and successor_source is None:
+                                # A post-paste successor already owns this lineage.
+                                # Never fall back to an invisible ordinary replay.
                                 return
-                    if gate_state == "normal" and ambiguous_count >= 3:
-                        if transition_pending_to_delivery_failed(message_ids):
-                            self._notify_delivery_failed(terminal_id, message_ids)
-                        logger.warning("Delivery ambiguity cap reached for terminal %s messages %s",
-                                       terminal_id, message_ids)
-                        return
                     if gate_state == "normal" and _should_defer_waiting(terminal_id, provider):
                         _defer_messages(terminal_id, messages[sent_count:])
                         return
-                    successor_source = None
-                    persisted_evidence = gate_evidence
                     if gate_state == "inject":
-                        persisted_evidence = dict(gate_evidence or {})
                         successor_source = persisted_evidence.pop(
                             "_wpm1_prior_attempt_uuid", None)
                         if successor_source is not None:
@@ -728,8 +766,7 @@ class InboxService:
                         status_monitor.get_status_gen(terminal_id),
                     )
                     opener_kwargs = {
-                        "evidence": json.dumps(
-                            persisted_evidence if gate_state == "inject" else transcript_ref(resolution)),
+                        "evidence": json.dumps(persisted_evidence),
                         "prior_attempt_uuid": successor_source,
                     }
 
@@ -738,7 +775,7 @@ class InboxService:
                                 or not isinstance(getattr(value, "observation_epoch", None), str)
                                 or type(getattr(value, "seq", None)) is not int):
                             return None
-                        result = dict(persisted_evidence or transcript_ref(resolution))
+                        result = dict(persisted_evidence)
                         same_epoch = (admission_kind != "s4_initial" or (
                             admission_snapshot is not None and
                             admission_snapshot.observation_epoch == value.observation_epoch))
@@ -803,8 +840,7 @@ class InboxService:
                         if submit_observation is None and legacy_test_seam:
                             raise
                         settle_delivery_attempt_proof_safe(
-                            attempt_uuid, submit_evidence or dict(
-                                persisted_evidence or transcript_ref(resolution)),
+                            attempt_uuid, submit_evidence or dict(persisted_evidence),
                             status_monitor.get_status_gen(terminal_id))
                         return
                     trace = get_message_trace(batch[0].id)
@@ -813,7 +849,7 @@ class InboxService:
                     outcome, evidence = confirm_delivery(
                         metadata, digest, current_attempt["started_at"],
                         current_attempt.get("evidence"))
-                    if gate_state == "inject":
+                    if successor_source is not None:
                         evidence = {**current_attempt.get("evidence", {}), **evidence}
                     if submit_evidence is not None:
                         evidence.update(submit_evidence)
