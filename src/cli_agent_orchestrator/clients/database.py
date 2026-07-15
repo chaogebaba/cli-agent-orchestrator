@@ -2159,6 +2159,14 @@ def list_overlapping_attempts(message_ids: list[int]) -> list[dict[str, Any]]:
         return _attempt_history_in_db(db, sorted(set(message_ids)))
 
 
+def attempt_proven_pre_paste(attempt: dict[str, Any]) -> bool:
+    return (attempt.get("outcome"), attempt.get("reason")) in {
+        ("deferred", "delivery_deferred"),
+        ("deferred", "input_blocked"),
+        ("interrupted", "terminal_not_found"),
+    }
+
+
 def make_admission_proof(
     kind: str, message_ids: list[int], prior_attempt_uuid: str | None = None,
 ) -> AdmissionProof:
@@ -2259,7 +2267,8 @@ def _admission_valid(
         return bool(prior and prior["outcome"] == "ambiguous" and
                     prior["reason"] == "confirmation_timeout" and
                     _corrective_evidence_valid(prior, candidate_ids) and
-                    not any(row["prior_attempt_uuid"] == prior_uuid for row in history))
+                    not any(row["prior_attempt_uuid"] == prior_uuid and
+                            not attempt_proven_pre_paste(row) for row in history))
     return True
 
 

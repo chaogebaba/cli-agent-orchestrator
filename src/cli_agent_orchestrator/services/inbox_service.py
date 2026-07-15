@@ -43,6 +43,7 @@ from cli_agent_orchestrator.clients.database import (
     settle_delivery_attempt_proof_safe,
     settle_pending_orphan_messages,
     advance_wpm2_continuity_cursor,
+    attempt_proven_pre_paste,
 )
 
 _PRODUCTION_BEGIN_DELIVERY_ATTEMPT = begin_delivery_attempt
@@ -450,16 +451,18 @@ class InboxService:
                         if result == "settled":
                             self._notify_delivery_failed(terminal_id, message_ids)
                     return "stop", None
-                successor = any(
-                    item.get("prior_attempt_uuid") == newest["attempt_uuid"]
-                    for item in attempts
-                )
-                if not successor:
-                    evidence = transcript_ref(resolution)
-                    evidence["boundary_authorized"] = now_z
-                    evidence["_wpm1_prior_attempt_uuid"] = newest["attempt_uuid"]
-                    return "inject", evidence
-                return "stop", None
+                successors = [
+                    item for item in attempts
+                    if item.get("prior_attempt_uuid") == newest["attempt_uuid"]
+                ]
+                if successors:
+                    if all(attempt_proven_pre_paste(item) for item in successors):
+                        return "normal", None
+                    return "stop", None
+                evidence = transcript_ref(resolution)
+                evidence["boundary_authorized"] = now_z
+                evidence["_wpm1_prior_attempt_uuid"] = newest["attempt_uuid"]
+                return "inject", evidence
 
         # Threshold decisions are deliberately after every proof/terminal arm.
         is_notice = any(

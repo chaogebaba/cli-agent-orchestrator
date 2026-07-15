@@ -1094,6 +1094,34 @@ def test_interrupted_successor_blocks_duplicate_respawn():
     assert state == "stop"
 
 
+def test_terminal_not_found_successor_returns_normal_for_untagged_retry() -> None:
+    svc = InboxService()
+    exhausted = _gate_attempt(0, exhausted=True)  # type: ignore[no-untyped-call]
+    interrupted = _gate_attempt(1)  # type: ignore[no-untyped-call]
+    interrupted.update(outcome="interrupted", reason="terminal_not_found",
+                       prior_attempt_uuid=exhausted["attempt_uuid"])
+    observation = lawful_boundary_observation(TerminalStatus.IDLE)
+    lawful_boundary_observation(
+        TerminalStatus.IDLE, attempt=exhausted, exhausted=True)
+    provider = MagicMock()
+    provider.read_composer_draft_state.return_value = "empty"
+    with (
+        patch.object(svc, "_exact_batch_attempts", return_value=[exhausted, interrupted]),
+        patch("cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
+              return_value=_binding()),  # type: ignore[no-untyped-call]
+        patch("cli_agent_orchestrator.services.message_trace_service.continuity_aware_lookup",
+              return_value=("absent", {})),
+        patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
+        patch("cli_agent_orchestrator.services.inbox_service.merge_wpm1_attempt_evidence",
+              return_value=True),
+    ):
+        monitor.get_boundary_observation.return_value = observation
+        state, _ = svc._handle_wpm1_gate(
+            "receiver", [_gate_message()], {"provider": "claude_code"}, provider,
+            "sender", OrchestrationType.SEND_MESSAGE)
+    assert state == "normal"
+
+
 def test_cap_barrier_late_payload_confirmation_wins():
     svc = InboxService()
     provider = MagicMock()

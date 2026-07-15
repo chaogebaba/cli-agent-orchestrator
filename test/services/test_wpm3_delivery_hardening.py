@@ -5,6 +5,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -325,12 +326,28 @@ def test_wpm3_corrective_opens_with_full_fingerprint(wpm3_db, tmp_path):
     assert result.kind == "opened" and result.attempt_uuid
     settle_delivery_attempt(
         result.attempt_uuid, MessageStatus.PENDING, "interrupted",
-        reason="terminal_not_found", evidence="{}")
+        reason="pane_unresolvable", evidence="{}")
     proof = make_admission_proof("corrective", [message.id], prior)
     successor = begin_delivery_attempt_if_no_other_delivering(
         [message], "receiver", "claude_code", "duplicate", 9,
         prior_attempt_uuid=prior, admission_proof=proof)
     assert successor.kind == "stale_admission"
+
+
+def test_wpm3_corrective_admission_ignores_proven_pre_paste_successor(
+    wpm3_db: Any, tmp_path: Path,
+) -> None:
+    result, message, prior = _corrective_result(  # type: ignore[no-untyped-call]
+        wpm3_db, tmp_path)
+    assert result.kind == "opened" and result.attempt_uuid
+    settle_delivery_attempt(
+        result.attempt_uuid, MessageStatus.PENDING, "interrupted",
+        reason="terminal_not_found", evidence="{}")
+    proof = make_admission_proof("corrective", [message.id], prior)
+    successor = begin_delivery_attempt_if_no_other_delivering(
+        [message], "receiver", "claude_code", "retry", 5,
+        prior_attempt_uuid=prior, admission_proof=proof)
+    assert successor.kind == "opened"
 
 
 def _invalid_snapshot_gate(attempts, *, notice=None):
