@@ -7,7 +7,15 @@ import { STATUS_CONFIG, UNKNOWN_CONFIG } from '../status.generated'
 
 export { STATUS_CONFIG }
 
-type TerminalStatus = 'IDLE' | 'PROCESSING' | 'COMPLETED' | 'WAITING_USER_ANSWER' | 'ERROR' | string | null
+type TerminalStatus =
+  | 'IDLE'
+  | 'PROCESSING'
+  | 'COMPLETED'
+  | 'WAITING_USER_ANSWER'
+  | 'RENDER_UNCERTAIN'
+  | 'ERROR'
+  | string
+  | null
 
 export function StatusBadge({ status }: { status: TerminalStatus }) {
   const normalized = status ? status.toUpperCase() : null

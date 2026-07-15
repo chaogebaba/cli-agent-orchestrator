@@ -26,6 +26,7 @@ class TerminalStatus(str, Enum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     WAITING_USER_ANSWER = "waiting_user_answer"
+    RENDER_UNCERTAIN = "render_uncertain"
     ERROR = "error"
 
 

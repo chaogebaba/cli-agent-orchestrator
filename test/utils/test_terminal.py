@@ -530,6 +530,17 @@ class TestPollUntilDone:
             poll_until_done("abcd1234", timeout=60, polling_interval=0)
             assert g.call_count == 1
 
+    def test_render_uncertain_polls_through_to_completed(self):
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.side_effect = [self._resp("render_uncertain"), self._resp("completed")]
+            poll_until_done("abcd1234", timeout=60, polling_interval=0)
+            assert g.call_count == 2
+
     def test_returns_on_stable_idle_after_working(self):
         """IDLE completes only after the agent has been observed working, then
         stays idle for idle_stable_polls reads."""

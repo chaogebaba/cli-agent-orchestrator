@@ -878,3 +878,22 @@ class TestRawDebounceArmedDetection:
         sm._process_chunk("t1", "● Working on task...")
 
         assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+
+@pytest.mark.parametrize("ready", [TerminalStatus.IDLE, TerminalStatus.COMPLETED])
+def test_render_uncertain_replaces_ready_and_authoritative_status_recovers(ready):
+    monitor = StatusMonitor()
+    monitor._last_status["t1"] = ready
+    monitor._allow_processing_revert["t1"] = False
+
+    with (
+        patch("cli_agent_orchestrator.services.status_monitor.bus"),
+        patch(
+            "cli_agent_orchestrator.services.auto_responder.auto_responder.record_published_status"
+        ),
+    ):
+        monitor._apply_detection("t1", TerminalStatus.RENDER_UNCERTAIN)
+        assert monitor._last_status["t1"] == TerminalStatus.RENDER_UNCERTAIN
+
+        monitor._apply_detection("t1", ready)
+        assert monitor._last_status["t1"] == ready

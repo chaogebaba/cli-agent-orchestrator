@@ -1,0 +1,7 @@
+label: plan-approval
+pane_geometry: 134x49
+target_geometry: 134x49
+pane_command: claude
+captured_at: 2026-07-15T01:52:57-04:00
+claude_version: 2.1.210 (Claude Code)
+host: fedora

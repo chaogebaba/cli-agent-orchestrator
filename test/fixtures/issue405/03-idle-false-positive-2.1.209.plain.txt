@@ -1,0 +1,49 @@
+     pane geometry, what was on screen), plain + SGR variants, expected classification.
+     4. Write the issue comment: attach/inline the frames, state the correction with
+     the msg-948 probe + the version-drift find, and point at the TOCTOU window in
+     inbox_service.py. Frames + correction only — not pushing our FX3 fix design
+     (per user decision this session).
+     5. User posts it (or approves me posting) — public, outward-facing.
+
+     Files
+
+     - Read-only: blueprints/fx3-inbox-delivery-race.md,
+     cli-agent-orchestrator/test/fixtures/fx3/,
+     cli-agent-orchestrator/src/cli_agent_orchestrator/providers/claude_code.py
+     - New: tmp/orch/frames/ corpus + tmp/orch/issue-405-reply.md
+
+     Verification
+
+     - Every claimed frame is grep-checked for ↑/↓ to navigate before the claim ships —
+     no assertion about a frame that isn't in the corpus.
+     - The version-drift claim is checked against both captures (2.1.205 fixture vs 2.1.209
+     fresh), not asserted from memory.
+     - Negative frames are run against the actual current pattern to confirm they don't
+     match today.
+
+● Plan approved — and that ExitPlanMode dialog is the frame we needed. Let me see what the capture caught.
+
+  Ran 1 shell command
+
+● Major find — and it flips part of my own analysis. Let me verify rigorously before claiming anything.
+
+  Ran 1 shell command
+
+● My test is unreliable — -qc is contradictory and the pane scrollback may still hold the earlier dialog. Let me check where that footer actually appears.
+
+  Searched for 1 pattern
+
+● Confirmed — and this is better evidence than I expected. Let me capture one more frame: right now my pane shows the plan text with no dialog open.
+
+● Running 2 shell commands…
+  ⎿  $ tmux capture-pane -p -t cao-claude-orch2:0.0 > neg-plantext-onscreen.plain.txt; tmux capture-pane -pe -t cao-claude-orch2:0.0 > neg-plantext-onscreen.sgr.txt; echo "=== unanchored matches (what upstream's
+     re.search(PATTERN, output) sees):"; grep -c "to navigate" neg-plantext-onscreen.plain.txt; g…
+
+✶ Skedaddling… (4m 14s · ↓ 15.2k tokens)
+  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's current work
+                                                                                                                                                           Plugins updated: 7 plugins · Run /reload-plugins to apply
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── fix-dialog-detection-race ──
+❯ 
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  …/orch/frames | Opus 4.8 | ctx:10% | ↑1.4k ↓102.1k | $2.30 | rate:21%                                                                                                                                          /rc
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent

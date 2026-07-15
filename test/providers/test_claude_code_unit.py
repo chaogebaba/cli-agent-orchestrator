@@ -449,7 +449,11 @@ class TestClaudeCodeProviderStatusDetection:
         )
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        status = provider.get_status(output)
+        with patch(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor.get_rendered_screen",
+            return_value=output.splitlines(),
+        ):
+            status = provider.get_status(output)
 
         assert status == TerminalStatus.WAITING_USER_ANSWER
 

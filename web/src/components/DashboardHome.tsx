@@ -8,7 +8,15 @@ import { InboxPanel } from './InboxPanel'
 import { StatusBadge, STATUS_CONFIG } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
 
-const STATUS_ORDER = ['PROCESSING', 'IDLE', 'WAITING_USER_ANSWER', 'ERROR', 'COMPLETED', 'UNKNOWN']
+export const STATUS_ORDER = [
+  'PROCESSING',
+  'IDLE',
+  'WAITING_USER_ANSWER',
+  'RENDER_UNCERTAIN',
+  'ERROR',
+  'COMPLETED',
+  'UNKNOWN',
+]
 
 function fmtRel(dateStr: string | null | undefined): string | null {
   if (!dateStr) return null
@@ -38,10 +46,11 @@ const STATUS_META: Record<string, { label: string; dot: string; text: string; pu
 )
 STATUS_META['UNKNOWN'] = { label: 'Unknown', dot: 'bg-gray-500', text: 'text-gray-500' }
 
-const STATUS_ACTIVE_BG: Record<string, string> = {
+export const STATUS_ACTIVE_BG: Record<string, string> = {
   PROCESSING: 'bg-blue-900/40 border-blue-500/50 text-blue-300',
   IDLE: 'bg-emerald-900/40 border-emerald-500/50 text-emerald-300',
   WAITING_USER_ANSWER: 'bg-amber-900/40 border-amber-500/50 text-amber-300',
+  RENDER_UNCERTAIN: 'bg-gray-800/40 border-gray-500/50 text-gray-300',
   ERROR: 'bg-red-900/40 border-red-500/50 text-red-300',
   COMPLETED: 'bg-purple-900/40 border-purple-500/50 text-purple-300',
   UNKNOWN: 'bg-gray-800/40 border-gray-500/50 text-gray-300',

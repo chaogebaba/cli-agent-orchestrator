@@ -405,6 +405,21 @@ class TestFailureRaises:
 
 class TestTypedCompletionWait:
     @pytest.mark.asyncio
+    async def test_render_uncertain_polls_through_to_completed(self):
+        with (
+            patch(
+                f"{_MODULE}.status_monitor.get_status",
+                side_effect=[TerminalStatus.RENDER_UNCERTAIN, TerminalStatus.COMPLETED],
+            ),
+            patch(f"{_MODULE}.status_monitor.get_status_gen", return_value=7),
+        ):
+            outcome = await _wait_for_completion(
+                "t1", input_gen=7, timeout=1.0, polling_interval=0
+            )
+
+        assert outcome == _CompletionOutcome.COMPLETED
+
+    @pytest.mark.asyncio
     async def test_cancel_interrupts_completion_wait_within_two_polls(self):
         signal = asyncio.Event()
         polls = 0

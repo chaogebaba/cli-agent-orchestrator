@@ -19,6 +19,7 @@ from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.terminal_render import compose_ansi_to_lines
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
@@ -151,6 +152,56 @@ NEW_TUI_SPINNER_PATTERN = r"[✶✢✽✻✳·*][^\n]*ing…"
 # sitting directly above the box from being misread as a live spinner.
 NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*ing\b.*…")
 
+# Claude pins its dialogs and composer near the bottom of the viewport. Keep this
+# shared with get_status_from_screen so both classifiers inspect the same region.
+CLAUDE_STATUS_BOTTOM_ROWS = 25
+_INK_OPTION_LINE_PATTERN = re.compile(r"^\s*(?:❯\s*)?\d+\.\s+\S")
+_INK_FOCUS_OPTION_PATTERN = re.compile(r"❯\s*\d+\.")
+_INK_PLAN_HEAD_PATTERN = re.compile(
+    r"Would you like to proceed\?|Claude has written up a plan", re.IGNORECASE
+)
+_INK_FOOTER_PROXIMITY_ROWS = 12
+_INK_PLAN_PROXIMITY_ROWS = 8
+
+
+def _is_ink_selection_waiting(rendered: str) -> bool:
+    """Return whether rendered bottom rows contain active Ink selection chrome.
+
+    Quoted dialog chrome in the live bottom region is intentionally an accepted
+    limit: once composited, it is structurally indistinguishable from the dialog.
+    """
+    lines = [line for line in rendered.splitlines() if line.strip()]
+    if not lines:
+        return False
+    joined = "\n".join(lines)
+    if re.search(TRUST_PROMPT_PATTERN, joined) or re.search(BYPASS_PROMPT_PATTERN, joined):
+        return False
+
+    option_rows = [i for i, line in enumerate(lines) if _INK_OPTION_LINE_PATTERN.search(line)]
+    focus_rows = [i for i, line in enumerate(lines) if _INK_FOCUS_OPTION_PATTERN.search(line)]
+    footer_rows = [
+        i for i, line in enumerate(lines) if re.search(WAITING_USER_ANSWER_PATTERN, line)
+    ]
+
+    for footer_row in footer_rows:
+        nearby_options = [
+            row for row in option_rows if abs(row - footer_row) <= _INK_FOOTER_PROXIMITY_ROWS
+        ]
+        nearby_focus = [
+            row for row in focus_rows if abs(row - footer_row) <= _INK_FOOTER_PROXIMITY_ROWS
+        ]
+        if len(nearby_options) >= 2 and nearby_focus:
+            return True
+
+    if _INK_PLAN_HEAD_PATTERN.search(joined):
+        for focus_row in focus_rows:
+            nearby_options = [
+                row for row in option_rows if abs(row - focus_row) <= _INK_PLAN_PROXIMITY_ROWS
+            ]
+            if len(nearby_options) >= 2:
+                return True
+    return False
+
 
 class ClaudeCodeProvider(BaseProvider):
     """Provider for Claude Code CLI tool integration."""
@@ -175,6 +226,7 @@ class ClaudeCodeProvider(BaseProvider):
         self._initialized = False
         self._agent_profile = agent_profile
         self.allocated_session_uuid = str(uuid.uuid4())
+        self._render_uncertain_active = False
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
         # lives on BaseProvider and is consumed by _resolve_native_status().
 
@@ -532,14 +584,20 @@ class ClaudeCodeProvider(BaseProvider):
 
         See: https://github.com/awslabs/cli-agent-orchestrator/issues/104
         """
+        def authoritative(status: TerminalStatus) -> TerminalStatus:
+            self._render_uncertain_active = False
+            return status
+
         # Native status (herdr): when the backend knows agent state, trust it and
         # skip buffer reads. Tmux returns None -- falls through to buffer analysis.
         native = self._resolve_native_status()
         if native is not None:
-            return native
+            return authoritative(native)
 
         if not output:
             return TerminalStatus.UNKNOWN
+
+        raw_output = output
 
         # The StatusMonitor feeds the RAW pipe-pane buffer (cursor-positioning
         # escapes, in-place redraws, OSC titles) — not a tmux-rendered snapshot.
@@ -584,7 +642,7 @@ class ClaudeCodeProvider(BaseProvider):
             pre_sep_lines = output[: _sep_positions[-1]].rstrip("\n").split("\n")
             for line in reversed(pre_sep_lines):
                 if re.search(r"[✶✢✽✻✳·][^\n]*\u2026", line):
-                    return TerminalStatus.PROCESSING  # spinner before another separator
+                    return authoritative(TerminalStatus.PROCESSING)
                 if _sep_re.search(line):
                     break  # hit another separator first -- spinner is from a completed task
 
@@ -613,15 +671,46 @@ class ClaudeCodeProvider(BaseProvider):
         # FALLBACK PROCESSING: spinner visible AND no separator follows it yet
         if last_processing and not re.search(r"\u2500{20,}", output):
             if last_idle is None or last_processing.start() > last_idle.start():
-                return TerminalStatus.PROCESSING
+                return authoritative(TerminalStatus.PROCESSING)
 
-        # Check for waiting user answer via the active Ink selection footer.
-        if (
+        # WAITING is the only raw-path status that requires a composited view.
+        # The raw patterns are candidate selectors only; they never classify a
+        # dialog. This preserves every non-WAITING raw status arm unchanged.
+        waiting_candidate = (
             re.search(WAITING_USER_ANSWER_PATTERN, output)
-            and not re.search(TRUST_PROMPT_PATTERN, output)
-            and not re.search(BYPASS_PROMPT_PATTERN, output)
-        ):
-            return TerminalStatus.WAITING_USER_ANSWER
+            or _INK_PLAN_HEAD_PATTERN.search(output)
+        )
+        if waiting_candidate:
+            # Prefer StatusMonitor's incremental screen; replaying the rolling
+            # 8192-character buffer is only a fallback and uses live geometry.
+            rendered_lines = None
+            try:
+                from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                rendered_lines = status_monitor.get_rendered_screen(self.terminal_id)
+            except Exception:
+                rendered_lines = None
+
+            if rendered_lines is None:
+                try:
+                    geometry = get_backend().get_pane_size(self.session_name, self.window_name)
+                    if not isinstance(geometry, (tuple, list)) or len(geometry) != 2:
+                        raise ValueError("pane geometry is unavailable")
+                    cols, rows = geometry
+                    rendered_lines = compose_ansi_to_lines(raw_output, cols, rows)
+                except Exception as exc:
+                    if not self._render_uncertain_active:
+                        logger.debug(
+                            "Claude screen render uncertain for %s: %s", self.terminal_id, exc
+                        )
+                    self._render_uncertain_active = True
+                    return TerminalStatus.RENDER_UNCERTAIN
+
+            self._render_uncertain_active = False
+            rendered_rows = [line.rstrip() for line in rendered_lines if line.strip()]
+            rendered_bottom = "\n".join(rendered_rows[-CLAUDE_STATUS_BOTTOM_ROWS:])
+            if _is_ink_selection_waiting(rendered_bottom):
+                return authoritative(TerminalStatus.WAITING_USER_ANSWER)
 
         # New Claude Code TUI PROCESSING: the input prompt is BOXED between two
         # separators, and the live spinner renders on the line DIRECTLY ABOVE the
@@ -650,7 +739,7 @@ class ClaudeCodeProvider(BaseProvider):
                 if not line.strip() or line.lstrip().startswith("⎿"):
                     continue
                 if NEW_TUI_BOX_SPINNER_PATTERN.search(line):
-                    return TerminalStatus.PROCESSING
+                    return authoritative(TerminalStatus.PROCESSING)
                 break
 
         # COMPLETED: the finished turn left output behind — a "✻ <Verb>ed for Ns"
@@ -690,18 +779,18 @@ class ClaudeCodeProvider(BaseProvider):
             for marker in (last_completion, last_response, last_sol_response)
             if marker is not None
         ):
-            return TerminalStatus.PROCESSING
+            return authoritative(TerminalStatus.PROCESSING)
 
         if last_idle is not None and (
             last_completion is not None
             or last_sol_response is not None
             or last_response is not None
         ):
-            return TerminalStatus.COMPLETED
+            return authoritative(TerminalStatus.COMPLETED)
 
         # IDLE: shell prompt visible but no response yet (e.g. just initialized).
         if last_idle:
-            return TerminalStatus.IDLE
+            return authoritative(TerminalStatus.IDLE)
 
         return TerminalStatus.UNKNOWN
 
@@ -732,7 +821,7 @@ class ClaudeCodeProvider(BaseProvider):
         if not rows:
             return TerminalStatus.UNKNOWN
         joined = "\n".join(rows)
-        bottom = rows[-25:]
+        bottom = rows[-CLAUDE_STATUS_BOTTOM_ROWS:]
 
         # Live spinner: "✻ <gerund>… (…)" — the boxed-prompt spinner or a bare
         # spinner line. Visible in a composited frame ⇒ genuinely working.

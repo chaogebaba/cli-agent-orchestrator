@@ -4,6 +4,7 @@ import asyncio
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -12,6 +13,7 @@ from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.inbox_service import InboxService
@@ -643,6 +645,41 @@ class TestEagerInboxDelivery:
         mock_term_svc.send_prepared_input.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_unanchored_footer_no_longer_self_latches_delivery(
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+    ):
+        frame = (
+            Path(__file__).resolve().parents[1]
+            / "fixtures"
+            / "issue405"
+            / "03-idle-false-positive-2.1.209.plain.txt"
+        ).read_text(encoding="utf-8")
+        provider = ClaudeCodeProvider("t1", "session", "window")
+        provider._resolve_native_status = lambda: None  # type: ignore[method-assign]
+        with patch(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor.get_rendered_screen",
+            return_value=frame.splitlines(),
+        ):
+            classified = provider.get_status(frame)
+        assert classified == TerminalStatus.COMPLETED
+
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = classified
+        mock_pm.get_provider.return_value = provider
+
+        with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", False):
+            InboxService().deliver_pending("t1")
+
+        mock_term_svc.send_prepared_input.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
@@ -768,6 +805,30 @@ class TestEagerInboxDelivery:
             svc.deliver_pending("t1")
 
         mock_term_svc.send_prepared_input.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_render_uncertain_never_delivers_even_in_eager_mode(
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+    ):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.RENDER_UNCERTAIN
+        provider = MagicMock()
+        provider.accepts_input_while_processing = True
+        provider.blocks_orchestrated_input_while_waiting_user_answer = False
+        mock_pm.get_provider.return_value = provider
+
+        with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True):
+            InboxService().deliver_pending("t1")
+
+        mock_term_svc.send_prepared_input.assert_not_called()
+        mock_update.assert_not_called()
 
 
 class TestPollOpenCodePendingMessages:

@@ -1,0 +1,49 @@
+
+
+● The fx3 fixture is a live capture from the exact incident date — and it contains something that complicates the maintainer's diagnosis. Let me check our FX3 blueprint before I say anything.
+
+  Ran 1 shell command
+
+● The blueprint is literally named fx3-inbox-delivery-race.md. Let me read the root-cause section.
+
+  Read 1 file
+
+● Let me inventory the other fixture sets — negative frames matter as much as positive ones here.
+
+  Ran 1 shell command
+
+● Real finding — this changes the answer materially. Our own FX3 blueprint (with a live probe) concluded the opposite of the maintainer's diagnosis. Let me verify empirically before I contradict a maintainer
+  publicly.
+
+  I'll capture a fresh frame from my own pane on claude 2.1.209 while a dialog is open — arming a background capture, then opening a real dialog.
+
+  Ran 2 shell commands
+
+● Capture armed. Now I need your call on scope — and conveniently, asking it opens the exact dialog we need to capture.
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Reply scope
+
+Our FX3 blueprint contradicts the maintainer's diagnosis. Their plan is to broaden the WAITING_USER_ANSWER pattern; our live probe (2026-07-09) showed the AskUserQuestion frame DOES contain '↑/↓ to navigate',
+classification DID fire, and msg 948 correctly stayed PENDING — the incident was a read-decide-act race in deliver_pending, not a detection gap. How far do we go in the reply?
+
+❯ 1. Frames + root-cause          ┌────────────────────────────────────────────────┐
+    correction (Recommended)      │ Attach:                                        │
+ 2. Frames + correction + our     │ - fx3-dialog-capture.txt (2.1.205, live)       │
+   FX3 fix shape                  │ - fresh 2.1.209 AskUserQuestion + plan frames  │
+ 3. Frames only, no correction    │ - negative frames (must NOT match)             │
+                                  │                                                │
+                                  │ Say:                                           │
+                                  │   "The footer IS present on these frames —     │
+                                  │    classification fires. Our probe: msg 948    │
+                                  │    stayed PENDING at steady-state WAITING.     │
+                                  │    The 17:59:45 auto-answer was a race between │
+                                  │    the entry status-read and the keystroke."   │
+                                  └────────────────────────────────────────────────┘
+
+                                  Notes: press n to add notes
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Chat about this
+
+Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel

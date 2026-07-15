@@ -39,6 +39,12 @@ export const STATUS_CONFIG: Record<string, StatusStyle> = {
     bgClass: "bg-cao-warning/10",
     textClass: "text-cao-warning",
   },
+  RENDER_UNCERTAIN: {
+    label: "Render Uncertain",
+    dotClass: "bg-cao-neutral",
+    bgClass: "bg-cao-neutral/10",
+    textClass: "text-cao-neutral",
+  },
   ERROR: {
     label: "Error",
     dotClass: "bg-cao-danger",

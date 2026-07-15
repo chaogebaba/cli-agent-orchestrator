@@ -4,6 +4,7 @@ import { StatusBadge } from '../components/StatusBadge'
 import { ErrorBoundary } from '../components/ErrorBoundary'
 import { ConfirmModal } from '../components/ConfirmModal'
 import { FALLBACK_PROVIDERS } from '../components/AgentPanel'
+import { STATUS_ACTIVE_BG, STATUS_ORDER } from '../components/DashboardHome'
 
 describe('StatusBadge', () => {
   it('renders idle status', () => {
@@ -31,9 +32,19 @@ describe('StatusBadge', () => {
     expect(screen.getByText('Awaiting Input')).toBeInTheDocument()
   })
 
+  it('renders render_uncertain status', () => {
+    render(<StatusBadge status="render_uncertain" />)
+    expect(screen.getByText('Render Uncertain')).toBeInTheDocument()
+  })
+
   it('renders null status as unknown', () => {
     render(<StatusBadge status={null} />)
     expect(screen.getByText('Unknown')).toBeInTheDocument()
+  })
+
+  it('includes render uncertainty in dashboard ordering and active styles', () => {
+    expect(STATUS_ORDER).toContain('RENDER_UNCERTAIN')
+    expect(STATUS_ACTIVE_BG.RENDER_UNCERTAIN).toBeTruthy()
   })
 })
 
