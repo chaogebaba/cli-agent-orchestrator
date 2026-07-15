@@ -49,7 +49,15 @@ def test_manifest_projection_and_renderer_are_safe_and_deterministic(monkeypatch
     brief = svc.render_session_brief(manifest)
     encoded = json.dumps(manifest)
     assert manifest["schema_version"] == "cao.session-manifest/v1"
-    assert manifest["sections"] == {name: "ok" for name in ("profiles", "ready_bases", "skills", "workflows", "terminals", "activation")}
+    assert manifest["sections"] == {
+        **{name: "ok" for name in (
+            "profiles", "ready_bases", "skills", "workflows", "terminals", "activation"
+        )},
+        "tools": "not_collected",
+        "ledger": "not_collected",
+    }
+    assert manifest["complete"] is False
+    assert manifest["session"]["supervisors"] == ["term0001"]
     assert manifest["profiles"][0]["charter"] == "Never route policy from inventory."
     assert manifest["profiles"][0]["charter_digest"] == "Safe charter digest"
     for canary in (
@@ -198,9 +206,14 @@ def test_schema_is_additive_and_renderer_is_inventory_only(monkeypatch):
             assert isinstance(payload[key], expected_type)
         nested = {
             "sections": {name: str for name in (
-                "profiles", "ready_bases", "skills", "workflows", "terminals", "activation"
+                "profiles", "ready_bases", "skills", "workflows", "terminals", "activation",
+                "tools", "ledger",
             )},
-            "session": {"name": str, "supervisor_terminal_id": str},
+            "session": {
+                "name": str,
+                "supervisors": list,
+                "supervisor_terminal_id": (str, type(None)),
+            },
             "profiles": {"name": str, "description": str, "skills": list, "charter_digest": str},
             "ready_bases": {"name": str, "provider": str, "staleness_count": int},
             "terminals": {"id": str, "provider": str, "status": str, "kind": str},
@@ -224,6 +237,31 @@ def test_schema_is_additive_and_renderer_is_inventory_only(monkeypatch):
     brief = svc.render_session_brief(manifest)
     forbidden = ("route to", "use codex for", "gate procedure", "fold round", "review lane")
     assert all(phrase not in brief.lower() for phrase in forbidden)
+    assert "- tools: not_collected" in brief
+    assert "- ledger: not_collected" in brief
+
+
+def test_supervisor_projection_is_role_based_sorted_and_honest(monkeypatch):
+    _seed(monkeypatch)
+    rows = [
+        {"id": "term-z", "agent_profile": "supervisor", "provider": "codex"},
+        {"id": "term-a", "agent_profile": "supervisor", "provider": "codex"},
+    ]
+    monkeypatch.setattr(svc, "list_terminals_by_session", lambda _name: list(rows))
+    first = svc.build_session_manifest("cao-test")["session"]
+    rows.reverse()
+    second = svc.build_session_manifest("cao-test")["session"]
+    assert first["supervisors"] == second["supervisors"] == ["term-a", "term-z"]
+    assert first["supervisor_terminal_id"] is None
+
+    monkeypatch.setattr(
+        svc,
+        "list_terminals_by_session",
+        lambda _name: [{"id": "term-worker", "agent_profile": "unknown"}],
+    )
+    zero = svc.build_session_manifest("cao-test")["session"]
+    assert zero["supervisors"] == []
+    assert zero["supervisor_terminal_id"] is None
 
 
 def test_manifest_reads_seeded_profile_skill_directories_and_database(tmp_path, monkeypatch):

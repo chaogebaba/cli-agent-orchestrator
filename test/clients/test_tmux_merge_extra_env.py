@@ -6,6 +6,7 @@ callers that bypass the CLI (cao-mcp-server, direct HTTP).
 """
 
 from cli_agent_orchestrator.clients.tmux import TmuxClient
+from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 
 
 def test_merge_with_none_is_noop():
@@ -65,3 +66,18 @@ def test_is_blocked_env_key_classification():
     # Unrelated keys aren't blocked.
     assert TmuxClient._is_blocked_env_key("AWS_REGION") is False
     assert TmuxClient._is_blocked_env_key("MNEMOSYNE_DIR") is False
+
+
+def test_artifacts_dir_filter_parity_tmux_and_herdr():
+    extra = {
+        "CAO_ARTIFACTS_DIR": "/repo/tmp/orch",
+        "CLAUDE_SECRET": "drop",
+        "BIG": "x" * 2048,
+    }
+    tmux_env: dict[str, str] = {}
+    TmuxClient._merge_extra_env(tmux_env, extra)
+
+    assert tmux_env == {"CAO_ARTIFACTS_DIR": "/repo/tmp/orch"}
+    assert HerdrBackend._build_extra_env_exports(extra) == [
+        "export CAO_ARTIFACTS_DIR=/repo/tmp/orch"
+    ]

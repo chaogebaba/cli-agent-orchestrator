@@ -5,11 +5,32 @@ from unittest.mock import ANY, MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.services.session_service import (
+    canonical_session_env,
     create_session,
     delete_session,
     get_session,
     list_sessions,
 )
+
+
+def test_canonical_session_env_uses_working_directory(tmp_path):
+    result = canonical_session_env(str(tmp_path), {"KEEP": "yes"})
+    assert result == {
+        "KEEP": "yes",
+        "CAO_ARTIFACTS_DIR": str(tmp_path.resolve() / "tmp" / "orch"),
+    }
+
+
+def test_canonical_session_env_accepts_absolute_override(tmp_path):
+    override = tmp_path / "artifacts"
+    result = canonical_session_env("/ignored", {"CAO_ARTIFACTS_DIR": str(override)})
+    assert result["CAO_ARTIFACTS_DIR"] == str(override.resolve())
+
+
+@pytest.mark.parametrize("override", ["", "tmp/orch"])
+def test_canonical_session_env_rejects_non_absolute_override(override):
+    with pytest.raises(ValueError, match="artifacts_dir_not_absolute"):
+        canonical_session_env("/repo", {"CAO_ARTIFACTS_DIR": override})
 
 
 class TestCreateSession:
@@ -49,6 +70,25 @@ class TestCreateSession:
 
         mock_resolve.assert_not_called()
         assert mock_create_terminal.call_args.kwargs["provider"] == "kiro_cli"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    async def test_create_session_forwards_canonical_root_once(
+        self, mock_create_terminal, mock_dispatch, tmp_path
+    ):
+        mock_terminal = MagicMock(session_name="cao-test")
+        mock_create_terminal.return_value = mock_terminal
+
+        await create_session(
+            provider="codex", agent_profile="developer",
+            working_directory=str(tmp_path), env_vars={"KEEP": "yes"},
+        )
+
+        assert mock_create_terminal.call_args.kwargs["env_vars"] == {
+            "KEEP": "yes",
+            "CAO_ARTIFACTS_DIR": str(tmp_path.resolve() / "tmp" / "orch"),
+        }
 
 
 class TestListSessions:

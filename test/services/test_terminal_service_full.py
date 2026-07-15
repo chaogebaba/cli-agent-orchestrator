@@ -273,7 +273,11 @@ class TestCreateTerminal:
         mock_status_monitor,
     ):
         """Existing-session windows receive a caller-wins, non-persisted env overlay."""
-        session_floor = {"SHARED": "floor", "COLLISION": "session"}
+        session_floor = {
+            "SHARED": "floor",
+            "COLLISION": "session",
+            "CAO_ARTIFACTS_DIR": "/repo/tmp/orch",
+        }
         mock_get_session_env.return_value = session_floor
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
@@ -305,6 +309,12 @@ class TestCreateTerminal:
             session_name="cao-existing",
             env_vars={"WINDOW_ONLY": "overlay"},
         )
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-existing",
+            env_vars={"CAO_ARTIFACTS_DIR": "/override/refused"},
+        )
         await create_terminal("kiro_cli", "developer", session_name="cao-existing")
 
         assert result.id == "test1234"
@@ -315,8 +325,9 @@ class TestCreateTerminal:
             {**session_floor, "COLLISION": "caller"},
             {**session_floor, "WINDOW_ONLY": "overlay"},
             session_floor,
+            session_floor,
         ]
-        assert session_floor == {"SHARED": "floor", "COLLISION": "session"}
+        assert session_floor["CAO_ARTIFACTS_DIR"] == "/repo/tmp/orch"
         mock_set_session_env.assert_not_called()
 
     @pytest.mark.asyncio

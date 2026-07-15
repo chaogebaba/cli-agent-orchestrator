@@ -4,8 +4,10 @@ import json
 import os
 import subprocess
 import time
+import uuid as uuidlib
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, NoReturn, Optional
+from urllib.parse import quote
 
 from cli_agent_orchestrator.clients.database import (
     get_provider_session_by_uuid, get_ready_provider_session, get_terminal_metadata,
@@ -18,6 +20,15 @@ class ForkContextError(ValueError):
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
+
+
+class OfflineBaseRegistrationError(ValueError):
+    """Stable domain rejection for the offline base registration surface."""
+
+    def __init__(self, code: str, message: str):
+        self.code = code
+        self.message = message
+        super().__init__(f"{code}: {message}")
 
 
 _FORK_ROLE_NOTICE = (
@@ -221,6 +232,228 @@ def capture_codex_uuid(root_pid: int, launch_time: float, cwd: str) -> str:
     if sid not in p.name:
         raise ForkContextError("session_capture_mismatch")
     return sid
+
+
+def _registration_error(code: str, message: str) -> NoReturn:
+    raise OfflineBaseRegistrationError(code, message)
+
+
+def _grok_artifact_mismatch(session_uuid: str, cwd: str) -> str | None:
+    """Classify a missing expected Grok artifact against artifacts in other cwd roots."""
+    root = Path.home() / ".grok" / "sessions"
+    expected = root / quote(cwd, safe="") / session_uuid / "chat_history.jsonl"
+    matches = [
+        path
+        for path in root.glob(f"*/{session_uuid}/chat_history.jsonl")
+        if path.is_file() and path.stat().st_size > 0
+    ]
+    if expected in matches:
+        return None
+    if len(matches) > 1:
+        return "artifact_ambiguous"
+    if matches:
+        return "artifact_cwd_mismatch"
+    return None
+
+
+def validate_base_source(
+    *,
+    mode: Literal["registration", "compatibility"],
+    provider: str,
+    session_uuid: str,
+    cwd: str,
+    name: str | None = None,
+    agent_profile: str | None = None,
+) -> dict[str, str]:
+    """Validate stored provider history under an explicit strict or legacy mode.
+
+    ``compatibility`` intentionally preserves assign's historical loose artifact
+    predicate. ``registration`` is the operator-authority boundary and validates
+    every fact before the caller performs the superseding registry transaction.
+    """
+    if mode == "compatibility":
+        if provider == "codex":
+            found = any(
+                session_uuid in path.name
+                for path in (Path.home() / ".codex" / "sessions").glob(
+                    "**/rollout-*.jsonl"
+                )
+            )
+        else:
+            found = (
+                Path.home()
+                / ".grok"
+                / "sessions"
+                / quote(cwd, safe="")
+                / session_uuid
+            ).exists()
+        if not found:
+            raise ForkContextError("session_file_missing")
+        return {}
+
+    if mode != "registration":
+        raise ValueError(f"unknown validation mode: {mode}")
+    if name == "cold":
+        _registration_error("name_reserved", "base name 'cold' is reserved")
+    if not name:
+        _registration_error("name_reserved", "base name must be non-empty")
+
+    from cli_agent_orchestrator.providers.manager import get_provider_class
+
+    try:
+        provider_class = get_provider_class(provider)
+    except ValueError:
+        _registration_error("provider_unknown", f"unknown provider: {provider}")
+    if not provider_class.supports_fork_context:
+        _registration_error(
+            "fork_unsupported", f"provider does not support fork context: {provider}"
+        )
+
+    if not cwd or not Path(cwd).is_absolute():
+        _registration_error("cwd_not_absolute", "cwd must be an absolute path")
+    canonical_cwd = str(Path(cwd).resolve())
+    try:
+        uuidlib.UUID(session_uuid)
+    except (ValueError, AttributeError, TypeError):
+        _registration_error("uuid_malformed", "session_uuid must be a valid UUID")
+
+    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+
+    try:
+        profile = load_agent_profile(agent_profile or "")
+    except (FileNotFoundError, ValueError):
+        _registration_error(
+            "profile_unknown", f"unknown agent profile: {agent_profile or ''}"
+        )
+    if profile.provider and profile.provider != provider:
+        _registration_error(
+            "profile_provider_mismatch",
+            f"profile {agent_profile} uses provider {profile.provider}, not {provider}",
+        )
+
+    from cli_agent_orchestrator.providers.base import (
+        RetryableArtifactValidation,
+        TerminalArtifactValidation,
+    )
+
+    from cli_agent_orchestrator.providers.manager import provider_manager
+
+    validator = provider_manager.construct_provider(
+        provider,
+        "offline-base",
+        "offline-base",
+        "offline-base",
+        agent_profile=agent_profile,
+    )
+    try:
+        validator.validate_session_artifact(session_uuid, canonical_cwd)
+    except RetryableArtifactValidation:
+        if provider == "grok_cli":
+            mismatch = _grok_artifact_mismatch(session_uuid, canonical_cwd)
+            if mismatch == "artifact_ambiguous":
+                _registration_error(
+                    "artifact_ambiguous", "multiple provider artifacts match the UUID"
+                )
+            if mismatch == "artifact_cwd_mismatch":
+                _registration_error(
+                    "artifact_cwd_mismatch", "provider artifact belongs to a different cwd"
+                )
+        _registration_error("artifact_not_found", "provider artifact was not found")
+    except TerminalArtifactValidation as exc:
+        if "ambiguous" in exc.code:
+            _registration_error(
+                "artifact_ambiguous", "multiple provider artifacts match the UUID"
+            )
+        _registration_error(
+            "artifact_identity_mismatch", "provider artifact identity does not match the UUID"
+        )
+    except (OSError, KeyError, json.JSONDecodeError):
+        _registration_error(
+            "artifact_identity_mismatch", "provider artifact identity could not be validated"
+        )
+
+    if provider == "codex":
+        matches = list(
+            (Path.home() / ".codex" / "sessions").glob(
+                f"**/rollout-*{session_uuid}*.jsonl"
+            )
+        )
+        try:
+            with matches[0].open(encoding="utf-8") as stream:
+                payload_cwd = json.loads(stream.readline()).get("payload", {}).get("cwd")
+        except (IndexError, OSError, json.JSONDecodeError):
+            _registration_error(
+                "artifact_identity_mismatch", "provider artifact metadata is invalid"
+            )
+        if not isinstance(payload_cwd, str) or str(Path(payload_cwd).resolve()) != canonical_cwd:
+            _registration_error(
+                "artifact_cwd_mismatch", "provider artifact belongs to a different cwd"
+            )
+
+    inside_worktree = False
+    try:
+        inside_worktree = _run_git(
+            canonical_cwd, "rev-parse", "--is-inside-work-tree"
+        ).strip() == "true"
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    git_sha, dirty_hashes = snapshot(canonical_cwd)
+    if not inside_worktree or not git_sha:
+        _registration_error(
+            "cwd_not_git_worktree", "cwd must be a git worktree with a resolvable HEAD"
+        )
+    return {
+        "cwd": canonical_cwd,
+        "git_sha": git_sha,
+        "dirty_hashes": dirty_hashes,
+    }
+
+
+def register_offline_base(
+    *,
+    name: str,
+    provider: str,
+    session_uuid: str,
+    cwd: str,
+    agent_profile: str,
+    summary: str | None = None,
+) -> dict[str, Any]:
+    """Register a global base from validated provider history, without a live terminal."""
+    validated = validate_base_source(
+        mode="registration",
+        name=name,
+        provider=provider,
+        session_uuid=session_uuid,
+        cwd=cwd,
+        agent_profile=agent_profile,
+    )
+    row = register_provider_session(
+        name=name,
+        provider=provider,
+        session_uuid=session_uuid,
+        cwd=validated["cwd"],
+        agent_profile=agent_profile,
+        git_sha=validated["git_sha"],
+        dirty_hashes=validated["dirty_hashes"],
+        summary=summary,
+        kind="base",
+        source_terminal_id=None,
+        session_name=None,
+        include_superseded=True,
+    )
+    return {
+        "name": row["name"],
+        "provider": row["provider"],
+        "profile": row["agent_profile"],
+        "cwd": row["cwd"],
+        "session_uuid": row["session_uuid"],
+        "kind": row["kind"],
+        "session_name": row["session_name"],
+        "source_terminal_id": row["source_terminal_id"],
+        "git_sha": row["git_sha"],
+        "dirty_hashes": row["dirty_hashes"],
+        "superseded": row["superseded"],
+    }
 
 
 def mark_ready(

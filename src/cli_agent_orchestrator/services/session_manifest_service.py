@@ -40,7 +40,13 @@ def _charter_projection(name: str) -> dict[str, Any]:
 
 
 def build_session_manifest(session_name: str, terminal_id: str | None = None) -> dict[str, Any]:
-    sections = {name: "ok" for name in ("profiles", "ready_bases", "skills", "workflows", "terminals", "activation")}
+    sections = {
+        name: "ok"
+        for name in (
+            "profiles", "ready_bases", "skills", "workflows", "terminals", "activation"
+        )
+    }
+    sections.update({"tools": "not_collected", "ledger": "not_collected"})
     errors: list[dict[str, str]] = []
 
     def collect(section: str, fn: Callable[[], Any], fallback: Any) -> Any:
@@ -123,10 +129,18 @@ def build_session_manifest(session_name: str, terminal_id: str | None = None) ->
         errors.append({"section": "activation", "code": "source_root_unconfigured", "message": "CAO_SOURCE_REPO is not set"})
     from cli_agent_orchestrator.clients.database import get_session_epoch
     epoch_row = get_session_epoch(session_name)
+    supervisor_ids = sorted(
+        item["id"]
+        for item in raw_terminals
+        if roles.get(item.get("agent_profile")) == "supervisor"
+    )
     return {
         "schema_version": SCHEMA_VERSION, "generated_at": datetime.now(timezone.utc).isoformat(),
-        "complete": not errors, "errors": errors, "sections": sections,
-        "session": {"name": session_name, "supervisor_terminal_id": raw_terminals[0]["id"] if raw_terminals else terminal_id,
+        "complete": all(state == "ok" for state in sections.values()),
+        "errors": errors, "sections": sections,
+        "session": {"name": session_name,
+                    "supervisors": supervisor_ids,
+                    "supervisor_terminal_id": supervisor_ids[0] if len(supervisor_ids) == 1 else None,
                     "epoch": epoch_row["count"] if epoch_row else 0,
                     "epoch_started_at": epoch_row["last_epoch_at"] if epoch_row else None},
         "profiles": profile_rows, "ready_bases": base_rows, "skills": skill_rows,
@@ -150,8 +164,22 @@ def render_session_brief(manifest: dict[str, Any], thin: bool = False) -> str:
     lines += ["", "### Terminals", *(f"- {t['id']} — {t.get('profile')} ({t.get('provider')}, {t.get('status')}, {t.get('kind')})" for t in manifest["terminals"])]
     a = manifest["activation"]
     lines += ["", "### Activation", f"- cli_path={a.get('cli_path')}, differing_files={a.get('differing_files')}, server={a.get('server')}, source_root={a.get('source_root')}"]
-    if manifest["errors"]:
-        lines += ["", "### Incomplete sections", *(f"- {e['section']}: {e['code']}" for e in manifest["errors"])]
+    section_states = manifest.get("sections")
+    if isinstance(section_states, dict):
+        incomplete = [
+            (name, state)
+            for name, state in section_states.items()
+            if state != "ok"
+        ]
+    else:
+        # Additive-v1 compatibility for callers holding a pre-lattice snapshot.
+        incomplete = [(error["section"], "error") for error in manifest["errors"]]
+    if incomplete:
+        error_codes = {error["section"]: error["code"] for error in manifest["errors"]}
+        lines += ["", "### Incomplete sections"]
+        for name, state in incomplete:
+            suffix = f" ({error_codes[name]})" if state == "error" and name in error_codes else ""
+            lines.append(f"- {name}: {state}{suffix}")
     return "\n".join(lines)
 
 

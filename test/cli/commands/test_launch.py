@@ -857,6 +857,20 @@ class TestParseEnvPairs:
     def test_value_under_cap_accepted(self):
         assert _parse_env_pairs(["SMALL=" + ("x" * 2047)]) == {"SMALL": "x" * 2047}
 
+    @pytest.mark.parametrize(
+        "pair", ["CAO_ARTIFACTS_DIR=", "CAO_ARTIFACTS_DIR=tmp/orch"]
+    )
+    def test_artifacts_dir_must_be_absolute(self, pair):
+        import click as _click
+
+        with pytest.raises(_click.ClickException, match="artifacts_dir_not_absolute"):
+            _parse_env_pairs([pair])
+
+    def test_absolute_artifacts_dir_is_accepted(self):
+        assert _parse_env_pairs(["CAO_ARTIFACTS_DIR=/srv/cao/artifacts"]) == {
+            "CAO_ARTIFACTS_DIR": "/srv/cao/artifacts"
+        }
+
 
 def test_launch_forwards_env_in_json_body_not_url():
     """``--env`` values travel in the request body so secrets do not leak

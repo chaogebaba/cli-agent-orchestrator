@@ -1360,7 +1360,9 @@ def get_current_transcript_binding(terminal_id: str) -> Optional[Dict[str, Any]]
         raise
 
 
-def register_provider_session(**values: Any) -> Dict[str, Any]:
+def register_provider_session(
+    *, include_superseded: bool = False, **values: Any
+) -> Dict[str, Any]:
     """Atomically supersede a ready name and register its replacement."""
     if values.get("name") == "cold":
         raise ValueError("base_name_reserved:cold")
@@ -1368,7 +1370,7 @@ def register_provider_session(**values: Any) -> Dict[str, Any]:
         raise ValueError("invalid_provider_session_kind")
     with SessionLocal() as db:
         now = _utcnow()
-        db.query(ProviderSessionModel).filter(
+        superseded_count = db.query(ProviderSessionModel).filter(
             ProviderSessionModel.name == values["name"],
             ProviderSessionModel.status == "ready",
         ).update({"status": "superseded", "updated_at": now})
@@ -1376,7 +1378,10 @@ def register_provider_session(**values: Any) -> Dict[str, Any]:
         db.add(row)
         db.commit()
         db.refresh(row)
-        return provider_session_to_dict(row)
+        result = provider_session_to_dict(row)
+        if include_superseded:
+            result["superseded"] = superseded_count > 0
+        return result
 
 
 def get_provider_session_history(name: str) -> Optional[Dict[str, Any]]:

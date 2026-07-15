@@ -647,7 +647,13 @@ async def create_terminal(
             # Add window to existing session
             if not get_backend().session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
-            extra_env = {**get_session_env(session_name), **(env_vars or {})}
+            session_floor = get_session_env(session_name)
+            window_overlay = {
+                key: value
+                for key, value in (env_vars or {}).items()
+                if key != "CAO_ARTIFACTS_DIR"
+            }
+            extra_env = {**session_floor, **window_overlay}
             try:
                 window_name = get_backend().create_window(
                     session_name, window_name, terminal_id, working_directory,

@@ -22,6 +22,7 @@ Session Lifecycle:
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Dict, List
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -42,6 +43,26 @@ logger = logging.getLogger(__name__)
 
 SESSION_TEARDOWN_VERIFY_ATTEMPTS = 5
 SESSION_TEARDOWN_VERIFY_DELAY_SECONDS = 0.2
+ARTIFACTS_DIR_ENV = "CAO_ARTIFACTS_DIR"
+
+
+def canonical_session_env(
+    working_directory: str | None,
+    env_vars: dict[str, str] | None,
+) -> dict[str, str]:
+    """Return the session floor with one absolute, immutable artifact root."""
+    result = dict(env_vars or {})
+    override = result.get(ARTIFACTS_DIR_ENV)
+    if override is not None:
+        if not override or not Path(override).is_absolute():
+            raise ValueError(
+                "artifacts_dir_not_absolute: CAO_ARTIFACTS_DIR must be an absolute path"
+            )
+        artifact_root = Path(override).resolve()
+    else:
+        artifact_root = Path(working_directory or os.getcwd()).resolve() / "tmp" / "orch"
+    result[ARTIFACTS_DIR_ENV] = str(artifact_root)
+    return result
 
 
 def finalize_session(session_name: str, registry: PluginRegistry | None = None, backend=None) -> None:
@@ -85,6 +106,8 @@ async def create_session(
     else:
         resolved_provider = provider
 
+    session_env = canonical_session_env(working_directory, env_vars)
+
     from cli_agent_orchestrator.services.terminal_service import seed_resume_bootstrap
     fork_context = seed_resume_bootstrap(
         agent_profile, resolved_provider, working_directory or os.getcwd()
@@ -97,7 +120,7 @@ async def create_session(
         working_directory=working_directory,
         allowed_tools=allowed_tools,
         registry=registry,
-        env_vars=env_vars,
+        env_vars=session_env,
         allow_incomplete_brief=allow_incomplete_brief,
         fork_context=fork_context,
     )

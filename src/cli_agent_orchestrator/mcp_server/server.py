@@ -1032,8 +1032,6 @@ def _assign_impl(agent_profile: str, message: str, working_directory: Optional[s
             defaulted_fork = fork_from is not None
         row = None
         if fork_from:
-            from pathlib import Path
-            from urllib.parse import quote
             from cli_agent_orchestrator.models.terminal import ForkContext
             from cli_agent_orchestrator.services.fork_context_service import resolve_base, staleness
             try:
@@ -1063,14 +1061,15 @@ def _assign_impl(agent_profile: str, message: str, working_directory: Optional[s
                 raise ValueError("provider_lacks_fork_capability")
             if resume and agent_profile != row["agent_profile"]:
                 raise ValueError("resume_profile_mismatch")
-            if provider == "codex":
-                found = any(row["session_uuid"] in p.name for p in
-                            (Path.home() / ".codex" / "sessions").glob("**/rollout-*.jsonl"))
-            else:
-                found = ((Path.home() / ".grok" / "sessions" / quote(row["cwd"], safe="") /
-                          row["session_uuid"]).exists())
-            if not found:
-                raise ValueError("session_file_missing")
+            from cli_agent_orchestrator.services.fork_context_service import (
+                validate_base_source,
+            )
+            validate_base_source(
+                mode="compatibility",
+                provider=provider,
+                session_uuid=row["session_uuid"],
+                cwd=row["cwd"],
+            )
             if resume:
                 try:
                     owner = requests.get(

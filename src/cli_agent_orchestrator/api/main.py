@@ -429,6 +429,15 @@ class InstallAgentProfileRequest(BaseModel):
     env_vars: Optional[Dict[str, str]] = None
 
 
+class OfflineBaseRegistrationRequest(BaseModel):
+    name: str
+    provider: str
+    session_uuid: str
+    cwd: str
+    profile: str
+    summary: Optional[str] = None
+
+
 class MemorySummary(BaseModel):
     """Memory list entry. Excludes file_path (absolute server filesystem path)."""
 
@@ -1041,6 +1050,48 @@ async def get_skill_content(name: str) -> SkillContentResponse:
         )
 
 
+def _validate_artifacts_dir_override(env_vars: Optional[Dict[str, str]]) -> None:
+    if env_vars is None or "CAO_ARTIFACTS_DIR" not in env_vars:
+        return
+    value = env_vars["CAO_ARTIFACTS_DIR"]
+    if value and Path(value).is_absolute():
+        return
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={
+            "code": "artifacts_dir_not_absolute",
+            "message": "CAO_ARTIFACTS_DIR must be an absolute path",
+        },
+    )
+
+
+@app.post("/bases/register")
+def register_offline_base_endpoint(
+    body: OfflineBaseRegistrationRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, object]:
+    """Register validated provider history as a global, source-less fork base."""
+    from cli_agent_orchestrator.services.fork_context_service import (
+        OfflineBaseRegistrationError,
+        register_offline_base,
+    )
+
+    try:
+        return register_offline_base(
+            name=body.name,
+            provider=body.provider,
+            session_uuid=body.session_uuid,
+            cwd=body.cwd,
+            agent_profile=body.profile,
+            summary=body.summary,
+        )
+    except OfflineBaseRegistrationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+
+
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
 async def create_session(
     request: Request,
@@ -1069,6 +1120,7 @@ async def create_session(
     string — so values potentially containing secrets do not land in
     cao-server's HTTP access log. See issue #248.
     """
+    _validate_artifacts_dir_override(env_vars)
     try:
         if session_name is not None:
             # terminal_service.create_terminal prepends SESSION_PREFIX
@@ -1142,6 +1194,7 @@ async def start_session_endpoint(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Canonical lifecycle start endpoint."""
+    _validate_artifacts_dir_override(env_vars)
     try:
         result = await session_service.start_session(
             provider=provider, agent_profile=agent_profile, session_name=session_name,

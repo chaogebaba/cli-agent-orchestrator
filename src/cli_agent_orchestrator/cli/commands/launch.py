@@ -2,6 +2,7 @@
 
 import os
 import time
+from pathlib import Path
 
 import click
 import requests
@@ -86,6 +87,13 @@ def _parse_env_pairs(pairs):
             raise click.ClickException(
                 f"--env value for {key!r} exceeds {_FORWARDED_ENV_MAX_VALUE_BYTES} bytes "
                 "(tmux argv limit, PR #246)"
+            )
+        if key == "CAO_ARTIFACTS_DIR" and (
+            not value or not Path(value).is_absolute()
+        ):
+            raise click.ClickException(
+                "--env CAO_ARTIFACTS_DIR must be an absolute path "
+                "(artifacts_dir_not_absolute)"
             )
         result[key] = value
     return result
