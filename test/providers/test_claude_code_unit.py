@@ -1725,7 +1725,7 @@ class TestClaudeCodeScreenDetection:
     def test_selection_widget_is_waiting_user_answer(self):
         screen = [
             "Do you want to proceed?",
-            "  1. Yes",
+            "❯ 1. Yes",
             "  2. No",
             "  ↑/↓ to navigate · enter to select",
         ]

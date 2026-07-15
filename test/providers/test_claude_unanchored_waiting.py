@@ -178,6 +178,39 @@ def test_enter_to_confirm_prose_stays_on_raw_ready_path(raw, expected):
     backend.return_value.get_pane_size.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "Enter to select · ↑/↓ to navigate · Esc to cancel",
+        "Instructions: press Enter to confirm the example",
+    ],
+)
+def test_screen_ready_output_with_footer_or_enter_prose_stays_completed(prose):
+    screen = [
+        "● Done — example documented.",
+        prose,
+        "─" * 60,
+        "❯ ",
+        "─" * 60,
+    ]
+
+    assert _provider().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    [
+        "00-askuserquestion-2.1.205-incident.plain.txt",
+        "02-plan-approval-2.1.209.plain.txt",
+    ],
+)
+def test_screen_real_dialog_waits_via_each_structural_arm(fixture):
+    assert (
+        _provider().get_status_from_screen(_read(fixture).splitlines())
+        == TerminalStatus.WAITING_USER_ANSWER
+    )
+
+
 def test_non_waiting_raw_status_skips_rendering():
     with patch(
         "cli_agent_orchestrator.services.status_monitor.status_monitor.get_rendered_screen"

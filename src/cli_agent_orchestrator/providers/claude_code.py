@@ -839,11 +839,7 @@ class ClaudeCodeProvider(BaseProvider):
             return TerminalStatus.PROCESSING
 
         bottom_joined = "\n".join(bottom)
-        if (
-            re.search(WAITING_USER_ANSWER_PATTERN, bottom_joined)
-            and not re.search(TRUST_PROMPT_PATTERN, joined)
-            and not re.search(BYPASS_PROMPT_PATTERN, joined)
-        ):
+        if _is_ink_selection_waiting(bottom_joined):
             return TerminalStatus.WAITING_USER_ANSWER
 
         # Background task still running (GH #392): "✻ Waiting for N dynamic
