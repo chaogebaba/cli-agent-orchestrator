@@ -8,6 +8,9 @@ from cli_agent_orchestrator.models.provider import ProviderType
 
 # Terminal ID validation (8 character hex string)
 TerminalId = Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{8}$")]
+InboxReceiverId = Annotated[
+    str, StringConstraints(pattern=r"^(?:[a-f0-9]{8}|mb_[a-f0-9]{8})$")
+]
 RecoveryState = Literal[
     "rebind_starting",
     "rebind_exiting",
@@ -42,6 +45,9 @@ class Terminal(BaseModel):
     agent_profile: Optional[str] = Field(None, description="Agent profile")
     caller_id: Optional[str] = Field(
         None, description="Terminal that created this one via handoff/assign (callback target)"
+    )
+    caller_mailbox_id: Optional[str] = Field(
+        None, description="Durable mailbox of the recorded caller, derived by the server"
     )
     allowed_tools: Optional[List[str]] = Field(None, description="Allowed CAO tools")
     shell_command: Optional[str] = Field(

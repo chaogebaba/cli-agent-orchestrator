@@ -26,6 +26,7 @@ from cli_agent_orchestrator.services.memory_service import (
     MemoryDisabledError,
 )
 from cli_agent_orchestrator.services.settings_service import get_server_settings
+from cli_agent_orchestrator.security.auth import get_local_bearer
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 
@@ -35,6 +36,11 @@ logger = logging.getLogger(__name__)
 def _mcp_timeout() -> float:
     """Get MCP request timeout from server settings."""
     return float(get_server_settings()["mcp_request_timeout"])
+
+
+def _api_headers() -> dict[str, str]:
+    bearer = get_local_bearer()
+    return {"Authorization": f"Bearer {bearer}"} if bearer else {}
 
 
 # Environment variable to enable/disable automatic sender terminal ID injection.
@@ -379,6 +385,7 @@ def _send_direct_input(
             "orchestration_type": orchestration_type,
         },
         timeout=_mcp_timeout(),
+        headers=_api_headers(),
     )
     response.raise_for_status()
 
@@ -702,6 +709,18 @@ def _extract_error_detail(response: requests.Response, fallback: str) -> str:
     if isinstance(detail, str) and detail:
         return detail
     return fallback
+
+
+def _extract_structured_detail(response: requests.Response, fallback: str) -> str | dict[str, Any]:
+    try:
+        detail = response.json().get("detail")
+    except ValueError:
+        return fallback
+    if isinstance(detail, dict) and isinstance(detail.get("code"), str) and isinstance(
+        detail.get("message"), str
+    ):
+        return {"code": detail["code"], "message": detail["message"]}
+    return detail if isinstance(detail, str) and detail else fallback
 
 
 def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
@@ -1336,7 +1355,8 @@ def _send_message_impl(
                     ),
                 }
             response = requests.get(
-                f"{API_BASE_URL}/terminals/{own_terminal_id}", timeout=_mcp_timeout()
+                f"{API_BASE_URL}/terminals/{own_terminal_id}", timeout=_mcp_timeout(),
+                headers=_api_headers(),
             )
             try:
                 response.raise_for_status()
@@ -1350,7 +1370,10 @@ def _send_message_impl(
                         "receiver_id explicitly."
                     ),
                 }
-            receiver_id = response.json().get("caller_id")
+            terminal_payload = response.json()
+            receiver_id = terminal_payload.get("caller_mailbox_id") or terminal_payload.get(
+                "caller_id"
+            )
             if not receiver_id:
                 return {
                     "success": False,
@@ -1393,15 +1416,82 @@ def _send_message_impl(
         # e.g. the receiver terminal (a recorded caller included) was deleted
         # before this reply — surface the API detail instead of a raw
         # requests error string so the agent knows the address is gone.
-        detail = str(exc)
+        error_detail: str | dict[str, Any] = str(exc)
         if exc.response is not None:
-            detail = _extract_error_detail(exc.response, detail)
+            error_detail = _extract_structured_detail(exc.response, str(error_detail))
         return {
             "success": False,
-            "error": f"Failed to deliver to terminal {receiver_id}: {detail}",
+            "error": error_detail if isinstance(error_detail, dict)
+            else f"Failed to deliver to terminal {receiver_id}: {error_detail}",
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def _list_messages_impl(
+    receiver_id: Optional[str] = None, since: Optional[str] = None,
+    after_id: Optional[int] = None, limit: int = 25, status: Optional[str] = None,
+) -> Dict[str, Any]:
+    target = receiver_id
+    if target is None:
+        own_id = os.environ.get("CAO_TERMINAL_ID")
+        if not own_id:
+            return {"success": False, "error": {
+                "code": "missing_terminal_id", "message": "CAO_TERMINAL_ID is not set"
+            }}
+        target = own_id
+        mailboxes = requests.get(
+            f"{API_BASE_URL}/mailboxes", headers=_api_headers(), timeout=_mcp_timeout()
+        )
+        if mailboxes.status_code == 200:
+            current = next((item for item in mailboxes.json().get("items", [])
+                            if item.get("current_terminal_id") == own_id), None)
+            if current:
+                target = current["id"]
+    params: dict[str, Any] = {"to": target, "limit": limit}
+    if since is not None:
+        params["since"] = since
+    if after_id is not None:
+        params["after_id"] = after_id
+    if status is not None:
+        params["status"] = status
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/messages", params=params, headers=_api_headers(),
+            timeout=_mcp_timeout(),
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.HTTPError as exc:
+        try:
+            return response.json()
+        except ValueError:
+            return {"detail": str(exc)}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+def _ack_messages_impl(up_to_id: int) -> Dict[str, Any]:
+    terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    if not terminal_id:
+        return {"success": False, "error": {
+            "code": "missing_terminal_id", "message": "CAO_TERMINAL_ID is not set"
+        }}
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/messages/ack",
+            json={"terminal_id": terminal_id, "up_to_id": up_to_id},
+            headers=_api_headers(), timeout=_mcp_timeout(),
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.HTTPError as exc:
+        try:
+            return response.json()
+        except ValueError:
+            return {"detail": str(exc)}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
 
 
 def _codex_review_impl(
@@ -1529,6 +1619,28 @@ async def send_message(
         Dict with success status and message details
     """
     return _send_message_impl(receiver_id, message, refresh_ingest)
+
+
+@mcp.tool()
+async def list_messages(
+    receiver_id: Optional[str] = Field(
+        default=None, description="Terminal or mailbox receiver; omit for this terminal/mailbox"
+    ),
+    since: Optional[str] = Field(default=None, description="Inclusive ISO8601 timestamp"),
+    after_id: Optional[int] = Field(default=None, ge=0, description="Exclusive message cursor"),
+    limit: int = Field(default=25, ge=1, le=100),
+    status: Optional[str] = Field(default=None, description="Optional inbox status"),
+) -> Dict[str, Any]:
+    """List durable inbox messages through the scoped HTTP replay surface."""
+    return _list_messages_impl(receiver_id, since, after_id, limit, status)
+
+
+@mcp.tool()
+async def ack_messages(
+    up_to_id: int = Field(gt=0, description="Highest visible message id consumed")
+) -> Dict[str, Any]:
+    """Advance this supervisor incarnation's durable consumption cursor."""
+    return _ack_messages_impl(up_to_id)
 
 
 @mcp.tool()

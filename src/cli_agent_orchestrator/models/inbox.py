@@ -12,6 +12,7 @@ class OrchestrationType(str, Enum):
     SEND_MESSAGE = "send_message"
     HANDOFF = "handoff"
     ASSIGN = "assign"
+    MAILBOX_DIGEST = "mailbox_digest"
 
 
 class MessageStatus(str, Enum):
@@ -30,6 +31,9 @@ class InboxMessage(BaseModel):
     id: int = Field(..., description="Message ID")
     sender_id: str = Field(..., description="Sender terminal ID")
     receiver_id: str = Field(..., description="Receiver terminal ID")
+    logical_receiver_id: str | None = Field(
+        default=None, description="Durable logical mailbox destination, when present"
+    )
     message: str = Field(..., description="Message content")
     orchestration_type: OrchestrationType = Field(
         default=OrchestrationType.SEND_MESSAGE, description="Orchestration mode"

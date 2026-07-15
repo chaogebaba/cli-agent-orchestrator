@@ -41,6 +41,7 @@ from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.api.routes_fork import router as fork_router
 from cli_agent_orchestrator.clients.database import (
+    adopt_mailbox_rows_at_startup,
     create_inbox_message,
     create_transcript_binding,
     get_inbox_messages,
@@ -80,7 +81,9 @@ from cli_agent_orchestrator.models.memory import (
     MemoryScopeId,
     MemoryType,
 )
-from cli_agent_orchestrator.models.terminal import ForkContext, Terminal, TerminalId
+from cli_agent_orchestrator.models.terminal import (
+    ForkContext, InboxReceiverId, Terminal, TerminalId,
+)
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
@@ -111,6 +114,7 @@ from cli_agent_orchestrator.services.event_primitives import KINDS as EVENT_KIND
 from cli_agent_orchestrator.services.herdr_inbox_registry import set_herdr_inbox_service
 from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
 from cli_agent_orchestrator.services.inbox_service import inbox_service
+from cli_agent_orchestrator.services.mailbox_service import MailboxDomainError
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -499,6 +503,25 @@ class SessionRecoverRequest(BaseModel):
         return value
 
 
+class MessageAckRequest(BaseModel):
+    terminal_id: str
+    up_to_id: int = Field(gt=0)
+
+
+def _mailbox_http_exception(exc: Exception) -> HTTPException:
+    from cli_agent_orchestrator.services.mailbox_service import PublicationCleanupFailed
+    code = getattr(exc, "code", type(exc).__name__)
+    message = getattr(exc, "message", str(exc))
+    detail: dict[str, object] = {"code": code, "message": message}
+    if isinstance(exc, PublicationCleanupFailed):
+        detail["cause"] = {"code": str(exc.cause_code), "message": str(exc.cause_message)}
+        return HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=detail)
+    status_code = status.HTTP_409_CONFLICT if code in {
+        "mailbox_conflict", "mailbox_authority_timeout"
+    } else status.HTTP_400_BAD_REQUEST
+    return HTTPException(status_code=status_code, detail=detail)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -506,6 +529,7 @@ async def lifespan(app: FastAPI):
     setup_logging()
     init_db()
     inbox_service.recover_stale_deliveries()
+    adopt_mailbox_rows_at_startup()
     inbox_service.reconcile_pending_orphans()
     registry = PluginRegistry()
     await registry.load()
@@ -1174,6 +1198,8 @@ async def create_session(
 
         return result
 
+    except MailboxDomainError as e:
+        raise _mailbox_http_exception(e) from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
@@ -1203,6 +1229,8 @@ async def start_session_endpoint(
             registry=get_plugin_registry(request), env_vars=env_vars,
             allow_incomplete_brief=allow_incomplete_brief,
         )
+    except MailboxDomainError as exc:
+        raise _mailbox_http_exception(exc) from exc
     except RuntimeError as exc:
         code = str(exc)
         if code in {"seed_timeout", "seed_exec_failed", "seed_uuid_unparseable", "seed_artifact_invalid"}:
@@ -2248,13 +2276,40 @@ async def delete_terminal(
 @app.post("/terminals/{receiver_id}/inbox/messages")
 async def create_inbox_message_endpoint(
     request: Request,
-    receiver_id: TerminalId,
+    receiver_id: InboxReceiverId,
     sender_id: str,
     message: str,
     refresh_ingest: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
+    if receiver_id.startswith("mb_"):
+        from cli_agent_orchestrator.services.mailbox_service import create_logical_inbox_message
+        try:
+            inbox_msg = await asyncio.to_thread(
+                create_logical_inbox_message,
+                sender_id=sender_id,
+                mailbox_id=receiver_id,
+                message=message,
+                refresh_ingest=refresh_ingest,
+            )
+        except MailboxDomainError as exc:
+            raise _mailbox_http_exception(exc) from exc
+        except TerminalProtectionError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        try:
+            inbox_service.deliver_pending(
+                inbox_msg.receiver_id, registry=get_plugin_registry(request)
+            )
+        except Exception as exc:
+            logger.warning(
+                "Immediate delivery attempt failed for %s: %s", inbox_msg.receiver_id, exc
+            )
+        return {
+            "success": True, "message_id": inbox_msg.id,
+            "sender_id": inbox_msg.sender_id, "receiver_id": inbox_msg.receiver_id,
+            "created_at": inbox_msg.created_at.isoformat(),
+        }
     try:
         require_input_allowed(receiver_id, refresh_ingest=refresh_ingest)
     except TerminalProtectionError as e:
@@ -2300,7 +2355,7 @@ async def create_inbox_message_endpoint(
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.
     try:
-        inbox_service.deliver_pending(receiver_id, registry=get_plugin_registry(request))
+        inbox_service.deliver_pending(inbox_msg.receiver_id, registry=get_plugin_registry(request))
     except Exception as e:
         logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
 
@@ -2320,6 +2375,7 @@ async def get_inbox_messages_endpoint(
     status_param: Optional[str] = Query(
         default=None, alias="status", description="Filter by message status"
     ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
 ) -> List[Dict]:
     """Get inbox messages for a terminal.
 
@@ -2374,6 +2430,73 @@ async def get_inbox_messages_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve inbox messages: {str(e)}",
         )
+
+
+@app.get("/messages")
+async def list_messages_endpoint(
+    to: str = Query(..., pattern=r"^(?:[a-f0-9]{8}|mb_[a-f0-9]{8})$"),
+    since: Optional[str] = None,
+    after_id: Optional[int] = Query(default=None, ge=0),
+    limit: int = Query(default=25, ge=1, le=100),
+    status_param: Optional[MessageStatus] = Query(default=None, alias="status"),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
+) -> Dict:
+    """Replay a deterministic logical or incarnation-provenance message page."""
+    parsed_since = None
+    if since is not None:
+        try:
+            parsed_since = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            if parsed_since.tzinfo is not None:
+                parsed_since = parsed_since.astimezone().replace(tzinfo=None)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "invalid_since_format", "message": "invalid ISO8601 since"},
+            ) from exc
+    from cli_agent_orchestrator.services.mailbox_service import list_messages
+    try:
+        return await asyncio.to_thread(
+            list_messages, to, since=parsed_since, after_id=after_id,
+            limit=limit, status=status_param,
+        )
+    except MailboxDomainError as exc:
+        raise _mailbox_http_exception(exc) from exc
+
+
+@app.post("/messages/ack")
+async def ack_messages_endpoint(
+    body: MessageAckRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    from cli_agent_orchestrator.services.mailbox_service import ack_messages
+    try:
+        return await asyncio.to_thread(ack_messages, body.terminal_id, body.up_to_id)
+    except MailboxDomainError as exc:
+        raise _mailbox_http_exception(exc) from exc
+
+
+@app.get("/mailboxes")
+async def list_mailboxes_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
+) -> Dict:
+    from cli_agent_orchestrator.services.mailbox_service import list_mailboxes
+    return await asyncio.to_thread(list_mailboxes)
+
+
+@app.delete("/mailboxes/{mailbox_id}")
+async def delete_mailbox_endpoint(
+    mailbox_id: Annotated[str, Field(pattern=r"^mb_[a-f0-9]{8}$")],
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> Dict:
+    from cli_agent_orchestrator.services.mailbox_service import delete_mailbox
+    try:
+        return await asyncio.to_thread(delete_mailbox, mailbox_id)
+    except MailboxDomainError as exc:
+        if exc.code == "mailbox_authority_timeout":
+            raise HTTPException(
+                status_code=400, detail={"code": exc.code, "message": exc.message}
+            ) from exc
+        raise _mailbox_http_exception(exc) from exc
 
 
 @app.websocket("/terminals/{terminal_id}/ws")

@@ -17,17 +17,20 @@ from sqlalchemy import (
     Column,
     DateTime,
     Float,
+    ForeignKey,
     Integer,
     String,
     Text,
     UniqueConstraint,
     Index,
+    and_,
     create_engine,
     event,
     exists,
+    or_,
     text,
 )
-from sqlalchemy.orm import DeclarativeBase, Session, declarative_base, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Session, declarative_base, deferred, sessionmaker
 from sqlalchemy.exc import OperationalError
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
@@ -69,6 +72,7 @@ class TerminalModel(Base):
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
+    caller_mailbox_id = deferred(Column(String, nullable=True))
     provider_session_id = Column(String, nullable=True)
     recovery_state = Column(String, nullable=True)
     recovery_error = Column(String, nullable=True)
@@ -181,6 +185,32 @@ class SessionEpochModel(Base):
     last_epoch_at = Column(DateTime(timezone=True), nullable=True)
 
 
+class MailboxModel(Base):
+    """Durable logical receiver for one session role."""
+
+    __tablename__ = "mailboxes"
+    id = Column(String, primary_key=True)
+    session_name = Column(String, nullable=False)
+    role = Column(String, nullable=False)
+    current_terminal_id = Column(String, nullable=True)
+    generation = Column(Integer, nullable=False, default=1, server_default="1")
+    consumed_through_id = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+    __table_args__ = (UniqueConstraint("session_name", "role", name="uq_mailbox_session_role"),)
+
+
+class MailboxIncarnationModel(Base):
+    """Append-only terminal incarnations of a logical mailbox."""
+
+    __tablename__ = "mailbox_incarnations"
+    mailbox_id = Column(String, ForeignKey("mailboxes.id"), primary_key=True, nullable=False)
+    generation = Column(Integer, primary_key=True, nullable=False)
+    terminal_id = Column(String, nullable=False, unique=True)
+    published_at = Column(DateTime, nullable=False, default=datetime.now)
+    digest_message_id = Column(Integer, nullable=True)
+
+
 class TranscriptBindingModel(Base):
     """Append-only Claude transcript binding epochs reported by SessionStart."""
 
@@ -206,6 +236,7 @@ class InboxModel(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     sender_id = Column(String, nullable=False)
     receiver_id = Column(String, nullable=False)
+    logical_receiver_id = deferred(Column(String, nullable=True))
     message = Column(String, nullable=False)
     orchestration_type = Column(
         String,
@@ -377,6 +408,7 @@ def init_db() -> None:
     """Initialize database tables and apply schema migrations."""
     _migrate_project_aliases_schema()
     Base.metadata.create_all(bind=engine)
+    _migrate_mailbox_columns()
     _migrate_transcript_bindings_inode_nullable()
     _migrate_provider_sessions_status()
     _migrate_provider_sessions_session_name()
@@ -527,6 +559,17 @@ def _migrate_inbox_failure_reason() -> None:
         if not columns or "failure_reason" in {column["name"] for column in columns}:
             return
         connection.execute(text("ALTER TABLE inbox ADD COLUMN failure_reason TEXT"))
+
+
+def _migrate_mailbox_columns() -> None:
+    """Install the two nullable Wave 3B columns on legacy databases."""
+    with engine.begin() as connection:
+        inbox_columns = connection.execute(text("PRAGMA table_info(inbox)")).mappings().all()
+        if inbox_columns and "logical_receiver_id" not in {row["name"] for row in inbox_columns}:
+            connection.execute(text("ALTER TABLE inbox ADD COLUMN logical_receiver_id TEXT"))
+        terminal_columns = connection.execute(text("PRAGMA table_info(terminals)")).mappings().all()
+        if terminal_columns and "caller_mailbox_id" not in {row["name"] for row in terminal_columns}:
+            connection.execute(text("ALTER TABLE terminals ADD COLUMN caller_mailbox_id TEXT"))
 
 
 def _restrict_db_file_permissions() -> None:
@@ -852,6 +895,7 @@ def _migrate_terminals_schema() -> None:
         ).fetchone() is not None
         schema_current = (
             init_columns.issubset(columns)
+            and "caller_mailbox_id" in columns
             and "init_state IN" in table_sql
             and "init_deadline_s >= 1.0" in table_sql
             and has_token_unique
@@ -877,6 +921,7 @@ def _migrate_terminals_schema() -> None:
             "id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL, tmux_window TEXT NOT NULL, "
             "provider TEXT NOT NULL, agent_profile TEXT, allowed_tools TEXT, "
             "shell_command TEXT, caller_id TEXT, provider_session_id TEXT, "
+            "caller_mailbox_id TEXT, "
             "recovery_state TEXT, recovery_error TEXT, recovery_updated_at DATETIME, "
             "fallback_terminal_id TEXT, "
             "init_state TEXT NOT NULL DEFAULT 'ready' "
@@ -903,6 +948,7 @@ def _migrate_terminals_schema() -> None:
         destination = [
             "id", "tmux_session", "tmux_window", "provider", "agent_profile",
             "allowed_tools", "shell_command", "caller_id", "provider_session_id",
+            "caller_mailbox_id",
             "recovery_state", "recovery_error", "recovery_updated_at",
             "fallback_terminal_id", "last_active",
             "init_state", "init_started_at", "init_owner_epoch",
@@ -932,6 +978,64 @@ def _migrate_terminals_schema() -> None:
         conn.close()
 
 
+def _mailbox_schema_available(db: Any) -> bool:
+    try:
+        tables = {row[0] for row in db.execute(text(
+            "SELECT name FROM sqlite_master WHERE type='table' AND "
+            "name IN ('mailboxes','mailbox_incarnations')"
+        )).all()}
+    except TypeError:
+        return False
+    if tables != {"mailboxes", "mailbox_incarnations"}:
+        return False
+    inbox_columns = {row[1] for row in db.execute(text("PRAGMA table_info(inbox)")).all()}
+    return not inbox_columns or "logical_receiver_id" in inbox_columns
+
+
+def _terminal_mailbox_column_available(db: Any) -> bool:
+    return "caller_mailbox_id" in {
+        row[1] for row in db.execute(text("PRAGMA table_info(terminals)")).all()
+    }
+
+
+def _mailbox_id_for_terminal(db: Any, terminal_id: str | None) -> str | None:
+    if not terminal_id:
+        return None
+    if not _mailbox_schema_available(db):
+        return None
+    row = db.query(MailboxIncarnationModel.mailbox_id).filter(
+        MailboxIncarnationModel.terminal_id == terminal_id
+    ).one_or_none()
+    return cast(str, row[0]) if row is not None else None
+
+
+def resolve_inbox_receiver(db: Any, receiver_id: str) -> tuple[str, str | None]:
+    """Resolve a logical or historical inbox address inside the caller's transaction."""
+    if not _mailbox_schema_available(db):
+        return receiver_id, None
+    if receiver_id.startswith("mb_"):
+        mailbox = db.query(MailboxModel).filter(MailboxModel.id == receiver_id).one_or_none()
+        if mailbox is None:
+            raise ValueError("unknown_mailbox")
+        cache = mailbox.current_terminal_id
+        if cache is None:
+            latest = (db.query(MailboxIncarnationModel.terminal_id)
+                      .filter(MailboxIncarnationModel.mailbox_id == mailbox.id)
+                      .order_by(MailboxIncarnationModel.generation.desc()).first())
+            cache = latest[0] if latest is not None else receiver_id
+        return cast(str, cache), cast(str, mailbox.id)
+    mailbox_id = _mailbox_id_for_terminal(db, receiver_id)
+    return receiver_id, mailbox_id
+
+
+def _receiver_is_terminal_or_mailbox_address(db: Any, receiver_id: str | None) -> bool:
+    if not receiver_id:
+        return False
+    if db.query(TerminalModel.id).filter(TerminalModel.id == receiver_id).first() is not None:
+        return True
+    return _mailbox_id_for_terminal(db, receiver_id) is not None
+
+
 def create_terminal(
     terminal_id: str,
     tmux_session: str,
@@ -951,6 +1055,7 @@ def create_terminal(
     import json as _json
 
     with SessionLocal() as db:
+        caller_mailbox_id = _mailbox_id_for_terminal(db, caller_id)
         terminal = TerminalModel(
             id=terminal_id,
             tmux_session=tmux_session,
@@ -960,6 +1065,7 @@ def create_terminal(
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
             shell_command=shell_command,
             caller_id=caller_id,
+            caller_mailbox_id=caller_mailbox_id,
             provider_session_id=provider_session_id,
             init_state=init_state,
             init_started_at=init_started_at,
@@ -977,6 +1083,9 @@ def create_terminal(
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
+            "caller_mailbox_id": (
+                terminal.caller_mailbox_id if _terminal_mailbox_column_available(db) else None
+            ),
             "provider_session_id": terminal.provider_session_id,
             "recovery_state": terminal.recovery_state,
             "recovery_error": terminal.recovery_error,
@@ -1008,11 +1117,13 @@ def create_terminal_with_warm_intent(
     import uuid
 
     with SessionLocal.begin() as db:
+        caller_mailbox_id = _mailbox_id_for_terminal(db, caller_id)
         db.add(TerminalModel(
             id=terminal_id, tmux_session=tmux_session, tmux_window=tmux_window,
             provider=provider, agent_profile=agent_profile,
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
             caller_id=caller_id,
+            caller_mailbox_id=caller_mailbox_id,
             init_state=init_state, init_started_at=init_started_at,
             init_owner_epoch=init_owner_epoch, init_deadline_s=init_deadline_s,
         ))
@@ -1085,6 +1196,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
+            "caller_mailbox_id": terminal.caller_mailbox_id,
             "provider_session_id": terminal.provider_session_id,
             "recovery_state": terminal.recovery_state,
             "recovery_error": terminal.recovery_error,
@@ -1704,15 +1816,17 @@ def claim_deferred_init_failure(
                         "init_state": existing.init_state if existing is not None else None,
                         "token": existing.init_failure_token if existing is not None else None,
                     }
-                receiver_exists = bool(caller_id) and db.query(TerminalModel.id).filter(
-                    TerminalModel.id == caller_id
-                ).first() is not None
+                receiver_exists = _receiver_is_terminal_or_mailbox_address(db, caller_id)
                 row.init_failure_token = failure_token
                 if receiver_exists:
+                    receiver_cache, logical_receiver_id = resolve_inbox_receiver(
+                        db, cast(str, caller_id)
+                    )
                     row.init_state = "init_failed_notified"
                     db.add(InboxModel(
                         sender_id=terminal_id,
-                        receiver_id=cast(str, caller_id),
+                        receiver_id=receiver_cache,
+                        logical_receiver_id=logical_receiver_id,
                         message=notice,
                         orchestration_type=OrchestrationType.SEND_MESSAGE.value,
                         status=MessageStatus.PENDING.value,
@@ -2018,15 +2132,22 @@ def create_inbox_message(
         ValueError: If the receiver terminal does not exist.
     """
     with SessionLocal() as db:
-        if not db.query(TerminalModel).filter(TerminalModel.id == receiver_id).first():
+        mailbox_schema = _mailbox_schema_available(db)
+        receiver_cache, logical_receiver_id = resolve_inbox_receiver(db, receiver_id)
+        if logical_receiver_id is None and not db.query(TerminalModel).filter(
+            TerminalModel.id == receiver_cache
+        ).first():
             raise ValueError(f"Terminal '{receiver_id}' not found")
-        inbox_msg = InboxModel(
+        inbox_kwargs = dict(
             sender_id=sender_id,
-            receiver_id=receiver_id,
+            receiver_id=receiver_cache,
             message=message,
             orchestration_type=orchestration_type.value,
             status=MessageStatus.PENDING.value,
         )
+        if mailbox_schema:
+            inbox_kwargs["logical_receiver_id"] = logical_receiver_id
+        inbox_msg = InboxModel(**inbox_kwargs)
         db.add(inbox_msg)
         db.commit()
         db.refresh(inbox_msg)
@@ -2034,6 +2155,7 @@ def create_inbox_message(
             id=inbox_msg.id,
             sender_id=inbox_msg.sender_id,
             receiver_id=inbox_msg.receiver_id,
+            logical_receiver_id=(inbox_msg.logical_receiver_id if mailbox_schema else None),
             message=inbox_msg.message,
             orchestration_type=OrchestrationType(inbox_msg.orchestration_type),
             status=MessageStatus(inbox_msg.status),
@@ -2047,6 +2169,7 @@ def get_pending_messages(
     """Get pending messages ordered by created_at ASC (oldest first)."""
     excluded = set(excluded_message_ids or ())
     with SessionLocal() as db:
+        mailbox_schema = _mailbox_schema_available(db)
         query = db.query(InboxModel).filter(
             InboxModel.receiver_id == receiver_id,
             InboxModel.status == MessageStatus.PENDING.value,
@@ -2056,6 +2179,7 @@ def get_pending_messages(
         rows = query.order_by(InboxModel.created_at.asc(), InboxModel.id.asc()).limit(limit).all()
         return [InboxMessage(
             id=row.id, sender_id=row.sender_id, receiver_id=row.receiver_id,
+            logical_receiver_id=row.logical_receiver_id if mailbox_schema else None,
             message=row.message, orchestration_type=OrchestrationType(row.orchestration_type),
             status=MessageStatus(row.status), created_at=row.created_at,
         ) for row in rows]
@@ -2066,12 +2190,14 @@ def get_pending_messages_by_ids(receiver_id: str, message_ids: list[int]) -> Lis
     if not ids:
         return []
     with SessionLocal() as db:
+        mailbox_schema = _mailbox_schema_available(db)
         rows = db.query(InboxModel).filter(
             InboxModel.receiver_id == receiver_id, InboxModel.id.in_(ids),
             InboxModel.status == MessageStatus.PENDING.value,
         ).order_by(InboxModel.created_at, InboxModel.id).all()
         return [InboxMessage(
             id=row.id, sender_id=row.sender_id, receiver_id=row.receiver_id,
+            logical_receiver_id=row.logical_receiver_id if mailbox_schema else None,
             message=row.message, orchestration_type=OrchestrationType(row.orchestration_type),
             status=MessageStatus(row.status), created_at=row.created_at,
         ) for row in rows]
@@ -2091,6 +2217,7 @@ def get_inbox_messages(
         List of inbox messages ordered by creation time (oldest first)
     """
     with SessionLocal() as db:
+        mailbox_schema = _mailbox_schema_available(db)
         query = db.query(InboxModel).filter(InboxModel.receiver_id == receiver_id)
 
         if status is not None:
@@ -2103,6 +2230,7 @@ def get_inbox_messages(
                 id=msg.id,
                 sender_id=msg.sender_id,
                 receiver_id=msg.receiver_id,
+                logical_receiver_id=msg.logical_receiver_id if mailbox_schema else None,
                 message=msg.message,
                 orchestration_type=OrchestrationType(msg.orchestration_type),
                 status=MessageStatus(msg.status),
@@ -2450,6 +2578,23 @@ def begin_delivery_attempt_if_no_other_delivering(
         if sorted(row.id for row in candidates) != ids:
             db.rollback()
             return "stale_candidate"
+        attempt_evidence = _evidence_object(evidence)
+        logical_ids = (
+            {row.logical_receiver_id for row in candidates if row.logical_receiver_id}
+            if _mailbox_schema_available(db) else set()
+        )
+        if logical_ids:
+            if len(logical_ids) != 1:
+                db.rollback()
+                return "stale_candidate"
+            mailbox = db.query(MailboxModel).filter_by(id=next(iter(logical_ids))).one_or_none()
+            if mailbox is None or mailbox.current_terminal_id != receiver_terminal_id:
+                db.rollback()
+                return "stale_candidate"
+            attempt_evidence["mailbox_authority"] = {
+                "mailbox_id": mailbox.id, "generation": mailbox.generation,
+                "current_terminal_id": mailbox.current_terminal_id,
+            }
         changed = db.query(InboxModel).filter(
             InboxModel.id.in_(ids), InboxModel.receiver_id == receiver_terminal_id,
             InboxModel.status == MessageStatus.PENDING.value,
@@ -2464,7 +2609,7 @@ def begin_delivery_attempt_if_no_other_delivering(
             pre_input_gen=pre_input_gen, pre_status_gen=pre_status_gen,
             prior_attempt_uuid=prior_attempt_uuid,
             sender_id=first.sender_id, orchestration_type=first.orchestration_type.value,
-            evidence=evidence if _is_wpm1_evidence(evidence) else evidence[:2048],
+            evidence=_canonical_json(attempt_evidence)[:2048],
         )
         db.add(row)
         for position, message_id in enumerate(ids):
@@ -2546,6 +2691,19 @@ def begin_delivery_attempt(messages, receiver_terminal_id: str, provider: str, p
                            evidence: str = "{}", prior_attempt_uuid: str | None = None) -> str:
     attempt_uuid = str(uuid.uuid4())
     with SessionLocal.begin() as db:
+        attempt_evidence = _evidence_object(evidence)
+        logical_ids = {getattr(message, "logical_receiver_id", None) for message in messages}
+        logical_ids.discard(None)
+        if logical_ids:
+            if len(logical_ids) != 1:
+                raise ValueError("logical delivery batch spans mailboxes")
+            mailbox = db.query(MailboxModel).filter_by(id=next(iter(logical_ids))).one_or_none()
+            if mailbox is None or mailbox.current_terminal_id != receiver_terminal_id:
+                raise ValueError("logical delivery incarnation changed")
+            attempt_evidence["mailbox_authority"] = {
+                "mailbox_id": mailbox.id, "generation": mailbox.generation,
+                "current_terminal_id": mailbox.current_terminal_id,
+            }
         if prior_attempt_uuid is not None:
             prior = db.query(InboxDeliveryAttemptModel).filter_by(
                 attempt_uuid=prior_attempt_uuid).one_or_none()
@@ -2569,7 +2727,7 @@ def begin_delivery_attempt(messages, receiver_terminal_id: str, provider: str, p
             prior_attempt_uuid=prior.attempt_uuid if prior else None,
             sender_id=messages[0].sender_id,
             orchestration_type=messages[0].orchestration_type.value,
-            evidence=evidence if _is_wpm1_evidence(evidence) else evidence[:2048],
+            evidence=_canonical_json(attempt_evidence)[:2048],
         )
         db.add(row)
         for position, message in enumerate(messages):
@@ -2638,6 +2796,26 @@ def settle_delivery_attempt(attempt_uuid: str, status: MessageStatus, outcome: s
         if status == MessageStatus.DELIVERED and on_confirmed is not None:
             on_confirmed()
         return True
+
+
+def get_attempt_mailbox_authority(attempt_uuid: str) -> dict[str, Any] | None:
+    """Return the immutable logical authority captured by an attempt opener."""
+    with SessionLocal() as db:
+        row = db.query(InboxDeliveryAttemptModel.evidence).filter_by(
+            attempt_uuid=attempt_uuid
+        ).one_or_none()
+        if row is None:
+            return None
+        authority = _evidence_object(row[0]).get("mailbox_authority")
+        if not isinstance(authority, dict):
+            return None
+        if (
+            not isinstance(authority.get("mailbox_id"), str)
+            or type(authority.get("generation")) is not int
+            or not isinstance(authority.get("current_terminal_id"), str)
+        ):
+            return None
+        return authority
 
 
 def settle_delivery_attempt_proof_safe(
@@ -2796,6 +2974,39 @@ def _p5_batch_key(message_ids: list[int]) -> str:
     return ",".join(str(value) for value in sorted(set(message_ids)))
 
 
+def adopt_mailbox_rows_at_startup() -> int:
+    """Tag legacy PENDING rows addressed to a known mailbox incarnation."""
+    def operation(db: Any) -> int:
+        if not _mailbox_schema_available(db):
+            return 0
+        rows = (db.query(InboxModel)
+                .filter(InboxModel.status == MessageStatus.PENDING.value,
+                        InboxModel.logical_receiver_id.is_(None)).all())
+        changed = 0
+        for row in rows:
+            mailbox_id = _mailbox_id_for_terminal(db, row.receiver_id)
+            if mailbox_id is not None:
+                row.logical_receiver_id = mailbox_id
+                changed += 1
+        return changed
+    result = _run_wpm1_immediate(operation)
+    if result == "busy_aborted":
+        raise RuntimeError("mailbox_startup_adoption_busy")
+    return cast(int, result)
+
+
+def _p5_orphan_predicate():
+    logical_exists = exists().where(MailboxModel.id == InboxModel.logical_receiver_id)
+    address_exists = exists().where(
+        MailboxIncarnationModel.terminal_id == InboxModel.receiver_id
+    )
+    terminal_exists = exists().where(TerminalModel.id == InboxModel.receiver_id)
+    return or_(
+        and_(InboxModel.logical_receiver_id.is_not(None), ~logical_exists),
+        and_(InboxModel.logical_receiver_id.is_(None), ~terminal_exists, ~address_exists),
+    )
+
+
 def _record_p5_orphan_notices(db: Any, rows: list[InboxModel]) -> tuple[int, int]:
     """Insert deterministic sender notices inside the owning settlement transaction."""
     batches: dict[tuple[str, str], list[int]] = {}
@@ -2806,7 +3017,7 @@ def _record_p5_orphan_notices(db: Any, rows: list[InboxModel]) -> tuple[int, int
     logged_only_count = 0
     for (sender_id, receiver_id), message_ids in sorted(batches.items()):
         ids = sorted(message_ids)
-        if db.query(TerminalModel.id).filter(TerminalModel.id == sender_id).first() is None:
+        if not _receiver_is_terminal_or_mailbox_address(db, sender_id):
             logged_only_count += 1
             logger.warning(
                 "P5 orphan settlement has no live sender %s for receiver %s batch %s",
@@ -2815,15 +3026,17 @@ def _record_p5_orphan_notices(db: Any, rows: list[InboxModel]) -> tuple[int, int
             continue
         header = f"p5-orphan receiver={receiver_id} batch={_p5_batch_key(ids)}\n"
         notice_sender = f"message-trace:{receiver_id}"
+        notice_receiver, logical_receiver_id = resolve_inbox_receiver(db, sender_id)
         existing = db.query(InboxModel).filter(
             InboxModel.sender_id == notice_sender,
-            InboxModel.receiver_id == sender_id,
+            InboxModel.receiver_id == notice_receiver,
             text("substr(message, 1, :n) = :header").bindparams(
                 n=len(header), header=header),
         ).first()
         if existing is None:
             db.add(InboxModel(
-                sender_id=notice_sender, receiver_id=sender_id,
+                sender_id=notice_sender, receiver_id=notice_receiver,
+                logical_receiver_id=logical_receiver_id,
                 message=(header +
                          f"[message-trace] delivery to terminal {receiver_id} failed because "
                          f"the receiver terminal no longer exists for message(s) {ids}."),
@@ -2842,19 +3055,31 @@ def settle_pending_orphan_messages(
         raise ValueError("orphan reconcile limit must be positive")
 
     def operation(db: Any) -> OrphanReconcileResult:
+        mailbox_schema = db.execute(text(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='mailboxes'"
+        )).first() is not None
+        if not mailbox_schema:
+            # Unit seams may exercise the reconciler against a deliberately
+            # pre-init legacy schema; production startup installs D5 first.
+            return OrphanReconcileResult()
+        orphan_predicate = (
+            _p5_orphan_predicate()
+        )
         candidates = (db.query(InboxModel).filter(
             InboxModel.status == MessageStatus.PENDING.value,
-            ~exists().where(TerminalModel.id == InboxModel.receiver_id),
+            orphan_predicate,
         ).order_by(InboxModel.created_at.asc(), InboxModel.id.asc()).limit(limit).all())
         settled: list[InboxModel] = []
         for candidate in candidates:
             changed = (db.query(InboxModel).filter(
                 InboxModel.id == candidate.id,
                 InboxModel.status == MessageStatus.PENDING.value,
-                ~exists().where(TerminalModel.id == InboxModel.receiver_id),
+                orphan_predicate,
             ).update({
                 InboxModel.status: MessageStatus.DELIVERY_FAILED.value,
-                InboxModel.failure_reason: "receiver_gone",
+                InboxModel.failure_reason: (
+                    "mailbox_deleted" if candidate.logical_receiver_id else "receiver_gone"
+                ),
             }, synchronize_session=False))
             if changed == 1:
                 settled.append(candidate)
@@ -2964,11 +3189,11 @@ def _wpm1_batch_key(message_ids: list[int]) -> str:
 
 
 def _resolve_wpm1_recipient(db, sender_id: str, receiver_terminal_id: str) -> str | None:
-    if db.query(TerminalModel).filter_by(id=sender_id).first() is not None:
+    if _receiver_is_terminal_or_mailbox_address(db, sender_id):
         return sender_id
     receiver = db.query(TerminalModel).filter_by(id=receiver_terminal_id).first()
     caller_id = receiver.caller_id if receiver is not None else None
-    if caller_id and db.query(TerminalModel).filter_by(id=caller_id).first() is not None:
+    if _receiver_is_terminal_or_mailbox_address(db, caller_id):
         return cast(str, caller_id)
     return None
 
@@ -3011,8 +3236,10 @@ def record_wpm1_stalled_notice(
             text("substr(message, 1, :n) = :header").bindparams(n=len(header), header=header),
         ).first()
         if existing is None:
+            notice_receiver, logical_receiver_id = resolve_inbox_receiver(db, recipient)
             db.add(InboxModel(
-                sender_id=sender, receiver_id=recipient,
+                sender_id=sender, receiver_id=notice_receiver,
+                logical_receiver_id=logical_receiver_id,
                 message=header + "delivery stalled: receiver shows no progress / payload not yet "
                 "confirmed; no reinjection will occur while unproven; will confirm if consumed",
                 orchestration_type=OrchestrationType.SEND_MESSAGE.value,
@@ -3086,8 +3313,8 @@ def settle_wpm1_terminal_batch(
                     text("substr(message, 1, :n) = :header").bindparams(
                         n=len(stalled_header), header=stalled_header),
                 ).first()
-                if stalled is not None and db.query(TerminalModel).filter_by(
-                        id=stalled.receiver_id).first() is not None:
+                if stalled is not None and _receiver_is_terminal_or_mailbox_address(
+                        db, stalled.receiver_id):
                     existing = db.query(InboxModel).filter(
                         InboxModel.sender_id == sender,
                         InboxModel.receiver_id == stalled.receiver_id,
@@ -3095,8 +3322,12 @@ def settle_wpm1_terminal_batch(
                             n=len(corrective_header), header=corrective_header),
                     ).first()
                     if existing is None:
+                        notice_receiver, logical_receiver_id = resolve_inbox_receiver(
+                            db, stalled.receiver_id
+                        )
                         db.add(InboxModel(
-                            sender_id=sender, receiver_id=stalled.receiver_id,
+                            sender_id=sender, receiver_id=notice_receiver,
+                            logical_receiver_id=logical_receiver_id,
                             message=corrective_header + "previously-stalled message was delivered",
                             orchestration_type=OrchestrationType.SEND_MESSAGE.value,
                             status=MessageStatus.PENDING.value,

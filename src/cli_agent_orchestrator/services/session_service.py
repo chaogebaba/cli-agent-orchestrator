@@ -20,6 +20,7 @@ Session Lifecycle:
 """
 
 import logging
+import asyncio
 import os
 import time
 from pathlib import Path
@@ -38,6 +39,8 @@ from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_even
 from cli_agent_orchestrator.services.session_env import clear_session_env
 from cli_agent_orchestrator.services.terminal_service import create_terminal
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +111,19 @@ async def create_session(
 
     session_env = canonical_session_env(working_directory, env_vars)
 
+    from cli_agent_orchestrator.constants import SESSION_PREFIX
+    effective_session_name = session_name or generate_session_name()
+    if not effective_session_name.startswith(SESSION_PREFIX):
+        effective_session_name = f"{SESSION_PREFIX}{effective_session_name}"
+    try:
+        profile = load_agent_profile(agent_profile)
+    except FileNotFoundError:
+        profile = None
+    mailbox_claim = None
+    if profile is not None and profile.role == "supervisor":
+        from cli_agent_orchestrator.services.mailbox_service import claim_mailbox
+        mailbox_claim = claim_mailbox(effective_session_name, "supervisor")
+
     from cli_agent_orchestrator.services.terminal_service import seed_resume_bootstrap
     fork_context = seed_resume_bootstrap(
         agent_profile, resolved_provider, working_directory or os.getcwd()
@@ -115,7 +131,7 @@ async def create_session(
     terminal = await create_terminal(
         provider=resolved_provider,
         agent_profile=agent_profile,
-        session_name=session_name,
+        session_name=effective_session_name,
         new_session=True,
         working_directory=working_directory,
         allowed_tools=allowed_tools,
@@ -124,6 +140,41 @@ async def create_session(
         allow_incomplete_brief=allow_incomplete_brief,
         fork_context=fork_context,
     )
+    if mailbox_claim is not None:
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+        from cli_agent_orchestrator.services.mailbox_service import (
+            PublicationCleanupFailed,
+            publish_supervisor_incarnation,
+        )
+        try:
+            publication = await asyncio.to_thread(
+                publish_supervisor_incarnation, mailbox_claim, terminal.id
+            )
+        except Exception as cause:
+            try:
+                deleted = await asyncio.to_thread(
+                    __import__(
+                        "cli_agent_orchestrator.services.terminal_service",
+                        fromlist=["delete_terminal"],
+                    ).delete_terminal,
+                    terminal.id,
+                    registry,
+                )
+                if not deleted and get_terminal_metadata(terminal.id) is not None:
+                    raise RuntimeError("terminal retained")
+            except Exception as cleanup_error:
+                raise PublicationCleanupFailed(cause) from cleanup_error
+            raise
+        from cli_agent_orchestrator.services.inbox_service import inbox_service
+        await asyncio.to_thread(
+            inbox_service.deliver_pending,
+            terminal.id,
+            registry=registry,
+        )
+        logger.info(
+            "published supervisor mailbox %s generation %s",
+            publication["mailbox_id"], publication["generation"],
+        )
     dispatch_plugin_event(
         registry,
         "post_create_session",

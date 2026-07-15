@@ -1934,6 +1934,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "session_name": metadata["tmux_session"],
             "agent_profile": metadata["agent_profile"],
             "caller_id": metadata.get("caller_id"),
+            "caller_mailbox_id": metadata.get("caller_mailbox_id"),
             "allowed_tools": metadata.get("allowed_tools"),
             "provider_session_id": metadata.get("provider_session_id"),
             "status": status,

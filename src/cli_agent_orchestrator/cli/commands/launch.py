@@ -314,6 +314,24 @@ def launch(
             post_kwargs["json"] = {"env_vars": forwarded_env}
 
         response = requests.post(url, **post_kwargs)
+        from cli_agent_orchestrator.cli.http import format_domain_detail, response_detail
+        start_error = None
+        try:
+            start_error = response.json()
+        except ValueError:
+            pass
+        if (response.status_code == 422 and isinstance(start_error, dict)
+                and start_error.get("bootstrap", {}).get("status") == "seed_failed"):
+            click.echo(
+                f"bootstrap failed [{start_error['bootstrap']['error_code']}]", err=True
+            )
+            raise click.exceptions.Exit(2)
+        detail = response_detail(response)
+        if response.status_code in {409, 500} and detail and detail.get("code") in {
+            "mailbox_conflict", "mailbox_authority_timeout", "publication_cleanup_failed"
+        }:
+            click.echo(format_domain_detail(detail), err=True)
+            raise click.exceptions.Exit(1)
         response.raise_for_status()
 
         start_payload = response.json()
@@ -382,6 +400,8 @@ def launch(
             if output:
                 click.echo(output)
 
+    except click.exceptions.Exit:
+        raise
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {str(e)}")
     except click.ClickException:

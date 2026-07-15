@@ -12,6 +12,7 @@ import requests
 from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.utils.terminal import poll_until_done
+from cli_agent_orchestrator.cli.http import format_domain_detail, response_detail
 
 # Default poll timeout for sync send (seconds). Pass --timeout to override.
 _DEFAULT_SEND_TIMEOUT = 300
@@ -91,6 +92,12 @@ def start(session_name, agents, provider, working_directory, allowed_tools,
         click.echo(json.dumps(payload, indent=2) if as_json else
                    f"bootstrap failed [{payload['bootstrap']['error_code']}]", err=True)
         raise click.exceptions.Exit(2)
+    detail = response_detail(response)
+    if response.status_code in {409, 500} and detail and detail.get("code") in {
+        "mailbox_conflict", "mailbox_authority_timeout", "publication_cleanup_failed"
+    }:
+        click.echo(format_domain_detail(detail), err=True)
+        raise click.exceptions.Exit(1)
     try:
         response.raise_for_status()
     except requests.RequestException as exc:

@@ -29,6 +29,7 @@ from cli_agent_orchestrator.clients.database import (
     settle_delivery_attempt,
     list_stale_delivering_messages,
     get_message_trace,
+    get_attempt_mailbox_authority,
     list_attempt_member_ids,
     list_message_attempts,
     transition_pending_to_delivery_failed,
@@ -807,6 +808,52 @@ class InboxService:
                         logger.debug("WPM2 opener held %s: %s", terminal_id, opened.kind)
                         return
                     attempt_uuid = opened.attempt_uuid
+                    assert attempt_uuid is not None
+                    authority_lock = None
+                    candidate_logical_id = getattr(batch[0], "logical_receiver_id", None)
+                    logical_receiver_id = (
+                        candidate_logical_id
+                        if isinstance(candidate_logical_id, str)
+                        and candidate_logical_id.startswith("mb_")
+                        else None
+                    )
+                    if logical_receiver_id:
+                        from cli_agent_orchestrator.services.mailbox_service import (
+                            MailboxDomainError,
+                            acquire_logical_sender_authority,
+                        )
+                        captured_authority = get_attempt_mailbox_authority(attempt_uuid)
+                        if captured_authority is None:
+                            settle_delivery_attempt(
+                                attempt_uuid, MessageStatus.PENDING, "interrupted",
+                                reason="mailbox_generation_changed",
+                            )
+                            return
+                        try:
+                            authority_lock = acquire_logical_sender_authority(
+                                logical_receiver_id, terminal_id,
+                                captured_authority["generation"],
+                            )
+                        except MailboxDomainError:
+                            settle_delivery_attempt(
+                                attempt_uuid, MessageStatus.PENDING, "interrupted",
+                                reason="mailbox_authority_timeout",
+                            )
+                            with _delivery_seq_guard:
+                                _delivery_wake_seq[terminal_id] = (
+                                    _delivery_wake_seq.get(terminal_id, 0) + 1
+                                )
+                            return
+                        if authority_lock is None:
+                            settle_delivery_attempt(
+                                attempt_uuid, MessageStatus.PENDING, "interrupted",
+                                reason="mailbox_generation_changed",
+                            )
+                            with _delivery_seq_guard:
+                                _delivery_wake_seq[terminal_id] = (
+                                    _delivery_wake_seq.get(terminal_id, 0) + 1
+                                )
+                            return
                     def submitted(value):
                         nonlocal submit_observation, submit_evidence
                         submit_observation = value
@@ -819,8 +866,13 @@ class InboxService:
                         }
                         if not legacy_test_seam:
                             send_kwargs["on_submitted"] = submitted
-                        submit_observation = terminal_service.send_prepared_input(
-                            terminal_id, wire_prepared, **send_kwargs)
+                        try:
+                            submit_observation = terminal_service.send_prepared_input(
+                                terminal_id, wire_prepared, **send_kwargs)
+                        finally:
+                            if authority_lock is not None:
+                                authority_lock.release()
+                                authority_lock = None
                         if (not isinstance(getattr(submit_observation, "status", None), TerminalStatus)
                                 or not isinstance(getattr(
                                     submit_observation, "observation_epoch", None), str)
