@@ -497,6 +497,7 @@ async def lifespan(app: FastAPI):
     setup_logging()
     init_db()
     inbox_service.recover_stale_deliveries()
+    inbox_service.reconcile_pending_orphans()
     registry = PluginRegistry()
     await registry.load()
     app.state.plugin_registry = registry

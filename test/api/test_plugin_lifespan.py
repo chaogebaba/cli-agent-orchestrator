@@ -35,6 +35,8 @@ def _consumer_patches():
         patch("cli_agent_orchestrator.api.main.status_monitor.run", new_callable=AsyncMock),
         patch("cli_agent_orchestrator.api.main.log_writer.run", new_callable=AsyncMock),
         patch("cli_agent_orchestrator.api.main.inbox_service.run", new_callable=AsyncMock),
+        patch("cli_agent_orchestrator.api.main.inbox_service.recover_stale_deliveries"),
+        patch("cli_agent_orchestrator.api.main.inbox_service.reconcile_pending_orphans"),
         patch(
             "cli_agent_orchestrator.api.main.opencode_inbox_delivery_daemon",
             fake_opencode_daemon,
@@ -56,7 +58,8 @@ class TestPluginRegistryLifespan:
 
         request_scope = {"type": "http", "app": app, "headers": []}
 
-        status_run, log_run, inbox_run, opencode_daemon = _consumer_patches()
+        (status_run, log_run, inbox_run, recover_stale,
+         reconcile_orphans, opencode_daemon) = _consumer_patches()
 
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
@@ -74,6 +77,8 @@ class TestPluginRegistryLifespan:
             status_run,
             log_run,
             inbox_run,
+            recover_stale,
+            reconcile_orphans,
             opencode_daemon,
             patch.object(PluginRegistry, "load", mock_load),
             patch.object(PluginRegistry, "teardown", mock_teardown),
@@ -96,7 +101,8 @@ class TestPluginRegistryLifespan:
     ) -> None:
         """The lifespan should surface the empty-plugin INFO log from the registry."""
 
-        status_run, log_run, inbox_run, opencode_daemon = _consumer_patches()
+        (status_run, log_run, inbox_run, recover_stale,
+         reconcile_orphans, opencode_daemon) = _consumer_patches()
 
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
@@ -114,6 +120,8 @@ class TestPluginRegistryLifespan:
             status_run,
             log_run,
             inbox_run,
+            recover_stale,
+            reconcile_orphans,
             opencode_daemon,
             patch("importlib.metadata.entry_points", return_value=[]),
         ):
@@ -136,7 +144,8 @@ class TestPluginRegistryLifespan:
             async def on_message(self, event: PostSendMessageEvent) -> None:
                 del event
 
-        status_run, log_run, inbox_run, opencode_daemon = _consumer_patches()
+        (status_run, log_run, inbox_run, recover_stale,
+         reconcile_orphans, opencode_daemon) = _consumer_patches()
 
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
@@ -154,6 +163,8 @@ class TestPluginRegistryLifespan:
             status_run,
             log_run,
             inbox_run,
+            recover_stale,
+            reconcile_orphans,
             opencode_daemon,
             patch(
                 "importlib.metadata.entry_points",

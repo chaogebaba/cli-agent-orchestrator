@@ -963,6 +963,37 @@ class TestFlowOperations:
             value = connection.execute(text("SELECT orchestration_type FROM inbox")).scalar_one()
         assert value == OrchestrationType.SEND_MESSAGE.value
 
+    def test_inbox_failure_reason_migration_is_legacy_safe_and_idempotent(
+        self, tmp_path, monkeypatch
+    ):
+        from cli_agent_orchestrator.clients import database
+
+        legacy_engine = create_engine(f"sqlite:///{tmp_path / 'legacy-reason.db'}")
+        with legacy_engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE TABLE inbox (id INTEGER PRIMARY KEY, sender_id TEXT NOT NULL, "
+                    "receiver_id TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, "
+                    "created_at DATETIME)"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO inbox (sender_id, receiver_id, message, status) "
+                    "VALUES ('s', 'r', 'm', 'pending')"
+                )
+            )
+        monkeypatch.setattr(database, "engine", legacy_engine)
+
+        database._migrate_inbox_failure_reason()
+        database._migrate_inbox_failure_reason()
+
+        columns = {column["name"] for column in inspect(legacy_engine).get_columns("inbox")}
+        assert "failure_reason" in columns
+        with legacy_engine.connect() as connection:
+            value = connection.execute(text("SELECT failure_reason FROM inbox")).scalar_one()
+        assert value is None
+
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_create_inbox_message_receiver_not_found(self, mock_session_class):
         """create_inbox_message raises ValueError when receiver terminal does not exist."""

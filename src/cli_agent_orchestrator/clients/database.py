@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, cast
+from typing import Any, Callable, Dict, List, Optional, TypeVar, cast
 
 from sqlalchemy import (
     Boolean,
@@ -24,6 +24,7 @@ from sqlalchemy import (
     Index,
     create_engine,
     event,
+    exists,
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, declarative_base, sessionmaker
@@ -37,6 +38,7 @@ from cli_agent_orchestrator.models.terminal import RecoveryState, TerminalStatus
 logger = logging.getLogger(__name__)
 
 Base: Any = declarative_base()
+_ImmediateResult = TypeVar("_ImmediateResult")
 
 
 def _utcnow() -> datetime:
@@ -201,6 +203,7 @@ class InboxModel(Base):
         server_default=OrchestrationType.SEND_MESSAGE.value,
     )
     status = Column(String, nullable=False)  # MessageStatus enum value
+    failure_reason = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.now)
 
 
@@ -370,6 +373,7 @@ def init_db() -> None:
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
     _migrate_inbox_orchestration_type()
+    _migrate_inbox_failure_reason()
     _migrate_memory_indexes()
     _migrate_add_access_count()
     _migrate_add_last_compiled_at()
@@ -503,6 +507,15 @@ def _migrate_inbox_orchestration_type() -> None:
                 "DEFAULT 'send_message'"
             )
         )
+
+
+def _migrate_inbox_failure_reason() -> None:
+    """Add the nullable terminal-settlement reason to legacy inbox rows."""
+    with engine.begin() as connection:
+        columns = connection.execute(text("PRAGMA table_info(inbox)")).mappings().all()
+        if not columns or "failure_reason" in {column["name"] for column in columns}:
+            return
+        connection.execute(text("ALTER TABLE inbox ADD COLUMN failure_reason TEXT"))
 
 
 def _restrict_db_file_permissions() -> None:
@@ -2074,8 +2087,10 @@ WPM1_EVIDENCE_KEYS = frozenset({
     "last_activity_at", "last_observed_status", "last_observed_ref",
     "stalled_notified_at", "terminal_settled_at",
     "injection_completed_seq", "crash_recovery", "boundary_snapshot",
-    "queue_corroboration", "busy_initial_submit",
+    "queue_corroboration", "busy_initial_submit", "redelivery_tag",
 })
+
+ORPHAN_RECONCILE_BATCH_LIMIT = 100
 
 WPM2_CURSOR_VERSION = 1
 
@@ -2099,6 +2114,14 @@ class AttemptOpenResult:
     @classmethod
     def opened(cls, attempt_uuid: str) -> "AttemptOpenResult":
         return cls("opened", attempt_uuid)
+
+
+@dataclass(frozen=True)
+class OrphanReconcileResult:
+    settled_count: int = 0
+    notification_count: int = 0
+    logged_only_count: int = 0
+    busy_aborted: bool = False
 
 
 def _canonical_json(value: Any) -> str:
@@ -2355,6 +2378,21 @@ def _is_wpm1_evidence(value: str | None) -> bool:
     return isinstance(parsed, dict) and bool(WPM1_EVIDENCE_KEYS.intersection(parsed))
 
 
+def _has_valid_redelivery_tag(value: str | None, prior_attempt_uuid: str | None) -> bool:
+    if prior_attempt_uuid is None:
+        return False
+    parsed = _evidence_object(value)
+    tag = parsed.get("redelivery_tag")
+    if not isinstance(tag, dict):
+        return False
+    if tag.get("version") != 1 or tag.get("prior_attempt_uuid") != prior_attempt_uuid:
+        return False
+    try:
+        return str(uuid.UUID(prior_attempt_uuid)) == prior_attempt_uuid
+    except (ValueError, AttributeError):
+        return False
+
+
 def _valid_cursor(value: Any, *, versioned: bool = True) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -2459,10 +2497,14 @@ def settle_delivery_attempt(attempt_uuid: str, status: MessageStatus, outcome: s
         evidence_value = evidence
         if row.provider == "claude_code" and outcome not in {"confirmed", "failed"}:
             evidence_value = _canonical_json(_initialize_wpm2_cursor(_evidence_object(evidence)))
-        row.evidence = evidence_value if (
+        preserve_evidence = (
             outcome == "ambiguous" and reason == "confirmation_timeout"
             and _is_wpm1_evidence(evidence_value)
-        ) else evidence_value[:2048]
+        ) or _has_valid_redelivery_tag(evidence_value, row.prior_attempt_uuid)
+        row.evidence = (
+            _canonical_json(_evidence_object(evidence_value))
+            if preserve_evidence else evidence_value[:2048]
+        )
         row.settled_at = row.last_at = _utcnow()
         row.settled_status_gen = settled_status_gen
         ids = [x.message_id for x in db.query(InboxDeliveryAttemptMemberModel)
@@ -2563,6 +2605,7 @@ def get_message_trace(message_id: int) -> Optional[Dict[str, Any]]:
             attempts.append(item)
         return {"message": {"id": msg.id, "sender_id": msg.sender_id,
                             "receiver_id": msg.receiver_id, "status": msg.status,
+                            "failure_reason": msg.failure_reason,
                             "created_at": msg.created_at.isoformat()}, "attempts": attempts}
 
 
@@ -2601,7 +2644,9 @@ def _evidence_object(value: str | None) -> dict[str, Any]:
         return {}
 
 
-def _run_wpm1_immediate(operation: Callable[[Any], str]) -> str:
+def _run_wpm1_immediate(
+    operation: Callable[[Any], _ImmediateResult],
+) -> _ImmediateResult | str:
     """Run a paired WPM1 write with the frozen 3x1s busy policy."""
     for _ in range(3):
         db = SessionLocal()
@@ -2625,6 +2670,84 @@ def _run_wpm1_immediate(operation: Callable[[Any], str]) -> str:
             finally:
                 db.close()
     return "busy_aborted"
+
+
+def _p5_batch_key(message_ids: list[int]) -> str:
+    return ",".join(str(value) for value in sorted(set(message_ids)))
+
+
+def _record_p5_orphan_notices(db: Any, rows: list[InboxModel]) -> tuple[int, int]:
+    """Insert deterministic sender notices inside the owning settlement transaction."""
+    batches: dict[tuple[str, str], list[int]] = {}
+    for row in rows:
+        batches.setdefault((row.sender_id, row.receiver_id), []).append(row.id)
+
+    notification_count = 0
+    logged_only_count = 0
+    for (sender_id, receiver_id), message_ids in sorted(batches.items()):
+        ids = sorted(message_ids)
+        if db.query(TerminalModel.id).filter(TerminalModel.id == sender_id).first() is None:
+            logged_only_count += 1
+            logger.warning(
+                "P5 orphan settlement has no live sender %s for receiver %s batch %s",
+                sender_id, receiver_id, ids,
+            )
+            continue
+        header = f"p5-orphan receiver={receiver_id} batch={_p5_batch_key(ids)}\n"
+        notice_sender = f"message-trace:{receiver_id}"
+        existing = db.query(InboxModel).filter(
+            InboxModel.sender_id == notice_sender,
+            InboxModel.receiver_id == sender_id,
+            text("substr(message, 1, :n) = :header").bindparams(
+                n=len(header), header=header),
+        ).first()
+        if existing is None:
+            db.add(InboxModel(
+                sender_id=notice_sender, receiver_id=sender_id,
+                message=(header +
+                         f"[message-trace] delivery to terminal {receiver_id} failed because "
+                         f"the receiver terminal no longer exists for message(s) {ids}."),
+                orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+                status=MessageStatus.PENDING.value,
+            ))
+            notification_count += 1
+    return notification_count, logged_only_count
+
+
+def settle_pending_orphan_messages(
+    limit: int = ORPHAN_RECONCILE_BATCH_LIMIT,
+) -> OrphanReconcileResult:
+    """Settle the oldest PENDING messages whose receiver row is absent."""
+    if limit <= 0:
+        raise ValueError("orphan reconcile limit must be positive")
+
+    def operation(db: Any) -> OrphanReconcileResult:
+        candidates = (db.query(InboxModel).filter(
+            InboxModel.status == MessageStatus.PENDING.value,
+            ~exists().where(TerminalModel.id == InboxModel.receiver_id),
+        ).order_by(InboxModel.created_at.asc(), InboxModel.id.asc()).limit(limit).all())
+        settled: list[InboxModel] = []
+        for candidate in candidates:
+            changed = (db.query(InboxModel).filter(
+                InboxModel.id == candidate.id,
+                InboxModel.status == MessageStatus.PENDING.value,
+                ~exists().where(TerminalModel.id == InboxModel.receiver_id),
+            ).update({
+                InboxModel.status: MessageStatus.DELIVERY_FAILED.value,
+                InboxModel.failure_reason: "receiver_gone",
+            }, synchronize_session=False))
+            if changed == 1:
+                settled.append(candidate)
+        notification_count, logged_only_count = _record_p5_orphan_notices(db, settled)
+        return OrphanReconcileResult(
+            settled_count=len(settled), notification_count=notification_count,
+            logged_only_count=logged_only_count,
+        )
+
+    result = _run_wpm1_immediate(operation)
+    if isinstance(result, OrphanReconcileResult):
+        return result
+    return OrphanReconcileResult(busy_aborted=True)
 
 
 def advance_wpm2_continuity_cursor(
@@ -2933,18 +3056,23 @@ def recover_wpm2_stale_attempt(
             return "stale"
         members = sorted(x.message_id for x in db.query(InboxDeliveryAttemptMemberModel)
                          .filter_by(attempt_uuid=attempt_uuid).all())
-        delivering = db.query(InboxModel).filter(
-            InboxModel.id.in_(ids), InboxModel.status == MessageStatus.DELIVERING.value).count()
-        if members != ids or delivering != len(ids):
+        delivering_rows = db.query(InboxModel).filter(
+            InboxModel.id.in_(ids), InboxModel.status == MessageStatus.DELIVERING.value).all()
+        if members != ids or sorted(message.id for message in delivering_rows) != ids:
             return "stale"
         row.outcome, row.reason = outcome, reason
         row.evidence = _canonical_json(_initialize_wpm2_cursor(dict(evidence)))
         row.settled_at = row.last_at = _utcnow()
+        updates: dict[Any, Any] = {InboxModel.status: status.value}
+        if status == MessageStatus.DELIVERY_FAILED and reason == "receiver_gone":
+            updates[InboxModel.failure_reason] = "receiver_gone"
         changed = db.query(InboxModel).filter(
             InboxModel.id.in_(ids), InboxModel.status == MessageStatus.DELIVERING.value,
-        ).update({InboxModel.status: status.value}, synchronize_session=False)
+        ).update(updates, synchronize_session=False)
         if changed != len(ids):
             raise RuntimeError("stale recovery compare-and-set lost")
+        if status == MessageStatus.DELIVERY_FAILED and reason == "receiver_gone":
+            _record_p5_orphan_notices(db, delivering_rows)
         return "settled"
 
     return _run_wpm1_immediate(operation)

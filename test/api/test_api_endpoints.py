@@ -1269,6 +1269,10 @@ class TestLifespan:
                 main_module.inbox_service, "recover_stale_deliveries",
                 side_effect=lambda: startup_order.append("recover"),
             ) as mock_recover,
+            patch.object(
+                main_module.inbox_service, "reconcile_pending_orphans",
+                side_effect=lambda: startup_order.append("orphan_reconcile"),
+            ) as mock_orphan_reconcile,
             patch(
                 "cli_agent_orchestrator.api.main.terminal_service.recover_deferred_inits",
                 side_effect=recover_deferred,
@@ -1309,8 +1313,10 @@ class TestLifespan:
                     assert loop_arg is asyncio.get_running_loop()
                     mock_purge.assert_called_once_with()
                     mock_recover.assert_called_once_with()
+                    mock_orphan_reconcile.assert_called_once_with()
                     assert startup_order == [
-                        "init_db", "recover", "registry_load", "recover_deferred", "purge"
+                        "init_db", "recover", "orphan_reconcile", "registry_load",
+                        "recover_deferred", "purge"
                     ]
 
             assert "purged 2 stale terminals" in caplog.text
@@ -1353,6 +1359,8 @@ class TestLifespan:
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
+            patch.object(main_module.inbox_service, "recover_stale_deliveries"),
+            patch.object(main_module.inbox_service, "reconcile_pending_orphans"),
             patch(
                 "cli_agent_orchestrator.api.main.terminal_service.purge_stale_terminal_records",
                 return_value=0,

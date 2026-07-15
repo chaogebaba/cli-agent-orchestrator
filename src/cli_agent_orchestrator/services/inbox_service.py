@@ -14,6 +14,7 @@ from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
     AdmissionProof,
     AttemptOpenResult,
+    OrphanReconcileResult,
     begin_delivery_attempt,
     begin_delivery_attempt_if_no_other_delivering,
     confirm_batch_from_prior_attempt,
@@ -40,6 +41,7 @@ from cli_agent_orchestrator.clients.database import (
     list_stale_open_claude_attempts,
     recover_wpm2_stale_attempt,
     settle_delivery_attempt_proof_safe,
+    settle_pending_orphan_messages,
     advance_wpm2_continuity_cursor,
 )
 
@@ -70,6 +72,14 @@ logger = logging.getLogger(__name__)
 IDLE_STALL_AGE = 30 * 60
 ABS_STALLED_NOTICE_AGE = 4 * 60 * 60
 WPM2_STALE_OPEN_AGE_SECONDS = 60
+REDELIVERY_TAG_VERSION = 1
+
+
+def _redelivery_tag(prior_attempt_uuid: str) -> str:
+    return (
+        f"[redelivery of attempt {prior_attempt_uuid[:8]} - prior delivery unconfirmed; "
+        "ignore if already received]"
+    )
 
 
 def classify_permanently_d2_only(attempt: dict, current_observation_epoch: str | None) -> str:
@@ -680,26 +690,37 @@ class InboxService:
                     if gate_state == "normal" and _should_defer_waiting(terminal_id, provider):
                         _defer_messages(terminal_id, messages[sent_count:])
                         return
-                    shape_type = (
-                        None if registry is None and
-                        orchestration_type == OrchestrationType.SEND_MESSAGE
-                        else orchestration_type
-                    )
-                    prepared = terminal_service.prepare_input(terminal_id, combined, shape_type)
-                    digest = wire_hash(prepared)
-                    provider_name = metadata.get("provider", "unknown")
                     successor_source = None
                     persisted_evidence = gate_evidence
                     if gate_state == "inject":
                         persisted_evidence = dict(gate_evidence or {})
                         successor_source = persisted_evidence.pop(
                             "_wpm1_prior_attempt_uuid", None)
+                        if successor_source is not None:
+                            persisted_evidence["redelivery_tag"] = {
+                                "version": REDELIVERY_TAG_VERSION,
+                                "prior_attempt_uuid": successor_source,
+                            }
+                    shape_type = (
+                        None if registry is None and
+                        orchestration_type == OrchestrationType.SEND_MESSAGE
+                        else orchestration_type
+                    )
+                    base_prepared = terminal_service.prepare_input(
+                        terminal_id, combined, shape_type)
+                    wire_prepared = (
+                        f"{_redelivery_tag(successor_source)}\n{base_prepared}"
+                        if successor_source is not None else base_prepared
+                    )
+                    digest = wire_hash(wire_prepared)
+                    provider_name = metadata.get("provider", "unknown")
                     proof = make_admission_proof(
                         admission_kind, message_ids, successor_source)
                     if not legacy_test_seam and list_delivering_attempts_for_terminal(terminal_id):
                         return
                     opener_args = (
-                        batch, terminal_id, provider_name, digest, len(prepared.encode()),
+                        batch, terminal_id, provider_name, digest,
+                        len(wire_prepared.encode()),
                         status_monitor.get_input_gen(terminal_id),
                         status_monitor.get_status_gen(terminal_id),
                     )
@@ -759,7 +780,7 @@ class InboxService:
                         if not legacy_test_seam:
                             send_kwargs["on_submitted"] = submitted
                         submit_observation = terminal_service.send_prepared_input(
-                            terminal_id, prepared, **send_kwargs)
+                            terminal_id, wire_prepared, **send_kwargs)
                         if (not isinstance(getattr(submit_observation, "status", None), TerminalStatus)
                                 or not isinstance(getattr(
                                     submit_observation, "observation_epoch", None), str)
@@ -913,12 +934,26 @@ class InboxService:
         so the sweep never competes with the fast paths for freshly queued
         messages — it only adopts ones they have already missed.
         """
+        self.reconcile_pending_orphans()
         for terminal_id in list_pending_receiver_ids_older_than(INBOX_RECONCILE_GRACE_SECONDS):
             try:
                 self.deliver_pending(terminal_id, registry=registry)
             except Exception as e:
                 logger.debug(f"Inbox reconciliation failed for {terminal_id}: {e}")
         self.recover_stale_deliveries(recurring=True)
+
+    def reconcile_pending_orphans(self) -> OrphanReconcileResult:
+        """Settle one bounded batch of PENDING rows with absent receivers."""
+        result = settle_pending_orphan_messages()
+        if result.busy_aborted:
+            logger.warning("P5 orphan reconciliation aborted after bounded database contention")
+        elif result.settled_count:
+            logger.info(
+                "P5 orphan reconciliation settled %d message(s), queued %d notice(s), "
+                "logged-only %d batch(es)",
+                result.settled_count, result.notification_count, result.logged_only_count,
+            )
+        return result
 
     def _recover_wpm2_attempt(self, attempt: dict) -> None:
         terminal_id = attempt["receiver_terminal_id"]
@@ -931,11 +966,9 @@ class InboxService:
         try:
             metadata = get_terminal_metadata(terminal_id)
             if not metadata:
-                result = recover_wpm2_stale_attempt(
+                recover_wpm2_stale_attempt(
                     attempt_uuid, message_ids, MessageStatus.DELIVERY_FAILED,
                     "failed", "receiver_gone", {})
-                if result == "settled":
-                    self._notify_delivery_failed(terminal_id, message_ids, "receiver_gone")
                 return
             try:
                 evidence = json.loads(attempt.get("evidence") or "{}")

@@ -110,6 +110,9 @@ def _patched_lifespan(backend: object, tasks: list):
         # No-op the side-effecting startup calls.
         patch_main("setup_logging")
         patch_main("init_db")
+        inbox = patch_main("inbox_service")
+        inbox.recover_stale_deliveries.return_value = None
+        inbox.reconcile_pending_orphans.return_value = None
         stack.enter_context(
             patch(
                 "cli_agent_orchestrator.api.main.terminal_service.purge_stale_terminal_records",

@@ -35,4 +35,7 @@ class InboxMessage(BaseModel):
         default=OrchestrationType.SEND_MESSAGE, description="Orchestration mode"
     )
     status: MessageStatus = Field(..., description="Message status")
+    failure_reason: str | None = Field(
+        default=None, description="Terminal settlement reason, when available"
+    )
     created_at: datetime = Field(..., description="Creation timestamp")
