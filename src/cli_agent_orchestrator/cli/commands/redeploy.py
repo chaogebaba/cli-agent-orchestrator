@@ -13,6 +13,7 @@ import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL, CAO_HOME_DIR, MCP_REQUEST_TIMEOUT
 from cli_agent_orchestrator.services.verification_service import (
+    DeploymentStatus,
     cli_deploy_root,
     deployment_status,
     format_server_status,
@@ -20,17 +21,7 @@ from cli_agent_orchestrator.services.verification_service import (
 )
 
 
-_PROFILE_INSTALLS = (
-    ("chao_supervisor.md", None),
-    ("codex_dev.md", None),
-    ("codex_reviewer.md", None),
-    ("grok_oracle.md", "grok_cli"),
-    ("grok_dev.md", "grok_cli"),
-    ("grok_reviewer.md", "grok_cli"),
-    ("codex_base.md", None),
-    ("grok_base.md", "grok_cli"),
-    ("grok_tester.md", "grok_cli"),
-)
+_FROZEN_PROFILE_MARKER = "# FROZEN:"
 _NOT_RESTARTED = (
     "installed, NOT restarted - server-path changes inactive until restart"
 )
@@ -40,6 +31,21 @@ _VERIFY_TIMEOUT_SECONDS = 30
 
 def _redeploy_source_root() -> Path:
     return cli_deploy_root(git_root())
+
+
+def _installable_profiles(workspace_root: Path) -> list[Path]:
+    """Return active workspace profiles in deterministic filename order."""
+    profiles = sorted(
+        (workspace_root / "profiles").glob("*.md"), key=lambda path: path.name
+    )
+    return [
+        profile
+        for profile in profiles
+        if not any(
+            line.startswith(_FROZEN_PROFILE_MARKER)
+            for line in profile.read_text(encoding="utf-8").splitlines()
+        )
+    ]
 
 
 def _install_redeploy(source_root: Path) -> None:
@@ -53,11 +59,9 @@ def _install_redeploy(source_root: Path) -> None:
     if not providers_target.exists():
         shutil.copyfile(workspace_root / "providers.toml.default", providers_target)
     cao = shutil.which("cao") or "cao"
-    for profile_name, provider in _PROFILE_INSTALLS:
-        command = [cao, "install", str(workspace_root / "profiles" / profile_name)]
-        if provider is not None:
-            command.extend(["--provider", provider])
-        subprocess.run(command, check=True)
+    for profile in _installable_profiles(workspace_root):
+        # cao install derives the provider from the profile's own frontmatter.
+        subprocess.run([cao, "install", str(profile)], check=True)
 
 
 def _live_terminal_session_count() -> tuple[int, int] | None:
@@ -92,11 +96,11 @@ def _restart_server() -> None:
     subprocess.run(["systemctl", "--user", "restart", "cao-server"], check=True)
 
 
-def _verify_redeploy(source_root: Path) -> dict:
+def _verify_redeploy(source_root: Path) -> DeploymentStatus:
     return deployment_status(source_root)
 
 
-def _wait_for_server(source_root: Path) -> tuple[dict, int | None]:
+def _wait_for_server(source_root: Path) -> tuple[DeploymentStatus, int | None]:
     started = time.monotonic()
     deadline = started + _VERIFY_TIMEOUT_SECONDS
     reported_second: int | None = None
@@ -115,7 +119,7 @@ def _wait_for_server(source_root: Path) -> tuple[dict, int | None]:
 
 
 def _print_deployment(
-    status: dict,
+    status: DeploymentStatus,
     *,
     restarted: bool = False,
     timeout_seconds: int | None = None,

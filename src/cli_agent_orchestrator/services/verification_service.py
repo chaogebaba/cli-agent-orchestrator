@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import IO
+from typing import IO, TypedDict
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
@@ -26,6 +26,13 @@ _PYTEST_OUTCOME = re.compile(
 _PYTEST_COMPLETION = re.compile(
     r"\bin\s+\d+(?:\.\d+)?s(?:\s+\(\d+:\d{2}:\d{2}\))?\s*$"
 )
+
+
+class DeploymentStatus(TypedDict):
+    cli_path: str
+    differing_files: int | None
+    server: str
+    source_root: str
 
 
 def git_root(cwd: Path | None = None) -> Path:
@@ -283,7 +290,7 @@ def process_start_time(pid: int) -> float | None:
         return None
 
 
-def deployment_status(repo_root: Path) -> dict:
+def deployment_status(repo_root: Path) -> DeploymentStatus:
     """Return structured deploy truth for an explicit source root."""
     source_root = repo_root.resolve()
     installed = installed_package_root()

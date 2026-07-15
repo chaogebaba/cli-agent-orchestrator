@@ -163,8 +163,17 @@ def test_e4_install_mechanics_match_workspace_script(tmp_path, monkeypatch):
     profiles.mkdir(parents=True)
     source.mkdir()
     (source.parent / "providers.toml.default").write_text("[codex]\n", encoding="utf-8")
-    for profile, _provider in command._PROFILE_INSTALLS:
-        (profiles / profile).write_text(profile, encoding="utf-8")
+    profile_contents = {
+        "grok_doc_keeper.md": "---\nname: grok_doc_keeper\nprovider: grok_cli\n---\n",
+        "codex_dev.md": "---\nname: codex_dev\nprovider: codex\n---\n",
+        "chao_supervisor.md": "---\nname: chao_supervisor\n---\n",
+        "kiro_dev.md": (
+            "---\n# FROZEN: retained for revival only\nname: kiro_dev\n"
+            "provider: kiro_cli\n---\n"
+        ),
+    }
+    for profile, content in profile_contents.items():
+        (profiles / profile).write_text(content, encoding="utf-8")
     cao_home = tmp_path / "cao-home"
     monkeypatch.setattr(command, "CAO_HOME_DIR", cao_home)
     calls = []
@@ -177,6 +186,9 @@ def test_e4_install_mechanics_match_workspace_script(tmp_path, monkeypatch):
     assert calls[0] == [
         "uv", "tool", "install", "--force", "--python", "3.13", str(source)
     ]
-    assert len(calls) == 1 + len(command._PROFILE_INSTALLS)
-    assert all(call[:2] == ["/bin/cao", "install"] for call in calls[1:])
+    assert calls[1:] == [
+        ["/bin/cao", "install", str(profiles / "chao_supervisor.md")],
+        ["/bin/cao", "install", str(profiles / "codex_dev.md")],
+        ["/bin/cao", "install", str(profiles / "grok_doc_keeper.md")],
+    ]
     assert (cao_home / "providers.toml").read_text(encoding="utf-8") == "[codex]\n"
