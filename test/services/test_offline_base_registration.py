@@ -9,6 +9,7 @@ from unittest.mock import patch
 from urllib.parse import quote
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -224,6 +225,53 @@ def test_validation_precedes_supersession(
     )
     assert replacement["superseded"] is True
     assert database.get_ready_provider_session("stable")["session_uuid"] == missing_uuid
+
+
+def test_non_utf8_codex_rollout_is_stable_service_reject(
+    fake_home, profiles, tmp_path
+):
+    repo = _git_repo(tmp_path)
+    session_uuid = str(uuid.uuid4())
+    rollout = _write_codex(fake_home, session_uuid, repo)
+    rollout.write_bytes(b"\xff\xfe\x80")
+
+    with pytest.raises(svc.OfflineBaseRegistrationError) as caught:
+        svc.validate_base_source(
+            mode="registration", name="invalid-utf8", provider="codex",
+            session_uuid=session_uuid, cwd=str(repo),
+            agent_profile="codex_profile",
+        )
+    assert caught.value.code == "artifact_identity_mismatch"
+
+
+def test_non_utf8_codex_rollout_is_stable_api_400(
+    registry, fake_home, profiles, tmp_path
+):
+    from cli_agent_orchestrator.api.main import app
+
+    repo = _git_repo(tmp_path)
+    session_uuid = str(uuid.uuid4())
+    rollout = _write_codex(fake_home, session_uuid, repo)
+    rollout.write_bytes(b"\xff\xfe\x80")
+
+    response = TestClient(app).post(
+        "/bases/register",
+        headers={"Host": "localhost"},
+        json={
+            "name": "invalid-utf8",
+            "provider": "codex",
+            "session_uuid": session_uuid,
+            "cwd": str(repo),
+            "profile": "codex_profile",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": {
+            "code": "artifact_identity_mismatch",
+            "message": "provider artifact identity could not be validated",
+        }
+    }
 
 
 def test_fresh_then_mutate_then_stale_assign_succeeds_quietly(

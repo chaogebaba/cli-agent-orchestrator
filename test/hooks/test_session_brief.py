@@ -30,11 +30,19 @@ def test_required_failure_is_loud(monkeypatch, capsys):
 def test_compact_is_thin(monkeypatch, capsys):
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"source": "compact"})))
     monkeypatch.setenv("CAO_TERMINAL_ID", "term0001")
-    manifest = {"generated_at": "now", "complete": True, "profiles": [{"name": "a"}]}
+    manifest = {
+        "generated_at": "now",
+        "complete": False,
+        "profiles": [{"name": "a"}],
+        "sections": {"profiles": "ok", "tools": "not_collected", "activation": "error"},
+        "errors": [{"section": "activation", "code": "RuntimeError", "message": "broken"}],
+    }
     with patch("cli_agent_orchestrator.hooks.session_brief.requests.get", side_effect=[_response({"session_name": "cao-test"}), _response(manifest)]):
         assert main() == 0
     text = json.loads(capsys.readouterr().out)["additionalContext"]
     assert "run `cao session manifest --brief` for full" in text
+    assert "tools=not_collected" in text
+    assert "activation=error (RuntimeError)" in text
     assert "### Ready bases" not in text
 
 

@@ -152,8 +152,33 @@ def build_session_manifest(session_name: str, terminal_id: str | None = None) ->
 def render_session_brief(manifest: dict[str, Any], thin: bool = False) -> str:
     lines = ["## CAO Live Session Inventory", f"generated_at: {manifest['generated_at']}", f"complete: {str(manifest['complete']).lower()}"]
     names = ", ".join(p["name"] for p in manifest["profiles"])
+    errors = manifest.get("errors", [])
+    section_states = manifest.get("sections")
+    if isinstance(section_states, dict):
+        incomplete = [
+            (name, state)
+            for name, state in section_states.items()
+            if state != "ok"
+        ]
+    else:
+        # Additive-v1 compatibility for callers holding a pre-lattice snapshot.
+        incomplete = [(error["section"], "error") for error in errors]
+    error_codes = {error["section"]: error["code"] for error in errors}
+
+    def incomplete_line(name: str, state: str, separator: str) -> str:
+        suffix = (
+            f" ({error_codes[name]})"
+            if state == "error" and name in error_codes
+            else ""
+        )
+        return f"{name}{separator}{state}{suffix}"
+
     if thin:
-        return "\n".join(lines + [f"profiles: {names}", "run `cao session manifest --brief` for full"])
+        compact = [
+            "non-ok sections: "
+            + "; ".join(incomplete_line(name, state, "=") for name, state in incomplete)
+        ] if incomplete else []
+        return "\n".join(lines + [f"profiles: {names}"] + compact + ["run `cao session manifest --brief` for full"])
     lines += [f"session: {manifest['session']['name']}", "", "### Profiles"]
     for p in manifest["profiles"]:
         lines.append(f"- {p['name']} — role={p.get('role') or 'unknown'}, provider={p.get('provider') or 'default'}, skills={','.join(p['skills']) or '(none)'}; {p['charter_digest']}")
@@ -164,22 +189,10 @@ def render_session_brief(manifest: dict[str, Any], thin: bool = False) -> str:
     lines += ["", "### Terminals", *(f"- {t['id']} — {t.get('profile')} ({t.get('provider')}, {t.get('status')}, {t.get('kind')})" for t in manifest["terminals"])]
     a = manifest["activation"]
     lines += ["", "### Activation", f"- cli_path={a.get('cli_path')}, differing_files={a.get('differing_files')}, server={a.get('server')}, source_root={a.get('source_root')}"]
-    section_states = manifest.get("sections")
-    if isinstance(section_states, dict):
-        incomplete = [
-            (name, state)
-            for name, state in section_states.items()
-            if state != "ok"
-        ]
-    else:
-        # Additive-v1 compatibility for callers holding a pre-lattice snapshot.
-        incomplete = [(error["section"], "error") for error in manifest["errors"]]
     if incomplete:
-        error_codes = {error["section"]: error["code"] for error in manifest["errors"]}
         lines += ["", "### Incomplete sections"]
         for name, state in incomplete:
-            suffix = f" ({error_codes[name]})" if state == "error" and name in error_codes else ""
-            lines.append(f"- {name}: {state}{suffix}")
+            lines.append(f"- {incomplete_line(name, state, ': ')}")
     return "\n".join(lines)
 
 

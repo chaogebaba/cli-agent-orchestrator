@@ -367,7 +367,7 @@ def validate_base_source(
         _registration_error(
             "artifact_identity_mismatch", "provider artifact identity does not match the UUID"
         )
-    except (OSError, KeyError, json.JSONDecodeError):
+    except (OSError, KeyError, UnicodeError, json.JSONDecodeError):
         _registration_error(
             "artifact_identity_mismatch", "provider artifact identity could not be validated"
         )
@@ -381,7 +381,7 @@ def validate_base_source(
         try:
             with matches[0].open(encoding="utf-8") as stream:
                 payload_cwd = json.loads(stream.readline()).get("payload", {}).get("cwd")
-        except (IndexError, OSError, json.JSONDecodeError):
+        except (IndexError, OSError, UnicodeError, json.JSONDecodeError):
             _registration_error(
                 "artifact_identity_mismatch", "provider artifact metadata is invalid"
             )
