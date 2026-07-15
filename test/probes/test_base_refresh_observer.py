@@ -8,7 +8,15 @@ from pathlib import Path
 import pytest
 
 
-SCRIPT = Path(__file__).parents[3] / "probes" / "base-refresh-observer.py"
+def _find_observer_script() -> Path:
+    for root in Path(__file__).resolve().parents:
+        script = root / "probes" / "base-refresh-observer.py"
+        if script.is_file():
+            return script
+    raise RuntimeError("base-refresh-observer.py not found in repository ancestors")
+
+
+SCRIPT = _find_observer_script()
 TOKEN = "V2-ANSWER-TOKEN"
 
 
