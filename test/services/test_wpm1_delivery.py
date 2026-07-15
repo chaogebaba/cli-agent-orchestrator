@@ -448,15 +448,42 @@ def test_wpm1_all_terminal_arms_write_canonical_clock(wpm1_db, status, reason):
         assert evidence["terminal_settled_at"].endswith("Z")
 
 
-def test_wpm1_watchdog_suppression_query_episode_matrix(wpm1_db):
-    message, attempt = _ambiguous()
-    assert database.has_inflight_callback_since(
-        "sender", "receiver", datetime.now() - timedelta(minutes=1))
-    assert not database.has_inflight_callback_since(
-        "sender", "caller", datetime.now() - timedelta(minutes=1))
-    settle_wpm1_terminal_batch([message.id], MessageStatus.DELIVERED, "receiver")
-    assert not database.has_inflight_callback_since(
-        "sender", "receiver", datetime.now() - timedelta(minutes=1))
+def test_wpm1_watchdog_callback_status_query_exact_matrix(wpm1_db):
+    since = datetime.now()
+    query = database.get_callback_status_since
+    cases = [
+        ("sender", "receiver", timedelta(microseconds=1), MessageStatus.PENDING,
+         MessageStatus.PENDING),
+        ("sender", "receiver", timedelta(microseconds=1), MessageStatus.DELIVERING,
+         MessageStatus.DELIVERING),
+        ("sender", "receiver", timedelta(microseconds=1), MessageStatus.DELIVERED,
+         MessageStatus.DELIVERED),
+        ("sender", "receiver", timedelta(microseconds=1), MessageStatus.FAILED, None),
+        ("sender", "receiver", timedelta(microseconds=1),
+         MessageStatus.DELIVERY_FAILED, None),
+        ("other", "receiver", timedelta(microseconds=1), MessageStatus.PENDING, None),
+        ("watchdog:sender", "receiver", timedelta(microseconds=1),
+         MessageStatus.PENDING, None),
+        ("sender", "caller", timedelta(microseconds=1), MessageStatus.PENDING, None),
+        ("sender", "receiver", -timedelta(microseconds=1),
+         MessageStatus.PENDING, None),
+        ("sender", "receiver", timedelta(0), MessageStatus.PENDING, None),
+    ]
+
+    for row_sender, row_receiver, offset, status, expected in cases:
+        with wpm1_db.begin() as db:
+            db.query(InboxModel).delete()
+            db.add(
+                InboxModel(
+                    sender_id=row_sender,
+                    receiver_id=row_receiver,
+                    message="wire",
+                    orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+                    status=status.value,
+                    created_at=since + offset,
+                )
+            )
+        assert query("sender", "receiver", since) == expected
 
 
 def test_wpm1_watchdog_collect_due_uses_episode_scoped_inflight_query(wpm1_db):
@@ -467,6 +494,54 @@ def test_wpm1_watchdog_collect_due_uses_episode_scoped_inflight_query(wpm1_db):
     watchdog._episodes["sender"].last_screen_fp = "stable"
     assert watchdog.collect_due_notifications(now=13) == []
     assert not watchdog._episodes["sender"].fired
+
+
+@pytest.mark.parametrize(
+    "failure_status", [MessageStatus.FAILED, MessageStatus.DELIVERY_FAILED]
+)
+def test_wpm1_watchdog_pending_callback_failure_transition_fires_once(
+    wpm1_db, failure_status
+):
+    watchdog = StalledCallbackWatchdog(grace_seconds=3)
+    watchdog.record_inbound_task("sender", "receiver", "developer")
+    message = create_inbox_message("sender", "receiver", "callback")
+    watchdog.record_status("sender", TerminalStatus.IDLE, now=10)
+    watchdog._episodes["sender"].last_screen_fp = "stable"
+
+    assert watchdog.collect_due_notifications(now=13) == []
+    episode = watchdog._episodes["sender"]
+    assert not episode.callback_seen
+    assert not episode.fired
+
+    with wpm1_db.begin() as db:
+        db.get(InboxModel, message.id).status = failure_status.value
+
+    assert watchdog.collect_due_notifications(now=14) == [
+        (
+            "sender",
+            "receiver",
+            "[watchdog] worker sender (developer) idle 4s without callback",
+        )
+    ]
+    assert watchdog.collect_due_notifications(now=15) == []
+
+
+@pytest.mark.parametrize(
+    "failure_status", [MessageStatus.FAILED, MessageStatus.DELIVERY_FAILED]
+)
+def test_wpm1_watchdog_terminal_failure_only_callback_fires_once(
+    wpm1_db, failure_status
+):
+    watchdog = StalledCallbackWatchdog(grace_seconds=3)
+    watchdog.record_inbound_task("sender", "receiver", "developer")
+    message = create_inbox_message("sender", "receiver", "callback")
+    with wpm1_db.begin() as db:
+        db.get(InboxModel, message.id).status = failure_status.value
+    watchdog.record_status("sender", TerminalStatus.IDLE, now=10)
+    watchdog._episodes["sender"].last_screen_fp = "stable"
+
+    assert len(watchdog.collect_due_notifications(now=13)) == 1
+    assert watchdog.collect_due_notifications(now=14) == []
 
 
 def _gate_message() -> InboxMessage:

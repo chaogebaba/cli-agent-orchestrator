@@ -3,13 +3,21 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.stalled_callback_watchdog import StalledCallbackWatchdog
 
 
 def _mark_screen_sampled(svc, terminal_id="worker1"):
     svc._episodes[terminal_id].last_screen_fp = "sample"
+
+
+def _armed_due_watchdog():
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    svc.record_inbound_task("worker1", "caller1", "developer")
+    svc.record_status("worker1", TerminalStatus.IDLE, now=10.0)
+    _mark_screen_sampled(svc)
+    return svc
 
 
 def test_watchdog_pushes_exactly_one_due_notification():
@@ -307,13 +315,95 @@ def test_join_keeps_first_assignment_as_d4_suppression_lower_bound():
             return_value={"id": "worker1"},
         ),
         patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog.has_inflight_callback_since",
-            return_value=True,
-        ) as inflight,
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "get_callback_status_since",
+            return_value=MessageStatus.PENDING,
+        ) as callback_status,
     ):
         assert svc.collect_due_notifications(now=13.0) == []
-    inflight.assert_called_once_with("worker1", "caller1", started)
+    callback_status.assert_called_once_with("worker1", "caller1", started)
     assert not episode.fired
+
+
+@pytest.mark.parametrize(
+    "status", [MessageStatus.PENDING, MessageStatus.DELIVERING]
+)
+def test_watchdog_provisional_callback_suppresses_and_requeries(status):
+    svc = _armed_due_watchdog()
+    episode = svc._episodes["worker1"]
+
+    with (
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "get_terminal_metadata",
+            return_value={"id": "worker1"},
+        ),
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "get_callback_status_since",
+            return_value=status,
+        ) as callback_status,
+    ):
+        assert svc.collect_due_notifications(now=13.0) == []
+        assert svc.collect_due_notifications(now=14.0) == []
+
+    assert callback_status.call_count == 2
+    assert not episode.callback_seen
+    assert not episode.fired
+
+
+def test_watchdog_delivered_callback_durably_suppresses_without_requery():
+    svc = _armed_due_watchdog()
+    episode = svc._episodes["worker1"]
+
+    with (
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "get_terminal_metadata",
+            return_value={"id": "worker1"},
+        ),
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "get_callback_status_since",
+            return_value=MessageStatus.DELIVERED,
+        ) as callback_status,
+    ):
+        assert svc.collect_due_notifications(now=13.0) == []
+        assert svc.collect_due_notifications(now=14.0) == []
+
+    callback_status.assert_called_once()
+    assert episode.callback_seen
+    assert not episode.fired
+
+
+def test_watchdog_refresh_rearm_pending_callback_prevents_second_fire():
+    svc = _armed_due_watchdog()
+    first_episode = svc._episodes["worker1"]
+
+    with (
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "get_terminal_metadata",
+            return_value={"id": "worker1", "caller_id": "caller1"},
+        ),
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "get_callback_status_since",
+            side_effect=[None, MessageStatus.PENDING],
+        ) as callback_status,
+    ):
+        assert len(svc.collect_due_notifications(now=13.0)) == 1
+        svc.record_callback_if_to_caller("worker1", "caller1")
+        svc.record_inbound_task("worker1", "caller1", "developer")
+        svc.record_status("worker1", TerminalStatus.IDLE, now=20.0)
+        _mark_screen_sampled(svc)
+        assert svc.collect_due_notifications(now=23.0) == []
+
+    second_episode = svc._episodes["worker1"]
+    assert second_episode is not first_episode
+    assert callback_status.call_count == 2
+    assert not second_episode.callback_seen
+    assert not second_episode.fired
 
 
 def test_watchdog_prunes_deleted_terminal_without_push():

@@ -14,8 +14,8 @@ from datetime import datetime
 
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
+    get_callback_status_since,
     get_terminal_metadata,
-    has_inflight_callback_since,
     list_pending_receiver_ids,
 )
 from cli_agent_orchestrator.constants import (
@@ -23,6 +23,7 @@ from cli_agent_orchestrator.constants import (
     STALLED_CALLBACK_GRACE_SECONDS,
     WAITING_INBOX_PUSH_FLOOR_S,
 )
+from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.services.event_bus import bus
@@ -268,9 +269,12 @@ class StalledCallbackWatchdog:
                 idle_seconds = int(now - episode.idle_since)
                 if idle_seconds < self.grace_seconds:
                     continue
-                if has_inflight_callback_since(
+                callback_status = get_callback_status_since(
                     terminal_id, episode.caller_id, episode.episode_started_wall_at
-                ):
+                )
+                if callback_status is not None:
+                    if callback_status == MessageStatus.DELIVERED:
+                        episode.callback_seen = True
                     continue
                 episode.fired = True
                 due.append(

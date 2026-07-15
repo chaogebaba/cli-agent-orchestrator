@@ -2867,22 +2867,24 @@ def settle_wpm1_terminal_batch(
     return _run_wpm1_immediate(operation)
 
 
-def has_inflight_callback_since(sender_id: str, receiver_id: str, since: datetime) -> bool:
-    """Whether this watchdog episode has a newer deferred/ambiguous callback."""
+def get_callback_status_since(
+    sender_id: str, receiver_id: str, since: datetime
+) -> MessageStatus | None:
+    """Return a newer callback status that suppresses the watchdog."""
     with SessionLocal() as db:
-        return db.query(InboxModel.id).join(
-            InboxDeliveryAttemptMemberModel,
-            InboxDeliveryAttemptMemberModel.message_id == InboxModel.id,
-        ).join(
-            InboxDeliveryAttemptModel,
-            InboxDeliveryAttemptModel.attempt_uuid == InboxDeliveryAttemptMemberModel.attempt_uuid,
-        ).filter(
+        row = db.query(InboxModel.status).filter(
             InboxModel.sender_id == sender_id,
             InboxModel.receiver_id == receiver_id,
             InboxModel.created_at > since,
-            InboxModel.status == MessageStatus.PENDING.value,
-            InboxDeliveryAttemptModel.outcome.in_(("deferred", "ambiguous")),
-        ).first() is not None
+            InboxModel.status.in_(
+                (
+                    MessageStatus.PENDING.value,
+                    MessageStatus.DELIVERING.value,
+                    MessageStatus.DELIVERED.value,
+                )
+            ),
+        ).first()
+        return MessageStatus(row[0]) if row is not None else None
 
 
 def transition_pending_to_delivery_failed(message_ids: list[int]) -> bool:
