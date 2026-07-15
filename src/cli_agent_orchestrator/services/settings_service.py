@@ -66,6 +66,22 @@ def get_provider_defaults(provider: str) -> Dict[str, Any]:
     return dict(section)
 
 
+def get_default_fork_base(provider: str, profile_name: str) -> Optional[str]:
+    """Resolve the profile-over-provider default base without caching TOML."""
+    provider_defaults = get_provider_defaults(provider)
+    profiles = provider_defaults.get("profiles")
+    profile_defaults: Dict[str, Any] = {}
+    if isinstance(profiles, dict):
+        candidate = profiles.get(profile_name)
+        if isinstance(candidate, dict):
+            profile_defaults = candidate
+    for defaults in (profile_defaults, provider_defaults):
+        if "default_fork_base" in defaults:
+            value = defaults["default_fork_base"]
+            return value.strip() if isinstance(value, str) and value.strip() else None
+    return None
+
+
 def get_agent_dirs() -> Dict[str, str]:
     """Get configured agent directories per provider.
 

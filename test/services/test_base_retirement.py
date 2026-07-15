@@ -2,7 +2,14 @@
 
 from unittest.mock import patch
 
-from cli_agent_orchestrator.services.fork_context_service import list_bases, retire
+import pytest
+
+from cli_agent_orchestrator.services.fork_context_service import (
+    ForkContextError,
+    list_bases,
+    resolve_base,
+    retire,
+)
 
 
 def test_retire_is_thin_and_makes_no_backend_or_terminal_call():
@@ -29,3 +36,22 @@ def test_list_bases_uses_ready_only_registry_rows():
         assert list_bases() == []
     ready_rows.assert_called_once_with()
 
+
+def test_e3_anchor_is_typed_unforkable_and_absent_from_forkable_listing():
+    anchor = {"name": "root", "kind": "anchor"}
+    base = {"name": "forkable", "kind": "base"}
+    with patch(
+        "cli_agent_orchestrator.services.fork_context_service.get_ready_provider_session",
+        return_value=anchor,
+    ):
+        with pytest.raises(ForkContextError, match="anchor_not_forkable:root"):
+            resolve_base("root")
+
+    with patch(
+        "cli_agent_orchestrator.services.fork_context_service.list_ready_provider_sessions",
+        return_value=[anchor, base],
+    ), patch(
+        "cli_agent_orchestrator.services.fork_context_service.staleness",
+        return_value=([], "fresh"),
+    ):
+        assert [row["name"] for row in list_bases()] == ["forkable"]

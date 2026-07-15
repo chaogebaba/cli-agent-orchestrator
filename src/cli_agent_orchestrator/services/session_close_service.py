@@ -106,7 +106,7 @@ def close_session(session_name: str, *, keep_bases: bool = False, force: bool = 
             elif source_id in delete_by_id:
                 if not delete_by_id[source_id]:
                     settlement = "source_not_deleted"
-                elif keep_bases:
+                elif keep_bases and registration.get("kind", "base") == "base":
                     settlement = "kept"
                 else:
                     try:
@@ -114,7 +114,7 @@ def close_session(session_name: str, *, keep_bases: bool = False, force: bool = 
                     except Exception:
                         settlement = "retire_failed"
             elif source is None:
-                if keep_bases:
+                if keep_bases and registration.get("kind", "base") == "base":
                     settlement = "kept"
                 else:
                     try:

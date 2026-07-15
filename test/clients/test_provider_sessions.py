@@ -47,6 +47,49 @@ def test_fresh_schema_accepts_retired(provider_db):
     assert retired["status"] == "retired"
 
 
+def test_e3_anchor_kind_round_trips_and_cold_name_is_reserved(provider_db):
+    anchor = database.register_provider_session(**values(name="root", kind="anchor"))
+    assert anchor["kind"] == "anchor"
+    assert database.get_ready_provider_session("root")["kind"] == "anchor"
+
+    with pytest.raises(ValueError, match="base_name_reserved:cold"):
+        database.register_provider_session(**values(name="cold"))
+
+
+def test_e3_kind_migration_backfills_existing_rows_as_base(tmp_path, monkeypatch):
+    db_file = tmp_path / "kind-legacy.db"
+    with sqlite3.connect(db_file) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE provider_sessions (
+                id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL, provider TEXT NOT NULL, session_uuid TEXT NOT NULL,
+                cwd TEXT NOT NULL, agent_profile TEXT NOT NULL, git_sha TEXT,
+                dirty_hashes TEXT DEFAULT '{}' NOT NULL, summary TEXT, status TEXT NOT NULL,
+                source_terminal_id TEXT, session_name TEXT, created_at DATETIME, updated_at DATETIME,
+                CONSTRAINT ck_provider_sessions_status
+                    CHECK (status IN ('ready','superseded','retired'))
+            );
+            INSERT INTO provider_sessions
+                (name, provider, session_uuid, cwd, agent_profile, status)
+                VALUES ('legacy', 'codex', 'legacy-uuid', '/repo', 'developer', 'ready');
+            """
+        )
+    engine = create_engine(f"sqlite:///{db_file}")
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
+
+    database._migrate_provider_sessions_kind()
+    database._migrate_provider_sessions_kind()
+
+    with engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT name, kind FROM provider_sessions")
+        ).all() == [("legacy", "base")]
+    from cli_agent_orchestrator.services.fork_context_service import resolve_base
+    assert resolve_base("legacy")["kind"] == "base"
+
+
 def test_legacy_schema_migrates_rows_index_and_actual_retire(tmp_path, monkeypatch):
     db_file = tmp_path / "legacy.db"
     with sqlite3.connect(db_file) as conn:

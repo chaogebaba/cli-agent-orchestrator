@@ -207,6 +207,7 @@ class CreateTerminalBody(BaseModel):
     initial_message: Optional[str] = None
     initial_message_orchestration_type: Optional[str] = None
     fork_context: Optional[ForkContext] = None
+    refresh_base_name: Optional[str] = None
 
 
 class RunStepRequest(BaseModel):
@@ -1422,6 +1423,7 @@ async def create_terminal_in_session(
             initial_message=initial_message,
             initial_message_orchestration_type=orch_type,
             fork_context=fork_context,
+            refresh_base_name=body.refresh_base_name if body else None,
         )
         return result
     except HTTPException:

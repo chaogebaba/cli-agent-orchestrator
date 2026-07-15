@@ -83,6 +83,33 @@ def test_d7_registration_settlement_rows(monkeypatch, keep, source_present, dele
     assert result["bases"] == [{"base": "b", "status": expected}]
 
 
+def test_e3_keep_bases_retires_anchor_but_preserves_base(monkeypatch):
+    terminals = [
+        {"id": "anchor-term", "agent_profile": "base", "tmux_session": "cao-s"},
+        {"id": "base-term", "agent_profile": "base", "tmux_session": "cao-s"},
+    ]
+    registrations = [
+        {"name": "anchor", "kind": "anchor", "source_terminal_id": "anchor-term",
+         "session_name": "cao-s"},
+        {"name": "base", "kind": "base", "source_terminal_id": "base-term",
+         "session_name": "cao-s"},
+    ]
+    retired = []
+    _install(monkeypatch, terminals=terminals, registrations=registrations)
+    monkeypatch.setattr(
+        service, "retire_provider_session",
+        lambda name: retired.append(name) or {"status": "retired"},
+    )
+
+    result = service.close_session("cao-s", keep_bases=True)
+
+    assert retired == ["anchor"]
+    assert result["bases"] == [
+        {"base": "anchor", "status": "retired"},
+        {"base": "base", "status": "kept"},
+    ]
+
+
 def test_d7_other_session_source_is_skipped(monkeypatch):
     other = {"id": "t", "agent_profile": "base", "tmux_session": "cao-other"}
     _install(monkeypatch, terminals=[], registrations=[

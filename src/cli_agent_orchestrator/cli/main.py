@@ -13,6 +13,7 @@ from cli_agent_orchestrator.cli.commands.launch import launch
 from cli_agent_orchestrator.cli.commands.mcp_server import mcp_server
 from cli_agent_orchestrator.cli.commands.memory import memory
 from cli_agent_orchestrator.cli.commands.profile import profile
+from cli_agent_orchestrator.cli.commands.redeploy import redeploy
 from cli_agent_orchestrator.cli.commands.schedule import flow, schedule
 from cli_agent_orchestrator.cli.commands.session import session
 from cli_agent_orchestrator.cli.commands.shutdown import shutdown
@@ -42,6 +43,7 @@ cli.add_command(launch)
 cli.add_command(config)
 cli.add_command(init)
 cli.add_command(install)
+cli.add_command(redeploy)
 cli.add_command(shutdown)
 cli.add_command(schedule)
 cli.add_command(flow)  # deprecated alias for 'schedule' (issue #378)

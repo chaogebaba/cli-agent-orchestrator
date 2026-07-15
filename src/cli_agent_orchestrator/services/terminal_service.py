@@ -27,15 +27,17 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, Optional
+from typing import Dict, Optional, cast
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     claim_deferred_init_failure,
     delete_terminal_and_warm_intent,
+    get_ready_provider_session,
     list_deferred_init_recovery_rows,
     mark_terminal_init_ready,
+    update_provider_session_snapshot,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import create_terminal_with_warm_intent
@@ -65,6 +67,10 @@ from cli_agent_orchestrator.services.deferred_dispatcher import (
 )
 from cli_agent_orchestrator.services.draft_guard import preserve_draft_before_send, stash_draft_before_send
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
+from cli_agent_orchestrator.services.fork_context_service import (
+    snapshot as fork_snapshot,
+    staleness as fork_staleness,
+)
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
@@ -99,6 +105,7 @@ _deferred_tasks_lock = threading.Lock()
 
 POLL_INTERVAL = 2.0
 DEFERRED_TASK_QUIESCE_S = 10.0
+FORK_REFRESH_WAIT_BUDGET = 120.0
 SERVER_INIT_OWNER_EPOCH = str(uuid.uuid4())
 
 
@@ -113,6 +120,7 @@ class _DeferredTaskRecord:
 
 
 _deferred_tasks_by_terminal: dict[str, _DeferredTaskRecord] = {}
+_fork_refresh_locks: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock] = {}
 
 
 class TerminalInputBlockedError(Exception):
@@ -496,6 +504,7 @@ async def create_terminal(
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
     fork_context=None,
+    refresh_base_name: Optional[str] = None,
     allow_incomplete_brief: bool = False,
     terminal_id: Optional[str] = None,
     lease_token=None,
@@ -831,7 +840,7 @@ async def create_terminal(
         # keeps the tool call under 2s.
         if defer_init:
             shell_command = None  # unknown until initialize() runs
-            if fork_context and initial_message:
+            if fork_context and initial_message and refresh_base_name is None:
                 initial_message = f"{fork_context.initial_preamble}\n\n{initial_message}"
             published_snapshot = get_terminal_metadata(terminal_id)
             if published_snapshot is None:
@@ -851,6 +860,8 @@ async def create_terminal(
                     "resume" if resume_uuid else "first_time"
                 ),
                 caller_snapshot=published_snapshot,
+                fork_context=fork_context,
+                refresh_base_name=refresh_base_name,
             )
         else:
             try:
@@ -1529,6 +1540,173 @@ async def recover_deferred_inits(
                 logger.exception("deferred_init_settlement_failed terminal=%s", terminal_id)
 
 
+def _fork_refresh_lock(base_name: str) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    key = (loop, base_name)
+    lock = _fork_refresh_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _fork_refresh_locks[key] = lock
+    return lock
+
+
+def _fork_refresh_prompt(base_name: str, changed: list[str]) -> str:
+    paths = "\n".join(f"- {path}" for path in changed)
+    return (
+        f"[CAO AUTO-REFRESH] Refresh registered base '{base_name}'. Re-read and "
+        "ingest the current contents of every changed file below. Do no unrelated "
+        f"work; reply only after the refresh is complete.\n\n{paths}"
+    )
+
+
+def _dispatch_base_refresh(
+    base_terminal_id: str,
+    message: str,
+    *,
+    sender_id: str | None,
+    registry: PluginRegistry | None,
+) -> bool:
+    from cli_agent_orchestrator.services.terminal_guard_service import require_input_allowed
+
+    require_input_allowed(base_terminal_id, refresh_ingest=True)
+    return send_input(
+        base_terminal_id,
+        message,
+        registry=registry,
+        sender_id=sender_id,
+        orchestration_type=OrchestrationType.SEND_MESSAGE,
+    )
+
+
+async def _wait_for_base_ready(
+    base_terminal_id: str,
+    deadline: float,
+    *,
+    input_gen: int | None = None,
+) -> bool:
+    while time.monotonic() < deadline:
+        status = status_monitor.get_status(base_terminal_id)
+        if status == TerminalStatus.ERROR:
+            return False
+        if status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}:
+            if input_gen is None:
+                return True
+            status_gen = status_monitor.get_status_gen(base_terminal_id)
+            if status_gen is None or status_gen >= input_gen:
+                return True
+        await asyncio.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    return False
+
+
+async def _prepare_fork_refresh(
+    terminal_id: str,
+    generation: str,
+    base_name: str,
+    stale_preamble: str,
+    registry: PluginRegistry | None,
+    caller_snapshot: dict,
+) -> str:
+    """Coalesce one bounded refresh and return a fresh or stale preamble."""
+    deadline = time.monotonic() + FORK_REFRESH_WAIT_BUDGET
+    lock = _fork_refresh_lock(base_name)
+    try:
+        await asyncio.wait_for(lock.acquire(), max(0.0, deadline - time.monotonic()))
+    except asyncio.TimeoutError:
+        return stale_preamble
+    try:
+        row, _ = await _tracked_blocking(
+            terminal_id, generation, "abandonable", "fork_refresh_read",
+            get_ready_provider_session, base_name, deadline=deadline,
+        )
+        if row is None or row.get("kind", "base") != "base":
+            return stale_preamble
+        changed_and_preamble, _ = await _tracked_blocking(
+            terminal_id, generation, "abandonable", "fork_refresh_compare",
+            fork_staleness,
+            row,
+            deadline=deadline,
+        )
+        changed, current_preamble = changed_and_preamble
+        if not changed:
+            return cast(str, current_preamble)
+        base_terminal_id = row.get("source_terminal_id")
+        if not base_terminal_id:
+            return stale_preamble
+        if not await _wait_for_base_ready(base_terminal_id, deadline):
+            return stale_preamble
+        dispatched, _ = await _tracked_blocking(
+            terminal_id, generation, "abandonable", "fork_refresh_send",
+            _dispatch_base_refresh,
+            base_terminal_id,
+            _fork_refresh_prompt(base_name, changed),
+            sender_id=caller_snapshot.get("caller_id"),
+            registry=registry,
+            deadline=deadline,
+        )
+        if not dispatched:
+            return stale_preamble
+        input_gen = status_monitor.get_input_gen(base_terminal_id)
+        if not await _wait_for_base_ready(
+            base_terminal_id, deadline, input_gen=input_gen
+        ):
+            return stale_preamble
+        snapshot_result, _ = await _tracked_blocking(
+            terminal_id, generation, "abandonable", "fork_refresh_snapshot",
+            fork_snapshot, row["cwd"], deadline=deadline,
+        )
+        sha, hashes = snapshot_result
+        current, _ = await _tracked_blocking(
+            terminal_id, generation, "abandonable", "fork_refresh_read",
+            get_ready_provider_session, base_name, deadline=deadline,
+        )
+        if (
+            current is None
+            or current.get("kind", "base") != "base"
+            or current.get("source_terminal_id") != base_terminal_id
+            or current.get("session_uuid") != row.get("session_uuid")
+        ):
+            return stale_preamble
+        updated, _ = await _tracked_blocking(
+            terminal_id, generation, "abandonable", "fork_refresh_snapshot_write",
+            update_provider_session_snapshot,
+            current["id"], git_sha=sha, dirty_hashes=hashes, deadline=deadline,
+        )
+        if updated is None:
+            return stale_preamble
+        refreshed, _ = await _tracked_blocking(
+            terminal_id, generation, "abandonable", "fork_refresh_compare",
+            fork_staleness, updated, deadline=deadline,
+        )
+        return cast(str, refreshed[1])
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("fork_refresh_failed base=%s terminal=%s", base_name, terminal_id)
+        return stale_preamble
+    finally:
+        lock.release()
+
+
+async def _prepare_fork_message(
+    terminal_id: str,
+    generation: str,
+    initial_message: str | None,
+    fork_context,
+    refresh_base_name: str | None,
+    registry: PluginRegistry | None,
+    caller_snapshot: dict,
+) -> str | None:
+    if fork_context is None or not initial_message:
+        return initial_message
+    preamble = fork_context.initial_preamble
+    if refresh_base_name is not None:
+        preamble = await _prepare_fork_refresh(
+            terminal_id, generation, refresh_base_name, preamble,
+            registry, caller_snapshot,
+        )
+    return f"{preamble}\n\n{initial_message}"
+
+
 def _schedule_deferred_init(
     provider_instance,
     terminal_id: str,
@@ -1541,6 +1719,8 @@ def _schedule_deferred_init(
     owns_lifecycle_lease: bool = False,
     settlement_form: str = "first_time",
     caller_snapshot: dict | None = None,
+    fork_context=None,
+    refresh_base_name: str | None = None,
 ) -> None:
     """Kick off provider.initialize() in the background and, on success,
     deliver the initial message via send_input.
@@ -1562,6 +1742,10 @@ def _schedule_deferred_init(
 
     async def _run() -> None:
         try:
+            prepared_message = await _prepare_fork_message(
+                terminal_id, generation, initial_message, fork_context,
+                refresh_base_name, registry, snapshot,
+            )
             await provider_instance.initialize()
             prepared, _ = await _tracked_blocking(
                 terminal_id, generation, "abandonable", "capture_persist",
@@ -1583,7 +1767,7 @@ def _schedule_deferred_init(
                     terminal_id, generation, "abandonable", "capture_persist",
                     update_terminal_shell_command, terminal_id, shell_command,
                 )
-            if initial_message:
+            if prepared_message:
                 # For assign/handoff the sender is the CALLER (the supervisor),
                 # not this MCP server. But the deferred path is used only via
                 # /assign, and _assign_impl on the MCP-server side already
@@ -1594,7 +1778,7 @@ def _schedule_deferred_init(
                     terminal_id, generation, "abandonable", "send_input",
                     send_input,
                     terminal_id,
-                    initial_message,
+                    prepared_message,
                     registry=registry,
                     sender_id=snapshot.get("caller_id"),
                     orchestration_type=orchestration_type,
@@ -1619,7 +1803,7 @@ def _schedule_deferred_init(
                     create_inbox_message,
                     snapshot.get("caller_id") or "unknown",
                     terminal_id,
-                    initial_message,
+                    prepared_message,
                     OrchestrationType.ASSIGN,
                 )
                 queued = True

@@ -106,7 +106,8 @@ def build_session_manifest(session_name: str, terminal_id: str | None = None) ->
         "name": b["name"], "provider": b["provider"], "profile": b.get("agent_profile"),
         "source_terminal_id": b.get("source_terminal_id"), "cwd": b.get("cwd"),
         "git_sha": b.get("git_sha"), "staleness_count": b.get("staleness_count", 0),
-        "status": b.get("status"), "updated_at": b.get("updated_at"),
+        "status": b.get("status"), "kind": b.get("kind", "base"),
+        "updated_at": b.get("updated_at"),
     } for b in list_bases()], key=lambda r: r["name"]), [])
     skill_rows = collect("skills", lambda: [{"name": s.name, "description": s.description} for s in list_skills()], [])
     workflow_rows = collect("workflows", lambda: sorted([{"name": w.name, "description": w.description, "source": w.source_path} for w in list_workflows()], key=lambda r: r["name"]), [])

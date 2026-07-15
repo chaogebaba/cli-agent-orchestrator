@@ -120,7 +120,7 @@ def staleness(row: dict[str, Any]) -> tuple[Optional[list[str]], str]:
 def resolve_base(value: str) -> dict[str, Any]:
     row = get_ready_provider_session(value)
     if row:
-        return row
+        return _require_forkable(row)
     terminal = get_terminal_metadata(value)
     if terminal:
         uuid = terminal.get("provider_session_id")
@@ -129,10 +129,10 @@ def resolve_base(value: str) -> dict[str, Any]:
         row = get_provider_session_by_uuid(uuid)
         if not row:
             raise ForkContextError("base_not_registered")
-        return row
+        return _require_forkable(row)
     row = get_provider_session_by_uuid(value)
     if row:
-        return row
+        return _require_forkable(row)
     # UUID-looking input is a registry miss; other text is an unknown name.
     import uuid as uuidlib
     try:
@@ -142,6 +142,12 @@ def resolve_base(value: str) -> dict[str, Any]:
         if isinstance(exc, ForkContextError):
             raise
         raise ForkContextError("base_name_unknown")
+
+
+def _require_forkable(row: dict[str, Any]) -> dict[str, Any]:
+    if row.get("kind", "base") == "anchor":
+        raise ForkContextError(f"anchor_not_forkable:{row['name']}")
+    return row
 
 
 def pane_pid(session: str, window: str) -> int:
@@ -217,7 +223,16 @@ def capture_codex_uuid(root_pid: int, launch_time: float, cwd: str) -> str:
     return sid
 
 
-def mark_ready(terminal_id: str, name: str, summary: Optional[str]) -> dict[str, Any]:
+def mark_ready(
+    terminal_id: str,
+    name: str,
+    summary: Optional[str],
+    kind: str = "base",
+) -> dict[str, Any]:
+    if name == "cold":
+        raise ForkContextError("base_name_reserved:cold")
+    if kind not in {"base", "anchor"}:
+        raise ForkContextError("invalid_provider_session_kind")
     terminal = get_terminal_metadata(terminal_id)
     if not terminal:
         raise ForkContextError("terminal_not_found")
@@ -239,6 +254,7 @@ def mark_ready(terminal_id: str, name: str, summary: Optional[str]) -> dict[str,
     row = register_provider_session(name=name, provider=provider, session_uuid=session_uuid,
                                     cwd=cwd, agent_profile=terminal["agent_profile"], git_sha=sha,
                                     dirty_hashes=hashes, summary=summary,
+                                    kind=kind,
                                     source_terminal_id=terminal_id,
                                     session_name=terminal["tmux_session"])
     update_terminal_provider_session_id(terminal_id, session_uuid)
@@ -248,6 +264,8 @@ def mark_ready(terminal_id: str, name: str, summary: Optional[str]) -> dict[str,
 def list_bases() -> list[dict[str, Any]]:
     result = []
     for row in list_ready_provider_sessions():
+        if row.get("kind", "base") != "base":
+            continue
         changed, _ = staleness(row)
         row["staleness_count"] = None if changed is None else len(changed)
         result.append(row)

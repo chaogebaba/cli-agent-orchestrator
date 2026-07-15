@@ -13,6 +13,7 @@ from cli_agent_orchestrator.services.settings_service import (
     get_agent_dirs,
     get_extra_agent_dirs,
     get_extra_skill_dirs,
+    get_default_fork_base,
     get_provider_defaults,
     set_agent_dirs,
     set_extra_agent_dirs,
@@ -141,6 +142,31 @@ class TestGetProviderDefaults:
                 }
             },
         }
+
+    def test_e2_profile_default_overrides_provider_default(self, settings_file, tmp_path):
+        defaults_file = tmp_path / "providers.toml"
+        defaults_file.write_text(
+            "[codex]\n"
+            'default_fork_base = "provider-base"\n'
+            "[codex.profiles.developer]\n"
+            'default_fork_base = "profile-base"\n',
+            encoding="utf-8",
+        )
+
+        assert get_default_fork_base("codex", "developer") == "profile-base"
+        assert get_default_fork_base("codex", "reviewer") == "provider-base"
+
+    def test_e2_provider_defaults_hand_edit_is_live_without_cache(self, settings_file, tmp_path):
+        defaults_file = tmp_path / "providers.toml"
+        defaults_file.write_text(
+            '[codex]\ndefault_fork_base = "first"\n', encoding="utf-8"
+        )
+        assert get_default_fork_base("codex", "developer") == "first"
+
+        defaults_file.write_text(
+            '[codex]\ndefault_fork_base = "second"\n', encoding="utf-8"
+        )
+        assert get_default_fork_base("codex", "developer") == "second"
 
 
 class TestGetAgentDirs:

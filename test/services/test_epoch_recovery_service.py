@@ -224,6 +224,62 @@ async def test_d2b_real_creation_seam_is_synchronous_leased_and_strict(monkeypat
     assert seen["strict_backend_registration"] is True
 
 
+@pytest.mark.asyncio
+async def test_e3_epoch_recovery_preserves_anchor_kind_and_unforkable(
+    epoch_db, monkeypatch,
+):
+    anchor = database.register_provider_session(
+        name="root-anchor", provider="grok_cli", session_uuid="anchor-uuid",
+        cwd="/repo", agent_profile="dev", dirty_hashes="{}", kind="anchor",
+        summary="anchor context", source_terminal_id="old-anchor",
+        session_name="cao-s",
+    )
+    monkeypatch.setattr(service, "_preflight", lambda *_: None)
+    monkeypatch.setattr(service, "generate_terminal_id", lambda: "recovered-anchor")
+    lease = SimpleNamespace(terminal_id="recovered-anchor")
+    monkeypatch.setattr(service, "acquire_rebind_lease", lambda _: lease)
+    monkeypatch.setattr(service, "release_rebind_lease", lambda _: None)
+
+    from cli_agent_orchestrator.services import provider_session_lease
+    from cli_agent_orchestrator.services import session_lifecycle_lease
+
+    monkeypatch.setattr(
+        provider_session_lease, "acquire_provider_session_lease", lambda _: lease,
+    )
+    monkeypatch.setattr(provider_session_lease, "release_provider_session_lease", lambda _: None)
+    monkeypatch.setattr(
+        session_lifecycle_lease, "acquire_session_lifecycle_shared", lambda _: lease,
+    )
+    monkeypatch.setattr(session_lifecycle_lease, "release_session_lifecycle_lease", lambda _: None)
+
+    async def create(**_kwargs):
+        return SimpleNamespace(id="recovered-anchor")
+
+    def remark(terminal_id, name, summary, kind="base"):
+        return database.register_provider_session(
+            name=name, provider=anchor["provider"], session_uuid=anchor["session_uuid"],
+            cwd=anchor["cwd"], agent_profile=anchor["agent_profile"],
+            git_sha=anchor["git_sha"], dirty_hashes=anchor["dirty_hashes"],
+            kind=kind, summary=summary, source_terminal_id=terminal_id,
+            session_name="cao-s",
+        )
+
+    monkeypatch.setattr(service, "create_terminal", create)
+    monkeypatch.setattr(service, "mark_ready", remark)
+    monkeypatch.setattr(service, "staleness", lambda _: ([], ""))
+
+    result, _source = await service._recover_row(anchor, "cao-s")
+    recovered = database.get_ready_provider_session("root-anchor")
+
+    assert result["status"] == "resumed"
+    assert recovered["kind"] == "anchor"
+    with pytest.raises(
+        fork_context_service.ForkContextError,
+        match="anchor_not_forkable:root-anchor",
+    ):
+        fork_context_service.resolve_base("root-anchor")
+
+
 def test_d10_non_goals_are_absent_from_epoch_service():
     text = Path(service.__file__).read_text()
     forbidden = ["quota banner", "auto-trigger", "usage-reset", "approval automation",

@@ -52,7 +52,7 @@ def build_session_status(session_name: str) -> dict:
         "ready_bases": [{
             "base_name": row["name"], "agent_profile": row["agent_profile"],
             "provider": row["provider"], "provider_session_id": row["session_uuid"],
-        } for row in bases],
+        } for row in bases if row.get("kind", "base") == "base"],
         "quarantined": [{
             "terminal_id": row["id"], "recovery_state": row["recovery_state"],
             "recovery_error": row["recovery_error"], "provider": row["provider"],

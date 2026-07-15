@@ -22,6 +22,23 @@ async def test_mark_base_ready_replaces_dirty_hashes_with_count(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_e3_mark_base_ready_threads_anchor_kind(monkeypatch):
+    row = {"name": "root", "kind": "anchor", "dirty_hashes": "{}"}
+    monkeypatch.setenv("CAO_TERMINAL_ID", "terminal-1")
+    with patch(
+        "cli_agent_orchestrator.services.fork_context_service.mark_ready",
+        return_value=row,
+    ) as mark, patch(
+        "cli_agent_orchestrator.mcp_server.server.requests.get"
+    ) as mock_get:
+        mock_get.return_value.json.return_value = {"caller_id": None}
+        response = await mark_base_ready("root", summary=None, kind="anchor")
+
+    assert response["base"]["kind"] == "anchor"
+    mark.assert_called_once_with("terminal-1", "root", None, "anchor")
+
+
+@pytest.mark.asyncio
 async def test_mark_base_ready_notifies_recorded_caller(monkeypatch):
     row = {"name": "infra", "dirty_hashes": "{}"}
     monkeypatch.setenv("CAO_TERMINAL_ID", "terminal-1")

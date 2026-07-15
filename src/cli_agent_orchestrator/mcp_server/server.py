@@ -158,6 +158,7 @@ def _create_terminal(
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
     fork_context=None,
+    refresh_base_name: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -230,6 +231,8 @@ def _create_terminal(
                 )
             if fork_context is not None:
                 json_body["fork_context"] = fork_context.model_dump()
+            if refresh_base_name is not None:
+                json_body["refresh_base_name"] = refresh_base_name
 
         response = requests.post(
             f"{API_BASE_URL}/sessions/{session_name}/terminals",
@@ -983,6 +986,25 @@ async def handoff(
 
 
 # Implementation function for assign
+def _configured_default_fork_base(agent_profile: str) -> Optional[str]:
+    """Read the child's provider-scoped default base from live configuration."""
+    terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    if not terminal_id:
+        return None
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
+        )
+        response.raise_for_status()
+        fallback_provider = response.json()["provider"]
+        provider = resolve_provider(agent_profile, fallback_provider=fallback_provider)
+    except (requests.RequestException, KeyError, TypeError, ValueError):
+        return None
+    from cli_agent_orchestrator.services.settings_service import get_default_fork_base
+
+    return get_default_fork_base(provider, agent_profile)
+
+
 def _assign_impl(agent_profile: str, message: str, working_directory: Optional[str] = None,
                  fork_from: Optional[str] = None, resume: bool = False) -> Dict[str, Any]:
     """Implementation of assign logic.
@@ -998,14 +1020,37 @@ def _assign_impl(agent_profile: str, message: str, working_directory: Optional[s
     terminal_id: Optional[str] = None
     try:
         fork_context = None
+        refresh_base_name = None
+        assignment_preamble = None
         if resume and not fork_from:
             raise ValueError("resume_requires_fork_from")
+        defaulted_fork = False
+        if fork_from == "cold":
+            fork_from = None
+        elif fork_from is None and not resume:
+            fork_from = _configured_default_fork_base(agent_profile)
+            defaulted_fork = fork_from is not None
+        row = None
         if fork_from:
             from pathlib import Path
             from urllib.parse import quote
             from cli_agent_orchestrator.models.terminal import ForkContext
             from cli_agent_orchestrator.services.fork_context_service import resolve_base, staleness
-            row = resolve_base(fork_from)
+            try:
+                row = resolve_base(fork_from)
+            except Exception as exc:
+                code = str(exc)
+                unavailable = code in {
+                    "base_name_unknown", "base_not_registered", "base_session_unset"
+                } or code.startswith("anchor_not_forkable:")
+                if not defaulted_fork or not unavailable:
+                    raise
+                assignment_preamble = (
+                    f"[COLD-FALLBACK] configured default fork base '{fork_from}' "
+                    f"is unavailable ({code}); started cold."
+                )
+                fork_from = None
+        if row is not None:
             provider = resolve_provider(agent_profile, fallback_provider=row["provider"])
             if provider != row["provider"]:
                 raise ValueError("provider_mismatch")
@@ -1045,7 +1090,9 @@ def _assign_impl(agent_profile: str, message: str, working_directory: Optional[s
             working_directory, workdir_preamble = _resolve_fork_working_directory(
                 row, working_directory
             )
-            _, preamble = staleness(row)
+            changed, preamble = staleness(row)
+            if changed and not resume:
+                refresh_base_name = row["name"]
             if workdir_preamble:
                 preamble = f"{preamble}\n{workdir_preamble}"
             fork_context = ForkContext(mode="resume" if resume else "fork",
@@ -1092,6 +1139,8 @@ def _assign_impl(agent_profile: str, message: str, working_directory: Optional[s
             )
         else:
             worker_message = message
+        if assignment_preamble:
+            worker_message = f"{assignment_preamble}\n\n{worker_message}"
 
         # Create terminal in DEFERRED-INIT mode: cao-server returns as soon
         # as the tmux window is up and the DB row is written; the actual
@@ -1105,6 +1154,7 @@ def _assign_impl(agent_profile: str, message: str, working_directory: Optional[s
             initial_message=worker_message,
             initial_message_orchestration_type=OrchestrationType.ASSIGN,
             fork_context=fork_context,
+            refresh_base_name=refresh_base_name,
         )
 
         return {
@@ -1216,13 +1266,14 @@ async def assign(
 async def mark_base_ready(
     name: str = Field(description="Stable base name"),
     summary: Optional[str] = Field(default=None, description="Context ingested by the base"),
+    kind: str = Field(default="base", description="Registry kind: base or anchor"),
 ) -> Dict[str, Any]:
     try:
         terminal_id = os.environ.get("CAO_TERMINAL_ID")
         if not terminal_id:
             raise ValueError("CAO_TERMINAL_ID not set")
         from cli_agent_orchestrator.services.fork_context_service import mark_ready
-        row = mark_ready(terminal_id, name, summary)
+        row = mark_ready(terminal_id, name, summary, kind)
         result = {
             "success": True,
             "base": _serialize_provider_session(row),

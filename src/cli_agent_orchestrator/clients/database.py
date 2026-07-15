@@ -107,6 +107,7 @@ class ProviderSessionModel(Base):
     dirty_hashes = Column(Text, nullable=False, default="{}", server_default="{}")
     summary = Column(Text, nullable=True)
     status = Column(Text, nullable=False)
+    kind = Column(Text, nullable=False, default="base", server_default="base")
     source_terminal_id = Column(Text, nullable=True)
     session_name = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=_utcnow)
@@ -116,6 +117,7 @@ class ProviderSessionModel(Base):
             "status IN ('ready','superseded','retired')",
             name="ck_provider_sessions_status",
         ),
+        CheckConstraint("kind IN ('base','anchor')", name="ck_provider_sessions_kind"),
         Index("uq_provider_sessions_ready", "name", unique=True, sqlite_where=(status == "ready")),
     )
 
@@ -364,6 +366,7 @@ def init_db() -> None:
     _migrate_transcript_bindings_inode_nullable()
     _migrate_provider_sessions_status()
     _migrate_provider_sessions_session_name()
+    _migrate_provider_sessions_kind()
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
     _migrate_inbox_orchestration_type()
@@ -398,18 +401,20 @@ def _migrate_provider_sessions_status() -> None:
                 "name TEXT NOT NULL, provider TEXT NOT NULL, session_uuid TEXT NOT NULL, "
                 "cwd TEXT NOT NULL, agent_profile TEXT NOT NULL, git_sha TEXT, "
                 "dirty_hashes TEXT DEFAULT '{}' NOT NULL, summary TEXT, status TEXT NOT NULL, "
+                "kind TEXT DEFAULT 'base' NOT NULL, "
                 "source_terminal_id TEXT, session_name TEXT, created_at DATETIME, updated_at DATETIME, "
                 "CONSTRAINT ck_provider_sessions_status "
-                "CHECK (status IN ('ready','superseded','retired')))"
+                "CHECK (status IN ('ready','superseded','retired')), "
+                "CONSTRAINT ck_provider_sessions_kind CHECK (kind IN ('base','anchor')))"
             )
         )
         connection.execute(
             text(
                 "INSERT INTO provider_sessions "
                 "(id, name, provider, session_uuid, cwd, agent_profile, git_sha, dirty_hashes, "
-                "summary, status, source_terminal_id, session_name, created_at, updated_at) "
+                "summary, status, kind, source_terminal_id, session_name, created_at, updated_at) "
                 "SELECT id, name, provider, session_uuid, cwd, agent_profile, git_sha, "
-                "dirty_hashes, summary, status, source_terminal_id, NULL, created_at, updated_at "
+                "dirty_hashes, summary, status, 'base', source_terminal_id, NULL, created_at, updated_at "
                 "FROM provider_sessions_legacy"
             )
         )
@@ -429,6 +434,21 @@ def _migrate_provider_sessions_session_name() -> None:
         columns = connection.execute(text("PRAGMA table_info(provider_sessions)")).mappings().all()
         if columns and not any(column["name"] == "session_name" for column in columns):
             connection.execute(text("ALTER TABLE provider_sessions ADD COLUMN session_name TEXT"))
+
+
+def _migrate_provider_sessions_kind() -> None:
+    """Type legacy provider-session rows as forkable bases."""
+    from sqlalchemy import text
+
+    with engine.begin() as connection:
+        columns = connection.execute(text("PRAGMA table_info(provider_sessions)")).mappings().all()
+        if columns and not any(column["name"] == "kind" for column in columns):
+            connection.execute(
+                text(
+                    "ALTER TABLE provider_sessions ADD COLUMN kind TEXT NOT NULL "
+                    "DEFAULT 'base'"
+                )
+            )
 
 
 def _migrate_transcript_bindings_inode_nullable() -> None:
@@ -1307,6 +1327,10 @@ def get_current_transcript_binding(terminal_id: str) -> Optional[Dict[str, Any]]
 
 def register_provider_session(**values: Any) -> Dict[str, Any]:
     """Atomically supersede a ready name and register its replacement."""
+    if values.get("name") == "cold":
+        raise ValueError("base_name_reserved:cold")
+    if values.get("kind", "base") not in {"base", "anchor"}:
+        raise ValueError("invalid_provider_session_kind")
     with SessionLocal() as db:
         now = _utcnow()
         db.query(ProviderSessionModel).filter(
@@ -1419,6 +1443,25 @@ def get_ready_provider_session(name: str) -> Optional[Dict[str, Any]]:
     with SessionLocal() as db:
         row = db.query(ProviderSessionModel).filter_by(name=name, status="ready").first()
         return provider_session_to_dict(row) if row else None
+
+
+def update_provider_session_snapshot(
+    row_id: int,
+    *,
+    git_sha: Optional[str],
+    dirty_hashes: str,
+) -> Optional[Dict[str, Any]]:
+    """CAS-refresh the snapshot for the same still-ready registry row."""
+    with SessionLocal() as db:
+        row = db.query(ProviderSessionModel).filter_by(id=row_id, status="ready").first()
+        if row is None:
+            return None
+        row.git_sha = git_sha
+        row.dirty_hashes = dirty_hashes
+        row.updated_at = _utcnow()
+        db.commit()
+        db.refresh(row)
+        return provider_session_to_dict(row)
 
 
 def get_ready_provider_session_by_source_terminal(

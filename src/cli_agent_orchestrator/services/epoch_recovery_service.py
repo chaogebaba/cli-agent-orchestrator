@@ -157,7 +157,12 @@ async def _recover_row(row, session_name):
                            row.get("session_name") is None), None
         remark_error = None
         try:
-            mark_ready(terminal.id, row["name"], row.get("summary"))
+            mark_ready(
+                terminal.id,
+                row["name"],
+                row.get("summary"),
+                row.get("kind", "base"),
+            )
         except Exception:
             remark_error = "remark_failed"
         changed, _ = staleness(row)
