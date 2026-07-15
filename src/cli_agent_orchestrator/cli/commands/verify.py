@@ -6,7 +6,12 @@ from pathlib import Path
 import click
 
 from cli_agent_orchestrator.services.verification_service import (
-    changed_files, cli_deploy_root, deployment_status, git_root, verify_suite_log,
+    changed_files,
+    cli_deploy_root,
+    deployment_status,
+    format_server_status,
+    git_root,
+    verify_suite_log,
 )
 
 
@@ -43,7 +48,7 @@ def deploy() -> None:
     else:
         click.echo(f"CLI path: {state} ({count} files differ)")
     server_state = status["server"]
-    click.echo(f"server: {server_state}")
+    click.echo(format_server_status(server_state))
     if state != "current" or server_state != "current":
         raise click.exceptions.Exit(1)
 

@@ -258,7 +258,11 @@ def test_verify_deploy_unknown_and_install_not_found_fail(monkeypatch):
     result = CliRunner().invoke(cli, ["verify", "deploy"])
     assert result.exit_code == 1
     assert "CLI path: not-found" in result.output
-    assert "server: not-running" in result.output
+    assert (
+        "server: not-running (no listener on :9889 - check: "
+        "systemctl --user status cao-server; journalctl --user -u cao-server)"
+        in result.output
+    )
 
 
 def test_structured_deployment_status_current_stale_and_restart(tmp_path, monkeypatch):
@@ -337,7 +341,11 @@ def test_cli_deploy_non_string_direct_url_is_source_not_found(tmp_path, monkeypa
     result = CliRunner().invoke(cli, ["verify", "deploy"])
 
     assert result.exit_code == 1
-    assert result.stdout == "CLI path: source-not-found\nserver: not-running\n"
+    assert result.stdout == (
+        "CLI path: source-not-found\n"
+        "server: not-running (no listener on :9889 - check: "
+        "systemctl --user status cao-server; journalctl --user -u cao-server)\n"
+    )
     assert svc.cli_deploy_root(workspace) == workspace.resolve()
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -14,6 +15,7 @@ from cli_agent_orchestrator.constants import API_BASE_URL, CAO_HOME_DIR, MCP_REQ
 from cli_agent_orchestrator.services.verification_service import (
     cli_deploy_root,
     deployment_status,
+    format_server_status,
     git_root,
 )
 
@@ -32,6 +34,8 @@ _PROFILE_INSTALLS = (
 _NOT_RESTARTED = (
     "installed, NOT restarted - server-path changes inactive until restart"
 )
+_VERIFY_POLL_INTERVAL_SECONDS = 0.5
+_VERIFY_TIMEOUT_SECONDS = 30
 
 
 def _redeploy_source_root() -> Path:
@@ -92,13 +96,42 @@ def _verify_redeploy(source_root: Path) -> dict:
     return deployment_status(source_root)
 
 
-def _print_deployment(status: dict) -> None:
+def _wait_for_server(source_root: Path) -> tuple[dict, int | None]:
+    started = time.monotonic()
+    deadline = started + _VERIFY_TIMEOUT_SECONDS
+    reported_second: int | None = None
+    while True:
+        elapsed = min(int(time.monotonic() - started), _VERIFY_TIMEOUT_SECONDS)
+        if elapsed != reported_second:
+            click.echo(f"waiting for server to come back up... ({elapsed}s)")
+            reported_second = elapsed
+        status = _verify_redeploy(source_root)
+        if status["server"] != "not-running":
+            return status, None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return status, _VERIFY_TIMEOUT_SECONDS
+        time.sleep(min(_VERIFY_POLL_INTERVAL_SECONDS, remaining))
+
+
+def _print_deployment(
+    status: dict,
+    *,
+    restarted: bool = False,
+    timeout_seconds: int | None = None,
+) -> None:
     count = status["differing_files"]
     if count is None:
         click.echo(f"CLI path: {status['cli_path']}")
     else:
         click.echo(f"CLI path: {status['cli_path']} ({count} files differ)")
-    click.echo(f"server: {status['server']}")
+    click.echo(
+        format_server_status(
+            status["server"],
+            restarted=restarted,
+            timeout_seconds=timeout_seconds,
+        )
+    )
 
 
 @click.command()
@@ -129,11 +162,16 @@ def redeploy(yes: bool) -> None:
         click.echo(_NOT_RESTARTED)
         return
 
+    click.echo("restarting cao-server...")
     try:
         _restart_server()
     except (OSError, subprocess.CalledProcessError) as exc:
         raise click.ClickException(f"restart failed: {exc}") from exc
-    status = _verify_redeploy(source_root)
-    _print_deployment(status)
+    status, timeout_seconds = _wait_for_server(source_root)
+    _print_deployment(
+        status,
+        restarted=True,
+        timeout_seconds=timeout_seconds,
+    )
     if status["cli_path"] != "current" or status["server"] != "current":
         raise click.exceptions.Exit(1)

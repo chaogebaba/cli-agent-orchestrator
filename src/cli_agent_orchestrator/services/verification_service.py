@@ -305,6 +305,37 @@ def deployment_status(repo_root: Path) -> dict:
     }
 
 
+def format_server_status(
+    server: str,
+    *,
+    restarted: bool = False,
+    timeout_seconds: int | None = None,
+) -> str:
+    """Return an operator-facing explanation without changing status values."""
+    if server == "current" and restarted:
+        return f"server: current (restarted and listening on :{SERVER_PORT})"
+    if server == "not-running":
+        elapsed = (
+            f" after {timeout_seconds}s" if timeout_seconds is not None else ""
+        )
+        return (
+            f"server: not-running (no listener on :{SERVER_PORT}{elapsed} - check: "
+            "systemctl --user status cao-server; "
+            "journalctl --user -u cao-server)"
+        )
+    if server == "restart-needed" and restarted:
+        return (
+            "server: restart-needed\n"
+            "hint: cao-server is listening, but it predates the installed CLI"
+        )
+    if server == "unknown" and restarted:
+        return (
+            "server: unknown\n"
+            "hint: cao-server is listening, but deployment freshness could not be determined"
+        )
+    return f"server: {server}"
+
+
 def find_workspace_file(start: Path, name: str) -> Path | None:
     current = start.resolve()
     for directory in (current, *current.parents):
