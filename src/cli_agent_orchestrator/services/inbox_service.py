@@ -30,6 +30,7 @@ from cli_agent_orchestrator.clients.database import (
     list_stale_delivering_messages,
     get_message_trace,
     get_attempt_mailbox_authority,
+    get_current_mailbox_terminal,
     list_attempt_member_ids,
     list_message_attempts,
     transition_pending_to_delivery_failed,
@@ -849,10 +850,14 @@ class InboxService:
                                 attempt_uuid, MessageStatus.PENDING, "interrupted",
                                 reason="mailbox_generation_changed",
                             )
+                            successor_id = get_current_mailbox_terminal(logical_receiver_id)
                             with _delivery_seq_guard:
-                                _delivery_wake_seq[terminal_id] = (
-                                    _delivery_wake_seq.get(terminal_id, 0) + 1
+                                wake_id = successor_id or terminal_id
+                                _delivery_wake_seq[wake_id] = (
+                                    _delivery_wake_seq.get(wake_id, 0) + 1
                                 )
+                            if successor_id and successor_id != terminal_id:
+                                self.deliver_pending(successor_id, registry=registry)
                             return
                     def submitted(value):
                         nonlocal submit_observation, submit_evidence

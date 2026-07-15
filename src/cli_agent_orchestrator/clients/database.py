@@ -2163,6 +2163,23 @@ def create_inbox_message(
         )
 
 
+def _pending_receiver_predicate(receiver_id: str, mailbox_schema: bool):
+    """Select raw rows by cache and logical rows by the mailbox's live authority."""
+    if not mailbox_schema:
+        return InboxModel.receiver_id == receiver_id
+    current_logical_receiver = exists().where(and_(
+        MailboxModel.id == InboxModel.logical_receiver_id,
+        MailboxModel.current_terminal_id == receiver_id,
+    ))
+    return or_(
+        and_(
+            InboxModel.logical_receiver_id.is_(None),
+            InboxModel.receiver_id == receiver_id,
+        ),
+        current_logical_receiver,
+    )
+
+
 def get_pending_messages(
     receiver_id: str, limit: int = 1, excluded_message_ids: set[int] | None = None,
 ) -> List[InboxMessage]:
@@ -2171,7 +2188,7 @@ def get_pending_messages(
     with SessionLocal() as db:
         mailbox_schema = _mailbox_schema_available(db)
         query = db.query(InboxModel).filter(
-            InboxModel.receiver_id == receiver_id,
+            _pending_receiver_predicate(receiver_id, mailbox_schema),
             InboxModel.status == MessageStatus.PENDING.value,
         )
         if excluded:
@@ -2192,7 +2209,7 @@ def get_pending_messages_by_ids(receiver_id: str, message_ids: list[int]) -> Lis
     with SessionLocal() as db:
         mailbox_schema = _mailbox_schema_available(db)
         rows = db.query(InboxModel).filter(
-            InboxModel.receiver_id == receiver_id, InboxModel.id.in_(ids),
+            _pending_receiver_predicate(receiver_id, mailbox_schema), InboxModel.id.in_(ids),
             InboxModel.status == MessageStatus.PENDING.value,
         ).order_by(InboxModel.created_at, InboxModel.id).all()
         return [InboxMessage(
@@ -2421,8 +2438,9 @@ def make_admission_proof(
 
 def _delivering_authority_in_db(db, terminal_id: str) -> list[dict[str, Any]]:
     """Map each DELIVERING inbox row to its newest durable attempt owner."""
+    mailbox_schema = _mailbox_schema_available(db)
     messages = db.query(InboxModel).filter(
-        InboxModel.receiver_id == terminal_id,
+        _pending_receiver_predicate(terminal_id, mailbox_schema),
         InboxModel.status == MessageStatus.DELIVERING.value,
     ).all()
     owners: dict[str, set[int]] = {}
@@ -2571,8 +2589,10 @@ def begin_delivery_attempt_if_no_other_delivering(
                 if outcome != "absent":
                     db.rollback()
                     return "stale_admission"
+        mailbox_schema = _mailbox_schema_available(db)
         candidates = db.query(InboxModel).filter(
-            InboxModel.id.in_(ids), InboxModel.receiver_id == receiver_terminal_id,
+            InboxModel.id.in_(ids),
+            _pending_receiver_predicate(receiver_terminal_id, mailbox_schema),
             InboxModel.status == MessageStatus.PENDING.value,
         ).all()
         if sorted(row.id for row in candidates) != ids:
@@ -2596,7 +2616,8 @@ def begin_delivery_attempt_if_no_other_delivering(
                 "current_terminal_id": mailbox.current_terminal_id,
             }
         changed = db.query(InboxModel).filter(
-            InboxModel.id.in_(ids), InboxModel.receiver_id == receiver_terminal_id,
+            InboxModel.id.in_(ids),
+            _pending_receiver_predicate(receiver_terminal_id, mailbox_schema),
             InboxModel.status == MessageStatus.PENDING.value,
         ).update({InboxModel.status: MessageStatus.DELIVERING.value}, synchronize_session=False)
         if changed != len(ids):
@@ -2816,6 +2837,13 @@ def get_attempt_mailbox_authority(attempt_uuid: str) -> dict[str, Any] | None:
         ):
             return None
         return authority
+
+
+def get_current_mailbox_terminal(mailbox_id: str) -> str | None:
+    """Resolve the current delivery target without rewriting any inbox cache."""
+    with SessionLocal() as db:
+        row = db.query(MailboxModel.current_terminal_id).filter_by(id=mailbox_id).first()
+        return cast(str | None, row[0]) if row is not None else None
 
 
 def settle_delivery_attempt_proof_safe(

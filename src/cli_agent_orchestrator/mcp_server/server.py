@@ -385,7 +385,6 @@ def _send_direct_input(
             "orchestration_type": orchestration_type,
         },
         timeout=_mcp_timeout(),
-        headers=_api_headers(),
     )
     response.raise_for_status()
 
