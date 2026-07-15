@@ -438,7 +438,10 @@ def test_probe_04_two_generation_replay_me_and_digest_crash_retry_exclusion(
     first = publish_supervisor_incarnation(claim, "22222222")
     retry = publish_supervisor_incarnation(claim, "22222222")
     assert first == retry
-    assert ack_messages("22222222", first["digest_message_id"])["changed"] is True
+    # Keep the cursor below the first digest so only the orchestration-type
+    # exclusion can prevent that delivered digest from feeding the next one.
+    assert delivered_one.id < first["digest_message_id"]
+    assert ack_messages("22222222", delivered_one.id)["changed"] is True
     with scratch_db.begin() as db:
         delivered_two = inbox(db, "22222222", "delivered", logical="mb_aaaaaaaa")
         first_digest = db.get(InboxModel, first["digest_message_id"])
@@ -450,7 +453,7 @@ def test_probe_04_two_generation_replay_me_and_digest_crash_retry_exclusion(
     digest = next(item for item in page["items"] if item["id"] == second["digest_message_id"])
     assert digest["orchestration_type"] == "mailbox_digest"
     assert "1 delivered message(s)" in digest["message"]
-    assert str(first["digest_message_id"]) not in digest["message"]
+    assert f"ids {delivered_two.id}-{delivered_two.id}" in digest["message"]
 
     mailbox_response = Mock(status_code=200)
     mailbox_response.json.return_value = {"items": [{
@@ -623,6 +626,16 @@ def test_probe_07_scope_enforcement_is_401_and_403(client, monkeypatch):
         assert client.get("/mailboxes").status_code == 403
         # write is insufficient for operator deletion.
         assert client.delete("/mailboxes/mb_aaaaaaaa").status_code == 403
+    finally:
+        app.dependency_overrides.pop(auth.get_current_scopes, None)
+
+    async def read_only_scope():
+        return [auth.SCOPE_READ]
+    app.dependency_overrides[auth.get_current_scopes] = read_only_scope
+    try:
+        assert client.post("/messages/ack", json={
+            "terminal_id": "11111111", "up_to_id": 1,
+        }).status_code == 403
     finally:
         app.dependency_overrides.pop(auth.get_current_scopes, None)
 
@@ -937,17 +950,18 @@ def test_probe_12_attempt_open_racing_delete_serializes_behind_begin_immediate(
     (PublicationCleanupFailed(MailboxDomainError("mailbox_conflict", "cause")), 500,
      "publication_cleanup_failed"),
 ])
+@pytest.mark.parametrize("path,seam", [
+    ("/sessions", "cli_agent_orchestrator.api.main.session_service.create_session"),
+    ("/sessions/start", "cli_agent_orchestrator.api.main.session_service.start_session"),
+])
 def test_probe_13_http_projections_guard_delivery_and_cold_registry(
-    client, monkeypatch, error, expected_status, expected_code,
+    client, monkeypatch, error, expected_status, expected_code, path, seam,
 ):
     assert get_mailbox_authority_lock("cold", "supervisor") is get_mailbox_authority_lock(
         "cold", "supervisor"
     )
-    with patch(
-        "cli_agent_orchestrator.api.main.session_service.start_session",
-        side_effect=error,
-    ):
-        response = client.post("/sessions/start", params={"agent_profile": "code_supervisor"})
+    with patch(seam, side_effect=error):
+        response = client.post(path, params={"agent_profile": "code_supervisor"})
     assert response.status_code == expected_status
     assert response.json()["detail"]["code"] == expected_code
     if expected_code == "publication_cleanup_failed":
