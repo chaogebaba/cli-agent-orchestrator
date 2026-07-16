@@ -6,11 +6,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.services import terminal_service as terminal_service_module
-
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services import terminal_service as terminal_service_module
 from cli_agent_orchestrator.services.terminal_service import (
     OutputMode,
     TerminalInputBlockedError,
@@ -24,12 +23,14 @@ from cli_agent_orchestrator.services.terminal_service import (
     peek_terminal,
     send_input,
 )
+from cli_agent_orchestrator.utils.http import resolve_endpoint
 
 
 @pytest.fixture(autouse=True)
 def _legacy_direct_create_is_not_a_seed_capability(monkeypatch):
     monkeypatch.setattr(
-        terminal_service_module, "get_provider_class",
+        terminal_service_module,
+        "get_provider_class",
         lambda _name: type("Capability", (), {"supports_seed_resume_identity": False}),
     )
 
@@ -60,9 +61,7 @@ async def test_blocked_deferred_assign_queues_verbatim_once_and_notifies_once():
         await asyncio.gather(*list(_deferred_init_tasks))
 
     assert create_message.call_count == 2
-    create_message.assert_any_call(
-        "caller01", "worker99", shaped, OrchestrationType.ASSIGN
-    )
+    create_message.assert_any_call("caller01", "worker99", shaped, OrchestrationType.ASSIGN)
     notice_call = create_message.call_args_list[-1]
     assert notice_call.args[:2] == ("worker99", "caller01")
     assert "queued" in notice_call.args[2]
@@ -318,14 +317,21 @@ class TestCreateTerminal:
         await create_terminal("kiro_cli", "developer", session_name="cao-existing")
 
         assert result.id == "test1234"
-        forwarded_envs = [call.kwargs["extra_env"] for call in mock_tmux.create_window.call_args_list]
+        forwarded_envs = [
+            call.kwargs["extra_env"] for call in mock_tmux.create_window.call_args_list
+        ]
+        identity = {
+            "CAO_TERMINAL_ID": "test1234",
+            "CAO_INSTANCE_ID": "",
+            "CAO_ENDPOINT": resolve_endpoint(),
+        }
         assert forwarded_envs == [
-            session_floor,
-            {**session_floor, "CAO_WORKFLOW_RUN_ID": "run-123"},
-            {**session_floor, "COLLISION": "caller"},
-            {**session_floor, "WINDOW_ONLY": "overlay"},
-            session_floor,
-            session_floor,
+            {**session_floor, **identity},
+            {**session_floor, "CAO_WORKFLOW_RUN_ID": "run-123", **identity},
+            {**session_floor, "COLLISION": "caller", **identity},
+            {**session_floor, "WINDOW_ONLY": "overlay", **identity},
+            {**session_floor, **identity},
+            {**session_floor, **identity},
         ]
         assert session_floor["CAO_ARTIFACTS_DIR"] == "/repo/tmp/orch"
         mock_set_session_env.assert_not_called()
@@ -904,7 +910,9 @@ class TestSendInput:
             force_bracketed_paste=True,
             submit_delay=0.3,
         )
-        mock_preserve.assert_called_once_with("test1234", mock_get_metadata.return_value, mock_provider)
+        mock_preserve.assert_called_once_with(
+            "test1234", mock_get_metadata.return_value, mock_provider
+        )
         mock_update.assert_called_once_with("test1234")
 
     @pytest.mark.parametrize(
@@ -1228,9 +1236,7 @@ class TestSendInput:
 
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.services.terminal_service.preserve_draft_before_send")
-    @patch(
-        "cli_agent_orchestrator.services.stalled_callback_watchdog.stalled_callback_watchdog"
-    )
+    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.stalled_callback_watchdog")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
@@ -1631,30 +1637,44 @@ class TestDeferredInitFailureNotification:
     @pytest.mark.asyncio
     async def test_claimed_failure_settles_with_registry(self):
         registry = MagicMock()
-        tracked = AsyncMock(side_effect=[
-            ({"status": "claimed_notified", "init_state": "init_failed_notified"}, 0.0),
-            ({"status": "deleted"}, 0.0),
-        ])
+        tracked = AsyncMock(
+            side_effect=[
+                ({"status": "claimed_notified", "init_state": "init_failed_notified"}, 0.0),
+                ({"status": "deleted"}, 0.0),
+            ]
+        )
         with patch(
-            "cli_agent_orchestrator.services.terminal_service._tracked_blocking", tracked,
+            "cli_agent_orchestrator.services.terminal_service._tracked_blocking",
+            tracked,
         ):
             await terminal_service_module._claim_and_settle_deferred_failure(
-                "worker99", "generation", self._snapshot(), "worker_vanished", registry,
+                "worker99",
+                "generation",
+                self._snapshot(),
+                "worker_vanished",
+                registry,
             )
         assert tracked.await_count == 2
         assert tracked.await_args_list[1].args[6] is registry
 
     @pytest.mark.asyncio
     async def test_caller_gone_claim_still_settles(self):
-        tracked = AsyncMock(side_effect=[
-            ({"status": "claimed_caller_gone", "init_state": "init_failed_caller_gone"}, 0.0),
-            ({"status": "deleted"}, 0.0),
-        ])
+        tracked = AsyncMock(
+            side_effect=[
+                ({"status": "claimed_caller_gone", "init_state": "init_failed_caller_gone"}, 0.0),
+                ({"status": "deleted"}, 0.0),
+            ]
+        )
         with patch(
-            "cli_agent_orchestrator.services.terminal_service._tracked_blocking", tracked,
+            "cli_agent_orchestrator.services.terminal_service._tracked_blocking",
+            tracked,
         ):
             await terminal_service_module._claim_and_settle_deferred_failure(
-                "worker99", "generation", self._snapshot(None), "worker_vanished", None,
+                "worker99",
+                "generation",
+                self._snapshot(None),
+                "worker_vanished",
+                None,
             )
         assert tracked.await_count == 2
 
@@ -1662,10 +1682,15 @@ class TestDeferredInitFailureNotification:
     async def test_claim_failure_does_not_settle(self):
         tracked = AsyncMock(side_effect=RuntimeError("db down"))
         with patch(
-            "cli_agent_orchestrator.services.terminal_service._tracked_blocking", tracked,
+            "cli_agent_orchestrator.services.terminal_service._tracked_blocking",
+            tracked,
         ):
             await terminal_service_module._claim_and_settle_deferred_failure(
-                "worker99", "generation", self._snapshot(), "worker_vanished", None,
+                "worker99",
+                "generation",
+                self._snapshot(),
+                "worker_vanished",
+                None,
             )
         tracked.assert_awaited_once()
 
@@ -1673,9 +1698,14 @@ class TestDeferredInitFailureNotification:
     async def test_row_missing_claim_does_not_settle(self):
         tracked = AsyncMock(return_value=({"status": "row_missing", "init_state": None}, 0.0))
         with patch(
-            "cli_agent_orchestrator.services.terminal_service._tracked_blocking", tracked,
+            "cli_agent_orchestrator.services.terminal_service._tracked_blocking",
+            tracked,
         ):
             await terminal_service_module._claim_and_settle_deferred_failure(
-                "worker99", "generation", self._snapshot(), "worker_vanished", None,
+                "worker99",
+                "generation",
+                self._snapshot(),
+                "worker_vanished",
+                None,
             )
         tracked.assert_awaited_once()

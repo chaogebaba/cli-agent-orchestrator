@@ -3,13 +3,19 @@
 import json
 import os
 from typing import cast
+
 import click
 import requests
 
-from cli_agent_orchestrator.constants import API_BASE_URL, MCP_REQUEST_TIMEOUT
 from cli_agent_orchestrator.cli.http import (
-    bearer_headers, format_domain_detail, response_detail,
+    bearer_headers,
+    format_domain_detail,
+    response_detail,
 )
+from cli_agent_orchestrator.constants import MCP_REQUEST_TIMEOUT
+from cli_agent_orchestrator.utils.http import CAOHttpClient
+
+cao_http = CAOHttpClient(lambda: requests)
 
 
 @click.group()
@@ -22,8 +28,9 @@ def messages():
 @click.option("--json", "as_json", is_flag=True)
 def trace_cmd(message_id: int, as_json: bool) -> None:
     try:
-        response = requests.get(f"{API_BASE_URL}/messages/{message_id}/trace",
-                                timeout=MCP_REQUEST_TIMEOUT, headers=bearer_headers())
+        response = cao_http.get(
+            f"/messages/{message_id}/trace", timeout=MCP_REQUEST_TIMEOUT, headers=bearer_headers()
+        )
     except requests.RequestException as exc:
         raise click.ClickException(f"could not reach cao-server: {exc}")
     if response.status_code != 200:
@@ -34,8 +41,10 @@ def trace_cmd(message_id: int, as_json: bool) -> None:
         return
     click.echo(f"message {message_id}  status={body['message']['status']}")
     for attempt in body["attempts"]:
-        click.echo(f"{attempt['started_at']}  {attempt['outcome'] or 'delivering':12} "
-                   f"{attempt['attempt_uuid']}  {attempt.get('reason') or ''}")
+        click.echo(
+            f"{attempt['started_at']}  {attempt['outcome'] or 'delivering':12} "
+            f"{attempt['attempt_uuid']}  {attempt.get('reason') or ''}"
+        )
 
 
 def _resolve_me(value: str) -> str:
@@ -44,12 +53,16 @@ def _resolve_me(value: str) -> str:
     terminal_id = os.environ.get("CAO_TERMINAL_ID")
     if not terminal_id:
         raise click.UsageError("--to me requires CAO_TERMINAL_ID")
-    response = requests.get(
-        f"{API_BASE_URL}/mailboxes", headers=bearer_headers(), timeout=MCP_REQUEST_TIMEOUT
-    )
+    response = cao_http.get(f"/mailboxes", headers=bearer_headers(), timeout=MCP_REQUEST_TIMEOUT)
     if response.status_code == 200:
-        current = next((item for item in response.json().get("items", [])
-                        if item.get("current_terminal_id") == terminal_id), None)
+        current = next(
+            (
+                item
+                for item in response.json().get("items", [])
+                if item.get("current_terminal_id") == terminal_id
+            ),
+            None,
+        )
         if current:
             return cast(str, current["id"])
     return terminal_id
@@ -60,11 +73,14 @@ def _resolve_me(value: str) -> str:
 @click.option("--since")
 @click.option("--after-id", type=click.IntRange(min=0))
 @click.option("--limit", type=click.IntRange(1, 100), default=25, show_default=True)
-@click.option("--status", "status_value", type=click.Choice(
-    ["pending", "delivering", "delivered", "delivery_failed", "failed"]
-))
-def list_cmd(receiver: str, since: str | None, after_id: int | None,
-             limit: int, status_value: str | None) -> None:
+@click.option(
+    "--status",
+    "status_value",
+    type=click.Choice(["pending", "delivering", "delivered", "delivery_failed", "failed"]),
+)
+def list_cmd(
+    receiver: str, since: str | None, after_id: int | None, limit: int, status_value: str | None
+) -> None:
     """List durable inbox messages in ascending id order."""
     params: dict[str, object] = {"to": _resolve_me(receiver), "limit": limit}
     if since is not None:
@@ -74,8 +90,10 @@ def list_cmd(receiver: str, since: str | None, after_id: int | None,
     if status_value is not None:
         params["status"] = status_value
     try:
-        response = requests.get(
-            f"{API_BASE_URL}/messages", params=params, headers=bearer_headers(),
+        response = cao_http.get(
+            f"/messages",
+            params=params,
+            headers=bearer_headers(),
             timeout=MCP_REQUEST_TIMEOUT,
         )
     except requests.RequestException as exc:
@@ -96,10 +114,11 @@ def ack_cmd(up_to_id: int) -> None:
     if not terminal_id:
         raise click.UsageError("messages ack requires CAO_TERMINAL_ID")
     try:
-        response = requests.post(
-            f"{API_BASE_URL}/messages/ack",
+        response = cao_http.post(
+            f"/messages/ack",
             json={"terminal_id": terminal_id, "up_to_id": up_to_id},
-            headers=bearer_headers(), timeout=MCP_REQUEST_TIMEOUT,
+            headers=bearer_headers(),
+            timeout=MCP_REQUEST_TIMEOUT,
         )
     except requests.RequestException as exc:
         raise click.ClickException(f"could not reach cao-server: {exc}")

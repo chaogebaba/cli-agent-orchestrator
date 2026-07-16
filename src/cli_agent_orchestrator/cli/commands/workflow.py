@@ -16,10 +16,12 @@ import click
 import requests
 
 from cli_agent_orchestrator.constants import (
-    API_BASE_URL,
     MCP_REQUEST_TIMEOUT,
     WORKFLOW_RUN_REQUEST_TIMEOUT,
 )
+from cli_agent_orchestrator.utils.http import CAOHttpClient
+
+cao_http = CAOHttpClient(lambda: requests)
 
 
 def _extract_detail(response: requests.Response, fallback: str) -> str:
@@ -51,8 +53,8 @@ def validate_cmd(file, as_json):
       1  spec failed validation, or the request errored
     """
     try:
-        response = requests.post(
-            f"{API_BASE_URL}/workflows/validate",
+        response = cao_http.post(
+            f"/workflows/validate",
             json={"path": file},
             timeout=MCP_REQUEST_TIMEOUT,
         )
@@ -92,9 +94,7 @@ def list_cmd(scan_dir, as_json):
     if scan_dir is not None:
         params["dir"] = scan_dir
     try:
-        response = requests.get(
-            f"{API_BASE_URL}/workflows", params=params, timeout=MCP_REQUEST_TIMEOUT
-        )
+        response = cao_http.get(f"/workflows", params=params, timeout=MCP_REQUEST_TIMEOUT)
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -125,7 +125,7 @@ def list_cmd(scan_dir, as_json):
 def get_cmd(name, as_json):
     """Show the parsed/validated spec for a workflow name or file path."""
     try:
-        response = requests.get(f"{API_BASE_URL}/workflows/{name}", timeout=MCP_REQUEST_TIMEOUT)
+        response = cao_http.get(f"/workflows/{name}", timeout=MCP_REQUEST_TIMEOUT)
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -156,7 +156,7 @@ def delete_cmd(name, yes):
     if not yes:
         click.confirm(f"Delete workflow '{name}'?", abort=True)
     try:
-        response = requests.delete(f"{API_BASE_URL}/workflows/{name}", timeout=MCP_REQUEST_TIMEOUT)
+        response = cao_http.delete(f"/workflows/{name}", timeout=MCP_REQUEST_TIMEOUT)
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -221,8 +221,8 @@ def run_cmd(name_or_path, inputs, run_id, as_json):
         # ``run`` blocks until the whole workflow finishes (the server awaits the run
         # inline, Q1=A), so use the worst-case-covering run timeout, NOT the flat 30s
         # MCP_REQUEST_TIMEOUT (which would report a still-running run as a failure).
-        response = requests.post(
-            f"{API_BASE_URL}/workflows/runs",
+        response = cao_http.post(
+            f"/workflows/runs",
             json=payload,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
         )
@@ -253,9 +253,7 @@ def run_cmd(name_or_path, inputs, run_id, as_json):
 def status_cmd(run_id, as_json):
     """Show a point-in-time status snapshot for a run."""
     try:
-        response = requests.get(
-            f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=MCP_REQUEST_TIMEOUT
-        )
+        response = cao_http.get(f"/workflows/runs/{run_id}", timeout=MCP_REQUEST_TIMEOUT)
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -288,8 +286,8 @@ def resume_cmd(run_id, as_json):
     try:
         # Resume re-drives the run inline (the server awaits it), so use the
         # worst-case-covering run timeout, not the flat MCP_REQUEST_TIMEOUT.
-        response = requests.post(
-            f"{API_BASE_URL}/workflows/runs/{run_id}/resume",
+        response = cao_http.post(
+            f"/workflows/runs/{run_id}/resume",
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
         )
     except requests.exceptions.RequestException as e:
@@ -318,9 +316,7 @@ def resume_cmd(run_id, as_json):
 def cancel_cmd(run_id):
     """Cooperatively cancel a running workflow."""
     try:
-        response = requests.post(
-            f"{API_BASE_URL}/workflows/runs/{run_id}/cancel", timeout=MCP_REQUEST_TIMEOUT
-        )
+        response = cao_http.post(f"/workflows/runs/{run_id}/cancel", timeout=MCP_REQUEST_TIMEOUT)
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 

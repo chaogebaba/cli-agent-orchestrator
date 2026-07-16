@@ -705,8 +705,8 @@ class TestKimiCliProviderBuildCommand:
         assert config["test-server"]["env"]["CAO_TERMINAL_ID"] == "abc123"
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load):
-        """Test that existing CAO_TERMINAL_ID in env is not overwritten."""
+    def test_build_command_mcp_rejects_existing_terminal_id_override(self, mock_load):
+        """Profile MCP identity overrides are rejected."""
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
@@ -720,16 +720,8 @@ class TestKimiCliProviderBuildCommand:
         mock_load.return_value = mock_profile
 
         provider = KimiCliProvider("new-id", "session-1", "window-1", agent_profile="dev")
-        command = provider._build_kimi_command()
-
-        import json
-
-        parts = command.split("--mcp-config ")
-        mcp_json = parts[1].strip().strip("'")
-        config = json.loads(mcp_json)
-
-        # Should keep the existing value, not override
-        assert config["test-server"]["env"]["CAO_TERMINAL_ID"] == "existing-id"
+        with pytest.raises(ProviderError, match="profile may not override CAO_TERMINAL_ID"):
+            provider._build_kimi_command()
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     def test_build_command_mcp_tool_timeout(self, mock_load, tmp_path):

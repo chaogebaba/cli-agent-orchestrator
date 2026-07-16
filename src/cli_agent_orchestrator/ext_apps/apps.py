@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.services.config_service import ConfigService
+from cli_agent_orchestrator.utils.http import resolve_endpoint
 
 logger = logging.getLogger(__name__)
 
@@ -33,16 +34,20 @@ DASHBOARD_RESOURCE_URI = "ui://cao/dashboard"
 AGENT_RESOURCE_URI = "ui://cao/agent"
 EVENT_STREAM_RESOURCE_URI = "ui://cao/event-stream"
 
+
 # Default Content-Security-Policy domains for the sandboxed iframe, expressed in the
 # **structured** SEP-1865 ``_meta.ui.csp`` shape (NOT a raw CSP string). The host
 # composes the actual CSP header from
 # these declared domains. ``connectDomains`` allows the iframe to stream the loopback
-DEFAULT_CSP = {
-    "connectDomains": ["http://127.0.0.1:9889", "http://localhost:9889"],
-    "resourceDomains": [],
-    "frameDomains": [],
-    "baseUriDomains": [],
-}
+def default_csp() -> dict[str, list[str]]:
+    """Build the CSP from the endpoint bound to this process."""
+    return {
+        "connectDomains": [resolve_endpoint()],
+        "resourceDomains": [],
+        "frameDomains": [],
+        "baseUriDomains": [],
+    }
+
 
 # SEP-1865 mandates this MIME type for HTML MCP App resources.
 RESOURCE_MIME_TYPE = "text/html;profile=mcp-app"
@@ -122,7 +127,7 @@ def ui_meta(
 
     Args:
         csp: Structured CSP domains (``connectDomains`` / ``resourceDomains`` /
-            ``frameDomains`` / ``baseUriDomains``). Defaults to :data:`DEFAULT_CSP`.
+            ``frameDomains`` / ``baseUriDomains``). Defaults to the resolved CAO endpoint.
         required_scopes: CAO scopes the host should require before invoking the
             tool. Empty/None means no scope gate (a read tool).
         visibility: ``["model", "app"]`` or ``["app"]`` per SEP-1865. Omitted for
@@ -139,7 +144,7 @@ def ui_meta(
     """
 
     ui: dict = {
-        "csp": csp or dict(DEFAULT_CSP),
+        "csp": csp or default_csp(),
         "requiredScopes": list(required_scopes) if required_scopes else [],
     }
     # Spec `_meta.ui.permissions` is an OBJECT keyed by capability, NOT an array.

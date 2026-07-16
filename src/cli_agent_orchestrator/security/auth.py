@@ -36,7 +36,7 @@ import jwt
 from fastapi import Depends, Header, HTTPException, status
 from jwt import PyJWKClient, PyJWKClientError
 
-from cli_agent_orchestrator.constants import API_BASE_URL
+from cli_agent_orchestrator.utils.http import resolve_endpoint
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +105,7 @@ def get_expected_audience() -> Optional[str]:
     """Return the expected token audience.
 
     When auth is enabled this never returns ``None``: it falls back to
-    ``API_BASE_URL`` — the resource identifier advertised by the RFC 9728 PRM
+    the resolved CAO endpoint — the resource identifier advertised by the RFC 9728 PRM
     endpoint (``/.well-known/oauth-protected-resource``) — so audience
     verification is never silently disabled. An explicit ``CAO_AUTH_AUDIENCE`` /
     ``AUTH0_AUDIENCE`` takes precedence. Returns ``None`` only when auth is
@@ -117,7 +117,7 @@ def get_expected_audience() -> Optional[str]:
     return (
         os.getenv("CAO_AUTH_AUDIENCE", "").strip()
         or os.getenv("AUTH0_AUDIENCE", "").strip()
-        or API_BASE_URL
+        or resolve_endpoint()
     )
 
 

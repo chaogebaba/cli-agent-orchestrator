@@ -1230,8 +1230,8 @@ class TestClaudeCodeProviderMisc:
         assert server_env["CAO_TERMINAL_ID"] == "term-99"
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load):
-        """Test that an existing CAO_TERMINAL_ID in MCP env is NOT overwritten."""
+    def test_build_command_mcp_rejects_existing_terminal_id_override(self, mock_load):
+        """Identity keys in profile MCP env cannot override the terminal binding."""
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
@@ -1246,12 +1246,8 @@ class TestClaudeCodeProviderMisc:
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("term-99", "test-session", "window-0", "test-agent")
-        command = provider._build_claude_command()
-
-        mcp_data = _extract_mcp_config(command)
-        server_env = mcp_data["mcpServers"]["my-server"]["env"]
-        # Should keep the user-provided value, NOT overwrite with term-99
-        assert server_env["CAO_TERMINAL_ID"] == "user-provided-id"
+        with pytest.raises(ValueError, match="profile may not override CAO_TERMINAL_ID"):
+            provider._build_claude_command()
 
 
 class TestClaudeCodeProviderModelFlag:

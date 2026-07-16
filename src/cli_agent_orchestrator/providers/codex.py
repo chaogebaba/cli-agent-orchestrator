@@ -1,20 +1,22 @@
 """Codex CLI provider implementation."""
 
 import asyncio
+import json
 import logging
+import os
 import re
 import shlex
-import time
-import json
-import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
 from cli_agent_orchestrator.providers.base import (
-    BaseProvider, RetryableArtifactValidation, TerminalArtifactValidation,
+    BaseProvider,
+    RetryableArtifactValidation,
+    TerminalArtifactValidation,
 )
 from cli_agent_orchestrator.providers.screen_classification import (
     ScreenClassification,
@@ -27,6 +29,7 @@ from cli_agent_orchestrator.services.settings_service import (
 )
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+from cli_agent_orchestrator.utils.sandbox_guard import bind_mcp_server_identity
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -101,8 +104,7 @@ SCREEN_FALLBACK_PROCESSING_PATTERN = re.compile(r"\A[\s\S]*\Z")
 
 # Workspace trust/approval prompt shown when Codex opens a new directory
 TRUST_PROMPT_PATTERN = (
-    r"(?:allow Codex to work in this folder"
-    r"|Do you trust the contents of this directory)"
+    r"(?:allow Codex to work in this folder" r"|Do you trust the contents of this directory)"
 )
 TRUST_SELECTOR_PATTERN = re.compile(
     r"^\s*›\s*1\.\s*(?:Yes|Allow|Trust|Continue)\b",
@@ -354,6 +356,7 @@ class CodexProvider(BaseProvider):
     def capture_shell_baseline(self) -> str | None:
         """Capture through this module's backend seam before Codex starts."""
         return get_backend().get_pane_current_command(self.session_name, self.window_name)
+
     """Provider for Codex CLI tool integration."""
 
     def __init__(
@@ -367,7 +370,9 @@ class CodexProvider(BaseProvider):
         fork_context: Optional[ForkContext] = None,
     ):
         """Initialize provider state."""
-        super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt, fork_context)
+        super().__init__(
+            terminal_id, session_name, window_name, allowed_tools, skill_prompt, fork_context
+        )
         self._initialized = False
         self._agent_profile = agent_profile
 
@@ -384,8 +389,12 @@ class CodexProvider(BaseProvider):
         argv.append("Reply exactly: SEED_OK then stop.")
         try:
             completed = subprocess.run(
-                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, timeout=90, check=False,
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=90,
+                check=False,
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("seed_timeout") from exc
@@ -393,10 +402,12 @@ class CodexProvider(BaseProvider):
             raise RuntimeError("seed_exec_failed") from exc
         if completed.returncode != 0:
             raise RuntimeError("seed_exec_failed")
-        matches = set(re.findall(
-            r"(?im)^\s*session id:\s*([0-9a-f]{8}-[0-9a-f-]{27,})\s*$",
-            completed.stdout or "",
-        ))
+        matches = set(
+            re.findall(
+                r"(?im)^\s*session id:\s*([0-9a-f]{8}-[0-9a-f-]{27,})\s*$",
+                completed.stdout or "",
+            )
+        )
         if len(matches) != 1:
             raise RuntimeError("seed_uuid_unparseable")
         session_uuid = next(iter(matches))
@@ -474,7 +485,7 @@ class CodexProvider(BaseProvider):
                         cfg = server_config.model_dump(exclude_none=True)
                     # Resolve the bundled cao-mcp-server console script to a
                     # PATH-independent invocation.
-                    cfg = resolve_mcp_server_config(cfg)
+                    cfg = bind_mcp_server_identity(resolve_mcp_server_config(cfg), self.terminal_id)
                     if "command" in cfg:
                         command_parts.extend(
                             ["-c", f"{prefix}.command={_toml_scalar(cfg['command'])}"]
@@ -522,14 +533,23 @@ class CodexProvider(BaseProvider):
             mode = self._fork_context.mode
             prefix = ["codex", mode]
             rest = command_parts[1:]
-            rest = ["--dangerously-bypass-approvals-and-sandbox" if x == "--yolo" else x for x in rest]
+            rest = [
+                "--dangerously-bypass-approvals-and-sandbox" if x == "--yolo" else x for x in rest
+            ]
             command_parts = prefix + rest + [self._fork_context.session_uuid]
         return shlex.join(command_parts)
 
-    def build_fork_command(self, session_uuid: str, new_session_uuid: Optional[str] = None) -> list[str]:
+    def build_fork_command(
+        self, session_uuid: str, new_session_uuid: Optional[str] = None
+    ) -> list[str]:
         old = self._fork_context
-        self._fork_context = ForkContext(mode="fork", session_uuid=session_uuid, base_name="base",
-                                         provider="codex", initial_preamble="")
+        self._fork_context = ForkContext(
+            mode="fork",
+            session_uuid=session_uuid,
+            base_name="base",
+            provider="codex",
+            initial_preamble="",
+        )
         try:
             return shlex.split(self._build_codex_command())
         finally:
@@ -537,8 +557,13 @@ class CodexProvider(BaseProvider):
 
     def build_resume_command(self, session_uuid: str) -> list[str]:
         old = self._fork_context
-        self._fork_context = ForkContext(mode="resume", session_uuid=session_uuid, base_name="base",
-                                         provider="codex", initial_preamble="")
+        self._fork_context = ForkContext(
+            mode="resume",
+            session_uuid=session_uuid,
+            base_name="base",
+            provider="codex",
+            initial_preamble="",
+        )
         try:
             return shlex.split(self._build_codex_command())
         finally:
@@ -546,22 +571,26 @@ class CodexProvider(BaseProvider):
 
     def capture_session_uuid(self, pane_pid: int, launch_time: float, cwd: str) -> str:
         from cli_agent_orchestrator.services.fork_context_service import capture_codex_uuid
+
         return capture_codex_uuid(pane_pid, launch_time, cwd)
 
     def resume_session_uuid(self) -> str | None:
         return None
 
     def validate_session_artifact(self, session_uuid: str, cwd: str) -> None:
-        matches = list((Path.home() / ".codex" / "sessions").glob(
-            f"**/rollout-*{session_uuid}*.jsonl"
-        ))
+        matches = list(
+            (Path.home() / ".codex" / "sessions").glob(f"**/rollout-*{session_uuid}*.jsonl")
+        )
         if not matches:
             raise RetryableArtifactValidation("session_artifact_missing")
         if len(matches) > 1:
             raise TerminalArtifactValidation("session_artifact_ambiguous")
         with matches[0].open(encoding="utf-8") as stream:
             first = json.loads(stream.readline())
-        if first.get("type") != "session_meta" or first.get("payload", {}).get("id") != session_uuid:
+        if (
+            first.get("type") != "session_meta"
+            or first.get("payload", {}).get("id") != session_uuid
+        ):
             raise TerminalArtifactValidation("session_artifact_identity_invalid")
 
     def auth_state_path(self) -> Path | None:
@@ -581,7 +610,11 @@ class CodexProvider(BaseProvider):
         if len(matches) != 1:
             return None
         stat = Path(f"/proc/{matches[0]}/stat").read_text().split()
-        btime = next(float(x.split()[1]) for x in Path("/proc/stat").read_text().splitlines() if x.startswith("btime "))
+        btime = next(
+            float(x.split()[1])
+            for x in Path("/proc/stat").read_text().splitlines()
+            if x.startswith("btime ")
+        )
         return btime + float(stat[21]) / os.sysconf(os.sysconf_names["SC_CLK_TCK"])
 
     async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
@@ -619,8 +652,11 @@ class CodexProvider(BaseProvider):
         logger.warning("Codex trust prompt handler timed out")
 
     async def initialize(
-        self, *, coordinates: tuple[str, str] | None = None,
-        provider_override=None, raw_status: bool = False,
+        self,
+        *,
+        coordinates: tuple[str, str] | None = None,
+        provider_override=None,
+        raw_status: bool = False,
     ) -> bool:
         """Initialize Codex provider by starting codex command."""
         from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -833,11 +869,13 @@ class CodexProvider(BaseProvider):
         rows = clean.splitlines()
         legacy_status = self._get_screen_local_status(joined)
         chrome_rows = [
-            index for index, row in enumerate(rows)
+            index
+            for index, row in enumerate(rows)
             if re.search(IDLE_PROMPT_SCREEN_PATTERN, row, re.IGNORECASE)
         ]
         progress_rows = [
-            index for index, row in enumerate(rows)
+            index
+            for index, row in enumerate(rows)
             if re.search(TUI_PROGRESS_PATTERN, row) is not None
         ]
         terminal_index = next(
@@ -856,9 +894,7 @@ class CodexProvider(BaseProvider):
                 and index == terminal_index
                 and DIALOG_ACTION_FOOTER_PATTERN.search(row)
             ):
-                signals.append(
-                    ScreenSignal("waiting", "DIALOG_ACTION_FOOTER_PATTERN", index)
-                )
+                signals.append(ScreenSignal("waiting", "DIALOG_ACTION_FOOTER_PATTERN", index))
             if legacy_status == TerminalStatus.WAITING_USER_ANSWER and re.search(
                 WAITING_PROMPT_PATTERN, row, re.IGNORECASE
             ):
@@ -872,14 +908,16 @@ class CodexProvider(BaseProvider):
                 re.search(MCP_TOOL_CALL_PATTERN, row, re.IGNORECASE)
                 or re.search(SYSTEM_NOTICE_PATTERN, row, re.IGNORECASE)
             )
-            if assistant and not excluded_assistant and (
-                legacy_status == TerminalStatus.COMPLETED
-                or progress
-                or (bool(progress_rows) and index > max(progress_rows) and bool(chrome_rows))
-            ):
-                signals.append(
-                    ScreenSignal("completion", "ASSISTANT_PREFIX_PATTERN", index)
+            if (
+                assistant
+                and not excluded_assistant
+                and (
+                    legacy_status == TerminalStatus.COMPLETED
+                    or progress
+                    or (bool(progress_rows) and index > max(progress_rows) and bool(chrome_rows))
                 )
+            ):
+                signals.append(ScreenSignal("completion", "ASSISTANT_PREFIX_PATTERN", index))
             if index in chrome_rows:
                 signals.append(ScreenSignal("chrome", "IDLE_PROMPT_SCREEN_PATTERN", index))
 

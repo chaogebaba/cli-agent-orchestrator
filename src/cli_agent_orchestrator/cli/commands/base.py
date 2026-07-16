@@ -5,7 +5,9 @@ import json
 import click
 import requests
 
-from cli_agent_orchestrator.constants import API_BASE_URL
+from cli_agent_orchestrator.utils.http import CAOHttpClient
+
+cao_http = CAOHttpClient(lambda: requests)
 
 
 @click.group()
@@ -15,9 +17,7 @@ def base() -> None:
 
 @base.command("register")
 @click.argument("name")
-@click.option(
-    "--provider", required=True, type=click.Choice(["codex", "grok_cli"])
-)
+@click.option("--provider", required=True, type=click.Choice(["codex", "grok_cli"]))
 @click.option("--uuid", "session_uuid", required=True)
 @click.option("--cwd", required=True)
 @click.option("--profile", required=True)
@@ -41,7 +41,7 @@ def register(
     if summary is not None:
         payload["summary"] = summary
     try:
-        response = requests.post(f"{API_BASE_URL}/bases/register", json=payload)
+        response = cao_http.post(f"/bases/register", json=payload)
     except requests.RequestException as exc:
         raise click.ClickException(f"base registration failed: {exc}") from exc
 

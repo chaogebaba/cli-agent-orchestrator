@@ -9,8 +9,11 @@ from typing import Optional, Union
 
 import requests
 
-from cli_agent_orchestrator.constants import API_BASE_URL, SESSION_PREFIX
+from cli_agent_orchestrator.constants import SESSION_PREFIX
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.utils.http import CAOHttpClient
+
+cao_http = CAOHttpClient(lambda: requests)
 
 logger = logging.getLogger(__name__)
 
@@ -191,7 +194,8 @@ async def wait_until_status(
     while time.time() - start < timeout:
         current = (
             status_monitor.get_raw_status(terminal_id, provider_override=provider_override)
-            if raw_status else status_monitor.get_status(terminal_id)
+            if raw_status
+            else status_monitor.get_status(terminal_id)
         )
         status_gen = status_monitor.get_status_gen(terminal_id) if min_gen is not None else None
         if current in targets and (min_gen is None or status_gen is None or status_gen >= min_gen):
@@ -218,7 +222,7 @@ def sync_backend_from_server() -> None:
     from cli_agent_orchestrator.backends.registry import set_backend
 
     try:
-        resp = requests.get(f"{API_BASE_URL}/health", timeout=2.0)
+        resp = cao_http.get(f"/health", timeout=2.0)
         resp.raise_for_status()
         data = resp.json()
         backend_name = data.get("terminal_backend")
@@ -273,7 +277,7 @@ def poll_until_done(
         try:
             # Per-request timeout so a stalled server/network can't block past
             # the outer timeout budget (matches wait_until_terminal_status).
-            resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
+            resp = cao_http.get(f"/terminals/{terminal_id}", timeout=5.0)
             resp.raise_for_status()
             status = resp.json().get("status")
             if status == TerminalStatus.COMPLETED.value:
@@ -343,7 +347,7 @@ def wait_until_terminal_status(
     while time.time() - start_time < timeout:
         poll_count += 1
         try:
-            response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
+            response = cao_http.get(f"/terminals/{terminal_id}", timeout=5.0)
             if response.status_code == 200:
                 current_status = response.json().get("status")
                 last_seen = current_status

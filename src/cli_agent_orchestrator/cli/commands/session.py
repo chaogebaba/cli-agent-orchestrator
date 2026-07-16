@@ -9,37 +9,37 @@ from urllib.parse import quote
 import click
 import requests
 
-from cli_agent_orchestrator.constants import API_BASE_URL
-from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.utils.terminal import poll_until_done
 from cli_agent_orchestrator.cli.http import format_domain_detail, response_detail
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.utils.http import CAOHttpClient
+
+cao_http = CAOHttpClient(lambda: requests)
+from cli_agent_orchestrator.utils.terminal import poll_until_done
 
 # Default poll timeout for sync send (seconds). Pass --timeout to override.
 _DEFAULT_SEND_TIMEOUT = 300
 
 
 def _get_sessions():
-    response = requests.get(f"{API_BASE_URL}/sessions")
+    response = cao_http.get(f"/sessions")
     response.raise_for_status()
     return response.json()
 
 
 def _get_terminals(session_name):
-    response = requests.get(f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/terminals")
+    response = cao_http.get(f"/sessions/{quote(session_name, safe='')}/terminals")
     response.raise_for_status()
     return response.json()
 
 
 def _get_terminal(terminal_id):
-    response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
+    response = cao_http.get(f"/terminals/{terminal_id}")
     response.raise_for_status()
     return response.json()
 
 
 def _get_terminal_output(terminal_id):
-    response = requests.get(
-        f"{API_BASE_URL}/terminals/{terminal_id}/output", params={"mode": "last"}
-    )
+    response = cao_http.get(f"/terminals/{terminal_id}/output", params={"mode": "last"})
     response.raise_for_status()
     return response.json()
 
@@ -66,10 +66,20 @@ def session():
 @click.option("--allow-incomplete-brief", is_flag=True)
 @click.option("--memory", is_flag=True)
 @click.option("--json", "as_json", is_flag=True)
-def start(session_name, agents, provider, working_directory, allowed_tools,
-          env_pairs, allow_incomplete_brief, memory, as_json):
+def start(
+    session_name,
+    agents,
+    provider,
+    working_directory,
+    allowed_tools,
+    env_pairs,
+    allow_incomplete_brief,
+    memory,
+    as_json,
+):
     """Start a CAO session through the canonical lifecycle API."""
     from cli_agent_orchestrator.cli.commands.launch import _parse_env_pairs
+
     params = {"agent_profile": agents}
     if session_name:
         params["session_name"] = session_name
@@ -86,16 +96,25 @@ def start(session_name, agents, provider, working_directory, allowed_tools,
     kwargs = {"params": params}
     if env_pairs:
         kwargs["json"] = {"env_vars": _parse_env_pairs(env_pairs)}
-    response = requests.post(f"{API_BASE_URL}/sessions/start", **kwargs)
+    response = cao_http.post(f"/sessions/start", **kwargs)
     payload = response.json()
     if response.status_code == 422 and payload.get("bootstrap", {}).get("status") == "seed_failed":
-        click.echo(json.dumps(payload, indent=2) if as_json else
-                   f"bootstrap failed [{payload['bootstrap']['error_code']}]", err=True)
+        click.echo(
+            (
+                json.dumps(payload, indent=2)
+                if as_json
+                else f"bootstrap failed [{payload['bootstrap']['error_code']}]"
+            ),
+            err=True,
+        )
         raise click.exceptions.Exit(2)
     detail = response_detail(response)
-    if response.status_code in {409, 500} and detail and detail.get("code") in {
-        "mailbox_conflict", "mailbox_authority_timeout", "publication_cleanup_failed"
-    }:
+    if (
+        response.status_code in {409, 500}
+        and detail
+        and detail.get("code")
+        in {"mailbox_conflict", "mailbox_authority_timeout", "publication_cleanup_failed"}
+    ):
         click.echo(format_domain_detail(detail), err=True)
         raise click.exceptions.Exit(1)
     try:
@@ -126,13 +145,14 @@ def manifest(session_name, as_json, brief):
         except requests.RequestException as exc:
             raise click.ClickException(f"could not resolve caller session: {exc}")
     try:
-        response = requests.get(f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/manifest")
+        response = cao_http.get(f"/sessions/{quote(session_name, safe='')}/manifest")
         response.raise_for_status()
         payload = response.json()
     except requests.RequestException as exc:
         raise click.ClickException(f"failed to fetch session manifest: {exc}")
     if brief:
         from cli_agent_orchestrator.services.session_manifest_service import render_session_brief
+
         click.echo(render_session_brief(payload))
     else:
         click.echo(json.dumps(payload, indent=2))
@@ -204,8 +224,14 @@ def list_sessions(as_json):
 @click.option("--base", "base_names", multiple=True)
 @click.option("--json", "as_json", is_flag=True)
 def recover(
-    session_name, reason, provider, terminal_ids, interrupt,
-    acknowledge_ownership, base_names, as_json,
+    session_name,
+    reason,
+    provider,
+    terminal_ids,
+    interrupt,
+    acknowledge_ownership,
+    base_names,
+    as_json,
 ):
     """Explicitly rebind provider sessions after authentication changes."""
     if acknowledge_ownership and len(terminal_ids) != 1:
@@ -228,8 +254,8 @@ def recover(
     if reason == "epoch":
         payload["base_names"] = list(base_names)
     try:
-        response = requests.post(
-            f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/recover",
+        response = cao_http.post(
+            f"/sessions/{quote(session_name, safe='')}/recover",
             json=payload,
         )
         response.raise_for_status()
@@ -245,8 +271,9 @@ def recover(
         click.echo(f"Recovery: {result.get('session', session_name)} (epoch)")
     for item in result.get("results", []):
         detail = f" [{item['error_code']}]" if item.get("error_code") else ""
-        reconciliation = " reconciliation-required" if item.get(
-            "requires_supervisor_reconciliation") else ""
+        reconciliation = (
+            " reconciliation-required" if item.get("requires_supervisor_reconciliation") else ""
+        )
         label = item.get("terminal_id") or item.get("base")
         click.echo(f"{label}: {item['status']}{detail}{reconciliation}")
     if reason == "epoch":
@@ -267,8 +294,8 @@ def recover(
 def close(session_name, keep_bases, force, as_json):
     """Close a session and mechanically settle bases and warm intents."""
     try:
-        response = requests.post(
-            f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/close",
+        response = cao_http.post(
+            f"/sessions/{quote(session_name, safe='')}/close",
             params={"keep_bases": str(keep_bases).lower(), "force": str(force).lower()},
         )
         response.raise_for_status()
@@ -284,7 +311,9 @@ def close(session_name, keep_bases, force, as_json):
     for item in result.get("bases", []):
         click.echo(f"base {item['base']}: {item['status']}")
     intents = result.get("intents", {})
-    click.echo(f"intents: removed={intents.get('removed', 0)} retained={intents.get('retained', 0)}")
+    click.echo(
+        f"intents: removed={intents.get('removed', 0)} retained={intents.get('retained', 0)}"
+    )
 
 
 @session.command()
@@ -293,9 +322,7 @@ def close(session_name, keep_bases, force, as_json):
 def status(session_name, as_json):
     """Show the lifecycle status/v1 projection."""
     try:
-        response = requests.get(
-            f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/status"
-        )
+        response = cao_http.get(f"/sessions/{quote(session_name, safe='')}/status")
         response.raise_for_status()
         result = response.json()
     except requests.exceptions.RequestException as e:
@@ -335,7 +362,7 @@ def send(session_name, message, terminal_id, is_async, timeout):
             conductor, _ = _resolve_conductor(session_name)
             target_id = conductor["id"]
 
-        status_resp = requests.get(f"{API_BASE_URL}/terminals/{target_id}")
+        status_resp = cao_http.get(f"/terminals/{target_id}")
         status_resp.raise_for_status()
         current_status = status_resp.json().get("status")
         # "completed" is a valid pre-send state: the terminal has finished its
@@ -345,8 +372,8 @@ def send(session_name, message, terminal_id, is_async, timeout):
                 f"Terminal {target_id} is currently {current_status}. Wait for it to finish before sending."
             )
 
-        response = requests.post(
-            f"{API_BASE_URL}/terminals/{target_id}/input",
+        response = cao_http.post(
+            f"/terminals/{target_id}/input",
             params={"message": message},
         )
         response.raise_for_status()
@@ -366,8 +393,8 @@ def send(session_name, message, terminal_id, is_async, timeout):
         interrupted = True
 
     try:
-        output_resp = requests.get(
-            f"{API_BASE_URL}/terminals/{target_id}/output",
+        output_resp = cao_http.get(
+            f"/terminals/{target_id}/output",
             params={"mode": "last"},
         )
         output_resp.raise_for_status()

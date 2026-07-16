@@ -11,7 +11,7 @@ from urllib.parse import quote
 import click
 import requests
 
-from cli_agent_orchestrator.constants import API_BASE_URL, CAO_HOME_DIR, MCP_REQUEST_TIMEOUT
+from cli_agent_orchestrator.constants import CAO_HOME_DIR, MCP_REQUEST_TIMEOUT
 from cli_agent_orchestrator.services.verification_service import (
     DeploymentStatus,
     cli_deploy_root,
@@ -19,12 +19,13 @@ from cli_agent_orchestrator.services.verification_service import (
     format_server_status,
     git_root,
 )
+from cli_agent_orchestrator.utils.http import CAOHttpClient
 
+cao_http = CAOHttpClient(lambda: requests)
+from cli_agent_orchestrator.utils.sandbox_guard import require_not_sandbox_mutation
 
 _FROZEN_PROFILE_MARKER = "# FROZEN:"
-_NOT_RESTARTED = (
-    "installed, NOT restarted - server-path changes inactive until restart"
-)
+_NOT_RESTARTED = "installed, NOT restarted - server-path changes inactive until restart"
 _VERIFY_POLL_INTERVAL_SECONDS = 0.5
 _VERIFY_TIMEOUT_SECONDS = 30
 
@@ -35,9 +36,7 @@ def _redeploy_source_root() -> Path:
 
 def _installable_profiles(workspace_root: Path) -> list[Path]:
     """Return active workspace profiles in deterministic filename order."""
-    profiles = sorted(
-        (workspace_root / "profiles").glob("*.md"), key=lambda path: path.name
-    )
+    profiles = sorted((workspace_root / "profiles").glob("*.md"), key=lambda path: path.name)
     return [
         profile
         for profile in profiles
@@ -66,7 +65,7 @@ def _install_redeploy(source_root: Path) -> None:
 
 def _live_terminal_session_count() -> tuple[int, int] | None:
     try:
-        response = requests.get(f"{API_BASE_URL}/sessions", timeout=MCP_REQUEST_TIMEOUT)
+        response = cao_http.get(f"/sessions", timeout=MCP_REQUEST_TIMEOUT)
         response.raise_for_status()
         sessions = response.json()
         if not isinstance(sessions, list):
@@ -74,8 +73,8 @@ def _live_terminal_session_count() -> tuple[int, int] | None:
         terminal_count = 0
         for session in sessions:
             name = session["name"]
-            terminals = requests.get(
-                f"{API_BASE_URL}/sessions/{quote(name, safe='')}/terminals",
+            terminals = cao_http.get(
+                f"/sessions/{quote(name, safe='')}/terminals",
                 timeout=MCP_REQUEST_TIMEOUT,
             )
             terminals.raise_for_status()
@@ -142,6 +141,7 @@ def _print_deployment(
 @click.option("--yes", is_flag=True, help="Restart without an interactive confirmation.")
 def redeploy(yes: bool) -> None:
     """Reinstall CAO, optionally restart its server, then verify deployment."""
+    require_not_sandbox_mutation("redeploy")
     source_root = _redeploy_source_root()
     try:
         _install_redeploy(source_root)

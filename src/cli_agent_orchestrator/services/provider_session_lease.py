@@ -1,7 +1,7 @@
 """Non-reentrant, process-local leases for resumable provider-session UUIDs."""
 
-from dataclasses import dataclass
 import threading
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -42,4 +42,3 @@ def release_provider_session_lease(token: ProviderSessionLeaseToken) -> None:
 def provider_session_lease_held(session_uuid: str) -> bool:
     with _lock:
         return session_uuid in _held
-

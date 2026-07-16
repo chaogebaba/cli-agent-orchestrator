@@ -11,21 +11,22 @@ from cli_agent_orchestrator.cli.commands.info import info
 from cli_agent_orchestrator.cli.commands.init import init
 from cli_agent_orchestrator.cli.commands.install import install
 from cli_agent_orchestrator.cli.commands.launch import launch
+from cli_agent_orchestrator.cli.commands.ledger import ledger
+from cli_agent_orchestrator.cli.commands.mailbox import mailbox
 from cli_agent_orchestrator.cli.commands.mcp_server import mcp_server
 from cli_agent_orchestrator.cli.commands.memory import memory
+from cli_agent_orchestrator.cli.commands.messages import messages
 from cli_agent_orchestrator.cli.commands.profile import profile
 from cli_agent_orchestrator.cli.commands.redeploy import redeploy
+from cli_agent_orchestrator.cli.commands.sandbox import sandbox
 from cli_agent_orchestrator.cli.commands.schedule import flow, schedule
 from cli_agent_orchestrator.cli.commands.session import session
 from cli_agent_orchestrator.cli.commands.shutdown import shutdown
 from cli_agent_orchestrator.cli.commands.skills import skills
-from cli_agent_orchestrator.cli.commands.terminal import terminal
-from cli_agent_orchestrator.cli.commands.workflow import workflow
-from cli_agent_orchestrator.cli.commands.messages import messages
-from cli_agent_orchestrator.cli.commands.mailbox import mailbox
-from cli_agent_orchestrator.cli.commands.ledger import ledger
 from cli_agent_orchestrator.cli.commands.suite import suite
+from cli_agent_orchestrator.cli.commands.terminal import terminal
 from cli_agent_orchestrator.cli.commands.verify import verify
+from cli_agent_orchestrator.cli.commands.workflow import workflow
 
 try:
     __version__ = version("cli-agent-orchestrator")
@@ -47,6 +48,7 @@ cli.add_command(config)
 cli.add_command(init)
 cli.add_command(install)
 cli.add_command(redeploy)
+cli.add_command(sandbox)
 cli.add_command(shutdown)
 cli.add_command(schedule)
 cli.add_command(flow)  # deprecated alias for 'schedule' (issue #378)

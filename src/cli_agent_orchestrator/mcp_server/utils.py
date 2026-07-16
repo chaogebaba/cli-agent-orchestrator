@@ -11,8 +11,11 @@ from typing import Any, Dict, Optional
 
 import requests
 
-from cli_agent_orchestrator.constants import API_BASE_URL, MCP_REQUEST_TIMEOUT
+from cli_agent_orchestrator.constants import MCP_REQUEST_TIMEOUT
 from cli_agent_orchestrator.security.auth import get_local_bearer
+from cli_agent_orchestrator.utils.http import CAOHttpClient
+
+cao_http = CAOHttpClient(lambda: requests)
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +50,8 @@ def get_terminal_record(terminal_id: str) -> Optional[Dict[str, Any]]:
     """
 
     try:
-        response = requests.get(
-            f"{API_BASE_URL}/terminals/{terminal_id}",
+        response = cao_http.get(
+            f"/terminals/{terminal_id}",
             headers=_auth_headers() or None,
             timeout=MCP_REQUEST_TIMEOUT,
         )

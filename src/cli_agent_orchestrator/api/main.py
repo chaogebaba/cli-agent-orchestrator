@@ -10,6 +10,7 @@ import re
 import signal
 import struct
 import subprocess
+import sys
 import termios
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -28,7 +29,6 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,10 +36,10 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from cli_agent_orchestrator.api.routes_fork import router as fork_router
 from cli_agent_orchestrator.backends import TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.api.routes_fork import router as fork_router
 from cli_agent_orchestrator.clients.database import (
     adopt_mailbox_rows_at_startup,
     create_inbox_message,
@@ -51,7 +51,6 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
-    API_BASE_URL,
     CAO_HOME_DIR,
     CORS_ORIGINS,
     DEFAULT_PROVIDER,
@@ -82,7 +81,10 @@ from cli_agent_orchestrator.models.memory import (
     MemoryType,
 )
 from cli_agent_orchestrator.models.terminal import (
-    ForkContext, InboxReceiverId, Terminal, TerminalId,
+    ForkContext,
+    InboxReceiverId,
+    Terminal,
+    TerminalId,
 )
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.security.auth import (
@@ -114,26 +116,29 @@ from cli_agent_orchestrator.services.event_primitives import KINDS as EVENT_KIND
 from cli_agent_orchestrator.services.herdr_inbox_registry import set_herdr_inbox_service
 from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
 from cli_agent_orchestrator.services.inbox_service import inbox_service
-from cli_agent_orchestrator.services.mailbox_service import MailboxDomainError
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.services.log_writer import log_writer
-from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.mailbox_service import MailboxDomainError
 from cli_agent_orchestrator.services.stalled_callback_watchdog import stalled_callback_watchdog
+from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
-from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
 from cli_agent_orchestrator.services.terminal_guard_service import (
     TerminalProtectionError,
     require_delete_allowed,
     require_input_allowed,
 )
+from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.http import resolve_endpoint
 from cli_agent_orchestrator.utils.logging import setup_logging
+from cli_agent_orchestrator.utils.sandbox_guard import is_sandbox
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
     load_skill_content,
     validate_skill_name,
 )
 from cli_agent_orchestrator.utils.terminal import validate_tmux_name
+from cli_agent_orchestrator.utils.tmux_command import tmux_argv
 
 logger = logging.getLogger(__name__)
 
@@ -510,15 +515,18 @@ class MessageAckRequest(BaseModel):
 
 def _mailbox_http_exception(exc: Exception) -> HTTPException:
     from cli_agent_orchestrator.services.mailbox_service import PublicationCleanupFailed
+
     code = getattr(exc, "code", type(exc).__name__)
     message = getattr(exc, "message", str(exc))
     detail: dict[str, object] = {"code": code, "message": message}
     if isinstance(exc, PublicationCleanupFailed):
         detail["cause"] = {"code": str(exc.cause_code), "message": str(exc.cause_message)}
         return HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=detail)
-    status_code = status.HTTP_409_CONFLICT if code in {
-        "mailbox_conflict", "mailbox_authority_timeout"
-    } else status.HTTP_400_BAD_REQUEST
+    status_code = (
+        status.HTTP_409_CONFLICT
+        if code in {"mailbox_conflict", "mailbox_authority_timeout"}
+        else status.HTTP_400_BAD_REQUEST
+    )
     return HTTPException(status_code=status_code, detail=detail)
 
 
@@ -527,6 +535,16 @@ async def lifespan(app: FastAPI):
     """Application lifespan events."""
     logger.info("Starting CLI Agent Orchestrator server...")
     setup_logging()
+    if is_sandbox():
+        from cli_agent_orchestrator.sandbox_bootstrap import (
+            assert_sandbox_db_fence,
+            validate_active_sandbox,
+        )
+
+        active_manifest = validate_active_sandbox()
+        if active_manifest is None:
+            raise RuntimeError("sandbox startup lost its manifest binding")
+        assert_sandbox_db_fence(active_manifest)
     init_db()
     inbox_service.recover_stale_deliveries()
     adopt_mailbox_rows_at_startup()
@@ -543,7 +561,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(cleanup_expired_memories())
 
     # Start flow daemon as background task
-    daemon_task = asyncio.create_task(flow_daemon())
+    daemon_task = None if is_sandbox() else asyncio.create_task(flow_daemon())
 
     # Register event loop with event bus for thread-safe publishing
     loop = asyncio.get_running_loop()
@@ -557,7 +575,9 @@ async def lifespan(app: FastAPI):
 
     # Start temporary OpenCode inbox poller. GH #115 tracks replacing this
     # provider-specific wakeup path with a unified delivery engine.
-    opencode_inbox_task = asyncio.create_task(opencode_inbox_delivery_daemon(registry))
+    opencode_inbox_task = (
+        None if is_sandbox() else asyncio.create_task(opencode_inbox_delivery_daemon(registry))
+    )
 
     # Start provider-agnostic reconciliation sweep for orphaned PENDING messages
     # the immediate and event-driven status paths missed (issue #131).
@@ -601,7 +621,8 @@ async def lifespan(app: FastAPI):
     inbox_service_task.cancel()
     watchdog_task.cancel()
     # Cancel daemon on shutdown
-    daemon_task.cancel()
+    if daemon_task is not None:
+        daemon_task.cancel()
 
     try:
         await asyncio.gather(
@@ -609,18 +630,19 @@ async def lifespan(app: FastAPI):
             log_writer_task,
             inbox_service_task,
             watchdog_task,
-            daemon_task,
+            *([daemon_task] if daemon_task is not None else []),
             return_exceptions=True,
         )
     except asyncio.CancelledError:
         pass
 
     # Cancel OpenCode inbox poller on shutdown
-    opencode_inbox_task.cancel()
-    try:
-        await opencode_inbox_task
-    except asyncio.CancelledError:
-        pass
+    if opencode_inbox_task is not None:
+        opencode_inbox_task.cancel()
+        try:
+            await opencode_inbox_task
+        except asyncio.CancelledError:
+            pass
 
     # Cancel inbox reconciliation sweep on shutdown
     inbox_reconcile_task.cancel()
@@ -687,6 +709,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_SANDBOX_SETTER_PREFIXES = (
+    "/agents/profiles/install",
+    "/settings/agent-dirs",
+    "/settings/skill-dirs",
+)
+
+
+@app.middleware("http")
+async def instance_affinity_middleware(request: Request, call_next):
+    """Fence mutations to the server instance selected by the caller."""
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        expected = os.environ.get("CAO_INSTANCE_ID", "").strip()
+        supplied = request.headers.get("X-CAO-Instance", "").strip()
+        if (expected and supplied != expected) or (not expected and supplied):
+            return JSONResponse(status_code=409, content={"detail": "instance affinity mismatch"})
+        if expected and request.url.path.startswith(_SANDBOX_SETTER_PREFIXES):
+            return JSONResponse(status_code=403, content={"detail": "sandbox mutation forbidden"})
+    return await call_next(request)
+
 
 @app.exception_handler(RequestValidationError)
 async def _redact_env_vars_validation_error(
@@ -731,7 +772,7 @@ async def oauth_protected_resource_metadata():
     audience = (
         os.getenv("CAO_AUTH_AUDIENCE", "").strip()
         or os.getenv("AUTH0_AUDIENCE", "").strip()
-        or API_BASE_URL
+        or resolve_endpoint()
     )
     return {
         "resource": audience,
@@ -753,7 +794,7 @@ async def health_check():
     backend = get_backend()
     backend_name = "herdr" if isinstance(backend, HerdrBackend) else "tmux"
 
-    return {
+    payload = {
         "status": "ok",
         "service": "cli-agent-orchestrator",
         "terminal_backend": backend_name,
@@ -763,6 +804,31 @@ async def health_check():
             "claude": _probe("claude"),
         },
     }
+    if is_sandbox():
+        from cli_agent_orchestrator.sandbox_bootstrap import (
+            source_identity,
+            validate_active_sandbox,
+        )
+
+        manifest = validate_active_sandbox()
+        if manifest is None:
+            raise HTTPException(status_code=500, detail="sandbox identity unavailable")
+        source = source_identity(Path(manifest["source"]["fork_root"]))
+        module_path = Path(__file__).resolve()
+        fork_root = Path(manifest["source"]["fork_root"])
+        identity = source["interpreter_identity"]
+        expected_identity = manifest["source"]["interpreter_identity"]
+        payload.update(
+            {
+                "instance_id": manifest["instance_id"],
+                "source": {
+                    **source,
+                    "module_contained": module_path.is_relative_to(fork_root),
+                    "interpreter_match": identity == expected_identity,
+                },
+            }
+        )
+    return payload
 
 
 def _mcp_apps_enabled() -> bool:
@@ -1164,9 +1230,13 @@ async def create_session(
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
         create_kwargs = dict(
-            provider=provider, agent_profile=agent_profile, session_name=session_name,
-            working_directory=working_directory, allowed_tools=allowed_tools_list,
-            registry=get_plugin_registry(request), env_vars=env_vars,
+            provider=provider,
+            agent_profile=agent_profile,
+            session_name=session_name,
+            working_directory=working_directory,
+            allowed_tools=allowed_tools_list,
+            registry=get_plugin_registry(request),
+            env_vars=env_vars,
         )
         if allow_incomplete_brief:
             create_kwargs["allow_incomplete_brief"] = True
@@ -1180,6 +1250,7 @@ async def create_session(
             async def _spawn_sidecar() -> None:
                 try:
                     from cli_agent_orchestrator.services import terminal_service
+
                     sidecar_context = terminal_service.seed_resume_bootstrap(
                         "memory_manager", sidecar_provider, working_directory or os.getcwd()
                     )
@@ -1211,9 +1282,13 @@ async def create_session(
 
 @app.post("/sessions/start")
 async def start_session_endpoint(
-    request: Request, background_tasks: BackgroundTasks, agent_profile: str,
-    provider: Optional[str] = None, session_name: Optional[str] = None,
-    working_directory: Optional[str] = None, allowed_tools: Optional[str] = None,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    agent_profile: str,
+    provider: Optional[str] = None,
+    session_name: Optional[str] = None,
+    working_directory: Optional[str] = None,
+    allowed_tools: Optional[str] = None,
     memory: bool = False,
     env_vars: Optional[Dict[str, str]] = Body(default=None, embed=True),
     allow_incomplete_brief: bool = False,
@@ -1223,39 +1298,61 @@ async def start_session_endpoint(
     _validate_artifacts_dir_override(env_vars)
     try:
         result = await session_service.start_session(
-            provider=provider, agent_profile=agent_profile, session_name=session_name,
+            provider=provider,
+            agent_profile=agent_profile,
+            session_name=session_name,
             working_directory=working_directory,
             allowed_tools=allowed_tools.split(",") if allowed_tools else None,
-            registry=get_plugin_registry(request), env_vars=env_vars,
+            registry=get_plugin_registry(request),
+            env_vars=env_vars,
             allow_incomplete_brief=allow_incomplete_brief,
         )
     except MailboxDomainError as exc:
         raise _mailbox_http_exception(exc) from exc
     except RuntimeError as exc:
         code = str(exc)
-        if code in {"seed_timeout", "seed_exec_failed", "seed_uuid_unparseable", "seed_artifact_invalid"}:
-            return JSONResponse(status_code=422, content={
-                "schema_version": "cao.session-start/v1", "session": None,
-                "supervisor_terminal": None,
-                "bootstrap": {"mode": "seed_resume", "status": "seed_failed", "error_code": code},
-                "manifest": None, "manifest_error": None,
-            })
+        if code in {
+            "seed_timeout",
+            "seed_exec_failed",
+            "seed_uuid_unparseable",
+            "seed_artifact_invalid",
+        }:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "schema_version": "cao.session-start/v1",
+                    "session": None,
+                    "supervisor_terminal": None,
+                    "bootstrap": {
+                        "mode": "seed_resume",
+                        "status": "seed_failed",
+                        "error_code": code,
+                    },
+                    "manifest": None,
+                    "manifest_error": None,
+                },
+            )
         raise
     if memory:
         terminal = result["supervisor_terminal"]
         sidecar_provider = provider or DEFAULT_PROVIDER
+
         async def _spawn_start_sidecar() -> None:
             try:
                 context = terminal_service.seed_resume_bootstrap(
                     "memory_manager", sidecar_provider, working_directory or os.getcwd()
                 )
                 await terminal_service.create_terminal(
-                    provider=sidecar_provider, agent_profile="memory_manager",
-                    session_name=terminal["session_name"], working_directory=working_directory,
-                    registry=get_plugin_registry(request), fork_context=context,
+                    provider=sidecar_provider,
+                    agent_profile="memory_manager",
+                    session_name=terminal["session_name"],
+                    working_directory=working_directory,
+                    registry=get_plugin_registry(request),
+                    fork_context=context,
                 )
             except Exception as exc:
                 logger.warning("Failed to spawn memory_manager sidecar: %s", exc)
+
         background_tasks.add_task(_spawn_start_sidecar)
     return result
 
@@ -1294,6 +1391,7 @@ async def get_session(session_name: str) -> Dict:
 async def get_session_manifest(session_name: str) -> Dict:
     """Return the canonical live session world-model."""
     from cli_agent_orchestrator.services.session_manifest_service import build_session_manifest
+
     try:
         return build_session_manifest(session_name)
     except ValueError as exc:
@@ -1306,6 +1404,7 @@ async def get_session_status_endpoint(session_name: str) -> Dict:
     try:
         validate_tmux_name(session_name, "session_name")
         from cli_agent_orchestrator.services.session_status_service import build_session_status
+
         return build_session_status(session_name)
     except ValueError as exc:
         if str(exc) == "session_missing":
@@ -1324,15 +1423,22 @@ async def recover_session(
         validate_tmux_name(session_name, "session_name")
         if body.reason == "epoch":
             if body.terminal_ids or body.interrupt or body.acknowledge_ownership:
-                raise ValueError("epoch recovery rejects terminal_ids, interrupt, and acknowledge_ownership")
+                raise ValueError(
+                    "epoch recovery rejects terminal_ids, interrupt, and acknowledge_ownership"
+                )
             from cli_agent_orchestrator.services.epoch_recovery_service import recover_epoch
+
             return await recover_epoch(session_name, body.base_names or None)
         if body.base_names:
             raise ValueError("provider-reauth rejects base_names")
         from cli_agent_orchestrator.services.provider_rebind_service import recover_provider_reauth
+
         return await recover_provider_reauth(
-            session_name, provider=body.provider, terminal_ids=body.terminal_ids or None,
-            interrupt=body.interrupt, acknowledge_ownership=body.acknowledge_ownership,
+            session_name,
+            provider=body.provider,
+            terminal_ids=body.terminal_ids or None,
+            interrupt=body.interrupt,
+            acknowledge_ownership=body.acknowledge_ownership,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
@@ -1340,14 +1446,21 @@ async def recover_session(
 
 @app.post("/sessions/{session_name}/close")
 async def close_session_endpoint(
-    request: Request, session_name: str, keep_bases: bool = False, force: bool = False,
+    request: Request,
+    session_name: str,
+    keep_bases: bool = False,
+    force: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
 ) -> Dict:
     try:
         validate_tmux_name(session_name, "session_name")
         from cli_agent_orchestrator.services.session_close_service import close_session
+
         return await asyncio.to_thread(
-            close_session, session_name, keep_bases=keep_bases, force=force,
+            close_session,
+            session_name,
+            keep_bases=keep_bases,
+            force=force,
             registry=get_plugin_registry(request),
         )
     except PermissionError as exc:
@@ -1814,9 +1927,7 @@ async def run_step(
 
     if body.reuse_terminal_id:
         try:
-            require_input_allowed(
-                body.reuse_terminal_id, refresh_ingest=body.refresh_ingest
-            )
+            require_input_allowed(body.reuse_terminal_id, refresh_ingest=body.refresh_ingest)
         except TerminalProtectionError as e:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
 
@@ -2285,6 +2396,7 @@ async def create_inbox_message_endpoint(
     """Create inbox message and attempt immediate delivery."""
     if receiver_id.startswith("mb_"):
         from cli_agent_orchestrator.services.mailbox_service import create_logical_inbox_message
+
         try:
             inbox_msg = await asyncio.to_thread(
                 create_logical_inbox_message,
@@ -2306,8 +2418,10 @@ async def create_inbox_message_endpoint(
                 "Immediate delivery attempt failed for %s: %s", inbox_msg.receiver_id, exc
             )
         return {
-            "success": True, "message_id": inbox_msg.id,
-            "sender_id": inbox_msg.sender_id, "receiver_id": inbox_msg.receiver_id,
+            "success": True,
+            "message_id": inbox_msg.id,
+            "sender_id": inbox_msg.sender_id,
+            "receiver_id": inbox_msg.receiver_id,
             "created_at": inbox_msg.created_at.isoformat(),
         }
     try:
@@ -2396,8 +2510,10 @@ async def get_inbox_messages_endpoint(
             except ValueError:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=("Invalid status: %s. Valid values: pending, delivering, delivered, "
-                            "delivery_failed, failed" % status_param),
+                    detail=(
+                        "Invalid status: %s. Valid values: pending, delivering, delivered, "
+                        "delivery_failed, failed" % status_param
+                    ),
                 )
 
         # Get messages using existing database function
@@ -2454,10 +2570,15 @@ async def list_messages_endpoint(
                 detail={"code": "invalid_since_format", "message": "invalid ISO8601 since"},
             ) from exc
     from cli_agent_orchestrator.services.mailbox_service import list_messages
+
     try:
         return await asyncio.to_thread(
-            list_messages, to, since=parsed_since, after_id=after_id,
-            limit=limit, status=status_param,
+            list_messages,
+            to,
+            since=parsed_since,
+            after_id=after_id,
+            limit=limit,
+            status=status_param,
         )
     except MailboxDomainError as exc:
         raise _mailbox_http_exception(exc) from exc
@@ -2469,6 +2590,7 @@ async def ack_messages_endpoint(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     from cli_agent_orchestrator.services.mailbox_service import ack_messages
+
     try:
         return await asyncio.to_thread(ack_messages, body.terminal_id, body.up_to_id)
     except MailboxDomainError as exc:
@@ -2480,6 +2602,7 @@ async def list_mailboxes_endpoint(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
 ) -> Dict:
     from cli_agent_orchestrator.services.mailbox_service import list_mailboxes
+
     return await asyncio.to_thread(list_mailboxes)
 
 
@@ -2489,6 +2612,7 @@ async def delete_mailbox_endpoint(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
 ) -> Dict:
     from cli_agent_orchestrator.services.mailbox_service import delete_mailbox
+
     try:
         return await asyncio.to_thread(delete_mailbox, mailbox_id)
     except MailboxDomainError as exc:
@@ -2558,7 +2682,7 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # Any explicit non-dumb TERM the operator set is preserved.
     pty_env = _build_pty_env()
     proc = subprocess.Popen(
-        ["tmux", "-u", "attach-session", "-t", f"{session_name}:{window_name}"],
+        tmux_argv("-u", "attach-session", "-t", f"{session_name}:{window_name}"),
         stdin=slave_fd,
         stdout=slave_fd,
         stderr=slave_fd,

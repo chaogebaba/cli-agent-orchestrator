@@ -5,6 +5,7 @@ import json
 import click
 
 from cli_agent_orchestrator.services.config_service import ConfigService
+from cli_agent_orchestrator.utils.sandbox_guard import require_not_sandbox_mutation
 
 
 def _coerce(value: str):
@@ -48,6 +49,7 @@ _ENV_ONLY_SECTIONS = ("network.", "auth.")
 @click.argument("value")
 def set_cmd(key, value):
     """Set config KEY to VALUE, persisting it to settings.json."""
+    require_not_sandbox_mutation("config set")
     try:
         result = ConfigService.set(key, _coerce(value))
     except (ValueError, KeyError) as exc:

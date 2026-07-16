@@ -6,6 +6,7 @@ from pathlib import Path
 import click
 
 from cli_agent_orchestrator.constants import SKILLS_DIR
+from cli_agent_orchestrator.utils.sandbox_guard import require_not_sandbox_mutation
 from cli_agent_orchestrator.utils.skill_injection import refresh_all_cao_managed_agents
 from cli_agent_orchestrator.utils.skills import (
     list_skills,
@@ -55,6 +56,7 @@ def skills():
 @click.option("--force", is_flag=True, help="Overwrite an existing installed skill.")
 def add(folder_path: Path, force: bool) -> None:
     """Install a skill from a local folder path."""
+    require_not_sandbox_mutation("skills add")
     try:
         destination_dir = _install_skill_folder(folder_path, force=force)
         click.echo(f"Skill '{destination_dir.name}' installed successfully")
@@ -67,6 +69,7 @@ def add(folder_path: Path, force: bool) -> None:
 @click.argument("name")
 def remove(name: str) -> None:
     """Remove an installed skill."""
+    require_not_sandbox_mutation("skills remove")
     try:
         skill_name = validate_skill_name(name)
         skill_dir = SKILLS_DIR / skill_name

@@ -9,6 +9,7 @@ from cli_agent_orchestrator.utils.env import (
     set_env_var,
     unset_env_var,
 )
+from cli_agent_orchestrator.utils.sandbox_guard import require_not_sandbox_mutation
 
 
 @click.group(name="env", invoke_without_command=True)
@@ -24,6 +25,7 @@ def env(ctx: click.Context) -> None:
 @click.argument("value")
 def env_set(key: str, value: str) -> None:
     """Set a managed environment variable."""
+    require_not_sandbox_mutation("env set")
     set_env_var(key, value)
     click.echo(f"✓ Set {key} in {CAO_ENV_FILE}")
 
@@ -56,5 +58,6 @@ def env_list() -> None:
 @click.argument("key")
 def env_unset(key: str) -> None:
     """Unset a managed environment variable."""
+    require_not_sandbox_mutation("env unset")
     unset_env_var(key)
     click.echo(f"✓ Unset {key} in {CAO_ENV_FILE}")

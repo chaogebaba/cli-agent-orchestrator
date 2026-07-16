@@ -12,6 +12,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict
 
+from cli_agent_orchestrator.utils.sandbox_guard import bind_mcp_server_identity
+
 logger = logging.getLogger(__name__)
 
 GROK_CONFIG_FILE = Path.home() / ".grok" / "config.toml"
@@ -19,7 +21,9 @@ _MCP_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _TABLE_RE = re.compile(r"^\s*\[([^\]]+)\]\s*(?:#.*)?$")
 
 
-def ensure_grok_mcp_servers(mcp_servers: Dict[str, Any] | None) -> None:
+def ensure_grok_mcp_servers(
+    mcp_servers: Dict[str, Any] | None, *, terminal_id: str | None = None
+) -> None:
     """Ensure profile MCP servers exist in ``~/.grok/config.toml``.
 
     The write is intentionally narrow: only ``[mcp_servers.<name>]`` and its
@@ -32,6 +36,8 @@ def ensure_grok_mcp_servers(mcp_servers: Dict[str, Any] | None) -> None:
     content = GROK_CONFIG_FILE.read_text(encoding="utf-8") if GROK_CONFIG_FILE.exists() else ""
     for name, raw_config in mcp_servers.items():
         config = dict(raw_config)
+        if terminal_id is not None:
+            config = bind_mcp_server_identity(config, terminal_id)
         content = _upsert_mcp_server_section(content, name, config)
 
     GROK_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)

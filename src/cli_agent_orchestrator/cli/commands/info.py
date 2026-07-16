@@ -8,10 +8,12 @@ import requests
 
 from cli_agent_orchestrator.constants import (
     DATABASE_FILE,
-    SERVER_HOST,
-    SERVER_PORT,
     SESSION_PREFIX,
 )
+from cli_agent_orchestrator.utils.http import CAOHttpClient
+
+cao_http = CAOHttpClient(lambda: requests)
+from cli_agent_orchestrator.utils.tmux_command import tmux_argv
 
 
 @click.command()
@@ -29,7 +31,7 @@ def info():
         if not session_name:
             try:
                 result = subprocess.run(
-                    ["tmux", "display-message", "-p", "#S"],
+                    tmux_argv("display-message", "-p", "#S"),
                     capture_output=True,
                     text=True,
                     check=True,
@@ -41,8 +43,7 @@ def info():
         if session_name and session_name.startswith(SESSION_PREFIX):
             try:
                 # Call API to get session details
-                url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions/{session_name}"
-                response = requests.get(url)
+                response = cao_http.get(f"/sessions/{session_name}")
 
                 if response.status_code == 200:
                     data = response.json()

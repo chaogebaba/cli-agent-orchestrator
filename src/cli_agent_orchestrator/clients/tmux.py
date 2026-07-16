@@ -15,6 +15,7 @@ from cli_agent_orchestrator.utils.path_validation import (
     resolve_and_validate_path,
 )
 from cli_agent_orchestrator.utils.terminal import validate_tmux_name
+from cli_agent_orchestrator.utils.tmux_command import tmux_argv, tmux_socket_name
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,8 @@ class TmuxClient:
     """Simplified tmux client for basic operations."""
 
     def __init__(self) -> None:
-        self.server = libtmux.Server()
+        socket_name = tmux_socket_name()
+        self.server = libtmux.Server(socket_name=socket_name) if socket_name else libtmux.Server()
 
     # Kept as an alias so existing callers/tests referencing the class
     # attribute keep working; the canonical set lives in
@@ -295,12 +297,12 @@ class TmuxClient:
             buf_content = keys.encode()
             paste_flag = "-p"
             subprocess.run(
-                ["tmux", "load-buffer", "-b", buf_name, "-"],
+                tmux_argv("load-buffer", "-b", buf_name, "-"),
                 input=buf_content,
                 check=True,
             )
             subprocess.run(
-                ["tmux", "paste-buffer", paste_flag, "-b", buf_name, "-t", target],
+                tmux_argv("paste-buffer", paste_flag, "-b", buf_name, "-t", target),
                 check=True,
             )
             # Delay to let the TUI process the bracketed paste end sequence before
@@ -316,7 +318,7 @@ class TmuxClient:
                     # before the next Enter triggers form submission.
                     time.sleep(0.5)
                 subprocess.run(
-                    ["tmux", "send-keys", "-t", target, "Enter"],
+                    tmux_argv("send-keys", "-t", target, "Enter"),
                     check=True,
                 )
             logger.debug(f"Sent keys to {target}")
@@ -325,7 +327,7 @@ class TmuxClient:
             raise
         finally:
             subprocess.run(
-                ["tmux", "delete-buffer", "-b", buf_name],
+                tmux_argv("delete-buffer", "-b", buf_name),
                 check=False,
             )
 

@@ -20,6 +20,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
+from cli_agent_orchestrator.utils.sandbox_guard import bind_mcp_server_identity
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 
 logger = logging.getLogger(__name__)
@@ -181,12 +182,14 @@ class CopilotCliProvider(BaseProvider):
         # invocation via the shared resolver.
         mcp_command, mcp_args = resolve_cao_mcp_command("cao-mcp-server", [])
         merged_servers: dict = {
-            "cao-mcp-server": {
-                "command": mcp_command,
-                "args": mcp_args,
-                "disabled": False,
-                "env": {"CAO_TERMINAL_ID": self.terminal_id},
-            }
+            "cao-mcp-server": bind_mcp_server_identity(
+                {
+                    "command": mcp_command,
+                    "args": mcp_args,
+                    "disabled": False,
+                },
+                self.terminal_id,
+            )
         }
         return json.dumps({"mcpServers": merged_servers}, ensure_ascii=False)
 

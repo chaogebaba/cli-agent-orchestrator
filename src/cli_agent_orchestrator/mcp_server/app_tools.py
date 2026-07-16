@@ -14,7 +14,7 @@ Tools implemented here:
 * ``submit_command``    — single mutation choke point **(Phase II skeleton)**
 
 **HTTP-only boundary.** Every read of Backplane state goes through
-the FastAPI surface over ``API_BASE_URL`` (``requests``) or through process-local
+the FastAPI surface through the shared endpoint-bound HTTP helper or process-local
 read-only services (``event_log_service``, ``ui_state_service``). This module — and
 all of ``mcp_server/`` — must never import ``clients.tmux`` or ``clients.database``;
 the guard test enforces it.
@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from cli_agent_orchestrator.constants import API_BASE_URL, MCP_REQUEST_TIMEOUT
+from cli_agent_orchestrator.constants import MCP_REQUEST_TIMEOUT
 from cli_agent_orchestrator.ext_apps import (
     AGENT_RESOURCE_URI,
     DASHBOARD_RESOURCE_URI,
@@ -57,6 +57,9 @@ from cli_agent_orchestrator.services.ui_state_service import (
     build_agent_detail_snapshot,
     build_dashboard_snapshot,
 )
+from cli_agent_orchestrator.utils.http import CAOHttpClient
+
+cao_http = CAOHttpClient(lambda: requests)
 
 logger = logging.getLogger(__name__)
 
@@ -115,10 +118,10 @@ def _auth_headers() -> Dict[str, str]:
 
 
 def _get_json(path: str, **params: Any) -> Any:
-    """GET ``{API_BASE_URL}{path}`` and return parsed JSON (raises on HTTP error)."""
+    """GET a CAO API path and return parsed JSON (raises on HTTP error)."""
 
-    response = requests.get(
-        f"{API_BASE_URL}{path}",
+    response = cao_http.get(
+        f"{path}",
         params=params or None,
         headers=_auth_headers() or None,
         timeout=MCP_REQUEST_TIMEOUT,
@@ -139,15 +142,15 @@ def _extract_error_detail(response: "requests.Response", fallback: str) -> str:
 
 
 def _post_json(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    """POST ``{API_BASE_URL}{path}`` with query params and return parsed JSON.
+    """POST a CAO API path with query params and return parsed JSON.
 
     The Backplane mutation endpoints (``/sessions``, ``/terminals/*/input``,
     ``/terminals/*/key``, ``/terminals/*/inbox/messages``) take their arguments as
     query parameters, mirroring how ``mcp_server/server.py`` already calls them.
     """
 
-    response = requests.post(
-        f"{API_BASE_URL}{path}",
+    response = cao_http.post(
+        f"{path}",
         params={k: v for k, v in (params or {}).items() if v is not None} or None,
         headers=_auth_headers() or None,
         timeout=MCP_REQUEST_TIMEOUT,
@@ -160,10 +163,10 @@ def _post_json(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
 
 
 def _delete_json(path: str) -> Any:
-    """DELETE ``{API_BASE_URL}{path}`` and return parsed JSON (raises on HTTP error)."""
+    """DELETE a CAO API path and return parsed JSON (raises on HTTP error)."""
 
-    response = requests.delete(
-        f"{API_BASE_URL}{path}",
+    response = cao_http.delete(
+        f"{path}",
         headers=_auth_headers() or None,
         timeout=MCP_REQUEST_TIMEOUT,
     )

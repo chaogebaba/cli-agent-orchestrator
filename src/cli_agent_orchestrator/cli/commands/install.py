@@ -13,6 +13,7 @@ from cli_agent_orchestrator.constants import (
     PROVIDERS,
 )
 from cli_agent_orchestrator.services.install_service import install_agent, parse_env_assignment
+from cli_agent_orchestrator.utils.sandbox_guard import require_not_sandbox_mutation
 
 # Profile names are used as filesystem path segments; this matches the stricter
 # validator inside install_service.py (kept duplicated deliberately — the CLI
@@ -66,8 +67,7 @@ def _copy_local_profile_to_store(agent_source: str) -> Optional[str]:
     type=click.Choice(PROVIDERS),
     default=None,
     help=(
-        "Provider to use (default: profile frontmatter `provider:`, "
-        f"else {DEFAULT_PROVIDER})"
+        "Provider to use (default: profile frontmatter `provider:`, " f"else {DEFAULT_PROVIDER})"
     ),
 )
 @click.option(
@@ -100,6 +100,7 @@ def install(agent_source: str, provider: Optional[str], env_vars: tuple[str, ...
           --env API_TOKEN=my-secret-token \
           --env SERVICE_URL=http://127.0.0.1:27124
     """
+    require_not_sandbox_mutation("install")
     try:
         parsed_env = dict(parse_env_assignment(env_assignment) for env_assignment in env_vars)
     except ValueError as exc:

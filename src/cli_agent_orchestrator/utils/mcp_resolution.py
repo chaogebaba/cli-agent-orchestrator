@@ -23,10 +23,13 @@ server, or an explicit absolute path) passes through unchanged.
 """
 
 import logging
+import os
 import shutil
 import sys
 from pathlib import Path
 from typing import List, Tuple
+
+from cli_agent_orchestrator.utils.sandbox_guard import bind_mcp_server_identity
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +90,11 @@ def resolve_cao_mcp_command(
     if command != CAO_MCP_SERVER_COMMAND:
         return command, list(args)
 
+    if os.environ.get("CAO_INSTANCE_ID"):
+        if not sys.executable:
+            raise RuntimeError("sandbox MCP server requires the current interpreter")
+        return sys.executable, ["-m", CAO_MCP_SERVER_MODULE, *args]
+
     sibling = _sibling_script()
     on_path = shutil.which(CAO_MCP_SERVER_COMMAND)
     order = (
@@ -112,7 +120,9 @@ def resolve_cao_mcp_command(
     return interpreter, ["-m", CAO_MCP_SERVER_MODULE, *args]
 
 
-def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
+def resolve_mcp_server_config(
+    config: dict, *, persisted: bool = False, terminal_id: str | None = None
+) -> dict:
     """Return a copy of an MCP server config with its command resolved.
 
     ``persisted`` is forwarded to :func:`resolve_cao_mcp_command`; set it True
@@ -128,7 +138,8 @@ def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
     present key.
     """
     if "command" not in config:
-        return dict(config)
+        resolved = dict(config)
+        return bind_mcp_server_identity(resolved, terminal_id) if terminal_id else resolved
     resolved = dict(config)
     command = resolved.get("command", "")
     args = resolved.get("args", []) or []
@@ -136,7 +147,7 @@ def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
     if (new_command, new_args) == (command, args):
         # Passthrough (non-bundled command): don't write back keys the entry
         # didn't have — e.g. don't add args=[] to an entry that omitted args.
-        return resolved
+        return bind_mcp_server_identity(resolved, terminal_id) if terminal_id else resolved
     resolved["command"] = new_command
     resolved["args"] = new_args
-    return resolved
+    return bind_mcp_server_identity(resolved, terminal_id) if terminal_id else resolved

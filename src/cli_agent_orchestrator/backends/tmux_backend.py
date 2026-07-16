@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 
 from cli_agent_orchestrator.backends.base import TerminalBackend, TerminalBackendError
 from cli_agent_orchestrator.clients.tmux import TmuxClient
+from cli_agent_orchestrator.utils.tmux_command import tmux_argv
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +82,12 @@ class TmuxBackend(TerminalBackend):
 
     def window_liveness(self, session_name: str, window_name: str) -> str:
         import subprocess
-        proc = subprocess.run(["tmux", "list-windows", "-t", session_name, "-F", "#{window_name}"],
-                              capture_output=True, text=True)
+
+        proc = subprocess.run(
+            tmux_argv("list-windows", "-t", session_name, "-F", "#{window_name}"),
+            capture_output=True,
+            text=True,
+        )
         if proc.returncode == 0:
             return "live" if window_name in proc.stdout.splitlines() else "gone"
         stderr = proc.stderr.lower()
@@ -149,7 +154,7 @@ class TmuxBackend(TerminalBackend):
         """Attach to tmux session via subprocess (replaces current process)."""
         import subprocess
 
-        subprocess.run(["tmux", "attach-session", "-t", session_name], check=True)
+        subprocess.run(tmux_argv("attach-session", "-t", session_name), check=True)
 
     # --- Pipe-pane ---
 

@@ -16,6 +16,7 @@ from cli_agent_orchestrator.constants import LOCAL_AGENT_STORE_DIR, ROLE_TOOL_DE
 from cli_agent_orchestrator.utils.agent_profiles import (
     list_agent_profiles,
 )
+from cli_agent_orchestrator.utils.sandbox_guard import require_not_sandbox_mutation
 
 # Known deprecated frontmatter fields that should trigger warnings.
 _DEPRECATED_FIELDS = {"autoApproveTools"}
@@ -253,6 +254,7 @@ def remove_cmd(name: str, yes: bool):
     Only removes profiles from ~/.aws/cli-agent-orchestrator/agent-store/.
     Does not affect built-in or provider-managed profiles.
     """
+    require_not_sandbox_mutation("profile remove")
     store_root = LOCAL_AGENT_STORE_DIR.resolve()
     target = (LOCAL_AGENT_STORE_DIR / f"{name}.md").resolve()
 
@@ -327,6 +329,7 @@ def create_cmd(template: str, config_path: str, output_dir: str):
 
         cao profile create -t aws/sqs-monitor -c config.json -o ./agents/
     """
+    require_not_sandbox_mutation("profile create")
     from cli_agent_orchestrator.services.agent_scaffold import (
         render_template,
     )

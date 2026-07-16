@@ -6,7 +6,7 @@ import requests  # type: ignore[import-untyped]
 from fastmcp import FastMCP
 from pydantic import Field
 
-from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER
+from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
 from cli_agent_orchestrator.ops_mcp_server.models import (
     InstallResult,
     LaunchResult,
@@ -14,6 +14,9 @@ from cli_agent_orchestrator.ops_mcp_server.models import (
     SendMessageResult,
     SessionListResult,
 )
+from cli_agent_orchestrator.utils.http import CAOHttpClient
+
+cao_http = CAOHttpClient(lambda: requests)
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 JsonDict = Dict[str, Any]
@@ -24,7 +27,7 @@ mcp = FastMCP(
     # CAO Operations MCP Server
 
     Manage CLI Agent Orchestrator profiles and sessions from outside a CAO session.
-    Requires the CAO API server running at localhost:9889.
+    Requires a reachable CAO API server.
 
     ## Typical Workflow
     1. list_profiles to inspect available profiles
@@ -68,9 +71,9 @@ def _request_json(
 ) -> tuple[Optional[Any], Optional[str]]:
     """Execute an API request and return either JSON data or an error message."""
     try:
-        response = requests.request(
+        response = cao_http.request(
             method,
-            f"{API_BASE_URL}{path}",
+            path,
             params=params,
             json=json,
         )

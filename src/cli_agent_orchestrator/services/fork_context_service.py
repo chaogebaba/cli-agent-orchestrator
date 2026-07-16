@@ -1,4 +1,5 @@
 """Provider-session registry, capture, and deterministic staleness helpers."""
+
 import hashlib
 import json
 import os
@@ -10,10 +11,16 @@ from typing import Any, Literal, NoReturn, Optional
 from urllib.parse import quote
 
 from cli_agent_orchestrator.clients.database import (
-    get_provider_session_by_uuid, get_ready_provider_session, get_terminal_metadata,
-    list_ready_provider_sessions, list_terminals_by_provider_session_id,
-    register_provider_session, retire_provider_session, update_terminal_provider_session_id,
+    get_provider_session_by_uuid,
+    get_ready_provider_session,
+    get_terminal_metadata,
+    list_ready_provider_sessions,
+    list_terminals_by_provider_session_id,
+    register_provider_session,
+    retire_provider_session,
+    update_terminal_provider_session_id,
 )
+from cli_agent_orchestrator.utils.tmux_command import tmux_argv
 
 
 class ForkContextError(ValueError):
@@ -45,8 +52,9 @@ def _with_role_notice(preamble: str) -> str:
 
 
 def _run_git(cwd: str, *args: str) -> str:
-    return subprocess.run(["git", "-C", cwd, *args], check=True, text=True,
-                          capture_output=True).stdout
+    return subprocess.run(
+        ["git", "-C", cwd, *args], check=True, text=True, capture_output=True
+    ).stdout
 
 
 def _hash(path: Path) -> str:
@@ -146,6 +154,7 @@ def resolve_base(value: str) -> dict[str, Any]:
         return _require_forkable(row)
     # UUID-looking input is a registry miss; other text is an unknown name.
     import uuid as uuidlib
+
     try:
         uuidlib.UUID(value)
         raise ForkContextError("base_not_registered")
@@ -162,8 +171,12 @@ def _require_forkable(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def pane_pid(session: str, window: str) -> int:
-    out = subprocess.run(["tmux", "display-message", "-p", "-t", f"{session}:{window}",
-                          "#{pane_pid}"], check=True, capture_output=True, text=True).stdout
+    out = subprocess.run(
+        tmux_argv("display-message", "-p", "-t", f"{session}:{window}", "#{pane_pid}"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
     return int(out.strip())
 
 
@@ -174,7 +187,7 @@ def _descendants(root: int) -> list[int]:
             continue
         try:
             stat = (entry / "stat").read_text()
-            tail = stat[stat.rfind(")") + 2:].split()
+            tail = stat[stat.rfind(")") + 2 :].split()
             children.setdefault(int(tail[1]), []).append(int(entry.name))
         except (OSError, ValueError, IndexError):
             continue
@@ -188,9 +201,12 @@ def _descendants(root: int) -> list[int]:
 
 def pane_launch_epoch(pid: int) -> float:
     stat = Path(f"/proc/{pid}/stat").read_text()
-    start_ticks = int(stat[stat.rfind(")") + 2:].split()[19])
-    btime = next(int(x.split()[1]) for x in Path("/proc/stat").read_text().splitlines()
-                 if x.startswith("btime "))
+    start_ticks = int(stat[stat.rfind(")") + 2 :].split()[19])
+    btime = next(
+        int(x.split()[1])
+        for x in Path("/proc/stat").read_text().splitlines()
+        if x.startswith("btime ")
+    )
     return btime + start_ticks / os.sysconf("SC_CLK_TCK")
 
 
@@ -202,7 +218,11 @@ def capture_codex_uuid(root_pid: int, launch_time: float, cwd: str) -> str:
                 for fd in Path(f"/proc/{pid}/fd").iterdir():
                     try:
                         p = Path(os.readlink(fd)).resolve()
-                        if "/.codex/sessions/" in str(p) and p.name.startswith("rollout-") and p.suffix == ".jsonl":
+                        if (
+                            "/.codex/sessions/" in str(p)
+                            and p.name.startswith("rollout-")
+                            and p.suffix == ".jsonl"
+                        ):
                             candidates.add(p)
                     except OSError:
                         pass
@@ -275,17 +295,11 @@ def validate_base_source(
         if provider == "codex":
             found = any(
                 session_uuid in path.name
-                for path in (Path.home() / ".codex" / "sessions").glob(
-                    "**/rollout-*.jsonl"
-                )
+                for path in (Path.home() / ".codex" / "sessions").glob("**/rollout-*.jsonl")
             )
         else:
             found = (
-                Path.home()
-                / ".grok"
-                / "sessions"
-                / quote(cwd, safe="")
-                / session_uuid
+                Path.home() / ".grok" / "sessions" / quote(cwd, safe="") / session_uuid
             ).exists()
         if not found:
             raise ForkContextError("session_file_missing")
@@ -322,9 +336,7 @@ def validate_base_source(
     try:
         profile = load_agent_profile(agent_profile or "")
     except (FileNotFoundError, ValueError):
-        _registration_error(
-            "profile_unknown", f"unknown agent profile: {agent_profile or ''}"
-        )
+        _registration_error("profile_unknown", f"unknown agent profile: {agent_profile or ''}")
     if profile.provider and profile.provider != provider:
         _registration_error(
             "profile_provider_mismatch",
@@ -335,7 +347,6 @@ def validate_base_source(
         RetryableArtifactValidation,
         TerminalArtifactValidation,
     )
-
     from cli_agent_orchestrator.providers.manager import provider_manager
 
     validator = provider_manager.construct_provider(
@@ -361,9 +372,7 @@ def validate_base_source(
         _registration_error("artifact_not_found", "provider artifact was not found")
     except TerminalArtifactValidation as exc:
         if "ambiguous" in exc.code:
-            _registration_error(
-                "artifact_ambiguous", "multiple provider artifacts match the UUID"
-            )
+            _registration_error("artifact_ambiguous", "multiple provider artifacts match the UUID")
         _registration_error(
             "artifact_identity_mismatch", "provider artifact identity does not match the UUID"
         )
@@ -374,9 +383,7 @@ def validate_base_source(
 
     if provider == "codex":
         matches = list(
-            (Path.home() / ".codex" / "sessions").glob(
-                f"**/rollout-*{session_uuid}*.jsonl"
-            )
+            (Path.home() / ".codex" / "sessions").glob(f"**/rollout-*{session_uuid}*.jsonl")
         )
         try:
             with matches[0].open(encoding="utf-8") as stream:
@@ -392,9 +399,9 @@ def validate_base_source(
 
     inside_worktree = False
     try:
-        inside_worktree = _run_git(
-            canonical_cwd, "rev-parse", "--is-inside-work-tree"
-        ).strip() == "true"
+        inside_worktree = (
+            _run_git(canonical_cwd, "rev-parse", "--is-inside-work-tree").strip() == "true"
+        )
     except (OSError, subprocess.CalledProcessError):
         pass
     git_sha, dirty_hashes = snapshot(canonical_cwd)
@@ -472,7 +479,10 @@ def mark_ready(
     cwd = terminal.get("working_directory") or terminal.get("cwd")
     if not cwd:
         from cli_agent_orchestrator.backends.registry import get_backend
-        cwd = get_backend().get_pane_working_directory(terminal["tmux_session"], terminal["tmux_window"])
+
+        cwd = get_backend().get_pane_working_directory(
+            terminal["tmux_session"], terminal["tmux_window"]
+        )
     provider = terminal["provider"]
     if provider == "codex":
         pid = pane_pid(terminal["tmux_session"], terminal["tmux_window"])
@@ -484,12 +494,19 @@ def mark_ready(
     else:
         raise ForkContextError("provider_lacks_fork_capability")
     sha, hashes = snapshot(cwd)
-    row = register_provider_session(name=name, provider=provider, session_uuid=session_uuid,
-                                    cwd=cwd, agent_profile=terminal["agent_profile"], git_sha=sha,
-                                    dirty_hashes=hashes, summary=summary,
-                                    kind=kind,
-                                    source_terminal_id=terminal_id,
-                                    session_name=terminal["tmux_session"])
+    row = register_provider_session(
+        name=name,
+        provider=provider,
+        session_uuid=session_uuid,
+        cwd=cwd,
+        agent_profile=terminal["agent_profile"],
+        git_sha=sha,
+        dirty_hashes=hashes,
+        summary=summary,
+        kind=kind,
+        source_terminal_id=terminal_id,
+        session_name=terminal["tmux_session"],
+    )
     update_terminal_provider_session_id(terminal_id, session_uuid)
     return row
 

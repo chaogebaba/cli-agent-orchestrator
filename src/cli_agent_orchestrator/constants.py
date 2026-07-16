@@ -10,8 +10,10 @@ for agent management.
 
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.utils.http import resolve_endpoint
 
 
 def _env_int(name: str, default: int) -> int:
@@ -49,7 +51,9 @@ TMUX_HISTORY_LINES = 200
 # Application Directory Structure
 # =============================================================================
 # Base directory for all CAO data (~/.aws/cli-agent-orchestrator)
-CAO_HOME_DIR = Path.home() / ".aws" / "cli-agent-orchestrator"
+CAO_HOME_DIR = Path(
+    os.environ.get("CAO_HOME", str(Path.home() / ".aws" / "cli-agent-orchestrator"))
+)
 
 # Managed environment variable file
 CAO_ENV_FILE = CAO_HOME_DIR / ".env"
@@ -194,7 +198,10 @@ def graph_export_root() -> Path:
     graph-exports``). The directory need not exist yet — sinks create it under
     the confined join.
     """
-    return Path(os.environ.get("CAO_GRAPH_EXPORT_ROOT", str(GRAPH_EXPORT_ROOT_DEFAULT)))
+    configured = os.environ.get("CAO_GRAPH_EXPORT_ROOT")
+    if os.environ.get("CAO_INSTANCE_ID") and not configured:
+        raise RuntimeError("CAO_GRAPH_EXPORT_ROOT is required for a sandbox instance")
+    return Path(configured or str(GRAPH_EXPORT_ROOT_DEFAULT))
 
 
 # Provider-specific agent directories
@@ -215,12 +222,15 @@ DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
 # Server Configuration
 # =============================================================================
 # FastAPI server settings for the CAO API
-SERVER_HOST = os.environ.get("CAO_API_HOST", "127.0.0.1")
-SERVER_PORT = int(os.environ.get("CAO_API_PORT", "9889"))
+_SERVER_ENDPOINT = urlsplit(resolve_endpoint())
+SERVER_HOST = _SERVER_ENDPOINT.hostname or "127.0.0.1"
+SERVER_PORT = _SERVER_ENDPOINT.port or 0
 SERVER_VERSION = "0.1.0"
 
-
-API_BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
+# Compatibility fixture for downstream tests only. Product code must resolve
+# at call time through utils.http and the AST guard enforces that no consumer
+# imports or loads this name.
+API_BASE_URL = resolve_endpoint()
 
 # Default timeout (seconds) for HTTP calls to the CAO API server.
 MCP_REQUEST_TIMEOUT = 30

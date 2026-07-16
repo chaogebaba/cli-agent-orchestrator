@@ -9,14 +9,14 @@ import requests
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import (
-    API_BASE_URL,
     DEFAULT_PROVIDER,
     PROVIDERS,
-    SERVER_HOST,
-    SERVER_PORT,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.settings_service import get_server_settings
+from cli_agent_orchestrator.utils.http import CAOHttpClient
+
+cao_http = CAOHttpClient(lambda: requests)
 from cli_agent_orchestrator.utils.terminal import (
     poll_until_done,
     sync_backend_from_server,
@@ -88,12 +88,9 @@ def _parse_env_pairs(pairs):
                 f"--env value for {key!r} exceeds {_FORWARDED_ENV_MAX_VALUE_BYTES} bytes "
                 "(tmux argv limit, PR #246)"
             )
-        if key == "CAO_ARTIFACTS_DIR" and (
-            not value or not Path(value).is_absolute()
-        ):
+        if key == "CAO_ARTIFACTS_DIR" and (not value or not Path(value).is_absolute()):
             raise click.ClickException(
-                "--env CAO_ARTIFACTS_DIR must be an absolute path "
-                "(artifacts_dir_not_absolute)"
+                "--env CAO_ARTIFACTS_DIR must be an absolute path " "(artifacts_dir_not_absolute)"
             )
         result[key] = value
     return result
@@ -153,7 +150,8 @@ def _parse_env_pairs(pairs):
     "are rejected. See issue #248.",
 )
 @click.option(
-    "--allow-incomplete-brief", is_flag=True,
+    "--allow-incomplete-brief",
+    is_flag=True,
     help="Allow a required session brief to degrade loudly instead of aborting startup.",
 )
 def launch(
@@ -288,7 +286,7 @@ def launch(
 
         # Call API to create session — pass working_directory only if explicitly
         # provided. When omitted, the server defaults to its own CWD.
-        url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions/start"
+        url = "/sessions/start"
         params = {
             "agent_profile": agents,
             "working_directory": working_directory or os.getcwd(),
@@ -313,23 +311,28 @@ def launch(
         if forwarded_env:
             post_kwargs["json"] = {"env_vars": forwarded_env}
 
-        response = requests.post(url, **post_kwargs)
+        response = cao_http.post(url, **post_kwargs)
         from cli_agent_orchestrator.cli.http import format_domain_detail, response_detail
+
         start_error = None
         try:
             start_error = response.json()
         except ValueError:
             pass
-        if (response.status_code == 422 and isinstance(start_error, dict)
-                and start_error.get("bootstrap", {}).get("status") == "seed_failed"):
-            click.echo(
-                f"bootstrap failed [{start_error['bootstrap']['error_code']}]", err=True
-            )
+        if (
+            response.status_code == 422
+            and isinstance(start_error, dict)
+            and start_error.get("bootstrap", {}).get("status") == "seed_failed"
+        ):
+            click.echo(f"bootstrap failed [{start_error['bootstrap']['error_code']}]", err=True)
             raise click.exceptions.Exit(2)
         detail = response_detail(response)
-        if response.status_code in {409, 500} and detail and detail.get("code") in {
-            "mailbox_conflict", "mailbox_authority_timeout", "publication_cleanup_failed"
-        }:
+        if (
+            response.status_code in {409, 500}
+            and detail
+            and detail.get("code")
+            in {"mailbox_conflict", "mailbox_authority_timeout", "publication_cleanup_failed"}
+        ):
             click.echo(format_domain_detail(detail), err=True)
             raise click.exceptions.Exit(1)
         response.raise_for_status()
@@ -378,8 +381,8 @@ def launch(
                     f"Conductor {terminal['id']} did not become ready within 120s"
                 )
             request_timeout = get_server_settings()["mcp_request_timeout"]
-            response = requests.post(
-                f"{API_BASE_URL}/terminals/{terminal['id']}/input",
+            response = cao_http.post(
+                f"/terminals/{terminal['id']}/input",
                 params={"message": message},
                 timeout=request_timeout,
             )
@@ -390,8 +393,8 @@ def launch(
                 return
             poll_until_done(terminal["id"], timeout=300)
             request_timeout = get_server_settings()["mcp_request_timeout"]
-            output_resp = requests.get(
-                f"{API_BASE_URL}/terminals/{terminal['id']}/output",
+            output_resp = cao_http.get(
+                f"/terminals/{terminal['id']}/output",
                 params={"mode": "last"},
                 timeout=request_timeout,
             )

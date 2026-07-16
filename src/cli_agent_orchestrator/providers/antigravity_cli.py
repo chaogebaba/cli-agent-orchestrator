@@ -55,6 +55,7 @@ from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
+from cli_agent_orchestrator.utils.sandbox_guard import bind_mcp_server_identity
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -345,13 +346,10 @@ class AntigravityCliProvider(BaseProvider):
             command, args = resolve_cao_mcp_command(
                 cfg.get("command", ""), cfg.get("args", []) or [], persisted=True
             )
-            entry: dict = {
-                "command": command,
-                "args": args,
-            }
-            env = dict(cfg.get("env", {}))
-            env["CAO_TERMINAL_ID"] = self.terminal_id
-            entry["env"] = env
+            entry = bind_mcp_server_identity(
+                {"command": command, "args": args, "env": dict(cfg.get("env", {}))},
+                self.terminal_id,
+            )
             servers[server_name] = entry
             self._mcp_server_names.append(server_name)
 

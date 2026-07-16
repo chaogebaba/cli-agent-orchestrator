@@ -41,4 +41,3 @@ def check() -> None:
     for feature in stale:
         click.echo(f"warning: POST-RESTART RE-ENTRY names drained feature: {feature}")
     click.echo(f"pending-row count: {pending}")
-

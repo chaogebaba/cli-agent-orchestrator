@@ -13,7 +13,6 @@ from fastmcp import FastMCP
 from pydantic import Field
 
 from cli_agent_orchestrator.constants import (
-    API_BASE_URL,
     DEFAULT_PROVIDER,
     WORKFLOW_RUN_REQUEST_TIMEOUT,
 )
@@ -21,16 +20,28 @@ from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck
+from cli_agent_orchestrator.security.auth import get_local_bearer
 from cli_agent_orchestrator.services.memory_service import (
     MEMORY_DISABLED_MESSAGE,
     MemoryDisabledError,
 )
 from cli_agent_orchestrator.services.settings_service import get_server_settings
-from cli_agent_orchestrator.security.auth import get_local_bearer
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
+from cli_agent_orchestrator.utils.http import CAOHttpClient
+
+cao_http = CAOHttpClient(lambda: requests)
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 logger = logging.getLogger(__name__)
+
+
+def __getattr__(name: str) -> Any:
+    """Expose the removed endpoint constant only to legacy test consumers."""
+    if name == "API_BASE_URL":
+        from cli_agent_orchestrator.utils.http import resolve_endpoint
+
+        return resolve_endpoint()
+    raise AttributeError(name)
 
 
 def _mcp_timeout() -> float:
@@ -59,17 +70,13 @@ def _get_cleanup_nudge() -> str:
     if not current_terminal_id:
         return ""
     try:
-        resp = requests.get(
-            f"{API_BASE_URL}/terminals/{current_terminal_id}", timeout=_mcp_timeout()
-        )
+        resp = cao_http.get(f"/terminals/{current_terminal_id}", timeout=_mcp_timeout())
         if resp.status_code != 200:
             return ""
         session_name = resp.json().get("session_name")
         if not session_name:
             return ""
-        resp = requests.get(
-            f"{API_BASE_URL}/sessions/{session_name}/terminals", timeout=_mcp_timeout()
-        )
+        resp = cao_http.get(f"/sessions/{session_name}/terminals", timeout=_mcp_timeout())
         if resp.status_code != 200:
             return ""
         count = len(resp.json())
@@ -197,9 +204,7 @@ def _create_terminal(
     current_terminal_id = os.environ.get("CAO_TERMINAL_ID")
     if current_terminal_id:
         # Get terminal metadata via API
-        response = requests.get(
-            f"{API_BASE_URL}/terminals/{current_terminal_id}", timeout=_mcp_timeout()
-        )
+        response = cao_http.get(f"/terminals/{current_terminal_id}", timeout=_mcp_timeout())
         response.raise_for_status()
         terminal_metadata = response.json()
 
@@ -240,8 +245,8 @@ def _create_terminal(
             if refresh_base_name is not None:
                 json_body["refresh_base_name"] = refresh_base_name
 
-        response = requests.post(
-            f"{API_BASE_URL}/sessions/{session_name}/terminals",
+        response = cao_http.post(
+            f"/sessions/{session_name}/terminals",
             params=params,
             json=json_body,
             timeout=_mcp_timeout(),
@@ -271,7 +276,7 @@ def _create_terminal(
         if working_directory:
             params["working_directory"] = working_directory
 
-        response = requests.post(f"{API_BASE_URL}/sessions", params=params, timeout=_mcp_timeout())
+        response = cao_http.post(f"/sessions", params=params, timeout=_mcp_timeout())
         response.raise_for_status()
         terminal = response.json()
 
@@ -284,8 +289,8 @@ def strict_supervisor_cwd() -> str:
     if not terminal_id:
         raise ValueError("supervisor_working_directory_unavailable: CAO_TERMINAL_ID not set")
     try:
-        response = requests.get(
-            f"{API_BASE_URL}/terminals/{terminal_id}/working-directory",
+        response = cao_http.get(
+            f"/terminals/{terminal_id}/working-directory",
             timeout=_mcp_timeout(),
         )
         response.raise_for_status()
@@ -298,7 +303,10 @@ def strict_supervisor_cwd() -> str:
 
 
 _GIT_IDENTITY_ENV_VARS = {
-    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
 }
 
@@ -310,18 +318,27 @@ def _git_identity(path: str) -> tuple[str, str]:
     clean_env = {k: v for k, v in os.environ.items() if k not in _GIT_IDENTITY_ENV_VARS}
     try:
         top = subprocess.run(
-            ["git", "-C", path, "rev-parse", "--show-toplevel"], check=True,
-            capture_output=True, text=True, env=clean_env,
+            ["git", "-C", path, "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=clean_env,
         ).stdout.strip()
         try:
             common = subprocess.run(
                 ["git", "-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                check=True, capture_output=True, text=True, env=clean_env,
+                check=True,
+                capture_output=True,
+                text=True,
+                env=clean_env,
             ).stdout.strip()
         except subprocess.CalledProcessError:
             common = subprocess.run(
-                ["git", "-C", path, "rev-parse", "--git-common-dir"], check=True,
-                capture_output=True, text=True, env=clean_env,
+                ["git", "-C", path, "rev-parse", "--git-common-dir"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=clean_env,
             ).stdout.strip()
             if not os.path.isabs(common):
                 common = os.path.join(path, common)
@@ -330,7 +347,9 @@ def _git_identity(path: str) -> tuple[str, str]:
     return os.path.realpath(top), os.path.realpath(common)
 
 
-def _resolve_fork_working_directory(row: Dict[str, Any], requested: Optional[str]) -> tuple[str, str]:
+def _resolve_fork_working_directory(
+    row: Dict[str, Any], requested: Optional[str]
+) -> tuple[str, str]:
     """Apply fork cwd precedence and return (launch cwd, optional preamble line)."""
     base = row["cwd"]
     if requested is None or os.path.realpath(requested) == os.path.realpath(base):
@@ -374,8 +393,8 @@ def _send_direct_input(
     Raises:
         Exception: If sending fails
     """
-    response = requests.post(
-        f"{API_BASE_URL}/terminals/{terminal_id}/input",
+    response = cao_http.post(
+        f"/terminals/{terminal_id}/input",
         params={
             "message": message,
             # "supervisor" fallback is safe here: sender_id is a display label
@@ -405,9 +424,7 @@ def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
         }
 
     try:
-        status_response = requests.get(
-            f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
-        )
+        status_response = cao_http.get(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
         status_response.raise_for_status()
         terminal = status_response.json()
         current_status = terminal.get("status")
@@ -427,8 +444,8 @@ def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
             if hermes_result is not None:
                 return hermes_result
 
-        response = requests.post(
-            f"{API_BASE_URL}/terminals/{terminal_id}/input",
+        response = cao_http.post(
+            f"/terminals/{terminal_id}/input",
             params={
                 "message": answer,
                 "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
@@ -458,8 +475,8 @@ def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
 
 def _try_send_hermes_prompt_answer(terminal_id: str, answer: str) -> Optional[Dict[str, Any]]:
     """Answer Hermes clarify pickers with navigation keys when needed."""
-    output_response = requests.get(
-        f"{API_BASE_URL}/terminals/{terminal_id}/output",
+    output_response = cao_http.get(
+        f"/terminals/{terminal_id}/output",
         params={"mode": "full"},
         timeout=_mcp_timeout(),
     )
@@ -503,8 +520,8 @@ def _try_send_hermes_prompt_answer(terminal_id: str, answer: str) -> Optional[Di
 
 
 def _send_terminal_key(terminal_id: str, key: str) -> None:
-    response = requests.post(
-        f"{API_BASE_URL}/terminals/{terminal_id}/key",
+    response = cao_http.post(
+        f"/terminals/{terminal_id}/key",
         params={"key": key},
         timeout=_mcp_timeout(),
     )
@@ -512,8 +529,8 @@ def _send_terminal_key(terminal_id: str, key: str) -> None:
 
 
 def _send_terminal_input(terminal_id: str, message: str) -> None:
-    response = requests.post(
-        f"{API_BASE_URL}/terminals/{terminal_id}/input",
+    response = cao_http.post(
+        f"/terminals/{terminal_id}/input",
         params={
             "message": message,
             "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
@@ -604,9 +621,7 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
             allowed_tools=None,
         )
 
-    response = requests.get(
-        f"{API_BASE_URL}/terminals/{current_terminal_id}", timeout=_mcp_timeout()
-    )
+    response = cao_http.get(f"/terminals/{current_terminal_id}", timeout=_mcp_timeout())
     response.raise_for_status()
     terminal_metadata = response.json()
 
@@ -664,9 +679,7 @@ def _parse_run_step_error(
     return None, fallback, None
 
 
-def _send_to_inbox(
-    receiver_id: str, message: str, refresh_ingest: bool = False
-) -> Dict[str, Any]:
+def _send_to_inbox(receiver_id: str, message: str, refresh_ingest: bool = False) -> Dict[str, Any]:
     """Send message to another terminal's inbox (queued delivery when IDLE).
 
     Args:
@@ -684,8 +697,8 @@ def _send_to_inbox(
     if not sender_id:
         raise ValueError("CAO_TERMINAL_ID not set - cannot determine sender")
 
-    response = requests.post(
-        f"{API_BASE_URL}/terminals/{receiver_id}/inbox/messages",
+    response = cao_http.post(
+        f"/terminals/{receiver_id}/inbox/messages",
         params={
             "sender_id": sender_id,
             "message": message,
@@ -715,8 +728,10 @@ def _extract_structured_detail(response: requests.Response, fallback: str) -> st
         detail = response.json().get("detail")
     except ValueError:
         return fallback
-    if isinstance(detail, dict) and isinstance(detail.get("code"), str) and isinstance(
-        detail.get("message"), str
+    if (
+        isinstance(detail, dict)
+        and isinstance(detail.get("code"), str)
+        and isinstance(detail.get("message"), str)
     ):
         return {"code": detail["code"], "message": detail["message"]}
     return detail if isinstance(detail, str) and detail else fallback
@@ -725,7 +740,7 @@ def _extract_structured_detail(response: requests.Response, fallback: str) -> st
 def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
     """Fetch a skill body from cao-server and return content or a structured error."""
     try:
-        response = requests.get(f"{API_BASE_URL}/skills/{name}", timeout=_mcp_timeout())
+        response = cao_http.get(f"/skills/{name}", timeout=_mcp_timeout())
         response.raise_for_status()
         return response.json()["content"]
     except requests.HTTPError as exc:
@@ -743,20 +758,25 @@ def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
 
 
 @mcp.tool(description="Read the canonical live session manifest or rendered brief.")
-async def session_manifest(session_name: Optional[str] = None, brief: bool = False) -> Dict[str, Any]:
+async def session_manifest(
+    session_name: Optional[str] = None, brief: bool = False
+) -> Dict[str, Any]:
     try:
         terminal_id = os.environ.get("CAO_TERMINAL_ID")
         if not session_name:
             if not terminal_id:
                 raise ValueError("session_name required outside a CAO terminal")
-            response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout())
+            response = cao_http.get(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
             response.raise_for_status()
             session_name = response.json()["session_name"]
-        response = requests.get(f"{API_BASE_URL}/sessions/{session_name}/manifest", timeout=_mcp_timeout())
+        response = cao_http.get(f"/sessions/{session_name}/manifest", timeout=_mcp_timeout())
         response.raise_for_status()
         manifest = response.json()
         if brief:
-            from cli_agent_orchestrator.services.session_manifest_service import render_session_brief
+            from cli_agent_orchestrator.services.session_manifest_service import (
+                render_session_brief,
+            )
+
             return {"success": True, "brief": render_session_brief(manifest)}
         return {"success": True, "manifest": manifest}
     except Exception as exc:
@@ -767,8 +787,8 @@ def _peek_terminal_impl(terminal_id: str, lines: int = 40) -> Dict[str, Any]:
     """Return a read-only terminal pane tail via cao-server."""
     capped_lines = max(1, min(int(lines), 200))
     try:
-        response = requests.get(
-            f"{API_BASE_URL}/terminals/{terminal_id}/peek",
+        response = cao_http.get(
+            f"/terminals/{terminal_id}/peek",
             params={"lines": capped_lines},
             timeout=_mcp_timeout(),
         )
@@ -870,8 +890,8 @@ async def _handoff_impl(
         # plus headroom; the server enforces the per-step timeout internally.
         client_timeout = float(timeout) + 180.0
         try:
-            response = requests.post(
-                f"{API_BASE_URL}/terminals/run-step",
+            response = cao_http.post(
+                f"/terminals/run-step",
                 json=payload,
                 timeout=client_timeout,
             )
@@ -960,45 +980,45 @@ async def handoff(
     ),
     working_directory: Optional[str] = Field(
         default=None,
-        description='Optional working directory where the agent should execute',
+        description="Optional working directory where the agent should execute",
     ),
 ) -> HandoffResult:
     """Hand off a task to another agent via CAO terminal and wait for completion.
 
-        This tool allows handing off tasks to other agents by creating a new terminal
-        in the same session. It sends the message, waits for completion, and captures the output.
+    This tool allows handing off tasks to other agents by creating a new terminal
+    in the same session. It sends the message, waits for completion, and captures the output.
 
-        ## Usage
+    ## Usage
 
-        Use this tool to hand off tasks to another agent and wait for the results.
-        The tool will:
-        1. Create a new terminal with the specified agent profile and provider
-        2. Set the working directory for the terminal (defaults to supervisor's cwd)
-        3. Send the message to the terminal
-        4. Monitor until completion
-        5. Return the agent's response
-        6. Clean up the terminal with /exit
+    Use this tool to hand off tasks to another agent and wait for the results.
+    The tool will:
+    1. Create a new terminal with the specified agent profile and provider
+    2. Set the working directory for the terminal (defaults to supervisor's cwd)
+    3. Send the message to the terminal
+    4. Monitor until completion
+    5. Return the agent's response
+    6. Clean up the terminal with /exit
 
-        ## Working Directory
+    ## Working Directory
 
-        - By default, agents start in the supervisor's current working directory
-        - You can specify a custom directory via working_directory parameter
-        - Directory must exist and be accessible
+    - By default, agents start in the supervisor's current working directory
+    - You can specify a custom directory via working_directory parameter
+    - Directory must exist and be accessible
 
-        ## Requirements
+    ## Requirements
 
-        - Must be called from within a CAO terminal (CAO_TERMINAL_ID environment variable)
-        - Target session must exist and be accessible
-        - If working_directory is provided, it must exist and be accessible
+    - Must be called from within a CAO terminal (CAO_TERMINAL_ID environment variable)
+    - Target session must exist and be accessible
+    - If working_directory is provided, it must exist and be accessible
 
-        Args:
-            agent_profile: The agent profile for the new terminal
-            message: The task/message to send
-            timeout: Maximum wait time in seconds
-            working_directory: Optional directory path where agent should execute
+    Args:
+        agent_profile: The agent profile for the new terminal
+        message: The task/message to send
+        timeout: Maximum wait time in seconds
+        working_directory: Optional directory path where agent should execute
 
-        Returns:
-            HandoffResult with success status, message, and agent output
+    Returns:
+        HandoffResult with success status, message, and agent output
     """
     return await _handoff_impl(agent_profile, message, timeout, working_directory)
 
@@ -1010,9 +1030,7 @@ def _configured_default_fork_base(agent_profile: str) -> Optional[str]:
     if not terminal_id:
         return None
     try:
-        response = requests.get(
-            f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
-        )
+        response = cao_http.get(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
         response.raise_for_status()
         fallback_provider = response.json()["provider"]
         provider = resolve_provider(agent_profile, fallback_provider=fallback_provider)
@@ -1023,8 +1041,13 @@ def _configured_default_fork_base(agent_profile: str) -> Optional[str]:
     return get_default_fork_base(provider, agent_profile)
 
 
-def _assign_impl(agent_profile: str, message: str, working_directory: Optional[str] = None,
-                 fork_from: Optional[str] = None, resume: bool = False) -> Dict[str, Any]:
+def _assign_impl(
+    agent_profile: str,
+    message: str,
+    working_directory: Optional[str] = None,
+    fork_from: Optional[str] = None,
+    resume: bool = False,
+) -> Dict[str, Any]:
     """Implementation of assign logic.
 
     Uses the server-side deferred-init path: cao-server creates the tmux
@@ -1052,12 +1075,15 @@ def _assign_impl(agent_profile: str, message: str, working_directory: Optional[s
         if fork_from:
             from cli_agent_orchestrator.models.terminal import ForkContext
             from cli_agent_orchestrator.services.fork_context_service import resolve_base, staleness
+
             try:
                 row = resolve_base(fork_from)
             except Exception as exc:
                 code = str(exc)
                 unavailable = code in {
-                    "base_name_unknown", "base_not_registered", "base_session_unset"
+                    "base_name_unknown",
+                    "base_not_registered",
+                    "base_session_unset",
                 } or code.startswith("anchor_not_forkable:")
                 if not defaulted_fork or not unavailable:
                     raise
@@ -1071,6 +1097,7 @@ def _assign_impl(agent_profile: str, message: str, working_directory: Optional[s
             if provider != row["provider"]:
                 raise ValueError("provider_mismatch")
             from cli_agent_orchestrator.providers.manager import get_provider_class
+
             try:
                 supports_fork = get_provider_class(provider).supports_fork_context
             except ValueError:
@@ -1082,6 +1109,7 @@ def _assign_impl(agent_profile: str, message: str, working_directory: Optional[s
             from cli_agent_orchestrator.services.fork_context_service import (
                 validate_base_source,
             )
+
             validate_base_source(
                 mode="compatibility",
                 provider=provider,
@@ -1090,8 +1118,8 @@ def _assign_impl(agent_profile: str, message: str, working_directory: Optional[s
             )
             if resume:
                 try:
-                    owner = requests.get(
-                        f"{API_BASE_URL}/provider-sessions/{row['session_uuid']}/owner",
+                    owner = cao_http.get(
+                        f"/provider-sessions/{row['session_uuid']}/owner",
                         timeout=_mcp_timeout(),
                     )
                     owner.raise_for_status()
@@ -1112,9 +1140,13 @@ def _assign_impl(agent_profile: str, message: str, working_directory: Optional[s
                 refresh_base_name = row["name"]
             if workdir_preamble:
                 preamble = f"{preamble}\n{workdir_preamble}"
-            fork_context = ForkContext(mode="resume" if resume else "fork",
-                                       session_uuid=row["session_uuid"], base_name=row["name"],
-                                       provider=provider, initial_preamble=preamble)
+            fork_context = ForkContext(
+                mode="resume" if resume else "fork",
+                session_uuid=row["session_uuid"],
+                base_name=row["name"],
+                provider=provider,
+                initial_preamble=preamble,
+            )
         elif working_directory is None:
             working_directory = strict_supervisor_cwd()
         # Fail fast before creating the worker terminal when CAO_TERMINAL_ID is
@@ -1273,7 +1305,9 @@ async def assign(
     working_directory: Optional[str] = Field(
         default=None, description="Optional working directory where the agent should execute"
     ),
-    fork_from: Optional[str] = Field(default=None, description="Registered base name, UUID, or terminal id"),
+    fork_from: Optional[str] = Field(
+        default=None, description="Registered base name, UUID, or terminal id"
+    ),
     resume: bool = Field(default=False, description="Resume instead of fork"),
 ) -> Dict[str, Any]:
     return _assign_impl(agent_profile, message, working_directory, fork_from, resume)
@@ -1290,6 +1324,7 @@ async def mark_base_ready(
         if not terminal_id:
             raise ValueError("CAO_TERMINAL_ID not set")
         from cli_agent_orchestrator.services.fork_context_service import mark_ready
+
         row = mark_ready(terminal_id, name, summary, kind)
         result = {
             "success": True,
@@ -1297,9 +1332,7 @@ async def mark_base_ready(
             "callback": {"status": "not_applicable"},
         }
         try:
-            terminal_response = requests.get(
-                f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
-            )
+            terminal_response = cao_http.get(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
             terminal_response.raise_for_status()
             caller_id = terminal_response.json().get("caller_id")
             if caller_id:
@@ -1317,6 +1350,7 @@ async def mark_base_ready(
 @mcp.tool(description="List ready provider-native base sessions with live staleness counts.")
 async def list_base_sessions() -> Dict[str, Any]:
     from cli_agent_orchestrator.services.fork_context_service import list_bases
+
     bases = [_serialize_provider_session(row) for row in list_bases()]
     return {"success": True, "bases": bases}
 
@@ -1353,8 +1387,9 @@ def _send_message_impl(
                         "look up the recorded caller. Pass receiver_id explicitly."
                     ),
                 }
-            response = requests.get(
-                f"{API_BASE_URL}/terminals/{own_terminal_id}", timeout=_mcp_timeout(),
+            response = cao_http.get(
+                f"/terminals/{own_terminal_id}",
+                timeout=_mcp_timeout(),
                 headers=_api_headers(),
             )
             try:
@@ -1420,31 +1455,42 @@ def _send_message_impl(
             error_detail = _extract_structured_detail(exc.response, str(error_detail))
         return {
             "success": False,
-            "error": error_detail if isinstance(error_detail, dict)
-            else f"Failed to deliver to terminal {receiver_id}: {error_detail}",
+            "error": (
+                error_detail
+                if isinstance(error_detail, dict)
+                else f"Failed to deliver to terminal {receiver_id}: {error_detail}"
+            ),
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 def _list_messages_impl(
-    receiver_id: Optional[str] = None, since: Optional[str] = None,
-    after_id: Optional[int] = None, limit: int = 25, status: Optional[str] = None,
+    receiver_id: Optional[str] = None,
+    since: Optional[str] = None,
+    after_id: Optional[int] = None,
+    limit: int = 25,
+    status: Optional[str] = None,
 ) -> Dict[str, Any]:
     target = receiver_id
     if target is None:
         own_id = os.environ.get("CAO_TERMINAL_ID")
         if not own_id:
-            return {"success": False, "error": {
-                "code": "missing_terminal_id", "message": "CAO_TERMINAL_ID is not set"
-            }}
+            return {
+                "success": False,
+                "error": {"code": "missing_terminal_id", "message": "CAO_TERMINAL_ID is not set"},
+            }
         target = own_id
-        mailboxes = requests.get(
-            f"{API_BASE_URL}/mailboxes", headers=_api_headers(), timeout=_mcp_timeout()
-        )
+        mailboxes = cao_http.get(f"/mailboxes", headers=_api_headers(), timeout=_mcp_timeout())
         if mailboxes.status_code == 200:
-            current = next((item for item in mailboxes.json().get("items", [])
-                            if item.get("current_terminal_id") == own_id), None)
+            current = next(
+                (
+                    item
+                    for item in mailboxes.json().get("items", [])
+                    if item.get("current_terminal_id") == own_id
+                ),
+                None,
+            )
             if current:
                 target = current["id"]
     params: dict[str, Any] = {"to": target, "limit": limit}
@@ -1455,8 +1501,10 @@ def _list_messages_impl(
     if status is not None:
         params["status"] = status
     try:
-        response = requests.get(
-            f"{API_BASE_URL}/messages", params=params, headers=_api_headers(),
+        response = cao_http.get(
+            f"/messages",
+            params=params,
+            headers=_api_headers(),
             timeout=_mcp_timeout(),
         )
         response.raise_for_status()
@@ -1473,14 +1521,16 @@ def _list_messages_impl(
 def _ack_messages_impl(up_to_id: int) -> Dict[str, Any]:
     terminal_id = os.environ.get("CAO_TERMINAL_ID")
     if not terminal_id:
-        return {"success": False, "error": {
-            "code": "missing_terminal_id", "message": "CAO_TERMINAL_ID is not set"
-        }}
+        return {
+            "success": False,
+            "error": {"code": "missing_terminal_id", "message": "CAO_TERMINAL_ID is not set"},
+        }
     try:
-        response = requests.post(
-            f"{API_BASE_URL}/messages/ack",
+        response = cao_http.post(
+            f"/messages/ack",
             json={"terminal_id": terminal_id, "up_to_id": up_to_id},
-            headers=_api_headers(), timeout=_mcp_timeout(),
+            headers=_api_headers(),
+            timeout=_mcp_timeout(),
         )
         response.raise_for_status()
         return response.json()
@@ -1528,8 +1578,8 @@ def _codex_review_impl(
         payload["target"] = target
 
     try:
-        response = requests.post(
-            f"{API_BASE_URL}/codex-review",
+        response = cao_http.post(
+            f"/codex-review",
             json=payload,
             timeout=_mcp_timeout(),
         )
@@ -1700,8 +1750,8 @@ def delete_terminal(
         Dict with success status and message
     """
     try:
-        response = requests.delete(
-            f"{API_BASE_URL}/terminals/{terminal_id}",
+        response = cao_http.delete(
+            f"/terminals/{terminal_id}",
             params={"force": force is True},
             timeout=_mcp_timeout(),
         )
@@ -1727,7 +1777,7 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout())
+        response = cao_http.get(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
         response.raise_for_status()
         meta = response.json()
         ctx: Dict[str, Any] = {
@@ -1738,8 +1788,8 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
         }
         # Try to get working directory for project scope resolution
         try:
-            wd_resp = requests.get(
-                f"{API_BASE_URL}/terminals/{terminal_id}/working-directory",
+            wd_resp = cao_http.get(
+                f"/terminals/{terminal_id}/working-directory",
                 timeout=_mcp_timeout(),
             )
             if wd_resp.status_code == 200:
@@ -1979,8 +2029,8 @@ async def workflow_return(
         payload["output_schema"] = output_schema
 
     try:
-        response = requests.post(
-            f"{API_BASE_URL}/workflows/runs/{run_id}/steps/{step_id}/output",
+        response = cao_http.post(
+            f"/workflows/runs/{run_id}/steps/{step_id}/output",
             json=payload,
             timeout=_mcp_timeout(),
         )
@@ -2022,8 +2072,8 @@ async def workflow_run(
         # The server awaits the WHOLE run inline (Q1=A), so this blocks for the full
         # run duration — use the worst-case-covering run timeout, NOT the short
         # per-call _mcp_timeout() (mirrors handoff's timeout + 180.0 reasoning).
-        response = requests.post(
-            f"{API_BASE_URL}/workflows/runs",
+        response = cao_http.post(
+            f"/workflows/runs",
             json=payload,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
         )
@@ -2059,8 +2109,8 @@ async def workflow_resume(
     try:
         # Resume re-drives the WHOLE run inline, so block for the full run duration
         # using the worst-case run timeout, NOT the short per-call _mcp_timeout().
-        response = requests.post(
-            f"{API_BASE_URL}/workflows/runs/{run_id}/resume",
+        response = cao_http.post(
+            f"/workflows/runs/{run_id}/resume",
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
         )
     except requests.RequestException as e:
@@ -2091,8 +2141,8 @@ async def workflow_cancel(
     run settles to CANCELLED.
     """
     try:
-        response = requests.post(
-            f"{API_BASE_URL}/workflows/runs/{run_id}/cancel",
+        response = cao_http.post(
+            f"/workflows/runs/{run_id}/cancel",
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:

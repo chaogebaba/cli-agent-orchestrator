@@ -38,7 +38,6 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
-    API_BASE_URL,
     WORKFLOW_SCRIPT_LOG_CAP,
     WORKFLOW_SCRIPT_SCRATCH_DIR,
     WORKFLOW_SCRIPT_TERM_GRACE,
@@ -60,6 +59,7 @@ from cli_agent_orchestrator.services.workflow_service import (
     _is_resumable_for_tier,
     run_registry,
 )
+from cli_agent_orchestrator.utils.http import resolve_endpoint
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +224,7 @@ def _build_env(run_id: str, generation: str, *, resume: bool = False) -> Dict[st
     env = {
         "CAO_WORKFLOW_RUN_ID": run_id,
         "CAO_WORKFLOW_GENERATION": generation,
-        "CAO_API_BASE_URL": API_BASE_URL,
+        "CAO_API_BASE_URL": resolve_endpoint(),
         "PATH": os.environ.get("PATH", ""),
         "HOME": os.environ.get("HOME", ""),
     }

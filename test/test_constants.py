@@ -1,5 +1,6 @@
 """Tests for CLI Agent Orchestrator constants."""
 
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -247,11 +248,13 @@ class TestAddLocalCorsOrigins:
 class TestCaoHomeDir:
     """Tests for CAO home directory constants."""
 
-    def test_cao_home_dir_is_under_aws_cli_agent_orchestrator(self):
-        """Test that CAO_HOME_DIR is under ~/.aws/cli-agent-orchestrator."""
+    def test_cao_home_dir_honors_override_with_production_default(self):
+        """CAO_HOME overrides the namespace; its absence retains the legacy default."""
         from cli_agent_orchestrator.constants import CAO_HOME_DIR
 
-        expected = Path.home() / ".aws" / "cli-agent-orchestrator"
+        expected = Path(
+            os.environ.get("CAO_HOME", str(Path.home() / ".aws" / "cli-agent-orchestrator"))
+        )
         assert CAO_HOME_DIR == expected
 
     def test_cao_home_dir_is_pathlib_path(self):

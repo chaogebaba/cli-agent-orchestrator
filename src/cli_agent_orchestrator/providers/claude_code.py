@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.constants import API_BASE_URL, CAO_HOME_DIR
+from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.screen_classification import (
@@ -22,7 +22,10 @@ from cli_agent_orchestrator.providers.screen_classification import (
 )
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.http import resolve_endpoint
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+from cli_agent_orchestrator.utils.sandbox_guard import bind_mcp_server_identity
+from cli_agent_orchestrator.utils.temp_path import cao_tmp_dir
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.terminal_render import compose_ansi_to_lines
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -39,12 +42,8 @@ class ProviderError(Exception):
 
 # Regex patterns for Claude Code output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
-CLAUDE_STASHED_CHIP_PATTERN = re.compile(
-    r"›(?:\x1b\[[0-9;]*m)*\s*stashed", re.IGNORECASE
-)
-CLAUDE_DIALOG_PATTERN = re.compile(
-    r"Enter to select · ↑/↓ to navigate · Esc to cancel"
-)
+CLAUDE_STASHED_CHIP_PATTERN = re.compile(r"›(?:\x1b\[[0-9;]*m)*\s*stashed", re.IGNORECASE)
+CLAUDE_DIALOG_PATTERN = re.compile(r"Enter to select · ↑/↓ to navigate · Esc to cancel")
 RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between marker and text
 # Response marker at the START of a line, for message EXTRACTION only (not
 # status detection). Matches the legacy "⏺" (U+23FA) and the newest TUI's
@@ -306,8 +305,7 @@ class ClaudeCodeProvider(BaseProvider):
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
             system_prompt = self._apply_skill_prompt(system_prompt)
             if system_prompt:
-                tmp_dir = CAO_HOME_DIR / "tmp"
-                tmp_dir.mkdir(parents=True, exist_ok=True)
+                tmp_dir = cao_tmp_dir()
                 prompt_file = tmp_dir / f"{self.terminal_id}.prompt"
                 prompt_file.write_text(system_prompt, encoding="utf-8")
                 try:
@@ -331,15 +329,16 @@ class ClaudeCodeProvider(BaseProvider):
 
                     # Resolve the bundled cao-mcp-server console script to a
                     # PATH-independent invocation.
-                    mcp_config[server_name] = resolve_mcp_server_config(mcp_config[server_name])
+                    mcp_config[server_name] = bind_mcp_server_identity(
+                        resolve_mcp_server_config(mcp_config[server_name]), self.terminal_id
+                    )
 
                     env = mcp_config[server_name].get("env", {})
                     if "CAO_TERMINAL_ID" not in env:
                         env["CAO_TERMINAL_ID"] = self.terminal_id
                         mcp_config[server_name]["env"] = env
 
-                tmp_dir = CAO_HOME_DIR / "tmp"
-                tmp_dir.mkdir(parents=True, exist_ok=True)
+                tmp_dir = cao_tmp_dir()
                 mcp_file = tmp_dir / f"{self.terminal_id}.mcp.json"
                 mcp_file.write_text(json.dumps({"mcpServers": mcp_config}), encoding="utf-8")
                 try:
@@ -381,12 +380,11 @@ class ClaudeCodeProvider(BaseProvider):
 
     def _write_terminal_settings(self) -> Path:
         """Write the terminal-scoped additive SessionStart hook settings."""
-        tmp_dir = CAO_HOME_DIR / "tmp"
-        tmp_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp_dir = cao_tmp_dir()
         command = shlex.join(
             [
                 "env",
-                f"CAO_API_BASE_URL={API_BASE_URL}",
+                f"CAO_API_BASE_URL={resolve_endpoint()}",
                 sys.executable,
                 "-m",
                 "cli_agent_orchestrator.hooks.transcript_binding",
@@ -396,18 +394,27 @@ class ClaudeCodeProvider(BaseProvider):
         brief_mode = None
         try:
             if self._agent_profile:
-                from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text, read_agent_profile_source
+                from cli_agent_orchestrator.utils.agent_profiles import (
+                    parse_agent_profile_text,
+                    read_agent_profile_source,
+                )
+
                 raw = read_agent_profile_source(self._agent_profile)
                 candidate = parse_agent_profile_text(raw, self._agent_profile).sessionBrief
                 brief_mode = candidate if candidate in ("required", "optional") else None
         except Exception:
             pass
         if brief_mode:
-            brief_command = shlex.join([
-                "env", f"CAO_API_BASE_URL={API_BASE_URL}",
-                f"CAO_SESSION_BRIEF_MODE={brief_mode}", sys.executable,
-                "-m", "cli_agent_orchestrator.hooks.session_brief",
-            ])
+            brief_command = shlex.join(
+                [
+                    "env",
+                    f"CAO_API_BASE_URL={resolve_endpoint()}",
+                    f"CAO_SESSION_BRIEF_MODE={brief_mode}",
+                    sys.executable,
+                    "-m",
+                    "cli_agent_orchestrator.hooks.session_brief",
+                ]
+            )
             hooks.append({"type": "command", "command": brief_command, "timeout": 5})
         settings = {
             "hooks": {
@@ -591,6 +598,7 @@ class ClaudeCodeProvider(BaseProvider):
 
         See: https://github.com/awslabs/cli-agent-orchestrator/issues/104
         """
+
         def authoritative(status: TerminalStatus) -> TerminalStatus:
             self._render_uncertain_active = False
             return status
@@ -683,10 +691,9 @@ class ClaudeCodeProvider(BaseProvider):
         # WAITING is the only raw-path status that requires a composited view.
         # The raw patterns are candidate selectors only; they never classify a
         # dialog. This preserves every non-WAITING raw status arm unchanged.
-        waiting_candidate = (
-            re.search(WAITING_USER_ANSWER_PATTERN, output)
-            or _INK_PLAN_HEAD_PATTERN.search(output)
-        )
+        waiting_candidate = re.search(
+            WAITING_USER_ANSWER_PATTERN, output
+        ) or _INK_PLAN_HEAD_PATTERN.search(output)
         if waiting_candidate:
             # Prefer StatusMonitor's incremental screen; replaying the rolling
             # 8192-character buffer is only a fallback and uses live geometry.
@@ -812,15 +819,14 @@ class ClaudeCodeProvider(BaseProvider):
             return classify_screen_signals([])
         joined = "\n".join(rows)
         separator_rows = [
-            index for index, row in enumerate(rows)
-            if NEW_TUI_BOX_RAIL_PATTERN.search(row)
+            index for index, row in enumerate(rows) if NEW_TUI_BOX_RAIL_PATTERN.search(row)
         ]
         prompt_rows = [
-            index for index, row in enumerate(rows)
-            if NEW_TUI_BOX_PROMPT_PATTERN.search(row)
+            index for index, row in enumerate(rows) if NEW_TUI_BOX_PROMPT_PATTERN.search(row)
         ]
         boxed_prompt_rows = [
-            prompt for prompt in prompt_rows
+            prompt
+            for prompt in prompt_rows
             if any(0 < prompt - rail <= 2 for rail in separator_rows)
             and any(0 < rail - prompt <= 2 for rail in separator_rows)
         ]
@@ -828,32 +834,22 @@ class ClaudeCodeProvider(BaseProvider):
         signals: List[ScreenSignal] = []
         for index, row in enumerate(rows):
             if waiting and re.search(WAITING_USER_ANSWER_PATTERN, row):
-                signals.append(
-                    ScreenSignal("waiting", "WAITING_USER_ANSWER_PATTERN", index)
-                )
+                signals.append(ScreenSignal("waiting", "WAITING_USER_ANSWER_PATTERN", index))
             # The gerund-first structural matcher filters the broader ellipsis
             # pattern so settled markdown bullets cannot become progress.
             if NEW_TUI_BOX_SPINNER_PATTERN.search(row):
-                signals.append(
-                    ScreenSignal("progress", "NEW_TUI_BOX_SPINNER_PATTERN", index)
-                )
+                signals.append(ScreenSignal("progress", "NEW_TUI_BOX_SPINNER_PATTERN", index))
                 if re.search(PROCESSING_PATTERN, row):
                     signals.append(ScreenSignal("progress", "PROCESSING_PATTERN", index))
             background_wait = BACKGROUND_WAIT_PATTERN.search(row) is not None
             if background_wait:
-                signals.append(
-                    ScreenSignal("progress", "BACKGROUND_WAIT_PATTERN", index)
-                )
+                signals.append(ScreenSignal("progress", "BACKGROUND_WAIT_PATTERN", index))
             # A live background-wait row is never a completion candidate even
             # though the lenient glyph+"for" completion regex overlaps it.
             if not background_wait and re.search(GET_STATUS_COMPLETION_PATTERN, row):
-                signals.append(
-                    ScreenSignal("completion", "GET_STATUS_COMPLETION_PATTERN", index)
-                )
+                signals.append(ScreenSignal("completion", "GET_STATUS_COMPLETION_PATTERN", index))
             if not background_wait and EXTRACTION_RESPONSE_PATTERN.search(row):
-                signals.append(
-                    ScreenSignal("completion", "EXTRACTION_RESPONSE_PATTERN", index)
-                )
+                signals.append(ScreenSignal("completion", "EXTRACTION_RESPONSE_PATTERN", index))
         for index in boxed_prompt_rows:
             signals.append(ScreenSignal("chrome", "NEW_TUI_BOX_PATTERN", index))
         return classify_screen_signals(signals)
@@ -900,12 +896,16 @@ class ClaudeCodeProvider(BaseProvider):
 
             backend = get_backend()
             first = backend.get_history(
-                self.session_name, self.window_name,
-                tail_lines=PYTE_SCREEN_ROWS, strip_escapes=False,
+                self.session_name,
+                self.window_name,
+                tail_lines=PYTE_SCREEN_ROWS,
+                strip_escapes=False,
             )
             second = backend.get_history(
-                self.session_name, self.window_name,
-                tail_lines=PYTE_SCREEN_ROWS, strip_escapes=False,
+                self.session_name,
+                self.window_name,
+                tail_lines=PYTE_SCREEN_ROWS,
+                strip_escapes=False,
             )
             one = self.read_composer_draft(first.splitlines())
             two = self.read_composer_draft(second.splitlines())
@@ -999,7 +999,7 @@ class ClaudeCodeProvider(BaseProvider):
         """Clean up Claude Code provider."""
         self._initialized = False
         # Remove temp files created during initialization
-        tmp_dir = CAO_HOME_DIR / "tmp"
+        tmp_dir = cao_tmp_dir()
         for suffix in (".prompt", ".mcp.json", ".settings.json"):
             tmp_file = tmp_dir / f"{self.terminal_id}{suffix}"
             try:

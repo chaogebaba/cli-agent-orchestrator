@@ -8,15 +8,21 @@ import sys
 
 import requests
 
-from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.security.auth import get_local_bearer
+from cli_agent_orchestrator.utils.http import CAOHttpClient, resolve_endpoint
+
+cao_http = CAOHttpClient(lambda: requests)
 
 
 def main() -> int:
     try:
         event = json.load(sys.stdin)
         terminal_id = os.environ["CAO_TERMINAL_ID"]
-        base_url = os.environ.get("CAO_API_BASE_URL", API_BASE_URL).rstrip("/")
+        base_url = (
+            os.environ.get("CAO_ENDPOINT")
+            or os.environ.get("CAO_API_BASE_URL")
+            or resolve_endpoint()
+        ).rstrip("/")
         payload = {
             "terminal_id": terminal_id,
             "session_id": event["session_id"],
@@ -28,8 +34,9 @@ def main() -> int:
         token = get_local_bearer()
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        response = requests.post(
-            f"{base_url}/terminals/{terminal_id}/transcript-binding",
+        response = cao_http.post(
+            f"/terminals/{terminal_id}/transcript-binding",
+            base_url=base_url,
             json=payload,
             headers=headers,
             timeout=5,

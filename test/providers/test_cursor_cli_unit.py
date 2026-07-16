@@ -798,12 +798,7 @@ class TestBuildCommand:
         assert manifest["mcpServers"]["cao-mcp-server"]["command"] == "/venv/bin/cao-mcp-server"
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
-    def test_mcp_preserves_existing_cao_terminal_id(self, mock_load):
-        # The constructor's terminal_id must NOT override an
-        # explicit preset (matches the prior --mcp behaviour).
-        import json
-        from pathlib import Path
-
+    def test_mcp_rejects_existing_cao_terminal_id_override(self, mock_load):
         profile = MagicMock()
         profile.model = None
         profile.system_prompt = None
@@ -816,12 +811,8 @@ class TestBuildCommand:
         }
         mock_load.return_value = profile
         provider = make_provider(agent_profile="developer")
-        cmd = provider._build_cursor_command()
-        m = re.search(r"--plugin-dir\s+(\S+)", cmd)
-        assert m is not None
-        plugin_dir = Path(m.group(1))
-        manifest = json.loads((plugin_dir / "plugin.json").read_text(encoding="utf-8"))
-        assert manifest["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "preset"
+        with pytest.raises(ValueError, match="profile may not override CAO_TERMINAL_ID"):
+            provider._build_cursor_command()
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
     def test_tool_restrictions_skip_system_prompt(self, mock_load):

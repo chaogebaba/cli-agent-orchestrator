@@ -76,6 +76,7 @@ from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+from cli_agent_orchestrator.utils.sandbox_guard import bind_mcp_server_identity
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -507,7 +508,9 @@ class CursorCliProvider(BaseProvider):
                 servers[server_name] = server_config.model_dump(exclude_none=True)
             # Resolve the bundled cao-mcp-server console script to a
             # PATH-independent invocation.
-            servers[server_name] = resolve_mcp_server_config(servers[server_name])
+            servers[server_name] = bind_mcp_server_identity(
+                resolve_mcp_server_config(servers[server_name]), self.terminal_id
+            )
             env = servers[server_name].get("env", {})
             if "CAO_TERMINAL_ID" not in env:
                 env["CAO_TERMINAL_ID"] = self.terminal_id
@@ -534,15 +537,9 @@ class CursorCliProvider(BaseProvider):
         user's ``~/.aws/cli-agent-orchestrator/tmp``. Defaults to
         ``~/.aws/cli-agent-orchestrator/tmp`` for production.
         """
-        import os
+        from cli_agent_orchestrator.utils.temp_path import cao_tmp_dir
 
-        cao_tmp = Path(
-            os.environ.get(
-                "CAO_TMP_DIR", str(Path.home() / ".aws" / "cli-agent-orchestrator" / "tmp")
-            )
-        )
-        cao_tmp.mkdir(parents=True, exist_ok=True)
-        return cao_tmp
+        return cao_tmp_dir()
 
     def _register_tmp_path(self, path: Path) -> None:
         """Track a per-session temp path so ``cleanup()`` can remove it.

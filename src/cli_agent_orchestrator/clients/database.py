@@ -1,11 +1,11 @@
 """Minimal database client with only terminal metadata."""
 
+import hashlib
+import json
 import logging
 import os
-import json
-import uuid
-import hashlib
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,11 +18,11 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
-    Index,
     and_,
     create_engine,
     event,
@@ -30,8 +30,8 @@ from sqlalchemy import (
     or_,
     text,
 )
-from sqlalchemy.orm import DeclarativeBase, Session, declarative_base, deferred, sessionmaker
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import DeclarativeBase, Session, declarative_base, deferred, sessionmaker
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.flow import Flow
@@ -50,9 +50,7 @@ class ReadyBacklogObservation:
     oldest_message_id: int
     oldest_pending_age_seconds: float
     has_open_delivering_attempt: bool
-    attempt_fingerprint: tuple[
-        int, datetime | None, datetime | None, datetime | None
-    ]
+    attempt_fingerprint: tuple[int, datetime | None, datetime | None, datetime | None]
 
 
 def _utcnow() -> datetime:
@@ -72,6 +70,7 @@ class TerminalModel(Base):
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
+    instance_id = Column(String, nullable=True)
     caller_mailbox_id = deferred(Column(String, nullable=True))
     provider_session_id = Column(String, nullable=True)
     recovery_state = Column(String, nullable=True)
@@ -223,8 +222,7 @@ class TranscriptBindingModel(Base):
     source = Column(String, nullable=False)
     received_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
     __table_args__ = (
-        Index("ix_transcript_bindings_terminal_received",
-              "terminal_id", "received_at", "id"),
+        Index("ix_transcript_bindings_terminal_received", "terminal_id", "received_at", "id"),
     )
 
 
@@ -273,7 +271,9 @@ class InboxDeliveryAttemptModel(Base):
     __table_args__ = (
         Index(
             "uq_inbox_deferred_attempt",
-            "receiver_terminal_id", "payload_hash", "reason",
+            "receiver_terminal_id",
+            "payload_hash",
+            "reason",
             unique=True,
             sqlite_where=(outcome == "deferred"),
         ),
@@ -432,10 +432,7 @@ def _migrate_provider_sessions_status() -> None:
 
     with engine.begin() as connection:
         table_sql = connection.execute(
-            text(
-                "SELECT sql FROM sqlite_master "
-                "WHERE type='table' AND name='provider_sessions'"
-            )
+            text("SELECT sql FROM sqlite_master " "WHERE type='table' AND name='provider_sessions'")
         ).scalar_one_or_none()
         if table_sql is None or "'retired'" in table_sql:
             return
@@ -477,6 +474,7 @@ def _migrate_provider_sessions_status() -> None:
 def _migrate_provider_sessions_session_name() -> None:
     """Add nullable session scope to legacy base registrations."""
     from sqlalchemy import text
+
     with engine.begin() as connection:
         columns = connection.execute(text("PRAGMA table_info(provider_sessions)")).mappings().all()
         if columns and not any(column["name"] == "session_name" for column in columns):
@@ -492,8 +490,7 @@ def _migrate_provider_sessions_kind() -> None:
         if columns and not any(column["name"] == "kind" for column in columns):
             connection.execute(
                 text(
-                    "ALTER TABLE provider_sessions ADD COLUMN kind TEXT NOT NULL "
-                    "DEFAULT 'base'"
+                    "ALTER TABLE provider_sessions ADD COLUMN kind TEXT NOT NULL " "DEFAULT 'base'"
                 )
             )
 
@@ -503,9 +500,9 @@ def _migrate_transcript_bindings_inode_nullable() -> None:
     from sqlalchemy import text
 
     with engine.begin() as connection:
-        columns = connection.execute(
-            text("PRAGMA table_info(transcript_bindings)")
-        ).mappings().all()
+        columns = (
+            connection.execute(text("PRAGMA table_info(transcript_bindings)")).mappings().all()
+        )
         inode = next((column for column in columns if column["name"] == "inode"), None)
         if inode is None or not inode["notnull"]:
             return
@@ -527,7 +524,9 @@ def _migrate_transcript_bindings_inode_nullable() -> None:
             )
         )
         connection.execute(text("DROP TABLE transcript_bindings"))
-        connection.execute(text("ALTER TABLE transcript_bindings_new RENAME TO transcript_bindings"))
+        connection.execute(
+            text("ALTER TABLE transcript_bindings_new RENAME TO transcript_bindings")
+        )
         connection.execute(
             text(
                 "CREATE INDEX ix_transcript_bindings_terminal_received "
@@ -568,7 +567,9 @@ def _migrate_mailbox_columns() -> None:
         if inbox_columns and "logical_receiver_id" not in {row["name"] for row in inbox_columns}:
             connection.execute(text("ALTER TABLE inbox ADD COLUMN logical_receiver_id TEXT"))
         terminal_columns = connection.execute(text("PRAGMA table_info(terminals)")).mappings().all()
-        if terminal_columns and "caller_mailbox_id" not in {row["name"] for row in terminal_columns}:
+        if terminal_columns and "caller_mailbox_id" not in {
+            row["name"] for row in terminal_columns
+        }:
             connection.execute(text("ALTER TABLE terminals ADD COLUMN caller_mailbox_id TEXT"))
 
 
@@ -879,23 +880,31 @@ def _migrate_terminals_schema() -> None:
         ).fetchone()
         table_sql = table_sql_row[0] if table_sql_row else ""
         init_columns = {
-            "init_state", "init_started_at", "init_owner_epoch",
-            "init_failure_token", "init_deadline_s",
+            "init_state",
+            "init_started_at",
+            "init_owner_epoch",
+            "init_failure_token",
+            "init_deadline_s",
         }
         has_token_unique = any(
-            bool(row[2]) and any(
+            bool(row[2])
+            and any(
                 detail[2] == "init_failure_token"
                 for detail in conn.execute(f"PRAGMA index_info('{row[1]}')")
             )
             for row in conn.execute("PRAGMA index_list('terminals')")
         )
-        trigger_exists = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND "
-            "name='terminals_init_failure_token_immutable'"
-        ).fetchone() is not None
+        trigger_exists = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' AND "
+                "name='terminals_init_failure_token_immutable'"
+            ).fetchone()
+            is not None
+        )
         schema_current = (
             init_columns.issubset(columns)
             and "caller_mailbox_id" in columns
+            and "instance_id" in columns
             and "init_state IN" in table_sql
             and "init_deadline_s >= 1.0" in table_sql
             and has_token_unique
@@ -920,7 +929,7 @@ def _migrate_terminals_schema() -> None:
             "CREATE TABLE terminals ("
             "id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL, tmux_window TEXT NOT NULL, "
             "provider TEXT NOT NULL, agent_profile TEXT, allowed_tools TEXT, "
-            "shell_command TEXT, caller_id TEXT, provider_session_id TEXT, "
+            "shell_command TEXT, caller_id TEXT, provider_session_id TEXT, instance_id TEXT, "
             "caller_mailbox_id TEXT, "
             "recovery_state TEXT, recovery_error TEXT, recovery_updated_at DATETIME, "
             "fallback_terminal_id TEXT, "
@@ -942,17 +951,31 @@ def _migrate_terminals_schema() -> None:
             "substr(init_failure_token,9,1) = '-' AND substr(init_failure_token,14,1) = '-' AND "
             "substr(init_failure_token,19,1) = '-' AND substr(init_failure_token,24,1) = '-')))"
         )
-        legacy_columns = {row[1] for row in conn.execute(
-            "PRAGMA table_info(terminals_wpm4a_legacy)"
-        )}
+        legacy_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(terminals_wpm4a_legacy)")
+        }
         destination = [
-            "id", "tmux_session", "tmux_window", "provider", "agent_profile",
-            "allowed_tools", "shell_command", "caller_id", "provider_session_id",
+            "id",
+            "tmux_session",
+            "tmux_window",
+            "provider",
+            "agent_profile",
+            "allowed_tools",
+            "shell_command",
+            "caller_id",
+            "provider_session_id",
             "caller_mailbox_id",
-            "recovery_state", "recovery_error", "recovery_updated_at",
-            "fallback_terminal_id", "last_active",
-            "init_state", "init_started_at", "init_owner_epoch",
-            "init_failure_token", "init_deadline_s",
+            "instance_id",
+            "recovery_state",
+            "recovery_error",
+            "recovery_updated_at",
+            "fallback_terminal_id",
+            "last_active",
+            "init_state",
+            "init_started_at",
+            "init_owner_epoch",
+            "init_failure_token",
+            "init_deadline_s",
         ]
         copied = [name for name in destination if name in legacy_columns]
         conn.execute(
@@ -980,10 +1003,15 @@ def _migrate_terminals_schema() -> None:
 
 def _mailbox_schema_available(db: Any) -> bool:
     try:
-        tables = {row[0] for row in db.execute(text(
-            "SELECT name FROM sqlite_master WHERE type='table' AND "
-            "name IN ('mailboxes','mailbox_incarnations')"
-        )).all()}
+        tables = {
+            row[0]
+            for row in db.execute(
+                text(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND "
+                    "name IN ('mailboxes','mailbox_incarnations')"
+                )
+            ).all()
+        }
     except TypeError:
         return False
     if tables != {"mailboxes", "mailbox_incarnations"}:
@@ -1003,9 +1031,11 @@ def _mailbox_id_for_terminal(db: Any, terminal_id: str | None) -> str | None:
         return None
     if not _mailbox_schema_available(db):
         return None
-    row = db.query(MailboxIncarnationModel.mailbox_id).filter(
-        MailboxIncarnationModel.terminal_id == terminal_id
-    ).one_or_none()
+    row = (
+        db.query(MailboxIncarnationModel.mailbox_id)
+        .filter(MailboxIncarnationModel.terminal_id == terminal_id)
+        .one_or_none()
+    )
     return cast(str, row[0]) if row is not None else None
 
 
@@ -1019,9 +1049,12 @@ def resolve_inbox_receiver(db: Any, receiver_id: str) -> tuple[str, str | None]:
             raise ValueError("unknown_mailbox")
         cache = mailbox.current_terminal_id
         if cache is None:
-            latest = (db.query(MailboxIncarnationModel.terminal_id)
-                      .filter(MailboxIncarnationModel.mailbox_id == mailbox.id)
-                      .order_by(MailboxIncarnationModel.generation.desc()).first())
+            latest = (
+                db.query(MailboxIncarnationModel.terminal_id)
+                .filter(MailboxIncarnationModel.mailbox_id == mailbox.id)
+                .order_by(MailboxIncarnationModel.generation.desc())
+                .first()
+            )
             cache = latest[0] if latest is not None else receiver_id
         return cast(str, cache), cast(str, mailbox.id)
     mailbox_id = _mailbox_id_for_terminal(db, receiver_id)
@@ -1065,6 +1098,7 @@ def create_terminal(
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
             shell_command=shell_command,
             caller_id=caller_id,
+            instance_id=os.environ.get("CAO_INSTANCE_ID") or None,
             caller_mailbox_id=caller_mailbox_id,
             provider_session_id=provider_session_id,
             init_state=init_state,
@@ -1083,6 +1117,7 @@ def create_terminal(
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
+            "instance_id": terminal.instance_id,
             "caller_mailbox_id": (
                 terminal.caller_mailbox_id if _terminal_mailbox_column_available(db) else None
             ),
@@ -1104,10 +1139,18 @@ class WarmIntentPublishError(RuntimeError):
 
 
 def create_terminal_with_warm_intent(
-    *, terminal_id: str, tmux_session: str, tmux_window: str, provider: str,
-    agent_profile: Optional[str], allowed_tools: Optional[List[str]],
-    caller_id: Optional[str], parent_base_name: Optional[str],
-    fork_mode: Optional[str], cas_hook=None, init_state: str = "ready",
+    *,
+    terminal_id: str,
+    tmux_session: str,
+    tmux_window: str,
+    provider: str,
+    agent_profile: Optional[str],
+    allowed_tools: Optional[List[str]],
+    caller_id: Optional[str],
+    parent_base_name: Optional[str],
+    fork_mode: Optional[str],
+    cas_hook=None,
+    init_state: str = "ready",
     init_started_at: Optional[datetime] = None,
     init_owner_epoch: Optional[str] = None,
     init_deadline_s: Optional[float] = None,
@@ -1118,21 +1161,31 @@ def create_terminal_with_warm_intent(
 
     with SessionLocal.begin() as db:
         caller_mailbox_id = _mailbox_id_for_terminal(db, caller_id)
-        db.add(TerminalModel(
-            id=terminal_id, tmux_session=tmux_session, tmux_window=tmux_window,
-            provider=provider, agent_profile=agent_profile,
-            allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
-            caller_id=caller_id,
-            caller_mailbox_id=caller_mailbox_id,
-            init_state=init_state, init_started_at=init_started_at,
-            init_owner_epoch=init_owner_epoch, init_deadline_s=init_deadline_s,
-        ))
+        db.add(
+            TerminalModel(
+                id=terminal_id,
+                tmux_session=tmux_session,
+                tmux_window=tmux_window,
+                provider=provider,
+                agent_profile=agent_profile,
+                allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
+                caller_id=caller_id,
+                instance_id=os.environ.get("CAO_INSTANCE_ID") or None,
+                caller_mailbox_id=caller_mailbox_id,
+                init_state=init_state,
+                init_started_at=init_started_at,
+                init_owner_epoch=init_owner_epoch,
+                init_deadline_s=init_deadline_s,
+            )
+        )
         if fork_mode == "fork" and parent_base_name and agent_profile:
             claimed = False
             for attempt in range(3):
                 dead = (
                     db.query(WarmIntentModel)
-                    .outerjoin(TerminalModel, TerminalModel.id == WarmIntentModel.worker_terminal_id)
+                    .outerjoin(
+                        TerminalModel, TerminalModel.id == WarmIntentModel.worker_terminal_id
+                    )
                     .filter(
                         WarmIntentModel.session_name == tmux_session,
                         WarmIntentModel.worker_profile == agent_profile,
@@ -1143,27 +1196,39 @@ def create_terminal_with_warm_intent(
                     .first()
                 )
                 if dead is None:
-                    db.add(WarmIntentModel(
-                        intent_id=str(uuid.uuid4()), worker_terminal_id=terminal_id,
-                        session_name=tmux_session, worker_profile=agent_profile,
-                        parent_base_name=parent_base_name, provider=provider,
-                        created_at=_utcnow(),
-                    ))
+                    db.add(
+                        WarmIntentModel(
+                            intent_id=str(uuid.uuid4()),
+                            worker_terminal_id=terminal_id,
+                            session_name=tmux_session,
+                            worker_profile=agent_profile,
+                            parent_base_name=parent_base_name,
+                            provider=provider,
+                            created_at=_utcnow(),
+                        )
+                    )
                     claimed = True
                     break
                 old_id = dead.worker_terminal_id
                 if cas_hook and cas_hook(attempt, old_id, db) is False:
                     db.expire_all()
                     continue
-                changed = db.query(WarmIntentModel).filter(
-                    WarmIntentModel.intent_id == dead.intent_id,
-                    WarmIntentModel.worker_terminal_id == old_id,
-                    ~db.query(TerminalModel).filter(TerminalModel.id == old_id).exists(),
-                ).update({
-                    "worker_terminal_id": terminal_id,
-                    "replaces_worker_terminal_id": old_id,
-                    "created_at": _utcnow(),
-                }, synchronize_session=False)
+                changed = (
+                    db.query(WarmIntentModel)
+                    .filter(
+                        WarmIntentModel.intent_id == dead.intent_id,
+                        WarmIntentModel.worker_terminal_id == old_id,
+                        ~db.query(TerminalModel).filter(TerminalModel.id == old_id).exists(),
+                    )
+                    .update(
+                        {
+                            "worker_terminal_id": terminal_id,
+                            "replaces_worker_terminal_id": old_id,
+                            "created_at": _utcnow(),
+                        },
+                        synchronize_session=False,
+                    )
+                )
                 if changed:
                     claimed = True
                     break
@@ -1215,10 +1280,7 @@ def terminal_exists(terminal_id: str) -> bool:
     """Return whether a terminal row exists without logging on a miss."""
     with SessionLocal() as db:
         return (
-            db.query(TerminalModel.id)
-            .filter(TerminalModel.id == terminal_id)
-            .first()
-            is not None
+            db.query(TerminalModel.id).filter(TerminalModel.id == terminal_id).first() is not None
         )
 
 
@@ -1235,7 +1297,8 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "agent_profile": t.agent_profile,
                 "allowed_tools": (
                     __import__("json").loads(t.allowed_tools)
-                    if isinstance(t.allowed_tools, str) and t.allowed_tools else None
+                    if isinstance(t.allowed_tools, str) and t.allowed_tools
+                    else None
                 ),
                 "shell_command": t.shell_command,
                 "caller_id": t.caller_id,
@@ -1277,9 +1340,7 @@ def update_terminal_shell_command(terminal_id: str, shell_command: str) -> bool:
         return False
 
 
-def update_terminal_provider_session_id_if_null(
-    terminal_id: str, session_uuid: str
-) -> str | None:
+def update_terminal_provider_session_id_if_null(terminal_id: str, session_uuid: str) -> str | None:
     """Claim an unset provider session id and return the persisted winner."""
     with SessionLocal.begin() as db:
         db.query(TerminalModel).filter(
@@ -1293,14 +1354,21 @@ def update_terminal_provider_session_id_if_null(
 def update_terminal_provider_session_id(terminal_id: str, session_uuid: str) -> bool:
     """Explicitly set a provider session id (base registration/allocated UUID paths)."""
     with SessionLocal.begin() as db:
-        changed = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).update(
-            {TerminalModel.provider_session_id: session_uuid}, synchronize_session=False)
+        changed = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.id == terminal_id)
+            .update({TerminalModel.provider_session_id: session_uuid}, synchronize_session=False)
+        )
         return changed > 0
 
 
 def update_terminal_runtime_identity(
-    terminal_id: str, session_uuid: str, shell_command: str | None,
-    *, supersede_other_claims: bool = False, require_published_uuid: bool = False,
+    terminal_id: str,
+    session_uuid: str,
+    shell_command: str | None,
+    *,
+    supersede_other_claims: bool = False,
+    require_published_uuid: bool = False,
 ) -> bool:
     """Confirm identity and optionally transfer the UUID claim atomically.
 
@@ -1328,19 +1396,25 @@ def update_terminal_runtime_identity(
 
 
 def settle_terminal_rebound(
-    terminal_id: str, session_uuid: str, shell_command: str,
+    terminal_id: str,
+    session_uuid: str,
+    shell_command: str,
 ) -> bool:
     """Atomically persist proven runtime identity and the healthy projection."""
     with SessionLocal.begin() as db:
-        changed = db.query(TerminalModel).filter_by(id=terminal_id).update(
-            {
-                "provider_session_id": session_uuid,
-                "shell_command": shell_command,
-                "recovery_state": "rebound",
-                "recovery_error": None,
-                "recovery_updated_at": _utcnow(),
-            },
-            synchronize_session=False,
+        changed = (
+            db.query(TerminalModel)
+            .filter_by(id=terminal_id)
+            .update(
+                {
+                    "provider_session_id": session_uuid,
+                    "shell_command": shell_command,
+                    "recovery_state": "rebound",
+                    "recovery_error": None,
+                    "recovery_updated_at": _utcnow(),
+                },
+                synchronize_session=False,
+            )
         )
         return changed > 0
 
@@ -1360,13 +1434,18 @@ def set_terminal_recovery_state(
         }
         if fallback_terminal_id is not None:
             values["fallback_terminal_id"] = fallback_terminal_id
-        return db.query(TerminalModel).filter_by(id=terminal_id).update(
-            values, synchronize_session=False
-        ) > 0
+        return (
+            db.query(TerminalModel)
+            .filter_by(id=terminal_id)
+            .update(values, synchronize_session=False)
+            > 0
+        )
 
 
 def quarantine_terminal_owner(
-    terminal_id: str, session_uuid: str | None, error: str,
+    terminal_id: str,
+    session_uuid: str | None,
+    error: str,
 ) -> str:
     """Atomically retain attempted native ownership and quarantine projection."""
     with SessionLocal.begin() as db:
@@ -1375,14 +1454,20 @@ def quarantine_terminal_owner(
             return ""
         association = "skipped_existing_owner"
         if row.provider_session_id is None and session_uuid:
-            associated = db.query(TerminalModel).filter(
-                TerminalModel.id == terminal_id,
-                TerminalModel.provider_session_id.is_(None),
-                ~db.query(TerminalModel.id).filter(
-                    TerminalModel.provider_session_id == session_uuid,
-                    TerminalModel.id != terminal_id,
-                ).exists(),
-            ).update({"provider_session_id": session_uuid}, synchronize_session=False)
+            associated = (
+                db.query(TerminalModel)
+                .filter(
+                    TerminalModel.id == terminal_id,
+                    TerminalModel.provider_session_id.is_(None),
+                    ~db.query(TerminalModel.id)
+                    .filter(
+                        TerminalModel.provider_session_id == session_uuid,
+                        TerminalModel.id != terminal_id,
+                    )
+                    .exists(),
+                )
+                .update({"provider_session_id": session_uuid}, synchronize_session=False)
+            )
             association = "associated" if associated == 1 else "skipped_existing_owner"
         row.recovery_state = "rebind_failed"
         row.recovery_error = error[:2048]
@@ -1401,10 +1486,14 @@ def settle_terminal_fallback(old_terminal_id: str, new_terminal_id: str) -> int:
             raise RuntimeError("fallback_terminal_missing")
         if not new.provider_session_id:
             raise RuntimeError("fallback_terminal_identity_missing")
-        changed = db.query(InboxModel).filter(
-            InboxModel.receiver_id == old_terminal_id,
-            InboxModel.status == MessageStatus.PENDING.value,
-        ).update({"receiver_id": new_terminal_id}, synchronize_session=False)
+        changed = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.receiver_id == old_terminal_id,
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .update({"receiver_id": new_terminal_id}, synchronize_session=False)
+        )
         old.fallback_terminal_id = new_terminal_id
         old.recovery_state = "fallback_ready"
         old.recovery_error = None
@@ -1418,9 +1507,12 @@ def settle_terminal_fallback(old_terminal_id: str, new_terminal_id: str) -> int:
 
 def has_unsettled_delivery_attempt(terminal_id: str) -> bool:
     with SessionLocal() as db:
-        return db.query(InboxDeliveryAttemptModel).filter_by(
-            receiver_terminal_id=terminal_id, settled_at=None
-        ).first() is not None
+        return (
+            db.query(InboxDeliveryAttemptModel)
+            .filter_by(receiver_terminal_id=terminal_id, settled_at=None)
+            .first()
+            is not None
+        )
 
 
 def create_transcript_binding(
@@ -1472,9 +1564,7 @@ def get_current_transcript_binding(terminal_id: str) -> Optional[Dict[str, Any]]
         raise
 
 
-def register_provider_session(
-    *, include_superseded: bool = False, **values: Any
-) -> Dict[str, Any]:
+def register_provider_session(*, include_superseded: bool = False, **values: Any) -> Dict[str, Any]:
     """Atomically supersede a ready name and register its replacement."""
     if values.get("name") == "cold":
         raise ValueError("base_name_reserved:cold")
@@ -1482,10 +1572,14 @@ def register_provider_session(
         raise ValueError("invalid_provider_session_kind")
     with SessionLocal() as db:
         now = _utcnow()
-        superseded_count = db.query(ProviderSessionModel).filter(
-            ProviderSessionModel.name == values["name"],
-            ProviderSessionModel.status == "ready",
-        ).update({"status": "superseded", "updated_at": now})
+        superseded_count = (
+            db.query(ProviderSessionModel)
+            .filter(
+                ProviderSessionModel.name == values["name"],
+                ProviderSessionModel.status == "ready",
+            )
+            .update({"status": "superseded", "updated_at": now})
+        )
         row = ProviderSessionModel(**values, status="ready", created_at=now, updated_at=now)
         db.add(row)
         db.commit()
@@ -1498,34 +1592,39 @@ def register_provider_session(
 
 def get_provider_session_history(name: str) -> Optional[Dict[str, Any]]:
     with SessionLocal() as db:
-        row = (db.query(ProviderSessionModel).filter_by(name=name)
-               .order_by(ProviderSessionModel.updated_at.desc(), ProviderSessionModel.id.desc())
-               .first())
+        row = (
+            db.query(ProviderSessionModel)
+            .filter_by(name=name)
+            .order_by(ProviderSessionModel.updated_at.desc(), ProviderSessionModel.id.desc())
+            .first()
+        )
         return provider_session_to_dict(row) if row else None
 
 
 def list_ready_provider_sessions_for_session(session_name: str) -> List[Dict[str, Any]]:
     with SessionLocal() as db:
-        rows = db.query(ProviderSessionModel).filter_by(
-            status="ready", session_name=session_name).order_by(ProviderSessionModel.name).all()
+        rows = (
+            db.query(ProviderSessionModel)
+            .filter_by(status="ready", session_name=session_name)
+            .order_by(ProviderSessionModel.name)
+            .all()
+        )
         return [provider_session_to_dict(row) for row in rows]
 
 
 def delete_terminal_and_warm_intent(
-    terminal_id: str, *, preserve_warm_intent: bool = False,
+    terminal_id: str,
+    *,
+    preserve_warm_intent: bool = False,
 ) -> Dict[str, bool]:
     """Delete the terminal and, unless retained, its warm intent atomically."""
     with SessionLocal.begin() as db:
         intent_deleted = False
         if not preserve_warm_intent:
             intent_deleted = (
-                db.query(WarmIntentModel)
-                .filter_by(worker_terminal_id=terminal_id)
-                .delete() > 0
+                db.query(WarmIntentModel).filter_by(worker_terminal_id=terminal_id).delete() > 0
             )
-        terminal_deleted = (
-            db.query(TerminalModel).filter_by(id=terminal_id).delete() > 0
-        )
+        terminal_deleted = db.query(TerminalModel).filter_by(id=terminal_id).delete() > 0
         return {
             "terminal_deleted": terminal_deleted,
             "intent_deleted": intent_deleted,
@@ -1534,8 +1633,12 @@ def delete_terminal_and_warm_intent(
 
 def list_warm_intents(session_name: str) -> List[Dict[str, Any]]:
     with SessionLocal() as db:
-        rows = db.query(WarmIntentModel).filter_by(session_name=session_name).order_by(
-            WarmIntentModel.created_at, WarmIntentModel.intent_id).all()
+        rows = (
+            db.query(WarmIntentModel)
+            .filter_by(session_name=session_name)
+            .order_by(WarmIntentModel.created_at, WarmIntentModel.intent_id)
+            .all()
+        )
         return [{c.name: getattr(row, c.name) for c in row.__table__.columns} for row in rows]
 
 
@@ -1546,14 +1649,22 @@ def delete_warm_intents_for_session(session_name: str) -> int:
 
 def increment_session_epoch(session_name: str) -> Dict[str, Any]:
     from sqlalchemy.dialects.sqlite import insert
+
     now = _utcnow()
     with SessionLocal.begin() as db:
-        statement = insert(SessionEpochModel).values(
-            session_name=session_name, count=1, last_epoch_at=now,
-        ).on_conflict_do_update(
-            index_elements=[SessionEpochModel.session_name],
-            set_={"count": SessionEpochModel.count + 1, "last_epoch_at": now},
-        ).returning(SessionEpochModel.count, SessionEpochModel.last_epoch_at)
+        statement = (
+            insert(SessionEpochModel)
+            .values(
+                session_name=session_name,
+                count=1,
+                last_epoch_at=now,
+            )
+            .on_conflict_do_update(
+                index_elements=[SessionEpochModel.session_name],
+                set_={"count": SessionEpochModel.count + 1, "last_epoch_at": now},
+            )
+            .returning(SessionEpochModel.count, SessionEpochModel.last_epoch_at)
+        )
         count, last_epoch_at = db.execute(statement).one()
         return {"count": count, "last_epoch_at": last_epoch_at}
 
@@ -1562,7 +1673,7 @@ def get_session_epoch(session_name: str) -> Optional[Dict[str, Any]]:
     try:
         with SessionLocal() as db:
             row = db.query(SessionEpochModel).filter_by(session_name=session_name).first()
-            return ({"count": row.count, "last_epoch_at": row.last_epoch_at} if row else None)
+            return {"count": row.count, "last_epoch_at": row.last_epoch_at} if row else None
     except Exception as exc:
         if "no such table: session_epochs" in str(exc):
             return None
@@ -1621,18 +1732,26 @@ def get_ready_provider_session_by_source_terminal(
 ) -> Optional[Dict[str, Any]]:
     """Return the ready base owned by ``terminal_id``, if any."""
     with SessionLocal() as db:
-        row = db.query(ProviderSessionModel).filter_by(
-            source_terminal_id=terminal_id, status="ready"
-        ).first()
+        row = (
+            db.query(ProviderSessionModel)
+            .filter_by(source_terminal_id=terminal_id, status="ready")
+            .first()
+        )
         return provider_session_to_dict(row) if row else None
 
 
 def get_provider_session_by_uuid(session_uuid: str) -> Optional[Dict[str, Any]]:
     with SessionLocal() as db:
-        row = (db.query(ProviderSessionModel).filter_by(session_uuid=session_uuid)
-               .order_by((ProviderSessionModel.status == "ready").desc(),
-                         ProviderSessionModel.updated_at.desc(), ProviderSessionModel.id.desc())
-               .first())
+        row = (
+            db.query(ProviderSessionModel)
+            .filter_by(session_uuid=session_uuid)
+            .order_by(
+                (ProviderSessionModel.status == "ready").desc(),
+                ProviderSessionModel.updated_at.desc(),
+                ProviderSessionModel.id.desc(),
+            )
+            .first()
+        )
         if row is None or row.status == "retired":
             return None
         return provider_session_to_dict(row)
@@ -1640,15 +1759,27 @@ def get_provider_session_by_uuid(session_uuid: str) -> Optional[Dict[str, Any]]:
 
 def list_ready_provider_sessions() -> List[Dict[str, Any]]:
     with SessionLocal() as db:
-        return [provider_session_to_dict(r) for r in db.query(ProviderSessionModel)
-                .filter_by(status="ready").order_by(ProviderSessionModel.name).all()]
+        return [
+            provider_session_to_dict(r)
+            for r in db.query(ProviderSessionModel)
+            .filter_by(status="ready")
+            .order_by(ProviderSessionModel.name)
+            .all()
+        ]
 
 
 def list_terminals_by_provider_session_id(session_uuid: str) -> List[Dict[str, Any]]:
     with SessionLocal() as db:
         rows = db.query(TerminalModel).filter_by(provider_session_id=session_uuid).all()
-        return [{"id": r.id, "tmux_session": r.tmux_session, "tmux_window": r.tmux_window,
-                 "provider": r.provider} for r in rows]
+        return [
+            {
+                "id": r.id,
+                "tmux_session": r.tmux_session,
+                "tmux_window": r.tmux_window,
+                "provider": r.provider,
+            }
+            for r in rows
+        ]
 
 
 def list_all_terminals() -> List[Dict[str, Any]]:
@@ -1708,14 +1839,22 @@ def mark_terminal_init_ready(
         if should_commit is not None and progress_fence is not None:
             progress_fence(lambda: int(not should_commit()), 1)
         try:
-            changed = db.query(TerminalModel).filter(
-                TerminalModel.id == terminal_id,
-                TerminalModel.init_state == "init_pending",
-            ).update({
-                "init_state": "ready",
-                "init_owner_epoch": None,
-                "init_failure_token": None,
-            }, synchronize_session=False) == 1
+            changed = (
+                db.query(TerminalModel)
+                .filter(
+                    TerminalModel.id == terminal_id,
+                    TerminalModel.init_state == "init_pending",
+                )
+                .update(
+                    {
+                        "init_state": "ready",
+                        "init_owner_epoch": None,
+                        "init_failure_token": None,
+                    },
+                    synchronize_session=False,
+                )
+                == 1
+            )
             if should_commit is not None and not should_commit():
                 if progress_fence is not None:
                     progress_fence(None, 0)
@@ -1742,7 +1881,8 @@ def mark_terminal_init_ready(
             abandoned = should_commit is not None and not should_commit()
             if decided:
                 logger.critical(
-                    "ready_commit_invariant_breach terminal=%s", terminal_id,
+                    "ready_commit_invariant_breach terminal=%s",
+                    terminal_id,
                     exc_info=True,
                 )
             db.info.pop(_READY_COMMIT_CALLBACK, None)
@@ -1764,12 +1904,11 @@ def mark_terminal_init_ready(
                     db.rollback()
                 except Exception:
                     logger.error(
-                        "ready_commit_rollback_failed terminal=%s", terminal_id,
+                        "ready_commit_rollback_failed terminal=%s",
+                        terminal_id,
                         exc_info=True,
                     )
-                raise ReadyCommitInvariantBreach(
-                    "ready_commit_failed_after_decision"
-                ) from exc
+                raise ReadyCommitInvariantBreach("ready_commit_failed_after_decision") from exc
             db.rollback()
             if (
                 isinstance(exc, OperationalError)
@@ -1804,10 +1943,14 @@ def claim_deferred_init_failure(
         with SessionLocal() as db:
             try:
                 db.execute(text("BEGIN IMMEDIATE"))
-                row = db.query(TerminalModel).filter(
-                    TerminalModel.id == terminal_id,
-                    TerminalModel.init_state == "init_pending",
-                ).first()
+                row = (
+                    db.query(TerminalModel)
+                    .filter(
+                        TerminalModel.id == terminal_id,
+                        TerminalModel.init_state == "init_pending",
+                    )
+                    .first()
+                )
                 if row is None:
                     existing = db.query(TerminalModel).filter_by(id=terminal_id).first()
                     db.rollback()
@@ -1823,14 +1966,16 @@ def claim_deferred_init_failure(
                         db, cast(str, caller_id)
                     )
                     row.init_state = "init_failed_notified"
-                    db.add(InboxModel(
-                        sender_id=terminal_id,
-                        receiver_id=receiver_cache,
-                        logical_receiver_id=logical_receiver_id,
-                        message=notice,
-                        orchestration_type=OrchestrationType.SEND_MESSAGE.value,
-                        status=MessageStatus.PENDING.value,
-                    ))
+                    db.add(
+                        InboxModel(
+                            sender_id=terminal_id,
+                            receiver_id=receiver_cache,
+                            logical_receiver_id=logical_receiver_id,
+                            message=notice,
+                            orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+                            status=MessageStatus.PENDING.value,
+                        )
+                    )
                     status = "claimed_notified"
                 else:
                     row.init_state = "init_failed_caller_gone"
@@ -1854,14 +1999,20 @@ def claim_deferred_init_failure(
 def list_deferred_init_recovery_rows(current_owner_epoch: str) -> List[Dict[str, Any]]:
     """Return only durable init rows owned by the H5 startup sweep."""
     with SessionLocal() as db:
-        rows = db.query(TerminalModel).filter(
-            ((TerminalModel.init_state == "init_pending") &
-             ((TerminalModel.init_owner_epoch != current_owner_epoch) |
-              TerminalModel.init_owner_epoch.is_(None))) |
-            TerminalModel.init_state.in_((
-                "init_failed_notified", "init_failed_caller_gone"
-            ))
-        ).all()
+        rows = (
+            db.query(TerminalModel)
+            .filter(
+                (
+                    (TerminalModel.init_state == "init_pending")
+                    & (
+                        (TerminalModel.init_owner_epoch != current_owner_epoch)
+                        | TerminalModel.init_owner_epoch.is_(None)
+                    )
+                )
+                | TerminalModel.init_state.in_(("init_failed_notified", "init_failed_caller_gone"))
+            )
+            .all()
+        )
         return [
             {column.name: getattr(row, column.name) for column in row.__table__.columns}
             for row in rows
@@ -1875,8 +2026,11 @@ def begin_teardown_intent(workspace_id: str, session_name: str) -> Dict[str, Any
         row = db.get(TeardownIntentModel, workspace_id)
         if row is None:
             row = TeardownIntentModel(
-                workspace_id=workspace_id, session_name=session_name,
-                created_at=now, state="issuing", generation=1,
+                workspace_id=workspace_id,
+                session_name=session_name,
+                created_at=now,
+                state="issuing",
+                generation=1,
             )
             db.add(row)
         else:
@@ -1885,19 +2039,27 @@ def begin_teardown_intent(workspace_id: str, session_name: str) -> Dict[str, Any
             row.state = "issuing"
             row.generation += 1
         db.flush()
-        return {"workspace_id": workspace_id, "session_name": session_name,
-                "state": row.state, "generation": row.generation,
-                "created_at": row.created_at}
+        return {
+            "workspace_id": workspace_id,
+            "session_name": session_name,
+            "state": row.state,
+            "generation": row.generation,
+            "created_at": row.created_at,
+        }
 
 
 def settle_teardown_intent(workspace_id: str, generation: int, *, issued: bool) -> bool:
     with SessionLocal.begin() as db:
-        return db.query(TeardownIntentModel).filter(
-            TeardownIntentModel.workspace_id == workspace_id,
-            TeardownIntentModel.generation == generation,
-            TeardownIntentModel.state == "issuing",
-        ).update({"state": "issued_ok" if issued else "void"},
-                 synchronize_session=False) == 1
+        return (
+            db.query(TeardownIntentModel)
+            .filter(
+                TeardownIntentModel.workspace_id == workspace_id,
+                TeardownIntentModel.generation == generation,
+                TeardownIntentModel.state == "issuing",
+            )
+            .update({"state": "issued_ok" if issued else "void"}, synchronize_session=False)
+            == 1
+        )
 
 
 def get_teardown_intent(workspace_id: str) -> Optional[Dict[str, Any]]:
@@ -1909,16 +2071,23 @@ def get_teardown_intent(workspace_id: str) -> Optional[Dict[str, Any]]:
 
 
 def consume_current_teardown_intent(
-    workspace_id: str, *, ttl_s: float, now: Optional[datetime] = None,
+    workspace_id: str,
+    *,
+    ttl_s: float,
+    now: Optional[datetime] = None,
 ) -> Optional[Dict[str, Any]]:
     """Consume only the current issued, unexpired generation exactly once."""
     cutoff = (now or _utcnow()) - timedelta(seconds=ttl_s)
     with SessionLocal.begin() as db:
-        row = db.query(TeardownIntentModel).filter(
-            TeardownIntentModel.workspace_id == workspace_id,
-            TeardownIntentModel.state == "issued_ok",
-            TeardownIntentModel.created_at >= cutoff,
-        ).first()
+        row = (
+            db.query(TeardownIntentModel)
+            .filter(
+                TeardownIntentModel.workspace_id == workspace_id,
+                TeardownIntentModel.state == "issued_ok",
+                TeardownIntentModel.created_at >= cutoff,
+            )
+            .first()
+        )
         if row is None:
             return None
         result = {column.name: getattr(row, column.name) for column in row.__table__.columns}
@@ -1936,10 +2105,14 @@ def record_workspace_mapping(workspace_id: str, session_name: str) -> None:
         ).update({"active": False, "updated_at": _utcnow()}, synchronize_session=False)
         row = db.get(WorkspaceMapModel, workspace_id)
         if row is None:
-            db.add(WorkspaceMapModel(
-                workspace_id=workspace_id, session_name=session_name,
-                active=True, updated_at=_utcnow(),
-            ))
+            db.add(
+                WorkspaceMapModel(
+                    workspace_id=workspace_id,
+                    session_name=session_name,
+                    active=True,
+                    updated_at=_utcnow(),
+                )
+            )
         else:
             row.session_name = session_name
             row.active = True
@@ -1948,26 +2121,29 @@ def record_workspace_mapping(workspace_id: str, session_name: str) -> None:
 
 def resolve_workspace_mapping(workspace_id: str) -> Optional[str]:
     with SessionLocal() as db:
-        row = db.query(WorkspaceMapModel).filter_by(
-            workspace_id=workspace_id, active=True
-        ).first()
+        row = db.query(WorkspaceMapModel).filter_by(workspace_id=workspace_id, active=True).first()
         return cast(Optional[str], row.session_name) if row else None
 
 
 def current_workspace_for_session(session_name: str) -> Optional[str]:
     with SessionLocal() as db:
-        row = db.query(WorkspaceMapModel).filter_by(
-            session_name=session_name, active=True
-        ).order_by(WorkspaceMapModel.updated_at.desc()).first()
+        row = (
+            db.query(WorkspaceMapModel)
+            .filter_by(session_name=session_name, active=True)
+            .order_by(WorkspaceMapModel.updated_at.desc())
+            .first()
+        )
         return cast(Optional[str], row.workspace_id) if row else None
 
 
 def retire_workspace_mapping(workspace_id: str) -> bool:
     with SessionLocal.begin() as db:
-        return db.query(WorkspaceMapModel).filter_by(
-            workspace_id=workspace_id, active=True
-        ).update({"active": False, "updated_at": _utcnow()},
-                 synchronize_session=False) == 1
+        return (
+            db.query(WorkspaceMapModel)
+            .filter_by(workspace_id=workspace_id, active=True)
+            .update({"active": False, "updated_at": _utcnow()}, synchronize_session=False)
+            == 1
+        )
 
 
 def list_pending_receiver_ids_by_provider(provider: str) -> List[str]:
@@ -2046,16 +2222,16 @@ def list_ready_backlog_observations() -> list[ReadyBacklogObservation]:
             return []
 
         receiver_ids = list(oldest_by_receiver)
-        attempts = db.query(InboxDeliveryAttemptModel).filter(
-            InboxDeliveryAttemptModel.receiver_terminal_id.in_(receiver_ids)
-        ).all()
-        progress: dict[
-            str, tuple[int, datetime | None, datetime | None, datetime | None, bool]
-        ] = {}
+        attempts = (
+            db.query(InboxDeliveryAttemptModel)
+            .filter(InboxDeliveryAttemptModel.receiver_terminal_id.in_(receiver_ids))
+            .all()
+        )
+        progress: dict[str, tuple[int, datetime | None, datetime | None, datetime | None, bool]] = (
+            {}
+        )
 
-        def latest(
-            left: datetime | None, right: datetime | None
-        ) -> datetime | None:
+        def latest(left: datetime | None, right: datetime | None) -> datetime | None:
             if left is None:
                 return right
             if right is None:
@@ -2088,9 +2264,7 @@ def list_ready_backlog_observations() -> list[ReadyBacklogObservation]:
                 ReadyBacklogObservation(
                     receiver_id=receiver_id,
                     oldest_message_id=oldest.id,
-                    oldest_pending_age_seconds=max(
-                        0.0, (now - oldest.created_at).total_seconds()
-                    ),
+                    oldest_pending_age_seconds=max(0.0, (now - oldest.created_at).total_seconds()),
                     has_open_delivering_attempt=has_open,
                     attempt_fingerprint=(count, started, settled, last),
                 )
@@ -2101,7 +2275,8 @@ def list_ready_backlog_observations() -> list[ReadyBacklogObservation]:
 def delete_terminal(terminal_id: str) -> bool:
     """Delete terminal metadata and its warm intent through the universal seam."""
     return delete_terminal_and_warm_intent(
-        terminal_id, preserve_warm_intent=False,
+        terminal_id,
+        preserve_warm_intent=False,
     )["terminal_deleted"]
 
 
@@ -2109,12 +2284,15 @@ def delete_terminals_by_session(tmux_session: str) -> int:
     """Delete all session terminals and their warm intents through the universal seam."""
     with SessionLocal() as db:
         terminal_ids = [
-            terminal_id for terminal_id, in
-            db.query(TerminalModel.id).filter(TerminalModel.tmux_session == tmux_session).all()
+            terminal_id
+            for terminal_id, in db.query(TerminalModel.id)
+            .filter(TerminalModel.tmux_session == tmux_session)
+            .all()
         ]
     return sum(
         delete_terminal_and_warm_intent(
-            terminal_id, preserve_warm_intent=False,
+            terminal_id,
+            preserve_warm_intent=False,
         )["terminal_deleted"]
         for terminal_id in terminal_ids
     )
@@ -2134,9 +2312,10 @@ def create_inbox_message(
     with SessionLocal() as db:
         mailbox_schema = _mailbox_schema_available(db)
         receiver_cache, logical_receiver_id = resolve_inbox_receiver(db, receiver_id)
-        if logical_receiver_id is None and not db.query(TerminalModel).filter(
-            TerminalModel.id == receiver_cache
-        ).first():
+        if (
+            logical_receiver_id is None
+            and not db.query(TerminalModel).filter(TerminalModel.id == receiver_cache).first()
+        ):
             raise ValueError(f"Terminal '{receiver_id}' not found")
         inbox_kwargs = dict(
             sender_id=sender_id,
@@ -2167,10 +2346,12 @@ def _pending_receiver_predicate(receiver_id: str, mailbox_schema: bool):
     """Select raw rows by cache and logical rows by the mailbox's live authority."""
     if not mailbox_schema:
         return InboxModel.receiver_id == receiver_id
-    current_logical_receiver = exists().where(and_(
-        MailboxModel.id == InboxModel.logical_receiver_id,
-        MailboxModel.current_terminal_id == receiver_id,
-    ))
+    current_logical_receiver = exists().where(
+        and_(
+            MailboxModel.id == InboxModel.logical_receiver_id,
+            MailboxModel.current_terminal_id == receiver_id,
+        )
+    )
     return or_(
         and_(
             InboxModel.logical_receiver_id.is_(None),
@@ -2181,7 +2362,9 @@ def _pending_receiver_predicate(receiver_id: str, mailbox_schema: bool):
 
 
 def get_pending_messages(
-    receiver_id: str, limit: int = 1, excluded_message_ids: set[int] | None = None,
+    receiver_id: str,
+    limit: int = 1,
+    excluded_message_ids: set[int] | None = None,
 ) -> List[InboxMessage]:
     """Get pending messages ordered by created_at ASC (oldest first)."""
     excluded = set(excluded_message_ids or ())
@@ -2194,12 +2377,19 @@ def get_pending_messages(
         if excluded:
             query = query.filter(~InboxModel.id.in_(excluded))
         rows = query.order_by(InboxModel.created_at.asc(), InboxModel.id.asc()).limit(limit).all()
-        return [InboxMessage(
-            id=row.id, sender_id=row.sender_id, receiver_id=row.receiver_id,
-            logical_receiver_id=row.logical_receiver_id if mailbox_schema else None,
-            message=row.message, orchestration_type=OrchestrationType(row.orchestration_type),
-            status=MessageStatus(row.status), created_at=row.created_at,
-        ) for row in rows]
+        return [
+            InboxMessage(
+                id=row.id,
+                sender_id=row.sender_id,
+                receiver_id=row.receiver_id,
+                logical_receiver_id=row.logical_receiver_id if mailbox_schema else None,
+                message=row.message,
+                orchestration_type=OrchestrationType(row.orchestration_type),
+                status=MessageStatus(row.status),
+                created_at=row.created_at,
+            )
+            for row in rows
+        ]
 
 
 def get_pending_messages_by_ids(receiver_id: str, message_ids: list[int]) -> List[InboxMessage]:
@@ -2208,16 +2398,29 @@ def get_pending_messages_by_ids(receiver_id: str, message_ids: list[int]) -> Lis
         return []
     with SessionLocal() as db:
         mailbox_schema = _mailbox_schema_available(db)
-        rows = db.query(InboxModel).filter(
-            _pending_receiver_predicate(receiver_id, mailbox_schema), InboxModel.id.in_(ids),
-            InboxModel.status == MessageStatus.PENDING.value,
-        ).order_by(InboxModel.created_at, InboxModel.id).all()
-        return [InboxMessage(
-            id=row.id, sender_id=row.sender_id, receiver_id=row.receiver_id,
-            logical_receiver_id=row.logical_receiver_id if mailbox_schema else None,
-            message=row.message, orchestration_type=OrchestrationType(row.orchestration_type),
-            status=MessageStatus(row.status), created_at=row.created_at,
-        ) for row in rows]
+        rows = (
+            db.query(InboxModel)
+            .filter(
+                _pending_receiver_predicate(receiver_id, mailbox_schema),
+                InboxModel.id.in_(ids),
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .order_by(InboxModel.created_at, InboxModel.id)
+            .all()
+        )
+        return [
+            InboxMessage(
+                id=row.id,
+                sender_id=row.sender_id,
+                receiver_id=row.receiver_id,
+                logical_receiver_id=row.logical_receiver_id if mailbox_schema else None,
+                message=row.message,
+                orchestration_type=OrchestrationType(row.orchestration_type),
+                status=MessageStatus(row.status),
+                created_at=row.created_at,
+            )
+            for row in rows
+        ]
 
 
 def get_inbox_messages(
@@ -2323,13 +2526,24 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
         return False
 
 
-WPM1_EVIDENCE_KEYS = frozenset({
-    "boundary_authorized", "boundary_exhausted_at", "idle_observed_at",
-    "last_activity_at", "last_observed_status", "last_observed_ref",
-    "stalled_notified_at", "terminal_settled_at",
-    "injection_completed_seq", "crash_recovery", "boundary_snapshot",
-    "queue_corroboration", "busy_initial_submit", "redelivery_tag",
-})
+WPM1_EVIDENCE_KEYS = frozenset(
+    {
+        "boundary_authorized",
+        "boundary_exhausted_at",
+        "idle_observed_at",
+        "last_activity_at",
+        "last_observed_status",
+        "last_observed_ref",
+        "stalled_notified_at",
+        "terminal_settled_at",
+        "injection_completed_seq",
+        "crash_recovery",
+        "boundary_snapshot",
+        "queue_corroboration",
+        "busy_initial_submit",
+        "redelivery_tag",
+    }
+)
 
 ORPHAN_RECONCILE_BATCH_LIMIT = 100
 
@@ -2370,24 +2584,39 @@ def _canonical_json(value: Any) -> str:
 
 
 def _attempt_history_in_db(db, message_ids: list[int]) -> list[dict[str, Any]]:
-    rows = (db.query(InboxDeliveryAttemptModel).join(
-        InboxDeliveryAttemptMemberModel,
-        InboxDeliveryAttemptMemberModel.attempt_uuid == InboxDeliveryAttemptModel.attempt_uuid,
-    ).filter(InboxDeliveryAttemptMemberModel.message_id.in_(message_ids))
-      .order_by(InboxDeliveryAttemptModel.started_at, InboxDeliveryAttemptModel.attempt_uuid).distinct().all())
+    rows = (
+        db.query(InboxDeliveryAttemptModel)
+        .join(
+            InboxDeliveryAttemptMemberModel,
+            InboxDeliveryAttemptMemberModel.attempt_uuid == InboxDeliveryAttemptModel.attempt_uuid,
+        )
+        .filter(InboxDeliveryAttemptMemberModel.message_id.in_(message_ids))
+        .order_by(InboxDeliveryAttemptModel.started_at, InboxDeliveryAttemptModel.attempt_uuid)
+        .distinct()
+        .all()
+    )
     result = []
     for row in rows:
-        members = sorted(x.message_id for x in db.query(InboxDeliveryAttemptMemberModel)
-                         .filter_by(attempt_uuid=row.attempt_uuid).all())
-        result.append({
-            "attempt_uuid": row.attempt_uuid, "members": members, "outcome": row.outcome,
-            "reason": row.reason, "payload_hash": row.payload_hash,
-            "prior_attempt_uuid": row.prior_attempt_uuid,
-            "receiver_terminal_id": row.receiver_terminal_id,
-            "started_at": row.started_at,
-            "evidence": row.evidence,
-            "evidence_hash": hashlib.sha256((row.evidence or "{}").encode()).hexdigest(),
-        })
+        members = sorted(
+            x.message_id
+            for x in db.query(InboxDeliveryAttemptMemberModel)
+            .filter_by(attempt_uuid=row.attempt_uuid)
+            .all()
+        )
+        result.append(
+            {
+                "attempt_uuid": row.attempt_uuid,
+                "members": members,
+                "outcome": row.outcome,
+                "reason": row.reason,
+                "payload_hash": row.payload_hash,
+                "prior_attempt_uuid": row.prior_attempt_uuid,
+                "receiver_terminal_id": row.receiver_terminal_id,
+                "started_at": row.started_at,
+                "evidence": row.evidence,
+                "evidence_hash": hashlib.sha256((row.evidence or "{}").encode()).hexdigest(),
+            }
+        )
     return result
 
 
@@ -2409,7 +2638,9 @@ def attempt_proven_pre_paste(attempt: dict[str, Any]) -> bool:
 
 
 def make_admission_proof(
-    kind: str, message_ids: list[int], prior_attempt_uuid: str | None = None,
+    kind: str,
+    message_ids: list[int],
+    prior_attempt_uuid: str | None = None,
 ) -> AdmissionProof:
     ids = sorted(set(message_ids))
     history = list_overlapping_attempts(ids)
@@ -2427,35 +2658,56 @@ def make_admission_proof(
             authority = {
                 "binding_id": binding.get("id") if binding else None,
                 "session_id": binding.get("session_id") if binding else None,
-                "path": cursor["path"], "inode": cursor["inode"],
+                "path": cursor["path"],
+                "inode": cursor["inode"],
                 "resolution_kind": cursor["resolution_kind"],
             }
-            checks.append((row["payload_hash"], row.get("started_at"),
-                           tuple(sorted(cursor.items())), tuple(sorted(authority.items()))))
-    return AdmissionProof(kind, tuple(ids), _history_fingerprint(history),
-                          prior_attempt_uuid, tuple(checks))
+            checks.append(
+                (
+                    row["payload_hash"],
+                    row.get("started_at"),
+                    tuple(sorted(cursor.items())),
+                    tuple(sorted(authority.items())),
+                )
+            )
+    return AdmissionProof(
+        kind, tuple(ids), _history_fingerprint(history), prior_attempt_uuid, tuple(checks)
+    )
 
 
 def _delivering_authority_in_db(db, terminal_id: str) -> list[dict[str, Any]]:
     """Map each DELIVERING inbox row to its newest durable attempt owner."""
     mailbox_schema = _mailbox_schema_available(db)
-    messages = db.query(InboxModel).filter(
-        _pending_receiver_predicate(terminal_id, mailbox_schema),
-        InboxModel.status == MessageStatus.DELIVERING.value,
-    ).all()
+    messages = (
+        db.query(InboxModel)
+        .filter(
+            _pending_receiver_predicate(terminal_id, mailbox_schema),
+            InboxModel.status == MessageStatus.DELIVERING.value,
+        )
+        .all()
+    )
     owners: dict[str, set[int]] = {}
     for message in messages:
-        owner = (db.query(InboxDeliveryAttemptModel).join(
-            InboxDeliveryAttemptMemberModel,
-            InboxDeliveryAttemptMemberModel.attempt_uuid == InboxDeliveryAttemptModel.attempt_uuid,
-        ).filter(InboxDeliveryAttemptMemberModel.message_id == message.id).order_by(
-            InboxDeliveryAttemptModel.started_at.desc(),
-            InboxDeliveryAttemptModel.attempt_uuid.desc(),
-        ).first())
+        owner = (
+            db.query(InboxDeliveryAttemptModel)
+            .join(
+                InboxDeliveryAttemptMemberModel,
+                InboxDeliveryAttemptMemberModel.attempt_uuid
+                == InboxDeliveryAttemptModel.attempt_uuid,
+            )
+            .filter(InboxDeliveryAttemptMemberModel.message_id == message.id)
+            .order_by(
+                InboxDeliveryAttemptModel.started_at.desc(),
+                InboxDeliveryAttemptModel.attempt_uuid.desc(),
+            )
+            .first()
+        )
         if owner is not None:
             owners.setdefault(owner.attempt_uuid, set()).add(message.id)
-    return [{"attempt_uuid": attempt_uuid, "message_ids": sorted(message_ids)}
-            for attempt_uuid, message_ids in sorted(owners.items())]
+    return [
+        {"attempt_uuid": attempt_uuid, "message_ids": sorted(message_ids)}
+        for attempt_uuid, message_ids in sorted(owners.items())
+    ]
 
 
 def list_delivering_attempts_for_terminal(terminal_id: str) -> list[dict[str, Any]]:
@@ -2472,25 +2724,36 @@ def _corrective_evidence_valid(prior: dict[str, Any], candidate_ids: list[int]) 
     anchor = evidence.get("injection_completed_seq")
     exhausted_at = evidence.get("boundary_exhausted_at")
     snapshot = evidence.get("boundary_snapshot")
-    if (not isinstance(anchor, dict) or not isinstance(exhausted_at, str)
-            or not exhausted_at or not isinstance(snapshot, dict)):
+    if (
+        not isinstance(anchor, dict)
+        or not isinstance(exhausted_at, str)
+        or not exhausted_at
+        or not isinstance(snapshot, dict)
+    ):
         return False
     epoch, anchor_seq = anchor.get("observation_epoch"), anchor.get("seq")
     required = {
-        "observation_epoch", "status", "status_gen", "input_gen", "seq",
-        "last_non_ready_seq", "last_ready_seq",
+        "observation_epoch",
+        "status",
+        "status_gen",
+        "input_gen",
+        "seq",
+        "last_non_ready_seq",
+        "last_ready_seq",
     }
-    if (set(snapshot) != required or not isinstance(epoch, str) or not epoch
-            or type(anchor_seq) is not int
-            or snapshot.get("observation_epoch") != epoch
-            or snapshot.get("status") not in {
-                TerminalStatus.IDLE.value, TerminalStatus.COMPLETED.value}
-            or type(snapshot.get("input_gen")) is not int
-            or (snapshot.get("status_gen") is not None
-                and type(snapshot.get("status_gen")) is not int)
-            or type(snapshot.get("seq")) is not int
-            or type(snapshot.get("last_non_ready_seq")) is not int
-            or type(snapshot.get("last_ready_seq")) is not int):
+    if (
+        set(snapshot) != required
+        or not isinstance(epoch, str)
+        or not epoch
+        or type(anchor_seq) is not int
+        or snapshot.get("observation_epoch") != epoch
+        or snapshot.get("status") not in {TerminalStatus.IDLE.value, TerminalStatus.COMPLETED.value}
+        or type(snapshot.get("input_gen")) is not int
+        or (snapshot.get("status_gen") is not None and type(snapshot.get("status_gen")) is not int)
+        or type(snapshot.get("seq")) is not int
+        or type(snapshot.get("last_non_ready_seq")) is not int
+        or type(snapshot.get("last_ready_seq")) is not int
+    ):
         return False
     non_ready = snapshot["last_non_ready_seq"]
     ready = snapshot["last_ready_seq"]
@@ -2498,19 +2761,28 @@ def _corrective_evidence_valid(prior: dict[str, Any], candidate_ids: list[int]) 
 
 
 def _admission_valid(
-    kind: str, history: list[dict[str, Any]], prior_uuid: str | None,
+    kind: str,
+    history: list[dict[str, Any]],
+    prior_uuid: str | None,
     candidate_ids: list[int],
 ) -> bool:
     if kind == "s4_initial":
-        return all(row["outcome"] == "deferred" and row["reason"] in {
-            "delivery_deferred", "input_blocked"} for row in history)
+        return all(
+            row["outcome"] == "deferred" and row["reason"] in {"delivery_deferred", "input_blocked"}
+            for row in history
+        )
     if kind == "corrective":
         prior = next((row for row in history if row["attempt_uuid"] == prior_uuid), None)
-        return bool(prior and prior["outcome"] == "ambiguous" and
-                    prior["reason"] == "confirmation_timeout" and
-                    _corrective_evidence_valid(prior, candidate_ids) and
-                    not any(row["prior_attempt_uuid"] == prior_uuid and
-                            not attempt_proven_pre_paste(row) for row in history))
+        return bool(
+            prior
+            and prior["outcome"] == "ambiguous"
+            and prior["reason"] == "confirmation_timeout"
+            and _corrective_evidence_valid(prior, candidate_ids)
+            and not any(
+                row["prior_attempt_uuid"] == prior_uuid and not attempt_proven_pre_paste(row)
+                for row in history
+            )
+        )
     if kind == "tagged_replay":
         exact = [row for row in history if row["members"] == candidate_ids]
         prior = next((row for row in exact if row["attempt_uuid"] == prior_uuid), None)
@@ -2521,8 +2793,7 @@ def _admission_valid(
             and prior["reason"] == "confirmation_timeout"
             and ambiguous_count < 3
             and not any(
-                row["prior_attempt_uuid"] == prior_uuid
-                and not attempt_proven_pre_paste(row)
+                row["prior_attempt_uuid"] == prior_uuid and not attempt_proven_pre_paste(row)
                 for row in exact
             )
         )
@@ -2530,13 +2801,21 @@ def _admission_valid(
 
 
 def begin_delivery_attempt_if_no_other_delivering(
-    messages, receiver_terminal_id: str, provider: str, payload_hash: str,
-    payload_length: int, pre_input_gen=None, pre_status_gen=None, evidence: str = "{}",
-    prior_attempt_uuid: str | None = None, admission_proof: AdmissionProof | None = None,
+    messages,
+    receiver_terminal_id: str,
+    provider: str,
+    payload_hash: str,
+    payload_length: int,
+    pre_input_gen=None,
+    pre_status_gen=None,
+    evidence: str = "{}",
+    prior_attempt_uuid: str | None = None,
+    admission_proof: AdmissionProof | None = None,
 ) -> AttemptOpenResult:
     ids = sorted({int(message.id) for message in messages})
     proof = admission_proof or make_admission_proof(
-        "corrective" if prior_attempt_uuid else "ordinary", ids, prior_attempt_uuid)
+        "corrective" if prior_attempt_uuid else "ordinary", ids, prior_attempt_uuid
+    )
     if tuple(ids) != proof.candidate_ids:
         return AttemptOpenResult("stale_candidate")
     attempt_uuid = str(uuid.uuid4())
@@ -2547,14 +2826,16 @@ def begin_delivery_attempt_if_no_other_delivering(
             db.rollback()
             return "delivering_conflict"
         history = _attempt_history_in_db(db, ids)
-        if (_history_fingerprint(history) != proof.fingerprint or
-                not _admission_valid(proof.kind, history, proof.prior_attempt_uuid, ids)):
+        if _history_fingerprint(history) != proof.fingerprint or not _admission_valid(
+            proof.kind, history, proof.prior_attempt_uuid, ids
+        ):
             db.rollback()
             return "stale_admission"
         if proof.transcript_checks:
             from cli_agent_orchestrator.services.message_trace_service import (
                 bounded_transcript_suffix_lookup,
             )
+
             grouped: dict[tuple[tuple[str, Any], ...], list[tuple[str, object]]] = {}
             authority_by_cursor = {}
             for payload, started_at, cursor_items, authority_items in proof.transcript_checks:
@@ -2563,10 +2844,14 @@ def begin_delivery_attempt_if_no_other_delivering(
             for cursor_items, payloads in grouped.items():
                 authority = authority_by_cursor[cursor_items]
                 cursor = dict(cursor_items)
-                binding = (db.query(TranscriptBindingModel).filter_by(
-                    terminal_id=receiver_terminal_id).order_by(
-                        TranscriptBindingModel.received_at.desc(),
-                        TranscriptBindingModel.id.desc()).first())
+                binding = (
+                    db.query(TranscriptBindingModel)
+                    .filter_by(terminal_id=receiver_terminal_id)
+                    .order_by(
+                        TranscriptBindingModel.received_at.desc(), TranscriptBindingModel.id.desc()
+                    )
+                    .first()
+                )
                 if authority["binding_id"] is None and binding is None:
                     current_authority = dict(authority)
                 else:
@@ -2579,7 +2864,8 @@ def begin_delivery_attempt_if_no_other_delivering(
                     current_authority = {
                         "binding_id": binding.id if binding else None,
                         "session_id": binding.session_id if binding else None,
-                        "path": str(live_path), "inode": live_inode,
+                        "path": str(live_path),
+                        "inode": live_inode,
                         "resolution_kind": "binding" if binding else cursor["resolution_kind"],
                     }
                 if current_authority != authority:
@@ -2590,18 +2876,23 @@ def begin_delivery_attempt_if_no_other_delivering(
                     db.rollback()
                     return "stale_admission"
         mailbox_schema = _mailbox_schema_available(db)
-        candidates = db.query(InboxModel).filter(
-            InboxModel.id.in_(ids),
-            _pending_receiver_predicate(receiver_terminal_id, mailbox_schema),
-            InboxModel.status == MessageStatus.PENDING.value,
-        ).all()
+        candidates = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.id.in_(ids),
+                _pending_receiver_predicate(receiver_terminal_id, mailbox_schema),
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .all()
+        )
         if sorted(row.id for row in candidates) != ids:
             db.rollback()
             return "stale_candidate"
         attempt_evidence = _evidence_object(evidence)
         logical_ids = (
             {row.logical_receiver_id for row in candidates if row.logical_receiver_id}
-            if _mailbox_schema_available(db) else set()
+            if _mailbox_schema_available(db)
+            else set()
         )
         if logical_ids:
             if len(logical_ids) != 1:
@@ -2612,37 +2903,54 @@ def begin_delivery_attempt_if_no_other_delivering(
                 db.rollback()
                 return "stale_candidate"
             attempt_evidence["mailbox_authority"] = {
-                "mailbox_id": mailbox.id, "generation": mailbox.generation,
+                "mailbox_id": mailbox.id,
+                "generation": mailbox.generation,
                 "current_terminal_id": mailbox.current_terminal_id,
             }
-        changed = db.query(InboxModel).filter(
-            InboxModel.id.in_(ids),
-            _pending_receiver_predicate(receiver_terminal_id, mailbox_schema),
-            InboxModel.status == MessageStatus.PENDING.value,
-        ).update({InboxModel.status: MessageStatus.DELIVERING.value}, synchronize_session=False)
+        changed = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.id.in_(ids),
+                _pending_receiver_predicate(receiver_terminal_id, mailbox_schema),
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .update({InboxModel.status: MessageStatus.DELIVERING.value}, synchronize_session=False)
+        )
         if changed != len(ids):
             db.rollback()
             return "stale_candidate"
         first = sorted(messages, key=lambda item: item.id)[0]
         row = InboxDeliveryAttemptModel(
-            attempt_uuid=attempt_uuid, receiver_terminal_id=receiver_terminal_id,
-            provider=provider, payload_hash=payload_hash, payload_length=payload_length,
-            pre_input_gen=pre_input_gen, pre_status_gen=pre_status_gen,
+            attempt_uuid=attempt_uuid,
+            receiver_terminal_id=receiver_terminal_id,
+            provider=provider,
+            payload_hash=payload_hash,
+            payload_length=payload_length,
+            pre_input_gen=pre_input_gen,
+            pre_status_gen=pre_status_gen,
             prior_attempt_uuid=prior_attempt_uuid,
-            sender_id=first.sender_id, orchestration_type=first.orchestration_type.value,
+            sender_id=first.sender_id,
+            orchestration_type=first.orchestration_type.value,
             evidence=_canonical_json(attempt_evidence)[:2048],
         )
         db.add(row)
         for position, message_id in enumerate(ids):
-            db.add(InboxDeliveryAttemptMemberModel(
-                attempt_uuid=attempt_uuid, message_id=message_id, position=position))
+            db.add(
+                InboxDeliveryAttemptMemberModel(
+                    attempt_uuid=attempt_uuid, message_id=message_id, position=position
+                )
+            )
         db.flush()
         terminal_open = _delivering_authority_in_db(db, receiver_terminal_id)
         if {row["attempt_uuid"] for row in terminal_open} != {attempt_uuid}:
             db.rollback()
             return "delivering_conflict"
-        self_members = sorted(x.message_id for x in db.query(InboxDeliveryAttemptMemberModel)
-                              .filter_by(attempt_uuid=attempt_uuid).all())
+        self_members = sorted(
+            x.message_id
+            for x in db.query(InboxDeliveryAttemptMemberModel)
+            .filter_by(attempt_uuid=attempt_uuid)
+            .all()
+        )
         if self_members != ids:
             db.rollback()
             return "stale_candidate"
@@ -2682,14 +2990,21 @@ def _has_valid_redelivery_tag(value: str | None, prior_attempt_uuid: str | None)
 def _valid_cursor(value: Any, *, versioned: bool = True) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
-    if versioned and (type(value.get("cursor_version")) is not int or
-                      value.get("cursor_version") != WPM2_CURSOR_VERSION):
+    if versioned and (
+        type(value.get("cursor_version")) is not int
+        or value.get("cursor_version") != WPM2_CURSOR_VERSION
+    ):
         return None
     required = ("path", "inode", "size", "resolution_kind")
-    if (not all(key in value for key in required) or not isinstance(value["path"], str)
-            or not value["path"] or type(value["size"]) is not int or value["size"] < 0
-            or not isinstance(value["resolution_kind"], str)
-            or (value["inode"] is not None and type(value["inode"]) is not int)):
+    if (
+        not all(key in value for key in required)
+        or not isinstance(value["path"], str)
+        or not value["path"]
+        or type(value["size"]) is not int
+        or value["size"] < 0
+        or not isinstance(value["resolution_kind"], str)
+        or (value["inode"] is not None and type(value["inode"]) is not int)
+    ):
         return None
     return {key: value[key] for key in required} | ({"cursor_version": 1} if versioned else {})
 
@@ -2707,9 +3022,17 @@ def _initialize_wpm2_cursor(evidence: dict[str, Any]) -> dict[str, Any]:
     return evidence
 
 
-def begin_delivery_attempt(messages, receiver_terminal_id: str, provider: str, payload_hash: str,
-                           payload_length: int, pre_input_gen=None, pre_status_gen=None,
-                           evidence: str = "{}", prior_attempt_uuid: str | None = None) -> str:
+def begin_delivery_attempt(
+    messages,
+    receiver_terminal_id: str,
+    provider: str,
+    payload_hash: str,
+    payload_length: int,
+    pre_input_gen=None,
+    pre_status_gen=None,
+    evidence: str = "{}",
+    prior_attempt_uuid: str | None = None,
+) -> str:
     attempt_uuid = str(uuid.uuid4())
     with SessionLocal.begin() as db:
         attempt_evidence = _evidence_object(evidence)
@@ -2722,29 +3045,44 @@ def begin_delivery_attempt(messages, receiver_terminal_id: str, provider: str, p
             if mailbox is None or mailbox.current_terminal_id != receiver_terminal_id:
                 raise ValueError("logical delivery incarnation changed")
             attempt_evidence["mailbox_authority"] = {
-                "mailbox_id": mailbox.id, "generation": mailbox.generation,
+                "mailbox_id": mailbox.id,
+                "generation": mailbox.generation,
                 "current_terminal_id": mailbox.current_terminal_id,
             }
         if prior_attempt_uuid is not None:
-            prior = db.query(InboxDeliveryAttemptModel).filter_by(
-                attempt_uuid=prior_attempt_uuid).one_or_none()
+            prior = (
+                db.query(InboxDeliveryAttemptModel)
+                .filter_by(attempt_uuid=prior_attempt_uuid)
+                .one_or_none()
+            )
             prior_members = {
                 member.message_id
-                for member in db.query(InboxDeliveryAttemptMemberModel).filter_by(
-                    attempt_uuid=prior_attempt_uuid).all()
+                for member in db.query(InboxDeliveryAttemptMemberModel)
+                .filter_by(attempt_uuid=prior_attempt_uuid)
+                .all()
             }
             if prior is None or prior_members != {message.id for message in messages}:
                 raise ValueError("WPM1 successor prior attempt does not match exact batch")
         else:
-            prior = (db.query(InboxDeliveryAttemptModel).join(
-                     InboxDeliveryAttemptMemberModel,
-                     InboxDeliveryAttemptMemberModel.attempt_uuid == InboxDeliveryAttemptModel.attempt_uuid)
-                     .filter(InboxDeliveryAttemptMemberModel.message_id == messages[0].id)
-                     .order_by(InboxDeliveryAttemptModel.started_at.desc()).first())
+            prior = (
+                db.query(InboxDeliveryAttemptModel)
+                .join(
+                    InboxDeliveryAttemptMemberModel,
+                    InboxDeliveryAttemptMemberModel.attempt_uuid
+                    == InboxDeliveryAttemptModel.attempt_uuid,
+                )
+                .filter(InboxDeliveryAttemptMemberModel.message_id == messages[0].id)
+                .order_by(InboxDeliveryAttemptModel.started_at.desc())
+                .first()
+            )
         row = InboxDeliveryAttemptModel(
-            attempt_uuid=attempt_uuid, receiver_terminal_id=receiver_terminal_id,
-            provider=provider, payload_hash=payload_hash, payload_length=payload_length,
-            pre_input_gen=pre_input_gen, pre_status_gen=pre_status_gen,
+            attempt_uuid=attempt_uuid,
+            receiver_terminal_id=receiver_terminal_id,
+            provider=provider,
+            payload_hash=payload_hash,
+            payload_length=payload_length,
+            pre_input_gen=pre_input_gen,
+            pre_status_gen=pre_status_gen,
             prior_attempt_uuid=prior.attempt_uuid if prior else None,
             sender_id=messages[0].sender_id,
             orchestration_type=messages[0].orchestration_type.value,
@@ -2754,34 +3092,54 @@ def begin_delivery_attempt(messages, receiver_terminal_id: str, provider: str, p
         for position, message in enumerate(messages):
             current = db.query(InboxModel).filter_by(id=message.id).one()
             current.status = MessageStatus.DELIVERING.value
-            db.add(InboxDeliveryAttemptMemberModel(attempt_uuid=attempt_uuid,
-                                                   message_id=message.id, position=position))
+            db.add(
+                InboxDeliveryAttemptMemberModel(
+                    attempt_uuid=attempt_uuid, message_id=message.id, position=position
+                )
+            )
     return attempt_uuid
 
 
-def settle_delivery_attempt(attempt_uuid: str, status: MessageStatus, outcome: str,
-                            reason: str | None = None, error: str | None = None,
-                            evidence: str = "{}", settled_status_gen=None,
-                            on_confirmed: Callable[[], None] | None = None) -> bool:
+def settle_delivery_attempt(
+    attempt_uuid: str,
+    status: MessageStatus,
+    outcome: str,
+    reason: str | None = None,
+    error: str | None = None,
+    evidence: str = "{}",
+    settled_status_gen=None,
+    on_confirmed: Callable[[], None] | None = None,
+) -> bool:
     with SessionLocal.begin() as db:
         row = db.query(InboxDeliveryAttemptModel).filter_by(attempt_uuid=attempt_uuid).one()
         if row.settled_at is not None:
             return False
         if outcome == "deferred":
-            existing = (db.query(InboxDeliveryAttemptModel).filter(
-                InboxDeliveryAttemptModel.attempt_uuid != attempt_uuid,
-                InboxDeliveryAttemptModel.receiver_terminal_id == row.receiver_terminal_id,
-                InboxDeliveryAttemptModel.payload_hash == row.payload_hash,
-                InboxDeliveryAttemptModel.reason == reason,
-                InboxDeliveryAttemptModel.outcome == "deferred",
-            ).first())
+            existing = (
+                db.query(InboxDeliveryAttemptModel)
+                .filter(
+                    InboxDeliveryAttemptModel.attempt_uuid != attempt_uuid,
+                    InboxDeliveryAttemptModel.receiver_terminal_id == row.receiver_terminal_id,
+                    InboxDeliveryAttemptModel.payload_hash == row.payload_hash,
+                    InboxDeliveryAttemptModel.reason == reason,
+                    InboxDeliveryAttemptModel.outcome == "deferred",
+                )
+                .first()
+            )
             if existing is not None:
                 existing.count += 1
                 existing.last_at = _utcnow()
-                members = db.query(InboxDeliveryAttemptMemberModel).filter_by(
-                    attempt_uuid=attempt_uuid).all()
-                existing_ids = {x.message_id for x in db.query(InboxDeliveryAttemptMemberModel)
-                                .filter_by(attempt_uuid=existing.attempt_uuid).all()}
+                members = (
+                    db.query(InboxDeliveryAttemptMemberModel)
+                    .filter_by(attempt_uuid=attempt_uuid)
+                    .all()
+                )
+                existing_ids = {
+                    x.message_id
+                    for x in db.query(InboxDeliveryAttemptMemberModel)
+                    .filter_by(attempt_uuid=existing.attempt_uuid)
+                    .all()
+                }
                 for member in members:
                     if member.message_id not in existing_ids:
                         member.attempt_uuid = existing.attempt_uuid
@@ -2790,24 +3148,31 @@ def settle_delivery_attempt(attempt_uuid: str, status: MessageStatus, outcome: s
                 db.delete(row)
                 ids = [m.message_id for m in members]
                 db.query(InboxModel).filter(InboxModel.id.in_(ids)).update(
-                    {InboxModel.status: status.value}, synchronize_session=False)
+                    {InboxModel.status: status.value}, synchronize_session=False
+                )
                 return True
         row.outcome, row.reason, row.error = outcome, reason, error
         evidence_value = evidence
         if row.provider == "claude_code" and outcome not in {"confirmed", "failed"}:
             evidence_value = _canonical_json(_initialize_wpm2_cursor(_evidence_object(evidence)))
         preserve_evidence = (
-            outcome == "ambiguous" and reason == "confirmation_timeout"
+            outcome == "ambiguous"
+            and reason == "confirmation_timeout"
             and _is_wpm1_evidence(evidence_value)
         ) or _has_valid_redelivery_tag(evidence_value, row.prior_attempt_uuid)
         row.evidence = (
             _canonical_json(_evidence_object(evidence_value))
-            if preserve_evidence else evidence_value[:2048]
+            if preserve_evidence
+            else evidence_value[:2048]
         )
         row.settled_at = row.last_at = _utcnow()
         row.settled_status_gen = settled_status_gen
-        ids = [x.message_id for x in db.query(InboxDeliveryAttemptMemberModel)
-               .filter_by(attempt_uuid=attempt_uuid).all()]
+        ids = [
+            x.message_id
+            for x in db.query(InboxDeliveryAttemptMemberModel)
+            .filter_by(attempt_uuid=attempt_uuid)
+            .all()
+        ]
         query = db.query(InboxModel).filter(InboxModel.id.in_(ids))
         if status == MessageStatus.DELIVERED:
             query = query.filter(InboxModel.status == MessageStatus.DELIVERING.value)
@@ -2822,9 +3187,11 @@ def settle_delivery_attempt(attempt_uuid: str, status: MessageStatus, outcome: s
 def get_attempt_mailbox_authority(attempt_uuid: str) -> dict[str, Any] | None:
     """Return the immutable logical authority captured by an attempt opener."""
     with SessionLocal() as db:
-        row = db.query(InboxDeliveryAttemptModel.evidence).filter_by(
-            attempt_uuid=attempt_uuid
-        ).one_or_none()
+        row = (
+            db.query(InboxDeliveryAttemptModel.evidence)
+            .filter_by(attempt_uuid=attempt_uuid)
+            .one_or_none()
+        )
         if row is None:
             return None
         authority = _evidence_object(row[0]).get("mailbox_authority")
@@ -2847,20 +3214,32 @@ def get_current_mailbox_terminal(mailbox_id: str) -> str | None:
 
 
 def settle_delivery_attempt_proof_safe(
-    attempt_uuid: str, evidence: dict[str, Any], settled_status_gen=None,
+    attempt_uuid: str,
+    evidence: dict[str, Any],
+    settled_status_gen=None,
 ) -> str:
     """Compensating post-submit settlement; never leaks into generic failure."""
+
     def operation(db) -> str:
-        row = db.query(InboxDeliveryAttemptModel).filter_by(
-            attempt_uuid=attempt_uuid, settled_at=None).one_or_none()
+        row = (
+            db.query(InboxDeliveryAttemptModel)
+            .filter_by(attempt_uuid=attempt_uuid, settled_at=None)
+            .one_or_none()
+        )
         if row is None:
             return "stale"
-        members = db.query(InboxDeliveryAttemptMemberModel).filter_by(
-            attempt_uuid=attempt_uuid).all()
+        members = (
+            db.query(InboxDeliveryAttemptMemberModel).filter_by(attempt_uuid=attempt_uuid).all()
+        )
         ids = [member.message_id for member in members]
-        delivering = db.query(InboxModel).filter(
-            InboxModel.id.in_(ids), InboxModel.status == MessageStatus.DELIVERING.value,
-        ).count()
+        delivering = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.id.in_(ids),
+                InboxModel.status == MessageStatus.DELIVERING.value,
+            )
+            .count()
+        )
         if delivering != len(ids):
             return "stale"
         row.outcome = "ambiguous"
@@ -2871,12 +3250,18 @@ def settle_delivery_attempt_proof_safe(
         row.evidence = _canonical_json(safe_evidence)
         row.settled_at = row.last_at = _utcnow()
         row.settled_status_gen = settled_status_gen
-        changed = db.query(InboxModel).filter(
-            InboxModel.id.in_(ids), InboxModel.status == MessageStatus.DELIVERING.value,
-        ).update({InboxModel.status: MessageStatus.PENDING.value}, synchronize_session=False)
+        changed = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.id.in_(ids),
+                InboxModel.status == MessageStatus.DELIVERING.value,
+            )
+            .update({InboxModel.status: MessageStatus.PENDING.value}, synchronize_session=False)
+        )
         if changed != len(ids):
             raise RuntimeError("proof-safe settlement compare-and-set lost")
         return "settled"
+
     try:
         result = _run_wpm1_immediate(operation)
     except Exception:
@@ -2886,23 +3271,31 @@ def settle_delivery_attempt_proof_safe(
 
 
 def confirm_batch_from_prior_attempt(
-    message_ids: list[int], prior_attempt_uuid: str,
+    message_ids: list[int],
+    prior_attempt_uuid: str,
     on_confirmed: Callable[[], None] | None = None,
 ) -> bool:
     """Atomically confirm a pending batch by an existing authoritative attempt."""
     with SessionLocal.begin() as db:
         referenced_ids = {
-            row.message_id for row in db.query(InboxDeliveryAttemptMemberModel).filter(
+            row.message_id
+            for row in db.query(InboxDeliveryAttemptMemberModel)
+            .filter(
                 InboxDeliveryAttemptMemberModel.attempt_uuid == prior_attempt_uuid,
                 InboxDeliveryAttemptMemberModel.message_id.in_(message_ids),
-            ).all()
+            )
+            .all()
         }
         if referenced_ids != set(message_ids):
             return False
-        changed = db.query(InboxModel).filter(
-            InboxModel.id.in_(message_ids),
-            InboxModel.status == MessageStatus.PENDING.value,
-        ).update({InboxModel.status: MessageStatus.DELIVERED.value}, synchronize_session=False)
+        changed = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.id.in_(message_ids),
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .update({InboxModel.status: MessageStatus.DELIVERED.value}, synchronize_session=False)
+        )
         if changed != len(message_ids):
             return False
         if on_confirmed is not None:
@@ -2915,50 +3308,83 @@ def get_message_trace(message_id: int) -> Optional[Dict[str, Any]]:
         msg = db.query(InboxModel).filter_by(id=message_id).first()
         if not msg:
             return None
-        rows = (db.query(InboxDeliveryAttemptModel, InboxDeliveryAttemptMemberModel.position)
-                .join(InboxDeliveryAttemptMemberModel,
-                      InboxDeliveryAttemptMemberModel.attempt_uuid == InboxDeliveryAttemptModel.attempt_uuid)
-                .filter(InboxDeliveryAttemptMemberModel.message_id == message_id)
-                .order_by(InboxDeliveryAttemptModel.started_at).all())
+        rows = (
+            db.query(InboxDeliveryAttemptModel, InboxDeliveryAttemptMemberModel.position)
+            .join(
+                InboxDeliveryAttemptMemberModel,
+                InboxDeliveryAttemptMemberModel.attempt_uuid
+                == InboxDeliveryAttemptModel.attempt_uuid,
+            )
+            .filter(InboxDeliveryAttemptMemberModel.message_id == message_id)
+            .order_by(InboxDeliveryAttemptModel.started_at)
+            .all()
+        )
         attempts = []
         for row, position in rows:
             item = {c.name: getattr(row, c.name) for c in row.__table__.columns}
             for key in ("started_at", "settled_at", "last_at"):
                 item[key] = item[key].isoformat() if item[key] else None
             item["position"] = position
-            try: item["evidence"] = __import__("json").loads(item["evidence"])
-            except Exception: item["evidence"] = {}
+            try:
+                item["evidence"] = __import__("json").loads(item["evidence"])
+            except Exception:
+                item["evidence"] = {}
             attempts.append(item)
-        return {"message": {"id": msg.id, "sender_id": msg.sender_id,
-                            "receiver_id": msg.receiver_id, "status": msg.status,
-                            "failure_reason": msg.failure_reason,
-                            "created_at": msg.created_at.isoformat()}, "attempts": attempts}
+        return {
+            "message": {
+                "id": msg.id,
+                "sender_id": msg.sender_id,
+                "receiver_id": msg.receiver_id,
+                "status": msg.status,
+                "failure_reason": msg.failure_reason,
+                "created_at": msg.created_at.isoformat(),
+            },
+            "attempts": attempts,
+        }
 
 
 def count_ambiguous_attempts(message_ids: list[int]) -> int:
     with SessionLocal() as db:
-        return (db.query(InboxDeliveryAttemptModel).join(
+        return (
+            db.query(InboxDeliveryAttemptModel)
+            .join(
                 InboxDeliveryAttemptMemberModel,
-                InboxDeliveryAttemptMemberModel.attempt_uuid == InboxDeliveryAttemptModel.attempt_uuid)
-                .filter(InboxDeliveryAttemptMemberModel.message_id.in_(message_ids),
-                        InboxDeliveryAttemptModel.outcome == "ambiguous").distinct().count())
+                InboxDeliveryAttemptMemberModel.attempt_uuid
+                == InboxDeliveryAttemptModel.attempt_uuid,
+            )
+            .filter(
+                InboxDeliveryAttemptMemberModel.message_id.in_(message_ids),
+                InboxDeliveryAttemptModel.outcome == "ambiguous",
+            )
+            .distinct()
+            .count()
+        )
 
 
 def list_message_attempts(message_ids: list[int]) -> List[Dict[str, Any]]:
     with SessionLocal() as db:
-        rows = (db.query(InboxDeliveryAttemptModel).join(
+        rows = (
+            db.query(InboxDeliveryAttemptModel)
+            .join(
                 InboxDeliveryAttemptMemberModel,
-                InboxDeliveryAttemptMemberModel.attempt_uuid == InboxDeliveryAttemptModel.attempt_uuid)
-                .filter(InboxDeliveryAttemptMemberModel.message_id.in_(message_ids))
-                .order_by(InboxDeliveryAttemptModel.started_at).all())
+                InboxDeliveryAttemptMemberModel.attempt_uuid
+                == InboxDeliveryAttemptModel.attempt_uuid,
+            )
+            .filter(InboxDeliveryAttemptMemberModel.message_id.in_(message_ids))
+            .order_by(InboxDeliveryAttemptModel.started_at)
+            .all()
+        )
         return [{c.name: getattr(row, c.name) for c in row.__table__.columns} for row in rows]
 
 
 def list_attempt_member_ids(attempt_uuid: str) -> list[int]:
     with SessionLocal() as db:
-        rows = (db.query(InboxDeliveryAttemptMemberModel)
-                .filter_by(attempt_uuid=attempt_uuid)
-                .order_by(InboxDeliveryAttemptMemberModel.position).all())
+        rows = (
+            db.query(InboxDeliveryAttemptMemberModel)
+            .filter_by(attempt_uuid=attempt_uuid)
+            .order_by(InboxDeliveryAttemptMemberModel.position)
+            .all()
+        )
         return [row.message_id for row in rows]
 
 
@@ -3004,12 +3430,18 @@ def _p5_batch_key(message_ids: list[int]) -> str:
 
 def adopt_mailbox_rows_at_startup() -> int:
     """Tag legacy PENDING rows addressed to a known mailbox incarnation."""
+
     def operation(db: Any) -> int:
         if not _mailbox_schema_available(db):
             return 0
-        rows = (db.query(InboxModel)
-                .filter(InboxModel.status == MessageStatus.PENDING.value,
-                        InboxModel.logical_receiver_id.is_(None)).all())
+        rows = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.logical_receiver_id.is_(None),
+            )
+            .all()
+        )
         changed = 0
         for row in rows:
             mailbox_id = _mailbox_id_for_terminal(db, row.receiver_id)
@@ -3017,6 +3449,7 @@ def adopt_mailbox_rows_at_startup() -> int:
                 row.logical_receiver_id = mailbox_id
                 changed += 1
         return changed
+
     result = _run_wpm1_immediate(operation)
     if result == "busy_aborted":
         raise RuntimeError("mailbox_startup_adoption_busy")
@@ -3025,9 +3458,7 @@ def adopt_mailbox_rows_at_startup() -> int:
 
 def _p5_orphan_predicate():
     logical_exists = exists().where(MailboxModel.id == InboxModel.logical_receiver_id)
-    address_exists = exists().where(
-        MailboxIncarnationModel.terminal_id == InboxModel.receiver_id
-    )
+    address_exists = exists().where(MailboxIncarnationModel.terminal_id == InboxModel.receiver_id)
     terminal_exists = exists().where(TerminalModel.id == InboxModel.receiver_id)
     return or_(
         and_(InboxModel.logical_receiver_id.is_not(None), ~logical_exists),
@@ -3049,28 +3480,38 @@ def _record_p5_orphan_notices(db: Any, rows: list[InboxModel]) -> tuple[int, int
             logged_only_count += 1
             logger.warning(
                 "P5 orphan settlement has no live sender %s for receiver %s batch %s",
-                sender_id, receiver_id, ids,
+                sender_id,
+                receiver_id,
+                ids,
             )
             continue
         header = f"p5-orphan receiver={receiver_id} batch={_p5_batch_key(ids)}\n"
         notice_sender = f"message-trace:{receiver_id}"
         notice_receiver, logical_receiver_id = resolve_inbox_receiver(db, sender_id)
-        existing = db.query(InboxModel).filter(
-            InboxModel.sender_id == notice_sender,
-            InboxModel.receiver_id == notice_receiver,
-            text("substr(message, 1, :n) = :header").bindparams(
-                n=len(header), header=header),
-        ).first()
+        existing = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.sender_id == notice_sender,
+                InboxModel.receiver_id == notice_receiver,
+                text("substr(message, 1, :n) = :header").bindparams(n=len(header), header=header),
+            )
+            .first()
+        )
         if existing is None:
-            db.add(InboxModel(
-                sender_id=notice_sender, receiver_id=notice_receiver,
-                logical_receiver_id=logical_receiver_id,
-                message=(header +
-                         f"[message-trace] delivery to terminal {receiver_id} failed because "
-                         f"the receiver terminal no longer exists for message(s) {ids}."),
-                orchestration_type=OrchestrationType.SEND_MESSAGE.value,
-                status=MessageStatus.PENDING.value,
-            ))
+            db.add(
+                InboxModel(
+                    sender_id=notice_sender,
+                    receiver_id=notice_receiver,
+                    logical_receiver_id=logical_receiver_id,
+                    message=(
+                        header
+                        + f"[message-trace] delivery to terminal {receiver_id} failed because "
+                        f"the receiver terminal no longer exists for message(s) {ids}."
+                    ),
+                    orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+                    status=MessageStatus.PENDING.value,
+                )
+            )
             notification_count += 1
     return notification_count, logged_only_count
 
@@ -3083,37 +3524,52 @@ def settle_pending_orphan_messages(
         raise ValueError("orphan reconcile limit must be positive")
 
     def operation(db: Any) -> OrphanReconcileResult:
-        mailbox_schema = db.execute(text(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='mailboxes'"
-        )).first() is not None
+        mailbox_schema = (
+            db.execute(
+                text("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mailboxes'")
+            ).first()
+            is not None
+        )
         if not mailbox_schema:
             # Unit seams may exercise the reconciler against a deliberately
             # pre-init legacy schema; production startup installs D5 first.
             return OrphanReconcileResult()
-        orphan_predicate = (
-            _p5_orphan_predicate()
-        )
-        candidates = (db.query(InboxModel).filter(
-            InboxModel.status == MessageStatus.PENDING.value,
-            orphan_predicate,
-        ).order_by(InboxModel.created_at.asc(), InboxModel.id.asc()).limit(limit).all())
-        settled: list[InboxModel] = []
-        for candidate in candidates:
-            changed = (db.query(InboxModel).filter(
-                InboxModel.id == candidate.id,
+        orphan_predicate = _p5_orphan_predicate()
+        candidates = (
+            db.query(InboxModel)
+            .filter(
                 InboxModel.status == MessageStatus.PENDING.value,
                 orphan_predicate,
-            ).update({
-                InboxModel.status: MessageStatus.DELIVERY_FAILED.value,
-                InboxModel.failure_reason: (
-                    "mailbox_deleted" if candidate.logical_receiver_id else "receiver_gone"
-                ),
-            }, synchronize_session=False))
+            )
+            .order_by(InboxModel.created_at.asc(), InboxModel.id.asc())
+            .limit(limit)
+            .all()
+        )
+        settled: list[InboxModel] = []
+        for candidate in candidates:
+            changed = (
+                db.query(InboxModel)
+                .filter(
+                    InboxModel.id == candidate.id,
+                    InboxModel.status == MessageStatus.PENDING.value,
+                    orphan_predicate,
+                )
+                .update(
+                    {
+                        InboxModel.status: MessageStatus.DELIVERY_FAILED.value,
+                        InboxModel.failure_reason: (
+                            "mailbox_deleted" if candidate.logical_receiver_id else "receiver_gone"
+                        ),
+                    },
+                    synchronize_session=False,
+                )
+            )
             if changed == 1:
                 settled.append(candidate)
         notification_count, logged_only_count = _record_p5_orphan_notices(db, settled)
         return OrphanReconcileResult(
-            settled_count=len(settled), notification_count=notification_count,
+            settled_count=len(settled),
+            notification_count=notification_count,
             logged_only_count=logged_only_count,
         )
 
@@ -3124,7 +3580,9 @@ def settle_pending_orphan_messages(
 
 
 def advance_wpm2_continuity_cursor(
-    attempt_uuid: str, exact_message_ids: list[int], expected_ref: dict[str, Any],
+    attempt_uuid: str,
+    exact_message_ids: list[int],
+    expected_ref: dict[str, Any],
     observed_ref: dict[str, Any],
 ) -> str:
     expected = _valid_cursor(expected_ref) or _valid_cursor(expected_ref, versioned=False)
@@ -3132,29 +3590,42 @@ def advance_wpm2_continuity_cursor(
     if expected is None or observed is None:
         return "stale"
     identity = ("path", "inode", "resolution_kind")
-    if (any(expected[key] != observed[key] for key in identity) or
-            observed["size"] < expected["size"]):
+    if (
+        any(expected[key] != observed[key] for key in identity)
+        or observed["size"] < expected["size"]
+    ):
         return "stale"
     ids = sorted(set(exact_message_ids))
 
     def operation(db) -> str:
-        row = db.query(InboxDeliveryAttemptModel).filter_by(
-            attempt_uuid=attempt_uuid).one_or_none()
-        if row is None or row.settled_at is None or row.outcome not in {
-            "ambiguous", "interrupted", "deferred"}:
+        row = db.query(InboxDeliveryAttemptModel).filter_by(attempt_uuid=attempt_uuid).one_or_none()
+        if (
+            row is None
+            or row.settled_at is None
+            or row.outcome not in {"ambiguous", "interrupted", "deferred"}
+        ):
             return "stale"
         if row.outcome == "deferred" and row.reason not in {"delivery_deferred", "input_blocked"}:
             return "stale"
-        members = sorted(x.message_id for x in db.query(InboxDeliveryAttemptMemberModel)
-                         .filter_by(attempt_uuid=attempt_uuid).all())
-        pending = db.query(InboxModel).filter(
-            InboxModel.id.in_(ids), InboxModel.status == MessageStatus.PENDING.value).count()
+        members = sorted(
+            x.message_id
+            for x in db.query(InboxDeliveryAttemptMemberModel)
+            .filter_by(attempt_uuid=attempt_uuid)
+            .all()
+        )
+        pending = (
+            db.query(InboxModel)
+            .filter(InboxModel.id.in_(ids), InboxModel.status == MessageStatus.PENDING.value)
+            .count()
+        )
         if members != ids or pending != len(ids):
             return "stale"
         evidence = _evidence_object(row.evidence)
         stored_raw = evidence.get("last_observed_ref")
         stored = _valid_cursor(stored_raw)
-        upgrade = stored is None and isinstance(stored_raw, dict) and "cursor_version" not in stored_raw
+        upgrade = (
+            stored is None and isinstance(stored_raw, dict) and "cursor_version" not in stored_raw
+        )
         if stored is not None:
             if any(stored[key] != expected[key] for key in identity):
                 return "stale"
@@ -3166,7 +3637,8 @@ def advance_wpm2_continuity_cursor(
         elif not upgrade and stored_raw is not None:
             return "stale"
         evidence["last_observed_ref"] = {
-            **{key: observed[key] for key in identity}, "size": observed["size"],
+            **{key: observed[key] for key in identity},
+            "size": observed["size"],
             "cursor_version": WPM2_CURSOR_VERSION,
         }
         row.evidence = _canonical_json(evidence)
@@ -3185,18 +3657,30 @@ def merge_wpm1_attempt_evidence(
         raise ValueError("boundary exhaustion requires atomic snapshot")
 
     def operation(db) -> str:
-        row = db.query(InboxDeliveryAttemptModel).filter_by(
-            attempt_uuid=attempt_uuid, outcome="ambiguous", reason="confirmation_timeout"
-        ).first()
+        row = (
+            db.query(InboxDeliveryAttemptModel)
+            .filter_by(
+                attempt_uuid=attempt_uuid, outcome="ambiguous", reason="confirmation_timeout"
+            )
+            .first()
+        )
         if row is None:
             return "stale"
-        members = [x.message_id for x in db.query(InboxDeliveryAttemptMemberModel).filter_by(
-            attempt_uuid=attempt_uuid).all()]
+        members = [
+            x.message_id
+            for x in db.query(InboxDeliveryAttemptMemberModel)
+            .filter_by(attempt_uuid=attempt_uuid)
+            .all()
+        ]
         if set(members) != set(message_ids):
             return "stale"
-        pending = db.query(InboxModel).filter(
-            InboxModel.id.in_(message_ids), InboxModel.status == MessageStatus.PENDING.value
-        ).count()
+        pending = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.id.in_(message_ids), InboxModel.status == MessageStatus.PENDING.value
+            )
+            .count()
+        )
         if pending != len(message_ids):
             return "stale"
         evidence = _evidence_object(row.evidence)
@@ -3227,7 +3711,9 @@ def _resolve_wpm1_recipient(db, sender_id: str, receiver_terminal_id: str) -> st
 
 
 def record_wpm1_stalled_notice(
-    attempt_uuid: str, message_ids: list[int], receiver_terminal_id: str,
+    attempt_uuid: str,
+    message_ids: list[int],
+    receiver_terminal_id: str,
     notified_at: str,
 ) -> str:
     """Atomically mark a stalled batch and enqueue its exactly-once notice."""
@@ -3235,16 +3721,27 @@ def record_wpm1_stalled_notice(
     header = f"wpm1-notice kind=stalled batch={_wpm1_batch_key(ids)}\n"
 
     def operation(db) -> str:
-        row = db.query(InboxDeliveryAttemptModel).filter_by(
-            attempt_uuid=attempt_uuid, outcome="ambiguous", reason="confirmation_timeout"
-        ).first()
+        row = (
+            db.query(InboxDeliveryAttemptModel)
+            .filter_by(
+                attempt_uuid=attempt_uuid, outcome="ambiguous", reason="confirmation_timeout"
+            )
+            .first()
+        )
         if row is None:
             db.rollback()
             return "stale"
-        members = {x.message_id for x in db.query(InboxDeliveryAttemptMemberModel).filter_by(
-            attempt_uuid=attempt_uuid).all()}
-        pending = db.query(InboxModel).filter(
-            InboxModel.id.in_(ids), InboxModel.status == MessageStatus.PENDING.value).count()
+        members = {
+            x.message_id
+            for x in db.query(InboxDeliveryAttemptMemberModel)
+            .filter_by(attempt_uuid=attempt_uuid)
+            .all()
+        }
+        pending = (
+            db.query(InboxModel)
+            .filter(InboxModel.id.in_(ids), InboxModel.status == MessageStatus.PENDING.value)
+            .count()
+        )
         if members != set(ids) or pending != len(ids):
             db.rollback()
             return "stale"
@@ -3259,28 +3756,41 @@ def record_wpm1_stalled_notice(
             logger.warning("WPM1 stalled notice has no live recipient for batch %s", ids)
             return "logged_only"
         sender = f"message-trace:{receiver_terminal_id}"
-        existing = db.query(InboxModel).filter(
-            InboxModel.sender_id == sender, InboxModel.receiver_id == recipient,
-            text("substr(message, 1, :n) = :header").bindparams(n=len(header), header=header),
-        ).first()
+        existing = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.sender_id == sender,
+                InboxModel.receiver_id == recipient,
+                text("substr(message, 1, :n) = :header").bindparams(n=len(header), header=header),
+            )
+            .first()
+        )
         if existing is None:
             notice_receiver, logical_receiver_id = resolve_inbox_receiver(db, recipient)
-            db.add(InboxModel(
-                sender_id=sender, receiver_id=notice_receiver,
-                logical_receiver_id=logical_receiver_id,
-                message=header + "delivery stalled: receiver shows no progress / payload not yet "
-                "confirmed; no reinjection will occur while unproven; will confirm if consumed",
-                orchestration_type=OrchestrationType.SEND_MESSAGE.value,
-                status=MessageStatus.PENDING.value,
-            ))
+            db.add(
+                InboxModel(
+                    sender_id=sender,
+                    receiver_id=notice_receiver,
+                    logical_receiver_id=logical_receiver_id,
+                    message=header
+                    + "delivery stalled: receiver shows no progress / payload not yet "
+                    "confirmed; no reinjection will occur while unproven; will confirm if consumed",
+                    orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+                    status=MessageStatus.PENDING.value,
+                )
+            )
         return "recorded"
 
     return _run_wpm1_immediate(operation)
 
 
 def settle_wpm1_terminal_batch(
-    message_ids: list[int], status: MessageStatus, receiver_terminal_id: str,
-    *, reason: str | None = None, on_confirmed: Callable[[], None] | None = None,
+    message_ids: list[int],
+    status: MessageStatus,
+    receiver_terminal_id: str,
+    *,
+    reason: str | None = None,
+    on_confirmed: Callable[[], None] | None = None,
     confirmation_evidence: tuple[str, dict[str, Any]] | None = None,
 ) -> str:
     """Merge the terminal clock before the exact-batch CAS, with corrective notice."""
@@ -3290,22 +3800,43 @@ def settle_wpm1_terminal_batch(
     corrective_header = f"wpm1-notice kind=corrective batch={_wpm1_batch_key(ids)}\n"
 
     def operation(db) -> str:
-        attempts = (db.query(InboxDeliveryAttemptModel)
-                    .join(InboxDeliveryAttemptMemberModel,
-                          InboxDeliveryAttemptMemberModel.attempt_uuid ==
-                          InboxDeliveryAttemptModel.attempt_uuid)
-                    .filter(InboxDeliveryAttemptMemberModel.message_id.in_(ids),
-                            InboxDeliveryAttemptModel.outcome == "ambiguous",
-                            InboxDeliveryAttemptModel.reason == "confirmation_timeout")
-                    .order_by(InboxDeliveryAttemptModel.started_at.desc()).all())
-        target = next((row for row in attempts if {
-            x.message_id for x in db.query(InboxDeliveryAttemptMemberModel).filter_by(
-                attempt_uuid=row.attempt_uuid).all()} == set(ids)), None)
+        attempts = (
+            db.query(InboxDeliveryAttemptModel)
+            .join(
+                InboxDeliveryAttemptMemberModel,
+                InboxDeliveryAttemptMemberModel.attempt_uuid
+                == InboxDeliveryAttemptModel.attempt_uuid,
+            )
+            .filter(
+                InboxDeliveryAttemptMemberModel.message_id.in_(ids),
+                InboxDeliveryAttemptModel.outcome == "ambiguous",
+                InboxDeliveryAttemptModel.reason == "confirmation_timeout",
+            )
+            .order_by(InboxDeliveryAttemptModel.started_at.desc())
+            .all()
+        )
+        target = next(
+            (
+                row
+                for row in attempts
+                if {
+                    x.message_id
+                    for x in db.query(InboxDeliveryAttemptMemberModel)
+                    .filter_by(attempt_uuid=row.attempt_uuid)
+                    .all()
+                }
+                == set(ids)
+            ),
+            None,
+        )
         if target is None:
             db.rollback()
             return "stale"
-        pending = db.query(InboxModel).filter(
-            InboxModel.id.in_(ids), InboxModel.status == MessageStatus.PENDING.value).count()
+        pending = (
+            db.query(InboxModel)
+            .filter(InboxModel.id.in_(ids), InboxModel.status == MessageStatus.PENDING.value)
+            .count()
+        )
         if pending != len(ids):
             db.rollback()
             return "stale"
@@ -3325,43 +3856,63 @@ def settle_wpm1_terminal_batch(
             hit_target.evidence = _canonical_json(hit_value)
         if reason == "receiver_gone":
             target.reason = reason
-        changed = db.query(InboxModel).filter(
-            InboxModel.id.in_(ids), InboxModel.status == MessageStatus.PENDING.value
-        ).update({InboxModel.status: status.value}, synchronize_session=False)
+        changed = (
+            db.query(InboxModel)
+            .filter(InboxModel.id.in_(ids), InboxModel.status == MessageStatus.PENDING.value)
+            .update({InboxModel.status: status.value}, synchronize_session=False)
+        )
         if changed != len(ids):
             db.rollback()
             return "stale"
         if status == MessageStatus.DELIVERED:
-            any_stalled = any(_evidence_object(row.evidence).get("stalled_notified_at")
-                              for row in attempts)
+            any_stalled = any(
+                _evidence_object(row.evidence).get("stalled_notified_at") for row in attempts
+            )
             if any_stalled:
                 sender = f"message-trace:{receiver_terminal_id}"
-                stalled = db.query(InboxModel).filter(
-                    InboxModel.sender_id == sender,
-                    text("substr(message, 1, :n) = :header").bindparams(
-                        n=len(stalled_header), header=stalled_header),
-                ).first()
-                if stalled is not None and _receiver_is_terminal_or_mailbox_address(
-                        db, stalled.receiver_id):
-                    existing = db.query(InboxModel).filter(
+                stalled = (
+                    db.query(InboxModel)
+                    .filter(
                         InboxModel.sender_id == sender,
-                        InboxModel.receiver_id == stalled.receiver_id,
                         text("substr(message, 1, :n) = :header").bindparams(
-                            n=len(corrective_header), header=corrective_header),
-                    ).first()
+                            n=len(stalled_header), header=stalled_header
+                        ),
+                    )
+                    .first()
+                )
+                if stalled is not None and _receiver_is_terminal_or_mailbox_address(
+                    db, stalled.receiver_id
+                ):
+                    existing = (
+                        db.query(InboxModel)
+                        .filter(
+                            InboxModel.sender_id == sender,
+                            InboxModel.receiver_id == stalled.receiver_id,
+                            text("substr(message, 1, :n) = :header").bindparams(
+                                n=len(corrective_header), header=corrective_header
+                            ),
+                        )
+                        .first()
+                    )
                     if existing is None:
                         notice_receiver, logical_receiver_id = resolve_inbox_receiver(
                             db, stalled.receiver_id
                         )
-                        db.add(InboxModel(
-                            sender_id=sender, receiver_id=notice_receiver,
-                            logical_receiver_id=logical_receiver_id,
-                            message=corrective_header + "previously-stalled message was delivered",
-                            orchestration_type=OrchestrationType.SEND_MESSAGE.value,
-                            status=MessageStatus.PENDING.value,
-                        ))
+                        db.add(
+                            InboxModel(
+                                sender_id=sender,
+                                receiver_id=notice_receiver,
+                                logical_receiver_id=logical_receiver_id,
+                                message=corrective_header
+                                + "previously-stalled message was delivered",
+                                orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+                                status=MessageStatus.PENDING.value,
+                            )
+                        )
                 else:
-                    logger.warning("WPM1 corrective notice recipient is no longer available for batch %s", ids)
+                    logger.warning(
+                        "WPM1 corrective notice recipient is no longer available for batch %s", ids
+                    )
             if on_confirmed is not None:
                 on_confirmed()
         return "settled"
@@ -3374,69 +3925,113 @@ def get_callback_status_since(
 ) -> MessageStatus | None:
     """Return a newer callback status that suppresses the watchdog."""
     with SessionLocal() as db:
-        row = db.query(InboxModel.status).filter(
-            InboxModel.sender_id == sender_id,
-            InboxModel.receiver_id == receiver_id,
-            InboxModel.created_at > since,
-            InboxModel.status.in_(
-                (
-                    MessageStatus.PENDING.value,
-                    MessageStatus.DELIVERING.value,
-                    MessageStatus.DELIVERED.value,
-                )
-            ),
-        ).first()
+        row = (
+            db.query(InboxModel.status)
+            .filter(
+                InboxModel.sender_id == sender_id,
+                InboxModel.receiver_id == receiver_id,
+                InboxModel.created_at > since,
+                InboxModel.status.in_(
+                    (
+                        MessageStatus.PENDING.value,
+                        MessageStatus.DELIVERING.value,
+                        MessageStatus.DELIVERED.value,
+                    )
+                ),
+            )
+            .first()
+        )
         return MessageStatus(row[0]) if row is not None else None
 
 
 def transition_pending_to_delivery_failed(message_ids: list[int]) -> bool:
     """Cap transition; True exactly once even across process restarts."""
     with SessionLocal.begin() as db:
-        changed = (db.query(InboxModel).filter(
-            InboxModel.id.in_(message_ids), InboxModel.status == MessageStatus.PENDING.value)
-            .update({InboxModel.status: MessageStatus.DELIVERY_FAILED.value},
-                    synchronize_session=False))
+        changed = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.id.in_(message_ids), InboxModel.status == MessageStatus.PENDING.value
+            )
+            .update(
+                {InboxModel.status: MessageStatus.DELIVERY_FAILED.value}, synchronize_session=False
+            )
+        )
         return changed > 0
 
 
 def list_stale_delivering_messages() -> List[InboxMessage]:
     with SessionLocal() as db:
         rows = db.query(InboxModel).filter_by(status=MessageStatus.DELIVERING.value).all()
-        return [InboxMessage(id=x.id, sender_id=x.sender_id, receiver_id=x.receiver_id,
-                message=x.message, orchestration_type=OrchestrationType(x.orchestration_type),
-                status=MessageStatus(x.status), created_at=x.created_at) for x in rows]
+        return [
+            InboxMessage(
+                id=x.id,
+                sender_id=x.sender_id,
+                receiver_id=x.receiver_id,
+                message=x.message,
+                orchestration_type=OrchestrationType(x.orchestration_type),
+                status=MessageStatus(x.status),
+                created_at=x.created_at,
+            )
+            for x in rows
+        ]
 
 
 def list_stale_open_claude_attempts(age_seconds: int) -> list[dict[str, Any]]:
     bound = _utcnow() - timedelta(seconds=age_seconds)
     with SessionLocal() as db:
-        rows = db.query(InboxDeliveryAttemptModel).filter(
-            InboxDeliveryAttemptModel.provider == "claude_code",
-            InboxDeliveryAttemptModel.settled_at.is_(None),
-            InboxDeliveryAttemptModel.started_at <= bound,
-        ).order_by(InboxDeliveryAttemptModel.started_at).all()
-        return [{c.name: getattr(row, c.name) for c in row.__table__.columns} | {
-            "message_ids": sorted(x.message_id for x in db.query(
-                InboxDeliveryAttemptMemberModel).filter_by(
-                    attempt_uuid=row.attempt_uuid).all())
-        } for row in rows]
+        rows = (
+            db.query(InboxDeliveryAttemptModel)
+            .filter(
+                InboxDeliveryAttemptModel.provider == "claude_code",
+                InboxDeliveryAttemptModel.settled_at.is_(None),
+                InboxDeliveryAttemptModel.started_at <= bound,
+            )
+            .order_by(InboxDeliveryAttemptModel.started_at)
+            .all()
+        )
+        return [
+            {c.name: getattr(row, c.name) for c in row.__table__.columns}
+            | {
+                "message_ids": sorted(
+                    x.message_id
+                    for x in db.query(InboxDeliveryAttemptMemberModel)
+                    .filter_by(attempt_uuid=row.attempt_uuid)
+                    .all()
+                )
+            }
+            for row in rows
+        ]
 
 
 def recover_wpm2_stale_attempt(
-    attempt_uuid: str, exact_message_ids: list[int], status: MessageStatus,
-    outcome: str, reason: str, evidence: dict[str, Any],
+    attempt_uuid: str,
+    exact_message_ids: list[int],
+    status: MessageStatus,
+    outcome: str,
+    reason: str,
+    evidence: dict[str, Any],
 ) -> str:
     ids = sorted(set(exact_message_ids))
 
     def operation(db) -> str:
-        row = db.query(InboxDeliveryAttemptModel).filter_by(
-            attempt_uuid=attempt_uuid, settled_at=None, provider="claude_code").one_or_none()
+        row = (
+            db.query(InboxDeliveryAttemptModel)
+            .filter_by(attempt_uuid=attempt_uuid, settled_at=None, provider="claude_code")
+            .one_or_none()
+        )
         if row is None:
             return "stale"
-        members = sorted(x.message_id for x in db.query(InboxDeliveryAttemptMemberModel)
-                         .filter_by(attempt_uuid=attempt_uuid).all())
-        delivering_rows = db.query(InboxModel).filter(
-            InboxModel.id.in_(ids), InboxModel.status == MessageStatus.DELIVERING.value).all()
+        members = sorted(
+            x.message_id
+            for x in db.query(InboxDeliveryAttemptMemberModel)
+            .filter_by(attempt_uuid=attempt_uuid)
+            .all()
+        )
+        delivering_rows = (
+            db.query(InboxModel)
+            .filter(InboxModel.id.in_(ids), InboxModel.status == MessageStatus.DELIVERING.value)
+            .all()
+        )
         if members != ids or sorted(message.id for message in delivering_rows) != ids:
             return "stale"
         row.outcome, row.reason = outcome, reason
@@ -3445,9 +4040,14 @@ def recover_wpm2_stale_attempt(
         updates: dict[Any, Any] = {InboxModel.status: status.value}
         if status == MessageStatus.DELIVERY_FAILED and reason == "receiver_gone":
             updates[InboxModel.failure_reason] = "receiver_gone"
-        changed = db.query(InboxModel).filter(
-            InboxModel.id.in_(ids), InboxModel.status == MessageStatus.DELIVERING.value,
-        ).update(updates, synchronize_session=False)
+        changed = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.id.in_(ids),
+                InboxModel.status == MessageStatus.DELIVERING.value,
+            )
+            .update(updates, synchronize_session=False)
+        )
         if changed != len(ids):
             raise RuntimeError("stale recovery compare-and-set lost")
         if status == MessageStatus.DELIVERY_FAILED and reason == "receiver_gone":

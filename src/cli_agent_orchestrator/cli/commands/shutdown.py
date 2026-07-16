@@ -3,12 +3,14 @@
 import click
 import requests
 
-from cli_agent_orchestrator.constants import API_BASE_URL
+from cli_agent_orchestrator.utils.http import CAOHttpClient
+
+cao_http = CAOHttpClient(lambda: requests)
 
 
 def _list_sessions():
     try:
-        response = requests.get(f"{API_BASE_URL}/sessions")
+        response = cao_http.get(f"/sessions")
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
@@ -17,7 +19,7 @@ def _list_sessions():
 
 def _delete_session(name):
     try:
-        response = requests.delete(f"{API_BASE_URL}/sessions/{name}")
+        response = cao_http.delete(f"/sessions/{name}")
         if response.status_code == 404:
             click.echo(f"Session '{name}' already removed", err=True)
             return False
