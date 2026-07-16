@@ -25,7 +25,7 @@ from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.http import resolve_endpoint
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.provider_auth import classify_auth_refresh_output
-from cli_agent_orchestrator.utils.provider_plane import provider_home
+from cli_agent_orchestrator.utils.provider_plane import provider_home, wrap_claude_command
 from cli_agent_orchestrator.utils.sandbox_guard import bind_mcp_server_identity
 from cli_agent_orchestrator.utils.temp_path import cao_tmp_dir
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
@@ -362,9 +362,14 @@ class ClaudeCodeProvider(BaseProvider):
             for tool in disallowed:
                 command_parts.extend(["--disallowedTools", tool])
 
-        # Use shlex.join() for proper shell escaping of all arguments
-        # This correctly handles multiline strings, quotes, and special characters
-        claude_cmd = shlex.join(command_parts)
+        # Use shlex.join() for proper shell escaping of all arguments. In a
+        # sandbox, only the Claude provider command is pane-scoped through
+        # bubblewrap; the leading environment cleanup remains outside it.
+        plane = provider_home("claude_code")
+        if plane.classification == "shared-auth-read-only":
+            claude_cmd = shlex.join(wrap_claude_command(plane, command_parts))
+        else:
+            claude_cmd = shlex.join(command_parts)
 
         # When cao-server runs inside a Claude Code session, CLAUDE* env vars
         # leak into spawned tmux panes (via the tmux server's global env).

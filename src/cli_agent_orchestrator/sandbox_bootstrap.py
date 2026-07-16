@@ -77,6 +77,7 @@ SHARED_AUTH_PROVIDERS = {
     },
     "claude_code": {
         "home_relative": "provider-homes/claude",
+        "native_home_relative": "provider-homes/claude/native-home",
         "credential_source": Path.home() / ".claude" / ".credentials.json",
         "credential_name": ".credentials.json",
         "home_env": "CLAUDE_CONFIG_DIR",
@@ -355,6 +356,13 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> dict[str
             "credential_source": str(expected_source),
             "credential_path": str(expected_credential),
         }
+        native_home_relative = pin.get("native_home_relative")
+        if native_home_relative is not None:
+            expected_native_home = root / str(native_home_relative)
+            expected_row["native_home"] = str(expected_native_home)
+            _assert_clean_components(expected_native_home)
+            if not expected_native_home.is_relative_to(root):
+                raise SandboxError(f"provider native home is outside sandbox root: {provider}")
         if not isinstance(row, dict) or row != expected_row:
             raise SandboxError(f"shared-auth provider plane is invalid: {provider}")
         _assert_clean_components(expected_home)
@@ -540,12 +548,28 @@ def _build_manifest(root: Path, port: int) -> dict[str, Any]:
                 "credential_source": str(pin["credential_source"]),
                 "credential_path": str(home / str(pin["credential_name"])),
             }
+            native_home_relative = pin.get("native_home_relative")
+            if native_home_relative is not None:
+                manifest["providers"][provider]["native_home"] = str(
+                    root / str(native_home_relative)
+                )
         for field, relative in MUTABLE_PATHS.items():
             manifest[field] = str(root / relative)
         return manifest
     except Exception:
         shutil.rmtree(root, ignore_errors=True)
         raise
+
+
+def _initialize_claude_native_home(manifest: dict[str, Any]) -> Path:
+    """Create the bootstrap-owned native-memory tree exactly once."""
+    claude_home = Path(manifest["providers"]["claude_code"]["home"])
+    claude_home.mkdir(mode=0o700, parents=True, exist_ok=False)
+    native_home = Path(manifest["providers"]["claude_code"]["native_home"])
+    native_home.mkdir(mode=0o700, exist_ok=False)
+    _write_once(native_home / "CLAUDE.md", "# G7 sandbox CLAUDE.md\n", 0o600)
+    _write_once(native_home / "RTK.md", "", 0o600)
+    return native_home
 
 
 def command_up(args: argparse.Namespace) -> int:
@@ -580,6 +604,7 @@ def command_up(args: argparse.Namespace) -> int:
             "graph_exports_dir",
         ):
             Path(manifest[field]).mkdir(mode=0o700, parents=True, exist_ok=True)
+        _initialize_claude_native_home(manifest)
         _seed_sandbox_db(manifest)
         sentinel = f"cao-sbx-{manifest['instance_id']}-owner"
         existing = _tmux_lifecycle(

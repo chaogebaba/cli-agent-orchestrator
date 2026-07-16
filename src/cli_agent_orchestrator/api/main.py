@@ -133,7 +133,10 @@ from cli_agent_orchestrator.services.terminal_service import OutputMode, Termina
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.http import resolve_endpoint
 from cli_agent_orchestrator.utils.logging import setup_logging
-from cli_agent_orchestrator.utils.provider_plane import provider_home
+from cli_agent_orchestrator.utils.provider_plane import (
+    NativeHomeIsolationUnavailable,
+    provider_home,
+)
 from cli_agent_orchestrator.utils.sandbox_guard import is_sandbox, require_provider_admitted
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
@@ -1280,6 +1283,11 @@ async def create_session(
 
     except MailboxDomainError as e:
         raise _mailbox_http_exception(e) from e
+    except NativeHomeIsolationUnavailable as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": e.code, "message": e.detail},
+        ) from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
@@ -1322,6 +1330,11 @@ async def start_session_endpoint(
         )
     except MailboxDomainError as exc:
         raise _mailbox_http_exception(exc) from exc
+    except NativeHomeIsolationUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": exc.code, "message": exc.detail},
+        ) from exc
     except RuntimeError as exc:
         code = str(exc)
         if code in {
@@ -1639,6 +1652,11 @@ async def create_terminal_in_session(
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
+    except NativeHomeIsolationUnavailable as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": e.code, "message": e.detail},
+        ) from e
     except ValueError as e:
         if str(e).startswith("invalid_working_directory: "):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))

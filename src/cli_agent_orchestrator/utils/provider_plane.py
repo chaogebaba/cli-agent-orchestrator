@@ -4,15 +4,28 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Sequence
 
 from cli_agent_orchestrator.utils.sandbox_guard import SandboxProviderUnsafe
 
 PlaneClass = Literal["production", "shared-auth-read-only", "unsafe"]
+CLAUDE_SANDBOX_MARKER = "# G7 sandbox CLAUDE.md"
+
+
+class NativeHomeIsolationUnavailable(RuntimeError):
+    """Claude's sandbox native-home mount plane could not be proven usable."""
+
+    code = "provider_native_home_isolation_unavailable"
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(f"{self.code}:{detail}")
 
 
 @dataclass(frozen=True)
@@ -23,6 +36,7 @@ class ProviderHome:
     credential_source: Path | None = None
     credential_path: Path | None = None
     home_env: str | None = None
+    native_home: Path | None = None
 
     @property
     def sessions(self) -> Path:
@@ -66,7 +80,104 @@ def provider_home(provider: str) -> ProviderHome:
         credential_source=Path(row["credential_source"]),
         credential_path=Path(row["credential_path"]),
         home_env=home_env,
+        native_home=(Path(row["native_home"]) if row.get("native_home") else None),
     )
+
+
+def _claude_bwrap_prefix(plane: ProviderHome, *, executable: str = "bwrap") -> list[str]:
+    native_home = plane.native_home
+    if plane.provider != "claude_code" or native_home is None:
+        raise NativeHomeIsolationUnavailable("claude native home is not configured")
+    marker = native_home / "CLAUDE.md"
+    try:
+        if marker.read_text(encoding="utf-8").splitlines()[:1] != [CLAUDE_SANDBOX_MARKER]:
+            raise NativeHomeIsolationUnavailable("sandbox native-home marker is invalid")
+    except OSError as exc:
+        raise NativeHomeIsolationUnavailable(
+            f"sandbox native-home marker is inaccessible: {exc}"
+        ) from exc
+    return [
+        executable,
+        "--bind",
+        "/",
+        "/",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--unshare-pid",
+        "--bind",
+        str(native_home),
+        str(Path.home() / ".claude"),
+        "--die-with-parent",
+    ]
+
+
+def _selinux_avc_detail() -> str:
+    ausearch = shutil.which("ausearch")
+    if ausearch is None:
+        return ""
+    try:
+        result = subprocess.run(
+            [ausearch, "-m", "AVC", "-ts", "recent"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return f"; recent SELinux AVC: {' | '.join(lines[-3:])}" if lines else ""
+
+
+def preflight_claude_native_home(plane: ProviderHome) -> None:
+    """Prove the exact pane-scoped bwrap mount before terminal side effects."""
+    executable = shutil.which("bwrap")
+    if executable is None:
+        raise NativeHomeIsolationUnavailable("bwrap is not installed")
+    command = [
+        *_claude_bwrap_prefix(plane, executable=executable),
+        "--",
+        "head",
+        "-1",
+        str(Path.home() / ".claude" / "CLAUDE.md"),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise NativeHomeIsolationUnavailable(
+            f"bwrap native-home preflight could not run: {exc}{_selinux_avc_detail()}"
+        ) from exc
+    if result.returncode != 0 or result.stdout.rstrip("\n") != CLAUDE_SANDBOX_MARKER:
+        detail = (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
+        raise NativeHomeIsolationUnavailable(
+            f"bwrap native-home preflight failed: {detail}{_selinux_avc_detail()}"
+        )
+
+
+def wrap_claude_command(plane: ProviderHome, command_parts: Sequence[str]) -> list[str]:
+    """Return the frozen bwrap+env argv for the Claude compound command."""
+    if shutil.which("bwrap") is None:
+        raise NativeHomeIsolationUnavailable("bwrap is not installed")
+    try:
+        return [
+            *_claude_bwrap_prefix(plane),
+            "--",
+            "env",
+            f"CLAUDE_CONFIG_DIR={plane.home}",
+            *command_parts,
+        ]
+    except NativeHomeIsolationUnavailable:
+        raise
+    except Exception as exc:
+        raise NativeHomeIsolationUnavailable(f"bwrap command construction failed: {exc}") from exc
 
 
 def provider_plane_environment() -> dict[str, str]:
@@ -241,3 +352,5 @@ def admit_provider(provider: str) -> None:
         raise SandboxProviderUnsafe(f"sandbox_provider_unsafe:{provider}")
     plane = provider_home(provider)
     seed_provider_credential(plane)
+    if provider == "claude_code":
+        preflight_claude_native_home(plane)
