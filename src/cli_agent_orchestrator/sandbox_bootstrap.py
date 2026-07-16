@@ -359,7 +359,6 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> dict[str
             raise SandboxError(f"shared-auth provider plane is invalid: {provider}")
         _assert_clean_components(expected_home)
         _assert_clean_components(expected_credential)
-        _assert_clean_components(expected_source)
         if not expected_home.is_relative_to(root):
             raise SandboxError(f"provider home is outside sandbox root: {provider}")
     result = dict(manifest)
