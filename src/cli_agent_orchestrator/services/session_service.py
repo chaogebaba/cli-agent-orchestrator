@@ -19,8 +19,8 @@ Session Lifecycle:
 3. delete_session() removes the entire session and all contained terminals
 """
 
-import logging
 import asyncio
+import logging
 import os
 import time
 from pathlib import Path
@@ -38,8 +38,8 @@ from cli_agent_orchestrator.plugins import (
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import clear_session_env
 from cli_agent_orchestrator.services.terminal_service import create_terminal
-from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
-from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.sandbox_guard import require_provider_admitted
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 logger = logging.getLogger(__name__)
@@ -68,7 +68,9 @@ def canonical_session_env(
     return result
 
 
-def finalize_session(session_name: str, registry: PluginRegistry | None = None, backend=None) -> None:
+def finalize_session(
+    session_name: str, registry: PluginRegistry | None = None, backend=None
+) -> None:
     """Kill/verify a backend session and settle shared session-level side effects."""
     backend = backend or get_backend()
     if backend.session_exists(session_name):
@@ -83,7 +85,8 @@ def finalize_session(session_name: str, registry: PluginRegistry | None = None, 
         raise RuntimeError(f"Session '{session_name}' still exists after teardown")
     clear_session_env(session_name)
     dispatch_plugin_event(
-        registry, "post_kill_session",
+        registry,
+        "post_kill_session",
         PostKillSessionEvent(session_id=session_name, session_name=session_name),
     )
 
@@ -108,10 +111,12 @@ async def create_session(
         resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
     else:
         resolved_provider = provider
+    require_provider_admitted(resolved_provider)
 
     session_env = canonical_session_env(working_directory, env_vars)
 
     from cli_agent_orchestrator.constants import SESSION_PREFIX
+
     effective_session_name = session_name or generate_session_name()
     if not effective_session_name.startswith(SESSION_PREFIX):
         effective_session_name = f"{SESSION_PREFIX}{effective_session_name}"
@@ -122,9 +127,11 @@ async def create_session(
     mailbox_claim = None
     if profile is not None and profile.role == "supervisor":
         from cli_agent_orchestrator.services.mailbox_service import claim_mailbox
+
         mailbox_claim = claim_mailbox(effective_session_name, "supervisor")
 
     from cli_agent_orchestrator.services.terminal_service import seed_resume_bootstrap
+
     fork_context = seed_resume_bootstrap(
         agent_profile, resolved_provider, working_directory or os.getcwd()
     )
@@ -146,6 +153,7 @@ async def create_session(
             PublicationCleanupFailed,
             publish_supervisor_incarnation,
         )
+
         try:
             publication = await asyncio.to_thread(
                 publish_supervisor_incarnation, mailbox_claim, terminal.id
@@ -166,6 +174,7 @@ async def create_session(
                 raise PublicationCleanupFailed(cause) from cleanup_error
             raise
         from cli_agent_orchestrator.services.inbox_service import inbox_service
+
         await asyncio.to_thread(
             inbox_service.deliver_pending,
             terminal.id,
@@ -173,7 +182,8 @@ async def create_session(
         )
         logger.info(
             "published supervisor mailbox %s generation %s",
-            publication["mailbox_id"], publication["generation"],
+            publication["mailbox_id"],
+            publication["generation"],
         )
     dispatch_plugin_event(
         registry,
@@ -191,6 +201,7 @@ async def start_session(**kwargs) -> dict:
     provider = kwargs.get("provider")
     profile = kwargs["agent_profile"]
     resolved = provider or resolve_provider(profile, fallback_provider="kiro_cli")
+    require_provider_admitted(resolved)
     from cli_agent_orchestrator.providers.manager import get_provider_class
 
     seed_mode = get_provider_class(resolved).supports_seed_resume_identity is True
@@ -199,6 +210,7 @@ async def start_session(**kwargs) -> dict:
     manifest_error = None
     try:
         from cli_agent_orchestrator.services.session_manifest_service import build_session_manifest
+
         manifest = build_session_manifest(terminal.session_name)
     except Exception:
         manifest_error = "build_failed"
@@ -323,6 +335,7 @@ def delete_session(
         from cli_agent_orchestrator.services.session_lifecycle_lease import (
             release_session_lifecycle_lease,
         )
+
         release_session_lifecycle_lease(lifecycle_lease)
         lifecycle_lease = None
 
@@ -333,6 +346,7 @@ def delete_session(
     except Exception as e:
         if leases:
             from cli_agent_orchestrator.services.rebind_lease import release_rebind_lease
+
             for token in reversed(leases):
                 try:
                     release_rebind_lease(token)
@@ -342,6 +356,7 @@ def delete_session(
             from cli_agent_orchestrator.services.session_lifecycle_lease import (
                 release_session_lifecycle_lease,
             )
+
             release_session_lifecycle_lease(lifecycle_lease)
         logger.error(f"Failed to delete session {session_name}: {e}")
         raise

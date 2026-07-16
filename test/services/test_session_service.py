@@ -80,10 +80,16 @@ class TestCreateSession:
         mock_terminal = MagicMock(session_name="cao-test")
         mock_create_terminal.return_value = mock_terminal
 
-        await create_session(
-            provider="codex", agent_profile="developer",
-            working_directory=str(tmp_path), env_vars={"KEEP": "yes"},
-        )
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service.seed_resume_bootstrap",
+            return_value=None,
+        ):
+            await create_session(
+                provider="codex",
+                agent_profile="developer",
+                working_directory=str(tmp_path),
+                env_vars={"KEEP": "yes"},
+            )
 
         assert mock_create_terminal.call_args.kwargs["env_vars"] == {
             "KEEP": "yes",
@@ -259,7 +265,8 @@ class TestDeleteSession:
         # Each terminal is torn down via the event-driven delete_terminal path.
         assert mock_delete_terminal.call_count == 2
         assert [call.args[0] for call in mock_delete_terminal.call_args_list] == [
-            "terminal1", "terminal2"
+            "terminal1",
+            "terminal2",
         ]
 
     @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_under_lease")
@@ -391,5 +398,8 @@ class TestDeleteSession:
         # Verify delete_terminal was called for each terminal with the correct ID
         assert mock_delete_terminal.call_count == 4
         assert [call.args[0] for call in mock_delete_terminal.call_args_list] == [
-            "term-aaa", "term-bbb", "term-ccc", "term-ddd"
+            "term-aaa",
+            "term-bbb",
+            "term-ccc",
+            "term-ddd",
         ]

@@ -70,7 +70,13 @@ class CAOHttpClient:
     def _url(path: str, base_url: str | None = None) -> str:
         if not path.startswith("/"):
             raise EndpointConfigurationError("CAO API request path must start with '/'")
-        return f"{(base_url or resolve_endpoint()).rstrip('/')}{path}"
+        resolved = resolve_endpoint()
+        selected = base_url.rstrip("/") if base_url is not None else resolved
+        if os.environ.get("CAO_INSTANCE_ID") and selected != resolved:
+            raise EndpointConfigurationError(
+                "sandbox HTTP base_url must match the bound CAO_ENDPOINT"
+            )
+        return f"{selected}{path}"
 
     def request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
         base_url = kwargs.pop("base_url", None)

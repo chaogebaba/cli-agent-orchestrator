@@ -150,7 +150,7 @@ def source_identity(fork_root: Path) -> dict[str, Any]:
         digest.update(b"\0")
         digest.update(content_hash.encode("ascii"))
         digest.update(b"\n")
-    interpreter_path = Path(os.path.abspath(sys.executable))
+    interpreter_path = fork_root / ".venv" / "bin" / "python"
     venv_prefix = _canonical(Path(sys.prefix))
     return {
         "fork_root": str(fork_root),
@@ -466,7 +466,10 @@ def _build_manifest(root: Path, port: int) -> dict[str, Any]:
         raise SandboxError("sandbox port is invalid or production-owned")
     fork_root = _canonical(Path(__file__).parents[2])
     expected_interpreter = fork_root / ".venv" / "bin" / "python"
-    if Path(os.path.abspath(sys.executable)) != expected_interpreter:
+    current_interpreter = Path(os.path.abspath(sys.executable))
+    if _canonical(Path(sys.prefix)) != fork_root / ".venv" or _canonical(
+        current_interpreter
+    ) != _canonical(expected_interpreter):
         raise SandboxError("bootstrap must run from the fork's absolute venv interpreter")
     root.mkdir(mode=0o700)
     try:
@@ -526,6 +529,15 @@ def command_up(args: argparse.Namespace) -> int:
             Path(manifest[field]).mkdir(mode=0o700, parents=True, exist_ok=True)
         _seed_sandbox_db(manifest)
         sentinel = f"cao-sbx-{manifest['instance_id']}-owner"
+        existing = _tmux_lifecycle(
+            str(manifest["tmux_socket"]),
+            "list-sessions",
+            "-F",
+            "#{session_name}",
+            check=False,
+        )
+        if existing.returncode == 0:
+            raise SandboxError("sandbox tmux socket is already live")
         _tmux_lifecycle(
             str(manifest["tmux_socket"]),
             "new-session",
@@ -535,6 +547,21 @@ def command_up(args: argparse.Namespace) -> int:
             "-n",
             "owner",
         )
+        claimed = _tmux_lifecycle(
+            str(manifest["tmux_socket"]),
+            "list-sessions",
+            "-F",
+            "#{session_name}",
+        )
+        if claimed.stdout.splitlines() != [sentinel]:
+            _tmux_lifecycle(
+                str(manifest["tmux_socket"]),
+                "kill-session",
+                "-t",
+                sentinel,
+                check=False,
+            )
+            raise SandboxError("sandbox tmux socket ownership collision")
         sentinel_created = True
         env = {**os.environ, **_manifest_env(manifest, manifest_path)}
         command = [
@@ -582,6 +609,7 @@ def command_up(args: argparse.Namespace) -> int:
 
 
 def _load_owned(root: Path) -> tuple[dict[str, Any], Path, dict[str, Any]]:
+    _assert_clean_components(root)
     root = _canonical(root)
     manifest_path = root / MANIFEST_NAME
     manifest = validate_manifest(read_manifest(manifest_path), manifest_path)

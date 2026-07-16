@@ -594,6 +594,7 @@ async def create_terminal(
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
         TimeoutError: If provider initialization times out
     """
+    require_provider_admitted(provider)
     if working_directory is not None:
         if not os.path.isabs(os.path.expanduser(working_directory)):
             raise ValueError(
@@ -607,7 +608,6 @@ async def create_terminal(
         except ValueError as exc:
             raise ValueError(f"invalid_working_directory: {exc}") from exc
     provider_class = get_provider_class(provider)
-    require_provider_admitted(provider)
     if provider_class.supports_seed_resume_identity is True and fork_context is None:
         raise RuntimeError("seed_required")
     resume_uuid = (

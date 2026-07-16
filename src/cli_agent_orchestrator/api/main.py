@@ -35,6 +35,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
+from starlette.middleware.base import RequestResponseEndpoint
+from starlette.responses import Response
 
 from cli_agent_orchestrator.api.routes_fork import router as fork_router
 from cli_agent_orchestrator.backends import TerminalNotFoundError
@@ -131,7 +133,7 @@ from cli_agent_orchestrator.services.terminal_service import OutputMode, Termina
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.http import resolve_endpoint
 from cli_agent_orchestrator.utils.logging import setup_logging
-from cli_agent_orchestrator.utils.sandbox_guard import is_sandbox
+from cli_agent_orchestrator.utils.sandbox_guard import is_sandbox, require_provider_admitted
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
     load_skill_content,
@@ -717,7 +719,9 @@ _SANDBOX_SETTER_PREFIXES = (
 
 
 @app.middleware("http")
-async def instance_affinity_middleware(request: Request, call_next):
+async def instance_affinity_middleware(
+    request: Request, call_next: RequestResponseEndpoint
+) -> Response:
     """Fence mutations to the server instance selected by the caller."""
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         expected = os.environ.get("CAO_INSTANCE_ID", "").strip()
@@ -1212,6 +1216,10 @@ async def create_session(
     """
     _validate_artifacts_dir_override(env_vars)
     try:
+        resolved_provider = provider or resolve_provider(
+            agent_profile, fallback_provider="kiro_cli"
+        )
+        require_provider_admitted(resolved_provider)
         if session_name is not None:
             # terminal_service.create_terminal prepends SESSION_PREFIX
             # ("cao-") if missing, so an API caller's 64-char valid name
@@ -1230,7 +1238,7 @@ async def create_session(
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
         create_kwargs = dict(
-            provider=provider,
+            provider=resolved_provider,
             agent_profile=agent_profile,
             session_name=session_name,
             working_directory=working_directory,
@@ -1244,7 +1252,7 @@ async def create_session(
 
         if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
             registry = get_plugin_registry(request)
-            sidecar_provider = provider or DEFAULT_PROVIDER
+            sidecar_provider = resolved_provider
             sidecar_session = result.session_name
 
             async def _spawn_sidecar() -> None:
@@ -1297,8 +1305,12 @@ async def start_session_endpoint(
     """Canonical lifecycle start endpoint."""
     _validate_artifacts_dir_override(env_vars)
     try:
+        resolved_provider = provider or resolve_provider(
+            agent_profile, fallback_provider="kiro_cli"
+        )
+        require_provider_admitted(resolved_provider)
         result = await session_service.start_session(
-            provider=provider,
+            provider=resolved_provider,
             agent_profile=agent_profile,
             session_name=session_name,
             working_directory=working_directory,
@@ -1335,7 +1347,7 @@ async def start_session_endpoint(
         raise
     if memory:
         terminal = result["supervisor_terminal"]
-        sidecar_provider = provider or DEFAULT_PROVIDER
+        sidecar_provider = resolved_provider
 
         async def _spawn_start_sidecar() -> None:
             try:
@@ -1559,6 +1571,7 @@ async def create_terminal_in_session(
             resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
         else:
             resolved_provider = provider
+        require_provider_admitted(resolved_provider)
 
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
