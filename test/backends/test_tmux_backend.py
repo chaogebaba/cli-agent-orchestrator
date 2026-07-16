@@ -32,6 +32,7 @@ class TestTmuxBackendSatisfiesABC:
         assert hasattr(backend, "send_keys")
         assert hasattr(backend, "send_special_key")
         assert hasattr(backend, "get_history")
+        assert hasattr(backend, "capture_viewport")
         assert hasattr(backend, "get_pane_working_directory")
         assert hasattr(backend, "get_pane_current_command")
         assert hasattr(backend, "attach_session")
@@ -123,6 +124,12 @@ class TestTmuxBackendDelegation:
             full_history=False,
         )
         assert result == "output text"
+
+    def test_capture_viewport_delegates(self, backend, mock_client):
+        mock_client.capture_viewport.return_value = "visible output"
+        result = backend.capture_viewport("cao-test", "window-0")
+        mock_client.capture_viewport.assert_called_once_with("cao-test", "window-0")
+        assert result == "visible output"
 
     def test_get_pane_working_directory_delegates(self, backend, mock_client):
         mock_client.get_pane_working_directory.return_value = "/home/user"

@@ -205,6 +205,14 @@ class TerminalBackend(ABC):
         """
         ...
 
+    def capture_viewport(self, session_name: str, window_name: str) -> str:
+        """Capture the current escape-normalized viewport without scrollback.
+
+        Backends that cannot provide this exact freshness primitive fail closed
+        at admission rather than approximating it with terminal history.
+        """
+        raise NotImplementedError("viewport capture is not supported by this backend")
+
     @abstractmethod
     def get_pane_working_directory(self, session_name: str, window_name: str) -> Optional[str]:
         """Get the current working directory of a pane.

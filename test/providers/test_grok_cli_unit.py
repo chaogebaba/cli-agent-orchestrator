@@ -246,6 +246,37 @@ def test_grok_extract_last_message_from_minimal_scrollback() -> None:
     assert provider.extract_last_message_from_script(output) == "GROK_SECOND_minimal"
 
 
+def test_grok_standalone_worked_marker_is_raw_screen_and_extraction_boundary() -> None:
+    provider = _provider()
+    output = """
+   ❯ Summarize the incident.
+
+   Waiting for response…
+   The delivery gate is now fresh-frame safe.
+   Worked for 1.6s.
+   ❯
+   Grok 4.5 · always-approve · ctrl+o transcript
+"""
+
+    assert provider.get_status(output) == TerminalStatus.COMPLETED
+    assert provider.get_status_from_screen(output.splitlines()) == TerminalStatus.COMPLETED
+    assert (
+        provider.extract_last_message_from_script(output)
+        == "Waiting for response…\nThe delivery gate is now fresh-frame safe."
+    )
+
+
+def test_grok_busy_worked_row_is_not_a_completion_boundary() -> None:
+    provider = _provider()
+    row = "Worked for 19s. 2 commands still running."
+
+    assert provider.get_status_from_screen(["⠹ Thinking… 1.1s", row, "❯", "always-approve"]) == (
+        TerminalStatus.PROCESSING
+    )
+    with pytest.raises(ValueError, match="no completion marker"):
+        provider.extract_last_message_from_script(f"❯ run tools\nanswer\n{row}\n")
+
+
 def test_grok_read_composer_draft() -> None:
     provider = _provider()
     screen = """

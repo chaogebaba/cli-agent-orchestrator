@@ -457,6 +457,24 @@ class TmuxClient:
             logger.error(f"Failed to get history from {session_name}:{window_name}: {e}")
             raise
 
+    def capture_viewport(self, session_name: str, window_name: str) -> str:
+        """Capture only the current pane viewport as escape-normalized text."""
+        try:
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                raise ValueError(f"Session '{session_name}' not found")
+
+            window = session.windows.get(window_name=window_name)
+            if not window:
+                raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
+
+            pane = window.panes[0]
+            result = pane.cmd("capture-pane", "-p")
+            return "\n".join(result.stdout) if result.stdout else ""
+        except Exception as e:
+            logger.error(f"Failed to capture viewport from {session_name}:{window_name}: {e}")
+            raise
+
     def list_sessions(self) -> List[Dict[str, str]]:
         """List all tmux sessions."""
         try:

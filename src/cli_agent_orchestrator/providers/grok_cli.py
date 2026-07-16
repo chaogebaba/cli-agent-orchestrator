@@ -49,7 +49,7 @@ PROCESSING_PATTERN = (
     r"|^[^\S\r\n]*(?:⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏)[^\S\r\n]+\S"
     r"| - (?:Waiting for response|Thinking|Responding) - "
 )
-COMPLETION_PATTERN = r"Turn completed in [\d.]+s\."
+COMPLETION_PATTERN = r"^\s*(?:Turn completed in [\d.]+s\.|Worked for [\d.]+s\.)\s*$"
 WAITING_USER_ANSWER_PATTERN = (
     r"Run Grok Build in a project directory\?"
     r"|↑/↓ navigate"

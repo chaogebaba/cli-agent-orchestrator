@@ -31,6 +31,7 @@ ScreenProbeResult = Literal[
 ScreenProbeSignalClass = Literal[
     "waiting", "error", "progress", "completion", "chrome", "none"
 ]
+ScreenProbeFrameSource = Literal["incremental", "fresh_capture"]
 
 
 class ScreenProbeGeometry(TypedDict):
@@ -52,6 +53,7 @@ class ScreenProbeMeta(TypedDict):
     probed_at: str
     geometry: ScreenProbeGeometry
     frame_rows_hash: str
+    frame_source: ScreenProbeFrameSource
     result_status: ScreenProbeResult
     law_signal: ScreenProbeLawSignal
 
@@ -1006,7 +1008,7 @@ class StatusMonitor:
     def probe_screen_status(
         self, terminal_id: str
     ) -> Tuple[TerminalStatus, ScreenProbeMeta]:
-        """Reclassify one locked copy of the latest composited screen frame."""
+        """Classify one frame, refreshing incremental ready frames before admission."""
         try:
             provider = provider_manager.get_provider(terminal_id)
         except Exception:
@@ -1046,6 +1048,51 @@ class StatusMonitor:
 
             classification = classify_screen_signals([])
 
+        frame_source: ScreenProbeFrameSource = "incremental"
+        if provider is not None and classification.status in {
+            TerminalStatus.IDLE,
+            TerminalStatus.COMPLETED,
+        }:
+            frame_source = "fresh_capture"
+            try:
+                from cli_agent_orchestrator.backends.registry import get_backend
+                from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+                metadata = get_terminal_metadata(terminal_id)
+                if not metadata:
+                    raise ValueError(f"No terminal metadata for {terminal_id}")
+                backend = get_backend()
+                captured = backend.capture_viewport(
+                    metadata["tmux_session"], metadata["tmux_window"]
+                )
+                pane_size = backend.get_pane_size(
+                    metadata["tmux_session"], metadata["tmux_window"]
+                )
+                fresh_rows = captured.splitlines()
+                if not fresh_rows or not any(row.strip() for row in fresh_rows):
+                    raise ValueError("Fresh viewport capture was empty")
+                rows = fresh_rows
+                if (
+                    isinstance(pane_size, tuple)
+                    and len(pane_size) == 2
+                    and all(isinstance(value, int) for value in pane_size)
+                ):
+                    columns, row_count = pane_size
+                else:
+                    columns = max((len(row) for row in rows), default=0)
+                    row_count = len(rows)
+                classification = provider.classify_screen(rows)
+            except Exception:
+                logger.exception("Error refreshing admission screen for %s", terminal_id)
+                rows = []
+                columns = 0
+                row_count = 0
+                from cli_agent_orchestrator.providers.screen_classification import (
+                    classify_screen_signals,
+                )
+
+                classification = classify_screen_signals([])
+
         status_values: Dict[TerminalStatus, ScreenProbeResult] = {
             TerminalStatus.WAITING_USER_ANSWER: "waiting_user_answer",
             TerminalStatus.ERROR: "error",
@@ -1060,6 +1107,7 @@ class StatusMonitor:
             "probed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "geometry": {"columns": columns, "rows": row_count},
             "frame_rows_hash": _frame_rows_hash(rows),
+            "frame_source": frame_source,
             "result_status": result_status,
             "law_signal": {
                 "class": classification.signal_class,

@@ -446,6 +446,22 @@ class TestGetHistory:
         # full_history uses "-S" "-" (no line count), strip_escapes omits "-e"
         mock_pane.cmd.assert_called_once_with("capture-pane", "-p", "-S", "-")
 
+    def test_capture_viewport_never_requests_scrollback_or_escapes(self, tmux):
+        mock_pane = MagicMock()
+        mock_result = MagicMock()
+        mock_result.stdout = ["visible", "rows"]
+        mock_pane.cmd.return_value = mock_result
+        mock_window = MagicMock()
+        mock_window.panes = [mock_pane]
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.capture_viewport("ses", "win")
+
+        assert result == "visible\nrows"
+        mock_pane.cmd.assert_called_once_with("capture-pane", "-p")
+
 
 # ── list_sessions ────────────────────────────────────────────────────
 

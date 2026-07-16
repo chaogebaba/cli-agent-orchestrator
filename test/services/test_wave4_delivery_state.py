@@ -5,10 +5,12 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import re
 import subprocess
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
+from typing import get_args
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -41,7 +43,11 @@ from cli_agent_orchestrator.services.replay_policy import (
     ReplayPolicy,
     run_post_auth_engine,
 )
-from cli_agent_orchestrator.services.status_monitor import BoundaryObservation, StatusMonitor
+from cli_agent_orchestrator.services.status_monitor import (
+    BoundaryObservation,
+    ScreenProbeFrameSource,
+    StatusMonitor,
+)
 
 
 def _grok() -> GrokCliProvider:
@@ -56,12 +62,21 @@ def _codex() -> CodexProvider:
     return CodexProvider("codex", "session", "window")
 
 
-def _probe_meta(status: TerminalStatus, provider_signal: str | None = None) -> dict:
+def _probe_meta(
+    status: TerminalStatus,
+    provider_signal: str | None = None,
+    frame_source: str | None = None,
+) -> dict:
     signal_class = "chrome" if status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED} else "progress"
     return {
         "probed_at": "2026-07-16T00:00:00Z",
         "geometry": {"columns": 220, "rows": 50},
         "frame_rows_hash": "0" * 64,
+        "frame_source": frame_source or (
+            "fresh_capture"
+            if status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
+            else "incremental"
+        ),
         "result_status": status.value,
         "law_signal": {
             "class": signal_class,
@@ -267,20 +282,32 @@ def test_probe_07_grok_historical_error_is_filtered_by_newer_completion():
 
 def test_probe_08_typed_screen_probe_uses_one_frame_and_named_source_signal():
     monitor = StatusMonitor()
+    backend = MagicMock()
     rows = ["Waiting for response…", "❯", "always-approve"]
     monitor._screens["receiver"] = (  # noqa: SLF001 - acceptance probes the lock-owned frame
         SimpleNamespace(display=rows, columns=220, lines=50),
         object(),
     )
-    with patch(
-        "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
-        return_value=_grok(),
+    with (
+        patch(
+            "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
+            return_value=_grok(),
+        ),
+        patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
     ):
         status, meta = monitor.probe_screen_status("receiver")
+    assert backend.mock_calls == []
     assert status == TerminalStatus.PROCESSING
     assert set(meta) == {
-        "probed_at", "geometry", "frame_rows_hash", "result_status", "law_signal"
+        "probed_at",
+        "geometry",
+        "frame_rows_hash",
+        "frame_source",
+        "result_status",
+        "law_signal",
     }
+    assert set(get_args(ScreenProbeFrameSource)) == {"incremental", "fresh_capture"}
+    assert meta["frame_source"] == "incremental"
     assert meta["geometry"] == {"columns": 220, "rows": 50}
     assert len(meta["frame_rows_hash"]) == 64
     signal = meta["law_signal"]["provider_signal"]
@@ -293,21 +320,26 @@ def test_probe_08_typed_screen_probe_uses_one_frame_and_named_source_signal():
         SimpleNamespace(display=codex_rows, columns=220, lines=50),
         object(),
     )
-    backend = MagicMock()
     backend.get_native_status.side_effect = [None, TerminalStatus.PROCESSING]
+    backend.get_pane_size.return_value = (220, 50)
+    backend.capture_viewport.return_value = "\n".join(codex_rows)
     with (
         patch(
             "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
             return_value=_codex(),
         ),
         patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+        patch(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            return_value={"tmux_session": "session", "tmux_window": "receiver"},
+        ),
     ):
         first_status, first_meta = monitor.probe_screen_status("receiver")
-        second_status, second_meta = monitor.probe_screen_status("receiver")
     assert backend.get_native_status.call_count == 0
-    assert first_status == second_status == TerminalStatus.COMPLETED
-    assert first_meta["frame_rows_hash"] == second_meta["frame_rows_hash"]
-    assert first_meta["law_signal"] == second_meta["law_signal"]
+    backend.capture_viewport.assert_called_once_with("session", "receiver")
+    assert first_status == TerminalStatus.COMPLETED
+    assert first_meta["frame_source"] == "fresh_capture"
+    assert set(first_meta) == set(meta)
 
 
 def test_probe_08_every_emitted_provider_signal_names_a_module_constant():
@@ -505,6 +537,9 @@ def test_probe_17_lower_completion_beats_quoted_spinner_and_delivery_opens(wave4
     monitor.get_status_gen = MagicMock(return_value=1)
     probe = MagicMock(wraps=monitor.probe_screen_status)
     monitor.probe_screen_status = probe
+    backend = MagicMock()
+    backend.get_pane_size.return_value = (220, 50)
+    backend.capture_viewport.return_value = "\n".join(screen)
 
     def send(_terminal_id, _wire, **kwargs):
         kwargs["on_submitted"](observation)
@@ -532,6 +567,7 @@ def test_probe_17_lower_completion_beats_quoted_spinner_and_delivery_opens(wave4
             "cli_agent_orchestrator.services.inbox_service.confirm_delivery",
             return_value=("unverified", {"kind": "send_returned_unverified"}),
         ),
+        patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
     ):
         InboxService().deliver_pending("codex_receiver")
 
@@ -541,10 +577,166 @@ def test_probe_17_lower_completion_beats_quoted_spinner_and_delivery_opens(wave4
     assert classification.signal_class == "completion"
     assert classification.row_index == 1
     assert probe.call_count == 1
+    backend.capture_viewport.assert_called_once_with("session", "codex_receiver")
     persisted_probe = attempts[0]["evidence"]["screen_probe"]
     assert persisted_probe["result_status"] == TerminalStatus.COMPLETED.value
+    assert persisted_probe["frame_source"] == "fresh_capture"
     assert persisted_probe["law_signal"] == {
         "class": "completion",
         "provider_signal": "ASSISTANT_PREFIX_PATTERN",
         "row_index": 1,
     }
+
+
+def test_livefix_p1_stale_incremental_ready_fresh_busy_defers_without_overwrite(wave4_db):
+    message = create_inbox_message("sender", "receiver", "do not inject while busy")
+    incremental_rows = ["❯", "Grok 4.5 · always-approve · ctrl+o transcript"]
+    fresh_rows = [
+        "⠹ Thinking… 1.1s",
+        "Worked for 19s. 2 commands still running.",
+        "❯",
+        "Grok 4.5 · always-approve · ctrl+o transcript",
+    ]
+    observation = BoundaryObservation("epoch", TerminalStatus.IDLE, 1, 1, 1, None, 1)
+    monitor = StatusMonitor()
+    screen = SimpleNamespace(display=incremental_rows, columns=220, lines=50)
+    monitor._screens["receiver"] = (screen, object())  # noqa: SLF001
+    monitor.get_boundary_observation = MagicMock(return_value=observation)
+    monitor.get_status = MagicMock(return_value=TerminalStatus.IDLE)
+    monitor.get_input_gen = MagicMock(return_value=1)
+    monitor.get_status_gen = MagicMock(return_value=1)
+    backend = MagicMock()
+    backend.get_pane_size.return_value = (220, 50)
+    backend.capture_viewport.return_value = "\n".join(fresh_rows)
+
+    with (
+        patch("cli_agent_orchestrator.services.inbox_service.status_monitor", monitor),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
+            return_value=_grok(),
+        ),
+        patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.terminal_service.send_prepared_input"
+        ) as paste,
+    ):
+        InboxService().deliver_pending("receiver")
+
+    backend.capture_viewport.assert_called_once_with("session", "receiver")
+    assert paste.call_count == 0
+    assert get_message_trace(message.id)["attempts"] == []
+    assert screen.display == incremental_rows
+
+
+@pytest.mark.parametrize(
+    "capture_result", [RuntimeError("capture failed"), "", "unclassified viewport"]
+)
+def test_livefix_p2_fresh_capture_failure_fails_closed(wave4_db, capture_result):
+    message = create_inbox_message("sender", "receiver", "defer on capture failure")
+    incremental_rows = ["❯", "Grok 4.5 · always-approve · ctrl+o transcript"]
+    observation = BoundaryObservation("epoch", TerminalStatus.IDLE, 1, 1, 1, None, 1)
+    monitor = StatusMonitor()
+    screen = SimpleNamespace(display=incremental_rows, columns=220, lines=50)
+    monitor._screens["receiver"] = (screen, object())  # noqa: SLF001
+    monitor.get_boundary_observation = MagicMock(return_value=observation)
+    monitor.get_status = MagicMock(return_value=TerminalStatus.IDLE)
+    backend = MagicMock()
+    backend.get_pane_size.return_value = (220, 50)
+    if isinstance(capture_result, Exception):
+        backend.capture_viewport.side_effect = capture_result
+    else:
+        backend.capture_viewport.return_value = capture_result
+
+    with (
+        patch("cli_agent_orchestrator.services.inbox_service.status_monitor", monitor),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
+            return_value=_grok(),
+        ),
+        patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.terminal_service.send_prepared_input"
+        ) as paste,
+    ):
+        InboxService().deliver_pending("receiver")
+
+    assert backend.capture_viewport.call_count == 1
+    assert paste.call_count == 0
+    assert get_message_trace(message.id)["attempts"] == []
+    assert screen.display == incremental_rows
+
+
+def test_livefix_p3_grok_live_shape_completes_and_delivery_opens(wave4_db):
+    root = Path(__file__).parents[3]
+    screen = (root / "tmp/orch/drain-2026-07-16-wave4/p17-pane-final.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    provider = _grok()
+    classification = provider.classify_screen(screen)
+    assert classification.status == TerminalStatus.COMPLETED
+    assert classification.provider_signal == "COMPLETION_PATTERN"
+    assert screen[classification.row_index or 0].strip() == "Worked for 1.6s."
+
+    message = create_inbox_message("sender", "receiver", "deliver after grok completion")
+    observation = BoundaryObservation("epoch", TerminalStatus.IDLE, 1, 1, 1, None, 1)
+    monitor = StatusMonitor()
+    incremental_screen = SimpleNamespace(display=screen, columns=139, lines=61)
+    monitor._screens["receiver"] = (incremental_screen, object())  # noqa: SLF001
+    monitor.get_boundary_observation = MagicMock(return_value=observation)
+    monitor.get_status = MagicMock(return_value=TerminalStatus.IDLE)
+    monitor.get_input_gen = MagicMock(return_value=1)
+    monitor.get_status_gen = MagicMock(return_value=1)
+    backend = MagicMock()
+    backend.get_pane_size.return_value = (139, 61)
+    backend.capture_viewport.return_value = "\n".join(screen)
+
+    def send(_terminal_id, _wire, **kwargs):
+        kwargs["on_submitted"](observation)
+        return observation
+
+    with (
+        patch("cli_agent_orchestrator.services.inbox_service.status_monitor", monitor),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
+            return_value=provider,
+        ),
+        patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
+            return_value=None,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.terminal_service.prepare_input",
+            side_effect=lambda _terminal, value, _kind: value,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.terminal_service.send_prepared_input",
+            side_effect=send,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.confirm_delivery",
+            return_value=("unverified", {"kind": "send_returned_unverified"}),
+        ),
+    ):
+        InboxService().deliver_pending("receiver")
+
+    attempts = get_message_trace(message.id)["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["evidence"]["screen_probe"]["frame_source"] == "fresh_capture"
+    assert attempts[0]["evidence"]["screen_probe"]["result_status"] == "completed"
+    assert incremental_screen.display == screen
+
+
+def test_livefix_p4_f16_live_pane_remains_processing():
+    root = Path(__file__).parents[3]
+    screen = (root / "tmp/orch/drain-2026-07-16-wave4/f16-tmux-tail.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    classification = _grok().classify_screen(screen)
+    assert classification.status == TerminalStatus.PROCESSING
+    assert classification.provider_signal == "PROCESSING_PATTERN"
+    assert not any(
+        re.search(grok_cli.COMPLETION_PATTERN, row)
+        for row in screen
+        if "commands still running" in row
+    )

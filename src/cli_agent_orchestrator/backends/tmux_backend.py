@@ -131,6 +131,9 @@ class TmuxBackend(TerminalBackend):
             full_history=full_history,
         )
 
+    def capture_viewport(self, session_name: str, window_name: str) -> str:
+        return self._client.capture_viewport(session_name, window_name)
+
     def get_pane_working_directory(self, session_name: str, window_name: str) -> Optional[str]:
         return self._client.get_pane_working_directory(session_name, window_name)
 
