@@ -23,6 +23,7 @@ from cli_agent_orchestrator.services.epoch_recovery_lease import (
 from cli_agent_orchestrator.services.rebind_lease import acquire_rebind_lease, release_rebind_lease
 from cli_agent_orchestrator.services.terminal_service import create_terminal, provider_session_owner
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.provider_plane import provider_home
 from cli_agent_orchestrator.utils.terminal import generate_terminal_id
 
 
@@ -40,7 +41,7 @@ def _result(base, status, terminal_id=None, error_code=None, unscoped=False):
 def _artifact_exists(row) -> bool:
     if row["provider"] == "codex":
         return any(row["session_uuid"] in path.name for path in
-                   (Path.home() / ".codex" / "sessions").glob("**/rollout-*.jsonl"))
+                   provider_home("codex").sessions.glob("**/rollout-*.jsonl"))
     if row["provider"] == "grok_cli":
         return (Path.home() / ".grok" / "sessions" / quote(row["cwd"], safe="") /
                 row["session_uuid"]).exists()

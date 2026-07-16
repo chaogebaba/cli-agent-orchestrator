@@ -297,6 +297,7 @@ def test_claude_allocated_session_launch_resolves_first_accepted_turn(tmp_path):
 
 
 def test_codex_fd_capture_owns_descendant_and_rejects_same_cwd_decoy(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     owned_id = "11111111-1111-1111-1111-111111111111"
     decoy_id = "22222222-2222-2222-2222-222222222222"
     owned = tmp_path / ".codex/sessions/2026/07/11" / f"rollout-{owned_id}.jsonl"

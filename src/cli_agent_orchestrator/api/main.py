@@ -133,6 +133,7 @@ from cli_agent_orchestrator.services.terminal_service import OutputMode, Termina
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.http import resolve_endpoint
 from cli_agent_orchestrator.utils.logging import setup_logging
+from cli_agent_orchestrator.utils.provider_plane import provider_home
 from cli_agent_orchestrator.utils.sandbox_guard import is_sandbox, require_provider_admitted
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
@@ -1739,7 +1740,7 @@ async def bind_transcript(
     try:
         if body.terminal_id != terminal_id:
             raise ValueError("terminal_id does not match route")
-        base_real = os.path.realpath(Path.home() / ".claude" / "projects")
+        base_real = os.path.realpath(provider_home("claude_code").projects)
         candidate_real = os.path.realpath(body.transcript_path)
         if not candidate_real.startswith(base_real + os.sep):
             raise ValueError("transcript path is outside ~/.claude/projects")

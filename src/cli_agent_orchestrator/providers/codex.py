@@ -29,6 +29,7 @@ from cli_agent_orchestrator.services.settings_service import (
 )
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+from cli_agent_orchestrator.utils.provider_plane import provider_home
 from cli_agent_orchestrator.utils.sandbox_guard import bind_mcp_server_identity
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -575,12 +576,12 @@ class CodexProvider(BaseProvider):
         return capture_codex_uuid(pane_pid, launch_time, cwd)
 
     def resume_session_uuid(self) -> str | None:
+        if self._fork_context is not None and self._fork_context.mode == "resume":
+            return self._fork_context.session_uuid
         return None
 
     def validate_session_artifact(self, session_uuid: str, cwd: str) -> None:
-        matches = list(
-            (Path.home() / ".codex" / "sessions").glob(f"**/rollout-*{session_uuid}*.jsonl")
-        )
+        matches = list(provider_home("codex").sessions.glob(f"**/rollout-*{session_uuid}*.jsonl"))
         if not matches:
             raise RetryableArtifactValidation("session_artifact_missing")
         if len(matches) > 1:
@@ -594,7 +595,7 @@ class CodexProvider(BaseProvider):
             raise TerminalArtifactValidation("session_artifact_identity_invalid")
 
     def auth_state_path(self) -> Path | None:
-        return Path.home() / ".codex" / "auth.json"
+        return provider_home("codex").home / "auth.json"
 
     def provider_process_started_at(self, pane_pid: int) -> float | None:
         from cli_agent_orchestrator.services.fork_context_service import _descendants

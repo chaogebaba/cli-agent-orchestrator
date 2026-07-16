@@ -27,7 +27,9 @@ def require_not_sandbox_mutation(action: str) -> None:
 
 def require_provider_admitted(provider: str) -> None:
     if is_sandbox():
-        raise SandboxProviderUnsafe(f"sandbox_provider_unsafe:{provider}")
+        from cli_agent_orchestrator.utils.provider_plane import admit_provider
+
+        admit_provider(provider)
 
 
 def bind_mcp_server_identity(config: dict[str, Any], terminal_id: str) -> dict[str, Any]:
@@ -67,4 +69,12 @@ def bind_pane_identity(environment: dict[str, str] | None, terminal_id: str) -> 
         if supplied is not None and supplied != value:
             raise ValueError(f"pane environment may not override {key}")
         result[key] = value
+    if is_sandbox():
+        from cli_agent_orchestrator.utils.provider_plane import provider_plane_environment
+
+        for key, value in provider_plane_environment().items():
+            supplied = result.get(key)
+            if supplied is not None and supplied != value:
+                raise ValueError(f"pane environment may not override {key}")
+            result[key] = value
     return result

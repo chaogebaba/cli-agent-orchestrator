@@ -1398,9 +1398,10 @@ class TestClaudeCodeProviderStartupPrompts:
     @patch("cli_agent_orchestrator.backends.registry._backend")
     def test_handle_startup_prompts_detected_and_accepted(self, mock_tmux):
         """Test that trust prompt is detected and auto-accepted."""
-        mock_tmux.get_history.return_value = (
-            "\x1b[1m❯\x1b[0m 1. Yes, I trust this folder\n  2. No, don't trust\n"
-        )
+        mock_tmux.get_history.side_effect = [
+            "\x1b[1m❯\x1b[0m 1. Yes, I trust this folder\n  2. No, don't trust\n",
+            "Welcome to Claude Code v2.1.211",
+        ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         provider._handle_startup_prompts(timeout=2.0)
@@ -1436,6 +1437,7 @@ class TestClaudeCodeProviderStartupPrompts:
         mock_tmux.get_history.side_effect = [
             "",
             "❯ 1. Yes, I trust this folder\n  2. No",
+            "Welcome to Claude Code v2.1.211",
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
@@ -1467,6 +1469,7 @@ class TestClaudeCodeProviderStartupPrompts:
         mock_tmux.get_history.side_effect = [
             "WARNING: Bypass Permissions mode\n❯ 1. No, exit\n  2. Yes, I accept\n",
             "❯ 1. Yes, I trust this folder\n  2. No",
+            "Welcome to Claude Code v2.1.211",
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
@@ -1476,6 +1479,24 @@ class TestClaudeCodeProviderStartupPrompts:
         # Trust: send_special_key (Enter) — called twice total
         assert mock_tmux.send_keys.call_count == 1  # Down arrow for bypass
         assert mock_tmux.send_special_key.call_count == 2  # Enter for bypass + Enter for trust
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_handle_trust_then_external_import_prompt_rejects_import(self, mock_tmux):
+        """Sandbox startup rejects external CLAUDE.md imports after trusting the repo."""
+        mock_tmux.get_history.side_effect = [
+            "❯ 1. Yes, I trust this folder\n  2. No",
+            "Yes, I trust this folder\nAllow external CLAUDE.md file imports?\n"
+            "❯ 1. Yes, allow external imports\n  2. No, disable external imports",
+            "Welcome to Claude Code v2.1.211",
+        ]
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider._handle_startup_prompts(timeout=5.0)
+
+        mock_tmux.send_keys.assert_called_once_with(
+            "test-session", "window-0", "\x1b[B", enter_count=0
+        )
+        assert mock_tmux.send_special_key.call_count == 2
 
     def test_get_status_trust_prompt_not_waiting_user_answer(self):
         """Test that trust prompt is NOT detected as WAITING_USER_ANSWER."""
@@ -1516,7 +1537,7 @@ class TestClaudeCodeProviderStartupPrompts:
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         trust_output = "❯ 1. Yes, I trust this folder\n  2. No"
-        mock_tmux.get_history.side_effect = ["", trust_output, trust_output]
+        mock_tmux.get_history.side_effect = ["", trust_output, "Welcome to Claude Code v2.1.211"]
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
             result = await provider.initialize()
@@ -1556,12 +1577,10 @@ class TestClaudeCodeProviderSettings:
         settings_file.parent.mkdir(parents=True)
         settings_file.write_text(json.dumps({"permissions": {"allow": []}}))
 
-        with patch("cli_agent_orchestrator.providers.claude_code.Path") as mock_path_cls:
-            mock_home = MagicMock()
-            mock_path_cls.home.return_value = mock_home
-            mock_home.__truediv__ = MagicMock(
-                return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
-            )
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.provider_home",
+            return_value=MagicMock(home=settings_file.parent),
+        ):
 
             ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
 
@@ -1574,12 +1593,10 @@ class TestClaudeCodeProviderSettings:
         """Test that settings file is created when it doesn't exist."""
         settings_file = tmp_path / ".claude" / "settings.json"
 
-        with patch("cli_agent_orchestrator.providers.claude_code.Path") as mock_path_cls:
-            mock_home = MagicMock()
-            mock_path_cls.home.return_value = mock_home
-            mock_home.__truediv__ = MagicMock(
-                return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
-            )
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.provider_home",
+            return_value=MagicMock(home=settings_file.parent),
+        ):
 
             ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
 

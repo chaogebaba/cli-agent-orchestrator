@@ -20,6 +20,7 @@ from cli_agent_orchestrator.clients.database import (
     get_current_transcript_binding,
     update_terminal_provider_session_id_if_null,
 )
+from cli_agent_orchestrator.utils.provider_plane import provider_home
 
 logger = logging.getLogger(__name__)
 _unresolved_warned: set[str] = set()
@@ -84,11 +85,12 @@ def _fd_codex_session(metadata: dict) -> str | None:
     try:
         from cli_agent_orchestrator.services.fork_context_service import _descendants, pane_pid
         candidates = set()
+        sessions_root = provider_home("codex").sessions.resolve()
         for pid in _descendants(pane_pid(metadata["tmux_session"], metadata["tmux_window"])):
             for fd in Path(f"/proc/{pid}/fd").iterdir():
                 try:
                     path = Path(os.readlink(fd)).resolve()
-                    if ("/.codex/sessions/" in str(path) and
+                    if (path.is_relative_to(sessions_root) and
                             path.name.startswith("rollout-") and path.suffix == ".jsonl"):
                         first = json.loads(path.open(encoding="utf-8").readline())
                         session_id = first.get("payload", {}).get("id")
@@ -226,7 +228,7 @@ def resolve_session_transcript(metadata: dict) -> TranscriptResolution | None:
             )
         return None
     if provider == "codex":
-        matches = list((Path.home() / ".codex" / "sessions").glob(f"**/*{session_id}*.jsonl"))
+        matches = list(provider_home("codex").sessions.glob(f"**/*{session_id}*.jsonl"))
         return candidate(matches[0], "uuid_glob") if len(matches) == 1 else None
     cwd = metadata.get("working_directory") or metadata.get("cwd")
     if not cwd:
@@ -241,7 +243,7 @@ def resolve_session_transcript(metadata: dict) -> TranscriptResolution | None:
         return candidate(path, "exact_id")
     if provider == "claude_code" and cwd:
         encoded = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
-        projects = Path.home() / ".claude" / "projects"
+        projects = provider_home("claude_code").projects
         path = projects / encoded / f"{session_id}.jsonl"
         if path.exists():
             result = candidate(path, "exact_id")

@@ -1,0 +1,12 @@
+Authentication failed. Please check your API credentials.
+Authentication failed: Invalid authorization code
+Authentication failed (401)
+Token refresh failed
+Session token expired or invalid
+Failed to save OAuth tokens
+tengu_oauth_tokens_save_failed
+tengu_oauth_tokens_save_exception
+Auto-refresh failed, falling back to needsRefresh:
+Credential renew failed:
+network is unreachable
+connection timed out

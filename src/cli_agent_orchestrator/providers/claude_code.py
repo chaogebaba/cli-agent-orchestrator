@@ -24,6 +24,8 @@ from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.http import resolve_endpoint
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+from cli_agent_orchestrator.utils.provider_auth import classify_auth_refresh_output
+from cli_agent_orchestrator.utils.provider_plane import provider_home
 from cli_agent_orchestrator.utils.sandbox_guard import bind_mcp_server_identity
 from cli_agent_orchestrator.utils.temp_path import cao_tmp_dir
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
@@ -81,6 +83,7 @@ WAITING_USER_ANSWER_PATTERN = (
 )
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
+EXTERNAL_IMPORT_PROMPT_PATTERN = r"Allow external CLAUDE\.md file imports\?"
 IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 # New Claude Code TUI completion summary, e.g. "✻ Sautéed for 1s" /
 # "✶ Cultivated for 12s". Unlike the active spinner (PROCESSING_PATTERN, which
@@ -373,7 +376,7 @@ class ClaudeCodeProvider(BaseProvider):
             "unset $(env | sed -n 's/^\\(CLAUDE[A-Z_]*\\)=.*/\\1/p'"
             " | grep -v -E 'CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY)"
             "|CLAUDE_CODE_SKIP_(BEDROCK|VERTEX|FOUNDRY)_AUTH"
-            "|CLAUDE_CODE_EFFORT_LEVEL'"
+            "|CLAUDE_CODE_EFFORT_LEVEL|CLAUDE_CONFIG_DIR'"
             ") 2>/dev/null"
         )
         return f"{unset_cmd}; {claude_cmd}"
@@ -444,7 +447,7 @@ class ClaudeCodeProvider(BaseProvider):
         ``~/.claude/settings.json``.  CAO already uses the flag intentionally,
         so the confirmation is redundant and blocks initialization.
         """
-        settings_path = Path.home() / ".claude" / "settings.json"
+        settings_path = provider_home("claude_code").home / "settings.json"
         settings: dict = {}
         if settings_path.exists():
             try:
@@ -462,10 +465,33 @@ class ClaudeCodeProvider(BaseProvider):
             json.dump(settings, f, indent=2)
         logger.info("Set skipDangerousModePermissionPrompt in ~/.claude/settings.json")
 
+    @staticmethod
+    def _ensure_sandbox_onboarding_state() -> None:
+        """Seed non-secret first-run state inside the isolated Claude home."""
+        plane = provider_home("claude_code")
+        if plane.classification != "shared-auth-read-only":
+            return
+        config_path = plane.home / ".claude.json"
+        config: dict[str, object] = {}
+        if config_path.exists():
+            try:
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                pass
+        config.update(
+            {
+                "hasCompletedOnboarding": True,
+                "theme": "dark",
+                "bypassPermissionsModeAccepted": True,
+            }
+        )
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        config_path.chmod(0o600)
+
     def _handle_startup_prompts(self, timeout: Optional[float] = None) -> None:
         """Auto-accept startup prompts that may appear before the REPL is ready.
 
-        Claude Code may show up to two prompts during startup:
+        Claude Code may show up to three prompts during startup:
 
         1. **Bypass permissions confirmation** (``--dangerously-skip-permissions``)
            – shows "Yes, I accept" as option 2; requires ``Down`` + ``Enter``.
@@ -473,11 +499,15 @@ class ClaudeCodeProvider(BaseProvider):
            this in most cases; this handler is a defensive fallback.
         2. **Workspace trust dialog** – shows "Yes, I trust this folder";
            requires ``Enter``.
+        3. **External CLAUDE.md import dialog** – reject external imports so an
+           isolated provider pane cannot read configuration from production home.
         """
         if timeout is None:
             timeout = get_server_settings()["startup_prompt_handler_timeout"]
         start_time = time.time()
         bypass_accepted = False
+        trust_accepted = False
+        external_imports_rejected = False
         while time.time() - start_time < timeout:
             output = get_backend().get_history(self.session_name, self.window_name)
             if not output:
@@ -504,16 +534,37 @@ class ClaudeCodeProvider(BaseProvider):
                 time.sleep(1.0)
                 continue  # Trust prompt may follow
 
-            # 2) Handle workspace trust prompt
-            if re.search(TRUST_PROMPT_PATTERN, clean_output):
+            # 2) Reject external imports before checking retained trust-prompt text.
+            if not external_imports_rejected and re.search(
+                EXTERNAL_IMPORT_PROMPT_PATTERN, clean_output
+            ):
+                from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                logger.info("External CLAUDE.md import prompt detected, rejecting")
+                status_monitor.notify_input_sent(self.terminal_id)
+                get_backend().send_keys(
+                    self.session_name, self.window_name, "\x1b[B", enter_count=0
+                )
+                time.sleep(0.5)
+                status_monitor.notify_input_sent(self.terminal_id)
+                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                external_imports_rejected = True
+                time.sleep(1.0)
+                continue
+
+            # 3) Handle workspace trust prompt. Continue because the external
+            #    import dialog may render immediately after trust is accepted.
+            if not trust_accepted and re.search(TRUST_PROMPT_PATTERN, clean_output):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
                 logger.info("Workspace trust prompt detected, auto-accepting")
                 status_monitor.notify_input_sent(self.terminal_id)
                 get_backend().send_special_key(self.session_name, self.window_name, "Enter")
-                return
+                trust_accepted = True
+                time.sleep(1.0)
+                continue
 
-            # 3) Claude Code fully started — no prompts needed.
+            # 4) Claude Code fully started — no prompts needed.
             #    The version banner is the ONLY reliable "ready" signal here: it
             #    renders only once the REPL is up and cannot appear in the echoed
             #    launch command. The old bare IDLE_PROMPT_PATTERN ("> "/"❯ ") check
@@ -544,6 +595,7 @@ class ClaudeCodeProvider(BaseProvider):
 
         # Prevent bypass permissions dialog from appearing (settings-based fix).
         self._ensure_skip_bypass_prompt_setting()
+        self._ensure_sandbox_onboarding_state()
 
         # Build properly escaped command string
         command = self._build_claude_command()
@@ -571,6 +623,11 @@ class ClaudeCodeProvider(BaseProvider):
             timeout=init_timeout,
             polling_interval=1.0,
         ):
+            auth_state = classify_auth_refresh_output(
+                "claude_code", get_backend().get_history(self.session_name, self.window_name)
+            )
+            if auth_state is not None:
+                raise ProviderError(f"provider_auth_refresh_failed:{auth_state}")
             raise TimeoutError(f"Claude Code initialization timed out after {init_timeout}s")
 
         self._initialized = True

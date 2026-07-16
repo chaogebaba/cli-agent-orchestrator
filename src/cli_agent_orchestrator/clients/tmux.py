@@ -113,6 +113,17 @@ class TmuxClient:
             return
         for key, value in extra_env.items():
             if cls._is_blocked_env_key(key):
+                if os.environ.get("CAO_INSTANCE_ID", "").strip() and key in {
+                    "CODEX_HOME",
+                    "CLAUDE_CONFIG_DIR",
+                }:
+                    from cli_agent_orchestrator.utils.provider_plane import (
+                        provider_plane_environment,
+                    )
+
+                    if provider_plane_environment().get(key) == value:
+                        environment[key] = value
+                        continue
                 logger.warning("Dropping forwarded env var with blocked prefix: %s", key)
                 continue
             if len(value.encode("utf-8")) >= cls._MAX_ENV_VALUE_BYTES:

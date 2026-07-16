@@ -68,6 +68,20 @@ PROVIDERS = (
     "cursor_cli",
     "antigravity_cli",
 )
+SHARED_AUTH_PROVIDERS = {
+    "codex": {
+        "home_relative": "provider-homes/codex",
+        "credential_source": Path.home() / ".codex" / "auth.json",
+        "credential_name": "auth.json",
+        "home_env": "CODEX_HOME",
+    },
+    "claude_code": {
+        "home_relative": "provider-homes/claude",
+        "credential_source": Path.home() / ".claude" / ".credentials.json",
+        "credential_name": ".credentials.json",
+        "home_env": "CLAUDE_CONFIG_DIR",
+    },
+}
 
 
 class SandboxError(RuntimeError):
@@ -194,7 +208,9 @@ def render_manifest(manifest: dict[str, Any]) -> str:
         lines.append(f"{key} = {_toml_string(str(identity[key]))}\n")
     for provider in PROVIDERS:
         lines.append(f"\n[providers.{provider}]\n")
-        lines.append('classification = "unsafe"\n')
+        row = manifest["providers"][provider]
+        for key, value in row.items():
+            lines.append(f"{key} = {_toml_string(str(value))}\n")
     return "".join(lines)
 
 
@@ -320,11 +336,32 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> dict[str
     providers = manifest["providers"]
     if not isinstance(providers, dict) or set(providers) != set(PROVIDERS):
         raise SandboxError("provider plane table is not the closed ten-provider set")
-    if any(
-        not isinstance(row, dict) or row != {"classification": "unsafe"}
-        for row in providers.values()
-    ):
-        raise SandboxError("G7a provider planes must all be unsafe")
+    for provider, row in providers.items():
+        if provider not in SHARED_AUTH_PROVIDERS:
+            if not isinstance(row, dict) or row != {"classification": "unsafe"}:
+                raise SandboxError(f"unsafe provider plane is invalid: {provider}")
+            continue
+        pin = SHARED_AUTH_PROVIDERS[provider]
+        expected_home = root / str(pin["home_relative"])
+        source_pin = pin["credential_source"]
+        if not isinstance(source_pin, Path):
+            raise SandboxError(f"credential source pin is invalid: {provider}")
+        expected_source = source_pin
+        expected_credential = expected_home / str(pin["credential_name"])
+        expected_row = {
+            "classification": "shared-auth-read-only",
+            "home": str(expected_home),
+            "home_env": str(pin["home_env"]),
+            "credential_source": str(expected_source),
+            "credential_path": str(expected_credential),
+        }
+        if not isinstance(row, dict) or row != expected_row:
+            raise SandboxError(f"shared-auth provider plane is invalid: {provider}")
+        _assert_clean_components(expected_home)
+        _assert_clean_components(expected_credential)
+        _assert_clean_components(expected_source)
+        if not expected_home.is_relative_to(root):
+            raise SandboxError(f"provider home is outside sandbox root: {provider}")
     result = dict(manifest)
     result["root"] = str(root)
     result["endpoint"] = endpoint
@@ -332,7 +369,7 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> dict[str
 
 
 def _manifest_env(manifest: dict[str, Any], manifest_path: Path) -> dict[str, str]:
-    return {
+    result = {
         "CAO_HOME": str(manifest["root"]),
         "CAO_ENDPOINT": str(manifest["endpoint"]),
         "CAO_INSTANCE_ID": str(manifest["instance_id"]),
@@ -343,6 +380,10 @@ def _manifest_env(manifest: dict[str, Any], manifest_path: Path) -> dict[str, st
         "CAO_SANDBOX_MANIFEST": str(manifest_path),
         "PYTHONDONTWRITEBYTECODE": "1",
     }
+    for row in manifest["providers"].values():
+        if row.get("classification") == "shared-auth-read-only":
+            result[str(row["home_env"])] = str(row["home"])
+    return result
 
 
 def _validate_env(manifest: dict[str, Any], manifest_path: Path) -> None:
@@ -485,8 +526,21 @@ def _build_manifest(root: Path, port: int) -> dict[str, Any]:
             "root_device": root_stat.st_dev,
             "root_inode": root_stat.st_ino,
             "source": source_identity(fork_root),
-            "providers": {provider: {"classification": "unsafe"} for provider in PROVIDERS},
+            "providers": {},
         }
+        for provider in PROVIDERS:
+            pin = SHARED_AUTH_PROVIDERS.get(provider)
+            if pin is None:
+                manifest["providers"][provider] = {"classification": "unsafe"}
+                continue
+            home = root / str(pin["home_relative"])
+            manifest["providers"][provider] = {
+                "classification": "shared-auth-read-only",
+                "home": str(home),
+                "home_env": str(pin["home_env"]),
+                "credential_source": str(pin["credential_source"]),
+                "credential_path": str(home / str(pin["credential_name"])),
+            }
         for field, relative in MUTABLE_PATHS.items():
             manifest[field] = str(root / relative)
         return manifest

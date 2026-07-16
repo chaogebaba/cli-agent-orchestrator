@@ -92,7 +92,11 @@ class TestHandleStartupPromptsBranches:
             "❯ 1. Yes, I trust this folder\n"
             "  2. No, exit\n"
         )
-        mock_backend.get_history.side_effect = [echoed_launch_cmd, trust_frame]
+        mock_backend.get_history.side_effect = [
+            echoed_launch_cmd,
+            trust_frame,
+            "Welcome to Claude Code v2.1.211",
+        ]
 
         provider._handle_startup_prompts(timeout=5.0)
 

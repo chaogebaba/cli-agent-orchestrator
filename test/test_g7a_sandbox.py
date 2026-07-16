@@ -214,7 +214,9 @@ async def test_all_ten_providers_fail_through_public_create_and_api_route(
     monkeypatch.setattr(terminal_service, "seed_resume_bootstrap", bomb)
     monkeypatch.setattr(terminal_service, "get_provider_class", bomb)
     client = TestClient(app, base_url="http://localhost", raise_server_exceptions=False)
-    for provider in bootstrap.PROVIDERS:
+    for provider in (
+        name for name in bootstrap.PROVIDERS if name not in bootstrap.SHARED_AUTH_PROVIDERS
+    ):
         with pytest.raises(SandboxProviderUnsafe, match=f"sandbox_provider_unsafe:{provider}"):
             await terminal_service.create_terminal(provider, "developer")
         with pytest.raises(SandboxProviderUnsafe, match=f"sandbox_provider_unsafe:{provider}"):

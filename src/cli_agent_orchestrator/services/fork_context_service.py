@@ -20,6 +20,7 @@ from cli_agent_orchestrator.clients.database import (
     retire_provider_session,
     update_terminal_provider_session_id,
 )
+from cli_agent_orchestrator.utils.provider_plane import provider_home
 from cli_agent_orchestrator.utils.tmux_command import tmux_argv
 
 
@@ -211,6 +212,7 @@ def pane_launch_epoch(pid: int) -> float:
 
 
 def capture_codex_uuid(root_pid: int, launch_time: float, cwd: str) -> str:
+    sessions_root = provider_home("codex").sessions.resolve()
     for attempt in range(3):
         candidates: set[Path] = set()
         try:
@@ -219,7 +221,7 @@ def capture_codex_uuid(root_pid: int, launch_time: float, cwd: str) -> str:
                     try:
                         p = Path(os.readlink(fd)).resolve()
                         if (
-                            "/.codex/sessions/" in str(p)
+                            p.is_relative_to(sessions_root)
                             and p.name.startswith("rollout-")
                             and p.suffix == ".jsonl"
                         ):
@@ -239,7 +241,7 @@ def capture_codex_uuid(root_pid: int, launch_time: float, cwd: str) -> str:
             time.sleep(1)
     matches = []
     now = time.time()
-    for p in (Path.home() / ".codex" / "sessions").glob("**/rollout-*.jsonl"):
+    for p in provider_home("codex").sessions.glob("**/rollout-*.jsonl"):
         try:
             meta = json.loads(p.open().readline())["payload"]
             if meta.get("cwd") == cwd and launch_time <= p.stat().st_mtime <= now:
@@ -295,7 +297,7 @@ def validate_base_source(
         if provider == "codex":
             found = any(
                 session_uuid in path.name
-                for path in (Path.home() / ".codex" / "sessions").glob("**/rollout-*.jsonl")
+                for path in provider_home("codex").sessions.glob("**/rollout-*.jsonl")
             )
         else:
             found = (
@@ -382,9 +384,7 @@ def validate_base_source(
         )
 
     if provider == "codex":
-        matches = list(
-            (Path.home() / ".codex" / "sessions").glob(f"**/rollout-*{session_uuid}*.jsonl")
-        )
+        matches = list(provider_home("codex").sessions.glob(f"**/rollout-*{session_uuid}*.jsonl"))
         try:
             with matches[0].open(encoding="utf-8") as stream:
                 payload_cwd = json.loads(stream.readline()).get("payload", {}).get("cwd")
