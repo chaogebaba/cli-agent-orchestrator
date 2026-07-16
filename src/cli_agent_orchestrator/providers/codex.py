@@ -680,6 +680,12 @@ class CodexProvider(BaseProvider):
         if native is not None:
             return native
 
+        return self._get_screen_local_status(output)
+
+    @staticmethod
+    def _get_screen_local_status(output: str) -> TerminalStatus:
+        """Classify Codex text without consulting backend or mutable provider state."""
+
         if not output:
             return TerminalStatus.UNKNOWN
 
@@ -825,7 +831,7 @@ class CodexProvider(BaseProvider):
         joined = "\n".join(screen_lines)
         clean = strip_terminal_escapes(joined)
         rows = clean.splitlines()
-        legacy_status = self.get_status(joined)
+        legacy_status = self._get_screen_local_status(joined)
         chrome_rows = [
             index for index, row in enumerate(rows)
             if re.search(IDLE_PROMPT_SCREEN_PATTERN, row, re.IGNORECASE)
@@ -845,7 +851,11 @@ class CodexProvider(BaseProvider):
                 signals.append(ScreenSignal("progress", "TUI_PROGRESS_PATTERN", index))
             if TRUST_SELECTOR_PATTERN.search(row):
                 signals.append(ScreenSignal("waiting", "TRUST_SELECTOR_PATTERN", index))
-            if index == terminal_index and DIALOG_ACTION_FOOTER_PATTERN.search(row):
+            if (
+                not progress_rows
+                and index == terminal_index
+                and DIALOG_ACTION_FOOTER_PATTERN.search(row)
+            ):
                 signals.append(
                     ScreenSignal("waiting", "DIALOG_ACTION_FOOTER_PATTERN", index)
                 )

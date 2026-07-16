@@ -76,7 +76,7 @@ def test_visible_spinner_wins_over_final_dialog_footer():
     )
     screen.insert(footer_index, "• Working (3s • esc to interrupt)")
 
-    assert _provider().get_status_from_screen(screen) == TerminalStatus.WAITING_USER_ANSWER
+    assert _provider().get_status_from_screen(screen) == TerminalStatus.PROCESSING
 
 
 @pytest.mark.parametrize(

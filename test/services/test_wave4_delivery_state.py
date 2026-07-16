@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import ast
 import inspect
 import json
 import subprocess
+import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -173,14 +175,62 @@ def test_probe_03_claude_full_screen_spinner_beats_older_response_and_chrome():
 
 
 def test_probe_04_codex_existing_fixture_corpus_is_unchanged():
-    fixtures = [
-        (["› Fix", "• Fixed", "› ", "? for shortcuts"], TerminalStatus.COMPLETED),
-        (["› Fix", "• Working (5s • esc to interrupt)", "› "], TerminalStatus.PROCESSING),
-        (["", "", ""], TerminalStatus.PROCESSING),
-    ]
-    assert [_codex().get_status_from_screen(rows) for rows, _ in fixtures] == [
-        expected for _, expected in fixtures
-    ]
+    fixture_root = Path(__file__).parents[1] / "fixtures" / "codex_dialogs"
+    corpus = {
+        path.name: path.read_text(encoding="utf-8").splitlines()
+        for path in sorted(fixture_root.glob("*.ansi.txt"))
+    }
+    corpus.update(
+        {
+            "synthetic:completed": ["› Fix", "• Fixed", "", "› ", "? for shortcuts"],
+            "synthetic:working": [
+                "› Fix", "• Working (5s • esc to interrupt)", "› ", "? for shortcuts"
+            ],
+            "synthetic:above_tail": [
+                "› Fix",
+                "• Working (5s • esc to interrupt)",
+                *([""] * 26),
+                "› Summarize recent commits",
+                "? for shortcuts",
+            ],
+            "synthetic:blank": ["", "", ""],
+        }
+    )
+    progress_dialog = list(corpus["model-picker.ansi.txt"])
+    footer_index = next(
+        index
+        for index in range(len(progress_dialog) - 1, -1, -1)
+        if codex.strip_terminal_escapes(progress_dialog[index]).strip()
+    )
+    progress_dialog.insert(footer_index, "• Working (3s • esc to interrupt)")
+    corpus["synthetic:progress_plus_dialog"] = progress_dialog
+
+    parent_results = {
+        "command-approval.ansi.txt": "waiting_user_answer",
+        "composer-draft.ansi.txt": "idle",
+        "experimental-checkboxes.ansi.txt": "waiting_user_answer",
+        "hooks-browser.ansi.txt": "waiting_user_answer",
+        "idle.ansi.txt": "idle",
+        "keymap-browser.ansi.txt": "waiting_user_answer",
+        "memories-enable.ansi.txt": "waiting_user_answer",
+        "model-picker.ansi.txt": "waiting_user_answer",
+        "permissions-picker.ansi.txt": "waiting_user_answer",
+        "quoted-trust-stall.ansi.txt": "processing",
+        "skills-menu.ansi.txt": "waiting_user_answer",
+        "synthetic:above_tail": "processing",
+        "synthetic:blank": "processing",
+        "synthetic:completed": "completed",
+        "synthetic:progress_plus_dialog": "processing",
+        "synthetic:working": "processing",
+        "theme-picker.ansi.txt": "waiting_user_answer",
+        "trust.ansi.txt": "waiting_user_answer",
+        "usage-picker-no-reset.ansi.txt": "waiting_user_answer",
+        "working.ansi.txt": "processing",
+    }
+    assert len(corpus) == 20
+    assert {
+        name: _codex().get_status_from_screen(rows).value for name, rows in corpus.items()
+    } == parent_results
 
 
 @pytest.mark.parametrize(
@@ -237,6 +287,79 @@ def test_probe_08_typed_screen_probe_uses_one_frame_and_named_source_signal():
     assert signal == "PROCESSING_PATTERN" and hasattr(grok_cli, signal)
     assert meta["result_status"] != TerminalStatus.RENDER_UNCERTAIN.value
     json.dumps(meta)
+
+    codex_rows = ["› task", "assistant: done", "› ", "? for shortcuts"]
+    monitor._screens["receiver"] = (  # noqa: SLF001 - same locked frame twice
+        SimpleNamespace(display=codex_rows, columns=220, lines=50),
+        object(),
+    )
+    backend = MagicMock()
+    backend.get_native_status.side_effect = [None, TerminalStatus.PROCESSING]
+    with (
+        patch(
+            "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
+            return_value=_codex(),
+        ),
+        patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+    ):
+        first_status, first_meta = monitor.probe_screen_status("receiver")
+        second_status, second_meta = monitor.probe_screen_status("receiver")
+    assert backend.get_native_status.call_count == 0
+    assert first_status == second_status == TerminalStatus.COMPLETED
+    assert first_meta["frame_rows_hash"] == second_meta["frame_rows_hash"]
+    assert first_meta["law_signal"] == second_meta["law_signal"]
+
+
+def test_probe_08_every_emitted_provider_signal_names_a_module_constant():
+    expected = {
+        grok_cli: {
+            "WAITING_USER_ANSWER_PATTERN",
+            "PROCESSING_PATTERN",
+            "COMPLETION_PATTERN",
+            "ERROR_PATTERN",
+            "IDLE_PROMPT_PATTERN",
+            "IDLE_FOOTER_PATTERN",
+            "COMPOSER_PROMPT_PATTERN",
+        },
+        claude_code: {
+            "WAITING_USER_ANSWER_PATTERN",
+            "NEW_TUI_BOX_SPINNER_PATTERN",
+            "PROCESSING_PATTERN",
+            "BACKGROUND_WAIT_PATTERN",
+            "GET_STATUS_COMPLETION_PATTERN",
+            "EXTRACTION_RESPONSE_PATTERN",
+            "NEW_TUI_BOX_PATTERN",
+        },
+        codex: {
+            "TUI_PROGRESS_PATTERN",
+            "TRUST_SELECTOR_PATTERN",
+            "DIALOG_ACTION_FOOTER_PATTERN",
+            "WAITING_PROMPT_PATTERN",
+            "ERROR_PATTERN",
+            "ASSISTANT_PREFIX_PATTERN",
+            "IDLE_PROMPT_SCREEN_PATTERN",
+            "SCREEN_FALLBACK_PROCESSING_PATTERN",
+        },
+    }
+    providers = {
+        grok_cli: GrokCliProvider,
+        claude_code: ClaudeCodeProvider,
+        codex: CodexProvider,
+    }
+    for module, provider in providers.items():
+        tree = ast.parse(textwrap.dedent(inspect.getsource(provider.classify_screen)))
+        emitted = {
+            call.args[1].value
+            for call in ast.walk(tree)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "ScreenSignal"
+            and len(call.args) >= 2
+            and isinstance(call.args[1], ast.Constant)
+            and isinstance(call.args[1].value, str)
+        }
+        assert emitted == expected[module]
+        assert all(hasattr(module, identifier) for identifier in emitted)
 
 
 def test_probe_09_normalized_native_turn_confirms_banner_envelope_and_whitespace(tmp_path):
@@ -360,7 +483,7 @@ def test_probe_16_frozen_drain_sql_fixture_ratios():
     assert "grok_cli|4|2|3|3|1|0.5|0.75|0.75|0.25" in output
 
 
-def test_probe_17_lower_completion_beats_quoted_codex_spinner_and_is_ready():
+def test_probe_17_lower_completion_beats_quoted_spinner_and_delivery_opens(wave4_db):
     screen = [
         "Report excerpt: • Working (0s • esc to interrupt)",
         "• Gate r5 complete",
@@ -368,6 +491,60 @@ def test_probe_17_lower_completion_beats_quoted_codex_spinner_and_is_ready():
         "? for shortcuts",
     ]
     classification = _codex().classify_screen(screen)
+    create_terminal("codex_receiver", "session", "codex_receiver", "codex")
+    message = create_inbox_message("sender", "codex_receiver", "deliver incident payload")
+    observation = BoundaryObservation("epoch", TerminalStatus.IDLE, 1, 1, 1, None, 1)
+    monitor = StatusMonitor()
+    monitor._screens["codex_receiver"] = (  # noqa: SLF001 - acceptance frame
+        SimpleNamespace(display=screen, columns=220, lines=50),
+        object(),
+    )
+    monitor.get_boundary_observation = MagicMock(return_value=observation)
+    monitor.get_status = MagicMock(return_value=TerminalStatus.IDLE)
+    monitor.get_input_gen = MagicMock(return_value=1)
+    monitor.get_status_gen = MagicMock(return_value=1)
+    probe = MagicMock(wraps=monitor.probe_screen_status)
+    monitor.probe_screen_status = probe
+
+    def send(_terminal_id, _wire, **kwargs):
+        kwargs["on_submitted"](observation)
+        return observation
+
+    with (
+        patch("cli_agent_orchestrator.services.inbox_service.status_monitor", monitor),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
+            return_value=_codex(),
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
+            return_value=None,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.terminal_service.prepare_input",
+            side_effect=lambda _terminal, value, _kind: value,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.terminal_service.send_prepared_input",
+            side_effect=send,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.confirm_delivery",
+            return_value=("unverified", {"kind": "send_returned_unverified"}),
+        ),
+    ):
+        InboxService().deliver_pending("codex_receiver")
+
+    attempts = get_message_trace(message.id)["attempts"]
+    assert len(attempts) == 1
     assert classification.status == TerminalStatus.COMPLETED
     assert classification.signal_class == "completion"
     assert classification.row_index == 1
+    assert probe.call_count == 1
+    persisted_probe = attempts[0]["evidence"]["screen_probe"]
+    assert persisted_probe["result_status"] == TerminalStatus.COMPLETED.value
+    assert persisted_probe["law_signal"] == {
+        "class": "completion",
+        "provider_signal": "ASSISTANT_PREFIX_PATTERN",
+        "row_index": 1,
+    }
