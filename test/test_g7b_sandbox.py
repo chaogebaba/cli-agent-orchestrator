@@ -319,10 +319,16 @@ def test_claude_isolated_home_gets_nonsecret_onboarding_state(
 
 @pytest.mark.asyncio
 async def test_claude_failed_refresh_maps_named_error_and_rolls_back(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from cli_agent_orchestrator.providers import claude_code
 
+    plane = _plane(tmp_path, "claude_code")
+    plane.home.mkdir(parents=True)
+    assert plane.credential_path is not None
+    plane.credential_path.write_text('{"accessToken":"expired"}', encoding="utf-8")
+    monkeypatch.setattr(claude_code, "provider_home", lambda _provider: plane)
     provider = claude_code.ClaudeCodeProvider("tid", "session", "window", "developer")
     monkeypatch.setattr(
         claude_code, "wait_for_shell", lambda *a, **k: asyncio.sleep(0, result=True)
@@ -347,6 +353,9 @@ async def test_claude_failed_refresh_maps_named_error_and_rolls_back(
         match="provider_auth_refresh_failed:credential_write_failed",
     ):
         await provider.initialize()
+    assert json.loads(plane.credential_path.read_text(encoding="utf-8")) == {
+        "accessToken": "expired"
+    }
 
 
 def test_provider_pane_production_home_canary_mutation_is_fatal(tmp_path: Path) -> None:
