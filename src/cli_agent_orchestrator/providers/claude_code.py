@@ -24,7 +24,10 @@ from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.http import resolve_endpoint
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
-from cli_agent_orchestrator.utils.provider_auth import classify_auth_refresh_output
+from cli_agent_orchestrator.utils.provider_auth import (
+    ProviderAuthRefreshFailed,
+    classify_auth_refresh_output,
+)
 from cli_agent_orchestrator.utils.provider_plane import provider_home, wrap_claude_command
 from cli_agent_orchestrator.utils.sandbox_guard import bind_mcp_server_identity
 from cli_agent_orchestrator.utils.temp_path import cao_tmp_dir
@@ -513,6 +516,9 @@ class ClaudeCodeProvider(BaseProvider):
         bypass_accepted = False
         trust_accepted = False
         external_imports_rejected = False
+        reject_external_imports = (
+            provider_home("claude_code").classification == "shared-auth-read-only"
+        )
         while time.time() - start_time < timeout:
             output = get_backend().get_history(self.session_name, self.window_name)
             if not output:
@@ -540,8 +546,10 @@ class ClaudeCodeProvider(BaseProvider):
                 continue  # Trust prompt may follow
 
             # 2) Reject external imports before checking retained trust-prompt text.
-            if not external_imports_rejected and re.search(
-                EXTERNAL_IMPORT_PROMPT_PATTERN, clean_output
+            if (
+                reject_external_imports
+                and not external_imports_rejected
+                and re.search(EXTERNAL_IMPORT_PROMPT_PATTERN, clean_output)
             ):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
@@ -632,7 +640,7 @@ class ClaudeCodeProvider(BaseProvider):
                 "claude_code", get_backend().get_history(self.session_name, self.window_name)
             )
             if auth_state is not None:
-                raise ProviderError(f"provider_auth_refresh_failed:{auth_state}")
+                raise ProviderAuthRefreshFailed(auth_state)
             raise TimeoutError(f"Claude Code initialization timed out after {init_timeout}s")
 
         self._initialized = True

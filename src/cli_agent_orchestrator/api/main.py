@@ -133,6 +133,7 @@ from cli_agent_orchestrator.services.terminal_service import OutputMode, Termina
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.http import resolve_endpoint
 from cli_agent_orchestrator.utils.logging import setup_logging
+from cli_agent_orchestrator.utils.provider_auth import ProviderAuthRefreshFailed
 from cli_agent_orchestrator.utils.provider_plane import (
     NativeHomeIsolationUnavailable,
     provider_home,
@@ -1283,7 +1284,7 @@ async def create_session(
 
     except MailboxDomainError as e:
         raise _mailbox_http_exception(e) from e
-    except NativeHomeIsolationUnavailable as e:
+    except (NativeHomeIsolationUnavailable, ProviderAuthRefreshFailed) as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": e.code, "message": e.detail},
@@ -1330,7 +1331,7 @@ async def start_session_endpoint(
         )
     except MailboxDomainError as exc:
         raise _mailbox_http_exception(exc) from exc
-    except NativeHomeIsolationUnavailable as exc:
+    except (NativeHomeIsolationUnavailable, ProviderAuthRefreshFailed) as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": exc.code, "message": exc.detail},
@@ -1652,7 +1653,7 @@ async def create_terminal_in_session(
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
-    except NativeHomeIsolationUnavailable as e:
+    except (NativeHomeIsolationUnavailable, ProviderAuthRefreshFailed) as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": e.code, "message": e.detail},

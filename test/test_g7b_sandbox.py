@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import shutil
 import signal
 import stat
@@ -20,7 +21,10 @@ import pytest
 
 from cli_agent_orchestrator import sandbox_bootstrap as bootstrap
 from cli_agent_orchestrator.utils import provider_plane
-from cli_agent_orchestrator.utils.provider_auth import classify_auth_refresh_output
+from cli_agent_orchestrator.utils.provider_auth import (
+    ProviderAuthRefreshFailed,
+    classify_auth_refresh_output,
+)
 from cli_agent_orchestrator.utils.provider_plane import (
     CLAUDE_SANDBOX_MARKER,
     NativeHomeIsolationUnavailable,
@@ -338,16 +342,57 @@ def test_claude_command_wrap_keeps_unset_outside_and_uses_frozen_argv(
     (plane.native_home / "RTK.md").write_text("", encoding="utf-8")
     monkeypatch.setattr(claude_code, "provider_home", lambda _provider: plane)
     monkeypatch.setattr(provider_plane.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        provider_plane.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, stdout=f"{CLAUDE_SANDBOX_MARKER}\n", stderr=""
+        ),
+    )
+    provider_plane.preflight_claude_native_home(plane)
     provider = claude_code.ClaudeCodeProvider("tid", "session", "window", "missing")
     monkeypatch.setattr(provider, "_write_terminal_settings", lambda: Path("/tmp/settings"))
     command = provider._build_claude_command()
     unset, wrapped = command.split("; ", 1)
     assert unset.startswith("unset $(env")
-    assert wrapped.startswith("bwrap --bind / / --proc /proc --dev /dev --unshare-pid ")
+    assert wrapped.startswith("/usr/bin/bwrap --bind / / --proc /proc --dev /dev --unshare-pid ")
     assert f"--bind {plane.native_home} {Path.home() / '.claude'}" in wrapped
     assert "--die-with-parent -- env" in wrapped
     assert f"CLAUDE_CONFIG_DIR={plane.home}" in wrapped
     assert wrapped.endswith("--settings /tmp/settings --agent missing")
+
+
+def test_claude_launch_uses_exact_preflight_executable_with_divergent_pane_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plane = _plane(tmp_path, "claude_code")
+    assert plane.native_home is not None
+    plane.native_home.mkdir(parents=True)
+    (plane.native_home / "CLAUDE.md").write_text(f"{CLAUDE_SANDBOX_MARKER}\n", encoding="utf-8")
+
+    trusted = tmp_path / "server-bin"
+    attacker = tmp_path / "pane-bin"
+    trusted.mkdir()
+    attacker.mkdir()
+    trace = tmp_path / "launches"
+    for directory, label in ((trusted, "trusted"), (attacker, "attacker")):
+        executable = directory / "bwrap"
+        executable.write_text(
+            f"#!/bin/sh\nprintf '{label}\\n' >> \"$G7B_TRACE\"\nprintf '%s\\n' '{CLAUDE_SANDBOX_MARKER}'\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+
+    monkeypatch.setenv("G7B_TRACE", str(trace))
+    monkeypatch.setenv("PATH", str(trusted))
+    provider_plane.preflight_claude_native_home(plane)
+    command = provider_plane.wrap_claude_command(plane, ["ignored"])
+    assert command[0] == str((trusted / "bwrap").resolve())
+
+    pane_env = {**os.environ, "PATH": str(attacker), "G7B_TRACE": str(trace)}
+    result = subprocess.run(command, env=pane_env, check=False, capture_output=True, text=True)
+    assert result.returncode == 0
+    assert trace.read_text(encoding="utf-8").splitlines() == ["trusted", "trusted"]
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bwrap unavailable")
@@ -388,47 +433,92 @@ def _descendants(root_pid: int) -> set[int]:
     return descendants
 
 
-@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bwrap unavailable")
-def test_unshare_pid_tears_down_backgrounded_descendant(tmp_path: Path) -> None:
-    plane = _plane(tmp_path, "claude_code")
-    assert plane.native_home is not None
-    plane.native_home.mkdir(parents=True)
-    (plane.native_home / "CLAUDE.md").write_text(f"{CLAUDE_SANDBOX_MARKER}\n", encoding="utf-8")
-    (plane.native_home / "RTK.md").write_text("", encoding="utf-8")
-    command = [*provider_plane.wrap_claude_command(plane, ["sh", "-c", "sleep 60 & wait"])]
-    process = subprocess.Popen(command)
+def _parent_death_probe(plane: ProviderHome, *, die_with_parent: bool) -> set[int]:
+    provider_plane.preflight_claude_native_home(plane)
+    command = provider_plane.wrap_claude_command(plane, ["sh", "-c", "sleep 60 & wait"])
+    if not die_with_parent:
+        command.remove("--die-with-parent")
+    outer = subprocess.Popen(
+        ["sh", "-c", f"{shlex.join(command)} & wait $!"], start_new_session=True
+    )
     recorded: set[int] = set()
     try:
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            recorded = _descendants(process.pid)
-            if len(recorded) >= 2:
+            recorded = _descendants(outer.pid)
+            if len(recorded) >= 3:
                 break
             time.sleep(0.05)
-        assert len(recorded) >= 2
-        process.send_signal(signal.SIGTERM)
-        process.wait(timeout=5)
+        assert len(recorded) >= 3
+        os.kill(outer.pid, signal.SIGKILL)
+        outer.wait(timeout=5)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and any(
             Path(f"/proc/{pid}").exists() for pid in recorded
         ):
             time.sleep(0.05)
-        assert all(not Path(f"/proc/{pid}").exists() for pid in recorded)
+        return {pid for pid in recorded if Path(f"/proc/{pid}").exists()}
     finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait()
+        try:
+            os.killpg(outer.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        for pid in recorded:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if outer.poll() is None:
+            outer.kill()
+            outer.wait()
 
 
-def test_native_home_failure_has_exact_sync_http_and_deferred_codes(
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bwrap unavailable")
+def test_outer_parent_death_tears_down_full_bwrap_descendant_closure(tmp_path: Path) -> None:
+    plane = _plane(tmp_path, "claude_code")
+    assert plane.native_home is not None
+    plane.native_home.mkdir(parents=True)
+    (plane.native_home / "CLAUDE.md").write_text(f"{CLAUDE_SANDBOX_MARKER}\n", encoding="utf-8")
+    (plane.native_home / "RTK.md").write_text("", encoding="utf-8")
+    assert _parent_death_probe(plane, die_with_parent=True) == set()
+
+
+@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bwrap unavailable")
+def test_outer_parent_death_probe_kills_die_with_parent_removal_mutant(tmp_path: Path) -> None:
+    plane = _plane(tmp_path, "claude_code")
+    assert plane.native_home is not None
+    plane.native_home.mkdir(parents=True)
+    (plane.native_home / "CLAUDE.md").write_text(f"{CLAUDE_SANDBOX_MARKER}\n", encoding="utf-8")
+    (plane.native_home / "RTK.md").write_text("", encoding="utf-8")
+    assert _parent_death_probe(plane, die_with_parent=False)
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (
+            NativeHomeIsolationUnavailable("preflight denied"),
+            {
+                "code": "provider_native_home_isolation_unavailable",
+                "message": "preflight denied",
+            },
+        ),
+        (
+            ProviderAuthRefreshFailed("credential_write_failed"),
+            {"code": "provider_auth_refresh_failed", "message": "credential_write_failed"},
+        ),
+    ],
+)
+def test_typed_provider_failure_has_exact_sync_http_and_deferred_codes(
     monkeypatch: pytest.MonkeyPatch,
+    failure: RuntimeError,
+    expected: dict[str, str],
 ) -> None:
     from fastapi.testclient import TestClient
 
     from cli_agent_orchestrator.api import main
     from cli_agent_orchestrator.services import terminal_service
 
-    failure = NativeHomeIsolationUnavailable("preflight denied")
     monkeypatch.setattr(
         main, "require_provider_admitted", lambda _provider: (_ for _ in ()).throw(failure)
     )
@@ -445,14 +535,10 @@ def test_native_home_failure_has_exact_sync_http_and_deferred_codes(
         "/sessions/start",
         params={"agent_profile": "developer", "provider": "claude_code"},
     )
-    expected = {
-        "code": "provider_native_home_isolation_unavailable",
-        "message": "preflight denied",
-    }
     for result in (response, terminal_response, start_response):
         assert result.status_code == 500
         assert result.json()["detail"] == expected
-    assert terminal_service._failure_code(failure) == ("provider_native_home_isolation_unavailable")
+    assert terminal_service._failure_code(failure) == expected["code"]
 
 
 @pytest.mark.asyncio
@@ -492,10 +578,11 @@ async def test_deferred_native_home_failure_reports_typed_code(
     assert claim.call_args.args[3] == "provider_native_home_isolation_unavailable"
 
 
-@pytest.mark.asyncio
-async def test_sync_native_home_construction_failure_rolls_back_in_reverse_order(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def _configure_failing_sync_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: RuntimeError,
+) -> list[str]:
     from cli_agent_orchestrator.services import terminal_service
 
     events: list[str] = []
@@ -526,7 +613,7 @@ async def test_sync_native_home_construction_failure_rolls_back_in_reverse_order
         allocated_session_uuid = None
 
         async def initialize(self) -> bool:
-            raise NativeHomeIsolationUnavailable("wrap construction failed")
+            raise failure
 
     backend = Backend()
     monkeypatch.delenv("CAO_INSTANCE_ID", raising=False)
@@ -572,14 +659,57 @@ async def test_sync_native_home_construction_failure_rolls_back_in_reverse_order
         terminal_service.provider_manager, "cleanup_provider", lambda _terminal: None
     )
     monkeypatch.setattr(terminal_service.status_monitor, "clear_terminal", lambda _terminal: None)
+    return events
 
-    with pytest.raises(
-        NativeHomeIsolationUnavailable, match="provider_native_home_isolation_unavailable"
-    ):
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        NativeHomeIsolationUnavailable("wrap construction failed"),
+        ProviderAuthRefreshFailed("credential_write_failed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_sync_typed_provider_failure_rolls_back_in_reverse_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: RuntimeError
+) -> None:
+    from cli_agent_orchestrator.services import terminal_service
+
+    events = _configure_failing_sync_create(tmp_path, monkeypatch, failure)
+
+    with pytest.raises(type(failure), match=getattr(failure, "code")):
         await terminal_service.create_terminal(
             "claude_code", "developer", session_name="cao-s", new_session=True
         )
     assert events[-4:] == ["db-stop", "pipe-stop", "fifo-stop", "window-stop"]
+
+
+@pytest.mark.asyncio
+async def test_lease_backed_sync_create_preserves_typed_auth_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cli_agent_orchestrator.services import rebind_lease, terminal_service
+
+    failure = ProviderAuthRefreshFailed("transient_network_failure")
+    events = _configure_failing_sync_create(tmp_path, monkeypatch, failure)
+    monkeypatch.setattr(rebind_lease, "validate_rebind_lease", lambda *_args: None)
+    monkeypatch.setattr(
+        terminal_service,
+        "_delete_terminal_under_lease",
+        lambda *_args, **_kwargs: events.append("lease-rollback")
+        or {"rollback_kill_uncertain": False},
+    )
+
+    with pytest.raises(ProviderAuthRefreshFailed) as raised:
+        await terminal_service.create_terminal(
+            "claude_code",
+            "developer",
+            session_name="cao-s",
+            new_session=True,
+            lease_token=object(),
+        )
+    assert raised.value.last_state == "transient_network_failure"
+    assert events[-1] == "lease-rollback"
 
 
 def test_claude_isolated_home_gets_nonsecret_onboarding_state(
@@ -631,11 +761,11 @@ async def test_claude_failed_refresh_maps_named_error_and_rolls_back(
             return "Failed to save OAuth tokens"
 
     monkeypatch.setattr(claude_code, "get_backend", lambda: Backend())
-    with pytest.raises(
-        claude_code.ProviderError,
-        match="provider_auth_refresh_failed:credential_write_failed",
-    ):
+    with pytest.raises(ProviderAuthRefreshFailed) as raised:
         await provider.initialize()
+    assert raised.value.code == "provider_auth_refresh_failed"
+    assert raised.value.last_state == "credential_write_failed"
+    assert raised.value.detail == "credential_write_failed"
     assert json.loads(plane.credential_path.read_text(encoding="utf-8")) == {
         "accessToken": "expired"
     }

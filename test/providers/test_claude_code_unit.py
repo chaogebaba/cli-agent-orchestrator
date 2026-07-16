@@ -1481,8 +1481,12 @@ class TestClaudeCodeProviderStartupPrompts:
         assert mock_tmux.send_special_key.call_count == 2  # Enter for bypass + Enter for trust
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_trust_then_external_import_prompt_rejects_import(self, mock_tmux):
+    def test_handle_trust_then_external_import_prompt_rejects_import(self, mock_tmux, monkeypatch):
         """Sandbox startup rejects external CLAUDE.md imports after trusting the repo."""
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.provider_home",
+            lambda _provider: type("Plane", (), {"classification": "shared-auth-read-only"})(),
+        )
         mock_tmux.get_history.side_effect = [
             "❯ 1. Yes, I trust this folder\n  2. No",
             "Yes, I trust this folder\nAllow external CLAUDE.md file imports?\n"
@@ -1497,6 +1501,27 @@ class TestClaudeCodeProviderStartupPrompts:
             "test-session", "window-0", "\x1b[B", enter_count=0
         )
         assert mock_tmux.send_special_key.call_count == 2
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_handle_external_import_prompt_does_not_change_production_policy(
+        self, mock_tmux, monkeypatch
+    ):
+        """Production startup leaves the external-import decision to the operator."""
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.provider_home",
+            lambda _provider: type("Plane", (), {"classification": "production"})(),
+        )
+        mock_tmux.get_history.side_effect = [
+            "Allow external CLAUDE.md file imports?\n"
+            "❯ 1. Yes, allow external imports\n  2. No, disable external imports",
+            "Welcome to Claude Code v2.1.211",
+        ]
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider._handle_startup_prompts(timeout=5.0)
+
+        mock_tmux.send_keys.assert_not_called()
+        mock_tmux.send_special_key.assert_not_called()
 
     def test_get_status_trust_prompt_not_waiting_user_answer(self):
         """Test that trust prompt is NOT detected as WAITING_USER_ANSWER."""

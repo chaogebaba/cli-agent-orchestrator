@@ -12,6 +12,18 @@ AuthRefreshState = Literal[
     "auth_changed_skip",
 ]
 
+
+class ProviderAuthRefreshFailed(RuntimeError):
+    """Provider authentication refresh failed with a classified final state."""
+
+    code = "provider_auth_refresh_failed"
+
+    def __init__(self, last_state: AuthRefreshState) -> None:
+        self.last_state = last_state
+        self.detail = last_state
+        super().__init__(f"{self.code}:{last_state}")
+
+
 _TERMINAL: dict[str, tuple[str, ...]] = {
     "interactive_login_required": (
         "Authentication failed. Please check your API credentials.",

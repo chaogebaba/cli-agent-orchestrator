@@ -89,6 +89,7 @@ from cli_agent_orchestrator.services.session_env import (
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
+from cli_agent_orchestrator.utils.provider_auth import ProviderAuthRefreshFailed
 from cli_agent_orchestrator.utils.provider_plane import NativeHomeIsolationUnavailable
 from cli_agent_orchestrator.utils.sandbox_guard import bind_pane_identity, require_provider_admitted
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
@@ -958,7 +959,7 @@ async def create_terminal(
         else:
             try:
                 await provider_instance.initialize()
-            except NativeHomeIsolationUnavailable:
+            except (NativeHomeIsolationUnavailable, ProviderAuthRefreshFailed):
                 raise
             except TimeoutError:
                 raise
@@ -1151,7 +1152,7 @@ class _DeferredInitFailure(RuntimeError):
 
 
 def _failure_code(exc: BaseException) -> str:
-    if isinstance(exc, NativeHomeIsolationUnavailable):
+    if isinstance(exc, (NativeHomeIsolationUnavailable, ProviderAuthRefreshFailed)):
         return exc.code
     if isinstance(exc, (RetryableArtifactValidation, TerminalArtifactValidation)):
         return exc.code

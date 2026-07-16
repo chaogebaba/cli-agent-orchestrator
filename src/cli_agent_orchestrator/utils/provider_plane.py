@@ -16,6 +16,7 @@ from cli_agent_orchestrator.utils.sandbox_guard import SandboxProviderUnsafe
 
 PlaneClass = Literal["production", "shared-auth-read-only", "unsafe"]
 CLAUDE_SANDBOX_MARKER = "# G7 sandbox CLAUDE.md"
+_PREFLIGHTED_BWRAP: dict[tuple[str, str], str] = {}
 
 
 class NativeHomeIsolationUnavailable(RuntimeError):
@@ -131,11 +132,21 @@ def _selinux_avc_detail() -> str:
     return f"; recent SELinux AVC: {' | '.join(lines[-3:])}" if lines else ""
 
 
+def _claude_plane_key(plane: ProviderHome) -> tuple[str, str]:
+    if plane.native_home is None:
+        raise NativeHomeIsolationUnavailable("claude native home is not configured")
+    return (str(plane.home), str(plane.native_home))
+
+
 def preflight_claude_native_home(plane: ProviderHome) -> None:
     """Prove the exact pane-scoped bwrap mount before terminal side effects."""
-    executable = shutil.which("bwrap")
+    plane_key = _claude_plane_key(plane)
+    executable = _PREFLIGHTED_BWRAP.get(plane_key)
     if executable is None:
-        raise NativeHomeIsolationUnavailable("bwrap is not installed")
+        resolved = shutil.which("bwrap")
+        if resolved is None:
+            raise NativeHomeIsolationUnavailable("bwrap is not installed")
+        executable = str(Path(resolved).resolve())
     command = [
         *_claude_bwrap_prefix(plane, executable=executable),
         "--",
@@ -160,15 +171,17 @@ def preflight_claude_native_home(plane: ProviderHome) -> None:
         raise NativeHomeIsolationUnavailable(
             f"bwrap native-home preflight failed: {detail}{_selinux_avc_detail()}"
         )
+    _PREFLIGHTED_BWRAP.setdefault(plane_key, executable)
 
 
 def wrap_claude_command(plane: ProviderHome, command_parts: Sequence[str]) -> list[str]:
     """Return the frozen bwrap+env argv for the Claude compound command."""
-    if shutil.which("bwrap") is None:
-        raise NativeHomeIsolationUnavailable("bwrap is not installed")
+    executable = _PREFLIGHTED_BWRAP.get(_claude_plane_key(plane))
+    if executable is None:
+        raise NativeHomeIsolationUnavailable("bwrap native-home preflight was not completed")
     try:
         return [
-            *_claude_bwrap_prefix(plane),
+            *_claude_bwrap_prefix(plane, executable=executable),
             "--",
             "env",
             f"CLAUDE_CONFIG_DIR={plane.home}",
