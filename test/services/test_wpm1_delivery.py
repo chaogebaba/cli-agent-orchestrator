@@ -625,6 +625,10 @@ def test_incident2_replay_growth_injects_once_then_d2_confirms(wpm1_db):
     ):
         monitor.get_input_gen.return_value = 1
         monitor.get_status_gen.return_value = 1
+        monitor.probe_screen_status.return_value = (
+            TerminalStatus.IDLE,
+            {"result_status": "idle", "law_signal": {"class": "chrome"}},
+        )
         monitor.get_status.return_value = TerminalStatus.IDLE
         svc.deliver_pending("receiver")
         monitor.get_status.return_value = TerminalStatus.PROCESSING
@@ -954,6 +958,10 @@ def test_successor_restart_after_exhaustion_merge_injects_once(wpm1_db):
     ):
         monitor.get_input_gen.return_value = 1
         monitor.get_status_gen.return_value = 1
+        monitor.probe_screen_status.return_value = (
+            TerminalStatus.IDLE,
+            {"result_status": "idle", "law_signal": {"class": "chrome"}},
+        )
         monitor.get_boundary_observation.return_value = observation
         svc.deliver_pending("receiver")
     assert send.call_count == 1
@@ -1034,6 +1042,10 @@ def test_successor_restart_after_paste_return_recovers_and_never_respawns(wpm1_d
     ):
         monitor.get_input_gen.return_value = 1
         monitor.get_status_gen.return_value = 1
+        monitor.probe_screen_status.return_value = (
+            TerminalStatus.IDLE,
+            {"result_status": "idle", "law_signal": {"class": "chrome"}},
+        )
         monitor.get_boundary_observation.return_value = observation
         with pytest.raises(KeyboardInterrupt, match="crash after paste"):
             svc.deliver_pending("receiver")

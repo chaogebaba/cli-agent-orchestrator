@@ -129,6 +129,9 @@ def _assert_corrective_pre_paste_retries_untagged(scratch_db: Any, error: Except
         monitor.get_status.return_value = TerminalStatus.IDLE
         monitor.get_input_gen.return_value = 1
         monitor.get_status_gen.return_value = 3
+        monitor.probe_screen_status.return_value = (
+            TerminalStatus.IDLE, {"result_status": "idle"}
+        )
         service.deliver_pending("receiver")
         service.deliver_pending("receiver")
         service.deliver_pending("receiver")

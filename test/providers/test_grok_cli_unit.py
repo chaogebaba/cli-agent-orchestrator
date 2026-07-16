@@ -140,11 +140,11 @@ def test_grok_screen_status_quoted_spinner_line_is_processing() -> None:
     assert _provider().get_status_from_screen(screen) == TerminalStatus.PROCESSING
 
 
-def test_grok_screen_status_spinner_outside_bottom_twelve_is_idle() -> None:
+def test_grok_screen_status_spinner_outside_bottom_twelve_is_processing() -> None:
     screen = ["⠴ Old tool run… 1.9s", *[f"output row {i}" for i in range(11)]]
     screen.extend(["❯", "Grok 4.5 (high) · always-approve · ctrl+o transcript"])
 
-    assert _provider().get_status_from_screen(screen) == TerminalStatus.IDLE
+    assert _provider().get_status_from_screen(screen) == TerminalStatus.PROCESSING
 
 
 def test_grok_screen_status_glyph_only_line_above_prompt_is_idle() -> None:

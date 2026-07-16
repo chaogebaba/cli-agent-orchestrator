@@ -22,6 +22,11 @@ from typing import Any, Dict, List, Optional
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider, RetryableArtifactValidation
+from cli_agent_orchestrator.providers.screen_classification import (
+    ScreenClassification,
+    ScreenSignal,
+    classify_screen_signals,
+)
 from cli_agent_orchestrator.services.settings_service import (
     get_provider_defaults,
     get_server_settings,
@@ -65,6 +70,7 @@ FOOTER_HINT_PATTERN = (
     r"(?:\balways-approve\b|ctrl\+o transcript|Shift\+Tab:mode|Ctrl\+x:shortcuts)"
 )
 IDLE_FOOTER_PATTERN = FOOTER_HINT_PATTERN
+COMPOSER_PROMPT_PATTERN = r"^\s*(?:│\s*)?❯(?:\s|$)"
 EMPTY_DRAFT_PLACEHOLDERS = {
     "",
 }
@@ -358,34 +364,36 @@ class GrokCliProvider(BaseProvider):
 
         return TerminalStatus.PROCESSING
 
-    def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
+    def classify_screen(self, screen_lines: List[str]) -> ScreenClassification:
         rows = [line.rstrip() for line in screen_lines]
         while rows and not rows[-1].strip():
             rows.pop()
-        joined = "\n".join(rows)
-        if not joined.strip():
-            return TerminalStatus.UNKNOWN
+        signals: List[ScreenSignal] = []
+        completion_rows = [
+            index for index, row in enumerate(rows)
+            if re.search(COMPLETION_PATTERN, row)
+        ]
+        newest_completion = max(completion_rows, default=-1)
+        for index, row in enumerate(rows):
+            if re.search(WAITING_USER_ANSWER_PATTERN, row):
+                signals.append(ScreenSignal("waiting", "WAITING_USER_ANSWER_PATTERN", index))
+            if re.search(PROCESSING_PATTERN, row):
+                signals.append(ScreenSignal("progress", "PROCESSING_PATTERN", index))
+            if re.search(COMPLETION_PATTERN, row):
+                signals.append(ScreenSignal("completion", "COMPLETION_PATTERN", index))
+            # Grok errors are effective only after the newest completion.
+            if index > newest_completion and re.search(ERROR_PATTERN, row):
+                signals.append(ScreenSignal("error", "ERROR_PATTERN", index))
+            if re.search(IDLE_PROMPT_PATTERN, row):
+                signals.append(ScreenSignal("chrome", "IDLE_PROMPT_PATTERN", index))
+            if re.search(IDLE_FOOTER_PATTERN, row):
+                signals.append(ScreenSignal("chrome", "IDLE_FOOTER_PATTERN", index))
+            if re.search(COMPOSER_PROMPT_PATTERN, row):
+                signals.append(ScreenSignal("chrome", "COMPOSER_PROMPT_PATTERN", index))
+        return classify_screen_signals(signals)
 
-        if re.search(WAITING_USER_ANSWER_PATTERN, joined, re.MULTILINE):
-            return TerminalStatus.WAITING_USER_ANSWER
-
-        bottom = "\n".join(rows[-12:])
-        if re.search(PROCESSING_PATTERN, bottom, re.MULTILINE):
-            return TerminalStatus.PROCESSING
-
-        if self._has_error_after_last_completion(
-            joined,
-            self._last_match(COMPLETION_PATTERN, joined),
-        ):
-            return TerminalStatus.ERROR
-
-        if re.search(COMPLETION_PATTERN, joined) and re.search(IDLE_FOOTER_PATTERN, bottom):
-            return TerminalStatus.COMPLETED
-
-        if re.search(IDLE_FOOTER_PATTERN, bottom) or self.read_composer_draft(rows) is not None:
-            return TerminalStatus.IDLE
-
-        return TerminalStatus.UNKNOWN
+    def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
+        return self.classify_screen(screen_lines).status
 
     def read_composer_draft(self, screen_lines: List[str]) -> Optional[str]:
         """Read Grok's visible bottom composer draft from a rendered screen."""
@@ -404,7 +412,7 @@ class GrokCliProvider(BaseProvider):
         lower_bound = max(0, footer_idx - 8)
         prompt_idx = None
         for idx in range(footer_idx - 1, lower_bound - 1, -1):
-            if re.match(r"^\s*(?:│\s*)?❯(?:\s|$)", visible[idx]):
+            if re.match(COMPOSER_PROMPT_PATTERN, visible[idx]):
                 prompt_idx = idx
                 break
         if prompt_idx is None:

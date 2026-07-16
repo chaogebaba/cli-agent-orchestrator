@@ -148,6 +148,10 @@ def deliver_with_real_attempt(
         monitor.get_status.return_value = TerminalStatus.IDLE
         monitor.get_input_gen.return_value = 1
         monitor.get_status_gen.return_value = 1
+        monitor.probe_screen_status.return_value = (
+            TerminalStatus.IDLE,
+            {"result_status": "idle", "law_signal": {"class": "chrome"}},
+        )
         InboxService().deliver_pending(receiver_id, num_messages=num_messages)
     return pasted
 
@@ -410,6 +414,10 @@ def test_probe_03_publication_waits_until_actual_paste_releases_authority(
         monitor.get_boundary_observation.return_value = observation
         monitor.get_status.return_value = TerminalStatus.IDLE
         monitor.get_input_gen.return_value = monitor.get_status_gen.return_value = 1
+        monitor.probe_screen_status.return_value = (
+            TerminalStatus.IDLE,
+            {"result_status": "idle", "law_signal": {"class": "chrome"}},
+        )
         delivery_thread = threading.Thread(
             target=InboxService().deliver_pending, args=("11111111",)
         )
@@ -1058,6 +1066,10 @@ def test_probe_13_logical_insert_immediately_pastes_to_resolved_live_incarnation
         monitor.get_boundary_observation.return_value = observation
         monitor.get_status.return_value = TerminalStatus.IDLE
         monitor.get_input_gen.return_value = monitor.get_status_gen.return_value = 1
+        monitor.probe_screen_status.return_value = (
+            TerminalStatus.IDLE,
+            {"result_status": "idle", "law_signal": {"class": "chrome"}},
+        )
         response = client.post(
             "/terminals/mb_aaaaaaaa/inbox/messages",
             params={"sender_id": "99999999", "message": "inline"},

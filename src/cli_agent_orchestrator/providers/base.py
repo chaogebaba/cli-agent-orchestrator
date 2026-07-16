@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
+from cli_agent_orchestrator.providers.screen_classification import ScreenClassification
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +226,17 @@ class BaseProvider(ABC):
         (see ClaudeCodeProvider) and set ``supports_screen_detection = True``.
         """
         return self.get_status("\n".join(screen_lines))
+
+    def classify_screen(self, screen_lines: List[str]) -> ScreenClassification:
+        """Return status plus Wave 4 deciding evidence for a composited frame.
+
+        Providers migrated to the shared law override this. The fallback keeps
+        third-party providers source-compatible but deliberately emits no signal.
+        """
+        status = self.get_status_from_screen(screen_lines)
+        if status == TerminalStatus.RENDER_UNCERTAIN:
+            status = TerminalStatus.UNKNOWN
+        return ScreenClassification(status, "none", None, None)
 
     # Opt-in flag for preserving an unsent human composer draft before CAO
     # injects orchestrated input. Providers that set this True must implement

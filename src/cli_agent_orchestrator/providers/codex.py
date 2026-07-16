@@ -16,6 +16,11 @@ from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
 from cli_agent_orchestrator.providers.base import (
     BaseProvider, RetryableArtifactValidation, TerminalArtifactValidation,
 )
+from cli_agent_orchestrator.providers.screen_classification import (
+    ScreenClassification,
+    ScreenSignal,
+    classify_screen_signals,
+)
 from cli_agent_orchestrator.services.settings_service import (
     get_provider_defaults,
     get_server_settings,
@@ -70,6 +75,7 @@ USER_PREFIX_PATTERN = r"^(?:You\b|›[^\S\n]*\S)"
 # Strict idle prompt pattern for extraction: matches empty prompt lines only.
 # Distinguishes "› " (idle) from "› user message" (user input with text).
 IDLE_PROMPT_STRICT_PATTERN = r"^\s*(?:❯|›|codex>)\s*$"
+IDLE_PROMPT_SCREEN_PATTERN = rf"^\s*{IDLE_PROMPT_PATTERN}"
 
 PROCESSING_PATTERN = r"\b(thinking|working|running|executing|processing|analyzing)\b"
 WAITING_PROMPT_PATTERN = r"^(?:Approve|Allow)\b.*\b(?:y/n|yes/no|yes|no)\b"
@@ -91,6 +97,7 @@ TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])
 # Must be checked before COMPLETED to avoid false positives (the • matches
 # ASSISTANT_PREFIX_PATTERN and the TUI footer › matches idle prompt).
 TUI_PROGRESS_PATTERN = r"•.*\([^)]*\besc to interrupt\)"
+SCREEN_FALLBACK_PROCESSING_PATTERN = re.compile(r"\A[\s\S]*\Z")
 
 # Workspace trust/approval prompt shown when Codex opens a new directory
 TRUST_PROMPT_PATTERN = (
@@ -813,31 +820,73 @@ class CodexProvider(BaseProvider):
         r"\btab\s+to\s+queue\s+message\b",
     ]
 
-    def get_status_from_screen(self, screen_lines) -> TerminalStatus:
-        """Screen-specific detection: progress spinner anywhere wins.
-
-        On a composited screen (unlike the raw rolling buffer, where frames
-        from finished turns linger as bytes), a visible
-        "(… esc to interrupt)" spinner means the agent IS busy right now — a
-        finished turn erases that row. get_status() only checks the spinner
-        in the last 25 lines while its COMPLETED/IDLE checks scan wider
-        regions; on a screen the asymmetry is wrong (the ghost '› …'
-        suggestion hint at the bottom satisfies the idle-prompt check while
-        the spinner sits above the tail window), and it latched a busy codex
-        as COMPLETED for a whole turn — false-firing the stalled-callback
-        watchdog. Keep the raw-path get_status() untouched: scanning the
-        whole rolling buffer for spinner text would false-report PROCESSING
-        from stale frames after completion.
-        """
+    def classify_screen(self, screen_lines: list[str]) -> ScreenClassification:
+        """Produce Codex signals while preserving the existing fixture corpus."""
         joined = "\n".join(screen_lines)
         clean = strip_terminal_escapes(joined)
-        if re.search(TUI_PROGRESS_PATTERN, clean, re.MULTILINE):
-            return TerminalStatus.PROCESSING
-        nonblank = [ln.strip() for ln in clean.splitlines() if ln.strip()]
-        terminal_line = nonblank[-1] if nonblank else ""
-        if DIALOG_ACTION_FOOTER_PATTERN.search(terminal_line):
-            return TerminalStatus.WAITING_USER_ANSWER
-        return self.get_status(joined)
+        rows = clean.splitlines()
+        legacy_status = self.get_status(joined)
+        chrome_rows = [
+            index for index, row in enumerate(rows)
+            if re.search(IDLE_PROMPT_SCREEN_PATTERN, row, re.IGNORECASE)
+        ]
+        progress_rows = [
+            index for index, row in enumerate(rows)
+            if re.search(TUI_PROGRESS_PATTERN, row) is not None
+        ]
+        terminal_index = next(
+            (index for index in range(len(rows) - 1, -1, -1) if rows[index].strip()),
+            -1,
+        )
+        signals: list[ScreenSignal] = []
+        for index, row in enumerate(rows):
+            progress = re.search(TUI_PROGRESS_PATTERN, row) is not None
+            if progress:
+                signals.append(ScreenSignal("progress", "TUI_PROGRESS_PATTERN", index))
+            if TRUST_SELECTOR_PATTERN.search(row):
+                signals.append(ScreenSignal("waiting", "TRUST_SELECTOR_PATTERN", index))
+            if index == terminal_index and DIALOG_ACTION_FOOTER_PATTERN.search(row):
+                signals.append(
+                    ScreenSignal("waiting", "DIALOG_ACTION_FOOTER_PATTERN", index)
+                )
+            if legacy_status == TerminalStatus.WAITING_USER_ANSWER and re.search(
+                WAITING_PROMPT_PATTERN, row, re.IGNORECASE
+            ):
+                signals.append(ScreenSignal("waiting", "WAITING_PROMPT_PATTERN", index))
+            if legacy_status == TerminalStatus.ERROR and re.search(
+                ERROR_PATTERN, row, re.IGNORECASE
+            ):
+                signals.append(ScreenSignal("error", "ERROR_PATTERN", index))
+            assistant = re.search(ASSISTANT_PREFIX_PATTERN, row, re.IGNORECASE) is not None
+            excluded_assistant = bool(
+                re.search(MCP_TOOL_CALL_PATTERN, row, re.IGNORECASE)
+                or re.search(SYSTEM_NOTICE_PATTERN, row, re.IGNORECASE)
+            )
+            if assistant and not excluded_assistant and (
+                legacy_status == TerminalStatus.COMPLETED
+                or progress
+                or (bool(progress_rows) and index > max(progress_rows) and bool(chrome_rows))
+            ):
+                signals.append(
+                    ScreenSignal("completion", "ASSISTANT_PREFIX_PATTERN", index)
+                )
+            if index in chrome_rows:
+                signals.append(ScreenSignal("chrome", "IDLE_PROMPT_SCREEN_PATTERN", index))
+
+        # Codex historically treats a signal-free screen as PROCESSING. Keep
+        # that output byte-identical for the existing corpus with an explicit,
+        # named producer fallback; it participates only when no law signal exists.
+        if not signals and legacy_status == TerminalStatus.PROCESSING:
+            assert SCREEN_FALLBACK_PROCESSING_PATTERN.search(clean)
+            signals.append(
+                ScreenSignal(
+                    "progress", "SCREEN_FALLBACK_PROCESSING_PATTERN", max(len(rows) - 1, 0)
+                )
+            )
+        return classify_screen_signals(signals)
+
+    def get_status_from_screen(self, screen_lines: list[str]) -> TerminalStatus:
+        return self.classify_screen(screen_lines).status
 
     def read_composer_draft(self, screen_lines: list[str]) -> str | None:
         """Read the visible Codex composer draft from rendered screen lines.

@@ -100,6 +100,9 @@ def _deliver_busy(wpm3_db, monkeypatch, *, provider_name="claude_code",
         monitor.get_boundary_observation.return_value = _observation(TerminalStatus.PROCESSING)
         monitor.get_status.return_value = TerminalStatus.PROCESSING
         monitor.get_input_gen.return_value = monitor.get_status_gen.return_value = 1
+        monitor.probe_screen_status.return_value = (
+            TerminalStatus.IDLE, {"result_status": "idle"}
+        )
         InboxService().deliver_pending(receiver)
     return message, paste
 
@@ -449,6 +452,9 @@ def test_wpm3_invalid_snapshot_releases_disjoint_work(wpm3_db):
         monitor.get_boundary_observation.return_value = SimpleNamespace(status="invalid")
         monitor.get_status.return_value = TerminalStatus.COMPLETED
         monitor.get_input_gen.return_value = monitor.get_status_gen.return_value = 1
+        monitor.probe_screen_status.return_value = (
+            TerminalStatus.IDLE, {"result_status": "idle"}
+        )
         InboxService().deliver_pending("receiver")
     assert paste.call_count == 1
     assert get_message_trace(protected.id)["message"]["status"] == "pending"
@@ -489,6 +495,9 @@ def _post_submit_multi_group(wpm3_db, error, proof_result="settled"):
     ):
         monitor.get_boundary_observation.return_value = _observation(TerminalStatus.IDLE)
         monitor.get_input_gen.return_value = monitor.get_status_gen.return_value = 1
+        monitor.probe_screen_status.return_value = (
+            TerminalStatus.IDLE, {"result_status": "idle"}
+        )
         InboxService().deliver_pending("receiver", num_messages=0)
     assert prepared == ["one"]
     proof_safe.assert_called_once()

@@ -5,11 +5,13 @@ Publisher: terminal.{id}.status
 """
 
 import asyncio
+import hashlib
 import logging
 import threading
 import uuid
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Dict, List, Literal, Optional, Tuple, TypedDict
 
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
@@ -22,6 +24,46 @@ from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
+
+ScreenProbeResult = Literal[
+    "waiting_user_answer", "error", "processing", "completed", "idle", "unknown"
+]
+ScreenProbeSignalClass = Literal[
+    "waiting", "error", "progress", "completion", "chrome", "none"
+]
+
+
+class ScreenProbeGeometry(TypedDict):
+    columns: int
+    rows: int
+
+
+ScreenProbeLawSignal = TypedDict(
+    "ScreenProbeLawSignal",
+    {
+        "class": ScreenProbeSignalClass,
+        "provider_signal": str | None,
+        "row_index": int | None,
+    },
+)
+
+
+class ScreenProbeMeta(TypedDict):
+    probed_at: str
+    geometry: ScreenProbeGeometry
+    frame_rows_hash: str
+    result_status: ScreenProbeResult
+    law_signal: ScreenProbeLawSignal
+
+
+def _frame_rows_hash(rows: List[str]) -> str:
+    """SHA-256 over an unambiguous length-delimited UTF-8 row sequence."""
+    digest = hashlib.sha256()
+    for row in rows:
+        encoded = row.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
 
 # Statuses that represent a stable "ready" state — the agent has finished
 # producing output and is waiting for further input. Once latched, the
@@ -960,6 +1002,72 @@ class StatusMonitor:
         ``_detect_screen`` callers do).
         """
         self._apply_detection(terminal_id, status)
+
+    def probe_screen_status(
+        self, terminal_id: str
+    ) -> Tuple[TerminalStatus, ScreenProbeMeta]:
+        """Reclassify one locked copy of the latest composited screen frame."""
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except Exception:
+            provider = None
+        with self._lock:
+            screen_state = self._screens.get(terminal_id)
+            if screen_state is None:
+                rows: List[str] = []
+                columns = 0
+                row_count = 0
+            else:
+                screen = screen_state[0]
+                try:
+                    rows = list(getattr(screen, "display", []))
+                    columns = int(getattr(screen, "columns", 0))
+                    row_count = int(getattr(screen, "lines", len(rows)))
+                except Exception:
+                    logger.exception("Error snapshotting screen probe for %s", terminal_id)
+                    rows = []
+                    columns = 0
+                    row_count = 0
+
+        if rows and provider is not None:
+            try:
+                classification = provider.classify_screen(rows)
+            except Exception:
+                logger.exception("Error classifying admission screen for %s", terminal_id)
+                from cli_agent_orchestrator.providers.screen_classification import (
+                    classify_screen_signals,
+                )
+
+                classification = classify_screen_signals([])
+        else:
+            from cli_agent_orchestrator.providers.screen_classification import (
+                classify_screen_signals,
+            )
+
+            classification = classify_screen_signals([])
+
+        status_values: Dict[TerminalStatus, ScreenProbeResult] = {
+            TerminalStatus.WAITING_USER_ANSWER: "waiting_user_answer",
+            TerminalStatus.ERROR: "error",
+            TerminalStatus.PROCESSING: "processing",
+            TerminalStatus.COMPLETED: "completed",
+            TerminalStatus.IDLE: "idle",
+            TerminalStatus.UNKNOWN: "unknown",
+        }
+        assert classification.status != TerminalStatus.RENDER_UNCERTAIN
+        result_status = status_values[classification.status]
+        meta: ScreenProbeMeta = {
+            "probed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "geometry": {"columns": columns, "rows": row_count},
+            "frame_rows_hash": _frame_rows_hash(rows),
+            "result_status": result_status,
+            "law_signal": {
+                "class": classification.signal_class,
+                "provider_signal": classification.provider_signal,
+                "row_index": classification.row_index,
+            },
+        }
+        return classification.status, meta
 
     def get_rendered_screen(self, terminal_id: str) -> Optional[List[str]]:
         """Return the current pyte-composited screen for a terminal if present."""

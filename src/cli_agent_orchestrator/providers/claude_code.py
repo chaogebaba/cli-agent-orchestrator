@@ -15,6 +15,11 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import API_BASE_URL, CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.screen_classification import (
+    ScreenClassification,
+    ScreenSignal,
+    classify_screen_signals,
+)
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
@@ -151,6 +156,8 @@ NEW_TUI_SPINNER_PATTERN = r"[✶✢✽✻✳·*][^\n]*ing…"
 # ("* Remember to deploy…") or the version footer ("· latest: … update…")
 # sitting directly above the box from being misread as a live spinner.
 NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*ing\b.*…")
+NEW_TUI_BOX_RAIL_PATTERN = re.compile(r"─{8,}")
+NEW_TUI_BOX_PROMPT_PATTERN = re.compile(r"[>❯](?:[\s\xa0]|$)")
 
 # Claude pins its dialogs and composer near the bottom of the viewport. Keep this
 # shared with get_status_from_screen so both classifiers inspect the same region.
@@ -798,91 +805,61 @@ class ClaudeCodeProvider(BaseProvider):
     # detector below is tuned for a COMPOSITED viewport, not the raw stream.
     supports_screen_detection = True
 
-    def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
-        """Detect status from a pyte-composited viewport (escape-free rows).
-
-        Anchors on the bottom of the rendered screen — exactly what a human
-        sees — rather than scanning a raw redraw stream. The StatusMonitor only
-        calls this on settled / rising-edge frames (quiescence debounce), so it
-        does not need to tolerate mid-repaint frames.
-
-        Precedence: a live spinner in the bottom region wins (PROCESSING); then
-        the Ink selection footer (WAITING_USER_ANSWER); then, if the BOXED input
-        prompt is visible, COMPLETED when a response/completion-summary is on
-        screen above it, else IDLE.
-
-        The prompt must be the real input box — a ``❯``/``>`` line adjacent to a
-        ``────`` separator — NOT any line containing ``> ``. During launch the
-        echoed command (whose system-prompt text contains ``> ``) would
-        otherwise read as an idle prompt and declare the terminal ready before
-        Claude's TUI has even rendered, breaking init (observed live).
-        """
-        rows = [ln.rstrip() for ln in screen_lines if ln.strip()]
+    def classify_screen(self, screen_lines: List[str]) -> ScreenClassification:
+        """Produce Claude signals and apply the provider-blind Wave 4 law."""
+        rows = [line.rstrip() for line in screen_lines if line.strip()]
         if not rows:
-            return TerminalStatus.UNKNOWN
+            return classify_screen_signals([])
         joined = "\n".join(rows)
-        bottom = rows[-CLAUDE_STATUS_BOTTOM_ROWS:]
+        separator_rows = [
+            index for index, row in enumerate(rows)
+            if NEW_TUI_BOX_RAIL_PATTERN.search(row)
+        ]
+        prompt_rows = [
+            index for index, row in enumerate(rows)
+            if NEW_TUI_BOX_PROMPT_PATTERN.search(row)
+        ]
+        boxed_prompt_rows = [
+            prompt for prompt in prompt_rows
+            if any(0 < prompt - rail <= 2 for rail in separator_rows)
+            and any(0 < rail - prompt <= 2 for rail in separator_rows)
+        ]
+        waiting = _is_ink_selection_waiting(joined)
+        signals: List[ScreenSignal] = []
+        for index, row in enumerate(rows):
+            if waiting and re.search(WAITING_USER_ANSWER_PATTERN, row):
+                signals.append(
+                    ScreenSignal("waiting", "WAITING_USER_ANSWER_PATTERN", index)
+                )
+            # The gerund-first structural matcher filters the broader ellipsis
+            # pattern so settled markdown bullets cannot become progress.
+            if NEW_TUI_BOX_SPINNER_PATTERN.search(row):
+                signals.append(
+                    ScreenSignal("progress", "NEW_TUI_BOX_SPINNER_PATTERN", index)
+                )
+                if re.search(PROCESSING_PATTERN, row):
+                    signals.append(ScreenSignal("progress", "PROCESSING_PATTERN", index))
+            background_wait = BACKGROUND_WAIT_PATTERN.search(row) is not None
+            if background_wait:
+                signals.append(
+                    ScreenSignal("progress", "BACKGROUND_WAIT_PATTERN", index)
+                )
+            # A live background-wait row is never a completion candidate even
+            # though the lenient glyph+"for" completion regex overlaps it.
+            if not background_wait and re.search(GET_STATUS_COMPLETION_PATTERN, row):
+                signals.append(
+                    ScreenSignal("completion", "GET_STATUS_COMPLETION_PATTERN", index)
+                )
+            if not background_wait and EXTRACTION_RESPONSE_PATTERN.search(row):
+                signals.append(
+                    ScreenSignal("completion", "EXTRACTION_RESPONSE_PATTERN", index)
+                )
+        for index in boxed_prompt_rows:
+            signals.append(ScreenSignal("chrome", "NEW_TUI_BOX_PATTERN", index))
+        return classify_screen_signals(signals)
 
-        # Live spinner: "✻ <gerund>… (…)" — the boxed-prompt spinner or a bare
-        # spinner line. Visible in a composited frame ⇒ genuinely working.
-        #
-        # Use ONLY the gerund-first NEW_TUI_BOX_SPINNER_PATTERN, not the looser
-        # NEW_TUI_SPINNER_PATTERN. The loose pattern ([glyph][^\n]*ing…) is
-        # documented (see its definition) as too permissive precisely because
-        # its glyph class includes the markdown bullets "·"/"*", so a settled
-        # response bullet ending in a gerund + ellipsis ("* …after deploying…")
-        # in the bottom region reads as a live spinner — a false PROCESSING that
-        # then latches and starves InboxService (delivers only on IDLE/COMPLETED).
-        # The raw get_status() path already switched to the tight pattern for the
-        # same reason; the screen path must match.
-        if any(NEW_TUI_BOX_SPINNER_PATTERN.search(ln) for ln in bottom):
-            return TerminalStatus.PROCESSING
-
-        bottom_joined = "\n".join(bottom)
-        if _is_ink_selection_waiting(bottom_joined):
-            return TerminalStatus.WAITING_USER_ANSWER
-
-        # Background task still running (GH #392): "✻ Waiting for N dynamic
-        # workflow(s)…" has no spinner ellipsis, so the spinner check above
-        # misses it, while the response + boxed-prompt signature below would
-        # read COMPLETED. Checked AFTER the Ink selection footer on purpose: a
-        # permission prompt co-rendering with a wait line must surface as
-        # WAITING_USER_ANSWER (a security gate the user has to answer), never
-        # be masked as "working" — mirrors the raw path's precedence. The
-        # composited screen shows only LIVE content — the line disappears on
-        # the finished repaint — so presence in the bottom region is a safe
-        # PROCESSING signal (no staleness risk, unlike the raw buffer path).
-        if any(BACKGROUND_WAIT_PATTERN.search(ln) for ln in bottom):
-            return TerminalStatus.PROCESSING
-
-        # Real input box: a prompt line with a "────" rail BOTH within 2 rows
-        # above AND within 2 rows below — the "──── / ❯ / ────" box Claude pins
-        # to the bottom of the viewport.
-        sep_idx = [i for i, ln in enumerate(rows) if re.search(r"─{8,}", ln)]
-        # Prompt line: ❯/> followed by whitespace OR alone at end-of-line. The
-        # bare-glyph case matters because rows are rstrip()ed: an EMPTY prompt
-        # box renders as "❯" + pyte's space padding, which rstrip reduces to a
-        # bare "❯" that IDLE_PROMPT_PATTERN (glyph + whitespace) cannot match.
-        # We deliberately do NOT require the prompt line to be empty — a ready
-        # box carries placeholder text (❯ Try "fix typecheck errors").
-        prompt_idx = [i for i, ln in enumerate(rows) if re.search(r"[>❯](?:[\s\xa0]|$)", ln)]
-        # Require BOTH rails, not just one nearby separator: during launch the
-        # echoed "> " system-prompt quote can land within 2 rows of a single
-        # early-painted ──── rule, which a one-sided adjacency misread as a ready
-        # prompt (premature IDLE on init — the first task then hits a not-ready
-        # agent). The real box always has a rail above AND below the prompt.
-        boxed_prompt = any(
-            any(0 < pi - si <= 2 for si in sep_idx) and any(0 < si - pi <= 2 for si in sep_idx)
-            for pi in prompt_idx
-        )
-        if boxed_prompt:
-            if re.search(
-                GET_STATUS_COMPLETION_PATTERN, joined
-            ) or EXTRACTION_RESPONSE_PATTERN.search(joined):
-                return TerminalStatus.COMPLETED
-            return TerminalStatus.IDLE
-
-        return TerminalStatus.UNKNOWN
+    def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
+        return self.classify_screen(screen_lines).status
 
     def read_composer_draft(self, screen_lines: List[str]) -> Optional[str]:
         """Read Claude Code's boxed composer, excluding dim placeholder hints."""

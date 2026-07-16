@@ -312,6 +312,9 @@ def test_wpm2_busy_claude_real_empty_frame_reaches_initial_paste(wpm2_db):
         monitor.get_boundary_observation.return_value = _observation(
             TerminalStatus.PROCESSING)
         monitor.get_input_gen.return_value = monitor.get_status_gen.return_value = 1
+        monitor.probe_screen_status.return_value = (
+            TerminalStatus.IDLE, {"result_status": "idle"}
+        )
         InboxService().deliver_pending("receiver")
     assert paste.call_count == 1
     trace = get_message_trace(message.id)
@@ -838,6 +841,9 @@ def _deliver_scenario(wpm2_db, *, admission_status, submit_status=None,
         try:
             with patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor:
                 monitor.get_input_gen.return_value = monitor.get_status_gen.return_value = 1
+                monitor.probe_screen_status.return_value = (
+                    TerminalStatus.IDLE, {"result_status": "idle"}
+                )
                 if snapshot_error is not None:
                     monitor.get_boundary_observation.side_effect = snapshot_error
                 elif malformed_snapshot:
@@ -981,6 +987,9 @@ def test_wpm2_busy_initial_compact_cycles_never_exhaust(wpm2_db):
         monitor.get_boundary_observation.side_effect = lambda _terminal: observation[0]
         monitor.get_status.side_effect = lambda _terminal: observation[0].status
         monitor.get_input_gen.return_value = monitor.get_status_gen.return_value = 1
+        monitor.probe_screen_status.return_value = (
+            TerminalStatus.IDLE, {"result_status": "idle"}
+        )
         service = InboxService()
         service.deliver_pending("receiver")
         assert len(pastes) == 1
@@ -1055,6 +1064,9 @@ def _release_disjoint(wpm2_db, evidences, *, num_messages=1, transient=False):
         monitor.get_boundary_observation.side_effect = boundary
         monitor.get_status.return_value = TerminalStatus.IDLE
         monitor.get_input_gen.return_value = monitor.get_status_gen.return_value = 1
+        monitor.probe_screen_status.return_value = (
+            TerminalStatus.IDLE, {"result_status": "idle"}
+        )
         InboxService().deliver_pending("receiver", num_messages=num_messages)
     return protected, later, paste.call_count
 
@@ -1478,6 +1490,9 @@ def test_wpm2_overflow_absent_refresh_advances_baseline_then_opens(wpm2_db, tmp_
     ):
         monitor.get_boundary_observation.return_value = cycle
         monitor.get_input_gen.return_value = monitor.get_status_gen.return_value = 1
+        monitor.probe_screen_status.return_value = (
+            TerminalStatus.IDLE, {"result_status": "idle"}
+        )
         # Fresh service object is the restart cut after the capped opener wake.
         InboxService().deliver_pending("receiver")
     trace = get_message_trace(message.id)
@@ -1528,6 +1543,9 @@ def test_wpm2_overflow_cursor_crash_before_and_after_commit(wpm2_db, tmp_path):
     ):
         monitor.get_boundary_observation.return_value = cycle
         monitor.get_input_gen.return_value = monitor.get_status_gen.return_value = 1
+        monitor.probe_screen_status.return_value = (
+            TerminalStatus.IDLE, {"result_status": "idle"}
+        )
         # Fresh service/process after the pre-commit crash rescans and commits w5.
         InboxService().deliver_pending("receiver")
     after = json.loads(_attempt_row(wpm2_db, attempt).evidence)["last_observed_ref"]

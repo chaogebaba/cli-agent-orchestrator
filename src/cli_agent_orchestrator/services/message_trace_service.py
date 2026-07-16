@@ -25,6 +25,13 @@ logger = logging.getLogger(__name__)
 _unresolved_warned: set[str] = set()
 _unresolved_warned_lock = threading.Lock()
 
+NORMALIZED_CONFIRMATION_MIN_CHARS = 48
+REDELIVERY_TAG_BANNER_PATTERN = re.compile(
+    r"\A\[redelivery of attempt [0-9a-fA-F]{8} - prior delivery unconfirmed; "
+    r"ignore if already received\](?:\r?\n)?"
+)
+USER_QUERY_ENVELOPE_PATTERN = re.compile(r"\A<user_query>([\s\S]*)</user_query>\Z")
+
 
 @dataclass(frozen=True, eq=False)
 class TranscriptLiveReference:
@@ -55,6 +62,22 @@ class TranscriptResolution:
 
 def wire_hash(payload: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def normalized_confirmation_fingerprint(payload: str) -> tuple[str, int] | None:
+    """Return the safe-narrow rung-3 fingerprint for one whole eligible record."""
+    core = REDELIVERY_TAG_BANNER_PATTERN.sub("", payload, count=1)
+    envelope = USER_QUERY_ENVELOPE_PATTERN.fullmatch(core)
+    if envelope is not None:
+        core = envelope.group(1)
+        if core.startswith("\n"):
+            core = core[1:]
+        if core.endswith("\n"):
+            core = core[:-1]
+    core = " ".join(core.split())
+    if len(core) < NORMALIZED_CONFIRMATION_MIN_CHARS:
+        return None
+    return wire_hash(core), len(core)
 
 
 def _fd_codex_session(metadata: dict) -> str | None:
@@ -361,7 +384,8 @@ def _queue_operation(record: dict, payload_hash: str) -> dict | None:
 
 def transcript_lookup(path: Path, payload_hash: str, started_at=None,
                       expected_ref: dict | None = None,
-                      scan_from_start: bool = False) -> tuple[str, dict]:
+                      scan_from_start: bool = False,
+                      normalized_payload_hash: str | None = None) -> tuple[str, dict]:
     """Return hit, absent, or unresolved with bounded continuity evidence."""
     if isinstance(path, TranscriptResolution):
         path = path.path
@@ -387,6 +411,7 @@ def transcript_lookup(path: Path, payload_hash: str, started_at=None,
             threshold = threshold.replace(tzinfo=timezone.utc)
         byte_offset = baseline_size
         queued_command_evidence = None
+        normalized_evidence = None
         queue_corroboration = None
         for line in raw.splitlines(keepends=True):
             line_offset = byte_offset
@@ -419,6 +444,17 @@ def transcript_lookup(path: Path, payload_hash: str, started_at=None,
                     return "hit", {"kind": "transcript_user_turn", "path": str(path),
                                    "offset": line_offset, "inode": after.st_ino,
                                    "size": after.st_size}
+                fingerprint = normalized_confirmation_fingerprint(candidate)
+                if (normalized_evidence is None and normalized_payload_hash is not None
+                        and fingerprint is not None
+                        and fingerprint[0] == normalized_payload_hash):
+                    normalized_evidence = {
+                        "kind": "transcript_user_turn_normalized",
+                        "path": str(path),
+                        "offset": line_offset,
+                        "inode": after.st_ino,
+                        "size": after.st_size,
+                    }
             if (queued_command_evidence is None and queued_prompt is not None and
                     wire_hash(queued_prompt) == payload_hash):
                 queued_command_evidence = {
@@ -428,6 +464,17 @@ def transcript_lookup(path: Path, payload_hash: str, started_at=None,
                     "inode": after.st_ino,
                     "size": after.st_size,
                 }
+            if queued_prompt is not None and normalized_payload_hash is not None:
+                queued_fingerprint = normalized_confirmation_fingerprint(queued_prompt)
+                if (normalized_evidence is None and queued_fingerprint is not None
+                        and queued_fingerprint[0] == normalized_payload_hash):
+                    normalized_evidence = {
+                        "kind": "transcript_user_turn_normalized",
+                        "path": str(path),
+                        "offset": line_offset,
+                        "inode": after.st_ino,
+                        "size": after.st_size,
+                    }
             if queue_op is not None:
                 queue_corroboration = {**queue_op, "offset": line_offset}
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -436,6 +483,10 @@ def transcript_lookup(path: Path, payload_hash: str, started_at=None,
         if queue_corroboration is not None:
             queued_command_evidence["queue_corroboration"] = queue_corroboration
         return "hit", queued_command_evidence
+    if normalized_evidence is not None:
+        if queue_corroboration is not None:
+            normalized_evidence["queue_corroboration"] = queue_corroboration
+        return "hit", normalized_evidence
     absent = {"kind": "transcript_absent", "path": str(path),
               "inode": after.st_ino, "size": after.st_size}
     if queue_corroboration is not None:
@@ -594,25 +645,40 @@ def continuity_aware_lookup(
         reference = resolution.live_reference
         continuity_ref = {
             "path": str(reference.path), "inode": reference.inode, "size": reference.size,
+            **{
+                key: continuity_ref[key]
+                for key in ("normalized_payload_hash", "normalized_payload_length")
+                if key in continuity_ref
+            },
         }
         extra = {
             "continuity_reseed": "binding_epoch",
             "continuity_reseed_old_path": old_path,
             "continuity_reseed_new_path": str(reference.path),
         }
+    normalized_payload_hash = continuity_ref.get("normalized_payload_hash")
     outcome, evidence = transcript_lookup(
         resolution.path, payload_hash, started_at, continuity_ref,
         scan_from_start=reseed,
+        normalized_payload_hash=(
+            normalized_payload_hash if isinstance(normalized_payload_hash, str) else None
+        ),
     )
     return outcome, _with_resolution_evidence({**evidence, **extra}, resolution)
 
 
 def confirm_delivery(metadata: dict, payload_hash: str, started_at=None,
                      expected_ref: dict | None = None,
-                     timeout: float = 10.0) -> tuple[str, dict]:
+                     timeout: float = 10.0,
+                     wire_payload: str | None = None) -> tuple[str, dict]:
     deadline = time.monotonic() + timeout
     last = ("unverified", {"kind": "send_returned_unverified"})
     continuity_ref = dict(expected_ref or {})
+    if wire_payload is not None:
+        fingerprint = normalized_confirmation_fingerprint(wire_payload)
+        if fingerprint is not None:
+            continuity_ref["normalized_payload_hash"] = fingerprint[0]
+            continuity_ref["normalized_payload_length"] = fingerprint[1]
     saw_resolution = False
     if timeout <= 0:
         resolution = resolve_session_transcript(metadata)

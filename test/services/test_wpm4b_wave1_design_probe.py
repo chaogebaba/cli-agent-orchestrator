@@ -364,6 +364,9 @@ def test_real_deliver_pending_replay_tags_exact_wire_and_trace(scratch_db):
         monitor.get_status.return_value = TerminalStatus.IDLE
         monitor.get_input_gen.return_value = 1
         monitor.get_status_gen.return_value = 3
+        monitor.probe_screen_status.return_value = (
+            TerminalStatus.IDLE, {"result_status": "idle"}
+        )
         service.deliver_pending("receiver")
         service.deliver_pending("receiver")
 
@@ -426,6 +429,9 @@ def test_failed_pre_paste_attempt_retries_without_tag(scratch_db):
         monitor.get_boundary_observation.return_value = _observation(0, non_ready=None, ready=0)
         monitor.get_input_gen.return_value = 1
         monitor.get_status_gen.return_value = 3
+        monitor.probe_screen_status.return_value = (
+            TerminalStatus.IDLE, {"result_status": "idle"}
+        )
         service.deliver_pending("receiver")
 
     sent.assert_called_once()

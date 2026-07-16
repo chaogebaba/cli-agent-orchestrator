@@ -204,6 +204,10 @@ def _deliver_with_fakes(
     monitor.get_status.return_value = TerminalStatus.IDLE
     monitor.get_input_gen.return_value = 1
     monitor.get_status_gen.return_value = 3
+    monitor.probe_screen_status.return_value = (
+        TerminalStatus.IDLE,
+        {"result_status": "idle", "law_signal": {"class": "chrome"}},
+    )
     wires = []
 
     def send(_terminal_id, wire, **kwargs):

@@ -63,9 +63,14 @@ from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import TerminalInputBlockedError
+from cli_agent_orchestrator.services.replay_policy import (
+    AuthorizationFacts,
+    ObservedFact,
+    run_post_auth_engine,
+)
 from cli_agent_orchestrator.services.message_trace_service import (
     confirm_delivery, continuity_aware_lookup, resolve_session_transcript,
-    transcript_lookup, transcript_ref, wire_hash,
+    normalized_confirmation_fingerprint, transcript_lookup, transcript_ref, wire_hash,
     wpm2_lookup as _wpm2_lookup, wpm2_cursor_baseline,
 )
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
@@ -75,9 +80,6 @@ logger = logging.getLogger(__name__)
 IDLE_STALL_AGE = 30 * 60
 ABS_STALLED_NOTICE_AGE = 4 * 60 * 60
 WPM2_STALE_OPEN_AGE_SECONDS = 60
-REDELIVERY_TAG_VERSION = 1
-
-
 def _redelivery_tag(prior_attempt_uuid: str) -> str:
     return (
         f"[redelivery of attempt {prior_attempt_uuid[:8]} - prior delivery unconfirmed; "
@@ -459,7 +461,7 @@ class InboxService:
                 ]
                 if successors:
                     if all(attempt_proven_pre_paste(item) for item in successors):
-                        return "normal", None
+                        return "normal", {"_wpm1_retry_pre_paste": True}
                     return "stop", None
                 evidence = transcript_ref(resolution)
                 evidence["boundary_authorized"] = now_z
@@ -609,6 +611,10 @@ class InboxService:
                     if gate_state == "skip_d2_only":
                         continue
                     admission_snapshot = None
+                    wpm1_retry_pre_paste = bool(
+                        isinstance(gate_evidence, dict)
+                        and gate_evidence.get("_wpm1_retry_pre_paste") is True
+                    )
                     admission_kind = "corrective" if gate_state == "inject" else "ordinary"
                     if gate_state == "normal":
                         if _should_defer_waiting(terminal_id, provider):
@@ -660,7 +666,7 @@ class InboxService:
                         if legacy_test_seam
                         else self._exact_batch_attempts(message_ids)
                     )
-                    successor_source = None
+                    successor_source: str | None = None
                     persisted_evidence = (
                         dict(gate_evidence)
                         if gate_state == "inject" and isinstance(gate_evidence, dict)
@@ -698,52 +704,101 @@ class InboxService:
                             )
                             return
 
-                        if ambiguous_count >= 3:
-                            if transition_pending_to_delivery_failed(message_ids):
-                                self._notify_delivery_failed(terminal_id, message_ids)
-                            logger.warning(
-                                "Delivery ambiguity cap reached for terminal %s messages %s",
-                                terminal_id, message_ids,
-                            )
-                            return
-
                         ambiguous = [
                             prior for prior in exact_attempts
                             if prior.get("outcome") == "ambiguous"
                             and prior.get("reason") == "confirmation_timeout"
                         ]
-                        if metadata.get("provider") != "claude_code":
-                            for prior in reversed(ambiguous):
-                                successors = [
-                                    item for item in exact_attempts
-                                    if item.get("prior_attempt_uuid")
-                                    == prior["attempt_uuid"]
-                                ]
-                                if all(
-                                    attempt_proven_pre_paste(item) for item in successors
-                                ):
-                                    successor_source = prior["attempt_uuid"]
-                                    admission_kind = "tagged_replay"
-                                    persisted_evidence["redelivery_tag"] = {
-                                        "version": REDELIVERY_TAG_VERSION,
-                                        "prior_attempt_uuid": successor_source,
-                                    }
-                                    break
-                            if ambiguous and successor_source is None:
-                                # A post-paste successor already owns this lineage.
-                                # Never fall back to an invisible ordinary replay.
-                                return
+                        eligible_prior = None
+                        post_paste_successor = False
+                        for prior in reversed(ambiguous):
+                            successors = [
+                                item for item in exact_attempts
+                                if item.get("prior_attempt_uuid") == prior["attempt_uuid"]
+                            ]
+                            if all(attempt_proven_pre_paste(item) for item in successors):
+                                eligible_prior = prior
+                                break
+                            post_paste_successor = True
+                        facts = AuthorizationFacts(
+                            prior_ambiguous_eligible=ObservedFact(
+                                eligible_prior is not None and not wpm1_retry_pre_paste,
+                                (
+                                    eligible_prior.get("attempt_uuid")
+                                    if eligible_prior and not wpm1_retry_pre_paste
+                                    else None
+                                ),
+                            ),
+                            prior_batch_hit=ObservedFact(False),
+                            post_paste_successor_exists=post_paste_successor,
+                            receiver_alive=bool(metadata),
+                            composer_empty=False,
+                        )
+                        decision = run_post_auth_engine(
+                            facts,
+                            ambiguous_count=ambiguous_count,
+                            exhausted_boundary_count=0,
+                        )
+                        if decision.kind == "stop":
+                            if decision.evidence.get("reason") == "attempt_cap":
+                                if transition_pending_to_delivery_failed(message_ids):
+                                    self._notify_delivery_failed(terminal_id, message_ids)
+                                logger.warning(
+                                    "Delivery ambiguity cap reached for terminal %s messages %s",
+                                    terminal_id, message_ids,
+                                )
+                            return
+                        if decision.kind == "suppress":
+                            return
+                        if decision.kind == "tagged_replay":
+                            decision_source = decision.evidence["prior_attempt_uuid"]
+                            assert isinstance(decision_source, str)
+                            successor_source = decision_source
+                            admission_kind = "tagged_replay"
+                            persisted_evidence["redelivery_tag"] = decision.evidence[
+                                "redelivery_tag"
+                            ]
                     if gate_state == "normal" and _should_defer_waiting(terminal_id, provider):
                         _defer_messages(terminal_id, messages[sent_count:])
                         return
                     if gate_state == "inject":
-                        successor_source = persisted_evidence.pop(
-                            "_wpm1_prior_attempt_uuid", None)
-                        if successor_source is not None:
-                            persisted_evidence["redelivery_tag"] = {
-                                "version": REDELIVERY_TAG_VERSION,
-                                "prior_attempt_uuid": successor_source,
-                            }
+                        source = persisted_evidence.pop("_wpm1_prior_attempt_uuid", None)
+                        exhausted_count = 0
+                        for item in exact_attempts:
+                            try:
+                                item_evidence = json.loads(item.get("evidence") or "{}")
+                            except (TypeError, json.JSONDecodeError):
+                                item_evidence = {}
+                            if isinstance(item_evidence, dict) and item_evidence.get(
+                                "boundary_exhausted_at"
+                            ):
+                                exhausted_count += 1
+                        decision = run_post_auth_engine(
+                            AuthorizationFacts(
+                                prior_ambiguous_eligible=ObservedFact(
+                                    isinstance(source, str), source if isinstance(source, str) else None
+                                ),
+                                prior_batch_hit=ObservedFact(False),
+                                post_paste_successor_exists=False,
+                                receiver_alive=bool(metadata),
+                                composer_empty=True,
+                                binding_authority=True,
+                                boundary_observation=persisted_evidence.get(
+                                    "boundary_authorized"
+                                ),
+                                continuity_cursor=persisted_evidence.get("last_observed_ref"),
+                            ),
+                            ambiguous_count=ambiguous_count,
+                            exhausted_boundary_count=exhausted_count,
+                        )
+                        if decision.kind != "inject":
+                            return
+                        decision_source = decision.evidence["prior_attempt_uuid"]
+                        assert isinstance(decision_source, str)
+                        successor_source = decision_source
+                        persisted_evidence["redelivery_tag"] = decision.evidence[
+                            "redelivery_tag"
+                        ]
                     shape_type = (
                         None if registry is None and
                         orchestration_type == OrchestrationType.SEND_MESSAGE
@@ -756,18 +811,32 @@ class InboxService:
                         if successor_source is not None else base_prepared
                     )
                     digest = wire_hash(wire_prepared)
+                    normalized_fingerprint = normalized_confirmation_fingerprint(wire_prepared)
+                    if normalized_fingerprint is not None:
+                        persisted_evidence["normalized_payload_hash"] = normalized_fingerprint[0]
+                        persisted_evidence["normalized_payload_length"] = normalized_fingerprint[1]
                     provider_name = metadata.get("provider", "unknown")
                     proof = make_admission_proof(
                         admission_kind, message_ids, successor_source)
                     if not legacy_test_seam and list_delivering_attempts_for_terminal(terminal_id):
                         return
+                    if not legacy_test_seam:
+                        probe_result = status_monitor.probe_screen_status(terminal_id)
+                        if not isinstance(probe_result, tuple) or len(probe_result) != 2:
+                            return
+                        probe_status, probe_meta = probe_result
+                        if probe_status not in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}:
+                            return
+                        if not isinstance(probe_meta, dict):
+                            return
+                        persisted_evidence["screen_probe"] = probe_meta
                     opener_args = (
                         batch, terminal_id, provider_name, digest,
                         len(wire_prepared.encode()),
                         status_monitor.get_input_gen(terminal_id),
                         status_monitor.get_status_gen(terminal_id),
                     )
-                    opener_kwargs = {
+                    opener_kwargs: dict[str, str | None] = {
                         "evidence": json.dumps(persisted_evidence),
                         "prior_attempt_uuid": successor_source,
                     }
