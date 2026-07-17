@@ -1321,6 +1321,23 @@ class TestCodexIdleReasonClassification:
         provider = self._p()
 
         assert provider.classify_idle_reason(rows, provider.classify_screen(rows)) == "error_banner"
+        continuation_rows = ["Error: upstream request failed", "stream disconnected"]
+        assert (
+            provider.classify_idle_reason(
+                continuation_rows, provider.classify_screen(continuation_rows)
+            )
+            == "transient_api_error"
+        )
+        for flow_exit_rows in (
+            ["Error: generic failure", "assistant: quoting usage limit"],
+            ["Error: generic failure", "› explain usage limit"],
+        ):
+            assert (
+                provider.classify_idle_reason(
+                    flow_exit_rows, provider.classify_screen(flow_exit_rows)
+                )
+                == "error_banner"
+            )
 
     def test_wpq6_a2_real_ghost_composer_sample_classifies_without_nudge(self):
         rows = load_fixture("codex_capacity_ghost_composer_2026-07-17.txt").splitlines()
@@ -1358,6 +1375,39 @@ class TestCodexIdleReasonClassification:
             provider.classify_idle_reason(rows, provider.classify_screen(rows))
             == "transient_api_error"
         )
+        for override_rows, expected in (
+            (["› inspect the failure", "⚠ Selected model is at capacity."], "transient_api_error"),
+            (["assistant: prior reply", "Error: stream ended unexpectedly"], "error_banner"),
+            (["› inspect the failure", "Error: stream ended unexpectedly"], "error_banner"),
+        ):
+            assert (
+                provider.classify_idle_reason(
+                    override_rows, provider.classify_screen(override_rows)
+                )
+                == expected
+            )
+
+    def test_wpq6_strict_empty_composer_resets_assistant_ownership(self):
+        rows = [
+            "assistant: prior reply",
+            "› ",
+            "429 Too Many Requests",
+        ]
+        provider = self._p()
+
+        assert (
+            provider.classify_idle_reason(rows, provider.classify_screen(rows))
+            == "transient_api_error"
+        )
+        footer_rows = [
+            "assistant: prior reply",
+            "  gpt-5.6-sol high · ~/project",
+            "429 Too Many Requests",
+        ]
+        assert (
+            provider.classify_idle_reason(footer_rows, provider.classify_screen(footer_rows))
+            == "transient_api_error"
+        )
 
     def test_wpq6_t_label_style_assistant_quote_is_conversational(self):
         rows = [
@@ -1367,6 +1417,16 @@ class TestCodexIdleReasonClassification:
         provider = self._p()
 
         assert provider.classify_idle_reason(rows, provider.classify_screen(rows)) is None
+        for label in ("codex", "agent"):
+            label_rows = [f"{label}: Documentation example", "429 Too Many Requests"]
+            assert (
+                provider.classify_idle_reason(label_rows, provider.classify_screen(label_rows))
+                is None
+            )
+        you_rows = ["You asked about authentication middleware", "429 Too Many Requests"]
+        assert provider.classify_idle_reason(
+            you_rows, provider.classify_screen(you_rows)
+        ) is None
 
     def test_wpq6_u_system_notice_bullet_is_conversational(self):
         rows = ["• You have 3 usage limit resets available. Run /usage to use one."]
