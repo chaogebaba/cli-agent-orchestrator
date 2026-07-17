@@ -39,10 +39,13 @@ def _patch_terminal_layer(
     wait_results=(True, True),
     final_status=TerminalStatus.COMPLETED,
     output="the answer",
+    get_wd_return=None,
+    get_wd_side_effect=None,
 ):
     """Context-manager bundle patching the terminal layer for run_agent_step.
 
     wait_results: side_effect list for wait_until_status calls (ready, complete).
+    get_wd_*: patch for terminal_service.get_working_directory (CWD inheritance #423).
     """
     create = patch(
         f"{_MODULE}.terminal_service.create_terminal",
@@ -57,18 +60,24 @@ def _patch_terminal_layer(
         new=AsyncMock(side_effect=list(wait_results)),
     )
     status = patch(f"{_MODULE}.status_monitor.get_status", return_value=final_status)
-    return create, send, delete, get_output, exit_cli, wait, status
+    get_wd = patch(
+        f"{_MODULE}.terminal_service.get_working_directory",
+        return_value=get_wd_return,
+        side_effect=get_wd_side_effect,
+    )
+    return create, send, delete, get_output, exit_cli, get_wd, wait, status
 
 
 class TestHappyPath:
     def test_create_per_call_runs_full_sequence_and_tears_down(self):
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
         with (
             create as m_create,
             send as m_send,
             delete as m_delete,
             get_output as m_out,
             exit_cli as m_exit,
+            get_wd,
             wait,
             status,
         ):
@@ -89,15 +98,15 @@ class TestHappyPath:
         m_delete.assert_called_once_with("abc12345", registry=None)
 
     def test_teardown_false_skips_delete(self):
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
-        with create, send, delete as m_delete, get_output, exit_cli as m_exit, wait, status:
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with create, send, delete as m_delete, get_output, exit_cli as m_exit, get_wd, wait, status:
             asyncio.run(run_agent_step("kiro_cli", "dev", "x", teardown=False))
         m_delete.assert_not_called()
         m_exit.assert_not_called()
 
     def test_teardown_false_cancelled_skips_delete(self):
         signal = asyncio.Event()
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
 
         async def _cancel(*args, **kwargs):
             signal.set()
@@ -109,6 +118,7 @@ class TestHappyPath:
             delete as m_delete,
             get_output,
             exit_cli as m_exit,
+            get_wd,
             wait,
             status,
             patch(f"{_MODULE}._wait_for_completion", new=AsyncMock(side_effect=_cancel)),
@@ -125,7 +135,7 @@ class TestHappyPath:
 
     @pytest.mark.parametrize("cancelled", [False, True])
     def test_reuse_terminal_skips_create_and_delete(self, cancelled):
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
             wait_results=(True,)
         )
         signal = asyncio.Event()
@@ -142,6 +152,7 @@ class TestHappyPath:
             delete as m_delete,
             get_output,
             exit_cli as m_exit,
+            get_wd,
             wait,
             status,
             patch(
@@ -175,7 +186,7 @@ class TestHappyPath:
         )
 
     def test_dialog_block_surfaces_structured_non_retryable_error(self):
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
             wait_results=(True,)
         )
         with (
@@ -184,6 +195,7 @@ class TestHappyPath:
             delete as m_delete,
             get_output,
             exit_cli,
+            get_wd,
             wait,
             status as m_status,
         ):
@@ -200,7 +212,7 @@ class TestHappyPath:
         m_delete.assert_not_called()
 
     def test_draft_guard_deferral_surfaces_structured_retryable_error(self):
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
             wait_results=(True,)
         )
         with create, send as m_send, delete, get_output, exit_cli, wait, status:
@@ -213,7 +225,7 @@ class TestHappyPath:
         assert exc_info.value.terminal_id == "reuse99"
 
     def test_reads_generation_after_send_and_admits_fresh_idle(self):
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
             wait_results=(True,), final_status=TerminalStatus.IDLE
         )
         events = []
@@ -223,6 +235,7 @@ class TestHappyPath:
             delete,
             get_output,
             exit_cli,
+            get_wd,
             wait,
             status as m_status,
             patch(f"{_MODULE}.status_monitor.get_input_gen", return_value=7) as m_gen,
@@ -240,8 +253,8 @@ class TestHappyPath:
         assert events == ["send", "gen"]
 
     def test_working_directory_forwarded_to_create(self):
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
-        with create as m_create, send, delete, get_output, exit_cli, wait, status:
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with create as m_create, send, delete, get_output, exit_cli, get_wd, wait, status:
             asyncio.run(run_agent_step("kiro_cli", "dev", "x", working_directory="/tmp/wd"))
         assert m_create.await_args.kwargs["working_directory"] == "/tmp/wd"
 
@@ -250,18 +263,19 @@ class TestHappyPath:
         (new_session=True). Otherwise create_terminal auto-generates a name and
         then fails with 'Session not found' because it tries to add a window to
         a session that does not exist yet."""
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
-        with create as m_create, send, delete, get_output, exit_cli, wait, status:
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with create as m_create, send, delete, get_output, exit_cli, get_wd, wait, status:
             asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
         assert m_create.await_args.kwargs["new_session"] is True
         assert m_create.await_args.kwargs["session_name"] is None
 
     def test_session_name_adds_to_existing_session(self):
         """A supplied session_name adds a window to that EXISTING session
-        (new_session=False) and preserves the per-step env overlay."""
+        (new_session=False; handoff same-session path) and preserves the
+        per-step env overlay."""
         env_vars = {"CAO_WORKFLOW_RUN_ID": "run-123", "CAO_WORKFLOW_GENERATION": "1"}
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
-        with create as m_create, send, delete, get_output, exit_cli, wait, status:
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with create as m_create, send, delete, get_output, exit_cli, get_wd, wait, status:
             asyncio.run(
                 run_agent_step(
                     "kiro_cli", "dev", "x", session_name="cao-sup", env_vars=env_vars
@@ -274,8 +288,8 @@ class TestHappyPath:
     def test_caller_id_and_allowed_tools_forwarded_to_create(self):
         """caller_id (#284 callback routing) and inherited allowed_tools must
         reach create_terminal for handoff workers."""
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
-        with create as m_create, send, delete, get_output, exit_cli, wait, status:
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with create as m_create, send, delete, get_output, exit_cli, get_wd, wait, status:
             asyncio.run(
                 run_agent_step(
                     "kiro_cli",
@@ -295,16 +309,115 @@ class TestHappyPath:
         from cli_agent_orchestrator.plugins import PluginRegistry
 
         sentinel = PluginRegistry()
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
-        with create, send, delete as m_delete, get_output, exit_cli, wait, status:
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with create, send, delete as m_delete, get_output, exit_cli, get_wd, wait, status:
             asyncio.run(run_agent_step("kiro_cli", "dev", "x", registry=sentinel))
         m_delete.assert_called_once_with("abc12345", registry=sentinel)
+
+    def test_explicit_wd_wins_over_caller_inheritance(self):
+        """An explicit working_directory takes precedence even when caller_id
+        is present — the inheritance path must not overwrite it."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with (
+            create as m_create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            get_wd as m_get_wd,
+            wait,
+            status,
+        ):
+            asyncio.run(
+                run_agent_step(
+                    "kiro_cli",
+                    "dev",
+                    "x",
+                    working_directory="/explicit/wd",
+                    caller_id="sup-123",
+                )
+            )
+        assert m_create.await_args.kwargs["working_directory"] == "/explicit/wd"
+        m_get_wd.assert_not_called()
+
+    def test_no_caller_id_skips_wd_inheritance(self):
+        """Without caller_id the inheritance path is skipped entirely — no
+        get_working_directory call, no mutation of working_directory."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with (
+            create as m_create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            get_wd as m_get_wd,
+            wait,
+            status,
+        ):
+            asyncio.run(run_agent_step("kiro_cli", "dev", "x", working_directory=None))
+        assert m_create.await_args.kwargs["working_directory"] is None
+        m_get_wd.assert_not_called()
+
+    def test_wd_inherited_from_caller(self):
+        """When working_directory is None and caller_id is set, run_agent_step
+        resolves CWD from the caller's terminal and forwards it to create_terminal."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            get_wd_return="/projects/my-app"
+        )
+        with (
+            create as m_create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            get_wd,
+            wait,
+            status,
+        ):
+            asyncio.run(
+                run_agent_step(
+                    "kiro_cli",
+                    "dev",
+                    "x",
+                    working_directory=None,
+                    caller_id="sup-123",
+                )
+            )
+        assert m_create.await_args.kwargs["working_directory"] == "/projects/my-app"
+
+    def test_wd_inheritance_failure_falls_back(self):
+        """A failure resolving the caller CWD is best-effort — the step must
+        still succeed with working_directory=None (server default)."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            get_wd_side_effect=ValueError("pane not found")
+        )
+        with (
+            create as m_create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            get_wd,
+            wait,
+            status,
+        ):
+            result = asyncio.run(
+                run_agent_step(
+                    "kiro_cli",
+                    "dev",
+                    "x",
+                    working_directory=None,
+                    caller_id="sup-123",
+                )
+            )
+        assert m_create.await_args.kwargs["working_directory"] is None
+        assert result.status == TerminalStatus.COMPLETED
 
 
 class TestFailureRaises:
     def test_completion_timeout_raises(self):
         """A typed completion timeout must raise, never return a falsy success."""
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
             wait_results=(True,),
             final_status=TerminalStatus.PROCESSING,
         )
@@ -314,6 +427,7 @@ class TestFailureRaises:
             delete as m_delete,
             get_output,
             exit_cli as m_exit,
+            get_wd,
             wait,
             status,
         ):
@@ -326,7 +440,7 @@ class TestFailureRaises:
         m_delete.assert_not_called()
 
     def test_readiness_timeout_raises(self):
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
             wait_results=(False,),  # readiness times out before any input
         )
         with (
@@ -335,6 +449,7 @@ class TestFailureRaises:
             delete as m_delete,
             get_output,
             exit_cli as m_exit,
+            get_wd,
             wait,
             status,
         ):
@@ -349,7 +464,7 @@ class TestFailureRaises:
 
     def test_error_fails_fast_with_error_kind(self):
         """ERROR fails immediately rather than burning the nominal timeout."""
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
             wait_results=(True,),
             final_status=TerminalStatus.ERROR,
         )
@@ -359,6 +474,7 @@ class TestFailureRaises:
             delete,
             get_output as m_out,
             exit_cli,
+            get_wd,
             wait,
             status,
             patch(f"{_MODULE}.asyncio.sleep", new=AsyncMock()) as m_sleep,
@@ -372,7 +488,7 @@ class TestFailureRaises:
 
     def test_error_wins_final_recheck_after_completed_outcome(self):
         """A completion-to-ERROR race must not be reported as success."""
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
             wait_results=(True,), final_status=TerminalStatus.COMPLETED
         )
         with (
@@ -381,6 +497,7 @@ class TestFailureRaises:
             delete,
             get_output as m_out,
             exit_cli,
+            get_wd,
             wait,
             status as m_status,
             patch(f"{_MODULE}.status_monitor.get_status_gen", return_value=None),
@@ -473,7 +590,7 @@ class TestTypedCompletionWait:
 
     @pytest.mark.parametrize("gate", ["wait_rule", "retry_exhausted", "unknown_dialog"])
     def test_nonempty_waiting_gate_requires_user_input(self, gate):
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
             wait_results=(True,), final_status=TerminalStatus.WAITING_USER_ANSWER
         )
         with (
@@ -482,6 +599,7 @@ class TestTypedCompletionWait:
             delete,
             get_output as m_out,
             exit_cli,
+            get_wd,
             wait,
             status,
             patch(
@@ -502,7 +620,7 @@ class TestTypedCompletionWait:
         m_out.assert_not_called()
 
     def test_empty_waiting_gate_keeps_waiting_until_completed(self):
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
             wait_results=(True,), final_status=TerminalStatus.WAITING_USER_ANSWER
         )
         with (
@@ -511,6 +629,7 @@ class TestTypedCompletionWait:
             delete,
             get_output,
             exit_cli,
+            get_wd,
             wait,
             status as m_status,
             patch(f"{_MODULE}.status_monitor.get_status_gen", return_value=None),
@@ -551,7 +670,7 @@ class TestCancellationPhaseTable:
     )
     def test_owned_terminal_phase_table(self, case, should_cleanup):
         ready = case != "pre_readiness"
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
             wait_results=(ready,)
         )
         outcome = {
@@ -572,6 +691,7 @@ class TestCancellationPhaseTable:
             delete as m_delete,
             get_output as m_output,
             exit_cli as m_exit,
+            get_wd,
             wait,
             status,
             patch(f"{_MODULE}._wait_for_completion", new=AsyncMock(return_value=outcome)),
@@ -603,13 +723,14 @@ class TestCancellationPhaseTable:
     def test_cancel_before_send_skips_send_and_extraction(self):
         signal = asyncio.Event()
         signal.set()
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
         with (
             create,
             send as m_send,
             delete as m_delete,
             get_output as m_output,
             exit_cli as m_exit,
+            get_wd,
             wait,
             status,
         ):
@@ -628,7 +749,7 @@ class TestCancellationPhaseTable:
         started = threading.Event()
         release = threading.Event()
         raw = RuntimeError(f"{phase} failed")
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
 
         def _block_then_raise(*args, **kwargs):
             started.set()
@@ -641,6 +762,7 @@ class TestCancellationPhaseTable:
             delete as m_delete,
             get_output as m_output,
             exit_cli as m_exit,
+            get_wd,
             wait,
             status,
             patch(
@@ -669,7 +791,7 @@ class TestCancellationPhaseTable:
         started = threading.Event()
         release = threading.Event()
         blocked = TerminalInputBlockedError("input blocked")
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
 
         def _block_then_raise(*args, **kwargs):
             started.set()
@@ -682,6 +804,7 @@ class TestCancellationPhaseTable:
             delete as m_delete,
             get_output,
             exit_cli as m_exit,
+            get_wd,
             wait,
             status,
         ):
@@ -705,7 +828,7 @@ class TestCancellationPhaseTable:
         signal = asyncio.Event()
         started = threading.Event()
         release = threading.Event()
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
 
         def _block_then_succeed(*args, **kwargs):
             started.set()
@@ -718,6 +841,7 @@ class TestCancellationPhaseTable:
             delete as m_delete,
             get_output as m_output,
             exit_cli as m_exit,
+            get_wd,
             wait,
             status,
             patch(
@@ -742,12 +866,12 @@ class TestTeardownIsBestEffort:
     def test_teardown_failure_does_not_fail_successful_step(self):
         """A delete failure after a successful step is logged, not raised — the
         work is done and captured."""
-        create, send, _delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
+        create, send, _delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
         delete = patch(
             f"{_MODULE}.terminal_service.delete_terminal",
             side_effect=Exception("kill failed"),
         )
-        with create, send, delete, get_output, exit_cli, wait, status:
+        with create, send, delete, get_output, exit_cli, get_wd, wait, status:
             result = asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
         assert result.status == TerminalStatus.COMPLETED
         assert result.last_message == "the answer"
@@ -755,12 +879,12 @@ class TestTeardownIsBestEffort:
     def test_graceful_exit_failure_does_not_fail_step_and_still_deletes(self):
         """A failure sending the graceful exit must be logged, not raised, and
         must NOT prevent the subsequent delete (best-effort exit-then-delete)."""
-        create, send, delete, get_output, _exit, wait, status = _patch_terminal_layer()
+        create, send, delete, get_output, _exit, get_wd, wait, status = _patch_terminal_layer()
         exit_cli = patch(
             f"{_MODULE}.terminal_service.exit_terminal_cli",
             side_effect=Exception("exit boom"),
         )
-        with create, send, delete as m_delete, get_output, exit_cli, wait, status:
+        with create, send, delete as m_delete, get_output, exit_cli, get_wd, wait, status:
             result = asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
         assert result.status == TerminalStatus.COMPLETED
         # Exit failed but delete still ran.
@@ -770,12 +894,12 @@ class TestTeardownIsBestEffort:
         """F9(b): a raising ``on_terminal_created`` callback (BR-31 sweep
         bookkeeping) must never propagate into ``run_agent_step`` — it is
         best-effort, logged and swallowed, and the step still completes."""
-        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer()
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
 
         def _boom_callback(terminal_id):
             raise RuntimeError("sweep bookkeeping boom")
 
-        with create, send, delete, get_output, exit_cli, wait, status:
+        with create, send, delete, get_output, exit_cli, get_wd, wait, status:
             result = asyncio.run(
                 run_agent_step("kiro_cli", "dev", "x", on_terminal_created=_boom_callback)
             )
