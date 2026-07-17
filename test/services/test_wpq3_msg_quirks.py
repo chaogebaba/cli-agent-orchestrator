@@ -845,6 +845,123 @@ def test_d5_finalize_exits_while_delivery_lock_held(monkeypatch):
     assert not delivery_lock.locked()
 
 
+def test_d5_invalid_finalize_cancellation_exits_while_delivery_lock_held(monkeypatch):
+    service, metadata = _armed()
+    callback_reads = 0
+    finalize_armed = False
+    finalize_exited = False
+
+    class TrackingDeliveryLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._acquire_count = 0
+
+        def acquire(self, *args, **kwargs):
+            if self._acquire_count == 0:
+                assert not service._lock._is_owned()
+            acquired = self._lock.acquire(*args, **kwargs)
+            if acquired:
+                self._acquire_count += 1
+            return acquired
+
+        def release(self):
+            assert finalize_exited is True
+            return self._lock.release()
+
+        def locked(self):
+            return self._lock.locked()
+
+    delivery_lock = TrackingDeliveryLock()
+
+    class FinalizeExitProbe:
+        def __init__(self, lock):
+            self._lock = lock
+
+        def acquire(self, *args, **kwargs):
+            return self._lock.acquire(*args, **kwargs)
+
+        def release(self):
+            return self._lock.release()
+
+        def _is_owned(self):
+            return self._lock._is_owned()
+
+        def __enter__(self):
+            self._lock.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            nonlocal finalize_armed, finalize_exited
+            if not finalize_armed:
+                return self._lock.__exit__(exc_type, exc, traceback)
+            assert self._lock._is_owned()
+            result = self._lock.__exit__(exc_type, exc, traceback)
+            assert not self._lock._is_owned()
+            finalize_exited = True
+            finalize_armed = False
+            return result
+
+    def callback_status(*_args):
+        nonlocal callback_reads, finalize_armed
+        callback_reads += 1
+        if callback_reads == 2:
+            finalize_armed = True
+            return MessageStatus.PENDING
+        return None
+
+    def cancel(message_id, terminal_id):
+        assert finalize_exited is False
+        assert delivery_lock.locked()
+        assert service._lock._is_owned()
+        assert (message_id, terminal_id) == (48, "worker")
+        return True
+
+    cancel_pending = MagicMock(side_effect=cancel)
+    deliver = MagicMock()
+    monkeypatch.setattr(service, "_lock", FinalizeExitProbe(service._lock))
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        lambda _terminal: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+        callback_status,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
+        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
+        lambda _terminal: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
+        lambda _terminal: delivery_lock,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
+        lambda *_args: WatchdogInsertResult("inserted", 48),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.cancel_pending_watchdog_message",
+        cancel_pending,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",
+        deliver,
+    )
+
+    assert service.collect_due_notifications(now=13.0) == []
+    assert callback_reads == 2
+    assert finalize_exited is True
+    cancel_pending.assert_called_once_with(48, "worker")
+    deliver.assert_not_called()
+    assert service._episodes["worker"].auto_resumed is False
+    assert service._episodes["worker"].resume_reserved_at is None
+    assert not delivery_lock.locked()
+
+
 def test_d5_insert_and_callback_reads_run_outside_watchdog_lock(monkeypatch):
     service, metadata = _armed()
     callback_reads = 0
