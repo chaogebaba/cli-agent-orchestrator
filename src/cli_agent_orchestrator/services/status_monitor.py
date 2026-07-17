@@ -11,7 +11,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Literal, Optional, Tuple, TypedDict
+from typing import Dict, List, Literal, NotRequired, Optional, Tuple, TypedDict
 
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
@@ -25,12 +25,15 @@ from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
 
+
+class PaneIdentityProofFailure(RuntimeError):
+    """Internal control flow for a fail-closed admission identity proof."""
+
+
 ScreenProbeResult = Literal[
     "waiting_user_answer", "error", "processing", "completed", "idle", "unknown"
 ]
-ScreenProbeSignalClass = Literal[
-    "waiting", "error", "progress", "completion", "chrome", "none"
-]
+ScreenProbeSignalClass = Literal["waiting", "error", "progress", "completion", "chrome", "none"]
 ScreenProbeFrameSource = Literal["incremental", "fresh_capture"]
 
 
@@ -56,6 +59,7 @@ class ScreenProbeMeta(TypedDict):
     frame_source: ScreenProbeFrameSource
     result_status: ScreenProbeResult
     law_signal: ScreenProbeLawSignal
+    identity_proof_failure: NotRequired[str]
 
 
 def _frame_rows_hash(rows: List[str]) -> str:
@@ -66,6 +70,7 @@ def _frame_rows_hash(rows: List[str]) -> str:
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
     return digest.hexdigest()
+
 
 # Statuses that represent a stable "ready" state — the agent has finished
 # producing output and is waiting for further input. Once latched, the
@@ -292,10 +297,7 @@ class StatusMonitor:
         """
         screen_spinner_override: Optional[TerminalStatus] = None
         with self._lock:
-            if (
-                expected_seq is not None
-                and self._chunk_seq.get(terminal_id, 0) != expected_seq
-            ):
+            if expected_seq is not None and self._chunk_seq.get(terminal_id, 0) != expected_seq:
                 return
             last = self._last_status.get(terminal_id)
             self._observe_locked(terminal_id, detected)
@@ -409,9 +411,7 @@ class StatusMonitor:
             metadata = get_terminal_metadata(terminal_id)
             if not metadata:
                 return None
-            return get_backend().get_pane_size(
-                metadata["tmux_session"], metadata["tmux_window"]
-            )
+            return get_backend().get_pane_size(metadata["tmux_session"], metadata["tmux_window"])
         except Exception:
             logger.exception("Failed to resolve pane size for %s", terminal_id)
             return None
@@ -459,9 +459,7 @@ class StatusMonitor:
         detected, _trusted_busy = self._detect_screen_with_trust(terminal_id, provider)
         return detected
 
-    def _detect_screen_with_trust(
-        self, terminal_id: str, provider
-    ) -> Tuple[TerminalStatus, bool]:
+    def _detect_screen_with_trust(self, terminal_id: str, provider) -> Tuple[TerminalStatus, bool]:
         """Detect screen status plus whether PROCESSING is a trusted screen read."""
         fallback_buffer: Optional[str] = None
         with self._lock:
@@ -567,9 +565,7 @@ class StatusMonitor:
                     expected_seq=chunk_seq,
                 )
 
-        self._arm_quiesce_timer(
-            loop, terminal_id, self._on_screen_quiescent, provider, chunk_seq
-        )
+        self._arm_quiesce_timer(loop, terminal_id, self._on_screen_quiescent, provider, chunk_seq)
 
     def _on_screen_quiescent(
         self, terminal_id: str, provider, expected_seq: Optional[int] = None
@@ -580,10 +576,7 @@ class StatusMonitor:
         to a worker thread so the loop stays free.
         """
         with self._lock:
-            if (
-                expected_seq is not None
-                and self._chunk_seq.get(terminal_id, 0) != expected_seq
-            ):
+            if expected_seq is not None and self._chunk_seq.get(terminal_id, 0) != expected_seq:
                 return
             self._bursting[terminal_id] = False
             self._quiesce_handle.pop(terminal_id, None)
@@ -593,10 +586,7 @@ class StatusMonitor:
                 self._detect_screen_with_trust, terminal_id, provider
             )
             with self._lock:
-                if (
-                    expected_seq is not None
-                    and self._chunk_seq.get(terminal_id, 0) != expected_seq
-                ):
+                if expected_seq is not None and self._chunk_seq.get(terminal_id, 0) != expected_seq:
                     return
             self._apply_detection(
                 terminal_id,
@@ -704,10 +694,7 @@ class StatusMonitor:
         on the loop.
         """
         with self._lock:
-            if (
-                expected_seq is not None
-                and self._chunk_seq.get(terminal_id, 0) != expected_seq
-            ):
+            if expected_seq is not None and self._chunk_seq.get(terminal_id, 0) != expected_seq:
                 return
             self._bursting[terminal_id] = False
             self._quiesce_handle.pop(terminal_id, None)
@@ -716,10 +703,7 @@ class StatusMonitor:
         async def _detect_and_apply() -> None:
             detected = await asyncio.to_thread(self._detect_status, terminal_id, buffer)
             with self._lock:
-                if (
-                    expected_seq is not None
-                    and self._chunk_seq.get(terminal_id, 0) != expected_seq
-                ):
+                if expected_seq is not None and self._chunk_seq.get(terminal_id, 0) != expected_seq:
                     return
             self._apply_detection(terminal_id, detected, expected_seq=expected_seq)
 
@@ -830,9 +814,11 @@ class StatusMonitor:
             status = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
             seq = self._observe_locked(terminal_id, status)
             return BoundaryObservation(
-                observation_epoch=self._epoch_locked(terminal_id), status=status,
+                observation_epoch=self._epoch_locked(terminal_id),
+                status=status,
                 status_gen=self._status_gen.get(terminal_id, 0),
-                input_gen=self._input_gen.get(terminal_id, 0), seq=seq,
+                input_gen=self._input_gen.get(terminal_id, 0),
+                seq=seq,
                 last_non_ready_seq=self._last_non_ready_seq.get(terminal_id),
                 last_ready_seq=self._last_ready_seq.get(terminal_id),
             )
@@ -1005,9 +991,7 @@ class StatusMonitor:
         """
         self._apply_detection(terminal_id, status)
 
-    def probe_screen_status(
-        self, terminal_id: str
-    ) -> Tuple[TerminalStatus, ScreenProbeMeta]:
+    def probe_screen_status(self, terminal_id: str) -> Tuple[TerminalStatus, ScreenProbeMeta]:
         """Classify one frame, refreshing incremental ready frames before admission."""
         try:
             provider = provider_manager.get_provider(terminal_id)
@@ -1049,6 +1033,7 @@ class StatusMonitor:
             classification = classify_screen_signals([])
 
         frame_source: ScreenProbeFrameSource = "incremental"
+        identity_proof_failure: str | None = None
         if provider is not None and classification.status in {
             TerminalStatus.IDLE,
             TerminalStatus.COMPLETED,
@@ -1062,12 +1047,32 @@ class StatusMonitor:
                 if not metadata:
                     raise ValueError(f"No terminal metadata for {terminal_id}")
                 backend = get_backend()
+                if getattr(backend, "supports_identity_readback", False) is not True:
+                    logger.warning(
+                        "pane_identity_proof_unsupported terminal=%s backend=%s",
+                        terminal_id,
+                        type(backend).__name__,
+                    )
+                else:
+                    from cli_agent_orchestrator.services.pane_identity_service import (
+                        pane_identity_failure,
+                    )
+
+                    identity_proof_failure = pane_identity_failure(terminal_id, metadata, backend)
+                    if identity_proof_failure is not None:
+                        logger.critical(
+                            "pane_identity_proof_failed terminal=%s session=%s window=%s "
+                            "reason=%s stage=admission",
+                            terminal_id,
+                            metadata["tmux_session"],
+                            metadata["tmux_window"],
+                            identity_proof_failure,
+                        )
+                        raise PaneIdentityProofFailure(identity_proof_failure)
                 captured = backend.capture_viewport(
                     metadata["tmux_session"], metadata["tmux_window"]
                 )
-                pane_size = backend.get_pane_size(
-                    metadata["tmux_session"], metadata["tmux_window"]
-                )
+                pane_size = backend.get_pane_size(metadata["tmux_session"], metadata["tmux_window"])
                 fresh_rows = captured.splitlines()
                 if not fresh_rows or not any(row.strip() for row in fresh_rows):
                     raise ValueError("Fresh viewport capture was empty")
@@ -1082,6 +1087,15 @@ class StatusMonitor:
                     columns = max((len(row) for row in rows), default=0)
                     row_count = len(rows)
                 classification = provider.classify_screen(rows)
+            except PaneIdentityProofFailure:
+                rows = []
+                columns = 0
+                row_count = 0
+                from cli_agent_orchestrator.providers.screen_classification import (
+                    classify_screen_signals,
+                )
+
+                classification = classify_screen_signals([])
             except Exception:
                 logger.exception("Error refreshing admission screen for %s", terminal_id)
                 rows = []
@@ -1115,6 +1129,8 @@ class StatusMonitor:
                 "row_index": classification.row_index,
             },
         }
+        if identity_proof_failure is not None:
+            meta["identity_proof_failure"] = identity_proof_failure
         return classification.status, meta
 
     def get_rendered_screen(self, terminal_id: str) -> Optional[List[str]]:

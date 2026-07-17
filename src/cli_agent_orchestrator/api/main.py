@@ -197,11 +197,16 @@ async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
     """
     logger.info("Inbox reconciliation daemon started")
     while True:
-        await asyncio.sleep(INBOX_RECONCILE_INTERVAL)
         try:
+            from cli_agent_orchestrator.services.deferred_deadletter_service import (
+                replay_deferred_failure_deadletters,
+            )
+
+            await asyncio.to_thread(replay_deferred_failure_deadletters)
             await asyncio.to_thread(inbox_service.reconcile_orphaned_messages, registry)
         except Exception:
             logger.exception("Inbox reconciliation daemon error")
+        await asyncio.sleep(INBOX_RECONCILE_INTERVAL)
 
 
 # Response Models
@@ -2545,7 +2550,7 @@ async def get_inbox_messages_endpoint(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=(
                         "Invalid status: %s. Valid values: pending, delivering, delivered, "
-                        "delivery_failed, failed" % status_param
+                        "delivery_failed, failed, digested" % status_param
                     ),
                 )
 
@@ -2563,6 +2568,8 @@ async def get_inbox_messages_endpoint(
                     "message": msg.message,
                     "orchestration_type": msg.orchestration_type.value,
                     "status": msg.status.value,
+                    "digested_into": msg.digested_into,
+                    "enqueue_generation": msg.enqueue_generation,
                     "created_at": msg.created_at.isoformat() if msg.created_at else None,
                 }
             )

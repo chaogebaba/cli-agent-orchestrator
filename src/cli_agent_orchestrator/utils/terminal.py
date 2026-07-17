@@ -5,7 +5,8 @@ import logging
 import re
 import time
 import uuid
-from typing import Optional, Union
+from dataclasses import dataclass
+from typing import Awaitable, Callable, Optional, Union
 
 import requests
 
@@ -16,6 +17,17 @@ from cli_agent_orchestrator.utils.http import CAOHttpClient
 cao_http = CAOHttpClient(lambda: requests)
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BlockedWaitPolicy:
+    """Pause a status deadline only for named auto-responder wait rules."""
+
+    probe: Callable[[], tuple[str, str] | None]
+    blocked_cap_s: float
+    on_first_blocked: Callable[[str], Awaitable[None]]
+    last_blocked_rule: str | None = None
+
 
 # Allowlist for tmux session/window names. tmux uses ':' and '.' as target
 # delimiters and treats leading '-' as an option, so we constrain names to
@@ -172,6 +184,7 @@ async def wait_until_status(
     *,
     provider_override=None,
     raw_status: bool = False,
+    blocked_policy: BlockedWaitPolicy | None = None,
 ) -> bool:
     """Wait until terminal reaches target status by polling status_monitor.
 
@@ -190,8 +203,23 @@ async def wait_until_status(
     logger.info(
         f"wait_until_status [{terminal_id}]: waiting for {{{target_str}}}, timeout={timeout}s"
     )
-    start = time.time()
-    while time.time() - start < timeout:
+    unblocked_elapsed = 0.0
+    blocked_elapsed = 0.0
+    last_tick = time.monotonic()
+    previous_blocked = False
+    active_rule: str | None = None
+    clean_polls = 0
+    notified = False
+    while unblocked_elapsed < timeout:
+        now = time.monotonic()
+        delta = now - last_tick
+        last_tick = now
+        if previous_blocked:
+            blocked_elapsed += delta
+        else:
+            unblocked_elapsed += delta
+        if blocked_policy is not None and blocked_elapsed > blocked_policy.blocked_cap_s:
+            break
         current = (
             status_monitor.get_raw_status(terminal_id, provider_override=provider_override)
             if raw_status
@@ -201,6 +229,43 @@ async def wait_until_status(
         if current in targets and (min_gen is None or status_gen is None or status_gen >= min_gen):
             logger.info(f"wait_until_status [{terminal_id}]: reached {current.value}")
             return True
+        policy = blocked_policy
+        gate = policy.probe() if policy is not None else None
+        rule = (
+            gate[1]
+            if isinstance(gate, tuple)
+            and len(gate) == 2
+            and gate[0] == "wait_rule"
+            and isinstance(gate[1], str)
+            and gate[1]
+            else None
+        )
+        if rule is not None:
+            if rule != active_rule:
+                active_rule = rule
+                clean_polls = 0
+                notified = False
+            previous_blocked = True
+            assert policy is not None
+            policy.last_blocked_rule = rule
+            if not notified:
+                notified = True
+                try:
+                    await policy.on_first_blocked(rule)
+                except Exception:
+                    logger.exception(
+                        "wait_until_status [%s]: blocked notifier failed for rule %s",
+                        terminal_id,
+                        rule,
+                    )
+        else:
+            previous_blocked = False
+            if active_rule is not None:
+                clean_polls += 1
+                if clean_polls >= 2:
+                    active_rule = None
+                    clean_polls = 0
+                    notified = False
         await asyncio.sleep(polling_interval)
     logger.warning(f"wait_until_status [{terminal_id}]: timeout waiting for {{{target_str}}}")
     return False

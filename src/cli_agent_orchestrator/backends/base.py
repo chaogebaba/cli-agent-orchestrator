@@ -5,6 +5,7 @@ Core services depend only on this ABC, never on a concrete backend directly.
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -24,6 +25,23 @@ class TerminalNotFoundError(TerminalBackendError):
         super().__init__(message or f"Terminal not found: {terminal_id}")
 
 
+@dataclass(frozen=True)
+class PaneIdentityReadResult:
+    identity: str | None = None
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.identity is None) == (self.reason is None):
+            raise ValueError("exactly one pane identity result field must be set")
+        if self.reason is not None and self.reason not in {
+            "missing_env",
+            "read_error",
+            "pane_cardinality",
+            "incarnation_changed",
+        }:
+            raise ValueError(f"invalid pane identity failure reason: {self.reason}")
+
+
 class TerminalBackend(ABC):
     """Abstract base class defining the terminal backend contract.
 
@@ -31,6 +49,8 @@ class TerminalBackend(ABC):
     (TmuxBackend, HerdrBackend) implement these methods using their respective
     multiplexer APIs.
     """
+
+    supports_identity_readback = False
 
     # --- Session lifecycle ---
 
@@ -212,6 +232,9 @@ class TerminalBackend(ABC):
         at admission rather than approximating it with terminal history.
         """
         raise NotImplementedError("viewport capture is not supported by this backend")
+
+    def read_pane_identity(self, session_name: str, window_name: str) -> PaneIdentityReadResult:
+        return PaneIdentityReadResult(reason="read_error")
 
     @abstractmethod
     def get_pane_working_directory(self, session_name: str, window_name: str) -> Optional[str]:

@@ -201,16 +201,17 @@ class AutoResponder:
         self._lock = threading.Lock()
         self._rule_state: Dict[tuple, _RuleState] = {}
         self._unknown_state: Dict[str, _UnknownDialogState] = {}
-        self._wait_rule_active: set[str] = set()
+        self._wait_rule_active: Dict[str, tuple[str, float]] = {}
         self._retry_exhausted: set[str] = set()
 
-    def waiting_gate(self, terminal_id: str) -> str | None:
+    def waiting_gate(self, terminal_id: str) -> str | tuple[str, str] | None:
         with self._lock:
             state = self._unknown_state.get(terminal_id)
             if state is not None and state.episode_open:
                 return "unknown_dialog"
-            if terminal_id in self._wait_rule_active:
-                return "wait_rule"
+            wait_state = self._wait_rule_active.get(terminal_id)
+            if wait_state is not None:
+                return ("wait_rule", wait_state[0])
             if terminal_id in self._retry_exhausted:
                 return "retry_exhausted"
             return None
@@ -232,13 +233,13 @@ class AutoResponder:
 
     def clear_terminal(self, terminal_id: str) -> None:
         with self._lock:
-            self._wait_rule_active.discard(terminal_id)
+            self._wait_rule_active.pop(terminal_id, None)
             self._retry_exhausted.discard(terminal_id)
             self._unknown_state.pop(terminal_id, None)
 
     def _clear_wait_rule(self, terminal_id: str) -> None:
         with self._lock:
-            self._wait_rule_active.discard(terminal_id)
+            self._wait_rule_active.pop(terminal_id, None)
 
     def on_screen(
         self, terminal_id: str, provider: Any, lines: List[str]
@@ -297,8 +298,11 @@ class AutoResponder:
             if not rule.matches(normalized):
                 continue
             if rule.is_wait:
+                fresh = self._capture_fresh(metadata, lines)
+                if fresh is None or not rule.matches(fresh[0]):
+                    return None
                 with self._lock:
-                    self._wait_rule_active.add(terminal_id)
+                    self._wait_rule_active[terminal_id] = (rule.name, time.monotonic())
                 return TerminalStatus.WAITING_USER_ANSWER
             self._clear_wait_rule(terminal_id)
             state = self._state_for(terminal_id, rule.name)
@@ -432,18 +436,30 @@ class AutoResponder:
                 )
 
         if not is_suspect:
-            close_episode = False
-            with self._lock:
-                state = self._unknown_state.get(terminal_id)
-                if state and state.episode_open:
-                    state.non_dialog_ticks += 1
-                    if state.non_dialog_ticks >= 2:
-                        state.episode_open = False
-                        state.non_dialog_ticks = 0
-                        close_episode = True
-            if state and state.episode_open and not close_episode:
-                return TerminalStatus.WAITING_USER_ANSWER
+            return self._record_unknown_clean_tick(terminal_id)
+
+        fresh = self._capture_fresh(metadata, lines)
+        if fresh is None:
             return None
+        fresh_normalized, fresh_lines = fresh
+        is_suspect = self._looks_like_dialog(fresh_normalized, provider_name)
+        if is_suspect:
+            try:
+                is_suspect = provider.get_status_from_screen(fresh_lines) in (
+                    TerminalStatus.WAITING_USER_ANSWER,
+                    TerminalStatus.UNKNOWN,
+                    TerminalStatus.ERROR,
+                )
+            except Exception:
+                logger.debug(
+                    "auto-responder: fresh provider status parse failed for %s",
+                    terminal_id,
+                    exc_info=True,
+                )
+                is_suspect = False
+        if not is_suspect:
+            return self._record_unknown_clean_tick(terminal_id)
+        normalized = fresh_normalized
 
         now = time.monotonic()
         with self._lock:
@@ -471,6 +487,45 @@ class AutoResponder:
                 f"Dialog text (normalized): {dialog_text}",
             )
         return TerminalStatus.WAITING_USER_ANSWER
+
+    def _record_unknown_clean_tick(self, terminal_id: str) -> Optional[TerminalStatus]:
+        """Apply the existing two-clean-tick close rule to a confirmed clean frame."""
+        close_episode = False
+        with self._lock:
+            state = self._unknown_state.get(terminal_id)
+            if state and state.episode_open:
+                state.non_dialog_ticks += 1
+                if state.non_dialog_ticks >= 2:
+                    state.episode_open = False
+                    state.non_dialog_ticks = 0
+                    close_episode = True
+        if state and state.episode_open and not close_episode:
+            return TerminalStatus.WAITING_USER_ANSWER
+        return None
+
+    @staticmethod
+    def _capture_fresh(
+        metadata: Dict[str, Any], _suspect_lines: List[str]
+    ) -> tuple[str, List[str]] | None:
+        """Capture exactly one fresh viewport without touching StatusMonitor state."""
+        try:
+            from cli_agent_orchestrator.backends.registry import get_backend
+
+            captured = get_backend().capture_viewport(
+                metadata["tmux_session"], metadata["tmux_window"]
+            )
+            lines = captured.splitlines()
+            normalized = normalize_screen(lines)
+            if not normalized:
+                return None
+            return normalized, lines
+        except Exception:
+            logger.debug(
+                "auto-responder: fresh confirmation capture failed for %s",
+                metadata.get("id", "unknown"),
+                exc_info=True,
+            )
+            return None
 
     @staticmethod
     def _payload_excerpt(normalized: str) -> str:

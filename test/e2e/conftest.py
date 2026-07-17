@@ -17,6 +17,14 @@ import requests
 from cli_agent_orchestrator.constants import API_BASE_URL
 
 
+def pytest_collection_modifyitems(items):
+    """Mark real E2E tests live while keeping the no-op script-runner subtree local."""
+    for item in items:
+        path = str(item.path)
+        if "/test/e2e/" in path and "/test/e2e/script_runner/" not in path:
+            item.add_marker(pytest.mark.live)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def require_cao_server():
     """Skip all E2E tests if CAO server is not reachable."""

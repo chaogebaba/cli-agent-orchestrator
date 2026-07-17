@@ -122,6 +122,7 @@ markers = [
     "asyncio: marks tests that use asyncio",
     "integration: marks integration tests",
     "e2e: marks end-to-end tests",
+    "live: marks tests that require live external services or authenticated CLIs",
     "slow: marks tests as slow (deselect with '-m \"not slow\"')"
 ]
 asyncio_mode = "strict"
@@ -130,4 +131,4 @@ python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
 # Local/default: skip e2e + slow real-binary tests. CI passes --cov explicitly.
-addopts = "-m 'not e2e and not slow'"
+addopts = "-m 'not e2e and not slow and not live'"

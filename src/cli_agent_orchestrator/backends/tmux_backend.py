@@ -6,9 +6,14 @@ no alternative is configured.
 """
 
 import logging
+from pathlib import Path
 from typing import Dict, List, Optional
 
-from cli_agent_orchestrator.backends.base import TerminalBackend, TerminalBackendError
+from cli_agent_orchestrator.backends.base import (
+    PaneIdentityReadResult,
+    TerminalBackend,
+    TerminalBackendError,
+)
 from cli_agent_orchestrator.clients.tmux import TmuxClient
 from cli_agent_orchestrator.utils.tmux_command import tmux_argv
 
@@ -17,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 class TmuxBackend(TerminalBackend):
     """TerminalBackend implementation backed by tmux via TmuxClient."""
+
+    supports_identity_readback = True
 
     def __init__(self, client: Optional[TmuxClient] = None) -> None:
         """Initialize with an optional TmuxClient (defaults to module singleton)."""
@@ -138,6 +145,57 @@ class TmuxBackend(TerminalBackend):
 
     def capture_viewport(self, session_name: str, window_name: str) -> str:
         return self._client.capture_viewport(session_name, window_name)
+
+    @staticmethod
+    def _pane_pids(session_name: str, window_name: str) -> list[int]:
+        import subprocess
+
+        result = subprocess.run(
+            tmux_argv("list-panes", "-t", f"{session_name}:{window_name}", "-F", "#{pane_pid}"),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise OSError(result.stderr.strip() or "tmux list-panes failed")
+        return [int(value) for value in result.stdout.splitlines() if value.strip()]
+
+    @staticmethod
+    def _proc_starttime(pid: int) -> str:
+        value = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        tail = value[value.rfind(")") + 2 :].split()
+        return tail[19]
+
+    @staticmethod
+    def _proc_identity(pid: int) -> str | None:
+        data = Path(f"/proc/{pid}/environ").read_bytes()
+        prefix = b"CAO_TERMINAL_ID="
+        for item in data.split(b"\0"):
+            if item.startswith(prefix):
+                return item[len(prefix) :].decode("utf-8")
+        return None
+
+    def read_pane_identity(self, session_name: str, window_name: str) -> PaneIdentityReadResult:
+        try:
+            first = self._pane_pids(session_name, window_name)
+        except (OSError, ValueError):
+            return PaneIdentityReadResult(reason="read_error")
+        if len(first) != 1:
+            return PaneIdentityReadResult(reason="pane_cardinality")
+        pid = first[0]
+        try:
+            birth = self._proc_starttime(pid)
+            identity = self._proc_identity(pid)
+            second = self._pane_pids(session_name, window_name)
+            if len(second) != 1 or second[0] != pid or self._proc_starttime(pid) != birth:
+                return PaneIdentityReadResult(reason="incarnation_changed")
+        except OSError:
+            return PaneIdentityReadResult(reason="read_error")
+        except (IndexError, ValueError, UnicodeError):
+            return PaneIdentityReadResult(reason="read_error")
+        if identity is None:
+            return PaneIdentityReadResult(reason="missing_env")
+        return PaneIdentityReadResult(identity=identity)
 
     def get_pane_working_directory(self, session_name: str, window_name: str) -> Optional[str]:
         return self._client.get_pane_working_directory(session_name, window_name)

@@ -86,12 +86,44 @@ class TestCodexProviderInitialization:
         with pytest.raises(TimeoutError, match="Codex initialization timed out"):
             await provider.initialize()
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_wpq1_blocked_rule_name_reaches_notifier_and_timeout(
+        self, mock_tmux, mock_wait_shell, mock_wait_status, _sleep
+    ):
+        mock_wait_shell.return_value = True
+        mock_tmux.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
+        notified = AsyncMock()
+
+        async def blocked(*_args, blocked_policy, **_kwargs):
+            blocked_policy.last_blocked_rule = "codex-update-available"
+            await blocked_policy.on_first_blocked("codex-update-available")
+            return False
+
+        mock_wait_status.side_effect = blocked
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+        provider.blocked_wait_notifier = notified
+
+        with pytest.raises(
+            TimeoutError,
+            match="after blocked wait rule 'codex-update-available'",
+        ):
+            await provider.initialize()
+
+        notified.assert_awaited_once_with("codex-update-available")
+
 
 class TestCodexBuildCommand:
     def test_build_command_no_profile(self):
         provider = CodexProvider("test1234", "test-session", "window-0", None)
         command = provider._build_codex_command()
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot -c features.multi_agent=false"
+        assert (
+            command
+            == "codex --yolo --no-alt-screen --disable shell_snapshot -c features.multi_agent=false"
+        )
 
     def test_build_command_disables_native_multi_agent(self):
         provider = CodexProvider("test1234", "test-session", "window-0", None)
@@ -368,7 +400,10 @@ class TestCodexBuildCommand:
         provider = CodexProvider("test1234", "test-session", "window-0", "empty_agent")
         command = provider._build_codex_command()
 
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot -c features.multi_agent=false"
+        assert (
+            command
+            == "codex --yolo --no-alt-screen --disable shell_snapshot -c features.multi_agent=false"
+        )
         assert "developer_instructions" not in command
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
@@ -383,7 +418,10 @@ class TestCodexBuildCommand:
         provider = CodexProvider("test1234", "test-session", "window-0", "none_agent")
         command = provider._build_codex_command()
 
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot -c features.multi_agent=false"
+        assert (
+            command
+            == "codex --yolo --no-alt-screen --disable shell_snapshot -c features.multi_agent=false"
+        )
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_profile_load_failure(self, mock_load_profile):
@@ -472,9 +510,7 @@ class TestCodexProviderModelFlag:
         assert "--model gpt-5.5" in command
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
-    def test_build_command_default_model_wins_over_profile(
-        self, mock_load, provider_defaults_file
-    ):
+    def test_build_command_default_model_wins_over_profile(self, mock_load, provider_defaults_file):
         mock_profile = MagicMock()
         mock_profile.model = "gpt-5-profile"
         mock_profile.system_prompt = None
@@ -508,6 +544,49 @@ class TestCodexProviderModelFlag:
 
         assert "--model" not in command
         assert "gpt-5-profile" not in command
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_wpq1_profile_model_layer_wins_over_provider_default(
+        self, mock_load, provider_defaults_file
+    ):
+        mock_profile = MagicMock(
+            model="frontmatter",
+            system_prompt=None,
+            mcpServers=None,
+            codexProfile=None,
+            codexConfig=None,
+        )
+        mock_load.return_value = mock_profile
+        provider_defaults_file.write_text(
+            '[codex]\nmodel = "provider"\n[codex.profiles.agent]\nmodel = "profile"\n',
+            encoding="utf-8",
+        )
+
+        command = CodexProvider("tid", "sess", "win", "agent")._build_codex_command()
+
+        assert "--model profile" in command
+        assert "--model provider" not in command
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_wpq1_empty_profile_model_layer_clears_all_fallbacks(
+        self, mock_load, provider_defaults_file
+    ):
+        mock_profile = MagicMock(
+            model="frontmatter",
+            system_prompt=None,
+            mcpServers=None,
+            codexProfile=None,
+            codexConfig=None,
+        )
+        mock_load.return_value = mock_profile
+        provider_defaults_file.write_text(
+            '[codex]\nmodel = "provider"\n[codex.profiles.agent]\nmodel = ""\n',
+            encoding="utf-8",
+        )
+
+        command = CodexProvider("tid", "sess", "win", "agent")._build_codex_command()
+
+        assert "--model" not in command
 
 
 class TestCodexBuildCommandExtra:
@@ -760,7 +839,10 @@ class TestCodexProviderCodexConfig:
         provider = CodexProvider("tid", "sess", "win", "agent")
         command = provider._build_codex_command()
 
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot -c features.multi_agent=false"
+        assert (
+            command
+            == "codex --yolo --no-alt-screen --disable shell_snapshot -c features.multi_agent=false"
+        )
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_codex_config_empty_dict_emits_no_overrides(self, mock_load):
@@ -775,7 +857,10 @@ class TestCodexProviderCodexConfig:
         provider = CodexProvider("tid", "sess", "win", "agent")
         command = provider._build_codex_command()
 
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot -c features.multi_agent=false"
+        assert (
+            command
+            == "codex --yolo --no-alt-screen --disable shell_snapshot -c features.multi_agent=false"
+        )
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_codex_config_composes_with_mcp_and_model(self, mock_load):
@@ -864,7 +949,29 @@ class TestCodexProviderCodexConfig:
         command = provider._build_codex_command()
 
         assert "model_reasoning_effort" not in command
-        assert "features.fast_mode=true" in command
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_wpq1_profile_reasoning_layer_wins_over_provider_default(
+        self, mock_load, provider_defaults_file
+    ):
+        mock_profile = MagicMock(
+            model=None,
+            system_prompt=None,
+            mcpServers=None,
+            codexProfile=None,
+            codexConfig={"model_reasoning_effort": "low"},
+        )
+        mock_load.return_value = mock_profile
+        provider_defaults_file.write_text(
+            '[codex]\nreasoning_effort = "medium"\n'
+            '[codex.profiles.agent]\nreasoning_effort = "high"\n',
+            encoding="utf-8",
+        )
+
+        command = CodexProvider("tid", "sess", "win", "agent")._build_codex_command()
+
+        assert 'model_reasoning_effort="high"' in command
+        assert 'model_reasoning_effort="medium"' not in command
 
 
 class TestCodexProviderStatusDetection:
@@ -1170,9 +1277,7 @@ class TestCodexComposerDraftParsing:
 
     def test_dim_sgr_ghost_with_bg_prefix_is_not_a_draft(self):
         """Some builds emit bg then dim before the hint text."""
-        ghost_line = (
-            "\x1b[1m›\x1b[0m \x1b[48;2;30;30;30m\x1b[2mSummarize recent commits\x1b[0m"
-        )
+        ghost_line = "\x1b[1m›\x1b[0m \x1b[48;2;30;30;30m\x1b[2mSummarize recent commits\x1b[0m"
         screen = [
             ghost_line,
             "  ? for shortcuts                     100% context left",
@@ -1217,9 +1322,7 @@ class TestCodexComposerDraftParsing:
 
     def test_combined_dim_and_truecolor_is_ghost(self):
         """Combined SGR with standalone 2 then truecolour still counts as dim."""
-        ghost_line = (
-            "\x1b[1m›\x1b[0m \x1b[2;38;2;120;120;120mSummarize recent commits\x1b[0m"
-        )
+        ghost_line = "\x1b[1m›\x1b[0m \x1b[2;38;2;120;120;120mSummarize recent commits\x1b[0m"
         screen = [
             ghost_line,
             "  ? for shortcuts                     100% context left",

@@ -27,7 +27,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, Optional, cast
+from typing import Any, Dict, Optional, cast
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
@@ -45,7 +45,9 @@ from cli_agent_orchestrator.clients.database import list_all_terminals as db_lis
 from cli_agent_orchestrator.clients.database import (
     list_deferred_init_recovery_rows,
     list_terminals_by_provider_session_id,
+    list_terminals_by_session,
     mark_terminal_init_ready,
+    settle_pending_orphan_messages,
     terminal_exists,
     update_last_active,
     update_provider_session_snapshot,
@@ -276,6 +278,9 @@ def purge_stale_terminal_records() -> int:
             if delete_terminal_and_warm_intent(terminal_id, preserve_warm_intent=False)[
                 "terminal_deleted"
             ]:
+                settlement = settle_pending_orphan_messages(receiver_ids=[terminal_id])
+                if settlement.busy_aborted:
+                    logger.warning("stale_terminal_p5_settlement_busy terminal=%s", terminal_id)
                 purged += 1
                 logger.debug(
                     "Purged stale terminal record %s for missing window %s:%s",
@@ -1467,18 +1472,80 @@ def _settle_deferred_failure_sync(
 async def _claim_and_settle_deferred_failure(
     terminal_id: str,
     generation: str,
-    snapshot: dict,
+    snapshot: dict[str, Any],
     code: str,
     registry: PluginRegistry | None,
     uuid_lease_token=None,
     *,
     fatal_claim_failure: bool = False,
 ) -> None:
+    token = str(uuid.uuid4())
+    owner_epoch = snapshot.get("init_owner_epoch")
+    try:
+        owner_epoch = str(uuid.UUID(str(owner_epoch)))
+    except (ValueError, TypeError, AttributeError):
+        owner_epoch = SERVER_INIT_OWNER_EPOCH
+
+    async def deadletter(
+        *,
+        stage: str,
+        notice: str,
+        rejection_reason: str | None = None,
+        attempts: list[dict[str, Any]] | None = None,
+    ) -> None:
+        from cli_agent_orchestrator.services.deferred_deadletter_service import (
+            write_deferred_failure_deadletter,
+        )
+
+        payload = {
+            "terminal_id": terminal_id,
+            "caller_id": snapshot.get("caller_id"),
+            "owner_epoch": owner_epoch,
+            "failure_token": token,
+            "notice": notice,
+            "stage": stage,
+        }
+        if rejection_reason is not None:
+            payload["rejection_reason"] = rejection_reason
+        if attempts is not None:
+            payload["attempt_log"] = attempts
+        try:
+            await _tracked_blocking(
+                terminal_id,
+                generation,
+                "mutating",
+                "deadletter",
+                write_deferred_failure_deadletter,
+                payload,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.critical(
+                "deferred_init_deadletter_write_failed terminal=%s token=%s stage=%s",
+                terminal_id,
+                token,
+                stage,
+                exc_info=True,
+            )
+
     deadline_s = snapshot.get("init_deadline_s")
     if not isinstance(deadline_s, (int, float)) or not 1.0 <= float(deadline_s) <= 600.0:
-        logger.error("deferred_init_internal terminal=%s invalid_stored_deadline", terminal_id)
+        notice = (
+            f"Worker {terminal_id} deferred initialization failed before claim validation "
+            f"(invalid_stored_deadline); token={token}."
+        )
+        logger.critical(
+            "deferred_init_internal terminal=%s invalid_stored_deadline token=%s",
+            terminal_id,
+            token,
+        )
+        await deadletter(
+            stage="pre_claim_validation",
+            notice=notice,
+            rejection_reason="invalid_stored_deadline",
+        )
         return
-    token = str(uuid.uuid4())
     try:
         notice = _notice_text(
             code=code,
@@ -1489,31 +1556,83 @@ async def _claim_and_settle_deferred_failure(
             provider=snapshot.get("provider"),
         )
     except ValueError:
-        logger.error("deferred_init_internal terminal=%s notice_rejected", terminal_id)
-        return
-    try:
-        claim, _ = await _tracked_blocking(
+        notice = (
+            f"Worker {terminal_id} deferred initialization failed before claim validation "
+            f"(notice_rejected); token={token}."
+        )
+        logger.critical(
+            "deferred_init_internal terminal=%s notice_rejected token=%s",
             terminal_id,
-            generation,
-            "mutating",
-            "h3_claim",
-            claim_deferred_init_failure,
-            terminal_id,
-            caller_id=snapshot.get("caller_id"),
-            failure_token=token,
+            token,
+        )
+        await deadletter(
+            stage="pre_claim_validation",
             notice=notice,
+            rejection_reason="notice_rejected",
         )
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        logger.error(
-            "deferred_init_claim_failed terminal=%s code=%s error=%s",
-            terminal_id,
-            code,
-            type(exc).__name__,
-        )
-        if fatal_claim_failure and str(exc) == "deferred_init_claim_busy_exhausted":
+        return
+    attempt_log: list[dict[str, Any]] = []
+    claim = None
+    retry_delays = (1.0, 5.0, 25.0)
+    total_attempts = 1 if fatal_claim_failure else 4
+    for attempt_index in range(total_attempts):
+        try:
+            claim, _ = await _tracked_blocking(
+                terminal_id,
+                generation,
+                "mutating",
+                "h3_claim",
+                claim_deferred_init_failure,
+                terminal_id,
+                caller_id=snapshot.get("caller_id"),
+                failure_token=token,
+                notice=notice,
+            )
+            break
+        except asyncio.CancelledError:
             raise
+        except Exception as exc:
+            chain: list[str] = []
+            cursor: BaseException | None = exc
+            while cursor is not None:
+                chain.append(f"{type(cursor).__name__}: {cursor}")
+                cursor = cursor.__cause__ or cursor.__context__
+            attempt_log.append(
+                {
+                    "attempt": attempt_index + 1,
+                    "exception": type(exc).__name__,
+                    "chain": chain,
+                }
+            )
+            busy_exhausted = str(exc) == "deferred_init_claim_busy_exhausted"
+            logger.error(
+                "deferred_init_claim_failed terminal=%s code=%s attempt=%s error=%s",
+                terminal_id,
+                code,
+                attempt_index + 1,
+                type(exc).__name__,
+                exc_info=True,
+            )
+            if fatal_claim_failure:
+                if busy_exhausted:
+                    raise
+                return
+            if busy_exhausted or attempt_index + 1 >= total_attempts:
+                logger.critical(
+                    "deferred_init_claim_exhausted_retaining terminal=%s code=%s token=%s",
+                    terminal_id,
+                    code,
+                    token,
+                    exc_info=True,
+                )
+                await deadletter(
+                    stage="h3_claim",
+                    notice=notice,
+                    attempts=attempt_log,
+                )
+                return
+            await asyncio.sleep(retry_delays[attempt_index])
+    if claim is None:
         return
     if claim["status"] == "claimed_caller_gone":
         logger.error("caller_gone_zero_notice terminal=%s token=%s", terminal_id, token)
@@ -2013,8 +2132,51 @@ def _schedule_deferred_init(
     snapshot = dict(caller_snapshot or get_terminal_metadata(terminal_id) or {})
     generation = str(uuid.uuid4())
 
+    def _blocked_notice_receiver() -> str | None:
+        caller_id = snapshot.get("caller_id")
+        if isinstance(caller_id, str) and get_terminal_metadata(caller_id) is not None:
+            return caller_id
+        session_name = snapshot.get("tmux_session")
+        if not isinstance(session_name, str):
+            return None
+        for terminal in list_terminals_by_session(session_name):
+            if terminal.get("id") == terminal_id:
+                continue
+            try:
+                candidate = load_agent_profile(terminal.get("agent_profile") or "")
+            except (FileNotFoundError, ValueError):
+                continue
+            if getattr(candidate, "role", None) == "supervisor":
+                return cast(str, terminal["id"])
+        return None
+
+    async def _notify_blocked_wait(rule_name: str) -> None:
+        receiver = _blocked_notice_receiver()
+        if receiver is None:
+            logger.warning(
+                "deferred_init_blocked_no_supervisor terminal=%s rule=%s",
+                terminal_id,
+                rule_name,
+            )
+            return
+        notice = (
+            f"Worker {terminal_id} initialization is paused by auto-responder "
+            f"wait rule '{rule_name}'. The worker remains alive and init_pending."
+        )
+        await _tracked_blocking(
+            terminal_id,
+            generation,
+            "mutating",
+            "notice",
+            create_inbox_message,
+            terminal_id,
+            receiver,
+            notice,
+        )
+
     async def _run() -> None:
         try:
+            provider_instance.blocked_wait_notifier = _notify_blocked_wait
             prepared_message = await _prepare_fork_message(
                 terminal_id,
                 generation,
@@ -2461,11 +2623,34 @@ def send_prepared_input(
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:
         raise ValueError(f"Terminal '{terminal_id}' not found")
+    backend = get_backend()
+    if getattr(backend, "supports_identity_readback", False) is not True:
+        logger.warning(
+            "pane_identity_proof_unsupported terminal=%s backend=%s",
+            terminal_id,
+            type(backend).__name__,
+        )
+    else:
+        from cli_agent_orchestrator.services.pane_identity_service import (
+            PaneIdentityMismatchError,
+            pane_identity_failure,
+        )
+
+        identity_failure = pane_identity_failure(terminal_id, metadata, backend)
+        if identity_failure is not None:
+            logger.critical(
+                "pane_identity_proof_failed terminal=%s session=%s window=%s "
+                "reason=%s stage=send",
+                terminal_id,
+                metadata["tmux_session"],
+                metadata["tmux_window"],
+                identity_failure,
+            )
+            raise PaneIdentityMismatchError(identity_failure)
     provider = provider_manager.get_provider(terminal_id)
     enter_count = provider.paste_enter_count if provider else 1
     status_monitor.notify_input_sent(terminal_id)
     status_monitor.clear_rolling_buffer(terminal_id)
-    backend = get_backend()
     if isinstance(getattr(provider, "composer_stash_keys", None), list):
         if stash_draft_before_send(terminal_id, metadata, provider, defer_on_dialog):
             enter_count = 1

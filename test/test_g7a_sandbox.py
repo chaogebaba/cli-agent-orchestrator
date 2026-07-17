@@ -684,7 +684,8 @@ from cli_agent_orchestrator import constants as c
 paths = [c.CAO_ENV_FILE, c.DB_DIR, c.LOG_DIR, c.TERMINAL_LOG_DIR, c.DRAFT_LOG_DIR,
          c.FIFO_DIR, c.AGENT_CONTEXT_DIR, c.LOCAL_AGENT_STORE_DIR, c.SKILLS_DIR,
          c.DATABASE_FILE, c.MEMORY_BASE_DIR, c.WORKFLOW_SPEC_DIR,
-         c.WORKFLOW_SCRIPT_SCRATCH_DIR, c.graph_export_root()]
+         c.WORKFLOW_SCRIPT_SCRATCH_DIR, c.DEFERRED_DEADLETTER_DIR,
+         c.graph_export_root()]
 print(chr(10).join(map(str, paths)))
 """
     result = subprocess.run(

@@ -17,9 +17,11 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from cli_agent_orchestrator.backends.base import PaneIdentityReadResult
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.clients.database import (
     Base,
+    NoticeInsertOutcome,
     create_inbox_message,
     create_terminal,
     get_message_trace,
@@ -29,6 +31,8 @@ from cli_agent_orchestrator.providers import claude_code, codex, grok_cli
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
+from cli_agent_orchestrator.services import inbox_service as inbox_service_module
+from cli_agent_orchestrator.services import terminal_service as terminal_service_module
 from cli_agent_orchestrator.services.inbox_service import InboxService
 from cli_agent_orchestrator.services.message_trace_service import (
     confirm_delivery,
@@ -36,6 +40,7 @@ from cli_agent_orchestrator.services.message_trace_service import (
     transcript_lookup,
     wire_hash,
 )
+from cli_agent_orchestrator.services.pane_identity_service import PaneIdentityMismatchError
 from cli_agent_orchestrator.services.replay_policy import (
     CAP_TABLE,
     AuthorizationFacts,
@@ -67,12 +72,15 @@ def _probe_meta(
     provider_signal: str | None = None,
     frame_source: str | None = None,
 ) -> dict:
-    signal_class = "chrome" if status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED} else "progress"
+    signal_class = (
+        "chrome" if status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED} else "progress"
+    )
     return {
         "probed_at": "2026-07-16T00:00:00Z",
         "geometry": {"columns": 220, "rows": 50},
         "frame_rows_hash": "0" * 64,
-        "frame_source": frame_source or (
+        "frame_source": frame_source
+        or (
             "fresh_capture"
             if status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
             else "incremental"
@@ -199,7 +207,10 @@ def test_probe_04_codex_existing_fixture_corpus_is_unchanged():
         {
             "synthetic:completed": ["› Fix", "• Fixed", "", "› ", "? for shortcuts"],
             "synthetic:working": [
-                "› Fix", "• Working (5s • esc to interrupt)", "› ", "? for shortcuts"
+                "› Fix",
+                "• Working (5s • esc to interrupt)",
+                "› ",
+                "? for shortcuts",
             ],
             "synthetic:above_tail": [
                 "› Fix",
@@ -261,23 +272,32 @@ def test_probe_05_equal_row_progress_wins(provider, row):
 
 
 def test_probe_06_claude_background_wait_and_permission_precedence():
-    assert _claude().get_status_from_screen(
-        ["● done", "✻ Waiting for 1 dynamic workflow to finish", "─" * 60, "❯", "─" * 60]
-    ) == TerminalStatus.PROCESSING
-    assert _claude().get_status_from_screen(
-        [
-            "✻ Waiting for 1 dynamic workflow to finish",
-            "❯ 1. Yes",
-            "  2. No",
-            "↑/↓ to navigate · Enter to select",
-        ]
-    ) == TerminalStatus.WAITING_USER_ANSWER
+    assert (
+        _claude().get_status_from_screen(
+            ["● done", "✻ Waiting for 1 dynamic workflow to finish", "─" * 60, "❯", "─" * 60]
+        )
+        == TerminalStatus.PROCESSING
+    )
+    assert (
+        _claude().get_status_from_screen(
+            [
+                "✻ Waiting for 1 dynamic workflow to finish",
+                "❯ 1. Yes",
+                "  2. No",
+                "↑/↓ to navigate · Enter to select",
+            ]
+        )
+        == TerminalStatus.WAITING_USER_ANSWER
+    )
 
 
 def test_probe_07_grok_historical_error_is_filtered_by_newer_completion():
-    assert _grok().get_status_from_screen(
-        ["Error: historical", "Turn completed in 1.5s.", "❯", "always-approve"]
-    ) == TerminalStatus.COMPLETED
+    assert (
+        _grok().get_status_from_screen(
+            ["Error: historical", "Turn completed in 1.5s.", "❯", "always-approve"]
+        )
+        == TerminalStatus.COMPLETED
+    )
 
 
 def test_probe_08_typed_screen_probe_uses_one_frame_and_named_source_signal():
@@ -340,6 +360,218 @@ def test_probe_08_typed_screen_probe_uses_one_frame_and_named_source_signal():
     assert first_status == TerminalStatus.COMPLETED
     assert first_meta["frame_source"] == "fresh_capture"
     assert set(first_meta) == set(meta)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["mismatch", "missing_env", "read_error", "pane_cardinality", "incarnation_changed"],
+)
+def test_wpq1_identity_failure_fences_ready_capture_and_projects_reason(reason):
+    monitor = StatusMonitor()
+    rows = ["› task", "assistant: done", "› ", "? for shortcuts"]
+    screen = SimpleNamespace(display=rows, columns=220, lines=50)
+    monitor._screens["receiver"] = (screen, object())  # noqa: SLF001
+    backend = MagicMock(supports_identity_readback=True)
+    backend.read_pane_identity.return_value = (
+        PaneIdentityReadResult(identity="other")
+        if reason == "mismatch"
+        else PaneIdentityReadResult(reason=reason)
+    )
+
+    with (
+        patch(
+            "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
+            return_value=_codex(),
+        ),
+        patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+        patch(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            return_value={"tmux_session": "session", "tmux_window": "receiver"},
+        ),
+    ):
+        status, meta = monitor.probe_screen_status("receiver")
+
+    assert status == TerminalStatus.UNKNOWN
+    assert meta["identity_proof_failure"] == reason
+    assert meta["result_status"] == "unknown"
+    backend.read_pane_identity.assert_called_once_with("session", "receiver")
+    backend.capture_viewport.assert_not_called()
+    assert screen.display == rows
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["mismatch", "missing_env", "read_error", "pane_cardinality", "incarnation_changed"],
+)
+def test_wpq1_send_sink_identity_failure_precedes_all_mutation(reason):
+    backend = MagicMock(supports_identity_readback=True)
+    backend.read_pane_identity.return_value = (
+        PaneIdentityReadResult(identity="other")
+        if reason == "mismatch"
+        else PaneIdentityReadResult(reason=reason)
+    )
+    with (
+        patch.object(
+            terminal_service_module,
+            "get_terminal_metadata",
+            return_value={"tmux_session": "session", "tmux_window": "receiver"},
+        ),
+        patch.object(terminal_service_module, "get_backend", return_value=backend),
+        patch.object(terminal_service_module, "status_monitor") as monitor,
+        patch.object(terminal_service_module, "provider_manager") as providers,
+    ):
+        with pytest.raises(PaneIdentityMismatchError) as caught:
+            terminal_service_module.send_prepared_input("receiver", "payload")
+
+    assert caught.value.reason == reason
+    backend.read_pane_identity.assert_called_once_with("session", "receiver")
+    backend.send_keys.assert_not_called()
+    monitor.notify_input_sent.assert_not_called()
+    monitor.clear_rolling_buffer.assert_not_called()
+    providers.get_provider.assert_not_called()
+
+
+def test_wpq1_three_preopen_identity_failures_notice_once_without_attempt(
+    wave4_db,
+):
+    with wave4_db.begin() as db:
+        db.get(database.TerminalModel, "receiver").caller_id = "sender"
+    message = create_inbox_message("sender", "receiver", "identity fenced")
+    meta = _probe_meta(TerminalStatus.UNKNOWN)
+    meta["identity_proof_failure"] = "mismatch"
+    monitor = MagicMock()
+    monitor.get_boundary_observation.return_value = BoundaryObservation(
+        "epoch", TerminalStatus.IDLE, 1, 1, 1, None, 1
+    )
+    monitor.get_status.return_value = TerminalStatus.IDLE
+    monitor.get_input_gen.return_value = monitor.get_status_gen.return_value = 1
+    monitor.probe_screen_status.return_value = (TerminalStatus.UNKNOWN, meta)
+    service = InboxService()
+
+    with (
+        patch("cli_agent_orchestrator.services.inbox_service.status_monitor", monitor),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.terminal_service.send_prepared_input"
+        ) as paste,
+    ):
+        for _ in range(4):
+            service.deliver_pending("receiver")
+
+    trace = get_message_trace(message.id)
+    assert trace["message"]["status"] == "pending"
+    assert trace["attempts"] == []
+    paste.assert_not_called()
+    notices = database.get_inbox_messages("sender")
+    authority = [item for item in notices if item.message.startswith("[identity-authority]")]
+    assert len(authority) == 1
+    assert "(mismatch, x3)" in authority[0].message
+
+
+def test_wpq1_three_postopen_identity_failures_stay_pending_and_bypass_caps(
+    wave4_db,
+):
+    with wave4_db.begin() as db:
+        db.get(database.TerminalModel, "receiver").caller_id = "sender"
+    message = create_inbox_message("sender", "receiver", "identity fenced after open")
+    observation = BoundaryObservation("epoch", TerminalStatus.IDLE, 1, 1, 1, None, 1)
+    monitor = MagicMock()
+    monitor.get_boundary_observation.return_value = observation
+    monitor.get_status.return_value = TerminalStatus.IDLE
+    monitor.get_input_gen.return_value = monitor.get_status_gen.return_value = 1
+    monitor.probe_screen_status.return_value = (
+        TerminalStatus.IDLE,
+        _probe_meta(TerminalStatus.IDLE),
+    )
+    service = InboxService()
+
+    with (
+        patch("cli_agent_orchestrator.services.inbox_service.status_monitor", monitor),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.terminal_service.prepare_input",
+            side_effect=lambda _terminal, value, _kind: value,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.terminal_service.send_prepared_input",
+            side_effect=PaneIdentityMismatchError("read_error"),
+        ),
+    ):
+        for _ in range(3):
+            service.deliver_pending("receiver")
+
+    trace = get_message_trace(message.id)
+    assert trace["message"]["status"] == "pending"
+    assert len(trace["attempts"]) == 3
+    assert {item["reason"] for item in trace["attempts"]} == {"pane_identity_mismatch:read_error"}
+    assert all(item["outcome"] == "ambiguous" for item in trace["attempts"])
+    assert all(item["evidence"]["identity_proof"] == "read_error" for item in trace["attempts"])
+    authority = [
+        item
+        for item in database.get_inbox_messages("sender")
+        if item.message.startswith("[identity-authority]")
+    ]
+    assert len(authority) == 1
+    assert "(read_error, x3)" in authority[0].message
+
+
+@pytest.mark.parametrize(
+    ("outcome", "notified", "calls_after_four"),
+    [
+        (NoticeInsertOutcome.INSERTED, True, 1),
+        (NoticeInsertOutcome.FAILED_AFTER_COMMIT, True, 1),
+        (NoticeInsertOutcome.UNCERTAIN_COMMIT, True, 1),
+        (NoticeInsertOutcome.FAILED_BEFORE_COMMIT, False, 2),
+    ],
+)
+def test_wpq1_identity_notice_outcome_state_machine(
+    monkeypatch, outcome, notified, calls_after_four
+):
+    service = InboxService()
+    batch = [SimpleNamespace(logical_receiver_id=None, enqueue_generation=None)]
+    metadata = {"caller_id": "sender", "tmux_session": "session"}
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.get_terminal_metadata",
+        lambda terminal_id: {"id": terminal_id},
+    )
+    insert = MagicMock(return_value=outcome)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.insert_identity_authority_notice",
+        insert,
+    )
+
+    for _ in range(4):
+        service._record_identity_authority_failure("receiver", batch, metadata, "read_error")
+
+    assert insert.call_count == calls_after_four
+    assert service._identity_authority[("receiver", "raw")].notified is notified
+
+
+def test_wpq1_identity_episode_generation_change_and_teardown_evict(monkeypatch):
+    service = InboxService()
+    batch = [
+        SimpleNamespace(
+            logical_receiver_id="mb_authority",
+            enqueue_generation=1,
+        )
+    ]
+    service._record_identity_authority_failure("receiver", batch, {}, "missing_env")
+    assert service._identity_authority[("receiver", "1")].count == 1
+
+    batch[0].enqueue_generation = 2
+    service._record_identity_authority_failure("receiver", batch, {}, "missing_env")
+    assert ("receiver", "1") not in service._identity_authority
+    assert service._identity_authority[("receiver", "2")].count == 1
+
+    monkeypatch.setattr(inbox_service_module, "inbox_service", service)
+    inbox_service_module.clear_terminal_delivery_state("receiver")
+    assert service._identity_authority == {}
 
 
 def test_probe_08_every_emitted_provider_signal_names_a_module_constant():
@@ -422,9 +654,10 @@ def test_probe_10_non_user_roles_and_tag_echo_never_confirm(tmp_path):
     transcript.write_text("".join(json.dumps(row) + "\n" for row in records))
     fingerprint = normalized_confirmation_fingerprint(payload)
     assert fingerprint is not None
-    assert transcript_lookup(
-        transcript, wire_hash(payload), normalized_payload_hash=fingerprint[0]
-    )[0] == "absent"
+    assert (
+        transcript_lookup(transcript, wire_hash(payload), normalized_payload_hash=fingerprint[0])[0]
+        == "absent"
+    )
 
 
 def test_probe_11_normalized_core_floor_is_strictly_48_characters():
@@ -436,14 +669,14 @@ def test_probe_12_queue_operation_and_missing_oracle_remain_out_of_ladder(tmp_pa
     payload = "A queue payload long enough to exceed forty eight characters without ambiguity."
     transcript = tmp_path / "trace.jsonl"
     transcript.write_text(
-        json.dumps({"type": "queue-operation", "operation": "enqueue", "content": payload})
-        + "\n"
+        json.dumps({"type": "queue-operation", "operation": "enqueue", "content": payload}) + "\n"
     )
     fingerprint = normalized_confirmation_fingerprint(payload)
     assert fingerprint is not None
-    assert transcript_lookup(
-        transcript, wire_hash(payload), normalized_payload_hash=fingerprint[0]
-    )[0] == "absent"
+    assert (
+        transcript_lookup(transcript, wire_hash(payload), normalized_payload_hash=fingerprint[0])[0]
+        == "absent"
+    )
     with patch(
         "cli_agent_orchestrator.services.message_trace_service.resolve_session_transcript",
         return_value=None,
@@ -464,12 +697,14 @@ def test_probe_13_both_open_replay_kinds_use_one_provider_blind_engine():
         binding_authority=True,
         boundary_observation={"seq": 7},
     )
-    assert run_post_auth_engine(
-        generic, ambiguous_count=1, exhausted_boundary_count=0
-    ).kind == "tagged_replay"
-    assert run_post_auth_engine(
-        binding, ambiguous_count=99, exhausted_boundary_count=1
-    ).kind == "inject"
+    assert (
+        run_post_auth_engine(generic, ambiguous_count=1, exhausted_boundary_count=0).kind
+        == "tagged_replay"
+    )
+    assert (
+        run_post_auth_engine(binding, ambiguous_count=99, exhausted_boundary_count=1).kind
+        == "inject"
+    )
     assert "claude" not in inspect.getsource(ReplayPolicy).lower()
     assert "claude" not in inspect.getsource(run_post_auth_engine).lower()
 
@@ -480,21 +715,31 @@ def test_probe_14_cap_table_is_closed_and_per_kind():
     assert CAP_TABLE["tagged_replay"].counter == "ambiguous"
     assert CAP_TABLE["inject"].counter == "exhausted_boundary"
     inject = AuthorizationFacts(
-        ObservedFact(True, "prior"), ObservedFact(False), False, True, True,
-        binding_authority=True, boundary_observation={"seq": 1},
+        ObservedFact(True, "prior"),
+        ObservedFact(False),
+        False,
+        True,
+        True,
+        binding_authority=True,
+        boundary_observation={"seq": 1},
     )
-    assert run_post_auth_engine(
-        inject, ambiguous_count=3, exhausted_boundary_count=2
-    ).kind == "inject"
-    assert run_post_auth_engine(
-        inject, ambiguous_count=3, exhausted_boundary_count=3
-    ).kind == "stop"
+    assert (
+        run_post_auth_engine(inject, ambiguous_count=3, exhausted_boundary_count=2).kind == "inject"
+    )
+    assert (
+        run_post_auth_engine(inject, ambiguous_count=3, exhausted_boundary_count=3).kind == "stop"
+    )
 
 
 def test_probe_15_prior_hit_suppression_precedes_every_open_kind():
     facts = AuthorizationFacts(
-        ObservedFact(True, "prior"), ObservedFact(True, "hit"), False, True, True,
-        binding_authority=True, boundary_observation={"seq": 1},
+        ObservedFact(True, "prior"),
+        ObservedFact(True, "hit"),
+        False,
+        True,
+        True,
+        binding_authority=True,
+        boundary_observation={"seq": 1},
     )
     assert ReplayPolicy.decide(facts).kind == "suppress"
 
@@ -503,11 +748,16 @@ def test_probe_16_frozen_drain_sql_fixture_ratios():
     root = Path(__file__).parents[3]
     command = [
         "sqlite3",
-        "-cmd", ".read blueprints/wave4-drain-metric-fixture.sql",
-        "-cmd", ".parameter init",
-        "-cmd", ".parameter set :start '2026-07-15T00:00:00Z'",
-        "-cmd", ".parameter set :end '2026-07-16T00:00:00Z'",
-        ":memory:", ".read blueprints/wave4-drain-metric.sql",
+        "-cmd",
+        ".read blueprints/wave4-drain-metric-fixture.sql",
+        "-cmd",
+        ".parameter init",
+        "-cmd",
+        ".parameter set :start '2026-07-15T00:00:00Z'",
+        "-cmd",
+        ".parameter set :end '2026-07-16T00:00:00Z'",
+        ":memory:",
+        ".read blueprints/wave4-drain-metric.sql",
     ]
     output = subprocess.run(command, cwd=root, check=True, text=True, capture_output=True).stdout
     assert "claude_code|2|1|1|1|0|0.5|0.5|0.5|0.0" in output
@@ -668,9 +918,11 @@ def test_livefix_p2_fresh_capture_failure_fails_closed(wave4_db, capture_result)
 
 def test_livefix_p3_grok_live_shape_completes_and_delivery_opens(wave4_db):
     root = Path(__file__).parents[3]
-    screen = (root / "tmp/orch/drain-2026-07-16-wave4/p17-pane-final.txt").read_text(
-        encoding="utf-8"
-    ).splitlines()
+    screen = (
+        (root / "tmp/orch/drain-2026-07-16-wave4/p17-pane-final.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
     provider = _grok()
     classification = provider.classify_screen(screen)
     assert classification.status == TerminalStatus.COMPLETED
@@ -729,9 +981,11 @@ def test_livefix_p3_grok_live_shape_completes_and_delivery_opens(wave4_db):
 
 def test_livefix_p4_f16_live_pane_remains_processing():
     root = Path(__file__).parents[3]
-    screen = (root / "tmp/orch/drain-2026-07-16-wave4/f16-tmux-tail.txt").read_text(
-        encoding="utf-8"
-    ).splitlines()
+    screen = (
+        (root / "tmp/orch/drain-2026-07-16-wave4/f16-tmux-tail.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
     classification = _grok().classify_screen(screen)
     assert classification.status == TerminalStatus.PROCESSING
     assert classification.provider_signal == "PROCESSING_PATTERN"

@@ -66,6 +66,33 @@ def get_provider_defaults(provider: str) -> Dict[str, Any]:
     return dict(section)
 
 
+def get_provider_profile_defaults(
+    provider_defaults: Dict[str, Any], profile_name: Optional[str]
+) -> Dict[str, Any]:
+    """Return one nested providers.toml profile layer, or an empty mapping."""
+    profiles = provider_defaults.get("profiles")
+    if not profile_name or not isinstance(profiles, dict):
+        return {}
+    defaults = profiles.get(profile_name)
+    return dict(defaults) if isinstance(defaults, dict) else {}
+
+
+def resolve_provider_string_option(
+    profile_defaults: Dict[str, Any],
+    provider_defaults: Dict[str, Any],
+    profile: Any,
+    toml_key: str,
+    profile_attr: str,
+) -> Optional[str]:
+    """Resolve profile TOML, provider TOML, then CAO profile with empty clearing."""
+    for defaults in (profile_defaults, provider_defaults):
+        value = defaults.get(toml_key)
+        if toml_key in defaults and isinstance(value, str):
+            return value or None
+    value = getattr(profile, profile_attr, None) if profile is not None else None
+    return value if isinstance(value, str) and value else None
+
+
 def get_default_fork_base(provider: str, profile_name: str) -> Optional[str]:
     """Resolve the profile-over-provider default base without caching TOML."""
     provider_defaults = get_provider_defaults(provider)

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.constants import BLOCKED_WAIT_CAP_S
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
 from cli_agent_orchestrator.providers.base import (
     BaseProvider,
@@ -25,13 +26,19 @@ from cli_agent_orchestrator.providers.screen_classification import (
 )
 from cli_agent_orchestrator.services.settings_service import (
     get_provider_defaults,
+    get_provider_profile_defaults,
     get_server_settings,
+    resolve_provider_string_option,
 )
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.provider_plane import provider_home
 from cli_agent_orchestrator.utils.sandbox_guard import bind_mcp_server_identity
-from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.terminal import (
+    BlockedWaitPolicy,
+    wait_for_shell,
+    wait_until_status,
+)
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
@@ -302,17 +309,27 @@ def _toml_override(key: str, value: Any) -> str:
         raise TypeError(f"codexConfig key '{key}': {exc}") from exc
 
 
-def _resolved_codex_profile_config(profile) -> tuple[str | None, dict[str, Any]]:
+def _resolved_codex_profile_config(
+    profile, profile_name: str | None = None
+) -> tuple[str | None, dict[str, Any]]:
     """Single model/config resolver shared by interactive and seed launches."""
     defaults = get_provider_defaults("codex")
-    default_model = defaults.get("model")
-    if "model" in defaults and isinstance(default_model, str):
-        model = default_model or None
-    else:
-        model = profile.model if profile and profile.model else None
+    declared_name = getattr(profile, "name", None) if profile is not None else None
+    resolved_profile_name = (
+        declared_name if isinstance(declared_name, str) and declared_name else profile_name
+    )
+    profile_defaults = get_provider_profile_defaults(defaults, resolved_profile_name)
+    model = resolve_provider_string_option(profile_defaults, defaults, profile, "model", "model")
     config = dict(getattr(profile, "codexConfig", None) or {})
-    effort = defaults.get("reasoning_effort")
-    if "reasoning_effort" in defaults and isinstance(effort, str):
+    effort = None
+    effort_configured = False
+    for layer in (profile_defaults, defaults):
+        candidate = layer.get("reasoning_effort")
+        if "reasoning_effort" in layer and isinstance(candidate, str):
+            effort = candidate
+            effort_configured = True
+            break
+    if effort_configured:
         if effort:
             config["model_reasoning_effort"] = effort
         else:
@@ -382,7 +399,7 @@ class CodexProvider(BaseProvider):
         """Create and validate a native Codex rollout without CAO coordinates."""
         profile = load_agent_profile(agent_profile)
         argv = ["codex", "exec", "--skip-git-repo-check", "-C", cwd]
-        model, config = _resolved_codex_profile_config(profile)
+        model, config = _resolved_codex_profile_config(profile, agent_profile)
         if isinstance(model, str) and model:
             argv.extend(["--model", model])
         for key, value in config.items():
@@ -447,7 +464,7 @@ class CodexProvider(BaseProvider):
             command_parts = ["codex", "--yolo"]
         command_parts.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
 
-        model, codex_config = _resolved_codex_profile_config(profile)
+        model, codex_config = _resolved_codex_profile_config(profile, self._agent_profile)
         if isinstance(model, str) and model:
             command_parts.extend(["--model", model])
 
@@ -694,18 +711,40 @@ class CodexProvider(BaseProvider):
         # Handle workspace trust prompt if it appears (new/untrusted directories)
         await self._handle_trust_prompt(timeout=20.0)
 
-        status_kwargs = dict(
-            timeout=float(get_server_settings()["provider_init_timeout"]),
-            polling_interval=1.0,
+        init_timeout = float(get_server_settings()["provider_init_timeout"])
+        from cli_agent_orchestrator.services.auto_responder import auto_responder
+
+        async def notify_blocked(rule_name: str) -> None:
+            if self.blocked_wait_notifier is not None:
+                await self.blocked_wait_notifier(rule_name)
+
+        def probe_blocked() -> tuple[str, str] | None:
+            gate = auto_responder.waiting_gate(self.terminal_id)
+            return gate if isinstance(gate, tuple) else None
+
+        blocked_policy = BlockedWaitPolicy(
+            probe=probe_blocked,
+            blocked_cap_s=BLOCKED_WAIT_CAP_S,
+            on_first_blocked=notify_blocked,
         )
-        if provider_override is not None or raw_status:
-            status_kwargs.update(provider_override=provider_override, raw_status=raw_status)
-        if not await wait_until_status(
+        ready = await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            **status_kwargs,
-        ):
-            raise TimeoutError("Codex initialization timed out after 60 seconds")
+            timeout=init_timeout,
+            polling_interval=1.0,
+            provider_override=provider_override,
+            raw_status=raw_status,
+            blocked_policy=blocked_policy,
+        )
+        if not ready:
+            suffix = (
+                f" after blocked wait rule '{blocked_policy.last_blocked_rule}'"
+                if blocked_policy.last_blocked_rule
+                else ""
+            )
+            raise TimeoutError(
+                f"Codex initialization timed out after {init_timeout:g} seconds{suffix}"
+            )
 
         self._initialized = True
         return True

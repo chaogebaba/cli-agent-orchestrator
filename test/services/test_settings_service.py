@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -11,10 +12,12 @@ from cli_agent_orchestrator.services.settings_service import (
     _load,
     _save,
     get_agent_dirs,
+    get_default_fork_base,
     get_extra_agent_dirs,
     get_extra_skill_dirs,
-    get_default_fork_base,
     get_provider_defaults,
+    get_provider_profile_defaults,
+    resolve_provider_string_option,
     set_agent_dirs,
     set_extra_agent_dirs,
     set_extra_skill_dirs,
@@ -158,15 +161,27 @@ class TestGetProviderDefaults:
 
     def test_e2_provider_defaults_hand_edit_is_live_without_cache(self, settings_file, tmp_path):
         defaults_file = tmp_path / "providers.toml"
-        defaults_file.write_text(
-            '[codex]\ndefault_fork_base = "first"\n', encoding="utf-8"
-        )
+        defaults_file.write_text('[codex]\ndefault_fork_base = "first"\n', encoding="utf-8")
         assert get_default_fork_base("codex", "developer") == "first"
 
-        defaults_file.write_text(
-            '[codex]\ndefault_fork_base = "second"\n', encoding="utf-8"
-        )
+        defaults_file.write_text('[codex]\ndefault_fork_base = "second"\n', encoding="utf-8")
         assert get_default_fork_base("codex", "developer") == "second"
+
+    def test_wpq1_shared_string_resolver_precedence_and_empty_clear(self):
+        provider = {"model": "provider", "profiles": {"dev": {"model": "profile"}}}
+        profile_layer = get_provider_profile_defaults(provider, "dev")
+        profile = SimpleNamespace(model="frontmatter")
+
+        assert (
+            resolve_provider_string_option(profile_layer, provider, profile, "model", "model")
+            == "profile"
+        )
+        profile_layer["model"] = ""
+        assert (
+            resolve_provider_string_option(profile_layer, provider, profile, "model", "model")
+            is None
+        )
+        assert get_provider_profile_defaults(provider, "missing") == {}
 
 
 class TestGetAgentDirs:

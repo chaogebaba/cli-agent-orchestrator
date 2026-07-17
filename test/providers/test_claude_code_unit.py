@@ -1281,6 +1281,62 @@ class TestClaudeCodeProviderModelFlag:
 
         assert "--model" not in command
 
+    @pytest.mark.parametrize(
+        ("toml", "expected"),
+        [
+            ('[claude_code]\nmodel = "provider"\n', "provider"),
+            (
+                '[claude_code]\nmodel = "provider"\n'
+                '[claude_code.profiles.agent]\nmodel = "profile"\n',
+                "profile",
+            ),
+            (
+                '[claude_code]\nmodel = "provider"\n' '[claude_code.profiles.agent]\nmodel = ""\n',
+                None,
+            ),
+        ],
+    )
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_wpq1_toml_model_overlay_precedence_and_clear(
+        self, mock_load, tmp_path, monkeypatch, toml, expected
+    ):
+        defaults = tmp_path / "providers.toml"
+        defaults.write_text(toml, encoding="utf-8")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.PROVIDER_DEFAULTS_FILE",
+            defaults,
+        )
+        mock_profile = MagicMock(
+            model="frontmatter",
+            native_agent=None,
+            system_prompt=None,
+            mcpServers=None,
+            permissionMode=None,
+        )
+        mock_load.return_value = mock_profile
+
+        command = ClaudeCodeProvider("tid", "sess", "win", "agent")._build_claude_command()
+
+        if expected is None:
+            assert "--model" not in command
+        else:
+            assert f"--model {expected}" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_wpq1_native_agent_branch_ignores_toml_model(self, mock_load, tmp_path, monkeypatch):
+        defaults = tmp_path / "providers.toml"
+        defaults.write_text('[claude_code]\nmodel = "provider"\n', encoding="utf-8")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.PROVIDER_DEFAULTS_FILE",
+            defaults,
+        )
+        mock_load.return_value = MagicMock(native_agent="native", permissionMode=None)
+
+        command = ClaudeCodeProvider("tid", "sess", "win", "agent")._build_claude_command()
+
+        assert "--agent native" in command
+        assert "--model" not in command
+
 
 class TestClaudeCodeProviderPermissionMode:
 

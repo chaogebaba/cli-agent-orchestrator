@@ -4,7 +4,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.backends.base import TerminalBackend, TerminalBackendError
+from cli_agent_orchestrator.backends.base import (
+    PaneIdentityReadResult,
+    TerminalBackend,
+    TerminalBackendError,
+)
 from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
 
 
@@ -157,3 +161,46 @@ class TestTmuxBackendDefaultClient:
     def test_uses_module_singleton(self, mock_singleton):
         backend = TmuxBackend()
         assert backend._client is mock_singleton
+
+
+class TestTmuxPaneIdentity:
+    def test_tagged_result_requires_exactly_one_field(self):
+        assert PaneIdentityReadResult(identity="term").identity == "term"
+        assert PaneIdentityReadResult(reason="missing_env").reason == "missing_env"
+        with pytest.raises(ValueError):
+            PaneIdentityReadResult()
+        with pytest.raises(ValueError):
+            PaneIdentityReadResult(identity="term", reason="read_error")
+
+    def test_reads_identity_from_stable_pane_process(self, monkeypatch):
+        backend = TmuxBackend(client=MagicMock())
+        monkeypatch.setattr(backend, "_pane_pids", lambda *_args: [101])
+        monkeypatch.setattr(backend, "_proc_starttime", lambda _pid: "44")
+        monkeypatch.setattr(backend, "_proc_identity", lambda _pid: "term-a")
+
+        assert backend.read_pane_identity("session", "window") == PaneIdentityReadResult(
+            identity="term-a"
+        )
+
+    def test_pid_aba_is_incarnation_changed(self, monkeypatch):
+        backend = TmuxBackend(client=MagicMock())
+        starts = iter(["44", "45"])
+        monkeypatch.setattr(backend, "_pane_pids", lambda *_args: [101])
+        monkeypatch.setattr(backend, "_proc_starttime", lambda _pid: next(starts))
+        monkeypatch.setattr(backend, "_proc_identity", lambda _pid: "term-a")
+
+        assert backend.read_pane_identity("session", "window").reason == "incarnation_changed"
+
+    def test_multi_window_positive_control_returns_each_identity(self, monkeypatch):
+        backend = TmuxBackend(client=MagicMock())
+        pids = {"one": 101, "two": 202}
+        monkeypatch.setattr(
+            backend,
+            "_pane_pids",
+            lambda _session, window: [pids[window]],
+        )
+        monkeypatch.setattr(backend, "_proc_starttime", lambda pid: str(pid * 10))
+        monkeypatch.setattr(backend, "_proc_identity", lambda pid: f"term-{pid}")
+
+        assert backend.read_pane_identity("session", "one").identity == "term-101"
+        assert backend.read_pane_identity("session", "two").identity == "term-202"

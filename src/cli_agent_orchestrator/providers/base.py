@@ -24,7 +24,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
 from cli_agent_orchestrator.providers.screen_classification import ScreenClassification
@@ -97,6 +97,7 @@ class BaseProvider(ABC):
         self._skill_prompt: Optional[str] = skill_prompt
         self._fork_context = fork_context
         self._shell_baseline: Optional[str] = None
+        self.blocked_wait_notifier: Callable[[str], Awaitable[None]] | None = None
         # Native-status (herdr) dispatch tracking. _task_dispatched disambiguates
         # herdr's ambiguous "idle" (pre-first-turn IDLE vs post-turn COMPLETED);
         # the two *_first_detected stamps drive the post-completion buffer-flush

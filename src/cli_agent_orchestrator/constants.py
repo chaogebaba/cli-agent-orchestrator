@@ -54,6 +54,8 @@ TMUX_HISTORY_LINES = 200
 CAO_HOME_DIR = Path(
     os.environ.get("CAO_HOME", str(Path.home() / ".aws" / "cli-agent-orchestrator"))
 )
+DEFERRED_DEADLETTER_DIR = CAO_HOME_DIR / "deadletters"
+BLOCKED_WAIT_CAP_S = 1800.0
 
 # Managed environment variable file
 CAO_ENV_FILE = CAO_HOME_DIR / ".env"

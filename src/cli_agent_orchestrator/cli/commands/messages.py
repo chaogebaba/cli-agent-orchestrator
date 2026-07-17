@@ -76,7 +76,9 @@ def _resolve_me(value: str) -> str:
 @click.option(
     "--status",
     "status_value",
-    type=click.Choice(["pending", "delivering", "delivered", "delivery_failed", "failed"]),
+    type=click.Choice(
+        ["pending", "delivering", "delivered", "delivery_failed", "failed", "digested"]
+    ),
 )
 def list_cmd(
     receiver: str, since: str | None, after_id: int | None, limit: int, status_value: str | None

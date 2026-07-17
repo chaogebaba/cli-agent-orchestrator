@@ -4,48 +4,55 @@ Consumer: terminal.{id}.status
 """
 
 import asyncio
-import logging
 import json
+import logging
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import groupby
+from typing import Any, Sequence
+
+from sqlalchemy.exc import OperationalError
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
     AdmissionProof,
     AttemptOpenResult,
+    NoticeInsertOutcome,
     OrphanReconcileResult,
+    advance_wpm2_continuity_cursor,
+    attempt_proven_pre_paste,
     begin_delivery_attempt,
     begin_delivery_attempt_if_no_other_delivering,
     confirm_batch_from_prior_attempt,
     count_ambiguous_attempts,
     create_inbox_message,
-    get_terminal_metadata,
+    get_attempt_mailbox_authority,
+    get_current_mailbox_generation,
+    get_current_mailbox_terminal,
+    get_message_trace,
     get_pending_messages,
     get_pending_messages_by_ids,
+    get_terminal_metadata,
+    insert_identity_authority_notice,
+    list_attempt_member_ids,
+    list_delivering_attempts_for_terminal,
+    list_message_attempts,
+    list_overlapping_attempts,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
-    update_message_status,
-    settle_delivery_attempt,
     list_stale_delivering_messages,
-    get_message_trace,
-    get_attempt_mailbox_authority,
-    get_current_mailbox_terminal,
-    list_attempt_member_ids,
-    list_message_attempts,
-    transition_pending_to_delivery_failed,
+    list_stale_open_claude_attempts,
+    make_admission_proof,
     merge_wpm1_attempt_evidence,
     record_wpm1_stalled_notice,
-    settle_wpm1_terminal_batch,
-    make_admission_proof,
-    list_overlapping_attempts,
-    list_delivering_attempts_for_terminal,
-    list_stale_open_claude_attempts,
     recover_wpm2_stale_attempt,
+    settle_delivery_attempt,
     settle_delivery_attempt_proof_safe,
     settle_pending_orphan_messages,
-    advance_wpm2_continuity_cursor,
-    attempt_proven_pre_paste,
+    settle_wpm1_terminal_batch,
+    transition_pending_to_delivery_failed,
+    update_message_status,
 )
 
 _PRODUCTION_BEGIN_DELIVERY_ATTEMPT = begin_delivery_attempt
@@ -53,7 +60,7 @@ from cli_agent_orchestrator.constants import (
     EAGER_INBOX_DELIVERY,
     INBOX_RECONCILE_GRACE_SECONDS,
 )
-from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
@@ -61,18 +68,25 @@ from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.event_bus import bus
-from cli_agent_orchestrator.services.status_monitor import status_monitor
-from cli_agent_orchestrator.services.terminal_service import TerminalInputBlockedError
+from cli_agent_orchestrator.services.message_trace_service import (
+    confirm_delivery,
+    continuity_aware_lookup,
+    normalized_confirmation_fingerprint,
+    resolve_session_transcript,
+    transcript_lookup,
+    transcript_ref,
+    wire_hash,
+    wpm2_cursor_baseline,
+)
+from cli_agent_orchestrator.services.message_trace_service import wpm2_lookup as _wpm2_lookup
+from cli_agent_orchestrator.services.pane_identity_service import PaneIdentityMismatchError
 from cli_agent_orchestrator.services.replay_policy import (
     AuthorizationFacts,
     ObservedFact,
     run_post_auth_engine,
 )
-from cli_agent_orchestrator.services.message_trace_service import (
-    confirm_delivery, continuity_aware_lookup, resolve_session_transcript,
-    normalized_confirmation_fingerprint, transcript_lookup, transcript_ref, wire_hash,
-    wpm2_lookup as _wpm2_lookup, wpm2_cursor_baseline,
-)
+from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.terminal_service import TerminalInputBlockedError
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
@@ -80,6 +94,8 @@ logger = logging.getLogger(__name__)
 IDLE_STALL_AGE = 30 * 60
 ABS_STALLED_NOTICE_AGE = 4 * 60 * 60
 WPM2_STALE_OPEN_AGE_SECONDS = 60
+
+
 def _redelivery_tag(prior_attempt_uuid: str) -> str:
     return (
         f"[redelivery of attempt {prior_attempt_uuid[:8]} - prior delivery unconfirmed; "
@@ -115,6 +131,13 @@ _delivery_wake_seq: dict[str, int] = {}
 _delivery_seq_guard = threading.Lock()
 
 
+@dataclass
+class _IdentityAuthorityEpisode:
+    count: int = 0
+    notified: bool = False
+    last_reason: str = "read_error"
+
+
 def get_delivery_lock(terminal_id: str) -> threading.Lock:
     with _delivery_locks_guard:
         lock = _delivery_locks.get(terminal_id)
@@ -133,6 +156,9 @@ def clear_terminal_delivery_state(terminal_id: str) -> None:
         _delivery_locks.pop(terminal_id, None)
         with _delivery_seq_guard:
             _delivery_wake_seq.pop(terminal_id, None)
+    service = globals().get("inbox_service")
+    if isinstance(service, InboxService):
+        service._clear_identity_authority(terminal_id)
 
 
 def _should_defer_waiting(terminal_id: str, provider=None) -> bool:
@@ -143,8 +169,7 @@ def _should_defer_waiting(terminal_id: str, provider=None) -> bool:
         provider = provider_manager.get_provider(terminal_id)
     return (
         provider is not None
-        and getattr(provider, "blocks_orchestrated_input_while_waiting_user_answer", False)
-        is True
+        and getattr(provider, "blocks_orchestrated_input_while_waiting_user_answer", False) is True
     )
 
 
@@ -165,6 +190,105 @@ class InboxService:
         self._defer_attempts: dict[int, int] = {}
         self._defer_notified: set[int] = set()
         self._defer_lock = threading.Lock()
+        self._identity_authority: dict[tuple[str, str], _IdentityAuthorityEpisode] = {}
+        self._identity_lock = threading.Lock()
+
+    def _clear_identity_authority(self, terminal_id: str) -> None:
+        with self._identity_lock:
+            for key in [key for key in self._identity_authority if key[0] == terminal_id]:
+                self._identity_authority.pop(key, None)
+
+    @staticmethod
+    def _identity_authority_token(
+        batch: Sequence[InboxMessage], attempt_uuid: str | None = None
+    ) -> str:
+        logical_id = getattr(batch[0], "logical_receiver_id", None) if batch else None
+        if not isinstance(logical_id, str) or not logical_id.startswith("mb_"):
+            return "raw"
+        if attempt_uuid is not None:
+            authority = get_attempt_mailbox_authority(attempt_uuid)
+            if authority is not None and type(authority.get("generation")) is int:
+                return str(authority["generation"])
+        generation = getattr(batch[0], "enqueue_generation", None)
+        if type(generation) is not int:
+            generation = get_current_mailbox_generation(logical_id)
+        if type(generation) is not int:
+            raise RuntimeError("mailbox_generation_unavailable")
+        return str(generation)
+
+    @staticmethod
+    def _identity_notice_receiver(terminal_id: str, metadata: dict[str, Any]) -> str | None:
+        caller_id = metadata.get("caller_id")
+        if isinstance(caller_id, str) and get_terminal_metadata(caller_id) is not None:
+            return caller_id
+        session_name = metadata.get("tmux_session")
+        if not isinstance(session_name, str):
+            return None
+        from cli_agent_orchestrator.clients.database import list_terminals_by_session
+        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+
+        for row in list_terminals_by_session(session_name):
+            if row.get("id") == terminal_id:
+                continue
+            try:
+                profile = load_agent_profile(row.get("agent_profile") or "")
+            except (FileNotFoundError, ValueError):
+                continue
+            if getattr(profile, "role", None) == "supervisor":
+                return str(row["id"])
+        return None
+
+    def _record_identity_authority_failure(
+        self,
+        terminal_id: str,
+        batch: Sequence[InboxMessage],
+        metadata: dict[str, Any],
+        reason: str,
+        *,
+        attempt_uuid: str | None = None,
+    ) -> None:
+        token = self._identity_authority_token(batch, attempt_uuid)
+        key = (terminal_id, token)
+        with self._identity_lock:
+            for old in [
+                item for item in self._identity_authority if item[0] == terminal_id and item != key
+            ]:
+                self._identity_authority.pop(old, None)
+            episode = self._identity_authority.setdefault(key, _IdentityAuthorityEpisode())
+            episode.count += 1
+            episode.last_reason = reason
+            if episode.count < 3 or episode.notified:
+                return
+            count = episode.count
+
+        receiver = self._identity_notice_receiver(terminal_id, metadata)
+        if receiver is None:
+            logger.critical(
+                "identity_authority_lost terminal=%s reason=%s count=%s no_supervisor",
+                terminal_id,
+                reason,
+                count,
+            )
+            with self._identity_lock:
+                self._identity_authority[key].notified = True
+            return
+        body = (
+            f"[identity-authority] terminal {terminal_id} pane identity unverifiable "
+            f"({reason}, x{count})\nHuman attention is required; delivery remains pending."
+        )
+        outcome = insert_identity_authority_notice(f"message-trace:{terminal_id}", receiver, body)
+        if outcome != NoticeInsertOutcome.FAILED_BEFORE_COMMIT:
+            with self._identity_lock:
+                self._identity_authority[key].notified = True
+        else:
+            logger.error(
+                "identity_authority_notice_failed_before_commit terminal=%s receiver=%s",
+                terminal_id,
+                receiver,
+            )
+
+    def _reset_identity_authority(self, terminal_id: str) -> None:
+        self._clear_identity_authority(terminal_id)
 
     def _evict_defer_state(self, messages) -> None:
         with self._defer_lock:
@@ -227,30 +351,51 @@ class InboxService:
         if not caller_id:
             logger.warning(
                 "Delivery failed (%s) for terminal %s message(s) %s; no caller_id is "
-                "available for notification", reason, terminal_id, message_ids)
+                "available for notification",
+                reason,
+                terminal_id,
+                message_ids,
+            )
             return
         if reason == "receiver_gone":
-            body = (f"[message-trace] delivery to terminal {terminal_id} failed because the "
-                    f"receiver terminal no longer exists for message(s) {message_ids}.")
+            body = (
+                f"[message-trace] delivery to terminal {terminal_id} failed because the "
+                f"receiver terminal no longer exists for message(s) {message_ids}."
+            )
         else:
-            body = (f"[message-trace] delivery to terminal {terminal_id} failed after 3 "
-                    f"ambiguous attempts for message(s) {message_ids}; inspect cao messages trace.")
+            body = (
+                f"[message-trace] delivery to terminal {terminal_id} failed after 3 "
+                f"ambiguous attempts for message(s) {message_ids}; inspect cao messages trace."
+            )
         create_inbox_message(
-            f"message-trace:{terminal_id}", caller_id, body,
+            f"message-trace:{terminal_id}",
+            caller_id,
+            body,
         )
 
-    def _commit_watchdog_ops(self, terminal_id: str, sender_id: str,
-                             orchestration_type: OrchestrationType, metadata: dict) -> None:
-        from cli_agent_orchestrator.services.stalled_callback_watchdog import stalled_callback_watchdog
+    def _commit_watchdog_ops(
+        self,
+        terminal_id: str,
+        sender_id: str,
+        orchestration_type: OrchestrationType,
+        metadata: dict,
+    ) -> None:
+        from cli_agent_orchestrator.services.stalled_callback_watchdog import (
+            stalled_callback_watchdog,
+        )
+
         stalled_callback_watchdog.record_callback_if_to_caller(sender_id, terminal_id)
         if metadata.get("caller_id") and (
-            orchestration_type == OrchestrationType.ASSIGN or
-            (orchestration_type == OrchestrationType.SEND_MESSAGE and
-             sender_id == metadata["caller_id"] and
-             stalled_callback_watchdog.has_episode(terminal_id))
+            orchestration_type == OrchestrationType.ASSIGN
+            or (
+                orchestration_type == OrchestrationType.SEND_MESSAGE
+                and sender_id == metadata["caller_id"]
+                and stalled_callback_watchdog.has_episode(terminal_id)
+            )
         ):
             stalled_callback_watchdog.record_inbound_task(
-                terminal_id, metadata["caller_id"], metadata.get("agent_profile") or "")
+                terminal_id, metadata["caller_id"], metadata.get("agent_profile") or ""
+            )
 
     @staticmethod
     def _exact_batch_attempts(message_ids: list[int]) -> list[dict]:
@@ -267,23 +412,31 @@ class InboxService:
         return exact
 
     def _handle_wpm1_gate(
-        self, terminal_id: str, batch, metadata: dict, provider,
-        sender_id: str, orchestration_type: OrchestrationType,
+        self,
+        terminal_id: str,
+        batch,
+        metadata: dict,
+        provider,
+        sender_id: str,
+        orchestration_type: OrchestrationType,
     ) -> tuple[str, object | None]:
         """Return normal, stop, or inject for a frozen-law gated batch."""
         message_ids = [message.id for message in batch]
         attempts = self._exact_batch_attempts(message_ids)
-        ambiguous = [attempt for attempt in attempts if
-                     attempt.get("outcome") == "ambiguous" and
-                     attempt.get("reason") == "confirmation_timeout"]
+        ambiguous = [
+            attempt
+            for attempt in attempts
+            if attempt.get("outcome") == "ambiguous"
+            and attempt.get("reason") == "confirmation_timeout"
+        ]
         if not ambiguous:
             return "normal", None
         # D1.1 is deliberately before continuity/evidence decoding. Historical
         # malformed rows must not make a dead receiver look non-authoritative.
         if not metadata and any(item.get("provider") == "claude_code" for item in ambiguous):
             result = settle_wpm1_terminal_batch(
-                message_ids, MessageStatus.DELIVERY_FAILED, terminal_id,
-                reason="receiver_gone")
+                message_ids, MessageStatus.DELIVERY_FAILED, terminal_id, reason="receiver_gone"
+            )
             if result == "settled":
                 self._notify_delivery_failed(terminal_id, message_ids, reason="receiver_gone")
             return "stop", None
@@ -296,10 +449,11 @@ class InboxService:
                 decoded[attempt["attempt_uuid"]] = {}
         resolution = resolve_session_transcript(metadata) if metadata else None
         authoritative = (
-            (metadata.get("provider") == "claude_code" or any(
-                item.get("provider") == "claude_code" for item in ambiguous))
-            and (getattr(resolution, "resolution_kind", None) == "binding" or any(
-                value.get("resolution_kind") == "binding" for value in decoded.values()))
+            metadata.get("provider") == "claude_code"
+            or any(item.get("provider") == "claude_code" for item in ambiguous)
+        ) and (
+            getattr(resolution, "resolution_kind", None) == "binding"
+            or any(value.get("resolution_kind") == "binding" for value in decoded.values())
         )
         if not authoritative:
             return "normal", resolution
@@ -312,44 +466,54 @@ class InboxService:
         for prior in reversed(ambiguous):
             prior_evidence = decoded[prior["attempt_uuid"]]
             lookup_result, lookup_evidence = _wpm2_lookup(
-                metadata, prior["payload_hash"], prior.get("started_at"),
+                metadata,
+                prior["payload_hash"],
+                prior.get("started_at"),
                 prior_evidence,
             )
             if lookup_result == "hit":
                 result = settle_wpm1_terminal_batch(
-                    message_ids, MessageStatus.DELIVERED, terminal_id,
+                    message_ids,
+                    MessageStatus.DELIVERED,
+                    terminal_id,
                     confirmation_evidence=(prior["attempt_uuid"], lookup_evidence),
                     on_confirmed=lambda: self._commit_watchdog_ops(
-                        terminal_id, sender_id, orchestration_type, metadata))
+                        terminal_id, sender_id, orchestration_type, metadata
+                    ),
+                )
                 return "stop", None
             corroboration = lookup_evidence.get("queue_corroboration")
             if corroboration is not None:
                 merge_wpm1_attempt_evidence(
-                    prior["attempt_uuid"], message_ids,
-                    {"queue_corroboration": corroboration})
+                    prior["attempt_uuid"], message_ids, {"queue_corroboration": corroboration}
+                )
             if lookup_result == "absent" and lookup_evidence.get("last_observed_ref"):
                 _, expected = wpm2_cursor_baseline(prior_evidence)
                 if expected is None:
                     return "stop", None
                 advanced = advance_wpm2_continuity_cursor(
-                    prior["attempt_uuid"], message_ids, expected,
-                    lookup_evidence["last_observed_ref"])
+                    prior["attempt_uuid"],
+                    message_ids,
+                    expected,
+                    lookup_evidence["last_observed_ref"],
+                )
                 if advanced not in {"advanced", "already_advanced"}:
                     return "stop", None
                 prior_evidence["last_observed_ref"] = lookup_evidence["last_observed_ref"]
 
         try:
             snapshot = status_monitor.get_boundary_observation(terminal_id)
-            if (not isinstance(getattr(snapshot, "status", None), TerminalStatus) or
-                    not isinstance(getattr(snapshot, "observation_epoch", None), str)):
+            if not isinstance(getattr(snapshot, "status", None), TerminalStatus) or not isinstance(
+                getattr(snapshot, "observation_epoch", None), str
+            ):
                 snapshot = None
         except Exception:
             snapshot = None
-        status = (snapshot.status if snapshot is not None else
-                  status_monitor.get_status(terminal_id))
+        status = snapshot.status if snapshot is not None else status_monitor.get_status(terminal_id)
         newest_evidence = decoded[newest["attempt_uuid"]]
         protection = classify_permanently_d2_only(
-            newest, snapshot.observation_epoch if snapshot is not None else None)
+            newest, snapshot.observation_epoch if snapshot is not None else None
+        )
         last_activity = newest_evidence.get("last_activity_at")
         updates: dict[str, object] = {
             "last_observed_status": status.value,
@@ -367,8 +531,7 @@ class InboxService:
         elif snapshot is not None and prior_status != status.value:
             last_activity = now_z
             updates["last_activity_at"] = now_z
-        if merge_wpm1_attempt_evidence(
-                newest["attempt_uuid"], message_ids, updates) is not True:
+        if merge_wpm1_attempt_evidence(newest["attempt_uuid"], message_ids, updates) is not True:
             return "stop", None
         newest_evidence.update(updates)
 
@@ -387,7 +550,9 @@ class InboxService:
             notice_due = False
 
         gate_open = protection == "normal" and status in {
-            TerminalStatus.IDLE, TerminalStatus.COMPLETED}
+            TerminalStatus.IDLE,
+            TerminalStatus.COMPLETED,
+        }
         if gate_open:
             if provider is None:
                 provider = provider_manager.get_provider(terminal_id)
@@ -402,61 +567,96 @@ class InboxService:
                 snapshot is not None
                 and anchor.get("observation_epoch") == snapshot.observation_epoch
                 and type(anchor.get("seq")) is int
-                and type(non_ready) is int and non_ready > anchor["seq"]
-                and type(ready) is int and ready > non_ready
+                and type(non_ready) is int
+                and non_ready > anchor["seq"]
+                and type(ready) is int
+                and ready > non_ready
             )
         if gate_open:
             fresh, fresh_evidence = _wpm2_lookup(
-                metadata, newest["payload_hash"], newest.get("started_at"), newest_evidence)
+                metadata, newest["payload_hash"], newest.get("started_at"), newest_evidence
+            )
             if fresh == "hit":
                 result = settle_wpm1_terminal_batch(
-                    message_ids, MessageStatus.DELIVERED, terminal_id,
+                    message_ids,
+                    MessageStatus.DELIVERED,
+                    terminal_id,
                     confirmation_evidence=(newest["attempt_uuid"], fresh_evidence),
                     on_confirmed=lambda: self._commit_watchdog_ops(
-                        terminal_id, sender_id, orchestration_type, metadata))
+                        terminal_id, sender_id, orchestration_type, metadata
+                    ),
+                )
                 return "stop", None
             if fresh == "absent":
-                unexhausted = next((attempt for attempt in reversed(ambiguous)
-                                    if not decoded[attempt["attempt_uuid"]].get(
-                                        "boundary_exhausted_at")), None)
+                unexhausted = next(
+                    (
+                        attempt
+                        for attempt in reversed(ambiguous)
+                        if not decoded[attempt["attempt_uuid"]].get("boundary_exhausted_at")
+                    ),
+                    None,
+                )
                 if unexhausted is not None:
                     boundary_snapshot = {
                         "observation_epoch": (snapshot.observation_epoch if snapshot else "legacy"),
                         "status": status.value,
-                        "status_gen": (snapshot.status_gen if snapshot else
-                                       status_monitor.get_status_gen(terminal_id)),
-                        "input_gen": (snapshot.input_gen if snapshot else
-                                      status_monitor.get_input_gen(terminal_id)),
+                        "status_gen": (
+                            snapshot.status_gen
+                            if snapshot
+                            else status_monitor.get_status_gen(terminal_id)
+                        ),
+                        "input_gen": (
+                            snapshot.input_gen
+                            if snapshot
+                            else status_monitor.get_input_gen(terminal_id)
+                        ),
                         "seq": (snapshot.seq if snapshot else 0),
                         "last_non_ready_seq": (snapshot.last_non_ready_seq if snapshot else None),
                         "last_ready_seq": (snapshot.last_ready_seq if snapshot else None),
                     }
-                    if merge_wpm1_attempt_evidence(
-                        unexhausted["attempt_uuid"], message_ids,
-                        {"boundary_exhausted_at": now_z,
-                         "boundary_snapshot": boundary_snapshot},
-                    ) is not True:
+                    if (
+                        merge_wpm1_attempt_evidence(
+                            unexhausted["attempt_uuid"],
+                            message_ids,
+                            {
+                                "boundary_exhausted_at": now_z,
+                                "boundary_snapshot": boundary_snapshot,
+                            },
+                        )
+                        is not True
+                    ):
                         return "stop", None
                     decoded[unexhausted["attempt_uuid"]]["boundary_exhausted_at"] = now_z
-                exhausted = sum(bool(decoded[item["attempt_uuid"]].get(
-                    "boundary_exhausted_at")) for item in ambiguous)
+                exhausted = sum(
+                    bool(decoded[item["attempt_uuid"]].get("boundary_exhausted_at"))
+                    for item in ambiguous
+                )
                 if exhausted >= 3:
                     barrier, _ = _wpm2_lookup(
-                        metadata, newest["payload_hash"], newest.get("started_at"),
-                        decoded[newest["attempt_uuid"]])
+                        metadata,
+                        newest["payload_hash"],
+                        newest.get("started_at"),
+                        decoded[newest["attempt_uuid"]],
+                    )
                     if barrier == "hit":
                         result = settle_wpm1_terminal_batch(
-                            message_ids, MessageStatus.DELIVERED, terminal_id,
+                            message_ids,
+                            MessageStatus.DELIVERED,
+                            terminal_id,
                             on_confirmed=lambda: self._commit_watchdog_ops(
-                                terminal_id, sender_id, orchestration_type, metadata))
+                                terminal_id, sender_id, orchestration_type, metadata
+                            ),
+                        )
                     elif barrier == "absent":
                         result = settle_wpm1_terminal_batch(
-                            message_ids, MessageStatus.DELIVERY_FAILED, terminal_id)
+                            message_ids, MessageStatus.DELIVERY_FAILED, terminal_id
+                        )
                         if result == "settled":
                             self._notify_delivery_failed(terminal_id, message_ids)
                     return "stop", None
                 successors = [
-                    item for item in attempts
+                    item
+                    for item in attempts
                     if item.get("prior_attempt_uuid") == newest["attempt_uuid"]
                 ]
                 if successors:
@@ -470,18 +670,23 @@ class InboxService:
 
         # Threshold decisions are deliberately after every proof/terminal arm.
         is_notice = any(
-            str(message.sender_id).startswith("message-trace:") and
-            str(message.message).startswith("wpm1-notice ") for message in batch)
-        already_notified = any(decoded[item["attempt_uuid"]].get("stalled_notified_at")
-                               for item in ambiguous)
+            str(message.sender_id).startswith("message-trace:")
+            and str(message.message).startswith("wpm1-notice ")
+            for message in batch
+        )
+        already_notified = any(
+            decoded[item["attempt_uuid"]].get("stalled_notified_at") for item in ambiguous
+        )
         if notice_due and not already_notified and not is_notice:
             outcome = record_wpm1_stalled_notice(
-                newest["attempt_uuid"], message_ids, terminal_id, now_z)
+                newest["attempt_uuid"], message_ids, terminal_id, now_z
+            )
             if outcome == "busy_aborted":
                 return "stop", None
         if protection != "normal":
             return "skip_d2_only", {
-                "attempt_uuid": newest["attempt_uuid"], "member_ids": message_ids,
+                "attempt_uuid": newest["attempt_uuid"],
+                "member_ids": message_ids,
                 "protection_reason": protection,
             }
         return "stop", None
@@ -536,6 +741,22 @@ class InboxService:
             metadata = get_terminal_metadata(terminal_id) or {}
             if metadata.get("recovery_state") not in (None, "rebound"):
                 return
+            legacy_test_seam = begin_delivery_attempt is not _PRODUCTION_BEGIN_DELIVERY_ATTEMPT
+            if not legacy_test_seam:
+                from cli_agent_orchestrator.services.mailbox_service import (
+                    digest_stale_pending_for_terminal,
+                )
+
+                try:
+                    digest_stale_pending_for_terminal(terminal_id)
+                except OperationalError as exc:
+                    error_detail = str(exc).lower()
+                    if "locked" not in error_detail and "busy" not in error_detail:
+                        raise
+                    # Digesting is the generation fence.  If its transaction
+                    # cannot open, leave every row pending for the next wake;
+                    # proceeding could expose a stale row to normal delivery.
+                    return
             with _delivery_seq_guard:
                 if _delivery_wake_seq.get(terminal_id, 0) > captured_wake:
                     return
@@ -543,37 +764,50 @@ class InboxService:
             provider = None
             excluded: set[int] = set()
             scanned: set[int] = set()
-            legacy_test_seam = begin_delivery_attempt is not _PRODUCTION_BEGIN_DELIVERY_ATTEMPT
             # Classify protected sets before the SQL LIMIT/grouping seam. This
             # deliberately scans beyond any number of D2-only heads.
             while not legacy_test_seam:
                 page = get_pending_messages(
-                    terminal_id, limit=100, excluded_message_ids=excluded | scanned)
+                    terminal_id, limit=100, excluded_message_ids=excluded | scanned
+                )
                 if not page:
                     break
                 first = page[0]
                 if first.id in excluded or first.id in scanned:
                     break
                 first_attempts = list_message_attempts([first.id])
-                protected_attempt = next((item for item in reversed(first_attempts)
-                    if item.get("outcome") == "ambiguous" and
-                    item.get("reason") == "confirmation_timeout"), None)
+                protected_attempt = next(
+                    (
+                        item
+                        for item in reversed(first_attempts)
+                        if item.get("outcome") == "ambiguous"
+                        and item.get("reason") == "confirmation_timeout"
+                    ),
+                    None,
+                )
                 if protected_attempt is not None:
                     durable_ids = list_attempt_member_ids(protected_attempt["attempt_uuid"])
                     group = get_pending_messages_by_ids(terminal_id, durable_ids)
                 else:
-                    _, first_group = next(groupby(
-                        page, key=lambda item: (item.sender_id, item.orchestration_type)))
+                    _, first_group = next(
+                        groupby(page, key=lambda item: (item.sender_id, item.orchestration_type))
+                    )
                     group = list(first_group)
                 if not group:
                     scanned.add(first.id)
                     continue
                 state, detail = self._handle_wpm1_gate(
-                    terminal_id, group, metadata, provider,
-                    first.sender_id, first.orchestration_type)
+                    terminal_id,
+                    group,
+                    metadata,
+                    provider,
+                    first.sender_id,
+                    first.orchestration_type,
+                )
                 ids = {item.id for item in group}
                 if state == "skip_d2_only":
-                    member_ids = set((detail or {}).get("member_ids") or ids)
+                    detail_map = detail if isinstance(detail, dict) else {}
+                    member_ids = set(detail_map.get("member_ids") or ids)
                     excluded.update(member_ids)
                     scanned.difference_update(member_ids)
                     continue
@@ -584,7 +818,8 @@ class InboxService:
                 messages = get_pending_messages(terminal_id, limit=limit)
             else:
                 messages = get_pending_messages(
-                    terminal_id, limit=limit, excluded_message_ids=excluded)
+                    terminal_id, limit=limit, excluded_message_ids=excluded
+                )
             if not messages:
                 return
 
@@ -605,7 +840,8 @@ class InboxService:
                     metadata = get_terminal_metadata(terminal_id) or {}
                     message_ids = [m.id for m in batch]
                     gate_state, gate_evidence = self._handle_wpm1_gate(
-                        terminal_id, batch, metadata, provider, sender_id, orchestration_type)
+                        terminal_id, batch, metadata, provider, sender_id, orchestration_type
+                    )
                     if gate_state == "stop":
                         return
                     if gate_state == "skip_d2_only":
@@ -621,22 +857,33 @@ class InboxService:
                             return
                         if not legacy_test_seam:
                             try:
-                                admission_snapshot = status_monitor.get_boundary_observation(terminal_id)
+                                admission_snapshot = status_monitor.get_boundary_observation(
+                                    terminal_id
+                                )
                             except Exception:
                                 return
-                        if not isinstance(getattr(admission_snapshot, "status", None), TerminalStatus):
+                        if not isinstance(
+                            getattr(admission_snapshot, "status", None), TerminalStatus
+                        ):
                             admission_snapshot = None
                             status = status_monitor.get_status(terminal_id)
-                            if (metadata.get("provider") == "claude_code" and status not in {
-                                    TerminalStatus.IDLE, TerminalStatus.COMPLETED}):
+                            if metadata.get("provider") == "claude_code" and status not in {
+                                TerminalStatus.IDLE,
+                                TerminalStatus.COMPLETED,
+                            }:
                                 return
                         else:
                             status = admission_snapshot.status
-                        if (metadata.get("provider") == "claude_code" and status not in {
-                                TerminalStatus.IDLE, TerminalStatus.COMPLETED}):
+                        if metadata.get("provider") == "claude_code" and status not in {
+                            TerminalStatus.IDLE,
+                            TerminalStatus.COMPLETED,
+                        }:
                             overlap = list_overlapping_attempts(message_ids)
-                            if all(item.get("outcome") == "deferred" and item.get("reason") in {
-                                    "delivery_deferred", "input_blocked"} for item in overlap):
+                            if all(
+                                item.get("outcome") == "deferred"
+                                and item.get("reason") in {"delivery_deferred", "input_blocked"}
+                                for item in overlap
+                            ):
                                 if provider is None:
                                     provider = provider_manager.get_provider(terminal_id)
                                 if provider is not None:
@@ -656,7 +903,8 @@ class InboxService:
                                 if provider is None:
                                     provider = provider_manager.get_provider(terminal_id)
                                 eager_eligible = provider is not None and getattr(
-                                    provider, "accepts_input_while_processing", False)
+                                    provider, "accepts_input_while_processing", False
+                                )
                             if not eager_eligible:
                                 return
                     ambiguous_count = count_ambiguous_attempts(message_ids)
@@ -686,26 +934,32 @@ class InboxService:
                             if not isinstance(prior_evidence, dict):
                                 prior_evidence = {}
                             result, _ = _wpm2_lookup(
-                                metadata, prior["payload_hash"], prior.get("started_at"),
-                                prior_evidence)
+                                metadata,
+                                prior["payload_hash"],
+                                prior.get("started_at"),
+                                prior_evidence,
+                            )
                             if result != "hit":
                                 continue
                             won = confirm_batch_from_prior_attempt(
                                 message_ids,
                                 prior["attempt_uuid"],
                                 on_confirmed=lambda: self._commit_watchdog_ops(
-                                    terminal_id, sender_id, orchestration_type, metadata),
+                                    terminal_id, sender_id, orchestration_type, metadata
+                                ),
                             )
                             if not won:
                                 return
                             logger.info(
                                 "Deduplicated delivery for terminal %s using attempt %s",
-                                terminal_id, prior["attempt_uuid"],
+                                terminal_id,
+                                prior["attempt_uuid"],
                             )
                             return
 
                         ambiguous = [
-                            prior for prior in exact_attempts
+                            prior
+                            for prior in exact_attempts
                             if prior.get("outcome") == "ambiguous"
                             and prior.get("reason") == "confirmation_timeout"
                         ]
@@ -713,7 +967,8 @@ class InboxService:
                         post_paste_successor = False
                         for prior in reversed(ambiguous):
                             successors = [
-                                item for item in exact_attempts
+                                item
+                                for item in exact_attempts
                                 if item.get("prior_attempt_uuid") == prior["attempt_uuid"]
                             ]
                             if all(attempt_proven_pre_paste(item) for item in successors):
@@ -745,7 +1000,8 @@ class InboxService:
                                     self._notify_delivery_failed(terminal_id, message_ids)
                                 logger.warning(
                                     "Delivery ambiguity cap reached for terminal %s messages %s",
-                                    terminal_id, message_ids,
+                                    terminal_id,
+                                    message_ids,
                                 )
                             return
                         if decision.kind == "suppress":
@@ -776,16 +1032,15 @@ class InboxService:
                         decision = run_post_auth_engine(
                             AuthorizationFacts(
                                 prior_ambiguous_eligible=ObservedFact(
-                                    isinstance(source, str), source if isinstance(source, str) else None
+                                    isinstance(source, str),
+                                    source if isinstance(source, str) else None,
                                 ),
                                 prior_batch_hit=ObservedFact(False),
                                 post_paste_successor_exists=False,
                                 receiver_alive=bool(metadata),
                                 composer_empty=True,
                                 binding_authority=True,
-                                boundary_observation=persisted_evidence.get(
-                                    "boundary_authorized"
-                                ),
+                                boundary_observation=persisted_evidence.get("boundary_authorized"),
                                 continuity_cursor=persisted_evidence.get("last_observed_ref"),
                             ),
                             ambiguous_count=ambiguous_count,
@@ -796,19 +1051,19 @@ class InboxService:
                         decision_source = decision.evidence["prior_attempt_uuid"]
                         assert isinstance(decision_source, str)
                         successor_source = decision_source
-                        persisted_evidence["redelivery_tag"] = decision.evidence[
-                            "redelivery_tag"
-                        ]
+                        persisted_evidence["redelivery_tag"] = decision.evidence["redelivery_tag"]
                     shape_type = (
-                        None if registry is None and
-                        orchestration_type == OrchestrationType.SEND_MESSAGE
+                        None
+                        if registry is None and orchestration_type == OrchestrationType.SEND_MESSAGE
                         else orchestration_type
                     )
                     base_prepared = terminal_service.prepare_input(
-                        terminal_id, combined, shape_type)
+                        terminal_id, combined, shape_type
+                    )
                     wire_prepared = (
                         f"{_redelivery_tag(successor_source)}\n{base_prepared}"
-                        if successor_source is not None else base_prepared
+                        if successor_source is not None
+                        else base_prepared
                     )
                     digest = wire_hash(wire_prepared)
                     normalized_fingerprint = normalized_confirmation_fingerprint(wire_prepared)
@@ -816,8 +1071,7 @@ class InboxService:
                         persisted_evidence["normalized_payload_hash"] = normalized_fingerprint[0]
                         persisted_evidence["normalized_payload_length"] = normalized_fingerprint[1]
                     provider_name = metadata.get("provider", "unknown")
-                    proof = make_admission_proof(
-                        admission_kind, message_ids, successor_source)
+                    proof = make_admission_proof(admission_kind, message_ids, successor_source)
                     if not legacy_test_seam and list_delivering_attempts_for_terminal(terminal_id):
                         return
                     if not legacy_test_seam:
@@ -825,13 +1079,29 @@ class InboxService:
                         if not isinstance(probe_result, tuple) or len(probe_result) != 2:
                             return
                         probe_status, probe_meta = probe_result
+                        identity_failure = (
+                            probe_meta.get("identity_proof_failure")
+                            if isinstance(probe_meta, dict)
+                            else None
+                        )
+                        if isinstance(identity_failure, str):
+                            self._record_identity_authority_failure(
+                                terminal_id,
+                                batch,
+                                metadata,
+                                identity_failure,
+                            )
+                            return
                         if probe_status not in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}:
                             return
                         if not isinstance(probe_meta, dict):
                             return
                         persisted_evidence["screen_probe"] = probe_meta
                     opener_args = (
-                        batch, terminal_id, provider_name, digest,
+                        batch,
+                        terminal_id,
+                        provider_name,
+                        digest,
                         len(wire_prepared.encode()),
                         status_monitor.get_input_gen(terminal_id),
                         status_monitor.get_status_gen(terminal_id),
@@ -842,23 +1112,28 @@ class InboxService:
                     }
 
                     def evidence_at_submit(value):
-                        if (not isinstance(getattr(value, "status", None), TerminalStatus)
-                                or not isinstance(getattr(value, "observation_epoch", None), str)
-                                or type(getattr(value, "seq", None)) is not int):
+                        if (
+                            not isinstance(getattr(value, "status", None), TerminalStatus)
+                            or not isinstance(getattr(value, "observation_epoch", None), str)
+                            or type(getattr(value, "seq", None)) is not int
+                        ):
                             return None
                         result = dict(persisted_evidence)
-                        same_epoch = (admission_kind != "s4_initial" or (
-                            admission_snapshot is not None and
-                            admission_snapshot.observation_epoch == value.observation_epoch))
+                        same_epoch = admission_kind != "s4_initial" or (
+                            admission_snapshot is not None
+                            and admission_snapshot.observation_epoch == value.observation_epoch
+                        )
                         if not same_epoch:
                             return result
                         result["injection_completed_seq"] = {
-                            "observation_epoch": value.observation_epoch, "seq": value.seq}
+                            "observation_epoch": value.observation_epoch,
+                            "seq": value.seq,
+                        }
                         if admission_snapshot is not None and (
-                                admission_snapshot.status not in {
-                                    TerminalStatus.IDLE, TerminalStatus.COMPLETED}
-                                or value.status not in {
-                                    TerminalStatus.IDLE, TerminalStatus.COMPLETED}):
+                            admission_snapshot.status
+                            not in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
+                            or value.status not in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
+                        ):
                             result["busy_initial_submit"] = {
                                 "status_at_admission": admission_snapshot.status.value,
                                 "status_at_submit": value.status.value,
@@ -866,14 +1141,17 @@ class InboxService:
                                 "seq": value.seq,
                             }
                         return result
+
                     # Preserve the long-standing injectable test seam. Runtime
                     # delivery always uses the WPM2 atomic opener.
                     if legacy_test_seam:
                         opened = AttemptOpenResult.opened(
-                            begin_delivery_attempt(*opener_args, **opener_kwargs))
+                            begin_delivery_attempt(*opener_args, **opener_kwargs)
+                        )
                     else:
                         opened = begin_delivery_attempt_if_no_other_delivering(
-                            *opener_args, admission_proof=proof, **opener_kwargs)
+                            *opener_args, admission_proof=proof, **opener_kwargs
+                        )
                     if opened.kind != "opened":
                         logger.debug("WPM2 opener held %s: %s", terminal_id, opened.kind)
                         return
@@ -892,23 +1170,31 @@ class InboxService:
                             MailboxDomainError,
                             acquire_logical_sender_authority,
                         )
+
                         captured_authority = get_attempt_mailbox_authority(attempt_uuid)
                         if captured_authority is None:
                             settle_delivery_attempt(
-                                attempt_uuid, MessageStatus.PENDING, "interrupted",
+                                attempt_uuid,
+                                MessageStatus.PENDING,
+                                "interrupted",
                                 reason="mailbox_generation_changed",
                             )
+                            self._reset_identity_authority(terminal_id)
                             return
                         try:
                             authority_lock = acquire_logical_sender_authority(
-                                logical_receiver_id, terminal_id,
+                                logical_receiver_id,
+                                terminal_id,
                                 captured_authority["generation"],
                             )
                         except MailboxDomainError:
                             settle_delivery_attempt(
-                                attempt_uuid, MessageStatus.PENDING, "interrupted",
+                                attempt_uuid,
+                                MessageStatus.PENDING,
+                                "interrupted",
                                 reason="mailbox_authority_timeout",
                             )
+                            self._reset_identity_authority(terminal_id)
                             with _delivery_seq_guard:
                                 _delivery_wake_seq[terminal_id] = (
                                     _delivery_wake_seq.get(terminal_id, 0) + 1
@@ -916,41 +1202,53 @@ class InboxService:
                             return
                         if authority_lock is None:
                             settle_delivery_attempt(
-                                attempt_uuid, MessageStatus.PENDING, "interrupted",
+                                attempt_uuid,
+                                MessageStatus.PENDING,
+                                "interrupted",
                                 reason="mailbox_generation_changed",
                             )
+                            self._reset_identity_authority(terminal_id)
                             successor_id = get_current_mailbox_terminal(logical_receiver_id)
                             with _delivery_seq_guard:
                                 wake_id = successor_id or terminal_id
-                                _delivery_wake_seq[wake_id] = (
-                                    _delivery_wake_seq.get(wake_id, 0) + 1
-                                )
+                                _delivery_wake_seq[wake_id] = _delivery_wake_seq.get(wake_id, 0) + 1
                             if successor_id and successor_id != terminal_id:
                                 self.deliver_pending(successor_id, registry=registry)
                             return
+
                     def submitted(value):
                         nonlocal submit_observation, submit_evidence
                         submit_observation = value
                         submit_evidence = evidence_at_submit(value)
+
                     try:
                         send_kwargs = {
-                            "defer_on_dialog": True, "registry": registry,
-                            "sender_id": sender_id, "orchestration_type": shape_type,
+                            "defer_on_dialog": True,
+                            "registry": registry,
+                            "sender_id": sender_id,
+                            "orchestration_type": shape_type,
                             "original_message": combined,
                         }
                         if not legacy_test_seam:
                             send_kwargs["on_submitted"] = submitted
                         try:
                             submit_observation = terminal_service.send_prepared_input(
-                                terminal_id, wire_prepared, **send_kwargs)
+                                terminal_id, wire_prepared, **send_kwargs
+                            )
                         finally:
                             if authority_lock is not None:
                                 authority_lock.release()
                                 authority_lock = None
-                        if (not isinstance(getattr(submit_observation, "status", None), TerminalStatus)
-                                or not isinstance(getattr(
-                                    submit_observation, "observation_epoch", None), str)
-                                or type(getattr(submit_observation, "seq", None)) is not int):
+                        self._reset_identity_authority(terminal_id)
+                        if (
+                            not isinstance(
+                                getattr(submit_observation, "status", None), TerminalStatus
+                            )
+                            or not isinstance(
+                                getattr(submit_observation, "observation_epoch", None), str
+                            )
+                            or type(getattr(submit_observation, "seq", None)) is not int
+                        ):
                             submit_observation = None
                             submit_evidence = None
                         else:
@@ -958,56 +1256,100 @@ class InboxService:
                     except (DeliveryDeferredError, TerminalInputBlockedError):
                         if submit_observation is None:
                             raise
+                        self._reset_identity_authority(terminal_id)
                         settle_delivery_attempt_proof_safe(
-                            attempt_uuid, submit_evidence or {},
-                            status_monitor.get_status_gen(terminal_id))
+                            attempt_uuid,
+                            submit_evidence or {},
+                            status_monitor.get_status_gen(terminal_id),
+                        )
+                        return
+                    except PaneIdentityMismatchError as exc:
+                        evidence = dict(persisted_evidence)
+                        evidence["identity_proof"] = exc.reason
+                        settle_delivery_attempt_proof_safe(
+                            attempt_uuid,
+                            evidence,
+                            status_monitor.get_status_gen(terminal_id),
+                            outcome="ambiguous",
+                            reason=f"pane_identity_mismatch:{exc.reason}",
+                        )
+                        self._record_identity_authority_failure(
+                            terminal_id,
+                            batch,
+                            metadata,
+                            exc.reason,
+                            attempt_uuid=attempt_uuid,
+                        )
                         return
                     except Exception:
                         if submit_observation is None and legacy_test_seam:
                             raise
+                        self._reset_identity_authority(terminal_id)
                         settle_delivery_attempt_proof_safe(
-                            attempt_uuid, submit_evidence or dict(persisted_evidence),
-                            status_monitor.get_status_gen(terminal_id))
+                            attempt_uuid,
+                            submit_evidence or dict(persisted_evidence),
+                            status_monitor.get_status_gen(terminal_id),
+                        )
                         return
                     trace = get_message_trace(batch[0].id)
-                    current_attempt = next(x for x in trace["attempts"]
-                                           if x["attempt_uuid"] == attempt_uuid)
+                    current_attempt = next(
+                        x for x in trace["attempts"] if x["attempt_uuid"] == attempt_uuid
+                    )
                     outcome, evidence = confirm_delivery(
-                        metadata, digest, current_attempt["started_at"],
-                        current_attempt.get("evidence"))
+                        metadata,
+                        digest,
+                        current_attempt["started_at"],
+                        current_attempt.get("evidence"),
+                    )
                     if successor_source is not None:
                         evidence = {**current_attempt.get("evidence", {}), **evidence}
                     if submit_evidence is not None:
                         evidence.update(submit_evidence)
                     if outcome in {"hit", "unverified"}:
                         settle_delivery_attempt(
-                            attempt_uuid, MessageStatus.DELIVERED, "confirmed",
+                            attempt_uuid,
+                            MessageStatus.DELIVERED,
+                            "confirmed",
                             evidence=json.dumps(evidence),
                             settled_status_gen=status_monitor.get_status_gen(terminal_id),
                             on_confirmed=lambda: self._commit_watchdog_ops(
-                                terminal_id, sender_id, orchestration_type, metadata),
+                                terminal_id, sender_id, orchestration_type, metadata
+                            ),
                         )
                     else:
-                        settle_delivery_attempt(attempt_uuid, MessageStatus.PENDING,
-                                                "ambiguous", reason="confirmation_timeout",
-                                                evidence=json.dumps(evidence),
-                                                settled_status_gen=status_monitor.get_status_gen(terminal_id))
+                        settle_delivery_attempt(
+                            attempt_uuid,
+                            MessageStatus.PENDING,
+                            "ambiguous",
+                            reason="confirmation_timeout",
+                            evidence=json.dumps(evidence),
+                            settled_status_gen=status_monitor.get_status_gen(terminal_id),
+                        )
                         with _delivery_seq_guard:
-                            _delivery_wake_seq[terminal_id] = _delivery_wake_seq.get(terminal_id, 0) + 1
+                            _delivery_wake_seq[terminal_id] = (
+                                _delivery_wake_seq.get(terminal_id, 0) + 1
+                            )
                         return
                     logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
                     self._evict_defer_state(batch)
                 except DeliveryDeferredError:
                     self._record_delivery_deferred(terminal_id, batch)
                     if attempt_uuid:
+                        self._reset_identity_authority(terminal_id)
                         if submit_evidence is not None:
                             settle_delivery_attempt_proof_safe(
-                                attempt_uuid, submit_evidence,
-                                status_monitor.get_status_gen(terminal_id))
+                                attempt_uuid,
+                                submit_evidence,
+                                status_monitor.get_status_gen(terminal_id),
+                            )
                             return
                         else:
-                            settle_delivery_attempt(attempt_uuid, MessageStatus.PENDING, "deferred",
-                                                    reason="delivery_deferred")
+                            settle_delivery_attempt(
+                                attempt_uuid,
+                                MessageStatus.PENDING,
+                                "deferred",
+                                reason="delivery_deferred",
+                            )
                     else:
                         _defer_messages(terminal_id, messages[sent_count:])
                     with _delivery_seq_guard:
@@ -1015,15 +1357,23 @@ class InboxService:
                     return
                 except TerminalInputBlockedError:
                     if attempt_uuid:
+                        self._reset_identity_authority(terminal_id)
                         if submit_evidence is not None:
                             settle_delivery_attempt_proof_safe(
-                                attempt_uuid, submit_evidence,
-                                status_monitor.get_status_gen(terminal_id))
+                                attempt_uuid,
+                                submit_evidence,
+                                status_monitor.get_status_gen(terminal_id),
+                            )
                             return
                         else:
-                            settle_delivery_attempt(attempt_uuid, MessageStatus.PENDING, "deferred",
-                                                    reason="input_blocked")
-                    else: _defer_messages(terminal_id, messages[sent_count:])
+                            settle_delivery_attempt(
+                                attempt_uuid,
+                                MessageStatus.PENDING,
+                                "deferred",
+                                reason="input_blocked",
+                            )
+                    else:
+                        _defer_messages(terminal_id, messages[sent_count:])
                     with _delivery_seq_guard:
                         _delivery_wake_seq[terminal_id] = _delivery_wake_seq.get(terminal_id, 0) + 1
                     return
@@ -1036,14 +1386,22 @@ class InboxService:
                     if attempt_uuid:
                         if submit_evidence is not None:
                             settle_delivery_attempt_proof_safe(
-                                attempt_uuid, submit_evidence,
-                                status_monitor.get_status_gen(terminal_id))
+                                attempt_uuid,
+                                submit_evidence,
+                                status_monitor.get_status_gen(terminal_id),
+                            )
                             return
                         else:
-                            settle_delivery_attempt(attempt_uuid, MessageStatus.PENDING, "interrupted",
-                                                    reason="terminal_not_found", error=str(e))
+                            settle_delivery_attempt(
+                                attempt_uuid,
+                                MessageStatus.PENDING,
+                                "interrupted",
+                                reason="terminal_not_found",
+                                error=str(e),
+                            )
                     else:
-                        for message in batch: update_message_status(message.id, MessageStatus.PENDING)
+                        for message in batch:
+                            update_message_status(message.id, MessageStatus.PENDING)
                     logger.warning(
                         f"Pane not resolvable for terminal {terminal_id}; leaving "
                         f"{len(batch)} message(s) pending for retry: {e}"
@@ -1055,17 +1413,21 @@ class InboxService:
                     if attempt_uuid:
                         if submit_observation is None:
                             settle_delivery_attempt(
-                                attempt_uuid, MessageStatus.FAILED, "failed", error=str(e))
+                                attempt_uuid, MessageStatus.FAILED, "failed", error=str(e)
+                            )
                         else:
                             result = settle_delivery_attempt_proof_safe(
-                                attempt_uuid, submit_evidence or {},
-                                status_monitor.get_status_gen(terminal_id))
+                                attempt_uuid,
+                                submit_evidence or {},
+                                status_monitor.get_status_gen(terminal_id),
+                            )
                             return
                     for message in batch:
                         logger.error(
                             f"Failed to deliver message {message.id} to {terminal_id}: {e}"
                         )
-                        if not attempt_uuid: update_message_status(message.id, MessageStatus.FAILED)
+                        if not attempt_uuid:
+                            update_message_status(message.id, MessageStatus.FAILED)
                     with _delivery_seq_guard:
                         _delivery_wake_seq[terminal_id] = _delivery_wake_seq.get(terminal_id, 0) + 1
                     sent_count += len(batch)
@@ -1116,7 +1478,9 @@ class InboxService:
             logger.info(
                 "P5 orphan reconciliation settled %d message(s), queued %d notice(s), "
                 "logged-only %d batch(es)",
-                result.settled_count, result.notification_count, result.logged_only_count,
+                result.settled_count,
+                result.notification_count,
+                result.logged_only_count,
             )
         return result
 
@@ -1132,8 +1496,13 @@ class InboxService:
             metadata = get_terminal_metadata(terminal_id)
             if not metadata:
                 recover_wpm2_stale_attempt(
-                    attempt_uuid, message_ids, MessageStatus.DELIVERY_FAILED,
-                    "failed", "receiver_gone", {})
+                    attempt_uuid,
+                    message_ids,
+                    MessageStatus.DELIVERY_FAILED,
+                    "failed",
+                    "receiver_gone",
+                    {},
+                )
                 return
             try:
                 evidence = json.loads(attempt.get("evidence") or "{}")
@@ -1146,15 +1515,24 @@ class InboxService:
                 lookup, lookup_evidence = "unresolved", {"kind": "transcript_unresolved"}
             else:
                 lookup, lookup_evidence = _wpm2_lookup(
-                    metadata, attempt["payload_hash"], attempt.get("started_at"), evidence)
+                    metadata, attempt["payload_hash"], attempt.get("started_at"), evidence
+                )
             if lookup == "hit":
                 result = recover_wpm2_stale_attempt(
-                    attempt_uuid, message_ids, MessageStatus.DELIVERED,
-                    "confirmed", "stale_recovery", lookup_evidence)
+                    attempt_uuid,
+                    message_ids,
+                    MessageStatus.DELIVERED,
+                    "confirmed",
+                    "stale_recovery",
+                    lookup_evidence,
+                )
                 if result == "settled":
                     self._commit_watchdog_ops(
-                        terminal_id, attempt["sender_id"],
-                        OrchestrationType(attempt["orchestration_type"]), metadata)
+                        terminal_id,
+                        attempt["sender_id"],
+                        OrchestrationType(attempt["orchestration_type"]),
+                        metadata,
+                    )
                 return
             recovered_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             recovery_evidence = {
@@ -1166,8 +1544,13 @@ class InboxService:
                 },
             }
             recover_wpm2_stale_attempt(
-                attempt_uuid, message_ids, MessageStatus.PENDING,
-                "ambiguous", "confirmation_timeout", recovery_evidence)
+                attempt_uuid,
+                message_ids,
+                MessageStatus.PENDING,
+                "ambiguous",
+                "confirmation_timeout",
+                recovery_evidence,
+            )
         finally:
             lock.release()
 
@@ -1191,53 +1574,75 @@ class InboxService:
             seen_attempts.add(attempt_uuid)
             message_ids = list_attempt_member_ids(attempt_uuid) or [message.id]
             if attempt.get("provider") == "claude_code":
-                self._recover_wpm2_attempt({
-                    **attempt, "receiver_terminal_id": message.receiver_id,
-                    "message_ids": message_ids,
-                })
+                self._recover_wpm2_attempt(
+                    {
+                        **attempt,
+                        "receiver_terminal_id": message.receiver_id,
+                        "message_ids": message_ids,
+                    }
+                )
                 continue
             metadata = get_terminal_metadata(message.receiver_id)
             if not metadata:
-                settle_delivery_attempt(attempt_uuid, MessageStatus.FAILED,
-                                        "failed", reason="receiver_metadata_gone")
+                settle_delivery_attempt(
+                    attempt_uuid, MessageStatus.FAILED, "failed", reason="receiver_metadata_gone"
+                )
                 continue
             try:
                 from cli_agent_orchestrator.backends.registry import get_backend
-                get_backend().get_history(metadata["tmux_session"], metadata["tmux_window"],
-                                          tail_lines=1)
+
+                get_backend().get_history(
+                    metadata["tmux_session"], metadata["tmux_window"], tail_lines=1
+                )
             except Exception:
-                settle_delivery_attempt(attempt_uuid, MessageStatus.PENDING,
-                                        "interrupted", reason="pane_unresolvable")
+                settle_delivery_attempt(
+                    attempt_uuid, MessageStatus.PENDING, "interrupted", reason="pane_unresolvable"
+                )
                 continue
             resolution = resolve_session_transcript(metadata)
             if resolution is None:
-                settle_delivery_attempt(attempt_uuid, MessageStatus.PENDING,
-                                        "interrupted", reason="no_oracle")
+                settle_delivery_attempt(
+                    attempt_uuid, MessageStatus.PENDING, "interrupted", reason="no_oracle"
+                )
                 continue
             path = getattr(resolution, "path", resolution)
             result, evidence = transcript_lookup(
-                path, attempt["payload_hash"], attempt.get("started_at"),
-                attempt.get("evidence"))
+                path, attempt["payload_hash"], attempt.get("started_at"), attempt.get("evidence")
+            )
             evidence["resolution_kind"] = getattr(resolution, "resolution_kind", "exact_id")
             stale_note = getattr(resolution, "stale_note", None)
             if stale_note:
                 evidence["binding_stale"] = stale_note
             if result == "hit":
                 settle_delivery_attempt(
-                    attempt_uuid, MessageStatus.DELIVERED, "confirmed",
-                    reason="startup_sweep", evidence=json.dumps(evidence),
+                    attempt_uuid,
+                    MessageStatus.DELIVERED,
+                    "confirmed",
+                    reason="startup_sweep",
+                    evidence=json.dumps(evidence),
                     on_confirmed=lambda: self._commit_watchdog_ops(
-                        message.receiver_id, attempt["sender_id"],
-                        OrchestrationType(attempt["orchestration_type"]), metadata),
+                        message.receiver_id,
+                        attempt["sender_id"],
+                        OrchestrationType(attempt["orchestration_type"]),
+                        metadata,
+                    ),
                 )
             elif result == "absent":
-                settle_delivery_attempt(attempt_uuid, MessageStatus.PENDING,
-                                        "interrupted", reason="proven_absent",
-                                        evidence=json.dumps(evidence))
+                settle_delivery_attempt(
+                    attempt_uuid,
+                    MessageStatus.PENDING,
+                    "interrupted",
+                    reason="proven_absent",
+                    evidence=json.dumps(evidence),
+                )
             else:
-                settle_delivery_attempt(attempt_uuid, MessageStatus.DELIVERY_FAILED,
-                                        "unresolved", reason="continuity_uncertain",
-                                        evidence=json.dumps(evidence))
+                settle_delivery_attempt(
+                    attempt_uuid,
+                    MessageStatus.DELIVERY_FAILED,
+                    "unresolved",
+                    reason="continuity_uncertain",
+                    evidence=json.dumps(evidence),
+                )
                 self._notify_delivery_failed(message.receiver_id, message_ids)
 
 

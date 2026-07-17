@@ -29,7 +29,9 @@ from cli_agent_orchestrator.providers.screen_classification import (
 )
 from cli_agent_orchestrator.services.settings_service import (
     get_provider_defaults,
+    get_provider_profile_defaults,
     get_server_settings,
+    resolve_provider_string_option,
 )
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.grok_config import ensure_grok_mcp_servers
@@ -74,33 +76,6 @@ EMPTY_DRAFT_PLACEHOLDERS = {
 
 class ProviderError(Exception):
     """Exception raised for Grok provider-specific errors."""
-
-
-def _profile_defaults(
-    provider_defaults: Dict[str, Any],
-    profile_name: Optional[str],
-) -> Dict[str, Any]:
-    profiles = provider_defaults.get("profiles")
-    if not profile_name or not isinstance(profiles, dict):
-        return {}
-    defaults = profiles.get(profile_name)
-    return dict(defaults) if isinstance(defaults, dict) else {}
-
-
-def _resolve_string_option(
-    profile_defaults: Dict[str, Any],
-    provider_defaults: Dict[str, Any],
-    profile,
-    toml_key: str,
-    profile_attr: str,
-) -> Optional[str]:
-    for defaults in (profile_defaults, provider_defaults):
-        value = defaults.get(toml_key)
-        if toml_key in defaults and isinstance(value, str):
-            return value or None
-
-    value = getattr(profile, profile_attr, None) if profile is not None else None
-    return value if isinstance(value, str) and value else None
 
 
 class GrokCliProvider(BaseProvider):
@@ -180,8 +155,8 @@ class GrokCliProvider(BaseProvider):
 
         provider_defaults = get_provider_defaults("grok_cli")
         profile_name = getattr(profile, "name", None) or self._agent_profile
-        profile_defaults = _profile_defaults(provider_defaults, profile_name)
-        model = _resolve_string_option(
+        profile_defaults = get_provider_profile_defaults(provider_defaults, profile_name)
+        model = resolve_provider_string_option(
             profile_defaults,
             provider_defaults,
             profile,
@@ -191,7 +166,7 @@ class GrokCliProvider(BaseProvider):
         if isinstance(model, str) and model:
             command_parts.extend(["-m", model])
 
-        reasoning_effort = _resolve_string_option(
+        reasoning_effort = resolve_provider_string_option(
             profile_defaults,
             provider_defaults,
             profile,

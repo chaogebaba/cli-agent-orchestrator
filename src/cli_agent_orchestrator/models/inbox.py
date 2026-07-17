@@ -23,6 +23,7 @@ class MessageStatus(str, Enum):
     DELIVERED = "delivered"
     DELIVERY_FAILED = "delivery_failed"
     FAILED = "failed"
+    DIGESTED = "digested"
 
 
 class InboxMessage(BaseModel):
@@ -41,5 +42,11 @@ class InboxMessage(BaseModel):
     status: MessageStatus = Field(..., description="Message status")
     failure_reason: str | None = Field(
         default=None, description="Terminal settlement reason, when available"
+    )
+    digested_into: int | None = Field(
+        default=None, description="Digest message containing this row"
+    )
+    enqueue_generation: int | None = Field(
+        default=None, description="Logical mailbox generation captured at enqueue"
     )
     created_at: datetime = Field(..., description="Creation timestamp")

@@ -1679,11 +1679,25 @@ class TestDeferredInitFailureNotification:
         assert tracked.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_claim_failure_does_not_settle(self):
-        tracked = AsyncMock(side_effect=RuntimeError("db down"))
-        with patch(
-            "cli_agent_orchestrator.services.terminal_service._tracked_blocking",
-            tracked,
+    async def test_claim_failure_retries_deadletters_and_does_not_settle(self):
+        tracked = AsyncMock(
+            side_effect=[
+                RuntimeError("db down"),
+                RuntimeError("db down"),
+                RuntimeError("db down"),
+                RuntimeError("db down"),
+                (None, 0.0),
+            ]
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service._tracked_blocking",
+                tracked,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.asyncio.sleep",
+                new_callable=AsyncMock,
+            ) as sleep,
         ):
             await terminal_service_module._claim_and_settle_deferred_failure(
                 "worker99",
@@ -1692,7 +1706,14 @@ class TestDeferredInitFailureNotification:
                 "worker_vanished",
                 None,
             )
-        tracked.assert_awaited_once()
+        assert [call.args[3] for call in tracked.await_args_list] == [
+            "h3_claim",
+            "h3_claim",
+            "h3_claim",
+            "h3_claim",
+            "deadletter",
+        ]
+        assert [call.args[0] for call in sleep.await_args_list] == [1.0, 5.0, 25.0]
 
     @pytest.mark.asyncio
     async def test_row_missing_claim_does_not_settle(self):

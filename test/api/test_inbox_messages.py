@@ -115,7 +115,27 @@ class TestGetInboxMessagesEndpoint:
         data = response.json()
         assert "detail" in data
         assert "Invalid status" in data["detail"]
-        assert "pending, delivering, delivered, delivery_failed, failed" in data["detail"]
+        assert "pending, delivering, delivered, delivery_failed, failed, digested" in data["detail"]
+
+    def test_wpq1_digested_status_and_link_are_public(self, client):
+        row = InboxMessage(
+            id=9,
+            sender_id="sender",
+            receiver_id="abcdef12",
+            message="historical",
+            status=MessageStatus.DIGESTED,
+            digested_into=10,
+            enqueue_generation=1,
+            created_at=datetime(2026, 7, 16, 12, 0, 0),
+        )
+        with patch("cli_agent_orchestrator.api.main.get_inbox_messages", return_value=[row]) as get:
+            response = client.get("/terminals/abcdef12/inbox/messages?status=digested")
+
+        assert response.status_code == 200
+        assert response.json()[0]["status"] == "digested"
+        assert response.json()[0]["digested_into"] == 10
+        assert response.json()[0]["enqueue_generation"] == 1
+        get.assert_called_once_with("abcdef12", limit=10, status=MessageStatus.DIGESTED)
 
     def test_limit_exceeds_maximum(self, client):
         """Test that limit parameter is properly validated."""
@@ -206,15 +226,22 @@ class TestMessageTraceEndpoint:
     def test_trace_http_golden(self, client):
         trace = {
             "message": {
-                "id": 7, "sender_id": "sender", "receiver_id": "receiver",
-                "status": "delivered", "created_at": "2026-07-11T00:00:00",
+                "id": 7,
+                "sender_id": "sender",
+                "receiver_id": "receiver",
+                "status": "delivered",
+                "created_at": "2026-07-11T00:00:00",
             },
-            "attempts": [{
-                "attempt_uuid": "attempt-1", "outcome": "confirmed",
-                "payload_hash": "abc", "payload_length": 3,
-                "evidence": {"kind": "transcript_user_turn", "offset": 12},
-                "position": 0,
-            }],
+            "attempts": [
+                {
+                    "attempt_uuid": "attempt-1",
+                    "outcome": "confirmed",
+                    "payload_hash": "abc",
+                    "payload_length": 3,
+                    "evidence": {"kind": "transcript_user_turn", "offset": 12},
+                    "position": 0,
+                }
+            ],
         }
         with patch("cli_agent_orchestrator.api.main.get_message_trace", return_value=trace):
             response = client.get("/messages/7/trace")

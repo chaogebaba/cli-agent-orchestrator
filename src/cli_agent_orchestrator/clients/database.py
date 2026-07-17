@@ -8,6 +8,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypeVar, cast
 
@@ -51,6 +52,13 @@ class ReadyBacklogObservation:
     oldest_pending_age_seconds: float
     has_open_delivering_attempt: bool
     attempt_fingerprint: tuple[int, datetime | None, datetime | None, datetime | None]
+
+
+class NoticeInsertOutcome(str, Enum):
+    INSERTED = "inserted"
+    FAILED_BEFORE_COMMIT = "failed_before_commit"
+    UNCERTAIN_COMMIT = "uncertain_commit"
+    FAILED_AFTER_COMMIT = "failed_after_commit"
 
 
 def _utcnow() -> datetime:
@@ -244,6 +252,8 @@ class InboxModel(Base):
     )
     status = Column(String, nullable=False)  # MessageStatus enum value
     failure_reason = Column(Text, nullable=True)
+    digested_into = deferred(Column(Integer, nullable=True))
+    enqueue_generation = deferred(Column(Integer, nullable=True))
     created_at = Column(DateTime, default=datetime.now)
 
 
@@ -566,6 +576,11 @@ def _migrate_mailbox_columns() -> None:
         inbox_columns = connection.execute(text("PRAGMA table_info(inbox)")).mappings().all()
         if inbox_columns and "logical_receiver_id" not in {row["name"] for row in inbox_columns}:
             connection.execute(text("ALTER TABLE inbox ADD COLUMN logical_receiver_id TEXT"))
+        inbox_column_names = {row["name"] for row in inbox_columns}
+        if inbox_columns and "digested_into" not in inbox_column_names:
+            connection.execute(text("ALTER TABLE inbox ADD COLUMN digested_into INTEGER"))
+        if inbox_columns and "enqueue_generation" not in inbox_column_names:
+            connection.execute(text("ALTER TABLE inbox ADD COLUMN enqueue_generation INTEGER"))
         terminal_columns = connection.execute(text("PRAGMA table_info(terminals)")).mappings().all()
         if terminal_columns and "caller_mailbox_id" not in {
             row["name"] for row in terminal_columns
@@ -1039,10 +1054,10 @@ def _mailbox_id_for_terminal(db: Any, terminal_id: str | None) -> str | None:
     return cast(str, row[0]) if row is not None else None
 
 
-def resolve_inbox_receiver(db: Any, receiver_id: str) -> tuple[str, str | None]:
+def resolve_inbox_receiver(db: Any, receiver_id: str) -> tuple[str, str | None, int | None]:
     """Resolve a logical or historical inbox address inside the caller's transaction."""
     if not _mailbox_schema_available(db):
-        return receiver_id, None
+        return receiver_id, None, None
     if receiver_id.startswith("mb_"):
         mailbox = db.query(MailboxModel).filter(MailboxModel.id == receiver_id).one_or_none()
         if mailbox is None:
@@ -1056,9 +1071,19 @@ def resolve_inbox_receiver(db: Any, receiver_id: str) -> tuple[str, str | None]:
                 .first()
             )
             cache = latest[0] if latest is not None else receiver_id
-        return cast(str, cache), cast(str, mailbox.id)
+        return cast(str, cache), cast(str, mailbox.id), cast(int, mailbox.generation)
     mailbox_id = _mailbox_id_for_terminal(db, receiver_id)
-    return receiver_id, mailbox_id
+    if mailbox_id is None:
+        return receiver_id, None, None
+    generation = db.query(MailboxModel.generation).filter_by(id=mailbox_id).scalar()
+    return receiver_id, mailbox_id, cast(int | None, generation)
+
+
+def get_current_mailbox_generation(mailbox_id: str) -> int | None:
+    """Return the current logical generation without rewriting receiver caches."""
+    with SessionLocal() as db:
+        value = db.query(MailboxModel.generation).filter_by(id=mailbox_id).scalar()
+        return cast(int | None, value)
 
 
 def _receiver_is_terminal_or_mailbox_address(db: Any, receiver_id: str | None) -> bool:
@@ -1941,7 +1966,21 @@ def claim_deferred_init_failure(
     """
     for attempt in range(busy_attempts):
         with SessionLocal() as db:
+            dbapi_identity: int | None = None
             try:
+                connection = db.connection()
+                fairy = connection.connection
+                dbapi_connection = getattr(fairy, "driver_connection", fairy)
+                dbapi_identity = id(dbapi_connection)
+                logger.info(
+                    "deferred_init_claim_connection terminal=%s attempt=%s engine=%s "
+                    "dbapi=%s pool=%s",
+                    terminal_id,
+                    attempt + 1,
+                    id(engine),
+                    dbapi_identity,
+                    engine.pool.status(),
+                )
                 db.execute(text("BEGIN IMMEDIATE"))
                 row = (
                     db.query(TerminalModel)
@@ -1962,8 +2001,8 @@ def claim_deferred_init_failure(
                 receiver_exists = _receiver_is_terminal_or_mailbox_address(db, caller_id)
                 row.init_failure_token = failure_token
                 if receiver_exists:
-                    receiver_cache, logical_receiver_id = resolve_inbox_receiver(
-                        db, cast(str, caller_id)
+                    receiver_cache, logical_receiver_id, enqueue_generation = (
+                        resolve_inbox_receiver(db, cast(str, caller_id))
                     )
                     row.init_state = "init_failed_notified"
                     db.add(
@@ -1971,6 +2010,7 @@ def claim_deferred_init_failure(
                             sender_id=terminal_id,
                             receiver_id=receiver_cache,
                             logical_receiver_id=logical_receiver_id,
+                            enqueue_generation=enqueue_generation,
                             message=notice,
                             orchestration_type=OrchestrationType.SEND_MESSAGE.value,
                             status=MessageStatus.PENDING.value,
@@ -1985,12 +2025,30 @@ def claim_deferred_init_failure(
                 return {"status": status, "init_state": row.init_state, "token": failure_token}
             except OperationalError as exc:
                 db.rollback()
+                logger.exception(
+                    "deferred_init_claim_db_error terminal=%s attempt=%s engine=%s "
+                    "dbapi=%s pool=%s",
+                    terminal_id,
+                    attempt + 1,
+                    id(engine),
+                    dbapi_identity,
+                    engine.pool.status(),
+                )
                 if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
                     raise
                 if attempt + 1 >= busy_attempts:
                     raise RuntimeError("deferred_init_claim_busy_exhausted") from exc
             except Exception:
                 db.rollback()
+                logger.exception(
+                    "deferred_init_claim_db_error terminal=%s attempt=%s engine=%s "
+                    "dbapi=%s pool=%s",
+                    terminal_id,
+                    attempt + 1,
+                    id(engine),
+                    dbapi_identity,
+                    engine.pool.status(),
+                )
                 raise
         time.sleep(busy_delay_s)
     raise RuntimeError("deferred_init_claim_busy_exhausted")
@@ -2311,7 +2369,9 @@ def create_inbox_message(
     """
     with SessionLocal() as db:
         mailbox_schema = _mailbox_schema_available(db)
-        receiver_cache, logical_receiver_id = resolve_inbox_receiver(db, receiver_id)
+        receiver_cache, logical_receiver_id, enqueue_generation = resolve_inbox_receiver(
+            db, receiver_id
+        )
         if (
             logical_receiver_id is None
             and not db.query(TerminalModel).filter(TerminalModel.id == receiver_cache).first()
@@ -2326,6 +2386,7 @@ def create_inbox_message(
         )
         if mailbox_schema:
             inbox_kwargs["logical_receiver_id"] = logical_receiver_id
+            inbox_kwargs["enqueue_generation"] = enqueue_generation
         inbox_msg = InboxModel(**inbox_kwargs)
         db.add(inbox_msg)
         db.commit()
@@ -2335,11 +2396,70 @@ def create_inbox_message(
             sender_id=inbox_msg.sender_id,
             receiver_id=inbox_msg.receiver_id,
             logical_receiver_id=(inbox_msg.logical_receiver_id if mailbox_schema else None),
+            digested_into=(inbox_msg.digested_into if mailbox_schema else None),
+            enqueue_generation=(inbox_msg.enqueue_generation if mailbox_schema else None),
             message=inbox_msg.message,
             orchestration_type=OrchestrationType(inbox_msg.orchestration_type),
             status=MessageStatus(inbox_msg.status),
             created_at=inbox_msg.created_at,
         )
+
+
+def insert_identity_authority_notice(
+    sender_id: str, receiver_id: str, message: str
+) -> NoticeInsertOutcome:
+    """Insert one generation-stamped authority notice with honest commit phases."""
+    try:
+        db = SessionLocal()
+    except Exception:
+        return NoticeInsertOutcome.FAILED_BEFORE_COMMIT
+    committed = False
+    try:
+        try:
+            receiver_cache, logical_receiver_id, enqueue_generation = resolve_inbox_receiver(
+                db, receiver_id
+            )
+            if (
+                logical_receiver_id is None
+                and not db.query(TerminalModel).filter(TerminalModel.id == receiver_cache).first()
+            ):
+                db.rollback()
+                return NoticeInsertOutcome.FAILED_BEFORE_COMMIT
+            row = InboxModel(
+                sender_id=sender_id,
+                receiver_id=receiver_cache,
+                logical_receiver_id=logical_receiver_id,
+                enqueue_generation=enqueue_generation,
+                message=message,
+                orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+                status=MessageStatus.PENDING.value,
+            )
+            db.add(row)
+            db.flush()
+        except Exception:
+            db.rollback()
+            return NoticeInsertOutcome.FAILED_BEFORE_COMMIT
+        try:
+            db.commit()
+            committed = True
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            return NoticeInsertOutcome.UNCERTAIN_COMMIT
+        try:
+            db.refresh(row)
+            int(row.id)
+        except Exception:
+            return NoticeInsertOutcome.FAILED_AFTER_COMMIT
+        return NoticeInsertOutcome.INSERTED
+    finally:
+        try:
+            db.close()
+        except Exception:
+            if committed:
+                logger.warning("identity_authority_notice_close_failed", exc_info=True)
 
 
 def _pending_receiver_predicate(receiver_id: str, mailbox_schema: bool):
@@ -2383,6 +2503,8 @@ def get_pending_messages(
                 sender_id=row.sender_id,
                 receiver_id=row.receiver_id,
                 logical_receiver_id=row.logical_receiver_id if mailbox_schema else None,
+                digested_into=row.digested_into if mailbox_schema else None,
+                enqueue_generation=row.enqueue_generation if mailbox_schema else None,
                 message=row.message,
                 orchestration_type=OrchestrationType(row.orchestration_type),
                 status=MessageStatus(row.status),
@@ -2414,6 +2536,8 @@ def get_pending_messages_by_ids(receiver_id: str, message_ids: list[int]) -> Lis
                 sender_id=row.sender_id,
                 receiver_id=row.receiver_id,
                 logical_receiver_id=row.logical_receiver_id if mailbox_schema else None,
+                digested_into=row.digested_into if mailbox_schema else None,
+                enqueue_generation=row.enqueue_generation if mailbox_schema else None,
                 message=row.message,
                 orchestration_type=OrchestrationType(row.orchestration_type),
                 status=MessageStatus(row.status),
@@ -2451,6 +2575,8 @@ def get_inbox_messages(
                 sender_id=msg.sender_id,
                 receiver_id=msg.receiver_id,
                 logical_receiver_id=msg.logical_receiver_id if mailbox_schema else None,
+                digested_into=msg.digested_into if mailbox_schema else None,
+                enqueue_generation=msg.enqueue_generation if mailbox_schema else None,
                 message=msg.message,
                 orchestration_type=OrchestrationType(msg.orchestration_type),
                 status=MessageStatus(msg.status),
@@ -3217,6 +3343,9 @@ def settle_delivery_attempt_proof_safe(
     attempt_uuid: str,
     evidence: dict[str, Any],
     settled_status_gen=None,
+    *,
+    outcome: str = "ambiguous",
+    reason: str = "confirmation_timeout",
 ) -> str:
     """Compensating post-submit settlement; never leaks into generic failure."""
 
@@ -3242,10 +3371,10 @@ def settle_delivery_attempt_proof_safe(
         )
         if delivering != len(ids):
             return "stale"
-        row.outcome = "ambiguous"
-        row.reason = "confirmation_timeout"
+        row.outcome = outcome
+        row.reason = reason
         safe_evidence = dict(evidence)
-        if row.provider == "claude_code":
+        if row.provider == "claude_code" and reason == "confirmation_timeout":
             safe_evidence = _initialize_wpm2_cursor(safe_evidence)
         row.evidence = _canonical_json(safe_evidence)
         row.settled_at = row.last_at = _utcnow()
@@ -3337,6 +3466,8 @@ def get_message_trace(message_id: int) -> Optional[Dict[str, Any]]:
                 "receiver_id": msg.receiver_id,
                 "status": msg.status,
                 "failure_reason": msg.failure_reason,
+                "digested_into": msg.digested_into,
+                "enqueue_generation": msg.enqueue_generation,
                 "created_at": msg.created_at.isoformat(),
             },
             "attempts": attempts,
@@ -3355,6 +3486,10 @@ def count_ambiguous_attempts(message_ids: list[int]) -> int:
             .filter(
                 InboxDeliveryAttemptMemberModel.message_id.in_(message_ids),
                 InboxDeliveryAttemptModel.outcome == "ambiguous",
+                or_(
+                    InboxDeliveryAttemptModel.reason.is_(None),
+                    ~InboxDeliveryAttemptModel.reason.like("pane_identity_mismatch:%"),
+                ),
             )
             .distinct()
             .count()
@@ -3487,7 +3622,9 @@ def _record_p5_orphan_notices(db: Any, rows: list[InboxModel]) -> tuple[int, int
             continue
         header = f"p5-orphan receiver={receiver_id} batch={_p5_batch_key(ids)}\n"
         notice_sender = f"message-trace:{receiver_id}"
-        notice_receiver, logical_receiver_id = resolve_inbox_receiver(db, sender_id)
+        notice_receiver, logical_receiver_id, enqueue_generation = resolve_inbox_receiver(
+            db, sender_id
+        )
         existing = (
             db.query(InboxModel)
             .filter(
@@ -3503,6 +3640,7 @@ def _record_p5_orphan_notices(db: Any, rows: list[InboxModel]) -> tuple[int, int
                     sender_id=notice_sender,
                     receiver_id=notice_receiver,
                     logical_receiver_id=logical_receiver_id,
+                    enqueue_generation=enqueue_generation,
                     message=(
                         header
                         + f"[message-trace] delivery to terminal {receiver_id} failed because "
@@ -3518,6 +3656,7 @@ def _record_p5_orphan_notices(db: Any, rows: list[InboxModel]) -> tuple[int, int
 
 def settle_pending_orphan_messages(
     limit: int = ORPHAN_RECONCILE_BATCH_LIMIT,
+    receiver_ids: list[str] | None = None,
 ) -> OrphanReconcileResult:
     """Settle the oldest PENDING messages whose receiver row is absent."""
     if limit <= 0:
@@ -3535,9 +3674,11 @@ def settle_pending_orphan_messages(
             # pre-init legacy schema; production startup installs D5 first.
             return OrphanReconcileResult()
         orphan_predicate = _p5_orphan_predicate()
+        candidate_query = db.query(InboxModel)
+        if receiver_ids is not None:
+            candidate_query = candidate_query.filter(InboxModel.receiver_id.in_(receiver_ids))
         candidates = (
-            db.query(InboxModel)
-            .filter(
+            candidate_query.filter(
                 InboxModel.status == MessageStatus.PENDING.value,
                 orphan_predicate,
             )
@@ -3766,12 +3907,15 @@ def record_wpm1_stalled_notice(
             .first()
         )
         if existing is None:
-            notice_receiver, logical_receiver_id = resolve_inbox_receiver(db, recipient)
+            notice_receiver, logical_receiver_id, enqueue_generation = resolve_inbox_receiver(
+                db, recipient
+            )
             db.add(
                 InboxModel(
                     sender_id=sender,
                     receiver_id=notice_receiver,
                     logical_receiver_id=logical_receiver_id,
+                    enqueue_generation=enqueue_generation,
                     message=header
                     + "delivery stalled: receiver shows no progress / payload not yet "
                     "confirmed; no reinjection will occur while unproven; will confirm if consumed",
@@ -3895,14 +4039,17 @@ def settle_wpm1_terminal_batch(
                         .first()
                     )
                     if existing is None:
-                        notice_receiver, logical_receiver_id = resolve_inbox_receiver(
-                            db, stalled.receiver_id
-                        )
+                        (
+                            notice_receiver,
+                            logical_receiver_id,
+                            enqueue_generation,
+                        ) = resolve_inbox_receiver(db, stalled.receiver_id)
                         db.add(
                             InboxModel(
                                 sender_id=sender,
                                 receiver_id=notice_receiver,
                                 logical_receiver_id=logical_receiver_id,
+                                enqueue_generation=enqueue_generation,
                                 message=corrective_header
                                 + "previously-stalled message was delivered",
                                 orchestration_type=OrchestrationType.SEND_MESSAGE.value,

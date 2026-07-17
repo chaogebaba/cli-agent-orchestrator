@@ -577,9 +577,7 @@ class TestDeleteSession:
         data = response.json()
         assert data["success"] is True
         assert data["deleted"] == ["test-session"]
-        mock_svc.delete_session.assert_called_once_with(
-            "test-session", registry=ANY, force=False
-        )
+        mock_svc.delete_session.assert_called_once_with("test-session", registry=ANY, force=False)
 
     def test_protected_mixed_session_maps_to_409(self, client):
         from cli_agent_orchestrator.services.terminal_guard_service import (
@@ -591,9 +589,7 @@ class TestDeleteSession:
             response = client.delete("/sessions/test-session")
 
         assert response.status_code == 409
-        service.delete_session.assert_called_once_with(
-            "test-session", registry=ANY, force=False
-        )
+        service.delete_session.assert_called_once_with("test-session", registry=ANY, force=False)
 
     def test_delete_session_force_propagates(self, client):
         with patch("cli_agent_orchestrator.api.main.session_service") as service:
@@ -601,9 +597,7 @@ class TestDeleteSession:
             response = client.delete("/sessions/test-session", params={"force": "true"})
 
         assert response.status_code == 200
-        service.delete_session.assert_called_once_with(
-            "test-session", registry=ANY, force=True
-        )
+        service.delete_session.assert_called_once_with("test-session", registry=ANY, force=True)
 
     def test_delete_session_not_found(self, client):
         """DELETE /sessions/{name} returns 404 for nonexistent session."""
@@ -789,9 +783,7 @@ class TestGetTerminal:
                 "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
                 return_value=metadata,
             ),
-            patch(
-                "cli_agent_orchestrator.services.terminal_service.status_monitor"
-            ) as monitor,
+            patch("cli_agent_orchestrator.services.terminal_service.status_monitor") as monitor,
         ):
             monitor.get_status.return_value = TerminalStatus.COMPLETED
             monitor.get_input_gen.return_value = 4
@@ -840,13 +832,14 @@ class TestSendTerminalInput:
     """Tests for POST /terminals/{terminal_id}/input endpoint."""
 
     def test_ready_base_direct_input_rejected(self, client):
-        with patch(
-            "cli_agent_orchestrator.services.terminal_guard_service.get_ready_provider_session_by_source_terminal",
-            return_value={"name": "infra"},
-        ), patch("cli_agent_orchestrator.api.main.terminal_service") as service:
-            response = client.post(
-                "/terminals/abcd1234/input", params={"message": "poison"}
-            )
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_guard_service.get_ready_provider_session_by_source_terminal",
+                return_value={"name": "infra"},
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as service,
+        ):
+            response = client.post("/terminals/abcd1234/input", params={"message": "poison"})
 
         assert response.status_code == 409
         assert "ready base 'infra'" in response.json()["detail"]
@@ -1191,6 +1184,10 @@ class TestInboxReconciliationDaemon:
     @pytest.mark.asyncio
     async def test_sweep_runs_one_iteration_then_cancels(self):
         """Daemon sleeps, runs the sync sweep in a thread, then handles cancellation."""
+        from cli_agent_orchestrator.services.deferred_deadletter_service import (
+            replay_deferred_failure_deadletters,
+        )
+
         sleep_calls = 0
         registry = MagicMock()
         mock_to_thread = AsyncMock()
@@ -1198,7 +1195,7 @@ class TestInboxReconciliationDaemon:
         async def fake_sleep(_seconds):
             nonlocal sleep_calls
             sleep_calls += 1
-            if sleep_calls > 1:
+            if sleep_calls >= 1:
                 raise asyncio.CancelledError
 
         with (
@@ -1208,12 +1205,14 @@ class TestInboxReconciliationDaemon:
             with pytest.raises(asyncio.CancelledError):
                 await inbox_reconciliation_daemon(registry)
 
-        mock_to_thread.assert_awaited_once()
-        # The sweep, not some other sync function, must be the dispatched work.
+        assert mock_to_thread.await_count == 2
+        assert mock_to_thread.await_args_list[0].args == (replay_deferred_failure_deadletters,)
+        # Reconciliation follows dead-letter replay in the same iteration.
         # reconcile_orphaned_messages is a bound method on the singleton now, so a
         # fresh attribute access is a distinct object — compare by value, not id.
-        assert mock_to_thread.await_args.args[0] == inbox_service.reconcile_orphaned_messages
-        assert mock_to_thread.await_args.args[1] is registry
+        reconcile_args = mock_to_thread.await_args_list[1].args
+        assert reconcile_args[0] == inbox_service.reconcile_orphaned_messages
+        assert reconcile_args[1] is registry
 
 
 # ── lifespan ─────────────────────────────────────────────────────────
@@ -1259,18 +1258,22 @@ class TestLifespan:
 
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
-            patch("cli_agent_orchestrator.api.main.init_db",
-                  side_effect=lambda: startup_order.append("init_db")),
+            patch(
+                "cli_agent_orchestrator.api.main.init_db",
+                side_effect=lambda: startup_order.append("init_db"),
+            ),
             patch(
                 "cli_agent_orchestrator.api.main.terminal_service.purge_stale_terminal_records",
                 side_effect=lambda: startup_order.append("purge") or 2,
             ) as mock_purge,
             patch.object(
-                main_module.inbox_service, "recover_stale_deliveries",
+                main_module.inbox_service,
+                "recover_stale_deliveries",
                 side_effect=lambda: startup_order.append("recover"),
             ) as mock_recover,
             patch.object(
-                main_module.inbox_service, "reconcile_pending_orphans",
+                main_module.inbox_service,
+                "reconcile_pending_orphans",
                 side_effect=lambda: startup_order.append("orphan_reconcile"),
             ) as mock_orphan_reconcile,
             patch(
@@ -1315,8 +1318,12 @@ class TestLifespan:
                     mock_recover.assert_called_once_with()
                     mock_orphan_reconcile.assert_called_once_with()
                     assert startup_order == [
-                        "init_db", "recover", "orphan_reconcile", "registry_load",
-                        "recover_deferred", "purge"
+                        "init_db",
+                        "recover",
+                        "orphan_reconcile",
+                        "registry_load",
+                        "recover_deferred",
+                        "purge",
                     ]
 
             assert "purged 2 stale terminals" in caplog.text

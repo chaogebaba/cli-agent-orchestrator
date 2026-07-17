@@ -14,6 +14,7 @@ from cli_agent_orchestrator.providers.claude_code import (
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "issue405"
 RAW_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "issue405_raw"
+WPQ1_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "wpq1_claude_2_1_211"
 
 
 def _read(name: str) -> str:
@@ -36,9 +37,7 @@ def _provider() -> ClaudeCodeProvider:
         ("05-bypass-prompt.raw", False, False),
     ],
 )
-def test_byte_exact_pipe_pane_replay_uses_recorded_geometry(
-    fixture, waiting, uses_geometry
-):
+def test_byte_exact_pipe_pane_replay_uses_recorded_geometry(fixture, waiting, uses_geometry):
     raw = (RAW_FIXTURES / fixture).read_bytes().decode("utf-8", errors="surrogateescape")
     with (
         patch(
@@ -227,3 +226,18 @@ def test_quoted_bottom_dialog_is_documented_limit():
         "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
     )
     assert _is_ink_selection_waiting(quoted) is True
+
+
+@pytest.mark.parametrize(
+    ("fixture", "expected"),
+    [
+        ("askuser-tab-arrow.txt", TerminalStatus.WAITING_USER_ANSWER),
+        ("resume-picker.txt", TerminalStatus.WAITING_USER_ANSWER),
+        ("quoted-resume-picker-completed.txt", TerminalStatus.COMPLETED),
+        ("completed-composer.txt", TerminalStatus.COMPLETED),
+        ("initial-empty-composer.txt", TerminalStatus.IDLE),
+    ],
+)
+def test_wpq1_claude_2_1_211_interactive_screen_roster(fixture, expected):
+    rows = (WPQ1_FIXTURES / fixture).read_text(encoding="utf-8").splitlines()
+    assert _provider().get_status_from_screen(rows) == expected

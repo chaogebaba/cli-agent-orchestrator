@@ -36,7 +36,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     send_input,
 )
 
-pytestmark = [pytest.mark.integration, pytest.mark.slow]
+pytestmark = [pytest.mark.integration, pytest.mark.slow, pytest.mark.live]
 
 KIRO_AGENTS_DIR = Path.home() / ".kiro" / "agents"
 TEST_AGENT_NAME = "agent-kiro-cli-integration-test"

@@ -7,6 +7,7 @@ import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.utils.terminal import (
+    BlockedWaitPolicy,
     generate_session_name,
     generate_terminal_id,
     generate_window_name,
@@ -317,8 +318,11 @@ class TestWaitUntilStatus:
         mock_monitor.get_status.return_value = TerminalStatus.COMPLETED
         mock_monitor.get_status_gen.side_effect = [3, 4]
         result = await wait_until_status(
-            "test-terminal", TerminalStatus.COMPLETED, timeout=1.0,
-            polling_interval=0.01, min_gen=4,
+            "test-terminal",
+            TerminalStatus.COMPLETED,
+            timeout=1.0,
+            polling_interval=0.01,
+            min_gen=4,
         )
         assert result is True
         assert mock_monitor.get_status_gen.call_count == 2
@@ -328,19 +332,85 @@ class TestWaitUntilStatus:
     async def test_min_gen_fast_turn_without_processing_times_out(self, mock_monitor):
         mock_monitor.get_status.return_value = TerminalStatus.COMPLETED
         mock_monitor.get_status_gen.return_value = 3
-        assert await wait_until_status(
-            "test-terminal", TerminalStatus.COMPLETED, timeout=0.03,
-            polling_interval=0.01, min_gen=4,
-        ) is False
+        assert (
+            await wait_until_status(
+                "test-terminal",
+                TerminalStatus.COMPLETED,
+                timeout=0.03,
+                polling_interval=0.01,
+                min_gen=4,
+            )
+            is False
+        )
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
     async def test_min_gen_event_inbox_falls_back_to_level_semantics(self, mock_monitor):
         mock_monitor.get_status.return_value = TerminalStatus.COMPLETED
         mock_monitor.get_status_gen.return_value = None
-        assert await wait_until_status(
-            "test-terminal", TerminalStatus.COMPLETED, timeout=1.0, min_gen=9
-        ) is True
+        assert (
+            await wait_until_status(
+                "test-terminal", TerminalStatus.COMPLETED, timeout=1.0, min_gen=9
+            )
+            is True
+        )
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_wpq1_named_wait_rule_pauses_clock_and_notifies_once(self, mock_monitor):
+        mock_monitor.get_status.side_effect = [
+            TerminalStatus.PROCESSING,
+            TerminalStatus.PROCESSING,
+            TerminalStatus.PROCESSING,
+            TerminalStatus.PROCESSING,
+            TerminalStatus.IDLE,
+        ]
+        gates = iter([("wait_rule", "update"), ("wait_rule", "update"), None, None])
+        notified = []
+
+        async def notify(rule):
+            notified.append(rule)
+
+        result = await wait_until_status(
+            "test-terminal",
+            TerminalStatus.IDLE,
+            timeout=0.02,
+            polling_interval=0.001,
+            blocked_policy=BlockedWaitPolicy(
+                probe=lambda: next(gates),
+                blocked_cap_s=1.0,
+                on_first_blocked=notify,
+            ),
+        )
+
+        assert result is True
+        assert type(result) is bool
+        assert notified == ["update"]
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_wpq1_blocked_cap_returns_literal_false(self, mock_monitor):
+        mock_monitor.get_status.return_value = TerminalStatus.PROCESSING
+        notified = []
+
+        async def notify(rule):
+            notified.append(rule)
+
+        result = await wait_until_status(
+            "test-terminal",
+            TerminalStatus.IDLE,
+            timeout=1.0,
+            polling_interval=0.002,
+            blocked_policy=BlockedWaitPolicy(
+                probe=lambda: ("wait_rule", "update"),
+                blocked_cap_s=0.005,
+                on_first_blocked=notify,
+            ),
+        )
+
+        assert result is False
+        assert type(result) is bool
+        assert notified == ["update"]
 
 
 class TestWaitUntilTerminalStatus:

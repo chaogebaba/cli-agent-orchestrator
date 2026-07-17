@@ -41,6 +41,11 @@ def _reset_engine(monkeypatch):
     monkeypatch.setattr(ar.time, "sleep", lambda _s: None)
     monkeypatch.setattr(ar.threading, "Thread", SyncThread)
     engine = ar.AutoResponder()
+    monkeypatch.setattr(
+        engine,
+        "_capture_fresh",
+        lambda _metadata, lines: (ar.normalize_screen(lines), lines),
+    )
     monkeypatch.setattr(ar, "auto_responder", engine)
     ar._store._cache.clear()
     yield engine
@@ -306,9 +311,7 @@ def _capture_pushes(monkeypatch):
     return pushed
 
 
-def test_completed_numbered_content_is_suppressed_by_real_codex_parser(
-    monkeypatch, _reset_engine
-):
+def test_completed_numbered_content_is_suppressed_by_real_codex_parser(monkeypatch, _reset_engine):
     _wire_common(monkeypatch)
     pushed = _capture_pushes(monkeypatch)
     screen = [
@@ -327,9 +330,7 @@ def test_completed_numbered_content_is_suppressed_by_real_codex_parser(
     assert pushed == []
 
 
-def test_idle_numbered_document_is_suppressed_by_real_codex_parser(
-    monkeypatch, _reset_engine
-):
+def test_idle_numbered_document_is_suppressed_by_real_codex_parser(monkeypatch, _reset_engine):
     _wire_common(monkeypatch)
     pushed = _capture_pushes(monkeypatch)
     screen = [
@@ -351,19 +352,13 @@ def test_codex_permissions_picker_pushes_unknown_dialog(monkeypatch, _reset_engi
     _wire_common(monkeypatch)
     pushed = _capture_pushes(monkeypatch)
     fixture = (
-        Path(__file__).parents[1]
-        / "fixtures"
-        / "codex_dialogs"
-        / "permissions-picker.ansi.txt"
+        Path(__file__).parents[1] / "fixtures" / "codex_dialogs" / "permissions-picker.ansi.txt"
     )
     screen = fixture.read_text(encoding="utf-8").splitlines()
     provider = _codex_provider()
 
     assert provider.get_status_from_screen(screen) == TerminalStatus.WAITING_USER_ANSWER
-    assert (
-        _reset_engine.on_screen("term1", provider, screen)
-        == TerminalStatus.WAITING_USER_ANSWER
-    )
+    assert _reset_engine.on_screen("term1", provider, screen) == TerminalStatus.WAITING_USER_ANSWER
     assert len(pushed) == 1
     assert "unknown blocking dialog" in pushed[0]
 
@@ -371,9 +366,7 @@ def test_codex_permissions_picker_pushes_unknown_dialog(monkeypatch, _reset_engi
 def test_grok_tool_list_capture_is_suppressed_by_real_parser(monkeypatch, _reset_engine):
     _wire_common(monkeypatch, metadata=_metadata(provider="grok_cli"))
     pushed = _capture_pushes(monkeypatch)
-    fixture = (
-        Path(__file__).parents[1] / "fixtures" / "fx4" / "fx4-grok-toollist-capture.txt"
-    )
+    fixture = Path(__file__).parents[1] / "fixtures" / "fx4" / "fx4-grok-toollist-capture.txt"
     screen = fixture.read_text(encoding="utf-8").splitlines()
     screen.insert(5, "Press enter to view tool details")
     provider = _grok_provider()
@@ -398,9 +391,7 @@ def test_numbered_option_at_least_201_chars_before_press_enter_is_not_suspect(
 
 def test_multi_press_enter_uses_later_adjacent_option():
     normalized = (
-        "Press enter for help "
-        + "x" * 220
-        + " 1. Continue 2. Cancel Press enter to choose"
+        "Press enter for help " + "x" * 220 + " 1. Continue 2. Cancel Press enter to choose"
     )
 
     assert ar.AutoResponder._looks_like_dialog(normalized, "other")
@@ -465,7 +456,7 @@ def test_genuine_unknown_non_ready_real_parsers_push_once(
         assert pushed == []
 
 
-def test_provider_parser_exception_is_treated_as_non_ready(monkeypatch, _reset_engine):
+def test_provider_parser_exception_during_confirmation_suppresses_tick(monkeypatch, _reset_engine):
     class RaisingProvider(FakeProvider):
         def get_status_from_screen(self, _lines):
             raise RuntimeError("parser failed")
@@ -474,11 +465,8 @@ def test_provider_parser_exception_is_treated_as_non_ready(monkeypatch, _reset_e
     pushed = _capture_pushes(monkeypatch)
     screen = ["1. Continue", "2. Cancel", "Press enter to choose"]
 
-    assert (
-        _reset_engine.on_screen("term1", RaisingProvider(), screen)
-        == TerminalStatus.WAITING_USER_ANSWER
-    )
-    assert len(pushed) == 1
+    assert _reset_engine.on_screen("term1", RaisingProvider(), screen) is None
+    assert pushed == []
 
 
 def test_codex_waiting_prompt_leading_branch_and_nonleading_generic_fallback(
@@ -491,10 +479,7 @@ def test_codex_waiting_prompt_leading_branch_and_nonleading_generic_fallback(
 
     assert ar.AutoResponder._looks_like_dialog(ar.normalize_screen(leading), "codex")
     assert provider.get_status_from_screen(leading) == TerminalStatus.WAITING_USER_ANSWER
-    assert (
-        _reset_engine.on_screen("term1", provider, leading)
-        == TerminalStatus.WAITING_USER_ANSWER
-    )
+    assert _reset_engine.on_screen("term1", provider, leading) == TerminalStatus.WAITING_USER_ANSWER
     assert not ar.AutoResponder._looks_like_dialog("prefix Approve command? y/n", "codex")
     assert ar.AutoResponder._looks_like_dialog(
         "prefix Approve command? y/n 1. Yes Press enter", "codex"
@@ -502,9 +487,7 @@ def test_codex_waiting_prompt_leading_branch_and_nonleading_generic_fallback(
     assert len(pushed) == 1
 
 
-def test_single_torn_codex_processing_frame_is_suppressed(
-    monkeypatch, _reset_engine
-):
+def test_single_torn_codex_processing_frame_is_suppressed(monkeypatch, _reset_engine):
     _wire_common(monkeypatch)
     pushed = _capture_pushes(monkeypatch)
     provider = _codex_provider()
@@ -547,15 +530,9 @@ def test_open_episode_closes_after_two_ready_grok_frames(monkeypatch, _reset_eng
     ready = ["1. Document row", "Press enter to read", "❯", "always-approve"]
 
     assert provider.get_status_from_screen(suspect) == TerminalStatus.UNKNOWN
-    assert (
-        _reset_engine.on_screen("term1", provider, suspect)
-        == TerminalStatus.WAITING_USER_ANSWER
-    )
+    assert _reset_engine.on_screen("term1", provider, suspect) == TerminalStatus.WAITING_USER_ANSWER
     assert provider.get_status_from_screen(ready) == TerminalStatus.IDLE
-    assert (
-        _reset_engine.on_screen("term1", provider, ready)
-        == TerminalStatus.WAITING_USER_ANSWER
-    )
+    assert _reset_engine.on_screen("term1", provider, ready) == TerminalStatus.WAITING_USER_ANSWER
     assert _reset_engine.on_screen("term1", provider, ready) is None
     state = _reset_engine._unknown_state["term1"]
     assert not state.episode_open
@@ -822,7 +799,7 @@ class TestWaitingGate:
             _reset_engine.on_screen("term1", FakeProvider(), ["danger zone"])
             == TerminalStatus.WAITING_USER_ANSWER
         )
-        assert _reset_engine.waiting_gate("term1") == "wait_rule"
+        assert _reset_engine.waiting_gate("term1") == ("wait_rule", "r")
 
         _reset_engine.on_screen("term1", FakeProvider(), ["ordinary output"])
         assert _reset_engine.waiting_gate("term1") is None
@@ -862,7 +839,7 @@ class TestWaitingGate:
         assert _reset_engine.waiting_gate("missing") is None
 
     def test_clear_terminal_empties_all_waiting_gate_states(self, _reset_engine):
-        _reset_engine._wait_rule_active.add("term1")
+        _reset_engine._wait_rule_active["term1"] = ("r", time.monotonic())
         _reset_engine._retry_exhausted.add("term1")
         _reset_engine._unknown_state["term1"] = ar._UnknownDialogState(episode_open=True)
 
@@ -882,3 +859,64 @@ class TestWaitingGate:
         _reset_engine.record_published_status("term1", TerminalStatus.PROCESSING)
 
         assert "failed to record published status" in caplog.text
+
+
+def test_wpq1_wait_rule_requires_one_fresh_matching_capture(monkeypatch, _reset_engine):
+    _wire_common(monkeypatch)
+    monkeypatch.setattr(
+        ar._store,
+        "get_rules",
+        lambda _provider: [ar.Rule("wait-update", True, "contains", "update", [], "wait")],
+    )
+    captures = []
+
+    def fresh(_metadata, _lines):
+        captures.append(True)
+        assert _reset_engine._lock.acquire(blocking=False)
+        _reset_engine._lock.release()
+        return ("ordinary composer", ["ordinary composer"])
+
+    monkeypatch.setattr(_reset_engine, "_capture_fresh", fresh)
+
+    assert _reset_engine.on_screen("term1", FakeProvider(), ["update available"]) is None
+    assert captures == [True]
+    assert _reset_engine.waiting_gate("term1") is None
+
+
+def test_wpq1_unknown_dialog_fresh_disagreement_suppresses_without_push(monkeypatch, _reset_engine):
+    _wire_common(monkeypatch)
+    monkeypatch.setattr(ar._store, "get_rules", lambda _provider: [])
+    pushed = _capture_pushes(monkeypatch)
+    captures = []
+    monkeypatch.setattr(
+        _reset_engine,
+        "_capture_fresh",
+        lambda _metadata, _lines: (
+            captures.append(True) or "ordinary composer",
+            ["ordinary composer"],
+        ),
+    )
+
+    result = _reset_engine.on_screen(
+        "term1", FakeProvider(), ["1. Continue", "2. Cancel", "Press enter to choose"]
+    )
+
+    assert result is None
+    assert captures == [True]
+    assert pushed == []
+    assert _reset_engine.waiting_gate("term1") is None
+
+
+def test_wpq1_failed_fresh_capture_does_not_mutate_open_unknown_episode(monkeypatch, _reset_engine):
+    _wire_common(monkeypatch)
+    monkeypatch.setattr(ar._store, "get_rules", lambda _provider: [])
+    _reset_engine._unknown_state["term1"] = ar._UnknownDialogState(episode_open=True)
+    monkeypatch.setattr(_reset_engine, "_capture_fresh", lambda *_args: None)
+
+    assert (
+        _reset_engine.on_screen(
+            "term1", FakeProvider(), ["1. Continue", "2. Cancel", "Press enter to choose"]
+        )
+        is None
+    )
+    assert _reset_engine.waiting_gate("term1") == "unknown_dialog"

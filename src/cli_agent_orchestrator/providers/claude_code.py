@@ -20,7 +20,12 @@ from cli_agent_orchestrator.providers.screen_classification import (
     ScreenSignal,
     classify_screen_signals,
 )
-from cli_agent_orchestrator.services.settings_service import get_server_settings
+from cli_agent_orchestrator.services.settings_service import (
+    get_provider_defaults,
+    get_provider_profile_defaults,
+    get_server_settings,
+    resolve_provider_string_option,
+)
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.http import resolve_endpoint
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
@@ -81,9 +86,7 @@ THINKING_BEFORE_SEPARATOR_PATTERN = re.compile(
     re.MULTILINE,
 )
 IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" prompt styles
-WAITING_USER_ANSWER_PATTERN = (
-    r"↑/↓ to navigate"  # Ink TUI footer shown only while a selection widget is active
-)
+WAITING_USER_ANSWER_PATTERN = r"(?:↑/↓|Tab/Arrow keys) to navigate"
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
 EXTERNAL_IMPORT_PROMPT_PATTERN = r"Allow external CLAUDE\.md file imports\?"
@@ -174,6 +177,11 @@ _INK_PLAN_HEAD_PATTERN = re.compile(
 )
 _INK_FOOTER_PROXIMITY_ROWS = 12
 _INK_PLAN_PROXIMITY_ROWS = 8
+_INK_RESUME_HEADER_PATTERN = re.compile(r"Resume session")
+
+
+def _is_resume_footer(line: str) -> bool:
+    return "Esc" in line and any(token in line for token in ("Ctrl+A", "to cancel", "to select"))
 
 
 def _is_ink_selection_waiting(rendered: str) -> bool:
@@ -194,6 +202,17 @@ def _is_ink_selection_waiting(rendered: str) -> bool:
     footer_rows = [
         i for i, line in enumerate(lines) if re.search(WAITING_USER_ANSWER_PATTERN, line)
     ]
+
+    bottom_start = max(0, len(lines) - _INK_FOOTER_PROXIMITY_ROWS)
+    bottom_options = [row for row in option_rows if row >= bottom_start]
+    bottom_focus = [row for row in bottom_options if row in focus_rows]
+    if (
+        any(_INK_RESUME_HEADER_PATTERN.search(line) for line in lines[bottom_start:])
+        and len(bottom_options) >= 2
+        and len(bottom_focus) == 1
+        and any(_is_resume_footer(line) for line in lines[bottom_start:])
+    ):
+        return True
 
     for footer_row in footer_rows:
         nearby_options = [
@@ -304,8 +323,19 @@ class ClaudeCodeProvider(BaseProvider):
             command_parts.extend(["--agent", self._agent_profile])
         elif profile is not None:
             # Full CAO profile with config decomposition
-            if profile.model:
-                command_parts.extend(["--model", profile.model])
+            defaults = get_provider_defaults("claude_code")
+            declared_name = getattr(profile, "name", None)
+            profile_name = (
+                declared_name
+                if isinstance(declared_name, str) and declared_name
+                else self._agent_profile
+            )
+            profile_defaults = get_provider_profile_defaults(defaults, profile_name)
+            model = resolve_provider_string_option(
+                profile_defaults, defaults, profile, "model", "model"
+            )
+            if model:
+                command_parts.extend(["--model", model])
 
             # Add system prompt - escape newlines to prevent tmux chunking issues
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
@@ -904,6 +934,8 @@ class ClaudeCodeProvider(BaseProvider):
         signals: List[ScreenSignal] = []
         for index, row in enumerate(rows):
             if waiting and re.search(WAITING_USER_ANSWER_PATTERN, row):
+                signals.append(ScreenSignal("waiting", "WAITING_USER_ANSWER_PATTERN", index))
+            elif waiting and _is_resume_footer(row):
                 signals.append(ScreenSignal("waiting", "WAITING_USER_ANSWER_PATTERN", index))
             # The gerund-first structural matcher filters the broader ellipsis
             # pattern so settled markdown bullets cannot become progress.

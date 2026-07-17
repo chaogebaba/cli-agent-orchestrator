@@ -15,35 +15,35 @@ from cli_agent_orchestrator.clients.database import (
     InboxModel,
     TerminalModel,
     TranscriptBindingModel,
+    begin_delivery_attempt,
+    confirm_batch_from_prior_attempt,
+    count_ambiguous_attempts,
     create_flow,
     create_inbox_message,
     create_terminal,
     create_transcript_binding,
-    begin_delivery_attempt,
-    confirm_batch_from_prior_attempt,
-    count_ambiguous_attempts,
     delete_flow,
     delete_terminal,
     delete_terminals_by_session,
+    get_current_transcript_binding,
     get_flow,
     get_inbox_messages,
     get_message_trace,
     get_pending_messages,
     get_terminal_metadata,
-    terminal_exists,
-    get_current_transcript_binding,
     init_db,
     list_flows,
-    list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids,
+    list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
     list_terminals_by_session,
+    settle_delivery_attempt,
+    settle_terminal_fallback,
+    terminal_exists,
     update_flow_enabled,
     update_flow_run_times,
     update_last_active,
     update_message_status,
-    settle_delivery_attempt,
-    settle_terminal_fallback,
     update_terminal_provider_session_id_if_null,
     update_terminal_shell_command,
 )
@@ -77,9 +77,7 @@ class TestTerminalOperations:
         mock_session.commit.assert_called_once()
 
     def test_terminal_exists_is_quiet_on_miss(self, test_db, monkeypatch, caplog):
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.clients.database.SessionLocal", test_db
-        )
+        monkeypatch.setattr("cli_agent_orchestrator.clients.database.SessionLocal", test_db)
         create_terminal("present", "cao-session", "window-0", "codex")
 
         caplog.clear()
@@ -90,18 +88,43 @@ class TestTerminalOperations:
     def test_fallback_settlement_moves_only_pending_and_commits_pointer(self, test_db, monkeypatch):
         monkeypatch.setattr("cli_agent_orchestrator.clients.database.SessionLocal", test_db)
         with test_db.begin() as db:
-            db.add_all([
-                TerminalModel(id="old", tmux_session="s", tmux_window="w1", provider="codex",
-                              recovery_state="fallback_starting", provider_session_id="uuid"),
-                TerminalModel(id="new", tmux_session="s", tmux_window="w2", provider="codex",
-                              provider_session_id="uuid"),
-                InboxModel(sender_id="sender", receiver_id="old", message="p",
-                           status=MessageStatus.PENDING.value),
-                InboxModel(sender_id="sender", receiver_id="old", message="d",
-                           status=MessageStatus.DELIVERED.value),
-                InboxModel(sender_id="sender", receiver_id="old", message="f",
-                           status=MessageStatus.DELIVERY_FAILED.value),
-            ])
+            db.add_all(
+                [
+                    TerminalModel(
+                        id="old",
+                        tmux_session="s",
+                        tmux_window="w1",
+                        provider="codex",
+                        recovery_state="fallback_starting",
+                        provider_session_id="uuid",
+                    ),
+                    TerminalModel(
+                        id="new",
+                        tmux_session="s",
+                        tmux_window="w2",
+                        provider="codex",
+                        provider_session_id="uuid",
+                    ),
+                    InboxModel(
+                        sender_id="sender",
+                        receiver_id="old",
+                        message="p",
+                        status=MessageStatus.PENDING.value,
+                    ),
+                    InboxModel(
+                        sender_id="sender",
+                        receiver_id="old",
+                        message="d",
+                        status=MessageStatus.DELIVERED.value,
+                    ),
+                    InboxModel(
+                        sender_id="sender",
+                        receiver_id="old",
+                        message="f",
+                        status=MessageStatus.DELIVERY_FAILED.value,
+                    ),
+                ]
+            )
         assert settle_terminal_fallback("old", "new") == 1
         with test_db() as db:
             old = db.get(TerminalModel, "old")
@@ -112,65 +135,83 @@ class TestTerminalOperations:
 
 
 class TestMessageTraceTransactions:
-    def test_transcript_binding_nullable_inode_migration_is_idempotent(
-        self, tmp_path, monkeypatch
-    ):
+    def test_transcript_binding_nullable_inode_migration_is_idempotent(self, tmp_path, monkeypatch):
         from cli_agent_orchestrator.clients import database as db_mod
 
         migration_engine = create_engine(f"sqlite:///{tmp_path / 'r4.db'}")
         with migration_engine.begin() as connection:
-            connection.execute(text(
-                "CREATE TABLE transcript_bindings ("
-                "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, terminal_id VARCHAR NOT NULL, "
-                "session_id VARCHAR NOT NULL, transcript_path TEXT NOT NULL, "
-                "inode INTEGER NOT NULL, source VARCHAR NOT NULL, received_at DATETIME NOT NULL)"
-            ))
-            connection.execute(text(
-                "CREATE INDEX ix_transcript_bindings_terminal_received "
-                "ON transcript_bindings (terminal_id, received_at, id)"
-            ))
-            connection.execute(text(
-                "INSERT INTO transcript_bindings VALUES "
-                "(7, 'term', 'session', '/path', 1234, 'resume', '2026-07-11 12:00:00')"
-            ))
+            connection.execute(
+                text(
+                    "CREATE TABLE transcript_bindings ("
+                    "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, terminal_id VARCHAR NOT NULL, "
+                    "session_id VARCHAR NOT NULL, transcript_path TEXT NOT NULL, "
+                    "inode INTEGER NOT NULL, source VARCHAR NOT NULL, received_at DATETIME NOT NULL)"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE INDEX ix_transcript_bindings_terminal_received "
+                    "ON transcript_bindings (terminal_id, received_at, id)"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO transcript_bindings VALUES "
+                    "(7, 'term', 'session', '/path', 1234, 'resume', '2026-07-11 12:00:00')"
+                )
+            )
         monkeypatch.setattr(db_mod, "engine", migration_engine)
         db_mod._migrate_transcript_bindings_inode_nullable()
         with migration_engine.begin() as connection:
-            connection.execute(text(
-                "INSERT INTO transcript_bindings "
-                "(terminal_id, session_id, transcript_path, inode, source, received_at) "
-                "VALUES ('term', 'next', '/next', NULL, 'startup', '2026-07-11 12:01:00')"
-            ))
-            before_rows = connection.execute(text(
-                "SELECT * FROM transcript_bindings ORDER BY id"
-            )).all()
-            before_schema = connection.execute(text(
-                "SELECT type, name, sql FROM sqlite_master WHERE "
-                "tbl_name='transcript_bindings' ORDER BY type, name"
-            )).all()
-            inode = next(row for row in connection.execute(text(
-                "PRAGMA table_info(transcript_bindings)"
-            )).mappings() if row["name"] == "inode")
-        assert before_rows[0] == (7, "term", "session", "/path", 1234,
-                                  "resume", "2026-07-11 12:00:00")
+            connection.execute(
+                text(
+                    "INSERT INTO transcript_bindings "
+                    "(terminal_id, session_id, transcript_path, inode, source, received_at) "
+                    "VALUES ('term', 'next', '/next', NULL, 'startup', '2026-07-11 12:01:00')"
+                )
+            )
+            before_rows = connection.execute(
+                text("SELECT * FROM transcript_bindings ORDER BY id")
+            ).all()
+            before_schema = connection.execute(
+                text(
+                    "SELECT type, name, sql FROM sqlite_master WHERE "
+                    "tbl_name='transcript_bindings' ORDER BY type, name"
+                )
+            ).all()
+            inode = next(
+                row
+                for row in connection.execute(
+                    text("PRAGMA table_info(transcript_bindings)")
+                ).mappings()
+                if row["name"] == "inode"
+            )
+        assert before_rows[0] == (
+            7,
+            "term",
+            "session",
+            "/path",
+            1234,
+            "resume",
+            "2026-07-11 12:00:00",
+        )
         assert inode["notnull"] == 0
-        assert any(row[1] == "ix_transcript_bindings_terminal_received"
-                   for row in before_schema)
+        assert any(row[1] == "ix_transcript_bindings_terminal_received" for row in before_schema)
         db_mod._migrate_transcript_bindings_inode_nullable()
         with migration_engine.connect() as connection:
-            after_rows = connection.execute(text(
-                "SELECT * FROM transcript_bindings ORDER BY id"
-            )).all()
-            after_schema = connection.execute(text(
-                "SELECT type, name, sql FROM sqlite_master WHERE "
-                "tbl_name='transcript_bindings' ORDER BY type, name"
-            )).all()
+            after_rows = connection.execute(
+                text("SELECT * FROM transcript_bindings ORDER BY id")
+            ).all()
+            after_schema = connection.execute(
+                text(
+                    "SELECT type, name, sql FROM sqlite_master WHERE "
+                    "tbl_name='transcript_bindings' ORDER BY type, name"
+                )
+            ).all()
         assert after_rows == before_rows
         assert after_schema == before_schema
 
-    def test_transcript_binding_epochs_append_and_tie_break_by_id(
-        self, test_db, monkeypatch
-    ):
+    def test_transcript_binding_epochs_append_and_tie_break_by_id(self, test_db, monkeypatch):
         from cli_agent_orchestrator.clients import database as db_mod
 
         monkeypatch.setattr(db_mod, "SessionLocal", test_db)
@@ -194,14 +235,24 @@ class TestMessageTraceTransactions:
         message = get_pending_messages("receiver")[0]
         attempt = begin_delivery_attempt([message], "receiver", "claude_code", "hash", 4)
         calls = []
-        assert settle_delivery_attempt(
-            attempt, MessageStatus.DELIVERED, "confirmed",
-            on_confirmed=lambda: calls.append("commit"),
-        ) is True
-        assert settle_delivery_attempt(
-            attempt, MessageStatus.DELIVERED, "confirmed",
-            on_confirmed=lambda: calls.append("duplicate"),
-        ) is False
+        assert (
+            settle_delivery_attempt(
+                attempt,
+                MessageStatus.DELIVERED,
+                "confirmed",
+                on_confirmed=lambda: calls.append("commit"),
+            )
+            is True
+        )
+        assert (
+            settle_delivery_attempt(
+                attempt,
+                MessageStatus.DELIVERED,
+                "confirmed",
+                on_confirmed=lambda: calls.append("duplicate"),
+            )
+            is False
+        )
         assert calls == ["commit"]
         assert get_inbox_messages("receiver")[0].status == MessageStatus.DELIVERED
 
@@ -218,15 +269,22 @@ class TestMessageTraceTransactions:
         attempt = begin_delivery_attempt([message], "receiver", "claude_code", "hash", 4)
         with pytest.raises(RuntimeError, match="crash"):
             settle_delivery_attempt(
-                attempt, MessageStatus.DELIVERED, "confirmed",
+                attempt,
+                MessageStatus.DELIVERED,
+                "confirmed",
                 on_confirmed=lambda: (_ for _ in ()).throw(RuntimeError("crash")),
             )
         assert get_inbox_messages("receiver")[0].status == MessageStatus.DELIVERING
         calls = []
-        assert settle_delivery_attempt(
-            attempt, MessageStatus.DELIVERED, "confirmed",
-            on_confirmed=lambda: calls.append("recovered"),
-        ) is True
+        assert (
+            settle_delivery_attempt(
+                attempt,
+                MessageStatus.DELIVERED,
+                "confirmed",
+                on_confirmed=lambda: calls.append("recovered"),
+            )
+            is True
+        )
         assert calls == ["recovered"]
 
     def test_dedup_confirms_whole_batch_by_prior_reference_once(self, test_db, monkeypatch):
@@ -242,12 +300,18 @@ class TestMessageTraceTransactions:
         settle_delivery_attempt(attempt, MessageStatus.PENDING, "ambiguous")
         calls = []
         ids = [message.id for message in messages]
-        assert confirm_batch_from_prior_attempt(
-            ids, attempt, on_confirmed=lambda: calls.append("watchdog")) is True
+        assert (
+            confirm_batch_from_prior_attempt(
+                ids, attempt, on_confirmed=lambda: calls.append("watchdog")
+            )
+            is True
+        )
         assert confirm_batch_from_prior_attempt(ids, attempt) is False
         assert calls == ["watchdog"]
         assert [row.status for row in get_inbox_messages("receiver")] == [
-            MessageStatus.DELIVERED, MessageStatus.DELIVERED]
+            MessageStatus.DELIVERED,
+            MessageStatus.DELIVERED,
+        ]
 
     def test_codex_session_self_heal_preserves_concurrent_winner(self, test_db, monkeypatch):
         from cli_agent_orchestrator.clients import database as db_mod
@@ -269,19 +333,24 @@ class TestMessageTraceTransactions:
         message = get_pending_messages("receiver")[0]
         first = begin_delivery_attempt([message], "receiver", "claude_code", "hash", 4)
         assert settle_delivery_attempt(
-            first, MessageStatus.PENDING, "deferred", reason="composer_unconfirmed")
+            first, MessageStatus.PENDING, "deferred", reason="composer_unconfirmed"
+        )
         second = begin_delivery_attempt([message], "receiver", "claude_code", "hash", 4)
         assert settle_delivery_attempt(
-            second, MessageStatus.PENDING, "deferred", reason="composer_unconfirmed")
+            second, MessageStatus.PENDING, "deferred", reason="composer_unconfirmed"
+        )
         trace = get_message_trace(message.id)
         assert len(trace["attempts"]) == 1
         assert trace["attempts"][0]["count"] == 2
 
         ambiguous = begin_delivery_attempt([message], "receiver", "claude_code", "new", 3)
         assert settle_delivery_attempt(
-            ambiguous, MessageStatus.PENDING, "ambiguous", evidence='{"kind":"absent"}')
-        assert settle_delivery_attempt(
-            ambiguous, MessageStatus.FAILED, "failed", error="overwrite") is False
+            ambiguous, MessageStatus.PENDING, "ambiguous", evidence='{"kind":"absent"}'
+        )
+        assert (
+            settle_delivery_attempt(ambiguous, MessageStatus.FAILED, "failed", error="overwrite")
+            is False
+        )
         settled = get_message_trace(message.id)["attempts"][-1]
         assert settled["outcome"] == "ambiguous"
         assert settled["evidence"] == {"kind": "absent"}
@@ -326,9 +395,7 @@ class TestMessageTraceTransactions:
         settle_delivery_attempt(third, MessageStatus.PENDING, "ambiguous")
         assert count_ambiguous_attempts([message.id]) == 3
 
-    def test_delivery_failed_is_excluded_from_waiting_inbox_receivers(
-        self, test_db, monkeypatch
-    ):
+    def test_delivery_failed_is_excluded_from_waiting_inbox_receivers(self, test_db, monkeypatch):
         from cli_agent_orchestrator.clients import database as db_mod
 
         monkeypatch.setattr(db_mod, "SessionLocal", test_db)
@@ -586,8 +653,7 @@ class TestMessageTraceTransactions:
         assert result == 2
         assert [item.args for item in atomic_delete.call_args_list] == [("t1",), ("t2",)]
         assert all(
-            item.kwargs == {"preserve_warm_intent": False}
-            for item in atomic_delete.call_args_list
+            item.kwargs == {"preserve_warm_intent": False} for item in atomic_delete.call_args_list
         )
 
 
@@ -595,9 +661,14 @@ class TestInboxOperations:
     """Tests for inbox database operations."""
 
     def test_message_status_storage_is_additive_unconstrained_text(self):
-        """Database-facing enum exposes all five honest delivery states."""
+        """Database-facing enum exposes all six honest delivery states."""
         assert [status.value for status in MessageStatus] == [
-            "pending", "delivering", "delivered", "delivery_failed", "failed"
+            "pending",
+            "delivering",
+            "delivered",
+            "delivery_failed",
+            "failed",
+            "digested",
         ]
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
