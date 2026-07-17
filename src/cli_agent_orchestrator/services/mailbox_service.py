@@ -149,9 +149,15 @@ def _digest_summary_lines(db: Any, rows: list[Any]) -> list[str]:
 
 def publish_supervisor_incarnation(claim: MailboxClaim, terminal_id: str) -> dict[str, Any]:
     """CAS-publish one supervisor incarnation and atomically adopt its backlog."""
+    from cli_agent_orchestrator.services.inbox_service import get_delivery_lock
+
+    delivery_lock = get_delivery_lock(terminal_id)
+    _acquire(delivery_lock)
     lock = get_mailbox_authority_lock(claim.session_name, claim.role)
-    _acquire(lock)
+    authority_acquired = False
     try:
+        _acquire(lock)
+        authority_acquired = True
         with SessionLocal() as db:
             db.execute(text("BEGIN IMMEDIATE"))
             existing = (
@@ -217,6 +223,20 @@ def publish_supervisor_incarnation(claim: MailboxClaim, terminal_id: str) -> dic
                 if changed != 1:
                     raise MailboxDomainError("mailbox_conflict", "mailbox publication conflict")
                 mailbox = cast(Any, db.query(MailboxModel).filter_by(id=claim.mailbox_id).one())
+
+            bumped = (
+                db.query(TerminalModel)
+                .filter(TerminalModel.id == terminal_id)
+                .update(
+                    {TerminalModel.lifecycle_generation: (TerminalModel.lifecycle_generation + 1)},
+                    synchronize_session=False,
+                )
+            )
+            # Direct mailbox-domain callers may publish without a terminal row;
+            # no CAO pane coordinates exist in that seam, so there is no proof
+            # generation to advance. Runtime publication always updates one row.
+            if bumped not in {0, 1}:
+                raise MailboxDomainError("mailbox_conflict", "terminal publication conflict")
 
             incarnation = MailboxIncarnationModel(
                 mailbox_id=mailbox.id,
@@ -305,7 +325,9 @@ def publish_supervisor_incarnation(claim: MailboxClaim, terminal_id: str) -> dic
     except IntegrityError as exc:
         raise MailboxDomainError("mailbox_conflict", "mailbox publication conflict") from exc
     finally:
-        lock.release()
+        if authority_acquired:
+            lock.release()
+        delivery_lock.release()
 
 
 @overload

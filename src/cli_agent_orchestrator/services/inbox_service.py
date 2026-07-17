@@ -40,15 +40,18 @@ from cli_agent_orchestrator.clients.database import (
     list_overlapping_attempts,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
+    list_pending_receiver_ids_with_terminal,
     list_stale_delivering_messages,
     list_stale_open_claude_attempts,
     make_admission_proof,
     merge_wpm1_attempt_evidence,
     record_wpm1_stalled_notice,
+    recover_transcript_binding_if_current,
     recover_wpm2_stale_attempt,
     settle_delivery_attempt,
     settle_delivery_attempt_proof_safe,
     settle_pending_orphan_messages,
+    settle_pending_receiver_gone_if_generation,
     settle_wpm1_terminal_batch,
     transition_pending_to_delivery_failed,
     update_message_status,
@@ -68,10 +71,13 @@ from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.message_trace_service import (
+    clear_binding_staleness_state,
     confirm_delivery,
     continuity_aware_lookup,
     normalized_confirmation_fingerprint,
+    observe_binding_absence,
     resolve_session_transcript,
+    scan_binding_candidates,
     transcript_lookup,
     transcript_ref,
     wire_hash,
@@ -158,6 +164,10 @@ def clear_terminal_delivery_state(terminal_id: str) -> None:
     service = globals().get("inbox_service")
     if isinstance(service, InboxService):
         service._clear_identity_authority(terminal_id)
+        service.reset_binding_episodes(terminal_id)
+        with service._gone_lock:
+            service._gone_streaks.pop(terminal_id, None)
+    clear_binding_staleness_state(terminal_id)
 
 
 def _should_defer_waiting(terminal_id: str, provider=None) -> bool:
@@ -191,6 +201,10 @@ class InboxService:
         self._defer_lock = threading.Lock()
         self._identity_authority: dict[tuple[str, str], _IdentityAuthorityEpisode] = {}
         self._identity_lock = threading.Lock()
+        self._binding_authority: dict[tuple[str, str], _IdentityAuthorityEpisode] = {}
+        self._binding_lock = threading.Lock()
+        self._gone_streaks: dict[str, int] = {}
+        self._gone_lock = threading.Lock()
 
     def _clear_identity_authority(self, terminal_id: str) -> None:
         with self._identity_lock:
@@ -291,6 +305,49 @@ class InboxService:
 
     def _reset_identity_authority(self, terminal_id: str) -> None:
         self._clear_identity_authority(terminal_id)
+
+    def reset_binding_episodes(self, terminal_id: str) -> None:
+        """Clear only the binding-authority family for one terminal."""
+        with self._binding_lock:
+            for key in [key for key in self._binding_authority if key[0] == terminal_id]:
+                self._binding_authority.pop(key, None)
+
+    def _record_binding_authority_failure(
+        self, terminal_id: str, binding_id: int, metadata: dict[str, Any]
+    ) -> None:
+        key = (terminal_id, f"binding:{binding_id}")
+        with self._binding_lock:
+            episode = self._binding_authority.setdefault(key, _IdentityAuthorityEpisode())
+            episode.count += 1
+            if episode.count < 3 or episode.notified:
+                return
+            count = episode.count
+        receiver = self._identity_notice_receiver(terminal_id, metadata)
+        if receiver is None:
+            logger.critical(
+                "binding_authority_lost terminal=%s binding=%s count=%s no_supervisor",
+                terminal_id,
+                binding_id,
+                count,
+            )
+            with self._binding_lock:
+                self._binding_authority[key].notified = True
+            return
+        body = (
+            f"[binding-authority] transcript binding presumed stale for terminal {terminal_id} "
+            f"(binding {binding_id}): delivery confirmations unconfirmable; {count} cycles "
+            "suppressed; awaiting binding recovery or a new session epoch"
+        )
+        outcome = insert_identity_authority_notice(f"message-trace:{terminal_id}", receiver, body)
+        if outcome != NoticeInsertOutcome.FAILED_BEFORE_COMMIT:
+            with self._binding_lock:
+                self._binding_authority[key].notified = True
+        else:
+            logger.error(
+                "binding_authority_notice_failed_before_commit terminal=%s receiver=%s",
+                terminal_id,
+                receiver,
+            )
 
     def _evict_defer_state(self, messages) -> None:
         with self._defer_lock:
@@ -929,6 +986,7 @@ class InboxService:
                         # A hit wins across the entire exact-batch history. An
                         # unresolved older row must not hide a later hit or the
                         # durable ambiguity cap.
+                        prior_lookups: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
                         for prior in exact_attempts:
                             if prior.get("outcome") is None:
                                 continue
@@ -938,12 +996,13 @@ class InboxService:
                                 prior_evidence = {}
                             if not isinstance(prior_evidence, dict):
                                 prior_evidence = {}
-                            result, _ = _wpm2_lookup(
+                            result, lookup_evidence = _wpm2_lookup(
                                 metadata,
                                 prior["payload_hash"],
                                 prior.get("started_at"),
                                 prior_evidence,
                             )
+                            prior_lookups.append((prior, result, prior_evidence))
                             if result != "hit":
                                 continue
                             won = confirm_batch_from_prior_attempt(
@@ -961,6 +1020,57 @@ class InboxService:
                                 prior["attempt_uuid"],
                             )
                             return
+
+                        if any(result == "absent" for _, result, _ in prior_lookups):
+                            stale = observe_binding_absence(metadata)
+                            if stale is not None and stale.presumed_stale:
+                                for prior, _, prior_evidence in prior_lookups:
+                                    candidate_result, _, candidate = scan_binding_candidates(
+                                        stale,
+                                        prior["payload_hash"],
+                                        prior.get("started_at"),
+                                        prior_evidence,
+                                    )
+                                    if candidate_result != "hit" or candidate is None:
+                                        continue
+                                    recovery = recover_transcript_binding_if_current(
+                                        terminal_id, stale.binding_id, str(candidate)
+                                    )
+                                    if recovery == "authority_changed":
+                                        refreshed, _ = _wpm2_lookup(
+                                            metadata,
+                                            prior["payload_hash"],
+                                            prior.get("started_at"),
+                                            prior_evidence,
+                                        )
+                                        if refreshed != "hit":
+                                            self._record_binding_authority_failure(
+                                                terminal_id, stale.binding_id, metadata
+                                            )
+                                            return
+                                    won = confirm_batch_from_prior_attempt(
+                                        message_ids,
+                                        prior["attempt_uuid"],
+                                        on_confirmed=lambda: self._commit_watchdog_ops(
+                                            terminal_id,
+                                            sender_id,
+                                            orchestration_type,
+                                            metadata,
+                                        ),
+                                    )
+                                    if not won:
+                                        return
+                                    logger.info(
+                                        "Deduplicated delivery for terminal %s using recovered "
+                                        "transcript %s",
+                                        terminal_id,
+                                        candidate,
+                                    )
+                                    return
+                                self._record_binding_authority_failure(
+                                    terminal_id, stale.binding_id, metadata
+                                )
+                                return
 
                         ambiguous = [
                             prior
@@ -1480,6 +1590,66 @@ class InboxService:
 
     def reconcile_pending_orphans(self) -> OrphanReconcileResult:
         """Settle one bounded batch of PENDING rows with absent receivers."""
+        from cli_agent_orchestrator.backends.registry import get_backend
+        from cli_agent_orchestrator.services.mailbox_service import (
+            get_mailbox_authority_lock,
+        )
+
+        for terminal_id in list_pending_receiver_ids_with_terminal():
+            metadata = get_terminal_metadata(terminal_id)
+            if metadata is None:
+                continue
+            try:
+                liveness = get_backend().window_liveness(
+                    metadata["tmux_session"], metadata["tmux_window"]
+                )
+            except Exception:
+                liveness = "error"
+            with self._gone_lock:
+                if liveness != "gone":
+                    self._gone_streaks.pop(terminal_id, None)
+                    continue
+                streak = self._gone_streaks.get(terminal_id, 0) + 1
+                self._gone_streaks[terminal_id] = streak
+            if streak < 3:
+                continue
+            captured_generation = metadata.get("lifecycle_generation")
+            if type(captured_generation) is not int:
+                with self._gone_lock:
+                    self._gone_streaks.pop(terminal_id, None)
+                continue
+            delivery_lock = get_delivery_lock(terminal_id)
+            if not delivery_lock.acquire(blocking=False):
+                continue
+            authority_lock = get_mailbox_authority_lock(metadata["tmux_session"], "supervisor")
+            authority_acquired = False
+            try:
+                authority_acquired = authority_lock.acquire(blocking=False)
+                if not authority_acquired:
+                    continue
+                try:
+                    final_liveness = get_backend().window_liveness(
+                        metadata["tmux_session"], metadata["tmux_window"]
+                    )
+                except Exception:
+                    final_liveness = "error"
+                if final_liveness != "gone":
+                    continue
+                gone_result = settle_pending_receiver_gone_if_generation(
+                    terminal_id, captured_generation
+                )
+                if gone_result.settled_count:
+                    logger.info(
+                        "P5 locked liveness reconciliation settled %d message(s) for %s",
+                        gone_result.settled_count,
+                        terminal_id,
+                    )
+            finally:
+                with self._gone_lock:
+                    self._gone_streaks.pop(terminal_id, None)
+                if authority_acquired:
+                    authority_lock.release()
+                delivery_lock.release()
         result = settle_pending_orphan_messages()
         if result.busy_aborted:
             logger.warning("P5 orphan reconciliation aborted after bounded database contention")

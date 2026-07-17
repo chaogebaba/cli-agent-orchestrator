@@ -8,6 +8,7 @@ from typing import Literal, Sequence
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 SignalClass = Literal["waiting", "error", "progress", "completion", "chrome", "none"]
+TemporalPolicy = Literal["corroborable", "exempt", "none"]
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,12 @@ class ScreenSignal:
     signal_class: SignalClass
     provider_signal: str
     row_index: int
+    row_bytes: str | None = None
+    temporal_policy: TemporalPolicy = "none"
+
+    def __post_init__(self) -> None:
+        if self.temporal_policy == "corroborable" and self.row_bytes is None:
+            raise ValueError("corroborable screen signals require row_bytes")
 
 
 @dataclass(frozen=True)
@@ -27,6 +34,37 @@ class ScreenClassification:
     signal_class: SignalClass
     provider_signal: str | None
     row_index: int | None
+
+
+@dataclass(frozen=True)
+class ScreenClassificationResult:
+    """Shared-law classification plus the provider's complete immutable evidence."""
+
+    classification: ScreenClassification
+    signals: tuple[ScreenSignal, ...]
+
+    @property
+    def status(self) -> TerminalStatus:
+        return self.classification.status
+
+    @property
+    def signal_class(self) -> SignalClass:
+        return self.classification.signal_class
+
+    @property
+    def provider_signal(self) -> str | None:
+        return self.classification.provider_signal
+
+    @property
+    def row_index(self) -> int | None:
+        return self.classification.row_index
+
+
+def screen_classification_result(signals: Sequence[ScreenSignal]) -> ScreenClassificationResult:
+    """Apply the shared law while retaining every producer signal."""
+
+    frozen = tuple(signals)
+    return ScreenClassificationResult(classify_screen_signals(frozen), frozen)
 
 
 def _select(signals: Sequence[ScreenSignal]) -> ScreenSignal:
@@ -53,9 +91,7 @@ def classify_screen_signals(signals: Sequence[ScreenSignal]) -> ScreenClassifica
                 status, selected.signal_class, selected.provider_signal, selected.row_index
             )
 
-    flow = [
-        signal for signal in signals if signal.signal_class in {"progress", "completion"}
-    ]
+    flow = [signal for signal in signals if signal.signal_class in {"progress", "completion"}]
     if flow:
         newest_row = max(signal.row_index for signal in flow)
         newest = [signal for signal in flow if signal.row_index == newest_row]

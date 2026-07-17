@@ -13,8 +13,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Literal
 from urllib.parse import quote
-from typing import Literal
 
 from cli_agent_orchestrator.clients.database import (
     get_current_transcript_binding,
@@ -25,6 +25,30 @@ from cli_agent_orchestrator.utils.provider_plane import provider_home
 logger = logging.getLogger(__name__)
 _unresolved_warned: set[str] = set()
 _unresolved_warned_lock = threading.Lock()
+_binding_staleness_lock = threading.Lock()
+
+FileTriple = tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class BindingStalenessBundle:
+    binding_id: int
+    path: Path
+    inode: int
+    size: int
+    content_sha256: str
+    baseline: dict[Path, FileTriple] | None
+
+
+@dataclass(frozen=True)
+class BindingStalenessObservation:
+    binding_id: int
+    path: Path
+    presumed_stale: bool
+    candidates: tuple[Path, ...]
+
+
+_binding_staleness: dict[str, BindingStalenessBundle] = {}
 
 NORMALIZED_CONFIRMATION_MIN_CHARS = 48
 REDELIVERY_TAG_BANNER_PATTERN = re.compile(
@@ -53,12 +77,161 @@ class TranscriptResolution:
 
     def __eq__(self, other) -> bool:
         if isinstance(other, TranscriptResolution):
-            return (
-                self.path, self.resolution_kind, self.inode, self.stale_note
-            ) == (other.path, other.resolution_kind, other.inode, other.stale_note)
+            return (self.path, self.resolution_kind, self.inode, self.stale_note) == (
+                other.path,
+                other.resolution_kind,
+                other.inode,
+                other.stale_note,
+            )
         if isinstance(other, Path):
             return self.path == other
         return NotImplemented
+
+
+def clear_binding_staleness_state(terminal_id: str) -> None:
+    with _binding_staleness_lock:
+        _binding_staleness.pop(terminal_id, None)
+
+
+def _direct_jsonl_triples(directory: Path) -> dict[Path, FileTriple] | None:
+    """Snapshot every direct regular non-symlink jsonl, or disable above 4096."""
+    triples: dict[Path, FileTriple] = {}
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                        continue
+                    if not entry.name.endswith(".jsonl"):
+                        continue
+                    stat = entry.stat(follow_symlinks=False)
+                    triples[Path(entry.path).resolve(strict=False)] = (
+                        stat.st_ino,
+                        stat.st_mtime_ns,
+                        stat.st_size,
+                    )
+                    if len(triples) > 4096:
+                        return None
+                except OSError:
+                    continue
+    except OSError:
+        return {}
+    return triples
+
+
+def _binding_snapshot(path: Path) -> tuple[int, int, str] | None:
+    try:
+        with path.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            remaining = before.st_size
+            digest = hashlib.sha256()
+            while remaining:
+                chunk = stream.read(min(remaining, 1024 * 1024))
+                if not chunk:
+                    return None
+                digest.update(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(stream.fileno())
+            if after.st_ino != before.st_ino or after.st_size != before.st_size:
+                return None
+            return before.st_ino, before.st_size, digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _capture_staleness_bundle(binding_id: int, path: Path) -> BindingStalenessBundle | None:
+    """Capture a baseline bracketed by the identical bound-file signature."""
+    for _ in range(2):
+        before = _binding_snapshot(path)
+        if before is None:
+            return None
+        baseline = _direct_jsonl_triples(path.parent)
+        after = _binding_snapshot(path)
+        if after == before:
+            inode, size, content_hash = before
+            return BindingStalenessBundle(binding_id, path, inode, size, content_hash, baseline)
+    return None
+
+
+def observe_binding_absence(metadata: dict[str, Any]) -> BindingStalenessObservation | None:
+    """Advance the per-terminal two-absence stale predicate and candidate set."""
+    terminal_id = str(metadata.get("id") or "")
+    binding = get_current_transcript_binding(terminal_id)
+    if not terminal_id or binding is None or type(binding.get("id")) is not int:
+        return None
+    path = Path(str(binding.get("transcript_path") or "")).resolve(strict=False)
+    snapshot = _binding_snapshot(path)
+    if snapshot is None:
+        return None
+    inode, size, content_hash = snapshot
+    binding_id = int(binding["id"])
+    with _binding_staleness_lock:
+        prior = _binding_staleness.get(terminal_id)
+        same_absence = (
+            prior is not None
+            and prior.binding_id == binding_id
+            and prior.path == path
+            and prior.inode == inode
+            and prior.size == size
+            and prior.content_sha256 == content_hash
+        )
+        if not same_absence:
+            replacement = _capture_staleness_bundle(binding_id, path)
+            if replacement is None:
+                _binding_staleness.pop(terminal_id, None)
+                return None
+            _binding_staleness[terminal_id] = replacement
+            return BindingStalenessObservation(binding_id, path, False, ())
+        assert prior is not None
+        baseline = prior.baseline
+
+    if baseline is None:
+        return BindingStalenessObservation(binding_id, path, True, ())
+    current = _direct_jsonl_triples(path.parent)
+    if current is None:
+        return BindingStalenessObservation(binding_id, path, True, ())
+    if _binding_snapshot(path) != (inode, size, content_hash):
+        with _binding_staleness_lock:
+            replacement = _capture_staleness_bundle(binding_id, path)
+            if replacement is None:
+                _binding_staleness.pop(terminal_id, None)
+                return None
+            _binding_staleness[terminal_id] = replacement
+        return BindingStalenessObservation(binding_id, path, False, ())
+    candidates = [
+        candidate
+        for candidate, triple in current.items()
+        if candidate != path and (candidate not in baseline or baseline[candidate] != triple)
+    ]
+    candidates.sort(key=lambda candidate: current[candidate][1], reverse=True)
+    return BindingStalenessObservation(binding_id, path, True, tuple(candidates[:8]))
+
+
+def scan_binding_candidates(
+    observation: BindingStalenessObservation,
+    payload_hash: str,
+    started_at: object,
+    evidence: dict[str, Any],
+) -> tuple[str, dict[str, Any], Path | None]:
+    """Scan every selected advancing candidate and accept exactly one hit."""
+    normalized = evidence.get("normalized_payload_hash")
+    hits: list[tuple[Path, dict[str, Any]]] = []
+    for candidate in observation.candidates:
+        result, candidate_evidence = transcript_lookup(
+            candidate,
+            payload_hash,
+            started_at,
+            {},
+            scan_from_start=True,
+            normalized_payload_hash=normalized if isinstance(normalized, str) else None,
+        )
+        if result == "hit":
+            hits.append((candidate, candidate_evidence))
+    if len(hits) == 1:
+        return "hit", hits[0][1], hits[0][0]
+    if len(hits) > 1:
+        return "unresolved", {"kind": "transcript_candidate_ambiguous"}, None
+    return "absent", {"kind": "binding_presumed_stale"}, None
 
 
 def wire_hash(payload: str) -> str:
@@ -84,14 +257,18 @@ def normalized_confirmation_fingerprint(payload: str) -> tuple[str, int] | None:
 def _fd_codex_session(metadata: dict) -> str | None:
     try:
         from cli_agent_orchestrator.services.fork_context_service import _descendants, pane_pid
+
         candidates = set()
         sessions_root = provider_home("codex").sessions.resolve()
         for pid in _descendants(pane_pid(metadata["tmux_session"], metadata["tmux_window"])):
             for fd in Path(f"/proc/{pid}/fd").iterdir():
                 try:
                     path = Path(os.readlink(fd)).resolve()
-                    if (path.is_relative_to(sessions_root) and
-                            path.name.startswith("rollout-") and path.suffix == ".jsonl"):
+                    if (
+                        path.is_relative_to(sessions_root)
+                        and path.name.startswith("rollout-")
+                        and path.suffix == ".jsonl"
+                    ):
                         first = json.loads(path.open(encoding="utf-8").readline())
                         session_id = first.get("payload", {}).get("id")
                         if first.get("type") == "session_meta" and session_id in path.name:
@@ -177,8 +354,9 @@ def resolve_session_transcript(metadata: dict) -> TranscriptResolution | None:
                 inode=(live_reference.inode if deferred_inode else int(binding["inode"])),
                 live_reference=live_reference,
                 binding_id=(int(binding["id"]) if binding.get("id") is not None else None),
-                binding_session_id=(str(binding["session_id"])
-                                    if binding.get("session_id") is not None else None),
+                binding_session_id=(
+                    str(binding["session_id"]) if binding.get("session_id") is not None else None
+                ),
             )
         stale_note = f"binding_stale:{stale_reason}"
         if stale_reason in {"inert", "unreadable"}:
@@ -187,33 +365,37 @@ def resolve_session_transcript(metadata: dict) -> TranscriptResolution | None:
 
     def candidate(path: Path, kind: Literal["exact_id", "uuid_glob"]):
         resolved = path.resolve(strict=False)
-        if (binding is not None and stale_note in {
-                "binding_stale:missing", "binding_stale:session_mismatch"
-        } and resolved == binding_path.resolve(strict=False)):
+        if (
+            binding is not None
+            and stale_note in {"binding_stale:missing", "binding_stale:session_mismatch"}
+            and resolved == binding_path.resolve(strict=False)
+        ):
             reason, reference = _validate_binding(
                 binding_path, binding.get("session_id"), check_identity=True
             )
             if reason is None:
                 return TranscriptResolution(
-                    binding_path, "binding", inode=reference.inode,
-                    stale_note=stale_note, live_reference=reference,
-                    binding_id=(int(binding["id"])
-                                if binding.get("id") is not None else None),
-                    binding_session_id=(str(binding["session_id"])
-                                        if binding.get("session_id") is not None else None),
+                    binding_path,
+                    "binding",
+                    inode=reference.inode,
+                    stale_note=stale_note,
+                    live_reference=reference,
+                    binding_id=(int(binding["id"]) if binding.get("id") is not None else None),
+                    binding_session_id=(
+                        str(binding["session_id"])
+                        if binding.get("session_id") is not None
+                        else None
+                    ),
                 )
             return None
-        if screen_fallback and (
-            resolved in excluded or _binding_path_state(path) is not None
-        ):
+        if screen_fallback and (resolved in excluded or _binding_path_state(path) is not None):
             return None
         return TranscriptResolution(path, kind, stale_note=stale_note)
 
     if provider == "codex" and not session_id:
         session_id = _fd_codex_session(metadata)
         if session_id:
-            session_id = update_terminal_provider_session_id_if_null(
-                metadata["id"], session_id)
+            session_id = update_terminal_provider_session_id_if_null(metadata["id"], session_id)
             metadata["provider_session_id"] = session_id
     if not session_id:
         terminal_id = str(metadata.get("id") or "unknown")
@@ -234,12 +416,21 @@ def resolve_session_transcript(metadata: dict) -> TranscriptResolution | None:
     if not cwd:
         try:
             from cli_agent_orchestrator.backends.registry import get_backend
+
             cwd = get_backend().get_pane_working_directory(
-                metadata["tmux_session"], metadata["tmux_window"])
+                metadata["tmux_session"], metadata["tmux_window"]
+            )
         except Exception:
             cwd = None
     if provider == "grok_cli" and cwd:
-        path = Path.home() / ".grok" / "sessions" / quote(cwd, safe="") / session_id / "chat_history.jsonl"
+        path = (
+            Path.home()
+            / ".grok"
+            / "sessions"
+            / quote(cwd, safe="")
+            / session_id
+            / "chat_history.jsonl"
+        )
         return candidate(path, "exact_id")
     if provider == "claude_code" and cwd:
         encoded = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
@@ -283,8 +474,12 @@ def transcript_ref(resolution: TranscriptResolution | None) -> dict:
             "resolution_kind": resolution.resolution_kind,
         }
     except OSError:
-        evidence = {"path": str(path), "inode": None, "size": 0,
-                    "resolution_kind": resolution.resolution_kind}
+        evidence = {
+            "path": str(path),
+            "inode": None,
+            "size": 0,
+            "resolution_kind": resolution.resolution_kind,
+        }
     if resolution.stale_note:
         evidence["binding_stale"] = resolution.stale_note
     return evidence
@@ -346,9 +541,12 @@ def _native_user_turn_texts(record: dict) -> list[str]:
         value = record.get("message", record.get("content"))
         return _content_texts(value)
     message = record.get("message")
-    if (isinstance(message, str) and message.startswith("<user_query>") and
-            message.endswith("</user_query>")):
-        value = message[len("<user_query>"):-len("</user_query>")]
+    if (
+        isinstance(message, str)
+        and message.startswith("<user_query>")
+        and message.endswith("</user_query>")
+    ):
+        value = message[len("<user_query>") : -len("</user_query>")]
         if value.startswith("\n"):
             value = value[1:]
         if value.endswith("\n"):
@@ -368,7 +566,10 @@ def _queued_command_prompt(record: dict) -> str | None:
 
 def _queue_operation(record: dict, payload_hash: str) -> dict | None:
     if record.get("type") != "queue-operation" or record.get("operation") not in {
-        "enqueue", "popAll", "remove"}:
+        "enqueue",
+        "popAll",
+        "remove",
+    }:
         return None
     content = record.get("content")
     if not isinstance(content, str) or wire_hash(content) != payload_hash:
@@ -384,10 +585,14 @@ def _queue_operation(record: dict, payload_hash: str) -> dict | None:
     return {"op": record["operation"], "observed_at": stamp}
 
 
-def transcript_lookup(path: Path, payload_hash: str, started_at=None,
-                      expected_ref: dict | None = None,
-                      scan_from_start: bool = False,
-                      normalized_payload_hash: str | None = None) -> tuple[str, dict]:
+def transcript_lookup(
+    path: Path,
+    payload_hash: str,
+    started_at=None,
+    expected_ref: dict | None = None,
+    scan_from_start: bool = False,
+    normalized_payload_hash: str | None = None,
+) -> tuple[str, dict]:
     """Return hit, absent, or unresolved with bounded continuity evidence."""
     if isinstance(path, TranscriptResolution):
         path = path.path
@@ -395,9 +600,12 @@ def transcript_lookup(path: Path, payload_hash: str, started_at=None,
         before = path.stat()
         raw_bytes = path.read_bytes()
         after = path.stat()
-        if (before.st_ino != after.st_ino or after.st_size < before.st_size or
-            (expected_ref and expected_ref.get("inode") not in (None, before.st_ino)) or
-            (expected_ref and before.st_size < int(expected_ref.get("size", 0)))):
+        if (
+            before.st_ino != after.st_ino
+            or after.st_size < before.st_size
+            or (expected_ref and expected_ref.get("inode") not in (None, before.st_ino))
+            or (expected_ref and before.st_size < int(expected_ref.get("size", 0)))
+        ):
             return "unresolved", {"kind": "transcript_continuity_uncertain", "path": str(path)}
     except OSError:
         return "unresolved", {"kind": "transcript_unreadable", "path": str(path)}
@@ -433,23 +641,33 @@ def transcript_lookup(path: Path, payload_hash: str, started_at=None,
                     if when < threshold:
                         continue
                 except ValueError:
-                    return "unresolved", {"kind": "transcript_malformed_timestamp", "path": str(path)}
+                    return "unresolved", {
+                        "kind": "transcript_malformed_timestamp",
+                        "path": str(path),
+                    }
             for candidate in candidates:
                 normalized = candidate
                 if normalized.startswith("<user_query>") and normalized.endswith("</user_query>"):
-                    normalized = normalized[len("<user_query>"):-len("</user_query>")]
+                    normalized = normalized[len("<user_query>") : -len("</user_query>")]
                     if normalized.startswith("\n"):
                         normalized = normalized[1:]
                     if normalized.endswith("\n"):
                         normalized = normalized[:-1]
                 if wire_hash(normalized) == payload_hash:
-                    return "hit", {"kind": "transcript_user_turn", "path": str(path),
-                                   "offset": line_offset, "inode": after.st_ino,
-                                   "size": after.st_size}
+                    return "hit", {
+                        "kind": "transcript_user_turn",
+                        "path": str(path),
+                        "offset": line_offset,
+                        "inode": after.st_ino,
+                        "size": after.st_size,
+                    }
                 fingerprint = normalized_confirmation_fingerprint(candidate)
-                if (normalized_evidence is None and normalized_payload_hash is not None
-                        and fingerprint is not None
-                        and fingerprint[0] == normalized_payload_hash):
+                if (
+                    normalized_evidence is None
+                    and normalized_payload_hash is not None
+                    and fingerprint is not None
+                    and fingerprint[0] == normalized_payload_hash
+                ):
                     normalized_evidence = {
                         "kind": "transcript_user_turn_normalized",
                         "path": str(path),
@@ -457,8 +675,11 @@ def transcript_lookup(path: Path, payload_hash: str, started_at=None,
                         "inode": after.st_ino,
                         "size": after.st_size,
                     }
-            if (queued_command_evidence is None and queued_prompt is not None and
-                    wire_hash(queued_prompt) == payload_hash):
+            if (
+                queued_command_evidence is None
+                and queued_prompt is not None
+                and wire_hash(queued_prompt) == payload_hash
+            ):
                 queued_command_evidence = {
                     "kind": "transcript_queued_command",
                     "path": str(path),
@@ -468,8 +689,11 @@ def transcript_lookup(path: Path, payload_hash: str, started_at=None,
                 }
             if queued_prompt is not None and normalized_payload_hash is not None:
                 queued_fingerprint = normalized_confirmation_fingerprint(queued_prompt)
-                if (normalized_evidence is None and queued_fingerprint is not None
-                        and queued_fingerprint[0] == normalized_payload_hash):
+                if (
+                    normalized_evidence is None
+                    and queued_fingerprint is not None
+                    and queued_fingerprint[0] == normalized_payload_hash
+                ):
                     normalized_evidence = {
                         "kind": "transcript_user_turn_normalized",
                         "path": str(path),
@@ -489,8 +713,12 @@ def transcript_lookup(path: Path, payload_hash: str, started_at=None,
         if queue_corroboration is not None:
             normalized_evidence["queue_corroboration"] = queue_corroboration
         return "hit", normalized_evidence
-    absent = {"kind": "transcript_absent", "path": str(path),
-              "inode": after.st_ino, "size": after.st_size}
+    absent = {
+        "kind": "transcript_absent",
+        "path": str(path),
+        "inode": after.st_ino,
+        "size": after.st_size,
+    }
     if queue_corroboration is not None:
         absent["queue_corroboration"] = queue_corroboration
     return "absent", absent
@@ -504,13 +732,18 @@ def wpm2_cursor_baseline(evidence: dict) -> tuple[str, dict | None]:
     def valid(value, version=None):
         if not isinstance(value, dict):
             return None
-        if version is not None and (type(value.get("cursor_version")) is not int or
-                                    value.get("cursor_version") != version):
+        if version is not None and (
+            type(value.get("cursor_version")) is not int or value.get("cursor_version") != version
+        ):
             return None
-        if (not isinstance(value.get("path"), str) or not value.get("path") or
-                type(value.get("size")) is not int or value["size"] < 0 or
-                not isinstance(value.get("resolution_kind"), str) or
-                (value.get("inode") is not None and type(value.get("inode")) is not int)):
+        if (
+            not isinstance(value.get("path"), str)
+            or not value.get("path")
+            or type(value.get("size")) is not int
+            or value["size"] < 0
+            or not isinstance(value.get("resolution_kind"), str)
+            or (value.get("inode") is not None and type(value.get("inode")) is not int)
+        ):
             return None
         result = {key: value.get(key) for key in ("path", "inode", "size", "resolution_kind")}
         if version is not None:
@@ -539,23 +772,27 @@ def wpm2_cursor_baseline(evidence: dict) -> tuple[str, dict | None]:
 
 
 def wpm2_lookup(
-    metadata: dict, payload_hash: str, started_at, evidence: dict,
+    metadata: dict[str, Any],
+    payload_hash: str,
+    started_at,
+    evidence: dict,
 ) -> tuple[str, dict]:
     """Canonical WPM2 lookup; containing evidence is never the continuity ref."""
     mode, baseline = wpm2_cursor_baseline(evidence)
     if baseline is None:
-        if (evidence.get("resolution_kind") == "binding"
-                and "last_observed_ref" not in evidence
-                and not any(key in evidence for key in ("path", "inode", "size"))):
-            outcome, observed = continuity_aware_lookup(
-                metadata, payload_hash, started_at, {})
+        if (
+            evidence.get("resolution_kind") == "binding"
+            and "last_observed_ref" not in evidence
+            and not any(key in evidence for key in ("path", "inode", "size"))
+        ):
+            outcome, observed = continuity_aware_lookup(metadata, payload_hash, started_at, {})
             if outcome == "hit":
                 return outcome, observed
         return "unresolved", {"kind": "transcript_continuity_uncertain"}
-    outcome, observed = continuity_aware_lookup(
-        metadata, payload_hash, started_at, baseline)
-    if outcome in {"hit", "absent"} and all(key in observed for key in (
-            "path", "inode", "size", "resolution_kind")):
+    outcome, observed = continuity_aware_lookup(metadata, payload_hash, started_at, baseline)
+    if outcome in {"hit", "absent"} and all(
+        key in observed for key in ("path", "inode", "size", "resolution_kind")
+    ):
         observed["last_observed_ref"] = {
             key: observed[key] for key in ("path", "inode", "size", "resolution_kind")
         } | {"cursor_version": 1}
@@ -567,7 +804,8 @@ MAX_IN_TXN_TRANSCRIPT_DELTA_BYTES = 1_048_576
 
 
 def bounded_transcript_suffix_lookup(
-    expected_ref: dict, payloads: list[tuple[str, object]],
+    expected_ref: dict,
+    payloads: list[tuple[str, object]],
 ) -> tuple[str, dict]:
     """One non-polling, offset-bounded lookup for an admission transaction."""
     path = Path(str(expected_ref.get("path") or ""))
@@ -577,8 +815,7 @@ def bounded_transcript_suffix_lookup(
     try:
         with path.open("rb") as stream:
             stat = os.fstat(stream.fileno())
-            if (expected_ref.get("inode") not in (None, stat.st_ino) or
-                    stat.st_size < baseline):
+            if expected_ref.get("inode") not in (None, stat.st_ino) or stat.st_size < baseline:
                 return "unresolved", {"kind": "transcript_continuity_uncertain"}
             delta = stat.st_size - baseline
             stream.seek(baseline)
@@ -616,15 +853,22 @@ def bounded_transcript_suffix_lookup(
                 if when < threshold:
                     continue
             if any(wire_hash(value) == payload_hash for value in candidates) or (
-                    queued is not None and wire_hash(queued) == payload_hash):
+                queued is not None and wire_hash(queued) == payload_hash
+            ):
                 return "hit", {"kind": "transcript_suffix_hit", "size": stat.st_size}
-    return "absent", {"kind": "transcript_absent", "path": str(path),
-                      "inode": stat.st_ino, "size": stat.st_size,
-                      "resolution_kind": expected_ref.get("resolution_kind")}
+    return "absent", {
+        "kind": "transcript_absent",
+        "path": str(path),
+        "inode": stat.st_ino,
+        "size": stat.st_size,
+        "resolution_kind": expected_ref.get("resolution_kind"),
+    }
 
 
 def continuity_aware_lookup(
-    metadata: dict, payload_hash: str, started_at=None,
+    metadata: dict,
+    payload_hash: str,
+    started_at=None,
     expected_ref: dict | None = None,
 ) -> tuple[str, dict]:
     """Resolve and search one transcript epoch without cross-epoch size comparison."""
@@ -646,7 +890,9 @@ def continuity_aware_lookup(
         old_path = str(current_path)
         reference = resolution.live_reference
         continuity_ref = {
-            "path": str(reference.path), "inode": reference.inode, "size": reference.size,
+            "path": str(reference.path),
+            "inode": reference.inode,
+            "size": reference.size,
             **{
                 key: continuity_ref[key]
                 for key in ("normalized_payload_hash", "normalized_payload_length")
@@ -660,7 +906,10 @@ def continuity_aware_lookup(
         }
     normalized_payload_hash = continuity_ref.get("normalized_payload_hash")
     outcome, evidence = transcript_lookup(
-        resolution.path, payload_hash, started_at, continuity_ref,
+        resolution.path,
+        payload_hash,
+        started_at,
+        continuity_ref,
         scan_from_start=reseed,
         normalized_payload_hash=(
             normalized_payload_hash if isinstance(normalized_payload_hash, str) else None
@@ -669,10 +918,14 @@ def continuity_aware_lookup(
     return outcome, _with_resolution_evidence({**evidence, **extra}, resolution)
 
 
-def confirm_delivery(metadata: dict, payload_hash: str, started_at=None,
-                     expected_ref: dict | None = None,
-                     timeout: float = 10.0,
-                     wire_payload: str | None = None) -> tuple[str, dict]:
+def confirm_delivery(
+    metadata: dict,
+    payload_hash: str,
+    started_at=None,
+    expected_ref: dict | None = None,
+    timeout: float = 10.0,
+    wire_payload: str | None = None,
+) -> tuple[str, dict]:
     deadline = time.monotonic() + timeout
     last = ("unverified", {"kind": "send_returned_unverified"})
     continuity_ref = dict(expected_ref or {})
@@ -701,7 +954,8 @@ def confirm_delivery(metadata: dict, payload_hash: str, started_at=None,
             resolution = TranscriptResolution(resolution, "exact_id")
         saw_resolution = True
         outcome, evidence = continuity_aware_lookup(
-            metadata, payload_hash, started_at, continuity_ref)
+            metadata, payload_hash, started_at, continuity_ref
+        )
         last = (outcome, evidence)
         if last[0] == "hit":
             return last
@@ -711,7 +965,7 @@ def confirm_delivery(metadata: dict, payload_hash: str, started_at=None,
             # manufacture authoritative evidence under the same attempt.
             continuity_ref = {
                 **continuity_ref,
-                    "path": last[1].get("path", str(resolution.path)),
+                "path": last[1].get("path", str(resolution.path)),
                 "inode": last[1].get("inode"),
                 "size": last[1].get("size", 0),
             }

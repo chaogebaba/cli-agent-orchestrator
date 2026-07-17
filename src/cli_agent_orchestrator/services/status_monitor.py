@@ -8,10 +8,12 @@ import asyncio
 import hashlib
 import logging
 import threading
+import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Literal, NotRequired, Optional, Tuple, TypedDict
+from typing import Any, Dict, List, Literal, NotRequired, Optional, Tuple, TypedDict
 
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
@@ -60,6 +62,12 @@ class ScreenProbeMeta(TypedDict):
     result_status: ScreenProbeResult
     law_signal: ScreenProbeLawSignal
     identity_proof_failure: NotRequired[str]
+    temporal_demotion: NotRequired["ScreenProbeTemporalDemotion"]
+
+
+class ScreenProbeTemporalDemotion(TypedDict):
+    frames: int
+    multiset_sha256: str
 
 
 def _frame_rows_hash(rows: List[str]) -> str:
@@ -70,6 +78,21 @@ def _frame_rows_hash(rows: List[str]) -> str:
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
     return digest.hexdigest()
+
+
+def _corroborable_rows(result: object) -> tuple[str, ...]:
+    signals = getattr(result, "signals", ())
+    return tuple(
+        signal.row_bytes
+        for signal in signals
+        if signal.signal_class == "progress"
+        and signal.temporal_policy == "corroborable"
+        and isinstance(signal.row_bytes, str)
+    )
+
+
+def _row_multiset_hash(rows: tuple[str, ...]) -> str:
+    return _frame_rows_hash(sorted(rows, key=lambda row: row.encode("utf-8")))
 
 
 # Statuses that represent a stable "ready" state — the agent has finished
@@ -992,7 +1015,22 @@ class StatusMonitor:
         self._apply_detection(terminal_id, status)
 
     def probe_screen_status(self, terminal_id: str) -> Tuple[TerminalStatus, ScreenProbeMeta]:
-        """Classify one frame, refreshing incremental ready frames before admission."""
+        """Classify a frame with temporal progress corroboration before admission."""
+        from cli_agent_orchestrator.providers.screen_classification import (
+            ScreenClassification,
+            ScreenClassificationResult,
+            ScreenSignal,
+            screen_classification_result,
+        )
+
+        def processing_result(
+            signals: tuple[ScreenSignal, ...] = (),
+        ) -> ScreenClassificationResult:
+            return ScreenClassificationResult(
+                ScreenClassification(TerminalStatus.PROCESSING, "progress", None, None),
+                signals,
+            )
+
         try:
             provider = provider_manager.get_provider(terminal_id)
         except Exception:
@@ -1015,31 +1053,26 @@ class StatusMonitor:
                     columns = 0
                     row_count = 0
 
-        if rows and provider is not None:
+        def classify(frame_rows: List[str]) -> ScreenClassificationResult:
+            if not frame_rows or provider is None:
+                return screen_classification_result([])
             try:
-                classification = provider.classify_screen(rows)
+                return provider.classify_screen(frame_rows)
             except Exception:
                 logger.exception("Error classifying admission screen for %s", terminal_id)
-                from cli_agent_orchestrator.providers.screen_classification import (
-                    classify_screen_signals,
-                )
+                return screen_classification_result([])
 
-                classification = classify_screen_signals([])
-        else:
-            from cli_agent_orchestrator.providers.screen_classification import (
-                classify_screen_signals,
-            )
-
-            classification = classify_screen_signals([])
+        classification = classify(rows)
 
         frame_source: ScreenProbeFrameSource = "incremental"
         identity_proof_failure: str | None = None
-        if provider is not None and classification.status in {
-            TerminalStatus.IDLE,
-            TerminalStatus.COMPLETED,
-        }:
-            frame_source = "fresh_capture"
-            try:
+
+        backend = None
+        metadata = None
+
+        def load_route() -> tuple[Any, dict[str, Any]]:
+            nonlocal backend, metadata
+            if backend is None or metadata is None:
                 from cli_agent_orchestrator.backends.registry import get_backend
                 from cli_agent_orchestrator.clients.database import get_terminal_metadata
 
@@ -1047,65 +1080,153 @@ class StatusMonitor:
                 if not metadata:
                     raise ValueError(f"No terminal metadata for {terminal_id}")
                 backend = get_backend()
-                if getattr(backend, "supports_identity_readback", False) is not True:
-                    logger.warning(
-                        "pane_identity_proof_unsupported terminal=%s backend=%s",
-                        terminal_id,
-                        type(backend).__name__,
-                    )
-                else:
-                    from cli_agent_orchestrator.services.pane_identity_service import (
-                        pane_identity_failure,
-                    )
+            return backend, metadata
 
-                    identity_proof_failure = pane_identity_failure(terminal_id, metadata, backend)
-                    if identity_proof_failure is not None:
-                        logger.critical(
-                            "pane_identity_proof_failed terminal=%s session=%s window=%s "
-                            "reason=%s stage=admission",
-                            terminal_id,
-                            metadata["tmux_session"],
-                            metadata["tmux_window"],
-                            identity_proof_failure,
-                        )
-                        raise PaneIdentityProofFailure(identity_proof_failure)
-                captured = backend.capture_viewport(
-                    metadata["tmux_session"], metadata["tmux_window"]
+        def capture() -> tuple[List[str], int, int, ScreenClassificationResult]:
+            route_backend, route_metadata = load_route()
+            captured = route_backend.capture_viewport(
+                route_metadata["tmux_session"], route_metadata["tmux_window"]
+            )
+            pane_size = route_backend.get_pane_size(
+                route_metadata["tmux_session"], route_metadata["tmux_window"]
+            )
+            captured_rows = captured.splitlines()
+            if not captured_rows or not any(row.strip() for row in captured_rows):
+                raise ValueError("Fresh viewport capture was empty")
+            if (
+                isinstance(pane_size, tuple)
+                and len(pane_size) == 2
+                and all(isinstance(value, int) for value in pane_size)
+            ):
+                captured_columns, captured_row_count = pane_size
+            else:
+                captured_columns = max((len(row) for row in captured_rows), default=0)
+                captured_row_count = len(captured_rows)
+            return (
+                captured_rows,
+                captured_columns,
+                captured_row_count,
+                classify(captured_rows),
+            )
+
+        def prove_identity() -> None:
+            nonlocal identity_proof_failure
+            route_backend, route_metadata = load_route()
+            if getattr(route_backend, "supports_identity_readback", False) is not True:
+                logger.warning(
+                    "pane_identity_proof_unsupported terminal=%s backend=%s",
+                    terminal_id,
+                    type(route_backend).__name__,
                 )
-                pane_size = backend.get_pane_size(metadata["tmux_session"], metadata["tmux_window"])
-                fresh_rows = captured.splitlines()
-                if not fresh_rows or not any(row.strip() for row in fresh_rows):
-                    raise ValueError("Fresh viewport capture was empty")
-                rows = fresh_rows
-                if (
-                    isinstance(pane_size, tuple)
-                    and len(pane_size) == 2
-                    and all(isinstance(value, int) for value in pane_size)
-                ):
-                    columns, row_count = pane_size
-                else:
-                    columns = max((len(row) for row in rows), default=0)
-                    row_count = len(rows)
-                classification = provider.classify_screen(rows)
+                return
+            from cli_agent_orchestrator.services.pane_identity_service import (
+                pane_identity_failure,
+            )
+
+            identity_proof_failure = pane_identity_failure(
+                terminal_id, route_metadata, route_backend
+            )
+            if identity_proof_failure is not None:
+                logger.critical(
+                    "pane_identity_proof_failed terminal=%s session=%s window=%s "
+                    "reason=%s stage=admission",
+                    terminal_id,
+                    route_metadata["tmux_session"],
+                    route_metadata["tmux_window"],
+                    identity_proof_failure,
+                )
+                raise PaneIdentityProofFailure(identity_proof_failure)
+
+        if provider is not None and classification.status in {
+            TerminalStatus.IDLE,
+            TerminalStatus.COMPLETED,
+        }:
+            frame_source = "fresh_capture"
+            try:
+                prove_identity()
+                rows, columns, row_count, classification = capture()
             except PaneIdentityProofFailure:
-                rows = []
-                columns = 0
-                row_count = 0
-                from cli_agent_orchestrator.providers.screen_classification import (
-                    classify_screen_signals,
-                )
-
-                classification = classify_screen_signals([])
+                rows, columns, row_count = [], 0, 0
+                classification = screen_classification_result([])
             except Exception:
                 logger.exception("Error refreshing admission screen for %s", terminal_id)
-                rows = []
-                columns = 0
-                row_count = 0
-                from cli_agent_orchestrator.providers.screen_classification import (
-                    classify_screen_signals,
-                )
+                rows, columns, row_count = [], 0, 0
+                classification = screen_classification_result([])
 
-                classification = classify_screen_signals([])
+        temporal_demotion: ScreenProbeTemporalDemotion | None = None
+        initial_corroborable = _corroborable_rows(classification)
+        deciding_is_corroborable = any(
+            signal.signal_class == classification.signal_class
+            and signal.provider_signal == classification.provider_signal
+            and signal.row_index == classification.row_index
+            and signal.temporal_policy == "corroborable"
+            for signal in classification.signals
+        )
+
+        if (
+            provider is not None
+            and classification.status == TerminalStatus.PROCESSING
+            and deciding_is_corroborable
+        ):
+            previous = initial_corroborable
+            corroboration_frames = 0
+            try:
+                for _ in range(2):
+                    time.sleep(1.2)
+                    fresh_rows, fresh_columns, fresh_row_count, fresh_result = capture()
+                    corroboration_frames += 1
+                    rows, columns, row_count = fresh_rows, fresh_columns, fresh_row_count
+                    frame_source = "fresh_capture"
+                    current = _corroborable_rows(fresh_result)
+                    classification = fresh_result
+                    if Counter(current) != Counter(previous):
+                        previous = current
+                        break
+                    previous = current
+                else:
+                    temporal_demotion = {
+                        "frames": corroboration_frames,
+                        "multiset_sha256": _row_multiset_hash(previous),
+                    }
+            except Exception:
+                logger.exception("Error corroborating admission screen for %s", terminal_id)
+                classification = processing_result()
+
+            if temporal_demotion is not None:
+                try:
+                    prove_identity()
+                    fresh_rows, fresh_columns, fresh_row_count, final_result = capture()
+                    rows, columns, row_count = fresh_rows, fresh_columns, fresh_row_count
+                    frame_source = "fresh_capture"
+                    final_rows = _corroborable_rows(final_result)
+                    if Counter(final_rows) != Counter(previous):
+                        classification = processing_result(final_result.signals)
+                    else:
+                        remaining = list(final_result.signals)
+                        demotions = Counter(previous)
+                        kept = []
+                        for signal in remaining:
+                            if (
+                                signal.signal_class == "progress"
+                                and signal.temporal_policy == "corroborable"
+                                and isinstance(signal.row_bytes, str)
+                                and demotions[signal.row_bytes] > 0
+                            ):
+                                demotions[signal.row_bytes] -= 1
+                            else:
+                                kept.append(signal)
+                        classification = screen_classification_result(kept)
+                        if classification.status not in {
+                            TerminalStatus.IDLE,
+                            TerminalStatus.COMPLETED,
+                        }:
+                            classification = processing_result(tuple(kept))
+                except PaneIdentityProofFailure:
+                    rows, columns, row_count = [], 0, 0
+                    classification = screen_classification_result([])
+                except Exception:
+                    logger.exception("Error finalizing admission screen for %s", terminal_id)
+                    classification = processing_result()
 
         status_values: Dict[TerminalStatus, ScreenProbeResult] = {
             TerminalStatus.WAITING_USER_ANSWER: "waiting_user_answer",
@@ -1131,6 +1252,8 @@ class StatusMonitor:
         }
         if identity_proof_failure is not None:
             meta["identity_proof_failure"] = identity_proof_failure
+        if temporal_demotion is not None:
+            meta["temporal_demotion"] = temporal_demotion
         return classification.status, meta
 
     def get_rendered_screen(self, terminal_id: str) -> Optional[List[str]]:

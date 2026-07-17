@@ -20,9 +20,9 @@ from cli_agent_orchestrator.providers.base import (
     TerminalArtifactValidation,
 )
 from cli_agent_orchestrator.providers.screen_classification import (
-    ScreenClassification,
+    ScreenClassificationResult,
     ScreenSignal,
-    classify_screen_signals,
+    screen_classification_result,
 )
 from cli_agent_orchestrator.services.settings_service import (
     get_provider_defaults,
@@ -902,7 +902,7 @@ class CodexProvider(BaseProvider):
         r"\btab\s+to\s+queue\s+message\b",
     ]
 
-    def classify_screen(self, screen_lines: list[str]) -> ScreenClassification:
+    def classify_screen(self, screen_lines: list[str]) -> ScreenClassificationResult:
         """Produce Codex signals while preserving the existing fixture corpus."""
         joined = "\n".join(screen_lines)
         clean = strip_terminal_escapes(joined)
@@ -926,7 +926,9 @@ class CodexProvider(BaseProvider):
         for index, row in enumerate(rows):
             progress = re.search(TUI_PROGRESS_PATTERN, row) is not None
             if progress:
-                signals.append(ScreenSignal("progress", "TUI_PROGRESS_PATTERN", index))
+                signals.append(
+                    ScreenSignal("progress", "TUI_PROGRESS_PATTERN", index, row, "corroborable")
+                )
             if TRUST_SELECTOR_PATTERN.search(row):
                 signals.append(ScreenSignal("waiting", "TRUST_SELECTOR_PATTERN", index))
             if (
@@ -968,10 +970,14 @@ class CodexProvider(BaseProvider):
             assert SCREEN_FALLBACK_PROCESSING_PATTERN.search(clean)
             signals.append(
                 ScreenSignal(
-                    "progress", "SCREEN_FALLBACK_PROCESSING_PATTERN", max(len(rows) - 1, 0)
+                    "progress",
+                    "SCREEN_FALLBACK_PROCESSING_PATTERN",
+                    max(len(rows) - 1, 0),
+                    clean,
+                    "exempt",
                 )
             )
-        return classify_screen_signals(signals)
+        return screen_classification_result(signals)
 
     def get_status_from_screen(self, screen_lines: list[str]) -> TerminalStatus:
         return self.classify_screen(screen_lines).status

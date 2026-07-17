@@ -808,6 +808,11 @@ async def create_terminal(
         # The manifest below then sees the new row, while rollback unwinds DB
         # before pipe-pane/FIFO/window in exact reverse acquisition order.
         try:
+            from cli_agent_orchestrator.services.inbox_service import get_delivery_lock
+            from cli_agent_orchestrator.services.mailbox_service import (
+                get_mailbox_authority_lock,
+            )
+
             init_fields = {}
             if defer_init:
                 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -818,44 +823,48 @@ async def create_terminal(
                     "init_owner_epoch": SERVER_INIT_OWNER_EPOCH,
                     "init_deadline_s": float(get_server_settings()["artifact_validate_deadline_s"]),
                 }
-            if fork_context and fork_context.mode == "fork":
-                create_terminal_with_warm_intent(
-                    terminal_id=terminal_id,
-                    tmux_session=session_name,
-                    tmux_window=window_name,
-                    provider=provider,
-                    agent_profile=agent_profile,
-                    allowed_tools=allowed_tools,
-                    caller_id=caller_id,
-                    parent_base_name=fork_context.base_name,
-                    fork_mode=fork_context.mode,
-                    **init_fields,
-                )
-            else:
-                attempted_resume_uuid = resume_uuid
-                if attempted_resume_uuid:
-                    db_create_terminal(
-                        terminal_id,
-                        session_name,
-                        window_name,
-                        provider,
-                        agent_profile,
-                        allowed_tools,
-                        caller_id=caller_id,
-                        provider_session_id=attempted_resume_uuid,
-                        **init_fields,
-                    )
-                else:
-                    db_create_terminal(
-                        terminal_id,
-                        session_name,
-                        window_name,
-                        provider,
-                        agent_profile,
-                        allowed_tools,
-                        caller_id=caller_id,
-                        **init_fields,
-                    )
+            delivery_authority = get_delivery_lock(terminal_id)
+            mailbox_authority = get_mailbox_authority_lock(session_name, "supervisor")
+            with delivery_authority:
+                with mailbox_authority:
+                    if fork_context and fork_context.mode == "fork":
+                        create_terminal_with_warm_intent(
+                            terminal_id=terminal_id,
+                            tmux_session=session_name,
+                            tmux_window=window_name,
+                            provider=provider,
+                            agent_profile=agent_profile,
+                            allowed_tools=allowed_tools,
+                            caller_id=caller_id,
+                            parent_base_name=fork_context.base_name,
+                            fork_mode=fork_context.mode,
+                            **init_fields,
+                        )
+                    else:
+                        attempted_resume_uuid = resume_uuid
+                        if attempted_resume_uuid:
+                            db_create_terminal(
+                                terminal_id,
+                                session_name,
+                                window_name,
+                                provider,
+                                agent_profile,
+                                allowed_tools,
+                                caller_id=caller_id,
+                                provider_session_id=attempted_resume_uuid,
+                                **init_fields,
+                            )
+                        else:
+                            db_create_terminal(
+                                terminal_id,
+                                session_name,
+                                window_name,
+                                provider,
+                                agent_profile,
+                                allowed_tools,
+                                caller_id=caller_id,
+                                **init_fields,
+                            )
         except Exception as exc:
             if lease_token is not None:
                 raise RuntimeError("db_publish_failed") from exc

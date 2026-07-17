@@ -61,6 +61,9 @@ class NoticeInsertOutcome(str, Enum):
     FAILED_AFTER_COMMIT = "failed_after_commit"
 
 
+TRANSCRIPT_BINDING_SOURCES = frozenset({"startup", "resume", "clear", "compact", "server_recovery"})
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -90,6 +93,7 @@ class TerminalModel(Base):
     init_owner_epoch = Column(String, nullable=True)
     init_failure_token = Column(String, nullable=True, unique=True)
     init_deadline_s = Column(Float, nullable=True)
+    lifecycle_generation = Column(Integer, nullable=False, default=0, server_default="0")
     last_active = Column(DateTime, default=datetime.now)
     __table_args__ = (
         CheckConstraint(
@@ -889,7 +893,8 @@ def _migrate_terminals_schema() -> None:
 
     conn = sqlite3.connect(str(DATABASE_FILE), isolation_level=None)
     try:
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(terminals)")}
+        table_info = list(conn.execute("PRAGMA table_info(terminals)"))
+        columns = {row[1] for row in table_info}
         table_sql_row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='terminals'"
         ).fetchone()
@@ -920,6 +925,7 @@ def _migrate_terminals_schema() -> None:
             init_columns.issubset(columns)
             and "caller_mailbox_id" in columns
             and "instance_id" in columns
+            and any(row[1] == "lifecycle_generation" and bool(row[3]) for row in table_info)
             and "init_state IN" in table_sql
             and "init_deadline_s >= 1.0" in table_sql
             and has_token_unique
@@ -953,6 +959,7 @@ def _migrate_terminals_schema() -> None:
             "'init_failed_caller_gone')), "
             "init_started_at DATETIME, init_owner_epoch TEXT, "
             "init_failure_token TEXT UNIQUE, init_deadline_s REAL, "
+            "lifecycle_generation INTEGER NOT NULL DEFAULT 0, "
             "last_active DATETIME, "
             "CHECK (init_state != 'init_pending' OR "
             "(init_started_at IS NOT NULL AND init_owner_epoch IS NOT NULL AND "
@@ -991,11 +998,16 @@ def _migrate_terminals_schema() -> None:
             "init_owner_epoch",
             "init_failure_token",
             "init_deadline_s",
+            "lifecycle_generation",
         ]
         copied = [name for name in destination if name in legacy_columns]
+        selected = [
+            "COALESCE(lifecycle_generation, 0)" if name == "lifecycle_generation" else name
+            for name in copied
+        ]
         conn.execute(
             f"INSERT INTO terminals ({','.join(copied)}) "
-            f"SELECT {','.join(copied)} FROM terminals_wpm4a_legacy"
+            f"SELECT {','.join(selected)} FROM terminals_wpm4a_legacy"
         )
         conn.execute("DROP TABLE terminals_wpm4a_legacy")
         conn.execute(
@@ -1132,6 +1144,12 @@ def create_terminal(
             init_deadline_s=init_deadline_s,
         )
         db.add(terminal)
+        db.flush()
+        db.query(TerminalModel).filter(TerminalModel.id == terminal_id).update(
+            {TerminalModel.lifecycle_generation: (TerminalModel.lifecycle_generation + 1)},
+            synchronize_session=False,
+        )
+        db.refresh(terminal)
         db.commit()
         return {
             "id": terminal.id,
@@ -1156,6 +1174,7 @@ def create_terminal(
             "init_owner_epoch": terminal.init_owner_epoch,
             "init_failure_token": terminal.init_failure_token,
             "init_deadline_s": terminal.init_deadline_s,
+            "lifecycle_generation": terminal.lifecycle_generation,
         }
 
 
@@ -1186,22 +1205,26 @@ def create_terminal_with_warm_intent(
 
     with SessionLocal.begin() as db:
         caller_mailbox_id = _mailbox_id_for_terminal(db, caller_id)
-        db.add(
-            TerminalModel(
-                id=terminal_id,
-                tmux_session=tmux_session,
-                tmux_window=tmux_window,
-                provider=provider,
-                agent_profile=agent_profile,
-                allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
-                caller_id=caller_id,
-                instance_id=os.environ.get("CAO_INSTANCE_ID") or None,
-                caller_mailbox_id=caller_mailbox_id,
-                init_state=init_state,
-                init_started_at=init_started_at,
-                init_owner_epoch=init_owner_epoch,
-                init_deadline_s=init_deadline_s,
-            )
+        terminal = TerminalModel(
+            id=terminal_id,
+            tmux_session=tmux_session,
+            tmux_window=tmux_window,
+            provider=provider,
+            agent_profile=agent_profile,
+            allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
+            caller_id=caller_id,
+            instance_id=os.environ.get("CAO_INSTANCE_ID") or None,
+            caller_mailbox_id=caller_mailbox_id,
+            init_state=init_state,
+            init_started_at=init_started_at,
+            init_owner_epoch=init_owner_epoch,
+            init_deadline_s=init_deadline_s,
+        )
+        db.add(terminal)
+        db.flush()
+        db.query(TerminalModel).filter(TerminalModel.id == terminal_id).update(
+            {TerminalModel.lifecycle_generation: (TerminalModel.lifecycle_generation + 1)},
+            synchronize_session=False,
         )
         if fork_mode == "fork" and parent_base_name and agent_profile:
             claimed = False
@@ -1297,6 +1320,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "init_owner_epoch": terminal.init_owner_epoch,
             "init_failure_token": terminal.init_failure_token,
             "init_deadline_s": terminal.init_deadline_s,
+            "lifecycle_generation": terminal.lifecycle_generation,
             "last_active": terminal.last_active,
         }
 
@@ -1561,6 +1585,57 @@ def create_transcript_binding(
         db.commit()
         db.refresh(row)
         return {column.name: getattr(row, column.name) for column in row.__table__.columns}
+
+
+def recover_transcript_binding_if_current(
+    terminal_id: str, stale_binding_id: int, transcript_path: str
+) -> str:
+    """CAS-mint a server recovery epoch against the still-current stale binding."""
+    try:
+        with Path(transcript_path).open(encoding="utf-8") as stream:
+            pairs = json.loads(stream.readline(), object_pairs_hook=lambda value: value)
+        if not isinstance(pairs, list):
+            return "invalid_session_id"
+        session_values = [value for key, value in pairs if key == "sessionId"]
+        if (
+            len(session_values) != 1
+            or not isinstance(session_values[0], str)
+            or not session_values[0]
+        ):
+            return "invalid_session_id"
+        session_id = session_values[0]
+        inode = Path(transcript_path).stat().st_ino
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return "invalid_session_id"
+
+    with SessionLocal() as db:
+        current = (
+            db.query(TranscriptBindingModel)
+            .filter_by(terminal_id=terminal_id)
+            .order_by(
+                TranscriptBindingModel.received_at.desc(),
+                TranscriptBindingModel.id.desc(),
+            )
+            .first()
+        )
+        if current is None or current.id != stale_binding_id:
+            db.rollback()
+            return "authority_changed"
+        db.add(
+            TranscriptBindingModel(
+                terminal_id=terminal_id,
+                session_id=session_id,
+                transcript_path=transcript_path,
+                inode=inode,
+                source="server_recovery",
+                received_at=_utcnow(),
+            )
+        )
+        db.commit()
+    from cli_agent_orchestrator.services.inbox_service import inbox_service
+
+    inbox_service.reset_binding_episodes(terminal_id)
+    return "inserted"
 
 
 def get_current_transcript_binding(terminal_id: str) -> Optional[Dict[str, Any]]:
@@ -2248,6 +2323,19 @@ def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
             .all()
         )
         return [row[0] for row in rows]
+
+
+def list_pending_receiver_ids_with_terminal() -> List[str]:
+    """List live terminal rows that still own at least one PENDING message."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(InboxModel.receiver_id)
+            .join(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
+            .filter(InboxModel.status == MessageStatus.PENDING.value)
+            .distinct()
+            .all()
+        )
+        return [str(row[0]) for row in rows]
 
 
 def list_pending_receiver_ids() -> List[str]:
@@ -3718,6 +3806,71 @@ def settle_pending_orphan_messages(
     if isinstance(result, OrphanReconcileResult):
         return result
     return OrphanReconcileResult(busy_aborted=True)
+
+
+def settle_pending_receiver_gone_if_generation(
+    receiver_id: str, lifecycle_generation: int
+) -> OrphanReconcileResult:
+    """P5 CAS settlement for a present row whose pane stayed gone under locks."""
+
+    def operation(db: Any) -> OrphanReconcileResult:
+        terminal = (
+            db.query(TerminalModel.id)
+            .filter(
+                TerminalModel.id == receiver_id,
+                TerminalModel.lifecycle_generation == lifecycle_generation,
+            )
+            .one_or_none()
+        )
+        if terminal is None:
+            return OrphanReconcileResult()
+        candidates = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.receiver_id == receiver_id,
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .order_by(InboxModel.created_at.asc(), InboxModel.id.asc())
+            .limit(ORPHAN_RECONCILE_BATCH_LIMIT)
+            .all()
+        )
+        candidate_ids = [candidate.id for candidate in candidates]
+        changed = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.id.in_(candidate_ids),
+                InboxModel.status == MessageStatus.PENDING.value,
+                exists().where(
+                    and_(
+                        TerminalModel.id == receiver_id,
+                        TerminalModel.lifecycle_generation == lifecycle_generation,
+                    )
+                ),
+            )
+            .update(
+                {
+                    InboxModel.status: MessageStatus.DELIVERY_FAILED.value,
+                    InboxModel.failure_reason: "receiver_gone",
+                },
+                synchronize_session=False,
+            )
+        )
+        if changed != len(candidate_ids):
+            db.rollback()
+            return OrphanReconcileResult()
+        notifications, logged_only = _record_p5_orphan_notices(db, candidates)
+        return OrphanReconcileResult(
+            settled_count=changed,
+            notification_count=notifications,
+            logged_only_count=logged_only,
+        )
+
+    result = _run_wpm1_immediate(operation)
+    return (
+        result
+        if isinstance(result, OrphanReconcileResult)
+        else OrphanReconcileResult(busy_aborted=True)
+    )
 
 
 def advance_wpm2_continuity_cursor(

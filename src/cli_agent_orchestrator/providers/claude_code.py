@@ -16,9 +16,9 @@ from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.screen_classification import (
-    ScreenClassification,
+    ScreenClassificationResult,
     ScreenSignal,
-    classify_screen_signals,
+    screen_classification_result,
 )
 from cli_agent_orchestrator.services.settings_service import (
     get_provider_defaults,
@@ -912,11 +912,11 @@ class ClaudeCodeProvider(BaseProvider):
     # detector below is tuned for a COMPOSITED viewport, not the raw stream.
     supports_screen_detection = True
 
-    def classify_screen(self, screen_lines: List[str]) -> ScreenClassification:
+    def classify_screen(self, screen_lines: List[str]) -> ScreenClassificationResult:
         """Produce Claude signals and apply the provider-blind Wave 4 law."""
         rows = [line.rstrip() for line in screen_lines if line.strip()]
         if not rows:
-            return classify_screen_signals([])
+            return screen_classification_result([])
         joined = "\n".join(rows)
         separator_rows = [
             index for index, row in enumerate(rows) if NEW_TUI_BOX_RAIL_PATTERN.search(row)
@@ -940,12 +940,24 @@ class ClaudeCodeProvider(BaseProvider):
             # The gerund-first structural matcher filters the broader ellipsis
             # pattern so settled markdown bullets cannot become progress.
             if NEW_TUI_BOX_SPINNER_PATTERN.search(row):
-                signals.append(ScreenSignal("progress", "NEW_TUI_BOX_SPINNER_PATTERN", index))
+                signals.append(
+                    ScreenSignal(
+                        "progress",
+                        "NEW_TUI_BOX_SPINNER_PATTERN",
+                        index,
+                        row,
+                        "corroborable",
+                    )
+                )
                 if re.search(PROCESSING_PATTERN, row):
-                    signals.append(ScreenSignal("progress", "PROCESSING_PATTERN", index))
+                    signals.append(
+                        ScreenSignal("progress", "PROCESSING_PATTERN", index, row, "corroborable")
+                    )
             background_wait = BACKGROUND_WAIT_PATTERN.search(row) is not None
             if background_wait:
-                signals.append(ScreenSignal("progress", "BACKGROUND_WAIT_PATTERN", index))
+                signals.append(
+                    ScreenSignal("progress", "BACKGROUND_WAIT_PATTERN", index, row, "exempt")
+                )
             # A live background-wait row is never a completion candidate even
             # though the lenient glyph+"for" completion regex overlaps it.
             if not background_wait and re.search(GET_STATUS_COMPLETION_PATTERN, row):
@@ -954,7 +966,7 @@ class ClaudeCodeProvider(BaseProvider):
                 signals.append(ScreenSignal("completion", "EXTRACTION_RESPONSE_PATTERN", index))
         for index in boxed_prompt_rows:
             signals.append(ScreenSignal("chrome", "NEW_TUI_BOX_PATTERN", index))
-        return classify_screen_signals(signals)
+        return screen_classification_result(signals)
 
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         return self.classify_screen(screen_lines).status

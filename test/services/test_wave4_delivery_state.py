@@ -68,6 +68,36 @@ def _codex() -> CodexProvider:
     return CodexProvider("codex", "session", "window")
 
 
+def _assert_animated_probe_stays_processing(provider, initial_rows, animated_rows):
+    """Drive the real StatusMonitor seam without patching provider/law calls."""
+    monitor = StatusMonitor()
+    screen = SimpleNamespace(display=initial_rows, columns=220, lines=50)
+    monitor._screens["receiver"] = (screen, object())  # noqa: SLF001
+    backend = MagicMock(supports_identity_readback=False)
+    backend.get_pane_size.return_value = (220, 50)
+    backend.capture_viewport.side_effect = [
+        "\n".join(initial_rows),
+        "\n".join(animated_rows),
+    ]
+    with (
+        patch(
+            "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
+            return_value=provider,
+        ),
+        patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+        patch(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            return_value={"tmux_session": "session", "tmux_window": "receiver"},
+        ),
+        patch("cli_agent_orchestrator.services.status_monitor.time.sleep"),
+    ):
+        status, meta = monitor.probe_screen_status("receiver")
+    assert status == TerminalStatus.PROCESSING
+    assert "temporal_demotion" not in meta
+    assert backend.capture_viewport.call_count == 2
+    assert screen.display == initial_rows
+
+
 def _probe_meta(
     status: TerminalStatus,
     provider_signal: str | None = None,
@@ -196,6 +226,8 @@ def test_probe_03_claude_full_screen_spinner_beats_older_response_and_chrome():
         "─" * 60,
     ]
     assert _claude().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+    animated = [row.replace("✻ Cultivating…", "✽ Cultivating…") for row in screen]
+    _assert_animated_probe_stays_processing(_claude(), screen, animated)
 
 
 def test_probe_04_codex_existing_fixture_corpus_is_unchanged():
@@ -258,6 +290,9 @@ def test_probe_04_codex_existing_fixture_corpus_is_unchanged():
     assert {
         name: _codex().get_status_from_screen(rows).value for name, rows in corpus.items()
     } == parent_results
+    working = corpus["synthetic:working"]
+    animated = [row.replace("(5s ", "(6s ") for row in working]
+    _assert_animated_probe_stays_processing(_codex(), working, animated)
 
 
 @pytest.mark.parametrize(
@@ -1035,7 +1070,12 @@ def test_livefix_p1_stale_incremental_ready_fresh_busy_defers_without_overwrite(
     monitor.get_status_gen = MagicMock(return_value=1)
     backend = MagicMock()
     backend.get_pane_size.return_value = (220, 50)
-    backend.capture_viewport.return_value = "\n".join(fresh_rows)
+    animated_rows = [row.replace("⠹", "⠸") for row in fresh_rows]
+    backend.capture_viewport.side_effect = [
+        "\n".join(fresh_rows),
+        "\n".join(fresh_rows),
+        "\n".join(animated_rows),
+    ]
 
     with (
         patch("cli_agent_orchestrator.services.inbox_service.status_monitor", monitor),
@@ -1044,13 +1084,15 @@ def test_livefix_p1_stale_incremental_ready_fresh_busy_defers_without_overwrite(
             return_value=_grok(),
         ),
         patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+        patch("cli_agent_orchestrator.services.status_monitor.time.sleep"),
         patch(
             "cli_agent_orchestrator.services.inbox_service.terminal_service.send_prepared_input"
         ) as paste,
     ):
         InboxService().deliver_pending("receiver")
 
-    backend.capture_viewport.assert_called_once_with("session", "receiver")
+    assert backend.capture_viewport.call_count == 3
+    backend.capture_viewport.assert_called_with("session", "receiver")
     assert paste.call_count == 0
     assert get_message_trace(message.id)["attempts"] == []
     assert screen.display == incremental_rows
@@ -1172,3 +1214,11 @@ def test_livefix_p4_f16_live_pane_remains_processing():
         for row in screen
         if "commands still running" in row
     )
+    animated = list(screen)
+    spinner_index = next(
+        index
+        for index, row in enumerate(animated)
+        if re.search(grok_cli.PROCESSING_PATTERN, row) and "Waiting for response" not in row
+    )
+    animated[spinner_index] += " tick"
+    _assert_animated_probe_stays_processing(_grok(), screen, animated)

@@ -43,6 +43,7 @@ from cli_agent_orchestrator.backends import TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
+    TRANSCRIPT_BINDING_SOURCES,
     adopt_mailbox_rows_at_startup,
     create_inbox_message,
     create_transcript_binding,
@@ -435,7 +436,14 @@ class TranscriptBindingRequest(BaseModel):
     session_id: str
     transcript_path: str
     cwd: str = ""
-    source: str = ""
+    source: str
+
+    @field_validator("source")
+    @classmethod
+    def validate_source(cls, value: str) -> str:
+        if value not in TRANSCRIPT_BINDING_SOURCES - {"server_recovery"}:
+            raise ValueError("invalid transcript binding source")
+        return value
 
 
 class InstallAgentProfileRequest(BaseModel):
@@ -1783,6 +1791,9 @@ async def bind_transcript(
             inode,
             body.source,
         )
+        from cli_agent_orchestrator.services.inbox_service import inbox_service
+
+        inbox_service.reset_binding_episodes(terminal_id)
         return {"success": True, "binding": row}
     except ValueError as exc:
         raise HTTPException(

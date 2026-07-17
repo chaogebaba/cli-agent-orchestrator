@@ -23,9 +23,9 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider, RetryableArtifactValidation
 from cli_agent_orchestrator.providers.screen_classification import (
-    ScreenClassification,
+    ScreenClassificationResult,
     ScreenSignal,
-    classify_screen_signals,
+    screen_classification_result,
 )
 from cli_agent_orchestrator.services.settings_service import (
     get_provider_defaults,
@@ -373,7 +373,7 @@ class GrokCliProvider(BaseProvider):
 
         return TerminalStatus.PROCESSING
 
-    def classify_screen(self, screen_lines: List[str]) -> ScreenClassification:
+    def classify_screen(self, screen_lines: List[str]) -> ScreenClassificationResult:
         rows = [line.rstrip() for line in screen_lines]
         while rows and not rows[-1].strip():
             rows.pop()
@@ -386,7 +386,14 @@ class GrokCliProvider(BaseProvider):
             if re.search(WAITING_USER_ANSWER_PATTERN, row):
                 signals.append(ScreenSignal("waiting", "WAITING_USER_ANSWER_PATTERN", index))
             if re.search(PROCESSING_PATTERN, row):
-                signals.append(ScreenSignal("progress", "PROCESSING_PATTERN", index))
+                if "Waiting for response" in row:
+                    signals.append(
+                        ScreenSignal("progress", "PROCESSING_PATTERN", index, row, "exempt")
+                    )
+                else:
+                    signals.append(
+                        ScreenSignal("progress", "PROCESSING_PATTERN", index, row, "corroborable")
+                    )
             if re.search(COMPLETION_PATTERN, row):
                 signals.append(ScreenSignal("completion", "COMPLETION_PATTERN", index))
             # Grok errors are effective only after the newest completion.
@@ -398,7 +405,7 @@ class GrokCliProvider(BaseProvider):
                 signals.append(ScreenSignal("chrome", "IDLE_FOOTER_PATTERN", index))
             if re.search(COMPOSER_PROMPT_PATTERN, row):
                 signals.append(ScreenSignal("chrome", "COMPOSER_PROMPT_PATTERN", index))
-        return classify_screen_signals(signals)
+        return screen_classification_result(signals)
 
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         return self.classify_screen(screen_lines).status

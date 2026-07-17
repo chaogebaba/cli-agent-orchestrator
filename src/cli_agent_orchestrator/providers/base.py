@@ -27,7 +27,11 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
-from cli_agent_orchestrator.providers.screen_classification import ScreenClassification
+from cli_agent_orchestrator.providers.screen_classification import (
+    ScreenClassification,
+    ScreenClassificationResult,
+    screen_classification_result,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -228,7 +232,7 @@ class BaseProvider(ABC):
         """
         return self.get_status("\n".join(screen_lines))
 
-    def classify_screen(self, screen_lines: List[str]) -> ScreenClassification:
+    def classify_screen(self, screen_lines: List[str]) -> ScreenClassificationResult:
         """Return status plus Wave 4 deciding evidence for a composited frame.
 
         Providers migrated to the shared law override this. The fallback keeps
@@ -237,7 +241,10 @@ class BaseProvider(ABC):
         status = self.get_status_from_screen(screen_lines)
         if status == TerminalStatus.RENDER_UNCERTAIN:
             status = TerminalStatus.UNKNOWN
-        return ScreenClassification(status, "none", None, None)
+        result = screen_classification_result([])
+        if status == TerminalStatus.UNKNOWN:
+            return result
+        return ScreenClassificationResult(ScreenClassification(status, "none", None, None), ())
 
     # Opt-in flag for preserving an unsent human composer draft before CAO
     # injects orchestrated input. Providers that set this True must implement
