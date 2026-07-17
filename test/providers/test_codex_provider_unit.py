@@ -2,6 +2,7 @@
 
 import shlex
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -13,6 +14,7 @@ from cli_agent_orchestrator.providers.codex import (
     _toml_override,
     _toml_scalar,
 )
+from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -1265,6 +1267,189 @@ class TestCodexScreenDetection:
         screen path intentionally reuses it verbatim rather than special-casing
         blank frames."""
         assert self._p().get_status_from_screen(["", "", ""]) == TerminalStatus.PROCESSING
+
+
+class TestCodexIdleReasonClassification:
+    def _p(self):
+        return CodexProvider("test1234", "test-session", "window-0")
+
+    def test_wpq6_a_capacity_is_transient_and_nudge_eligible(self):
+        rows = [
+            "⚠ Selected model is at capacity. Please try a different model.",
+            "› ",
+            "  gpt-5.6-sol high · ~/project",
+        ]
+        provider = self._p()
+        classification = provider.classify_screen(rows)
+
+        assert classification.status == TerminalStatus.IDLE
+        assert provider.transient_error_detected(rows, classification)
+        assert provider.classify_idle_reason(rows, classification) == "transient_api_error"
+
+    def test_wpq6_b_capacity_with_progress_is_not_nudge_eligible(self):
+        rows = [
+            "⚠ Selected model is at capacity. Please try a different model.",
+            "• Working (5s • esc to interrupt)",
+            "› ",
+            "  gpt-5.6-sol high · ~/project",
+        ]
+        provider = self._p()
+        classification = provider.classify_screen(rows)
+
+        assert classification.status == TerminalStatus.PROCESSING
+        assert not provider.transient_error_detected(rows, classification)
+
+    @pytest.mark.parametrize(
+        "banner",
+        [
+            "429 Too Many Requests: usage limit",
+            "502 Bad Gateway — 403 Forbidden",
+            "400 Bad Request: unauthorized",
+        ],
+    )
+    def test_wpq6_c_exclusion_wins_over_transient_positive(self, banner):
+        rows = [banner, "› ", "  gpt-5.6-sol high · ~/project"]
+        provider = self._p()
+        classification = provider.classify_screen(rows)
+
+        assert classification.status == TerminalStatus.IDLE
+        assert not provider.transient_error_detected(rows, classification)
+        assert provider.classify_idle_reason(rows, classification) == "quota_or_auth"
+
+    def test_wpq6_e_error_banner_reason(self):
+        rows = ["Error: stream ended unexpectedly", "› ", "  gpt-5.6-sol high · ~/project"]
+        provider = self._p()
+
+        assert provider.classify_idle_reason(rows, provider.classify_screen(rows)) == "error_banner"
+
+    def test_wpq6_a2_real_ghost_composer_sample_classifies_without_nudge(self):
+        rows = load_fixture("codex_capacity_ghost_composer_2026-07-17.txt").splitlines()
+        provider = self._p()
+        classification = provider.classify_screen(rows)
+
+        assert classification.status == TerminalStatus.IDLE
+        assert not provider.transient_error_detected(rows, classification)
+        assert provider.classify_idle_reason(rows, classification) == "transient_api_error"
+
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            ["• HTTP 403 means the authorization check rejected the request."],
+            ["› Review authentication middleware"],
+            ["• The documentation calls this a usage limit response."],
+            ["• The proxy reports nginx returned 502 Bad Gateway."],
+        ],
+    )
+    def test_wpq6_r_ordinary_conversation_has_no_idle_reason(self, rows):
+        provider = self._p()
+
+        assert provider.classify_idle_reason(rows, provider.classify_screen(rows)) is None
+
+    def test_wpq6_s_banner_overrides_prior_assistant_flow(self):
+        rows = [
+            "• I finished the requested analysis.",
+            "  Supporting detail.",
+            "⚠ Selected model is at capacity. Please try a different model.",
+            "› ",
+        ]
+        provider = self._p()
+
+        assert (
+            provider.classify_idle_reason(rows, provider.classify_screen(rows))
+            == "transient_api_error"
+        )
+
+    def test_wpq6_t_label_style_assistant_quote_is_conversational(self):
+        rows = [
+            "assistant: The documentation mentions a usage limit.",
+            "429 Too Many Requests",
+        ]
+        provider = self._p()
+
+        assert provider.classify_idle_reason(rows, provider.classify_screen(rows)) is None
+
+    def test_wpq6_u_system_notice_bullet_is_conversational(self):
+        rows = ["• You have 3 usage limit resets available. Run /usage to use one."]
+        provider = self._p()
+
+        assert provider.classify_idle_reason(rows, provider.classify_screen(rows)) is None
+
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            ["• Example response:", "403 Forbidden", "authentication required"],
+            ["assistant: Documentation example", "429 Too Many Requests"],
+            ["› 123 usage limit examples to document"],
+            ["assistant: 200 OK", "  usage limit metadata follows"],
+        ],
+    )
+    def test_wpq6_v_status_shaped_conversation_is_not_a_banner(self, rows):
+        provider = self._p()
+
+        assert provider.classify_idle_reason(rows, provider.classify_screen(rows)) is None
+
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            ["• Ran rg for examples", "  Error: stream disconnected is the quoted text"],
+            [
+                "• Ran rg for examples",
+                "  ⚠ Selected model is at capacity is the quoted text",
+            ],
+            ["  ⚠ Selected model is at capacity", "› ", "  gpt-5.6-sol high · ~/project"],
+            ["  Error: stream disconnected"],
+        ],
+    )
+    def test_wpq6_w_indented_continuations_never_start_banners(self, rows):
+        provider = self._p()
+        classification = provider.classify_screen(rows)
+
+        assert provider.classify_idle_reason(rows, classification) is None
+
+    def test_wpq6_w_cropped_capacity_quote_is_not_transient(self):
+        rows = [
+            "  ⚠ Selected model is at capacity",
+            "› ",
+            "  gpt-5.6-sol high · ~/project",
+        ]
+        provider = self._p()
+        classification = provider.classify_screen(rows)
+
+        assert not provider.transient_error_detected(rows, classification)
+
+    def test_wpq6_probe_meta_transports_idle_reason_from_final_frame(self):
+        rows = [
+            "⚠ Selected model is at capacity. Please try a different model.",
+            "› ",
+            "  gpt-5.6-sol high · ~/project",
+        ]
+        provider = self._p()
+        monitor = StatusMonitor()
+        monitor._screens["test1234"] = (  # noqa: SLF001 - acceptance probes final rows
+            SimpleNamespace(display=rows, columns=120, lines=3),
+            object(),
+        )
+        backend = MagicMock(supports_identity_readback=False)
+        backend.capture_viewport.return_value = "\n".join(rows)
+        backend.get_pane_size.return_value = (120, 3)
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
+                return_value=provider,
+            ),
+            patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+            patch(
+                "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+                return_value={"tmux_session": "test-session", "tmux_window": "window-0"},
+            ),
+        ):
+            status, meta = monitor.probe_screen_status("test1234")
+
+        assert status == TerminalStatus.IDLE
+        assert meta["transient_api_error"] is True
+        assert meta["idle_reason"] == "transient_api_error"
+        backend.capture_viewport.assert_called_once_with("test-session", "window-0")
 
 
 class TestCodexComposerDraftParsing:

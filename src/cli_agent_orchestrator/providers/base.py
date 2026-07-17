@@ -255,6 +255,12 @@ class BaseProvider(ABC):
         """Return whether a final proven frame is eligible for transient recovery."""
         return False
 
+    def classify_idle_reason(
+        self, rows: List[str], classification: ScreenClassificationResult
+    ) -> str | None:
+        """Classify an idle frame for watchdog reporting without backend I/O."""
+        return None
+
     # Opt-in flag for preserving an unsent human composer draft before CAO
     # injects orchestrated input. Providers that set this True must implement
     # read_composer_draft() against rendered screen lines and provide a single
