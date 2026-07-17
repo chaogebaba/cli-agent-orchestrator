@@ -748,10 +748,31 @@ def test_d5_insert_and_second_callback_read_hold_delivery_lock(monkeypatch):
 
 def test_d5_finalize_exits_while_delivery_lock_held(monkeypatch):
     service, metadata = _armed()
-    delivery_lock = threading.Lock()
     callback_reads = 0
     finalize_armed = False
-    finalize_exits = []
+    finalize_exited = False
+
+    class TrackingDeliveryLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._acquire_count = 0
+
+        def acquire(self, *args, **kwargs):
+            if self._acquire_count == 0:
+                assert not service._lock._is_owned()
+            acquired = self._lock.acquire(*args, **kwargs)
+            if acquired:
+                self._acquire_count += 1
+            return acquired
+
+        def release(self):
+            assert finalize_exited is True
+            return self._lock.release()
+
+        def locked(self):
+            return self._lock.locked()
+
+    delivery_lock = TrackingDeliveryLock()
 
     class FinalizeExitProbe:
         def __init__(self, lock):
@@ -771,16 +792,15 @@ def test_d5_finalize_exits_while_delivery_lock_held(monkeypatch):
             return self
 
         def __exit__(self, exc_type, exc, traceback):
-            nonlocal finalize_armed
-            try:
-                if finalize_armed:
-                    assert self._lock._is_owned()
-                    assert delivery_lock.locked()
-                    finalize_exits.append(True)
-                    finalize_armed = False
-            finally:
-                self._lock.__exit__(exc_type, exc, traceback)
-            return False
+            nonlocal finalize_armed, finalize_exited
+            if not finalize_armed:
+                return self._lock.__exit__(exc_type, exc, traceback)
+            assert self._lock._is_owned()
+            result = self._lock.__exit__(exc_type, exc, traceback)
+            assert not self._lock._is_owned()
+            finalize_exited = True
+            finalize_armed = False
+            return result
 
     def callback_status(*_args):
         nonlocal callback_reads, finalize_armed
@@ -821,7 +841,7 @@ def test_d5_finalize_exits_while_delivery_lock_held(monkeypatch):
 
     assert service.collect_due_notifications(now=13.0) == []
     assert callback_reads == 2
-    assert finalize_exits == [True]
+    assert finalize_exited is True
     assert not delivery_lock.locked()
 
 
