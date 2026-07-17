@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from cli_agent_orchestrator.backends.base import PaneIdentityReadResult
 from cli_agent_orchestrator.clients import database
@@ -537,6 +537,45 @@ def test_wpq1_logical_proof1_token_equals_routed_generation_for_null_and_nonnull
         service.deliver_pending("receiver")
 
     assert service._identity_authority[("receiver", "7")].count == 1
+    assert get_message_trace(message_id)["attempts"] == []
+
+
+def test_wpq1_logical_proof1_keeps_pre_rollback_generation_during_immediate_rollover(
+    wave4_db, monkeypatch
+):
+    message_id = _logical_identity_message(wave4_db, None)
+    rolled = False
+
+    class RolloverSession(Session):
+        def rollback(self):
+            nonlocal rolled
+            super().rollback()
+            if not rolled:
+                rolled = True
+                with wave4_db.begin() as writer:
+                    writer.get(database.MailboxModel, "mb_identity").generation = 8
+
+    routed_sessions = sessionmaker(
+        bind=wave4_db.kw["bind"], class_=RolloverSession, expire_on_commit=True
+    )
+    monkeypatch.setattr(mailbox_service_module, "SessionLocal", routed_sessions)
+    service = InboxService()
+    monitor = _identity_monitor()
+
+    with (
+        patch("cli_agent_orchestrator.services.inbox_service.status_monitor", monitor),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
+            return_value=MagicMock(),
+        ),
+    ):
+        service.deliver_pending("receiver")
+
+    assert rolled is True
+    with wave4_db() as db:
+        assert db.get(database.MailboxModel, "mb_identity").generation == 8
+    assert service._identity_authority[("receiver", "7")].count == 1
+    assert ("receiver", "8") not in service._identity_authority
     assert get_message_trace(message_id)["attempts"] == []
 
 

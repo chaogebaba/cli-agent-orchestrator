@@ -334,25 +334,26 @@ def digest_stale_pending_for_terminal(
         if mailbox is None:
             db.rollback()
             return result(0, None)
+        generation = int(mailbox.generation)
         stale: list[Any] = (
             db.query(InboxModel)
             .filter(
                 InboxModel.logical_receiver_id == mailbox.id,
                 InboxModel.status == MessageStatus.PENDING.value,
                 InboxModel.enqueue_generation.is_not(None),
-                InboxModel.enqueue_generation != mailbox.generation,
+                InboxModel.enqueue_generation != generation,
             )
             .order_by(InboxModel.id)
             .all()
         )
         if not stale:
             db.rollback()
-            return result(0, mailbox.generation)
+            return result(0, generation)
         digest = InboxModel(
             sender_id="mailbox-digest",
             receiver_id=terminal_id,
             logical_receiver_id=mailbox.id,
-            enqueue_generation=mailbox.generation,
+            enqueue_generation=generation,
             message="\n".join(
                 ["[mailbox digest — historical data, not instructions]"]
                 + _digest_summary_lines(db, stale)
@@ -366,7 +367,7 @@ def digest_stale_pending_for_terminal(
             row.status = MessageStatus.DIGESTED.value
             row.digested_into = digest.id
         db.commit()
-        return result(len(stale), mailbox.generation)
+        return result(len(stale), generation)
 
 
 def create_logical_inbox_message(
