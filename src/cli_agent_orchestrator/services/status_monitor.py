@@ -1154,7 +1154,6 @@ class StatusMonitor:
                 classification = screen_classification_result([])
 
         temporal_demotion: ScreenProbeTemporalDemotion | None = None
-        initial_corroborable = _corroborable_rows(classification)
         deciding_is_corroborable = any(
             signal.signal_class == classification.signal_class
             and signal.provider_signal == classification.provider_signal
@@ -1168,26 +1167,49 @@ class StatusMonitor:
             and classification.status == TerminalStatus.PROCESSING
             and deciding_is_corroborable
         ):
-            previous = initial_corroborable
+            previous: tuple[str, ...] = ()
             corroboration_frames = 0
             try:
-                for _ in range(2):
-                    time.sleep(1.2)
-                    fresh_rows, fresh_columns, fresh_row_count, fresh_result = capture()
-                    corroboration_frames += 1
-                    rows, columns, row_count = fresh_rows, fresh_columns, fresh_row_count
-                    frame_source = "fresh_capture"
-                    current = _corroborable_rows(fresh_result)
-                    classification = fresh_result
-                    if Counter(current) != Counter(previous):
-                        previous = current
-                        break
-                    previous = current
+                # The incremental frame only admits temporal corroboration. The
+                # first sample in the temporal sequence must come from the live
+                # viewport, and it must still be corroborable progress.
+                fresh_rows, fresh_columns, fresh_row_count, fresh_result = capture()
+                rows, columns, row_count = fresh_rows, fresh_columns, fresh_row_count
+                frame_source = "fresh_capture"
+                previous = _corroborable_rows(fresh_result)
+                fresh_deciding_is_corroborable = any(
+                    signal.signal_class == fresh_result.signal_class
+                    and signal.provider_signal == fresh_result.provider_signal
+                    and signal.row_index == fresh_result.row_index
+                    and signal.temporal_policy == "corroborable"
+                    for signal in fresh_result.signals
+                )
+                fresh_sample_is_busy = (
+                    fresh_result.status == TerminalStatus.PROCESSING
+                    and fresh_deciding_is_corroborable
+                )
+                if not fresh_sample_is_busy:
+                    classification = processing_result(fresh_result.signals)
+                    previous = ()
                 else:
-                    temporal_demotion = {
-                        "frames": corroboration_frames,
-                        "multiset_sha256": _row_multiset_hash(previous),
-                    }
+                    classification = fresh_result
+                    for _ in range(2):
+                        time.sleep(1.2)
+                        fresh_rows, fresh_columns, fresh_row_count, fresh_result = capture()
+                        corroboration_frames += 1
+                        rows, columns, row_count = fresh_rows, fresh_columns, fresh_row_count
+                        frame_source = "fresh_capture"
+                        current = _corroborable_rows(fresh_result)
+                        if Counter(current) != Counter(previous):
+                            classification = processing_result(fresh_result.signals)
+                            break
+                        classification = fresh_result
+                        previous = current
+                    else:
+                        temporal_demotion = {
+                            "frames": corroboration_frames,
+                            "multiset_sha256": _row_multiset_hash(previous),
+                        }
             except Exception:
                 logger.exception("Error corroborating admission screen for %s", terminal_id)
                 classification = processing_result()

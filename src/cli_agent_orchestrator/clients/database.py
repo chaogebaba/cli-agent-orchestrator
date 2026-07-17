@@ -1591,10 +1591,14 @@ def recover_transcript_binding_if_current(
     terminal_id: str, stale_binding_id: int, transcript_path: str
 ) -> str:
     """CAS-mint a server recovery epoch against the still-current stale binding."""
+
+    class _ObjectPairs(list[tuple[str, Any]]):
+        pass
+
     try:
         with Path(transcript_path).open(encoding="utf-8") as stream:
-            pairs = json.loads(stream.readline(), object_pairs_hook=lambda value: value)
-        if not isinstance(pairs, list):
+            pairs = json.loads(stream.readline(), object_pairs_hook=_ObjectPairs)
+        if not isinstance(pairs, _ObjectPairs):
             return "invalid_session_id"
         session_values = [value for key, value in pairs if key == "sessionId"]
         if (

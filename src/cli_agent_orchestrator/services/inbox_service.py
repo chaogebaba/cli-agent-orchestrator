@@ -349,6 +349,44 @@ class InboxService:
                 receiver,
             )
 
+    def _resolve_stale_binding_prior_hits(
+        self,
+        terminal_id: str,
+        metadata: dict[str, Any],
+        prior_lookups: Sequence[tuple[dict[str, Any], str, dict[str, Any]]],
+    ) -> tuple[str, dict[str, Any] | None, dict[str, Any], str | None] | None:
+        """Resolve one presumed-stale binding before any new attempt can open."""
+        if not any(result == "absent" for _, result, _ in prior_lookups):
+            return None
+        stale = observe_binding_absence(metadata)
+        if stale is None or not stale.presumed_stale:
+            return None
+        for prior, _, prior_evidence in prior_lookups:
+            candidate_result, candidate_evidence, candidate = scan_binding_candidates(
+                stale,
+                prior["payload_hash"],
+                prior.get("started_at"),
+                prior_evidence,
+            )
+            if candidate_result != "hit" or candidate is None:
+                continue
+            recovery = recover_transcript_binding_if_current(
+                terminal_id, stale.binding_id, str(candidate)
+            )
+            if recovery == "authority_changed":
+                refreshed, refreshed_evidence = _wpm2_lookup(
+                    metadata,
+                    prior["payload_hash"],
+                    prior.get("started_at"),
+                    prior_evidence,
+                )
+                if refreshed == "hit":
+                    return "hit", prior, refreshed_evidence, None
+                return "authority_changed", None, {}, None
+            return "hit", prior, candidate_evidence, str(candidate)
+        self._record_binding_authority_failure(terminal_id, stale.binding_id, metadata)
+        return "suppressed", None, {}, None
+
     def _evict_defer_state(self, messages) -> None:
         with self._defer_lock:
             for message in messages:
@@ -478,6 +516,8 @@ class InboxService:
         provider,
         sender_id: str,
         orchestration_type: OrchestrationType,
+        *,
+        observe_binding_staleness: bool = True,
     ) -> tuple[str, object | None]:
         """Return normal, stop, or inject for a frozen-law gated batch."""
         message_ids = [message.id for message in batch]
@@ -522,6 +562,7 @@ class InboxService:
         now_z = now.isoformat().replace("+00:00", "Z")
 
         lookup_result = "unresolved"
+        prior_lookups: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
         for prior in reversed(ambiguous):
             prior_evidence = decoded[prior["attempt_uuid"]]
             lookup_result, lookup_evidence = _wpm2_lookup(
@@ -530,6 +571,7 @@ class InboxService:
                 prior.get("started_at"),
                 prior_evidence,
             )
+            prior_lookups.append((prior, lookup_result, prior_evidence))
             if lookup_result == "hit":
                 result = settle_wpm1_terminal_batch(
                     message_ids,
@@ -559,6 +601,25 @@ class InboxService:
                 if advanced not in {"advanced", "already_advanced"}:
                     return "stop", None
                 prior_evidence["last_observed_ref"] = lookup_evidence["last_observed_ref"]
+
+        stale_resolution = (
+            self._resolve_stale_binding_prior_hits(terminal_id, metadata, prior_lookups)
+            if observe_binding_staleness
+            else None
+        )
+        if stale_resolution is not None:
+            state, stale_prior, stale_evidence, _ = stale_resolution
+            if state == "hit" and stale_prior is not None:
+                settle_wpm1_terminal_batch(
+                    message_ids,
+                    MessageStatus.DELIVERED,
+                    terminal_id,
+                    confirmation_evidence=(stale_prior["attempt_uuid"], stale_evidence),
+                    on_confirmed=lambda: self._commit_watchdog_ops(
+                        terminal_id, sender_id, orchestration_type, metadata
+                    ),
+                )
+            return "stop", None
 
         try:
             snapshot = status_monitor.get_boundary_observation(terminal_id)
@@ -902,7 +963,13 @@ class InboxService:
                     metadata = get_terminal_metadata(terminal_id) or {}
                     message_ids = [m.id for m in batch]
                     gate_state, gate_evidence = self._handle_wpm1_gate(
-                        terminal_id, batch, metadata, provider, sender_id, orchestration_type
+                        terminal_id,
+                        batch,
+                        metadata,
+                        provider,
+                        sender_id,
+                        orchestration_type,
+                        observe_binding_staleness=False,
                     )
                     if gate_state == "stop":
                         return
@@ -1021,56 +1088,31 @@ class InboxService:
                             )
                             return
 
-                        if any(result == "absent" for _, result, _ in prior_lookups):
-                            stale = observe_binding_absence(metadata)
-                            if stale is not None and stale.presumed_stale:
-                                for prior, _, prior_evidence in prior_lookups:
-                                    candidate_result, _, candidate = scan_binding_candidates(
-                                        stale,
-                                        prior["payload_hash"],
-                                        prior.get("started_at"),
-                                        prior_evidence,
-                                    )
-                                    if candidate_result != "hit" or candidate is None:
-                                        continue
-                                    recovery = recover_transcript_binding_if_current(
-                                        terminal_id, stale.binding_id, str(candidate)
-                                    )
-                                    if recovery == "authority_changed":
-                                        refreshed, _ = _wpm2_lookup(
-                                            metadata,
-                                            prior["payload_hash"],
-                                            prior.get("started_at"),
-                                            prior_evidence,
-                                        )
-                                        if refreshed != "hit":
-                                            self._record_binding_authority_failure(
-                                                terminal_id, stale.binding_id, metadata
-                                            )
-                                            return
-                                    won = confirm_batch_from_prior_attempt(
-                                        message_ids,
-                                        prior["attempt_uuid"],
-                                        on_confirmed=lambda: self._commit_watchdog_ops(
-                                            terminal_id,
-                                            sender_id,
-                                            orchestration_type,
-                                            metadata,
-                                        ),
-                                    )
-                                    if not won:
-                                        return
-                                    logger.info(
-                                        "Deduplicated delivery for terminal %s using recovered "
-                                        "transcript %s",
-                                        terminal_id,
-                                        candidate,
-                                    )
-                                    return
-                                self._record_binding_authority_failure(
-                                    terminal_id, stale.binding_id, metadata
-                                )
+                        stale_resolution = self._resolve_stale_binding_prior_hits(
+                            terminal_id, metadata, prior_lookups
+                        )
+                        if stale_resolution is not None:
+                            state, stale_prior, _, candidate = stale_resolution
+                            if state != "hit" or stale_prior is None:
                                 return
+                            won = confirm_batch_from_prior_attempt(
+                                message_ids,
+                                stale_prior["attempt_uuid"],
+                                on_confirmed=lambda: self._commit_watchdog_ops(
+                                    terminal_id,
+                                    sender_id,
+                                    orchestration_type,
+                                    metadata,
+                                ),
+                            )
+                            if not won:
+                                return
+                            logger.info(
+                                "Deduplicated delivery for terminal %s using %s authority",
+                                terminal_id,
+                                candidate or "refreshed binding",
+                            )
+                            return
 
                         ambiguous = [
                             prior
@@ -1633,7 +1675,7 @@ class InboxService:
                     )
                 except Exception:
                     final_liveness = "error"
-                if final_liveness != "gone":
+                if final_liveness not in {"gone", "live"}:
                     continue
                 gone_result = settle_pending_receiver_gone_if_generation(
                     terminal_id, captured_generation
