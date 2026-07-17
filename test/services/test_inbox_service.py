@@ -662,7 +662,7 @@ class TestEagerInboxDelivery:
             / "03-idle-false-positive-2.1.209.plain.txt"
         ).read_text(encoding="utf-8")
         provider = ClaudeCodeProvider("t1", "session", "window")
-        provider._resolve_native_status = lambda: None  # type: ignore[method-assign]
+        provider._resolve_native_status = lambda *_: None  # type: ignore[method-assign]
         with patch(
             "cli_agent_orchestrator.services.status_monitor.status_monitor.get_rendered_screen",
             return_value=frame.splitlines(),

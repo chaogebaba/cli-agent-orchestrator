@@ -68,6 +68,10 @@ class TestPluginRegistryLifespan:
                 "cli_agent_orchestrator.api.main.terminal_service.purge_stale_terminal_records",
                 return_value=0,
             ),
+            patch(
+                "cli_agent_orchestrator.services.memory_reconciliation.reconcile_memory_startup",
+                return_value=None,
+            ),
             patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
             patch(
                 "cli_agent_orchestrator.api.main.cleanup_expired_memories", new_callable=AsyncMock
@@ -111,6 +115,10 @@ class TestPluginRegistryLifespan:
                 "cli_agent_orchestrator.api.main.terminal_service.purge_stale_terminal_records",
                 return_value=0,
             ),
+            patch(
+                "cli_agent_orchestrator.services.memory_reconciliation.reconcile_memory_startup",
+                return_value=None,
+            ),
             patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
             patch(
                 "cli_agent_orchestrator.api.main.cleanup_expired_memories", new_callable=AsyncMock
@@ -153,6 +161,10 @@ class TestPluginRegistryLifespan:
             patch(
                 "cli_agent_orchestrator.api.main.terminal_service.purge_stale_terminal_records",
                 return_value=0,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.memory_reconciliation.reconcile_memory_startup",
+                return_value=None,
             ),
             patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
             patch(

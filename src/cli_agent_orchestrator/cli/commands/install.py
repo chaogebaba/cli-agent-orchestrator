@@ -67,7 +67,8 @@ def _copy_local_profile_to_store(agent_source: str) -> Optional[str]:
     type=click.Choice(PROVIDERS),
     default=None,
     help=(
-        "Provider to use (default: profile frontmatter `provider:`, " f"else {DEFAULT_PROVIDER})"
+        "Provider to use. Precedence: this flag > the profile's frontmatter "
+        f"'provider:' key > default ({DEFAULT_PROVIDER})."
     ),
 )
 @click.option(
@@ -142,4 +143,8 @@ def install(agent_source: str, provider: Optional[str], env_vars: tuple[str, ...
     if result.context_file:
         click.echo(f"✓ Context file: {result.context_file}")
     if result.agent_file:
-        click.echo(f"✓ {provider} agent: {result.agent_file}")
+        # The service resolves flag > frontmatter > default; result.provider
+        # carries the winner (older mocks may omit it, hence the fallback).
+        click.echo(
+            f"✓ {result.provider or provider or DEFAULT_PROVIDER} agent: {result.agent_file}"
+        )

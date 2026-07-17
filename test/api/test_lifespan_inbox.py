@@ -119,6 +119,12 @@ def _patched_lifespan(backend: object, tasks: list):
                 return_value=0,
             )
         )
+        stack.enter_context(
+            patch(
+                "cli_agent_orchestrator.services.memory_reconciliation.reconcile_memory_startup",
+                return_value=None,
+            )
+        )
         patch_main("cleanup_old_data")
         patch_main("flow_daemon", new=_fake_flow_daemon)
         patch_main("opencode_inbox_delivery_daemon", new=_fake_opencode_daemon)

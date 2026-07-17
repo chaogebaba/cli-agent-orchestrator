@@ -642,6 +642,30 @@ async def test_cancel_terminal_run_conflict(monkeypatch):
         ws.cancel_run("runDone")
 
 
+
+
+
+
+@pytest.mark.asyncio
+async def test_double_cancel_is_idempotent(monkeypatch):
+    """Cancelling twice while a step is in flight must not raise (setting an
+    already-set Event is a no-op) and still converges CANCELLED."""
+
+    async def _side(*a, **kw):
+        run_id = kw["env_vars"]["CAO_WORKFLOW_RUN_ID"]
+        ws.cancel_run(run_id)
+        ws.cancel_run(run_id)  # second cancel — must be a no-op, never raise
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    steps = [
+        WorkflowStep(id="s1", provider="p", agent="g", prompt="a"),
+        WorkflowStep(id="s2", provider="p", agent="g", prompt="b"),
+    ]
+    res = await ws.start_run(_spec(steps=steps), {}, "runDbl")
+    assert res.state == RunState.CANCELLED
+
+
 # ---------------------------------------------------------------------------
 # get_run_status
 # ---------------------------------------------------------------------------
@@ -724,3 +748,91 @@ async def test_bad_run_id_rejected(monkeypatch):
     monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
     with pytest.raises(ValueError):
         await ws.start_run(_spec(), {}, "../escape")
+
+
+# ---------------------------------------------------------------------------
+# Unit A — _validate_inputs generalized over both spec tiers (ADR-1, BR-A8)
+# ---------------------------------------------------------------------------
+class _FakeScriptSpecInputs:
+    """Minimal duck-typed spec exposing only ``.inputs`` (the Protocol surface)."""
+
+    def __init__(self, inputs):
+        self.inputs = inputs
+
+
+def test_validate_inputs_scriptspec_fills_defaults_and_types():
+    from cli_agent_orchestrator.models.workflow import InputDecl
+
+    spec = _FakeScriptSpecInputs(
+        {
+            "topic": InputDecl(type="string", required=True),
+            "count": InputDecl(type="int", default=5),
+        }
+    )
+    resolved = ws._validate_inputs(spec, {"topic": "birds"})
+    # Default filled for the omitted, non-required input; provided value kept.
+    assert resolved == {"topic": "birds", "count": 5}
+
+
+def test_validate_inputs_scriptspec_rejects_undeclared():
+    from cli_agent_orchestrator.models.workflow import InputDecl
+
+    spec = _FakeScriptSpecInputs({"topic": InputDecl(type="string")})
+    with pytest.raises(ValueError, match="unknown input 'bogus'"):
+        ws._validate_inputs(spec, {"topic": "x", "bogus": 1})
+
+
+def test_validate_inputs_scriptspec_type_mismatch_rejected():
+    from cli_agent_orchestrator.models.workflow import InputDecl
+
+    spec = _FakeScriptSpecInputs({"count": InputDecl(type="int", required=True)})
+    with pytest.raises(ValueError, match="must be an int"):
+        ws._validate_inputs(spec, {"count": "not-an-int"})
+
+
+def test_validate_inputs_scriptspec_missing_required_rejected():
+    from cli_agent_orchestrator.models.workflow import InputDecl
+
+    spec = _FakeScriptSpecInputs({"topic": InputDecl(type="string", required=True)})
+    with pytest.raises(ValueError, match="missing required input 'topic'"):
+        ws._validate_inputs(spec, {})
+
+
+def test_validate_inputs_yaml_behavior_unchanged_regression():
+    """BR-A8/REL-A4: generalizing the signature must not change WorkflowSpec
+    (YAML) validation — a real WorkflowSpec resolves exactly as before."""
+    from cli_agent_orchestrator.models.workflow import InputDecl
+
+    spec = _spec()
+    spec.inputs = {
+        "topic": InputDecl(type="string", required=True),
+        "count": InputDecl(type="int", default=7),
+        "flag": InputDecl(type="bool", default=True),
+    }
+    resolved = ws._validate_inputs(spec, {"topic": "t"})
+    assert resolved == {"topic": "t", "count": 7, "flag": True}
+    # And the same rejection semantics hold for the YAML tier.
+    with pytest.raises(ValueError, match="unknown input"):
+        ws._validate_inputs(spec, {"topic": "t", "extra": 1})
+
+
+@pytest.mark.asyncio
+async def test_cancel_at_boundary_skips_remaining(monkeypatch):
+    """Cancel observed at a step boundary -> CANCELLED + remaining PENDING SKIPPED."""
+
+    async def _side(*a, **kw):
+        # Cancel the run while step s1 is "in flight" so the flag is seen at the
+        # NEXT boundary.
+        ws.cancel_run("runCancel")
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    steps = [
+        WorkflowStep(id="s1", provider="p", agent="g", prompt="a"),
+        WorkflowStep(id="s2", provider="p", agent="g", prompt="b"),
+    ]
+    res = await ws.start_run(_spec(steps=steps), {}, "runCancel")
+    assert res.state == RunState.CANCELLED
+    states = {s.id: s.state for s in res.steps}
+    assert states["s1"] == StepState.COMPLETED  # in-flight step ran to completion
+    assert states["s2"] == StepState.SKIPPED

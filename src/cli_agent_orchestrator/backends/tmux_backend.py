@@ -216,6 +216,10 @@ class TmuxBackend(TerminalBackend):
 
         subprocess.run(tmux_argv("attach-session", "-t", session_name), check=True)
 
+    def prepare_web_attach(self, session_name: str, window_name: str) -> List[str]:
+        """Return the tmux command used by the browser PTY WebSocket."""
+        return tmux_argv("-u", "attach-session", "-t", f"{session_name}:{window_name}")
+
     # --- Pipe-pane ---
 
     def pipe_pane(self, session_name: str, window_name: str, file_path: str) -> None:

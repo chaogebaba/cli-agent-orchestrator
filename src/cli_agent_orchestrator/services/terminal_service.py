@@ -53,7 +53,12 @@ from cli_agent_orchestrator.clients.database import (
     update_provider_session_snapshot,
     update_terminal_shell_command,
 )
-from cli_agent_orchestrator.constants import FIFO_DIR, SESSION_PREFIX, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.constants import (
+    FIFO_DIR,
+    PIPE_LIVENESS_TAIL_LINES,
+    SESSION_PREFIX,
+    TERMINAL_LOG_DIR,
+)
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
@@ -588,7 +593,9 @@ async def create_terminal(
             ``new_session=False``, persisted session vars provide the shared
             session floor and explicit ``env_vars`` are overlaid for the new
             window only, with explicit values winning on collision. The overlay
-            is not persisted for later windows. See issue #248.
+            is not persisted for later windows. Per-step vars (e.g. workflow
+            routing ids) must reach the window even inside an existing session.
+            See issues #248 and #408.
         caller_id: Terminal ID of the supervisor that created this terminal
             via handoff/assign. Recorded so send_message can route callbacks
             structurally instead of parsing IDs out of message text (issue #284).
@@ -776,9 +783,24 @@ async def create_terminal(
         # socket events and their pipe_pane is a no-op, so skip the FIFO there and
         # rely on the herdr inbox registration below.
         if not get_backend().supports_event_inbox():
+            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+
             # Reader must exist BEFORE pipe-pane starts so it captures from the start.
+            # Enroll it in the pipe-pane liveness watchdog (issue #388).
+            def _probe_pane(s=session_name, w=window_name) -> str:
+                return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+
+            def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
+                get_backend().stop_pipe_pane(s, w)
+                get_backend().pipe_pane(s, w, p)
+
             try:
-                fifo_manager.create_reader(terminal_id)
+                try:
+                    fifo_manager.create_reader(
+                        terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe
+                    )
+                except TypeError:
+                    fifo_manager.create_reader(terminal_id)
                 fifo_attached = True
             except Exception as exc:
                 if lease_token is not None:
@@ -789,7 +811,6 @@ async def create_terminal(
             # real-time event-driven processing via StatusMonitor and LogWriter
             # (LogWriter writes TERMINAL_LOG_DIR/{id}.log from the FIFO). A pane
             # has a single pipe-pane target, so we pipe ONLY to the FIFO.
-            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
             try:
                 get_backend().pipe_pane(session_name, window_name, str(fifo_path))
             except Exception as exc:
@@ -2582,17 +2603,33 @@ def send_input(
                 )
         logger.info(f"Sent input to terminal: {terminal_id}")
         if registry is not None and sender_id is not None and orchestration_type is not None:
-            dispatch_plugin_event(
-                registry,
-                "post_send_message",
-                PostSendMessageEvent(
-                    session_id=metadata["tmux_session"],
-                    sender=sender_id,
-                    receiver=terminal_id,
-                    message=original_message,
-                    orchestration_type=orchestration_type,
-                ),
+            # Telemetry (opt-in; no-ops without the [otel] extra or when the SDK
+            # is disabled): record a GenAI ``execute_tool`` span for the dispatch,
+            # count it, and propagate the active trace context into the plugin
+            # event so downstream consumers can continue the trace.
+            from cli_agent_orchestrator.telemetry import (
+                execute_tool_span,
+                inject_traceparent,
+                record_orchestration_dispatch,
             )
+
+            with execute_tool_span(
+                f"send_message:{orchestration_value}",
+                conversation_id=metadata["tmux_session"],
+            ):
+                record_orchestration_dispatch(orchestration_value)
+                dispatch_plugin_event(
+                    registry,
+                    "post_send_message",
+                    PostSendMessageEvent(
+                        session_id=metadata["tmux_session"],
+                        sender=sender_id,
+                        receiver=terminal_id,
+                        message=original_message,
+                        orchestration_type=orchestration_type,
+                        traceparent=inject_traceparent(),
+                    ),
+                )
         return True
 
     except Exception as e:

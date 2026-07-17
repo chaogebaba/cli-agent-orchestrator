@@ -750,8 +750,8 @@ async def test_claude_failed_refresh_maps_named_error_and_rolls_back(
         claude_code, "wait_until_status", lambda *a, **k: asyncio.sleep(0, result=False)
     )
     monkeypatch.setattr(provider, "_ensure_skip_bypass_prompt_setting", lambda: None)
-    monkeypatch.setattr(provider, "_build_claude_command", lambda: "claude")
-    monkeypatch.setattr(provider, "_handle_startup_prompts", lambda: None)
+    monkeypatch.setattr(provider, "_build_claude_command", lambda *_: "claude")
+    monkeypatch.setattr(provider, "_handle_startup_prompts", lambda *_a, **_k: None)
 
     class Backend:
         def send_keys(self, *args: Any) -> None:

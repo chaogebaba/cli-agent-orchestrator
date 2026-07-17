@@ -23,7 +23,7 @@ def _read(name: str) -> str:
 
 def _provider() -> ClaudeCodeProvider:
     provider = ClaudeCodeProvider("issue405", "session", "window")
-    provider._resolve_native_status = lambda: None  # type: ignore[method-assign]
+    provider._resolve_native_status = lambda *_: None  # type: ignore[method-assign]
     return provider
 
 

@@ -7,7 +7,7 @@
 │[39m                      [38;5;174m▝▜[48;5;16m█████[49m▛▘[39m                     [2m[38;5;174m│[0m Added an auto mode rule that blocks tampering with session transcript files                                                 [38;5;174m│
 │[39m                      [38;5;174m  ▘▘ ▝▝  [39m                     [2m[38;5;174m│[0m Fixed `--json-schema` silently producing unstructured output when the schema was invalid, and schemas using the `format` k… [38;5;174m│
 │[39m     [38;5;246mFable 5 with medium effort · Claude Pro · [39m     [2m[38;5;174m│[0m Fixed a message sent while Claude was working being silently lost when the turn ended at the `--max-turns` limit            [38;5;174m│
-│[39m     [38;5;246mlucas89chen@gmail.com's Organization[39m           [2m[38;5;174m│[0m [3m[38;5;246m/release-notes for more[0m                                                                                                     [38;5;174m│
+│[39m     [38;5;246muser@example.com's Organization[39m           [2m[38;5;174m│[0m [3m[38;5;246m/release-notes for more[0m                                                                                                     [38;5;174m│
 │[39m          [38;5;246m~/VScode_projects/cli-subagents[39m           [2m[38;5;174m│[0m                                                                                                                             [38;5;174m│
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 

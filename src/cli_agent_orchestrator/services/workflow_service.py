@@ -29,7 +29,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Set, Union
 
 if TYPE_CHECKING:  # avoid a runtime circular import (script_runner imports this module)
     from cli_agent_orchestrator.services.script_runner import ScriptRunRecord
@@ -41,6 +41,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_STEP_TIMEOUT,
 )
 from cli_agent_orchestrator.models.workflow import (
+    InputDecl,
     NotBuiltYetError,
     RunState,
     StepState,
@@ -55,7 +56,10 @@ from cli_agent_orchestrator.models.workflow_runtime import (
     WorkflowRunResult,
 )
 from cli_agent_orchestrator.services import workflow_journal
-from cli_agent_orchestrator.services.agent_step import StepExecutionError, run_agent_step
+from cli_agent_orchestrator.services.agent_step import (
+    StepExecutionError,
+    run_agent_step,
+)
 from cli_agent_orchestrator.services.step_output_store import (
     _validate_key_part,
     step_output_store,
@@ -112,14 +116,11 @@ class StaleGenerationError(ValueError):
 
 
 class ReplayDivergenceError(Exception):
-    """A resumed script call's fingerprint diverged from its journaled row (A2, DR-4).
+    """The reserved replay lookup found a fingerprint mismatch (A2, DR-4).
 
-    U3 addition (issue #312, script-tier journal extension, C3). NOT a
-    ``ValueError`` / NOT mapped to an HTTP status at the resume route boundary
-    (business-rules "Error-to-status mapping" table) — the script changed between
-    runs at the same ``(run_id, step_id)`` key, so resume cannot honor the replay
-    determinism contract (ADR-5). The run is failed loudly (state -> FAILED,
-    surfaced in the run result), never silently re-executed.
+    U3 addition (issue #312, script-tier journal extension, C3). The current
+    run-step route does not call ``lookup_replay``, so this exception is not
+    mapped at an HTTP boundary or surfaced by script resume today.
     """
 
 
@@ -446,7 +447,19 @@ def _reprompt_prompt(step: WorkflowStep) -> str:
 # ---------------------------------------------------------------------------
 # §2/§3 — input validation, topo-sort, the two nested loops
 # ---------------------------------------------------------------------------
-def _validate_inputs(spec: WorkflowSpec, inputs: Dict[str, Any]) -> Dict[str, Any]:
+class _HasInputs(Protocol):
+    """Structural type for anything carrying a typed ``inputs`` declaration map.
+
+    Both ``WorkflowSpec`` (YAML tier) and ``ScriptSpec`` (script tier, Unit A)
+    satisfy this — they expose ``inputs: Dict[str, InputDecl]``. Widening
+    ``_validate_inputs`` to this Protocol (ADR-1, FR-A2) lets ONE validator serve
+    both tiers with no ``isinstance`` branch and no behavior change to either.
+    """
+
+    inputs: Dict[str, "InputDecl"]
+
+
+def _validate_inputs(spec: _HasInputs, inputs: Dict[str, Any]) -> Dict[str, Any]:
     """Validate ``inputs`` against ``spec.inputs`` BEFORE any step runs (B3-BR-2).
 
     Every required input must be present; each value must match its declared type;
@@ -787,6 +800,37 @@ async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRes
 
 
 # ---------------------------------------------------------------------------
+# U5 addition (issue #312, RunSurface, C4/C1 boundary) — shared run-admission
+# pre-check (BR-9a), extracted from start_run's own inline checks so the YAML
+# arm (start_run, below) and the script arm (U5's run route,
+# ``run_script_workflow`` has no admission check of its own) share ONE
+# implementation, never two that could drift.
+# ---------------------------------------------------------------------------
+def _check_run_id_available(run_id: str) -> None:
+    """Raise ``KeyError`` if ``run_id`` is already claimed, by either tier.
+
+    Checks, in order: (1) a live in-process record (``run_registry``) or an
+    in-flight drive (``_active_drives``); (2) a best-effort durable journal
+    read — a restart-survived remnant's ``run_id`` must not be silently
+    reused to open a second drive under an old id. The journal read is
+    wrapped in a broad, best-effort catch (a broken journal must never block
+    a NEW run, B4-BR-5) — never a substitute for the engine's own admission,
+    just the sole gate ahead of it (BR-9a).
+    """
+    if run_id in run_registry or run_id in _active_drives:
+        raise KeyError(f"run_id '{run_id}' already exists")
+    try:
+        existing_row = workflow_journal.get_run(run_id)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — journal read is best-effort; a broken journal must not block new runs (B4-BR-5)
+        logger.debug("journal: _check_run_id_available('%s') failed; proceeding: %s", run_id, e)
+        existing_row = None
+    if existing_row is not None:
+        raise KeyError(f"run_id '{run_id}' already exists")
+
+
+# ---------------------------------------------------------------------------
 # §1 — start_run entry point
 # ---------------------------------------------------------------------------
 async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> WorkflowRunResult:
@@ -803,24 +847,12 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
     (-> reserved seam) for a non-sequential mode, ``WorkflowEngineError`` (-> 500)
     on an engine-internal invariant violation (e.g. a bad template reference).
     """
-    # 1. Validate run_id via the shared key validator (B3-BR-1).
+    # 1. Validate run_id via the shared key validator (B3-BR-1), then the
+    # shared admission pre-check (U5, BR-9a) — extracted below so both the
+    # YAML arm (here) and the script arm (U5's run route) share ONE
+    # implementation, never two that can drift.
     _validate_key_part(run_id, "run_id")
-    if run_id in run_registry or run_id in _active_drives:
-        raise KeyError(f"run_id '{run_id}' already exists")
-    # A durable journal row also claims the id: after a restart the registry is
-    # empty, but re-using an old run_id must NOT overwrite its journal history.
-    # Best-effort read only — a broken journal must never block NEW runs.
-    # Read stays on-loop deliberately: a small point read via the sync helper
-    # shared with the sync status path.
-    try:
-        existing_row = workflow_journal.get_run(run_id)
-    except (
-        Exception
-    ) as e:  # noqa: BLE001 — journal read is best-effort; a broken journal must not block new runs (B4-BR-5)
-        logger.debug("journal: start_run get_run('%s') failed; proceeding: %s", run_id, e)
-        existing_row = None
-    if existing_row is not None:
-        raise KeyError(f"run_id '{run_id}' already exists")
+    _check_run_id_available(run_id)
 
     # 2. Validate inputs BEFORE any side effect (B3-BR-2 / FR-1.5, fail fast).
     resolved_inputs = _validate_inputs(spec, inputs)
@@ -934,11 +966,29 @@ def get_run_status(run_id: str) -> RunStatus:
     """
     record = run_registry.get(run_id)
     if record is None:
-        # Cache miss (cold read / after a restart): rebuild from the journal ONCE,
-        # then re-populate the cache (§2, B4-BR-4). A genuinely-absent run (absent
-        # from BOTH cache and journal) raises KeyError -> 404 (F1, contract
-        # unchanged). The rebuild returns None on absent and NEVER raises ValueError
-        # on this status read path.
+        # Cache miss (cold read / after a restart). U5-Q1=A: a script-tier run's
+        # cold-miss fallback must NOT attempt ``_rebuild_record_from_journal``
+        # (YAML-only, ``WorkflowSpec.model_validate_json`` would corrupt-degrade
+        # a ScriptSpec snapshot) — short-circuit to the journal row's last-known
+        # state directly, without the fast path gaining any new dispatch branch.
+        row = None
+        try:
+            row = workflow_journal.get_run(run_id)
+        except (
+            Exception
+        ) as e:  # noqa: BLE001 — journal read is best-effort on a status read (B4-RD-4)
+            logger.debug("journal: get_run('%s') failed on cold status read: %s", run_id, e)
+        if row is not None and row.tier == "script":
+            return RunStatus(
+                run_id=row.run_id,
+                state=RunState(row.state),
+                current_step_id=row.current_step_id,
+                steps=[],
+            )
+        # Rebuild from the journal ONCE, then re-populate the cache (§2, B4-BR-4).
+        # A genuinely-absent run (absent from BOTH cache and journal) raises
+        # KeyError -> 404 (F1, contract unchanged). The rebuild returns None on
+        # absent and NEVER raises ValueError on this status read path.
         record = _rebuild_record_from_journal(run_id)
         if record is not None:
             run_registry[run_id] = record

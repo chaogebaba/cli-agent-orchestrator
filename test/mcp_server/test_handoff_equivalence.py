@@ -7,9 +7,13 @@ shared run_agent_step substrate:
   - the handoff path: ``_handoff_impl`` -> ``POST /terminals/run-step`` ->
     ``run_agent_step(...)`` (the MCP client's six-call loop collapsed to one).
 
-Both must produce the same ordered terminal-layer calls (create -> send_input
--> wait COMPLETED -> get_output LAST -> delete). No latency assertion (Q7=A):
-equivalence is proven functionally, not by timing.
+Both must produce the same ordered terminal-layer calls (create -> readiness
+wait -> send_input -> completion poll -> get_output LAST -> delete). No latency
+assertion (Q7=A): equivalence is proven functionally, not by timing.
+
+Completion is a ``status_monitor.get_status`` poll (issue #409a: a post-input
+IDLE is a valid completion signal alongside COMPLETED), NOT a second
+``wait_until_status`` call — the recorder captures that poll as ``"poll"``.
 """
 
 import asyncio

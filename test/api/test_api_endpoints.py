@@ -1280,6 +1280,10 @@ class TestLifespan:
                 "cli_agent_orchestrator.api.main.terminal_service.recover_deferred_inits",
                 side_effect=recover_deferred,
             ),
+            patch(
+                "cli_agent_orchestrator.services.memory_reconciliation.reconcile_memory_startup",
+                return_value=None,
+            ),
             patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
             patch("cli_agent_orchestrator.api.main.cleanup_expired_memories", quick_return),
             patch("cli_agent_orchestrator.api.main.flow_daemon", fake_daemon),
@@ -1371,6 +1375,10 @@ class TestLifespan:
             patch(
                 "cli_agent_orchestrator.api.main.terminal_service.purge_stale_terminal_records",
                 return_value=0,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.memory_reconciliation.reconcile_memory_startup",
+                return_value=None,
             ),
             patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
             patch("cli_agent_orchestrator.api.main.cleanup_expired_memories", quick_return),

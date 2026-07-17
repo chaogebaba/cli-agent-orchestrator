@@ -38,9 +38,26 @@ def _python_files() -> list[Path]:
     return sorted(SOURCE.rglob("*.py"))
 
 
-def _raw_tmux_calls(tree: ast.AST) -> list[ast.Call]:
-    violations: list[ast.Call] = []
+
+def _raw_tmux_argv_literal(argument: ast.AST) -> bool:
+    return (
+        isinstance(argument, (ast.List, ast.Tuple))
+        and bool(argument.elts)
+        and isinstance(argument.elts[0], ast.Constant)
+        and argument.elts[0].value == "tmux"
+    )
+
+
+def _raw_tmux_calls(tree: ast.AST) -> list[ast.AST]:
+    violations: list[ast.AST] = []
     for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Return)
+            and node.value is not None
+            and _raw_tmux_argv_literal(node.value)
+        ):
+            violations.append(node)
+            continue
         if not isinstance(node, ast.Call) or not node.args:
             continue
         function = node.func
@@ -51,13 +68,7 @@ def _raw_tmux_calls(tree: ast.AST) -> list[ast.Call]:
             and function.attr in {"run", "Popen", "call", "check_call", "check_output"}
         ):
             continue
-        argument = node.args[0]
-        if (
-            isinstance(argument, (ast.List, ast.Tuple))
-            and argument.elts
-            and isinstance(argument.elts[0], ast.Constant)
-            and argument.elts[0].value == "tmux"
-        ):
+        if _raw_tmux_argv_literal(node.args[0]):
             violations.append(node)
     return violations
 
@@ -108,7 +119,7 @@ def test_tmux_ast_guard_is_closed() -> None:
         ("backends/tmux_backend.py", "attach-session"),
         ("services/fork_context_service.py", "display-message"),
         ("cli/commands/info.py", "display-message"),
-        ("api/main.py", "-u"),
+        ("backends/tmux_backend.py", "-u"),
     ],
 )
 def test_each_legacy_tmux_site_mutation_is_killed(relative: str, command: str) -> None:

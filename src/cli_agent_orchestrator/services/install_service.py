@@ -57,6 +57,7 @@ class InstallResult(BaseModel):
     agent_file: Optional[str] = None
     unresolved_vars: Optional[List[str]] = None
     source_kind: Optional[Literal["url", "file", "name"]] = None
+    provider: Optional[str] = None
 
 
 # Profile names are used as filesystem path segments under LOCAL_AGENT_STORE_DIR
@@ -243,6 +244,11 @@ def install_agent(
 ) -> InstallResult:
     """Install an agent profile for the requested provider.
 
+    ``provider`` resolution follows the same precedence as launch/handoff
+    (see ``resolve_provider``): an explicit argument wins, then the profile's
+    frontmatter ``provider:`` key, then ``DEFAULT_PROVIDER``. Pass ``None``
+    to defer to the profile.
+
     ``source`` must be either an https:// URL on the allowlist or a bare
     profile name matching ``_PROFILE_NAME_RE``. Local ``.md`` file paths
     are deliberately NOT accepted here — the CLI copies user files into
@@ -253,6 +259,9 @@ def install_agent(
     """
     try:
         valid_providers = [provider_type.value for provider_type in ProviderType]
+        # An explicit provider is validated up front so bad input fails fast
+        # BEFORE any URL download or env-file mutation. Frontmatter providers
+        # are validated after the profile is parsed (below).
         if provider is not None and provider not in valid_providers:
             return InstallResult(
                 success=False,
@@ -290,17 +299,21 @@ def install_agent(
         resolved_content = resolve_env_vars(raw_content)
         profile = parse_agent_profile_text(resolved_content, agent_name)
 
+        # No explicit provider — honour the profile's frontmatter ``provider:``
+        # key, mirroring resolve_provider() on the launch/handoff paths. Bogus
+        # frontmatter values warn and fall back to the default; built-in store
+        # profiles carry no frontmatter provider and keep the default.
         if provider is None:
-            if profile.provider in PROVIDERS:
+            if profile.provider and profile.provider in valid_providers:
                 provider = profile.provider
             else:
                 if profile.provider:
                     logger.warning(
                         "Agent profile '%s' has invalid provider '%s'. "
                         "Valid providers: %s. Falling back to '%s'.",
-                        agent_name,
+                        profile.name,
                         profile.provider,
-                        PROVIDERS,
+                        valid_providers,
                         DEFAULT_PROVIDER,
                     )
                 provider = DEFAULT_PROVIDER
@@ -436,6 +449,7 @@ def install_agent(
             agent_file=str(agent_file) if agent_file else None,
             unresolved_vars=unresolved_vars or None,
             source_kind=source_kind,
+            provider=provider,
         )
 
     except requests.RequestException as exc:
