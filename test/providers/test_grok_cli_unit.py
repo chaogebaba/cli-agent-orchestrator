@@ -277,6 +277,65 @@ def test_grok_busy_worked_row_is_not_a_completion_boundary() -> None:
         provider.extract_last_message_from_script(f"❯ run tools\nanswer\n{row}\n")
 
 
+def test_grok_detached_running_frame_with_idle_composer_is_processing() -> None:
+    frame = """
+◆ Task started: Sleep 90s then echo WPQ4_DONE
+◆ Thought for 0.0s
+Waiting for the backgrounded command to finish.
+Worked for 0.0s. 1 command still running.
+minimal · /help
+❯
+Grok 4.5 (medium) · always-approve · 13K / 500K (3%) · ctrl+o transcript
+"""
+
+    provider = _provider()
+    assert provider.get_status(frame) == TerminalStatus.PROCESSING
+    assert provider.get_status_from_screen(frame.splitlines()) == TerminalStatus.PROCESSING
+
+
+def test_grok_detached_running_then_bare_completion_is_completed() -> None:
+    frame = """
+Worked for 0.0s. 1 command still running.
+◆ Task completed in 1m14s: Sleep 90s then echo WPQ4_DONE
+◆ Thought for 0.1s
+Done.
+Worked for 0.0s.
+minimal · /help
+❯
+Grok 4.5 (medium) · always-approve · 13K / 500K (3%) · ctrl+o transcript
+"""
+
+    provider = _provider()
+    assert provider.get_status(frame) == TerminalStatus.COMPLETED
+    assert provider.get_status_from_screen(frame.splitlines()) == TerminalStatus.COMPLETED
+
+
+def test_grok_detached_running_pattern_accepts_singular_and_plural() -> None:
+    provider = _provider()
+    for row in (
+        "Worked for 0.0s. 1 command still running.",
+        "Worked for 19s. 2 commands still running.",
+    ):
+        classification = provider.classify_screen([row, "❯", "always-approve"])
+        assert classification.status == TerminalStatus.PROCESSING
+        assert classification.provider_signal == "RUNNING_PATTERN"
+
+
+def test_grok_quoted_detached_running_row_is_exempt_progress() -> None:
+    row = "Worked for 0.0s. 1 command still running."
+    classification = _provider().classify_screen(
+        ["Quoted capture follows:", row, "❯", "always-approve"]
+    )
+
+    running = next(
+        signal for signal in classification.signals if signal.provider_signal == "RUNNING_PATTERN"
+    )
+    assert classification.status == TerminalStatus.PROCESSING
+    assert classification.provider_signal == "RUNNING_PATTERN"
+    assert running.row_bytes == row
+    assert running.temporal_policy == "exempt"
+
+
 def test_grok_read_composer_draft() -> None:
     provider = _provider()
     screen = """

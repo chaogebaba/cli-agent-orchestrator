@@ -84,21 +84,27 @@ class _Episode:
 class PreflightCandidate:
     terminal_id: str
     caller_id: str
+    episode: _Episode
     generation: int
     revision: int
     episode_started_wall_at: datetime
     callback_fence_at_snapshot: int
     idle_seconds: int
+    idle_since: float
+    last_screen_fp: str
 
 
 @dataclass(frozen=True)
 class AutoResumeAction:
     terminal_id: str
     caller_id: str
+    episode: _Episode
     generation: int
     revision: int
     episode_started_wall_at: datetime
     callback_fence_at_snapshot: int
+    idle_since: float
+    last_screen_fp: str
     body: str
 
 
@@ -335,6 +341,26 @@ class StalledCallbackWatchdog:
                     episode.idle_since = now
                     episode.last_screen_fp = fingerprint
 
+    def _fresh_frame_decides_running(self, terminal_id: str) -> bool:
+        from cli_agent_orchestrator.backends.registry import get_backend
+        from cli_agent_orchestrator.providers.manager import provider_manager
+
+        try:
+            metadata = get_terminal_metadata(terminal_id)
+            provider = provider_manager.get_provider(terminal_id)
+            if metadata is None or provider is None:
+                return False
+            frame = get_backend().capture_viewport(
+                metadata["tmux_session"], metadata["tmux_window"]
+            )
+            classification = provider.classify_screen(frame.splitlines())
+            return (
+                classification.status == TerminalStatus.PROCESSING
+                and classification.provider_signal == "RUNNING_PATTERN"
+            )
+        except Exception:
+            return False
+
     def collect_due_notifications(self, now: float | None = None) -> list[tuple[str, str, str]]:
         now = time.monotonic() if now is None else now
         candidates: list[PreflightCandidate] = []
@@ -357,11 +383,14 @@ class StalledCallbackWatchdog:
                     PreflightCandidate(
                         terminal_id=terminal_id,
                         caller_id=episode.caller_id,
+                        episode=episode,
                         generation=episode.generation,
                         revision=episode.revision,
                         episode_started_wall_at=episode.episode_started_wall_at,
                         callback_fence_at_snapshot=self._callback_fences.get(terminal_id, 0),
                         idle_seconds=idle_seconds,
+                        idle_since=episode.idle_since,
+                        last_screen_fp=episode.last_screen_fp,
                     )
                 )
 
@@ -373,6 +402,23 @@ class StalledCallbackWatchdog:
                 candidate.caller_id,
                 candidate.episode_started_wall_at,
             )
+            provider = metadata.get("provider") if metadata is not None else None
+            auto_resume_applicable = (
+                self._auto_resume_enabled() and provider in AUTO_RESUME_PROVIDERS
+            )
+            suppress = False
+            second_callback_status = None
+            if (
+                metadata is not None
+                and callback_status is None
+                and not auto_resume_applicable
+            ):
+                suppress = self._fresh_frame_decides_running(candidate.terminal_id)
+                second_callback_status = get_callback_status_since(
+                    candidate.terminal_id,
+                    candidate.caller_id,
+                    candidate.episode_started_wall_at,
+                )
             action: AutoResumeAction | None = None
             with self._lock:
                 current_episode = self._episodes.get(candidate.terminal_id)
@@ -382,18 +428,31 @@ class StalledCallbackWatchdog:
                 if not self._candidate_valid(candidate, current_episode):
                     continue
                 assert current_episode is not None
+                assert current_episode.idle_since is not None
+                if int(now - current_episode.idle_since) < self.grace_seconds:
+                    continue
                 if callback_status in {MessageStatus.PENDING, MessageStatus.DELIVERING}:
                     continue
                 if callback_status == MessageStatus.DELIVERED:
                     current_episode.callback_seen = True
+                    continue
+                if second_callback_status in {
+                    MessageStatus.PENDING,
+                    MessageStatus.DELIVERING,
+                }:
+                    continue
+                if second_callback_status == MessageStatus.DELIVERED:
+                    current_episode.callback_seen = True
+                    continue
+                if suppress:
+                    current_episode.idle_since = now
                     continue
                 if current_episode.auto_resumed:
                     current_episode.fired = True
                     suffix = f" (auto-resume attempted at {current_episode.auto_resume_attempted_at})"
                     due.append(self._push_tuple(candidate, current_episode, suffix))
                     continue
-                provider = metadata.get("provider")
-                if not self._auto_resume_enabled() or provider not in AUTO_RESUME_PROVIDERS:
+                if not auto_resume_applicable:
                     current_episode.fired = True
                     due.append(self._push_tuple(candidate, current_episode))
                     continue
@@ -401,10 +460,13 @@ class StalledCallbackWatchdog:
                 action = AutoResumeAction(
                     terminal_id=candidate.terminal_id,
                     caller_id=candidate.caller_id,
+                    episode=candidate.episode,
                     generation=candidate.generation,
                     revision=candidate.revision,
                     episode_started_wall_at=candidate.episode_started_wall_at,
                     callback_fence_at_snapshot=candidate.callback_fence_at_snapshot,
+                    idle_since=candidate.idle_since,
+                    last_screen_fp=candidate.last_screen_fp,
                     body=AUTO_RESUME_BODY,
                 )
             if action is not None:
@@ -425,9 +487,14 @@ class StalledCallbackWatchdog:
     ) -> bool:
         return (
             episode is not None
+            and episode is candidate.episode
             and episode.generation == candidate.generation
             and episode.revision == candidate.revision
             and not episode.callback_seen
+            and not episode.fired
+            and episode.idle_since is not None
+            and episode.idle_since == candidate.idle_since
+            and episode.last_screen_fp == candidate.last_screen_fp
             and self._callback_fences.get(candidate.terminal_id, 0)
             == candidate.callback_fence_at_snapshot
         )

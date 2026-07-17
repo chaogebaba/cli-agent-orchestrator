@@ -1,11 +1,35 @@
 from contextlib import contextmanager
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
 from cli_agent_orchestrator.services.stalled_callback_watchdog import StalledCallbackWatchdog
+
+
+_WPQ4_T07_FRAME = """
+◆ Task started: Sleep 90s then echo WPQ4_DONE
+◆ Thought for 0.0s
+Waiting for the backgrounded command to finish.
+Worked for 0.0s. 1 command still running.
+minimal · /help
+❯
+Grok 4.5 (medium) · always-approve · 13K / 500K (3%) · ctrl+o transcript
+"""
+
+_WPQ4_T10_FRAME = """
+Worked for 0.0s. 1 command still running.
+◆ Task completed in 1m14s: Sleep 90s then echo WPQ4_DONE
+◆ Thought for 0.1s
+Done.
+Worked for 0.0s.
+minimal · /help
+❯
+Grok 4.5 (medium) · always-approve · 13K / 500K (3%) · ctrl+o transcript
+"""
 
 
 def _mark_screen_sampled(svc, terminal_id="worker1"):
@@ -18,6 +42,60 @@ def _armed_due_watchdog():
     svc.record_status("worker1", TerminalStatus.IDLE, now=10.0)
     _mark_screen_sampled(svc)
     return svc
+
+
+def _watchdog_grok_provider() -> GrokCliProvider:
+    return GrokCliProvider(
+        terminal_id="worker1",
+        session_name="cao-test",
+        window_name="worker1",
+        agent_profile="grok_dev",
+        allowed_tools=["*"],
+    )
+
+
+@contextmanager
+def _watchdog_guard_fakes(
+    capture_result,
+    *,
+    on_capture=None,
+    callback_side_effect=(None, None),
+):
+    backend = MagicMock()
+
+    def capture_viewport(_session, _window):
+        if on_capture is not None:
+            on_capture()
+        if isinstance(capture_result, Exception):
+            raise capture_result
+        return capture_result
+
+    backend.capture_viewport.side_effect = capture_viewport
+    metadata = {
+        "id": "worker1",
+        "caller_id": "caller1",
+        "provider": "grok_cli",
+        "tmux_session": "cao-test",
+        "tmux_window": "worker1",
+    }
+    with (
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "get_terminal_metadata",
+            return_value=metadata,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "get_callback_status_since",
+            side_effect=callback_side_effect,
+        ) as callback_status,
+        patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+        patch(
+            "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
+            return_value=_watchdog_grok_provider(),
+        ),
+    ):
+        yield backend, callback_status
 
 
 def test_watchdog_pushes_exactly_one_due_notification():
@@ -391,7 +469,7 @@ def test_watchdog_refresh_rearm_pending_callback_prevents_second_fire():
         patch(
             "cli_agent_orchestrator.services.stalled_callback_watchdog."
             "get_callback_status_since",
-            side_effect=[None, MessageStatus.PENDING],
+            side_effect=[None, None, MessageStatus.PENDING],
         ) as callback_status,
     ):
         assert len(svc.collect_due_notifications(now=13.0)) == 1
@@ -403,9 +481,151 @@ def test_watchdog_refresh_rearm_pending_callback_prevents_second_fire():
 
     second_episode = svc._episodes["worker1"]
     assert second_episode is not first_episode
-    assert callback_status.call_count == 2
+    assert callback_status.call_count == 3
     assert not second_episode.callback_seen
     assert not second_episode.fired
+
+
+def test_watchdog_due_t07_running_frame_suppresses_and_rearms_grace():
+    svc = _armed_due_watchdog()
+    episode = svc._episodes["worker1"]
+
+    with _watchdog_guard_fakes(_WPQ4_T07_FRAME) as (backend, callback_status):
+        assert svc.collect_due_notifications(now=13.0) == []
+
+    backend.capture_viewport.assert_called_once_with("cao-test", "worker1")
+    assert callback_status.call_count == 2
+    assert episode.idle_since == 13.0
+    assert episode.last_screen_fp == "sample"
+    assert not episode.fired
+
+
+def test_watchdog_due_t10_newer_completion_emits_notice():
+    svc = _armed_due_watchdog()
+    episode = svc._episodes["worker1"]
+
+    with _watchdog_guard_fakes(_WPQ4_T10_FRAME) as (backend, callback_status):
+        assert svc.collect_due_notifications(now=13.0) == [
+            (
+                "worker1",
+                "caller1",
+                "[watchdog] worker worker1 (developer) idle 3s without callback",
+            )
+        ]
+
+    backend.capture_viewport.assert_called_once_with("cao-test", "worker1")
+    assert callback_status.call_count == 2
+    assert episode.fired
+
+
+def test_watchdog_due_capture_failure_emits_notice():
+    svc = _armed_due_watchdog()
+    episode = svc._episodes["worker1"]
+
+    with _watchdog_guard_fakes(RuntimeError("capture failed")) as (backend, callback_status):
+        assert len(svc.collect_due_notifications(now=13.0)) == 1
+
+    backend.capture_viewport.assert_called_once_with("cao-test", "worker1")
+    assert callback_status.call_count == 2
+    assert episode.fired
+
+
+def test_watchdog_episode_replaced_during_capture_drops_candidate_without_rearm():
+    svc = _armed_due_watchdog()
+    original = svc._episodes["worker1"]
+
+    def replace_episode():
+        svc.clear_terminal("worker1")
+        svc.record_inbound_task("worker1", "caller1", "developer")
+
+    with _watchdog_guard_fakes(_WPQ4_T07_FRAME, on_capture=replace_episode):
+        assert svc.collect_due_notifications(now=13.0) == []
+
+    replacement = svc._episodes["worker1"]
+    assert replacement is not original
+    assert replacement.idle_since is None
+    assert replacement.last_screen_fp is None
+    assert not replacement.fired
+
+
+def test_watchdog_same_episode_processing_during_capture_drops_without_emission():
+    svc = _armed_due_watchdog()
+    episode = svc._episodes["worker1"]
+    joined = False
+
+    def unarm_episode():
+        nonlocal joined
+        thread = threading.Thread(
+            target=lambda: svc.record_status("worker1", TerminalStatus.PROCESSING, now=12.0)
+        )
+        thread.start()
+        thread.join(timeout=1.0)
+        joined = not thread.is_alive()
+
+    with _watchdog_guard_fakes(_WPQ4_T10_FRAME, on_capture=unarm_episode):
+        assert svc.collect_due_notifications(now=13.0) == []
+
+    assert joined
+    assert episode.idle_since is None
+    assert episode.last_screen_fp is None
+    assert not episode.fired
+
+
+def test_watchdog_same_episode_fingerprint_grace_reset_during_capture_drops():
+    svc = _armed_due_watchdog()
+    episode = svc._episodes["worker1"]
+
+    def reset_grace_and_fingerprint():
+        svc.record_status("worker1", TerminalStatus.PROCESSING, now=12.0)
+        svc.record_status("worker1", TerminalStatus.IDLE, now=12.0)
+        with svc._lock:
+            episode.last_screen_fp = "fresh-sample"
+
+    with _watchdog_guard_fakes(_WPQ4_T10_FRAME, on_capture=reset_grace_and_fingerprint):
+        assert svc.collect_due_notifications(now=13.0) == []
+
+    assert episode.idle_since == 12.0
+    assert episode.last_screen_fp == "fresh-sample"
+    assert not episode.fired
+
+
+def test_watchdog_callback_during_capture_drops_and_does_not_starve_callback_thread():
+    svc = _armed_due_watchdog()
+    episode = svc._episodes["worker1"]
+    callback_committed = threading.Event()
+    callback_calls = 0
+    callback_joined = False
+
+    def callback_status(*_args):
+        nonlocal callback_calls
+        callback_calls += 1
+        if callback_calls == 1:
+            return None
+        return MessageStatus.DELIVERED if callback_committed.is_set() else None
+
+    def record_callback():
+        nonlocal callback_joined
+
+        def commit():
+            with svc._lock:
+                callback_committed.set()
+
+        thread = threading.Thread(target=commit)
+        thread.start()
+        thread.join(timeout=1.0)
+        callback_joined = not thread.is_alive()
+
+    with _watchdog_guard_fakes(
+        _WPQ4_T10_FRAME,
+        on_capture=record_callback,
+        callback_side_effect=callback_status,
+    ) as (_, durable_query):
+        assert svc.collect_due_notifications(now=13.0) == []
+
+    assert callback_joined
+    assert durable_query.call_count == 2
+    assert episode.callback_seen
+    assert not episode.fired
 
 
 def test_watchdog_prunes_deleted_terminal_without_push():
