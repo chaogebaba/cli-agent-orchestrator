@@ -16,6 +16,7 @@ from cli_agent_orchestrator.clients.database import (
     TerminalModel,
     TranscriptBindingModel,
     begin_delivery_attempt,
+    cancel_pending_watchdog_message,
     confirm_batch_from_prior_attempt,
     count_ambiguous_attempts,
     create_flow,
@@ -84,6 +85,29 @@ class TestTerminalOperations:
         assert terminal_exists("present") is True
         assert terminal_exists("missing") is False
         assert not any("Terminal metadata not found" in record.message for record in caplog.records)
+
+    def test_cancel_watchdog_message_persists_cancelled_without_notice(self, test_db, monkeypatch):
+        monkeypatch.setattr("cli_agent_orchestrator.clients.database.SessionLocal", test_db)
+        with test_db.begin() as db:
+            row = InboxModel(
+                sender_id="watchdog:worker",
+                receiver_id="worker",
+                message="resume",
+                orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+                status=MessageStatus.PENDING.value,
+            )
+            db.add(row)
+            db.flush()
+            message_id = int(row.id)
+
+        assert cancel_pending_watchdog_message(message_id, "worker")
+
+        with test_db() as db:
+            rows = db.query(InboxModel).all()
+            assert len(rows) == 1
+            assert rows[0].status == MessageStatus.CANCELLED.value
+            assert rows[0].failure_reason == "auto_resume_superseded"
+            assert rows[0].sender_id == "watchdog:worker"
 
     def test_fallback_settlement_moves_only_pending_and_commits_pointer(self, test_db, monkeypatch):
         monkeypatch.setattr("cli_agent_orchestrator.clients.database.SessionLocal", test_db)

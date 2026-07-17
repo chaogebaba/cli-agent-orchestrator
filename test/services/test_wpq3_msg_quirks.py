@@ -1,6 +1,7 @@
 import json
 import threading
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -14,6 +15,7 @@ from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.services.inbox_service import (
     FirstLookupResult,
     InboxService,
+    SuccessorCorroborationResult,
     SuccessorLookupPlan,
     corroborate_claude_successor,
 )
@@ -22,6 +24,7 @@ from cli_agent_orchestrator.services.stalled_callback_watchdog import (
     AUTO_RESUME_BODY,
     StalledCallbackWatchdog,
 )
+from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 
 
 def _plan(*, evidence=None, first_ref=("/tmp/transcript", 7, 10), attempt="a"):
@@ -95,6 +98,148 @@ def test_d1_plan_evidence_is_deep_copied_for_second_lookup(monkeypatch):
     monkeypatch.setattr("cli_agent_orchestrator.services.inbox_service._wpm2_lookup", lookup)
     assert corroborate_claude_successor((plan,)).kind == "authorize"
     assert seen == [0]
+
+
+def test_d1_real_caller_runs_one_corroboration_and_defer_never_opens(monkeypatch):
+    service = InboxService()
+    plan = _plan()
+    message = SimpleNamespace(
+        id=1,
+        sender_id="sender",
+        receiver_id="worker",
+        message="payload",
+        orchestration_type=OrchestrationType.SEND_MESSAGE,
+        logical_receiver_id=None,
+    )
+    evidence = {
+        "_wpm1_prior_attempt_uuid": "prior",
+        "_successor_lookup_plans": (plan,),
+        "boundary_authorized": "2026-07-17T00:00:00Z",
+        "last_observed_ref": {"path": "/tmp/transcript", "inode": 7, "size": 10},
+    }
+    opener = MagicMock(return_value="new-attempt")
+    corroborate = MagicMock(return_value=SuccessorCorroborationResult("defer"))
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
+        lambda _terminal: threading.Lock(),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.get_terminal_metadata",
+        lambda _terminal: {"id": "worker", "provider": "claude_code"},
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+        lambda *_args, **_kwargs: [message],
+    )
+    monkeypatch.setattr(
+        service, "_handle_wpm1_gate", lambda *_args, **_kwargs: ("inject", evidence)
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.count_ambiguous_attempts",
+        lambda _ids: 0,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
+        lambda _metadata: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.list_message_attempts", lambda _ids: []
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt", opener
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.corroborate_claude_successor",
+        corroborate,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service.prepare_input",
+        lambda *_args: "payload",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.status_monitor.get_status",
+        lambda _terminal: TerminalStatus.IDLE,
+    )
+
+    service.deliver_pending("worker")
+
+    corroborate.assert_called_once_with((plan,))
+    opener.assert_not_called()
+
+
+def test_d1_wpq2_stale_hit_precedes_final_corroboration(monkeypatch):
+    service = InboxService()
+    attempt = {
+        "attempt_uuid": "prior",
+        "payload_hash": "hash",
+        "started_at": datetime(2026, 7, 17),
+        "outcome": "ambiguous",
+        "reason": "confirmation_timeout",
+        "evidence": json.dumps(
+            {
+                "resolution_kind": "binding",
+                "last_observed_ref": {
+                    "path": "/trace",
+                    "inode": 1,
+                    "size": 10,
+                    "resolution_kind": "binding",
+                },
+            }
+        ),
+    }
+    corroborate = MagicMock(return_value=SuccessorCorroborationResult("authorize"))
+    settle = MagicMock(return_value="settled")
+    monkeypatch.setattr(service, "_exact_batch_attempts", lambda _ids: [attempt])
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
+        lambda _metadata: SimpleNamespace(resolution_kind="binding"),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service._wpm2_lookup",
+        lambda *_args: (
+            "absent",
+            {
+                "path": "/trace",
+                "inode": 1,
+                "size": 10,
+                "last_observed_ref": {
+                    "path": "/trace",
+                    "inode": 1,
+                    "size": 10,
+                    "resolution_kind": "binding",
+                },
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.advance_wpm2_continuity_cursor",
+        lambda *_args: "already_advanced",
+    )
+    monkeypatch.setattr(
+        service,
+        "_resolve_stale_binding_prior_hits",
+        lambda *_args: ("hit", attempt, {"kind": "transcript_user_turn"}, None),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.settle_wpm1_terminal_batch", settle
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.corroborate_claude_successor",
+        corroborate,
+    )
+
+    state, detail = service._handle_wpm1_gate(
+        "worker",
+        [SimpleNamespace(id=1)],
+        {"provider": "claude_code"},
+        MagicMock(),
+        "sender",
+        OrchestrationType.SEND_MESSAGE,
+    )
+
+    assert (state, detail) == ("stop", None)
+    corroborate.assert_not_called()
+    settle.assert_called_once()
 
 
 def test_d3_real_queued_command_multiline_hits_with_queue_corroboration(tmp_path):
@@ -181,6 +326,42 @@ def test_d4_completed_quotes_never_signal(quote):
     classification = provider.classify_screen(rows)
     assert classification.status == TerminalStatus.COMPLETED
     assert not provider.transient_error_detected(rows, classification)
+
+
+def test_d4_generic_json_with_idle_chrome_is_not_transient_error():
+    provider = CodexProvider("worker", "session", "window")
+    rows = ['{"event":"response.completed"}', "› "]
+    classification = provider.classify_screen(rows)
+    assert classification.status == TerminalStatus.IDLE
+    assert not provider.transient_error_detected(rows, classification)
+
+
+def test_d4_transport_uses_only_fresh_final_frame_for_transient_key(monkeypatch):
+    monitor = StatusMonitor()
+    monitor._screens["worker"] = (
+        SimpleNamespace(display=["502 Bad Gateway", "› "], columns=80, lines=24),
+        object(),
+    )
+    backend = MagicMock(supports_identity_readback=False)
+    backend.capture_viewport.return_value = "all good\n› "
+    backend.get_pane_size.return_value = (80, 24)
+    provider = CodexProvider("worker", "session", "window")
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
+        lambda _terminal: provider,
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+        lambda _terminal: {"tmux_session": "session", "tmux_window": "window"},
+    )
+
+    status, meta = monitor.probe_screen_status("worker")
+
+    assert status == TerminalStatus.IDLE
+    assert meta["frame_source"] == "fresh_capture"
+    assert "transient_api_error" not in meta
+    backend.capture_viewport.assert_called_once()
 
 
 def _armed(provider="codex"):
@@ -285,6 +466,49 @@ def test_d5_full_fire_inserts_exact_body_then_delivers(monkeypatch):
     episode = service._episodes["worker"]
     assert episode.auto_resumed
     assert episode.resume_reserved_at is None
+
+
+def test_d5_auto_resume_is_one_shot_and_suffix_preserves_mark(monkeypatch):
+    service, metadata = _armed()
+    insert = MagicMock(return_value=WatchdogInsertResult("inserted", 45))
+    deliver = MagicMock()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        lambda _terminal: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
+        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
+        lambda _terminal: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
+        lambda _terminal: threading.Lock(),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
+        insert,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending", deliver
+    )
+
+    assert service.collect_due_notifications(now=13.0) == []
+    due = service.collect_due_notifications(now=16.0)
+
+    assert len(due) == 1
+    assert "auto-resume attempted at" in due[0][2]
+    assert service._episodes["worker"].auto_resumed is True
+    assert service._episodes["worker"].fired is True
+    insert.assert_called_once_with("worker", AUTO_RESUME_BODY)
+    deliver.assert_called_once_with("worker")
 
 
 def test_d5_second_callback_read_cancels_pending_resume(monkeypatch):
@@ -447,6 +671,100 @@ def test_d5_insert_and_second_callback_read_hold_delivery_lock(monkeypatch):
     assert len(service.collect_due_notifications(now=13.0)) == 1
     assert callback_reads == 2
     assert not delivery_lock.locked()
+
+
+def test_d5_insert_and_callback_reads_run_outside_watchdog_lock(monkeypatch):
+    service, metadata = _armed()
+    callback_reads = 0
+
+    def callback_status(*_args):
+        nonlocal callback_reads
+        callback_reads += 1
+        assert not service._lock._is_owned()
+        return None
+
+    def insert(*_args):
+        assert not service._lock._is_owned()
+        return WatchdogInsertResult("failed_before_commit")
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        lambda _terminal: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+        callback_status,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
+        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
+        lambda _terminal: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
+        lambda _terminal: threading.Lock(),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
+        insert,
+    )
+
+    assert len(service.collect_due_notifications(now=13.0)) == 1
+    assert callback_reads == 2
+
+
+def test_d5_auto_resume_order_is_insert_finalize_then_deliver(monkeypatch):
+    service, metadata = _armed()
+    events = []
+    callback_reads = 0
+
+    def callback_status(*_args):
+        nonlocal callback_reads
+        callback_reads += 1
+        if callback_reads == 2:
+            events.append("finalize")
+        return None
+
+    def insert(*_args):
+        events.append("insert")
+        return WatchdogInsertResult("inserted", 44)
+
+    def deliver(*_args):
+        events.append("deliver")
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        lambda _terminal: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+        callback_status,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
+        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
+        lambda _terminal: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
+        lambda _terminal: threading.Lock(),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
+        insert,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending", deliver
+    )
+
+    assert service.collect_due_notifications(now=13.0) == []
+    assert events == ["insert", "finalize", "deliver"]
 
 
 def test_d5_second_callback_read_uses_frozen_episode_start_after_replace(monkeypatch):
