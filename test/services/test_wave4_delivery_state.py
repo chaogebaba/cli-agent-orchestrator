@@ -32,6 +32,7 @@ from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
 from cli_agent_orchestrator.services import inbox_service as inbox_service_module
+from cli_agent_orchestrator.services import mailbox_service as mailbox_service_module
 from cli_agent_orchestrator.services import terminal_service as terminal_service_module
 from cli_agent_orchestrator.services.inbox_service import InboxService
 from cli_agent_orchestrator.services.message_trace_service import (
@@ -471,6 +472,143 @@ def test_wpq1_three_preopen_identity_failures_notice_once_without_attempt(
     assert "(mismatch, x3)" in authority[0].message
 
 
+def _logical_identity_message(wave4_db, enqueue_generation):
+    with wave4_db.begin() as db:
+        db.add(
+            database.MailboxModel(
+                id="mb_identity",
+                session_name="session",
+                role="supervisor",
+                current_terminal_id="receiver",
+                generation=7,
+                consumed_through_id=0,
+            )
+        )
+        db.add(
+            database.MailboxIncarnationModel(
+                mailbox_id="mb_identity",
+                generation=7,
+                terminal_id="receiver",
+            )
+        )
+        row = database.InboxModel(
+            sender_id="sender",
+            receiver_id="receiver",
+            logical_receiver_id="mb_identity",
+            enqueue_generation=enqueue_generation,
+            message="logical identity fenced",
+            orchestration_type="send_message",
+            status="pending",
+        )
+        db.add(row)
+        db.flush()
+        return row.id
+
+
+def _identity_monitor(reason="mismatch"):
+    monitor = MagicMock()
+    monitor.get_boundary_observation.return_value = BoundaryObservation(
+        "epoch", TerminalStatus.IDLE, 1, 1, 1, None, 1
+    )
+    monitor.get_status.return_value = TerminalStatus.IDLE
+    monitor.get_input_gen.return_value = monitor.get_status_gen.return_value = 1
+    meta = _probe_meta(TerminalStatus.UNKNOWN)
+    meta["identity_proof_failure"] = reason
+    monitor.probe_screen_status.return_value = (TerminalStatus.UNKNOWN, meta)
+    return monitor
+
+
+@pytest.mark.parametrize("enqueue_generation", [None, 7])
+def test_wpq1_logical_proof1_token_equals_routed_generation_for_null_and_nonnull(
+    wave4_db, monkeypatch, enqueue_generation
+):
+    message_id = _logical_identity_message(wave4_db, enqueue_generation)
+    monkeypatch.setattr(mailbox_service_module, "SessionLocal", wave4_db)
+    service = InboxService()
+    monitor = _identity_monitor()
+
+    with (
+        patch("cli_agent_orchestrator.services.inbox_service.status_monitor", monitor),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
+            return_value=MagicMock(),
+        ),
+    ):
+        service.deliver_pending("receiver")
+
+    assert service._identity_authority[("receiver", "7")].count == 1
+    assert get_message_trace(message_id)["attempts"] == []
+
+
+def test_wpq1_logical_proof1_three_failures_use_one_routed_generation_episode(
+    wave4_db, monkeypatch
+):
+    message_id = _logical_identity_message(wave4_db, None)
+    with wave4_db.begin() as db:
+        db.get(database.TerminalModel, "receiver").caller_id = "sender"
+    monkeypatch.setattr(mailbox_service_module, "SessionLocal", wave4_db)
+    service = InboxService()
+    monitor = _identity_monitor("missing_env")
+
+    with (
+        patch("cli_agent_orchestrator.services.inbox_service.status_monitor", monitor),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
+            return_value=MagicMock(),
+        ),
+    ):
+        for _ in range(3):
+            service.deliver_pending("receiver")
+
+    assert service._identity_authority[("receiver", "7")].count == 3
+    assert get_message_trace(message_id)["attempts"] == []
+    authority = [
+        item
+        for item in database.get_inbox_messages("sender")
+        if item.message.startswith("[identity-authority]")
+    ]
+    assert len(authority) == 1
+
+
+def test_wpq1_logical_proof2_three_real_settlements_keep_attempt_generation(wave4_db, monkeypatch):
+    message_id = _logical_identity_message(wave4_db, 7)
+    with wave4_db.begin() as db:
+        db.get(database.TerminalModel, "receiver").caller_id = "sender"
+    monkeypatch.setattr(mailbox_service_module, "SessionLocal", wave4_db)
+    monitor = _identity_monitor()
+    monitor.probe_screen_status.return_value = (
+        TerminalStatus.IDLE,
+        _probe_meta(TerminalStatus.IDLE),
+    )
+    backend = MagicMock(supports_identity_readback=True)
+    backend.read_pane_identity.return_value = PaneIdentityReadResult(reason="read_error")
+    service = InboxService()
+
+    with (
+        patch("cli_agent_orchestrator.services.inbox_service.status_monitor", monitor),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.terminal_service.prepare_input",
+            side_effect=lambda _terminal, value, _kind: value,
+        ),
+        patch.object(terminal_service_module, "get_backend", return_value=backend),
+    ):
+        for _ in range(3):
+            service.deliver_pending("receiver")
+
+    trace = get_message_trace(message_id)
+    assert len(trace["attempts"]) == 3
+    assert {
+        database.get_attempt_mailbox_authority(attempt["attempt_uuid"])["generation"]
+        for attempt in trace["attempts"]
+    } == {7}
+    assert service._identity_authority[("receiver", "7")].count == 3
+    backend.send_keys.assert_not_called()
+
+
 def test_wpq1_three_postopen_identity_failures_stay_pending_and_bypass_caps(
     wave4_db,
 ):
@@ -487,6 +625,8 @@ def test_wpq1_three_postopen_identity_failures_stay_pending_and_bypass_caps(
         _probe_meta(TerminalStatus.IDLE),
     )
     service = InboxService()
+    backend = MagicMock(supports_identity_readback=True)
+    backend.read_pane_identity.return_value = PaneIdentityReadResult(reason="read_error")
 
     with (
         patch("cli_agent_orchestrator.services.inbox_service.status_monitor", monitor),
@@ -498,20 +638,19 @@ def test_wpq1_three_postopen_identity_failures_stay_pending_and_bypass_caps(
             "cli_agent_orchestrator.services.inbox_service.terminal_service.prepare_input",
             side_effect=lambda _terminal, value, _kind: value,
         ),
-        patch(
-            "cli_agent_orchestrator.services.inbox_service.terminal_service.send_prepared_input",
-            side_effect=PaneIdentityMismatchError("read_error"),
-        ),
+        patch.object(terminal_service_module, "get_backend", return_value=backend),
     ):
-        for _ in range(3):
+        for _ in range(4):
             service.deliver_pending("receiver")
 
     trace = get_message_trace(message.id)
     assert trace["message"]["status"] == "pending"
-    assert len(trace["attempts"]) == 3
+    assert len(trace["attempts"]) == 4
     assert {item["reason"] for item in trace["attempts"]} == {"pane_identity_mismatch:read_error"}
+    assert "attempt_cap" not in {item["reason"] for item in trace["attempts"]}
     assert all(item["outcome"] == "ambiguous" for item in trace["attempts"])
     assert all(item["evidence"]["identity_proof"] == "read_error" for item in trace["attempts"])
+    backend.send_keys.assert_not_called()
     authority = [
         item
         for item in database.get_inbox_messages("sender")

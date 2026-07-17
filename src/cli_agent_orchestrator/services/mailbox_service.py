@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import threading
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, cast
+from typing import Any, Literal, cast, overload
 
 from sqlalchemy import and_, exists, func, or_, text
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -116,7 +117,11 @@ def _digest_summary_lines(db: Any, rows: list[Any]) -> list[str]:
             )
         else:
             clean = "".join(
-                " " if char in "\r\n\t" else ("" if ord(char) < 32 or ord(char) == 127 else char)
+                (
+                    " "
+                    if char in "\r\n\t"
+                    else ("" if unicodedata.category(char) in {"Cc", "Cf"} else char)
+                )
                 for char in row.message
             )
             body = " ".join(clean.split())
@@ -303,8 +308,24 @@ def publish_supervisor_incarnation(claim: MailboxClaim, terminal_id: str) -> dic
         lock.release()
 
 
-def digest_stale_pending_for_terminal(terminal_id: str) -> int:
+@overload
+def digest_stale_pending_for_terminal(terminal_id: str) -> int: ...
+
+
+@overload
+def digest_stale_pending_for_terminal(
+    terminal_id: str, *, include_generation: Literal[True]
+) -> tuple[int, int | None]: ...
+
+
+def digest_stale_pending_for_terminal(
+    terminal_id: str, *, include_generation: bool = False
+) -> int | tuple[int, int | None]:
     """Atomically route old-generation pending rows into one current digest."""
+
+    def result(count: int, generation: int | None) -> int | tuple[int, int | None]:
+        return (count, generation) if include_generation else count
+
     with SessionLocal() as db:
         db.execute(text("BEGIN IMMEDIATE"))
         mailbox: Any = (
@@ -312,7 +333,7 @@ def digest_stale_pending_for_terminal(terminal_id: str) -> int:
         )
         if mailbox is None:
             db.rollback()
-            return 0
+            return result(0, None)
         stale: list[Any] = (
             db.query(InboxModel)
             .filter(
@@ -326,7 +347,7 @@ def digest_stale_pending_for_terminal(terminal_id: str) -> int:
         )
         if not stale:
             db.rollback()
-            return 0
+            return result(0, mailbox.generation)
         digest = InboxModel(
             sender_id="mailbox-digest",
             receiver_id=terminal_id,
@@ -345,7 +366,7 @@ def digest_stale_pending_for_terminal(terminal_id: str) -> int:
             row.status = MessageStatus.DIGESTED.value
             row.digested_into = digest.id
         db.commit()
-        return len(stale)
+        return result(len(stale), mailbox.generation)
 
 
 def create_logical_inbox_message(

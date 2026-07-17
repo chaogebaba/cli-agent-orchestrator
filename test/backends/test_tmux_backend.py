@@ -191,6 +191,16 @@ class TestTmuxPaneIdentity:
 
         assert backend.read_pane_identity("session", "window").reason == "incarnation_changed"
 
+    @pytest.mark.parametrize("second", [[], [101, 202]])
+    def test_second_read_cardinality_is_pane_cardinality(self, monkeypatch, second):
+        backend = TmuxBackend(client=MagicMock())
+        reads = iter([[101], second])
+        monkeypatch.setattr(backend, "_pane_pids", lambda *_args: next(reads))
+        monkeypatch.setattr(backend, "_proc_starttime", lambda _pid: "44")
+        monkeypatch.setattr(backend, "_proc_identity", lambda _pid: "term-a")
+
+        assert backend.read_pane_identity("session", "window").reason == "pane_cardinality"
+
     def test_multi_window_positive_control_returns_each_identity(self, monkeypatch):
         backend = TmuxBackend(client=MagicMock())
         pids = {"one": 101, "two": 202}

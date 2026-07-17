@@ -3,6 +3,7 @@
 import threading
 import time
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -15,6 +16,11 @@ from cli_agent_orchestrator.services import auto_responder as ar
 class FakeProvider:
     supports_screen_detection = True
 
+    def get_status_from_screen(self, _lines):
+        return TerminalStatus.WAITING_USER_ANSWER
+
+
+class UnknownProvider(FakeProvider):
     def get_status_from_screen(self, _lines):
         return TerminalStatus.UNKNOWN
 
@@ -417,7 +423,7 @@ def test_multi_press_enter_uses_later_adjacent_option():
             _grok_provider,
             ["Unknown prompt", "1. Continue", "2. Cancel", "Press enter to choose"],
             TerminalStatus.UNKNOWN,
-            True,
+            False,
         ),
         (
             "grok_cli",
@@ -526,18 +532,16 @@ def test_open_episode_closes_after_two_ready_grok_frames(monkeypatch, _reset_eng
     _wire_common(monkeypatch, metadata=_metadata(provider="grok_cli"))
     pushed = _capture_pushes(monkeypatch)
     provider = _grok_provider()
-    suspect = ["1. Continue", "2. Cancel", "Press enter to choose"]
     ready = ["1. Document row", "Press enter to read", "❯", "always-approve"]
 
-    assert provider.get_status_from_screen(suspect) == TerminalStatus.UNKNOWN
-    assert _reset_engine.on_screen("term1", provider, suspect) == TerminalStatus.WAITING_USER_ANSWER
+    _reset_engine._unknown_state["term1"] = ar._UnknownDialogState(episode_open=True)
     assert provider.get_status_from_screen(ready) == TerminalStatus.IDLE
     assert _reset_engine.on_screen("term1", provider, ready) == TerminalStatus.WAITING_USER_ANSWER
     assert _reset_engine.on_screen("term1", provider, ready) is None
     state = _reset_engine._unknown_state["term1"]
     assert not state.episode_open
     assert state.non_dialog_ticks == 0
-    assert len(pushed) == 1
+    assert pushed == []
 
 
 def test_supervisor_terminal_is_excluded_from_unknown_detection(monkeypatch, _reset_engine):
@@ -920,3 +924,104 @@ def test_wpq1_failed_fresh_capture_does_not_mutate_open_unknown_episode(monkeypa
         is None
     )
     assert _reset_engine.waiting_gate("term1") == "unknown_dialog"
+
+
+@pytest.mark.parametrize("branch", ["wait_rule", "unknown_dialog"])
+@pytest.mark.parametrize("fresh_outcome", ["failure", "empty", "unknown"])
+def test_wpq1_production_fresh_capture_suppresses_unusable_frames_without_mutation(
+    monkeypatch, branch, fresh_outcome
+):
+    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+    _wire_common(monkeypatch)
+    engine = ar.AutoResponder()
+    pushed = []
+    monkeypatch.setattr(engine, "_push", lambda *args: pushed.append(args))
+    rule = ar.Rule("wait-update", True, "contains", "update", [], "wait")
+    monkeypatch.setattr(
+        ar._store, "get_rules", lambda _provider: [rule] if branch == "wait_rule" else []
+    )
+    provider = UnknownProvider() if fresh_outcome == "unknown" else FakeProvider()
+    initial = (
+        ["update available"]
+        if branch == "wait_rule"
+        else ["1. Continue", "2. Cancel", "Press enter to choose"]
+    )
+    fresh_text = (
+        "update available" if branch == "wait_rule" else "1. Continue\n2. Cancel\nPress enter"
+    )
+    screen_sentinel = (object(), object())
+    status_monitor._screens["term1"] = screen_sentinel
+    before_unknown = dict(engine._unknown_state)
+    before_wait = dict(engine._wait_rule_active)
+    captures = []
+
+    def capture(_session, _window):
+        captures.append(True)
+        assert engine._lock.acquire(blocking=False)
+        engine._lock.release()
+        assert not status_monitor._lock._is_owned()
+        if fresh_outcome == "failure":
+            raise OSError("capture failed")
+        return "" if fresh_outcome == "empty" else fresh_text
+
+    backend = MagicMock()
+    backend.capture_viewport.side_effect = capture
+    monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
+    try:
+        assert engine.on_screen("term1", provider, initial) is None
+        assert captures == [True]
+        assert pushed == []
+        assert engine._unknown_state == before_unknown
+        assert engine._wait_rule_active == before_wait
+        assert status_monitor._screens["term1"] is screen_sentinel
+    finally:
+        status_monitor._screens.pop("term1", None)
+
+
+@pytest.mark.parametrize("branch", ["wait_rule", "unknown_dialog"])
+def test_wpq1_production_fresh_capture_confirms_once_without_overwriting_screen(
+    monkeypatch, branch
+):
+    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+    _wire_common(monkeypatch)
+    engine = ar.AutoResponder()
+    monkeypatch.setattr(engine, "_push", lambda *args: None)
+    rule = ar.Rule("wait-update", True, "contains", "update", [], "wait")
+    monkeypatch.setattr(
+        ar._store, "get_rules", lambda _provider: [rule] if branch == "wait_rule" else []
+    )
+    initial = (
+        ["update available"]
+        if branch == "wait_rule"
+        else ["1. Continue", "2. Cancel", "Press enter to choose"]
+    )
+    fresh_text = (
+        "update available" if branch == "wait_rule" else "1. Continue\n2. Cancel\nPress enter"
+    )
+    screen_sentinel = (object(), object())
+    status_monitor._screens["term1"] = screen_sentinel
+    captures = []
+
+    def capture(_session, _window):
+        captures.append(True)
+        assert engine._lock.acquire(blocking=False)
+        engine._lock.release()
+        assert not status_monitor._lock._is_owned()
+        return fresh_text
+
+    backend = MagicMock()
+    backend.capture_viewport.side_effect = capture
+    monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
+    try:
+        assert (
+            engine.on_screen("term1", FakeProvider(), initial) == TerminalStatus.WAITING_USER_ANSWER
+        )
+        assert captures == [True]
+        assert status_monitor._screens["term1"] is screen_sentinel
+        assert engine.waiting_gate("term1") == (
+            ("wait_rule", "wait-update") if branch == "wait_rule" else "unknown_dialog"
+        )
+    finally:
+        status_monitor._screens.pop("term1", None)

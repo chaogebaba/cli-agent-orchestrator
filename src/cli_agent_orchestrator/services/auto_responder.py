@@ -301,6 +301,11 @@ class AutoResponder:
                 fresh = self._capture_fresh(metadata, lines)
                 if fresh is None or not rule.matches(fresh[0]):
                     return None
+                try:
+                    if provider.get_status_from_screen(fresh[1]) == TerminalStatus.UNKNOWN:
+                        return None
+                except Exception:
+                    return None
                 with self._lock:
                     self._wait_rule_active[terminal_id] = (rule.name, time.monotonic())
                 return TerminalStatus.WAITING_USER_ANSWER
@@ -447,7 +452,6 @@ class AutoResponder:
             try:
                 is_suspect = provider.get_status_from_screen(fresh_lines) in (
                     TerminalStatus.WAITING_USER_ANSWER,
-                    TerminalStatus.UNKNOWN,
                     TerminalStatus.ERROR,
                 )
             except Exception:

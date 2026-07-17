@@ -187,7 +187,9 @@ class TmuxBackend(TerminalBackend):
             birth = self._proc_starttime(pid)
             identity = self._proc_identity(pid)
             second = self._pane_pids(session_name, window_name)
-            if len(second) != 1 or second[0] != pid or self._proc_starttime(pid) != birth:
+            if len(second) != 1:
+                return PaneIdentityReadResult(reason="pane_cardinality")
+            if second[0] != pid or self._proc_starttime(pid) != birth:
                 return PaneIdentityReadResult(reason="incarnation_changed")
         except OSError:
             return PaneIdentityReadResult(reason="read_error")

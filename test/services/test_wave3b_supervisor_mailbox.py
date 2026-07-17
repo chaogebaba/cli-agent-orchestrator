@@ -43,6 +43,7 @@ from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     get_message_trace,
     get_pending_messages,
+    insert_identity_authority_notice,
     make_admission_proof,
     record_wpm1_stalled_notice,
     resolve_inbox_receiver,
@@ -62,6 +63,7 @@ from cli_agent_orchestrator.services.mailbox_service import (
     PublicationCleanupFailed,
     ack_messages,
     claim_mailbox,
+    create_logical_inbox_message,
     delete_mailbox,
     digest_stale_pending_for_terminal,
     get_mailbox_authority_lock,
@@ -829,6 +831,14 @@ def test_probe_08_each_direct_writer_resolves_dead_incarnation_to_mailbox(scratc
                 position=0,
             )
         )
+    direct = create_inbox_message("writer-1", "11111111", "writer-1-rollover")
+    logical = create_logical_inbox_message(
+        sender_id="writer-2", mailbox_id="mb_aaaaaaaa", message="writer-2-rollover"
+    )
+    assert (
+        insert_identity_authority_notice("writer-10", "11111111", "writer-10-rollover").value
+        == "inserted"
+    )
     deferred = claim_deferred_init_failure(
         "33333333",
         caller_id="11111111",
@@ -858,6 +868,23 @@ def test_probe_08_each_direct_writer_resolves_dead_incarnation_to_mailbox(scratc
         assert {(row.receiver_id, row.logical_receiver_id) for row in matched} == {
             ("11111111", "mb_aaaaaaaa")
         }
+        assert {row.enqueue_generation for row in matched} == {2}
+        rollover_rows = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.message.in_(
+                    ["writer-1-rollover", "writer-2-rollover", "writer-10-rollover"]
+                )
+            )
+            .all()
+        )
+        assert {row.message for row in rollover_rows} == {
+            "writer-1-rollover",
+            "writer-2-rollover",
+            "writer-10-rollover",
+        }
+        assert {row.enqueue_generation for row in rollover_rows} == {2}
+        assert direct.enqueue_generation == logical.enqueue_generation == 2
 
 
 def test_probe_09_raw_addressed_output_bytes_match_parent_33aad1c(tmp_path):
@@ -942,6 +969,61 @@ def test_probe_10_mailbox_delete_settles_refuses_and_p5_straggler(scratch_db):
         )
     with pytest.raises(MailboxDomainError, match="unknown_mailbox"):
         delete_mailbox("mb_aaaaaaaa")
+
+
+def test_wpq1_writer5_mailbox_delete_notice_stamps_sender_rollover_generation(scratch_db):
+    with scratch_db.begin() as db:
+        terminal(db, "sender-current")
+        db.add(
+            MailboxModel(
+                id="mb_sender",
+                session_name="cao-sender",
+                role="supervisor",
+                current_terminal_id="sender-current",
+                generation=4,
+                consumed_through_id=0,
+            )
+        )
+        db.add_all(
+            [
+                MailboxIncarnationModel(
+                    mailbox_id="mb_sender", generation=3, terminal_id="sender-old"
+                ),
+                MailboxIncarnationModel(
+                    mailbox_id="mb_sender", generation=4, terminal_id="sender-current"
+                ),
+            ]
+        )
+        db.add(
+            MailboxModel(
+                id="mb_target",
+                session_name="cao-target",
+                role="supervisor",
+                current_terminal_id=None,
+                generation=2,
+                consumed_through_id=0,
+            )
+        )
+        db.add(
+            MailboxIncarnationModel(mailbox_id="mb_target", generation=2, terminal_id="target-old")
+        )
+        pending = InboxModel(
+            sender_id="sender-old",
+            receiver_id="target-old",
+            logical_receiver_id="mb_target",
+            enqueue_generation=2,
+            message="writer-5-target",
+            orchestration_type="send_message",
+            status="pending",
+        )
+        db.add(pending)
+
+    assert delete_mailbox("mb_target") == {"settled_pending": 1, "notices_sent": 1}
+    with scratch_db() as db:
+        notice = db.query(InboxModel).filter(InboxModel.message.like("mailbox-delete %")).one()
+        assert notice.receiver_id == "sender-old"
+        assert notice.logical_receiver_id == "mb_sender"
+        assert notice.enqueue_generation == 4
 
 
 def test_probe_11_incarnation_mapper_pk_and_global_uniqueness(scratch_db):
@@ -1507,6 +1589,26 @@ def test_wpq1_drain_routes_only_stale_generation_to_digest(scratch_db):
         assert digest.orchestration_type == "mailbox_digest"
         assert digest.enqueue_generation == 2
         assert f"message {stale.id}" in digest.message
+
+
+def test_wpq1_digest_summary_strips_c1_and_format_controls_with_caps(scratch_db):
+    with scratch_db.begin() as db:
+        mailbox(db, terminal_id="22222222", generation=2)
+        terminal(db, "22222222")
+        stale = inbox(db, "22222222", logical="mb_aaaaaaaa")
+        stale.enqueue_generation = 1
+        stale.message = "left\u009fright\u200b " + ("é" * 2000)
+
+    assert digest_stale_pending_for_terminal("22222222") == 1
+
+    with scratch_db() as db:
+        digest = db.get(InboxModel, db.get(InboxModel, stale.id).digested_into)
+        summary = digest.message.splitlines()[1]
+        assert "\u009f" not in summary
+        assert "\u200b" not in summary
+        assert "leftright" in summary
+        assert len(summary.encode("utf-8")) <= 120
+        assert len(digest.message.encode("utf-8")) <= 2000
 
 
 def test_wpq1_superseded_digest_chain_uses_direct_structural_counts(scratch_db):

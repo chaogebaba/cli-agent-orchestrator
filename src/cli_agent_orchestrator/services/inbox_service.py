@@ -28,7 +28,6 @@ from cli_agent_orchestrator.clients.database import (
     count_ambiguous_attempts,
     create_inbox_message,
     get_attempt_mailbox_authority,
-    get_current_mailbox_generation,
     get_current_mailbox_terminal,
     get_message_trace,
     get_pending_messages,
@@ -200,7 +199,9 @@ class InboxService:
 
     @staticmethod
     def _identity_authority_token(
-        batch: Sequence[InboxMessage], attempt_uuid: str | None = None
+        batch: Sequence[InboxMessage],
+        attempt_uuid: str | None = None,
+        routed_generation: int | None = None,
     ) -> str:
         logical_id = getattr(batch[0], "logical_receiver_id", None) if batch else None
         if not isinstance(logical_id, str) or not logical_id.startswith("mb_"):
@@ -211,7 +212,7 @@ class InboxService:
                 return str(authority["generation"])
         generation = getattr(batch[0], "enqueue_generation", None)
         if type(generation) is not int:
-            generation = get_current_mailbox_generation(logical_id)
+            generation = routed_generation
         if type(generation) is not int:
             raise RuntimeError("mailbox_generation_unavailable")
         return str(generation)
@@ -246,8 +247,9 @@ class InboxService:
         reason: str,
         *,
         attempt_uuid: str | None = None,
+        routed_generation: int | None = None,
     ) -> None:
-        token = self._identity_authority_token(batch, attempt_uuid)
+        token = self._identity_authority_token(batch, attempt_uuid, routed_generation)
         key = (terminal_id, token)
         with self._identity_lock:
             for old in [
@@ -742,13 +744,16 @@ class InboxService:
             if metadata.get("recovery_state") not in (None, "rebound"):
                 return
             legacy_test_seam = begin_delivery_attempt is not _PRODUCTION_BEGIN_DELIVERY_ATTEMPT
+            routed_generation: int | None = None
             if not legacy_test_seam:
                 from cli_agent_orchestrator.services.mailbox_service import (
                     digest_stale_pending_for_terminal,
                 )
 
                 try:
-                    digest_stale_pending_for_terminal(terminal_id)
+                    _, routed_generation = digest_stale_pending_for_terminal(
+                        terminal_id, include_generation=True
+                    )
                 except OperationalError as exc:
                     error_detail = str(exc).lower()
                     if "locked" not in error_detail and "busy" not in error_detail:
@@ -1090,6 +1095,7 @@ class InboxService:
                                 batch,
                                 metadata,
                                 identity_failure,
+                                routed_generation=routed_generation,
                             )
                             return
                         if probe_status not in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}:
@@ -1266,6 +1272,9 @@ class InboxService:
                     except PaneIdentityMismatchError as exc:
                         evidence = dict(persisted_evidence)
                         evidence["identity_proof"] = exc.reason
+                        mailbox_authority = get_attempt_mailbox_authority(attempt_uuid)
+                        if mailbox_authority is not None:
+                            evidence["mailbox_authority"] = mailbox_authority
                         settle_delivery_attempt_proof_safe(
                             attempt_uuid,
                             evidence,

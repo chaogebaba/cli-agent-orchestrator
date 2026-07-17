@@ -389,6 +389,41 @@ class TestWaitUntilStatus:
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_wpq1_blocked_duration_exceeding_normal_timeout_is_paused(
+        self, mock_monitor, monkeypatch
+    ):
+        fake_time = MagicMock()
+        fake_time.monotonic.side_effect = [0.0, 0.0, 10.0, 20.0]
+        monkeypatch.setattr("cli_agent_orchestrator.utils.terminal.time", fake_time)
+
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr("cli_agent_orchestrator.utils.terminal.asyncio.sleep", no_sleep)
+        mock_monitor.get_status.side_effect = [
+            TerminalStatus.PROCESSING,
+            TerminalStatus.PROCESSING,
+            TerminalStatus.IDLE,
+        ]
+        gates = iter([("wait_rule", "update"), ("wait_rule", "update")])
+
+        assert (
+            await wait_until_status(
+                "test-terminal",
+                TerminalStatus.IDLE,
+                timeout=5.0,
+                polling_interval=1.0,
+                blocked_policy=BlockedWaitPolicy(
+                    probe=lambda: next(gates),
+                    blocked_cap_s=30.0,
+                    on_first_blocked=lambda _rule: no_sleep(0),
+                ),
+            )
+            is True
+        )
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
     async def test_wpq1_blocked_cap_returns_literal_false(self, mock_monitor):
         mock_monitor.get_status.return_value = TerminalStatus.PROCESSING
         notified = []
