@@ -746,6 +746,85 @@ def test_d5_insert_and_second_callback_read_hold_delivery_lock(monkeypatch):
     assert not delivery_lock.locked()
 
 
+def test_d5_finalize_exits_while_delivery_lock_held(monkeypatch):
+    service, metadata = _armed()
+    delivery_lock = threading.Lock()
+    callback_reads = 0
+    finalize_armed = False
+    finalize_exits = []
+
+    class FinalizeExitProbe:
+        def __init__(self, lock):
+            self._lock = lock
+
+        def acquire(self, *args, **kwargs):
+            return self._lock.acquire(*args, **kwargs)
+
+        def release(self):
+            return self._lock.release()
+
+        def _is_owned(self):
+            return self._lock._is_owned()
+
+        def __enter__(self):
+            self._lock.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            nonlocal finalize_armed
+            try:
+                if finalize_armed:
+                    assert self._lock._is_owned()
+                    assert delivery_lock.locked()
+                    finalize_exits.append(True)
+                    finalize_armed = False
+            finally:
+                self._lock.__exit__(exc_type, exc, traceback)
+            return False
+
+    def callback_status(*_args):
+        nonlocal callback_reads, finalize_armed
+        callback_reads += 1
+        if callback_reads == 2:
+            finalize_armed = True
+        return None
+
+    monkeypatch.setattr(service, "_lock", FinalizeExitProbe(service._lock))
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        lambda _terminal: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+        callback_status,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
+        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
+        lambda _terminal: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
+        lambda _terminal: delivery_lock,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
+        lambda *_args: WatchdogInsertResult("inserted", 47),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",
+        lambda _terminal: None,
+    )
+
+    assert service.collect_due_notifications(now=13.0) == []
+    assert callback_reads == 2
+    assert finalize_exits == [True]
+    assert not delivery_lock.locked()
+
+
 def test_d5_insert_and_callback_reads_run_outside_watchdog_lock(monkeypatch):
     service, metadata = _armed()
     callback_reads = 0
