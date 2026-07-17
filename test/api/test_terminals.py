@@ -58,6 +58,43 @@ class TestTranscriptBindingEndpoint:
         assert response.status_code == 200
         assert create.call_args.args[3] == transcript.stat().st_ino
 
+    def test_wpq5_m_digest_failure_never_fails_compact_binding_and_noncompact_skips(
+        self, client, tmp_path
+    ):
+        transcript = tmp_path / ".claude" / "projects" / "repo" / "session.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text('{"type":"user"}\n', encoding="utf-8")
+        payload = {
+            "terminal_id": "abcd1234",
+            "session_id": "effective",
+            "transcript_path": str(transcript),
+            "cwd": "/work",
+            "source": "compact",
+        }
+        with (
+            patch("cli_agent_orchestrator.api.main.Path.home", return_value=tmp_path),
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value={"id": "abcd1234"},
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.create_transcript_binding",
+                return_value={"id": 1},
+            ),
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service."
+                "publish_compact_boundary_digest",
+                side_effect=RuntimeError("digest unavailable"),
+            ) as digest,
+        ):
+            compact = client.post("/terminals/abcd1234/transcript-binding", json=payload)
+            payload["source"] = "startup"
+            startup = client.post("/terminals/abcd1234/transcript-binding", json=payload)
+
+        assert compact.status_code == 200
+        assert startup.status_code == 200
+        assert digest.call_count == 1
+
     @pytest.mark.parametrize("case", ["mismatch", "outside"])
     def test_binding_rejections_are_route_local_400(self, client, tmp_path, case):
         projects = tmp_path / ".claude" / "projects"

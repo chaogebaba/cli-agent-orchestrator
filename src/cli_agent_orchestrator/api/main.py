@@ -2130,6 +2130,19 @@ async def bind_transcript(
             inode,
             body.source,
         )
+        if body.source == "compact":
+            try:
+                from cli_agent_orchestrator.services.mailbox_service import (
+                    publish_compact_boundary_digest,
+                )
+
+                publish_compact_boundary_digest(
+                    terminal_id,
+                    window_min=int(os.environ.get("CAO_COMPACT_DIGEST_WINDOW_MIN", "15")),
+                    now_utc=datetime.now(timezone.utc),
+                )
+            except Exception:
+                logger.exception("Failed to publish compact digest for terminal %s", terminal_id)
         from cli_agent_orchestrator.services.inbox_service import inbox_service
 
         inbox_service.reset_binding_episodes(terminal_id)

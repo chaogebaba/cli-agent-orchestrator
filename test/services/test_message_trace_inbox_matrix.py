@@ -396,6 +396,7 @@ def test_messages_trace_cli_table_and_json(monkeypatch):
         "message": {"status": "delivered"},
         "attempts": [{"started_at": "now", "outcome": "confirmed",
                       "attempt_uuid": "attempt", "reason": None}],
+        "events": [{"created_at": "later", "kind": "inferred_delivered"}],
     }
     monkeypatch.setattr("cli_agent_orchestrator.cli.commands.messages.requests.get",
                         lambda *_a, **_k: response)
@@ -404,9 +405,11 @@ def test_messages_trace_cli_table_and_json(monkeypatch):
     assert table.exit_code == 0
     assert "message 7  status=delivered" in table.output
     assert "confirmed" in table.output
+    assert "later  event inferred_delivered" in table.output
     json_result = runner.invoke(messages, ["trace", "7", "--json"])
     assert json_result.exit_code == 0
     assert '"status": "delivered"' in json_result.output
+    assert '"kind": "inferred_delivered"' in json_result.output
 
 
 def test_terminal_delete_state_retains_lock_identity_and_cleans_wake_seq():
