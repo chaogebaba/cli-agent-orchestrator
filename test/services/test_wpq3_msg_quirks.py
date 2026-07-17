@@ -8,11 +8,12 @@ from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.messages import messages
 from cli_agent_orchestrator.clients.database import WatchdogInsertResult
-from cli_agent_orchestrator.models.inbox import MessageStatus
+from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.services.inbox_service import (
     FirstLookupResult,
+    InboxService,
     SuccessorLookupPlan,
     corroborate_claude_successor,
 )
@@ -320,6 +321,222 @@ def test_d5_second_callback_read_cancels_pending_resume(monkeypatch):
     assert service.collect_due_notifications(now=13.0) == []
     cancel.assert_called_once_with(42, "worker")
     assert not service._episodes["worker"].auto_resumed
+
+
+def test_d5_failed_before_commit_pushes_without_marking_auto_resumed(monkeypatch):
+    service, metadata = _armed()
+    deliver = MagicMock()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        lambda _terminal: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
+        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
+        lambda _terminal: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
+        lambda _terminal: threading.Lock(),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
+        lambda *_args: WatchdogInsertResult("failed_before_commit"),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending", deliver
+    )
+
+    assert service.collect_due_notifications(now=13.0) == [
+        ("worker", "caller", "[watchdog] worker worker (developer) idle 3s without callback")
+    ]
+    episode = service._episodes["worker"]
+    assert episode.fired
+    assert episode.auto_resumed is False
+    assert episode.resume_reserved_at is None
+    deliver.assert_not_called()
+
+
+def test_d5_watchdog_sender_commit_does_not_rearm_episode(monkeypatch):
+    service, _ = _armed()
+    episode = service._episodes["worker"]
+    before = (
+        episode.generation,
+        episode.revision,
+        episode.inbound_at,
+        episode.episode_started_wall_at,
+        episode.last_join_wall_at,
+        episode.idle_since,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.stalled_callback_watchdog",
+        service,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        lambda _terminal: None,
+    )
+
+    InboxService()._commit_watchdog_ops(
+        "worker",
+        "watchdog:worker",
+        OrchestrationType.SEND_MESSAGE,
+        {"caller_id": "caller", "agent_profile": "developer"},
+    )
+
+    current = service._episodes["worker"]
+    assert current is episode
+    assert (
+        current.generation,
+        current.revision,
+        current.inbound_at,
+        current.episode_started_wall_at,
+        current.last_join_wall_at,
+        current.idle_since,
+    ) == before
+
+
+def test_d5_insert_and_second_callback_read_hold_delivery_lock(monkeypatch):
+    service, metadata = _armed()
+    delivery_lock = threading.Lock()
+    callback_reads = 0
+
+    def callback_status(*_args):
+        nonlocal callback_reads
+        callback_reads += 1
+        if callback_reads == 2:
+            assert delivery_lock.locked()
+        return None
+
+    def insert(*_args):
+        assert delivery_lock.locked()
+        return WatchdogInsertResult("failed_before_commit")
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        lambda _terminal: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+        callback_status,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
+        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
+        lambda _terminal: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
+        lambda _terminal: delivery_lock,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
+        insert,
+    )
+
+    assert len(service.collect_due_notifications(now=13.0)) == 1
+    assert callback_reads == 2
+    assert not delivery_lock.locked()
+
+
+def test_d5_second_callback_read_uses_frozen_episode_start_after_replace(monkeypatch):
+    service, metadata = _armed()
+    old_started = service._episodes["worker"].episode_started_wall_at
+    callback_starts = []
+    cancel = MagicMock(return_value=True)
+
+    def callback_status(_terminal, _caller, since):
+        callback_starts.append(since)
+        return None
+
+    def insert(*_args):
+        service.record_inbound_task("worker", "caller", "developer")
+        service._episodes["worker"].episode_started_wall_at = datetime(2030, 1, 1)
+        return WatchdogInsertResult("inserted", 43)
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        lambda _terminal: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+        callback_status,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
+        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
+        lambda _terminal: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
+        lambda _terminal: threading.Lock(),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
+        insert,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.cancel_pending_watchdog_message",
+        cancel,
+    )
+
+    assert service.collect_due_notifications(now=13.0) == []
+    assert callback_starts == [old_started, old_started]
+    assert service._episodes["worker"].episode_started_wall_at != old_started
+    cancel.assert_called_once_with(43, "worker")
+
+
+def test_d5_callback_fence_holds_lock_until_commit_resolution(monkeypatch):
+    service = StalledCallbackWatchdog()
+    guard_entered = threading.Event()
+    resolve_commit = threading.Event()
+    lock_attempted = threading.Event()
+    competing_acquired = threading.Event()
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.terminal_exists",
+        lambda _sender: True,
+    )
+
+    def guarded_insert():
+        with service.callback_insert_guard("worker"):
+            guard_entered.set()
+            assert resolve_commit.wait(1)
+
+    def competing_watchdog_step():
+        assert guard_entered.wait(1)
+        lock_attempted.set()
+        with service._lock:
+            competing_acquired.set()
+
+    insert_thread = threading.Thread(target=guarded_insert)
+    competitor_thread = threading.Thread(target=competing_watchdog_step)
+    insert_thread.start()
+    competitor_thread.start()
+    try:
+        assert lock_attempted.wait(1)
+        assert not competing_acquired.wait(0.1)
+    finally:
+        resolve_commit.set()
+        insert_thread.join(1)
+        competitor_thread.join(1)
+
+    assert not insert_thread.is_alive()
+    assert not competitor_thread.is_alive()
+    assert competing_acquired.is_set()
 
 
 def test_d5_callback_fence_bumps_before_body_and_never_rolls_back(monkeypatch):
