@@ -373,6 +373,36 @@ def _armed(provider="codex"):
     return service, metadata
 
 
+def _patch_successful_auto_resume(monkeypatch, service, metadata, deliver):
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        lambda _terminal: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
+        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
+        lambda _terminal: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
+        lambda _terminal: threading.Lock(),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
+        lambda *_args: WatchdogInsertResult("inserted", 46),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending", deliver
+    )
+
+
 def test_d5_join_bumps_revision_and_fired_replaces_generation():
     service, _ = _armed()
     first = service._episodes["worker"]
@@ -466,6 +496,46 @@ def test_d5_full_fire_inserts_exact_body_then_delivers(monkeypatch):
     episode = service._episodes["worker"]
     assert episode.auto_resumed
     assert episode.resume_reserved_at is None
+
+
+def test_d5_delivery_callback_runs_outside_watchdog_lock(monkeypatch):
+    service, metadata = _armed()
+    delivered = []
+
+    def deliver(terminal_id):
+        assert not service._lock._is_owned()
+        delivered.append(terminal_id)
+
+    _patch_successful_auto_resume(monkeypatch, service, metadata, deliver)
+
+    assert service.collect_due_notifications(now=13.0) == []
+    assert delivered == ["worker"]
+
+
+def test_d5_delivery_callback_observes_actual_finalize(monkeypatch):
+    service, metadata = _armed()
+    finalized = []
+
+    def deliver(terminal_id):
+        episode = service._episodes[terminal_id]
+        finalized.append(
+            (
+                episode.auto_resumed,
+                episode.resume_reserved_at,
+                episode.auto_resume_attempted_at,
+                episode.idle_since,
+            )
+        )
+
+    _patch_successful_auto_resume(monkeypatch, service, metadata, deliver)
+
+    assert service.collect_due_notifications(now=13.0) == []
+    assert len(finalized) == 1
+    auto_resumed, reserved_at, attempted_at, idle_since = finalized[0]
+    assert auto_resumed is True
+    assert reserved_at is None
+    assert attempted_at is not None
+    assert idle_since == 13.0
 
 
 def test_d5_auto_resume_is_one_shot_and_suffix_preserves_mark(monkeypatch):
