@@ -374,6 +374,7 @@ def _armed(provider="codex"):
 
 
 def _patch_successful_auto_resume(monkeypatch, service, metadata, deliver):
+    delivery_lock = threading.Lock()
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
         lambda _terminal: metadata,
@@ -392,7 +393,7 @@ def _patch_successful_auto_resume(monkeypatch, service, metadata, deliver):
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
-        lambda _terminal: threading.Lock(),
+        lambda _terminal: delivery_lock,
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
@@ -401,6 +402,7 @@ def _patch_successful_auto_resume(monkeypatch, service, metadata, deliver):
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending", deliver
     )
+    return delivery_lock
 
 
 def test_d5_join_bumps_revision_and_fired_replaces_generation():
@@ -504,9 +506,10 @@ def test_d5_delivery_callback_runs_outside_watchdog_lock(monkeypatch):
 
     def deliver(terminal_id):
         assert not service._lock._is_owned()
+        assert not delivery_lock.locked()
         delivered.append(terminal_id)
 
-    _patch_successful_auto_resume(monkeypatch, service, metadata, deliver)
+    delivery_lock = _patch_successful_auto_resume(monkeypatch, service, metadata, deliver)
 
     assert service.collect_due_notifications(now=13.0) == []
     assert delivered == ["worker"]
