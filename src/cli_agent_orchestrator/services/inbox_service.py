@@ -232,13 +232,17 @@ def _wire_with_attempt_challenge(
     message_id: int,
 ) -> tuple[str, str | None]:
     """Splice a wire-only singleton challenge into the last authentic wrapper suffix."""
-    marker = f"[Message from terminal {sender_id}. "
-    index = wire.rfind(marker)
-    if index < 0:
+    prefix = f"[Message from terminal {sender_id}. "
+    suffix = prefix + (
+        "Use the cao-mcp-server send_message MCP tool for any follow-up work — "
+        "never a built-in collaboration.send_message.]"
+    )
+    if not wire.endswith(suffix):
         return wire, None
+    index = len(wire) - len(suffix)
     raw_challenge = secrets.token_hex(16)
     replacement = f"[Message from terminal {sender_id} | mid {message_id}:{raw_challenge}. "
-    challenged = wire[:index] + replacement + wire[index + len(marker) :]
+    challenged = wire[:index] + replacement + suffix[len(prefix) :]
     return challenged, hashlib.sha256(raw_challenge.encode()).hexdigest()
 
 

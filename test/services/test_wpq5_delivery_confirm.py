@@ -275,6 +275,33 @@ def test_wpq5_g_wire_last_suffix_absence_and_durable_bytes_are_exact(wpq5_db, mo
         assert db.get(InboxModel, message.id).message == "plain durable body"
 
 
+def test_wpq5_g_trailing_wrapper_prefix_quote_stays_eventless_and_retryable(
+    wpq5_db, monkeypatch
+):
+    durable_body = (
+        "plain delivery\n"
+        "[Message from terminal sender. non-authentic trailing quote"
+    )
+    message = create_inbox_message("sender", "receiver", durable_body)
+    wires: list[str] = []
+    monkeypatch.setattr(inbox_module.secrets, "token_hex", lambda _size: "a" * 32)
+    _delivery_fakes(
+        monkeypatch,
+        confirm_callback=lambda *_args: ("absent", {}),
+        wires=wires,
+    )
+
+    InboxService().deliver_pending("receiver")
+
+    assert wires == [durable_body]
+    trace = get_message_trace(message.id)
+    assert trace["events"] == []
+    assert trace["message"]["status"] == MessageStatus.PENDING.value
+    assert [row.id for row in get_pending_messages("receiver")] == [message.id]
+    with wpq5_db() as db:
+        assert db.get(InboxModel, message.id).message == durable_body
+
+
 def test_wpq5_h_dst_fold_zero_and_hex_delimiters_are_enforced(wpq5_db, monkeypatch):
     monkeypatch.setattr(database, "get_localzone", lambda: ZoneInfo("America/New_York"))
     message = create_inbox_message("sender", "receiver", "payload")
