@@ -92,6 +92,22 @@ PROCESSING_PATTERN = r"\b(thinking|working|running|executing|processing|analyzin
 WAITING_PROMPT_PATTERN = r"^(?:Approve|Allow)\b.*\b(?:y/n|yes/no|yes|no)\b"
 ERROR_PATTERN = r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|panic:)"
 
+TRANSIENT_API_ERROR_PATTERNS = (
+    r"(?i)invalid_request_error",
+    r"(?i)too many requests",
+    r"(?i)\b429\b.*(too many|rate)",
+    r"(?i)400 bad request",
+    r"(?i)502 bad gateway",
+    r"(?i)nginx(/[0-9.]+)?",
+    r"(?i)stream (error|disconnected)",
+)
+TRANSIENT_ERROR_EXCLUSIONS = (
+    r"(?i)invalid_api_key|authentication|unauthorized",
+    r"(?i)model_not_found|unknown model",
+    r"(?i)usage limit|insufficient_quota|quota",
+    r"(?i)content policy|safety",
+)
+
 # Codex TUI footer indicators (status bar below the idle prompt).
 # Used to detect when the bottom lines contain TUI chrome rather than user input.
 # v0.110 and earlier: "? for shortcuts" and "N% context left"
@@ -1019,6 +1035,31 @@ class CodexProvider(BaseProvider):
                 )
             )
         return screen_classification_result(signals)
+
+    def transient_error_detected(
+        self, rows: list[str], classification: ScreenClassificationResult
+    ) -> bool:
+        clean_rows = [strip_terminal_escapes(row) for row in rows]
+        positive = any(
+            re.search(pattern, row) is not None
+            for pattern in TRANSIENT_API_ERROR_PATTERNS
+            for row in clean_rows
+        )
+        excluded = any(
+            re.search(pattern, row) is not None
+            for pattern in TRANSIENT_ERROR_EXCLUSIONS
+            for row in clean_rows
+        )
+        strict_idle = any(
+            re.search(IDLE_PROMPT_STRICT_PATTERN, row, re.IGNORECASE) is not None
+            for row in clean_rows
+        )
+        return (
+            positive
+            and not excluded
+            and strict_idle
+            and classification.status == TerminalStatus.IDLE
+        )
 
     def get_status_from_screen(self, screen_lines: list[str]) -> TerminalStatus:
         return self.classify_screen(screen_lines).status

@@ -331,7 +331,15 @@ def test_real_deliver_pending_replay_tags_exact_wire_and_trace(scratch_db):
         ),
         patch(
             "cli_agent_orchestrator.services.inbox_service._wpm2_lookup",
-            return_value=("absent", {}),
+            return_value=(
+                "absent",
+                {
+                    "path": "/trace",
+                    "inode": 1,
+                    "size": 10,
+                    "resolution_kind": "binding",
+                },
+            ),
         ),
         patch(
             "cli_agent_orchestrator.services.message_trace_service."

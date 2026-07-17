@@ -409,41 +409,47 @@ def create_logical_inbox_message(
     lock = get_mailbox_authority_lock(*key)
     _acquire(lock)
     try:
-        with SessionLocal() as db:
-            receiver_cache, logical_receiver_id, enqueue_generation = resolve_inbox_receiver(
-                db, mailbox_id
-            )
-            if receiver_cache and not receiver_cache.startswith("mb_"):
-                from cli_agent_orchestrator.services.terminal_guard_service import (
-                    require_input_allowed,
+        from cli_agent_orchestrator.services.stalled_callback_watchdog import (
+            stalled_callback_watchdog,
+        )
+
+        with stalled_callback_watchdog.callback_insert_guard(sender_id):
+            with SessionLocal() as db:
+                receiver_cache, logical_receiver_id, enqueue_generation = resolve_inbox_receiver(
+                    db, mailbox_id
                 )
 
-                require_input_allowed(receiver_cache, refresh_ingest=refresh_ingest)
-            row: Any = InboxModel(
-                sender_id=sender_id,
-                receiver_id=receiver_cache,
-                logical_receiver_id=logical_receiver_id,
-                message=message,
-                enqueue_generation=enqueue_generation,
-                orchestration_type=orchestration_type.value,
-                status=MessageStatus.PENDING.value,
-            )
-            db.add(row)
-            db.commit()
-            db.refresh(row)
-            return InboxMessage(
-                id=row.id,
-                sender_id=row.sender_id,
-                receiver_id=row.receiver_id,
-                logical_receiver_id=row.logical_receiver_id,
-                message=row.message,
-                digested_into=row.digested_into,
-                enqueue_generation=row.enqueue_generation,
-                orchestration_type=OrchestrationType(row.orchestration_type),
-                status=MessageStatus(row.status),
-                failure_reason=row.failure_reason,
-                created_at=row.created_at,
-            )
+                if receiver_cache and not receiver_cache.startswith("mb_"):
+                    from cli_agent_orchestrator.services.terminal_guard_service import (
+                        require_input_allowed,
+                    )
+
+                    require_input_allowed(receiver_cache, refresh_ingest=refresh_ingest)
+                row: Any = InboxModel(
+                    sender_id=sender_id,
+                    receiver_id=receiver_cache,
+                    logical_receiver_id=logical_receiver_id,
+                    message=message,
+                    enqueue_generation=enqueue_generation,
+                    orchestration_type=orchestration_type.value,
+                    status=MessageStatus.PENDING.value,
+                )
+                db.add(row)
+                db.commit()
+                db.refresh(row)
+                return InboxMessage(
+                    id=row.id,
+                    sender_id=row.sender_id,
+                    receiver_id=row.receiver_id,
+                    logical_receiver_id=row.logical_receiver_id,
+                    message=row.message,
+                    digested_into=row.digested_into,
+                    enqueue_generation=row.enqueue_generation,
+                    orchestration_type=OrchestrationType(row.orchestration_type),
+                    status=MessageStatus(row.status),
+                    failure_reason=row.failure_reason,
+                    created_at=row.created_at,
+                )
     finally:
         lock.release()
 

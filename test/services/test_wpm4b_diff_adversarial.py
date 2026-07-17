@@ -96,7 +96,15 @@ def _assert_corrective_pre_paste_retries_untagged(scratch_db: Any, error: Except
         ),
         patch(
             "cli_agent_orchestrator.services.inbox_service._wpm2_lookup",
-            return_value=("absent", {}),
+            return_value=(
+                "absent",
+                {
+                    "path": "/trace",
+                    "inode": 1,
+                    "size": 10,
+                    "resolution_kind": "binding",
+                },
+            ),
         ),
         patch(
             "cli_agent_orchestrator.services.message_trace_service."

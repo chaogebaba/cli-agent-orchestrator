@@ -3105,7 +3105,7 @@ async def get_inbox_messages_endpoint(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=(
                         "Invalid status: %s. Valid values: pending, delivering, delivered, "
-                        "delivery_failed, failed, digested" % status_param
+                        "delivery_failed, failed, digested, cancelled" % status_param
                     ),
                 )
 

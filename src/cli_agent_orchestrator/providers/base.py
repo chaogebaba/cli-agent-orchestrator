@@ -249,6 +249,12 @@ class BaseProvider(ABC):
             return result
         return ScreenClassificationResult(ScreenClassification(status, "none", None, None), ())
 
+    def transient_error_detected(
+        self, rows: List[str], classification: ScreenClassificationResult
+    ) -> bool:
+        """Return whether a final proven frame is eligible for transient recovery."""
+        return False
+
     # Opt-in flag for preserving an unsent human composer draft before CAO
     # injects orchestrated input. Providers that set this True must implement
     # read_composer_draft() against rendered screen lines and provide a single

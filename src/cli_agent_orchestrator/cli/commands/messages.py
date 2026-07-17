@@ -77,7 +77,15 @@ def _resolve_me(value: str) -> str:
     "--status",
     "status_value",
     type=click.Choice(
-        ["pending", "delivering", "delivered", "delivery_failed", "failed", "digested"]
+        [
+            "pending",
+            "delivering",
+            "delivered",
+            "delivery_failed",
+            "failed",
+            "digested",
+            "cancelled",
+        ]
     ),
 )
 def list_cmd(

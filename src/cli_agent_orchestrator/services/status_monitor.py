@@ -63,6 +63,7 @@ class ScreenProbeMeta(TypedDict):
     law_signal: ScreenProbeLawSignal
     identity_proof_failure: NotRequired[str]
     temporal_demotion: NotRequired["ScreenProbeTemporalDemotion"]
+    transient_api_error: NotRequired[bool]
 
 
 class ScreenProbeTemporalDemotion(TypedDict):
@@ -1276,6 +1277,12 @@ class StatusMonitor:
             meta["identity_proof_failure"] = identity_proof_failure
         if temporal_demotion is not None:
             meta["temporal_demotion"] = temporal_demotion
+        if provider is not None:
+            try:
+                if provider.transient_error_detected(rows, classification):
+                    meta["transient_api_error"] = True
+            except Exception:
+                logger.exception("Error evaluating transient-error signal for %s", terminal_id)
         return classification.status, meta
 
     def get_rendered_screen(self, terminal_id: str) -> Optional[List[str]]:

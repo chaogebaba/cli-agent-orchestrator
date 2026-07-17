@@ -115,7 +115,10 @@ class TestGetInboxMessagesEndpoint:
         data = response.json()
         assert "detail" in data
         assert "Invalid status" in data["detail"]
-        assert "pending, delivering, delivered, delivery_failed, failed, digested" in data["detail"]
+        assert (
+            "pending, delivering, delivered, delivery_failed, failed, digested, cancelled"
+            in data["detail"]
+        )
 
     def test_wpq1_digested_status_and_link_are_public(self, client):
         row = InboxMessage(

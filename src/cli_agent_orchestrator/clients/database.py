@@ -61,6 +61,12 @@ class NoticeInsertOutcome(str, Enum):
     FAILED_AFTER_COMMIT = "failed_after_commit"
 
 
+@dataclass(frozen=True)
+class WatchdogInsertResult:
+    kind: str
+    message_id: int | None = None
+
+
 TRANSCRIPT_BINDING_SOURCES = frozenset({"startup", "resume", "clear", "compact", "server_recovery"})
 
 
@@ -2477,6 +2483,20 @@ def create_inbox_message(
     message: str,
     orchestration_type: OrchestrationType = OrchestrationType.SEND_MESSAGE,
 ) -> InboxMessage:
+    from cli_agent_orchestrator.services.stalled_callback_watchdog import (
+        stalled_callback_watchdog,
+    )
+
+    with stalled_callback_watchdog.callback_insert_guard(sender_id):
+        return _create_inbox_message_unfenced(sender_id, receiver_id, message, orchestration_type)
+
+
+def _create_inbox_message_unfenced(
+    sender_id: str,
+    receiver_id: str,
+    message: str,
+    orchestration_type: OrchestrationType = OrchestrationType.SEND_MESSAGE,
+) -> InboxMessage:
     """Create inbox message with status=MessageStatus.PENDING.
 
     Raises:
@@ -2518,6 +2538,61 @@ def create_inbox_message(
             status=MessageStatus(inbox_msg.status),
             created_at=inbox_msg.created_at,
         )
+
+
+def insert_watchdog_auto_resume_message(terminal_id: str, message: str) -> WatchdogInsertResult:
+    """Insert one resume row while preserving commit-phase uncertainty."""
+    try:
+        db = SessionLocal()
+    except Exception:
+        return WatchdogInsertResult("failed_before_commit")
+    commit_started = False
+    try:
+        if db.query(TerminalModel.id).filter(TerminalModel.id == terminal_id).first() is None:
+            return WatchdogInsertResult("failed_before_commit")
+        row = InboxModel(
+            sender_id=f"watchdog:{terminal_id}",
+            receiver_id=terminal_id,
+            message=message,
+            orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+            status=MessageStatus.PENDING.value,
+        )
+        db.add(row)
+        db.flush()
+        message_id = int(row.id)
+        commit_started = True
+        db.commit()
+        return WatchdogInsertResult("inserted", message_id)
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return WatchdogInsertResult("uncertain" if commit_started else "failed_before_commit")
+    finally:
+        db.close()
+
+
+def cancel_pending_watchdog_message(message_id: int, terminal_id: str) -> bool:
+    """Cancel exactly one still-pending auto-resume row by guarded CAS."""
+    with SessionLocal.begin() as db:
+        changed = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.id == message_id,
+                InboxModel.sender_id == f"watchdog:{terminal_id}",
+                InboxModel.receiver_id == terminal_id,
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .update(
+                {
+                    InboxModel.status: MessageStatus.CANCELLED.value,
+                    InboxModel.failure_reason: "auto_resume_superseded",
+                },
+                synchronize_session=False,
+            )
+        )
+        return changed == 1
 
 
 def insert_identity_authority_notice(

@@ -278,7 +278,7 @@ def test_watchdog_resets_on_new_task_after_firing():
         ]
 
 
-def test_caller_messages_join_fired_episode_without_rearming_alarm():
+def test_caller_messages_replace_fired_episode_with_fresh_alarm():
     svc = StalledCallbackWatchdog(grace_seconds=3)
     svc.record_inbound_task("worker1", "caller1", "developer")
     svc.record_status("worker1", TerminalStatus.IDLE, now=10.0)
@@ -293,10 +293,12 @@ def test_caller_messages_join_fired_episode_without_rearming_alarm():
         started = episode.episode_started_wall_at
         for _ in range(3):
             svc.record_inbound_task("worker1", "caller1", "developer")
-        assert svc._episodes["worker1"] is episode
-        assert episode.fired
-        assert episode.episode_started_wall_at == started
-        assert episode.last_join_wall_at is not None
+        replacement = svc._episodes["worker1"]
+        assert replacement is not episode
+        assert replacement.generation == episode.generation + 1
+        assert not replacement.fired
+        assert replacement.episode_started_wall_at != started
+        assert replacement.last_join_wall_at is not None
         assert svc.collect_due_notifications(now=30.0) == []
 
 

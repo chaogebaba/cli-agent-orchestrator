@@ -661,7 +661,7 @@ class TestInboxOperations:
     """Tests for inbox database operations."""
 
     def test_message_status_storage_is_additive_unconstrained_text(self):
-        """Database-facing enum exposes all six honest delivery states."""
+        """Database-facing enum exposes all seven honest delivery states."""
         assert [status.value for status in MessageStatus] == [
             "pending",
             "delivering",
@@ -669,6 +669,7 @@ class TestInboxOperations:
             "delivery_failed",
             "failed",
             "digested",
+            "cancelled",
         ]
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")

@@ -3171,26 +3171,33 @@ def _delete_terminal_under_lease(
         from cli_agent_orchestrator.services.stalled_callback_watchdog import (
             stalled_callback_watchdog,
         )
-
-        stalled_callback_watchdog.clear_terminal(terminal_id)
-        from cli_agent_orchestrator.services.inbox_service import clear_terminal_delivery_state
-
-        clear_terminal_delivery_state(terminal_id)
-        try:
-            from cli_agent_orchestrator.services.auto_responder import auto_responder
-
-            auto_responder.clear_terminal(terminal_id)
-        except Exception as e:
-            logger.warning(f"Failed to clear auto-responder for {terminal_id}: {e}")
-        # Drop any per-curator dispatch lock so the registry doesn't grow
-        # forever as memory_manager terminals come and go.
-        from cli_agent_orchestrator.services.memory_service import _curator_locks
-
-        _curator_locks.pop(terminal_id, None)
-        deletion = delete_terminal_and_warm_intent(
-            terminal_id,
-            preserve_warm_intent=preserve_warm_intent,
+        from cli_agent_orchestrator.services.inbox_service import (
+            clear_terminal_delivery_state,
+            get_delivery_lock,
         )
+
+        delivery_lock = get_delivery_lock(terminal_id)
+        delivery_lock.acquire()
+        try:
+            stalled_callback_watchdog.clear_terminal(terminal_id)
+            clear_terminal_delivery_state(terminal_id)
+            try:
+                from cli_agent_orchestrator.services.auto_responder import auto_responder
+
+                auto_responder.clear_terminal(terminal_id)
+            except Exception as e:
+                logger.warning(f"Failed to clear auto-responder for {terminal_id}: {e}")
+            # Drop any per-curator dispatch lock so the registry doesn't grow
+            # forever as memory_manager terminals come and go.
+            from cli_agent_orchestrator.services.memory_service import _curator_locks
+
+            _curator_locks.pop(terminal_id, None)
+            deletion = delete_terminal_and_warm_intent(
+                terminal_id,
+                preserve_warm_intent=preserve_warm_intent,
+            )
+        finally:
+            delivery_lock.release()
         deleted = deletion["terminal_deleted"]
         intent_deleted = deletion["intent_deleted"]
         intent_error = None

@@ -3,21 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import logging
+import os
 import re
 import threading
 import time
-import copy
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
+    cancel_pending_watchdog_message,
     get_callback_status_since,
     get_terminal_metadata,
+    insert_watchdog_auto_resume_message,
     list_pending_receiver_ids,
     list_ready_backlog_observations,
+    terminal_exists,
 )
 from cli_agent_orchestrator.constants import (
     CAO_WAITING_INBOX_GRACE_SECONDS,
@@ -32,6 +37,12 @@ from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
 WATCHDOG_SCREEN_TAIL_LINES = 45
+AUTO_RESUME_PROVIDERS = frozenset({"codex"})
+AUTO_RESUME_BODY = (
+    "[watchdog auto-resume] your previous turn ended on a transient API error. "
+    "Continue your assigned task from where you left off; do not redo work that already "
+    "completed; the original callback contract stands."
+)
 
 
 def _filtered_liveness_tail(tail: str, patterns: list[str]) -> str:
@@ -62,6 +73,33 @@ class _Episode:
     # state (observed live: pyte screen divergence latched COMPLETED through
     # a whole busy codex turn).
     last_screen_fp: str | None = None
+    generation: int = 1
+    revision: int = 0
+    auto_resumed: bool = False
+    resume_reserved_at: float | None = None
+    auto_resume_attempted_at: str | None = None
+
+
+@dataclass(frozen=True)
+class PreflightCandidate:
+    terminal_id: str
+    caller_id: str
+    generation: int
+    revision: int
+    episode_started_wall_at: datetime
+    callback_fence_at_snapshot: int
+    idle_seconds: int
+
+
+@dataclass(frozen=True)
+class AutoResumeAction:
+    terminal_id: str
+    caller_id: str
+    generation: int
+    revision: int
+    episode_started_wall_at: datetime
+    callback_fence_at_snapshot: int
+    body: str
 
 
 @dataclass
@@ -86,6 +124,30 @@ class StalledCallbackWatchdog:
         self._waiting_inbox_last_push: dict[str, float] = {}
         self._ready_backlog_episodes: dict[str, ReadyBacklogEpisode] = {}
         self._paused: set[str] = set()
+        self._generation_by_terminal: dict[str, int] = {}
+        self._callback_fences: dict[str, int] = {}
+
+    @contextmanager
+    def callback_insert_guard(self, sender_id: str):
+        """Fence a worker-sent durable insert from before write authority through commit."""
+        if sender_id.startswith("watchdog:") or not terminal_exists(sender_id):
+            yield
+            return
+        self._lock.acquire()
+        try:
+            self._callback_fences[sender_id] = self._callback_fences.get(sender_id, 0) + 1
+            yield
+        finally:
+            self._lock.release()
+
+    @contextmanager
+    def confirmed_settlement_guard(self):
+        """Pre-acquire the watchdog RLock before a confirmed settlement transaction."""
+        self._lock.acquire()
+        try:
+            yield
+        finally:
+            self._lock.release()
 
     def pause_terminal(self, terminal_id: str):
         with self._lock:
@@ -117,20 +179,32 @@ class StalledCallbackWatchdog:
             self._paused.discard(terminal_id)
 
     def record_inbound_task(self, terminal_id: str, caller_id: str, profile: str) -> None:
+        if caller_id.startswith("watchdog:"):
+            return
         now = time.monotonic()
         wall_now = datetime.now()
         with self._lock:
             if terminal_id in self._paused:
                 return
             episode = self._episodes.get(terminal_id)
-            if episode is not None and not episode.callback_seen:
+            if (
+                episode is not None
+                and not episode.callback_seen
+                and not episode.fired
+                and episode.resume_reserved_at is None
+                and not episode.auto_resumed
+            ):
                 episode.last_join_wall_at = wall_now
+                episode.revision += 1
                 return
+            generation = self._generation_by_terminal.get(terminal_id, 0) + 1
+            self._generation_by_terminal[terminal_id] = generation
             self._episodes[terminal_id] = _Episode(
                 caller_id=caller_id,
                 profile=profile,
                 inbound_at=now,
                 episode_started_wall_at=wall_now,
+                generation=generation,
             )
 
     def has_episode(self, terminal_id: str) -> bool:
@@ -143,6 +217,8 @@ class StalledCallbackWatchdog:
             self._waiting_inbox_episodes.pop(terminal_id, None)
             self._waiting_inbox_last_push.pop(terminal_id, None)
             self._ready_backlog_episodes.pop(terminal_id, None)
+            self._generation_by_terminal.pop(terminal_id, None)
+            self._callback_fences.pop(terminal_id, None)
 
     def record_callback_if_to_caller(self, sender_id: str, receiver_id: str) -> None:
         meta = get_terminal_metadata(sender_id)
@@ -261,41 +337,219 @@ class StalledCallbackWatchdog:
 
     def collect_due_notifications(self, now: float | None = None) -> list[tuple[str, str, str]]:
         now = time.monotonic() if now is None else now
-        due: list[tuple[str, str, str]] = []
+        candidates: list[PreflightCandidate] = []
         with self._lock:
-            for terminal_id, episode in list(self._episodes.items()):
+            for terminal_id, episode in self._episodes.items():
                 if terminal_id in self._paused:
-                    continue
-                if get_terminal_metadata(terminal_id) is None:
-                    self._episodes.pop(terminal_id, None)
                     continue
                 if (
                     episode.callback_seen
                     or episode.fired
                     or episode.idle_since is None
                     or episode.last_screen_fp is None
+                    or episode.resume_reserved_at is not None
                 ):
                     continue
                 idle_seconds = int(now - episode.idle_since)
                 if idle_seconds < self.grace_seconds:
                     continue
-                callback_status = get_callback_status_since(
-                    terminal_id, episode.caller_id, episode.episode_started_wall_at
-                )
-                if callback_status is not None:
-                    if callback_status == MessageStatus.DELIVERED:
-                        episode.callback_seen = True
-                    continue
-                episode.fired = True
-                due.append(
-                    (
-                        terminal_id,
-                        episode.caller_id,
-                        f"[watchdog] worker {terminal_id} ({episode.profile}) "
-                        f"idle {idle_seconds}s without callback",
+                candidates.append(
+                    PreflightCandidate(
+                        terminal_id=terminal_id,
+                        caller_id=episode.caller_id,
+                        generation=episode.generation,
+                        revision=episode.revision,
+                        episode_started_wall_at=episode.episode_started_wall_at,
+                        callback_fence_at_snapshot=self._callback_fences.get(terminal_id, 0),
+                        idle_seconds=idle_seconds,
                     )
                 )
+
+        due: list[tuple[str, str, str]] = []
+        for candidate in candidates:
+            metadata = get_terminal_metadata(candidate.terminal_id)
+            callback_status = get_callback_status_since(
+                candidate.terminal_id,
+                candidate.caller_id,
+                candidate.episode_started_wall_at,
+            )
+            action: AutoResumeAction | None = None
+            with self._lock:
+                current_episode = self._episodes.get(candidate.terminal_id)
+                if metadata is None:
+                    self._episodes.pop(candidate.terminal_id, None)
+                    continue
+                if not self._candidate_valid(candidate, current_episode):
+                    continue
+                assert current_episode is not None
+                if callback_status in {MessageStatus.PENDING, MessageStatus.DELIVERING}:
+                    continue
+                if callback_status == MessageStatus.DELIVERED:
+                    current_episode.callback_seen = True
+                    continue
+                if current_episode.auto_resumed:
+                    current_episode.fired = True
+                    suffix = f" (auto-resume attempted at {current_episode.auto_resume_attempted_at})"
+                    due.append(self._push_tuple(candidate, current_episode, suffix))
+                    continue
+                provider = metadata.get("provider")
+                if not self._auto_resume_enabled() or provider not in AUTO_RESUME_PROVIDERS:
+                    current_episode.fired = True
+                    due.append(self._push_tuple(candidate, current_episode))
+                    continue
+                current_episode.resume_reserved_at = now
+                action = AutoResumeAction(
+                    terminal_id=candidate.terminal_id,
+                    caller_id=candidate.caller_id,
+                    generation=candidate.generation,
+                    revision=candidate.revision,
+                    episode_started_wall_at=candidate.episode_started_wall_at,
+                    callback_fence_at_snapshot=candidate.callback_fence_at_snapshot,
+                    body=AUTO_RESUME_BODY,
+                )
+            if action is not None:
+                push = self._execute_auto_resume(action, now)
+                if push is not None:
+                    due.append(push)
         return due
+
+    @staticmethod
+    def _auto_resume_enabled() -> bool:
+        return os.environ.get("CAO_WATCHDOG_AUTO_RESUME", "").strip().casefold() not in {
+            "0",
+            "false",
+        }
+
+    def _candidate_valid(
+        self, candidate: PreflightCandidate | AutoResumeAction, episode: _Episode | None
+    ) -> bool:
+        return (
+            episode is not None
+            and episode.generation == candidate.generation
+            and episode.revision == candidate.revision
+            and not episode.callback_seen
+            and self._callback_fences.get(candidate.terminal_id, 0)
+            == candidate.callback_fence_at_snapshot
+        )
+
+    @staticmethod
+    def _push_tuple(
+        candidate: PreflightCandidate | AutoResumeAction,
+        episode: _Episode,
+        suffix: str = "",
+        idle_seconds: int | None = None,
+    ) -> tuple[str, str, str]:
+        if idle_seconds is None:
+            idle_seconds = (
+                candidate.idle_seconds
+                if isinstance(candidate, PreflightCandidate)
+                else int(time.monotonic() - (episode.idle_since or time.monotonic()))
+            )
+        return (
+            candidate.terminal_id,
+            candidate.caller_id,
+            f"[watchdog] worker {candidate.terminal_id} ({episode.profile}) "
+            f"idle {idle_seconds}s without callback{suffix}",
+        )
+
+    def _execute_auto_resume(
+        self, action: AutoResumeAction, enqueue_monotonic: float
+    ) -> tuple[str, str, str] | None:
+        from cli_agent_orchestrator.services.auto_responder import auto_responder
+        from cli_agent_orchestrator.services.inbox_service import get_delivery_lock, inbox_service
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        try:
+            probe_status, probe_meta = status_monitor.probe_screen_status(action.terminal_id)
+            applicable = (
+                isinstance(probe_meta, dict)
+                and probe_meta.get("transient_api_error") is True
+                and probe_status == TerminalStatus.IDLE
+                and auto_responder.waiting_gate(action.terminal_id) is None
+            )
+        except Exception:
+            logger.exception("Failed auto-resume preflight for %s", action.terminal_id)
+            applicable = False
+
+        if not applicable:
+            with self._lock:
+                episode = self._episodes.get(action.terminal_id)
+                if not self._candidate_valid(action, episode):
+                    if episode is not None and episode.generation == action.generation:
+                        episode.resume_reserved_at = None
+                    return None
+                assert episode is not None
+                episode.resume_reserved_at = None
+                episode.fired = True
+                return self._push_tuple(
+                    action,
+                    episode,
+                    idle_seconds=int(enqueue_monotonic - (episode.idle_since or enqueue_monotonic)),
+                )
+
+        delivery_lock = get_delivery_lock(action.terminal_id)
+        if not delivery_lock.acquire(blocking=False):
+            with self._lock:
+                episode = self._episodes.get(action.terminal_id)
+                if self._candidate_valid(action, episode):
+                    assert episode is not None
+                    episode.resume_reserved_at = None
+            return None
+
+        inserted = None
+        second_status = None
+        should_deliver = False
+        try:
+            inserted = insert_watchdog_auto_resume_message(action.terminal_id, action.body)
+            second_status = get_callback_status_since(
+                action.terminal_id,
+                action.caller_id,
+                action.episode_started_wall_at,
+            )
+            with self._lock:
+                episode = self._episodes.get(action.terminal_id)
+                valid = self._candidate_valid(action, episode) and second_status is None
+                if second_status == MessageStatus.DELIVERED and episode is not None:
+                    episode.callback_seen = True
+                    valid = False
+                if valid:
+                    assert episode is not None
+                    episode.resume_reserved_at = None
+                    if inserted.kind in {"inserted", "uncertain"}:
+                        attempted_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                        episode.auto_resumed = True
+                        episode.auto_resume_attempted_at = attempted_at
+                        episode.idle_since = enqueue_monotonic
+                        should_deliver = True
+                    else:
+                        episode.fired = True
+                        return self._push_tuple(
+                            action,
+                            episode,
+                            idle_seconds=int(
+                                enqueue_monotonic - (episode.idle_since or enqueue_monotonic)
+                            ),
+                        )
+                else:
+                    if episode is not None and episode.generation == action.generation:
+                        episode.resume_reserved_at = None
+                    if inserted.kind == "inserted" and inserted.message_id is not None:
+                        if not cancel_pending_watchdog_message(
+                            inserted.message_id, action.terminal_id
+                        ):
+                            logger.info(
+                                "auto-resume cancellation lost terminal=%s message=%s",
+                                action.terminal_id,
+                                inserted.message_id,
+                            )
+        finally:
+            delivery_lock.release()
+        if should_deliver:
+            try:
+                inbox_service.deliver_pending(action.terminal_id)
+            except Exception:
+                logger.exception("Failed to deliver auto-resume for %s", action.terminal_id)
+        return None
 
     def notify_due(self, registry: PluginRegistry | None = None) -> None:
         from cli_agent_orchestrator.services.inbox_service import inbox_service

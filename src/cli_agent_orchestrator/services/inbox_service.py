@@ -4,13 +4,15 @@ Consumer: terminal.{id}.status
 """
 
 import asyncio
+import copy
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import groupby
-from typing import Any, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 from sqlalchemy.exc import OperationalError
 
@@ -101,6 +103,117 @@ ABS_STALLED_NOTICE_AGE = 4 * 60 * 60
 WPM2_STALE_OPEN_AGE_SECONDS = 60
 
 
+@dataclass(frozen=True)
+class FirstLookupResult:
+    kind: str
+    evidence: dict[str, Any]
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class SuccessorLookupPlan:
+    attempt_uuid: str
+    payload_hash: str
+    started_at: object
+    evidence_at_first_lookup: dict[str, Any]
+    first_result: FirstLookupResult
+    first_ref: tuple[str, int | None, int] | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "evidence_at_first_lookup", copy.deepcopy(self.evidence_at_first_lookup)
+        )
+        object.__setattr__(
+            self,
+            "first_result",
+            FirstLookupResult(
+                self.first_result.kind,
+                copy.deepcopy(self.first_result.evidence),
+                copy.deepcopy(self.first_result.metadata),
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class SuccessorCorroborationResult:
+    kind: Literal["confirmed", "defer", "authorize"]
+    hit_attempt_uuid: str | None = None
+    hit_evidence: dict[str, Any] | None = None
+
+
+def _lookup_ref(evidence: dict[str, Any]) -> tuple[str, int | None, int] | None:
+    candidate = evidence.get("last_observed_ref")
+    if not isinstance(candidate, dict):
+        candidate = evidence
+    path = candidate.get("path")
+    inode = candidate.get("inode")
+    size = candidate.get("size")
+    if (
+        not isinstance(path, str)
+        or not path
+        or (inode is not None and type(inode) is not int)
+        or type(size) is not int
+    ):
+        return None
+    return path, inode, size
+
+
+def corroborate_claude_successor(
+    plans: tuple[SuccessorLookupPlan, ...],
+) -> SuccessorCorroborationResult:
+    """Run the single read-only final corroboration pass for a Claude successor."""
+    time.sleep(2.0)
+    if not plans:
+        return SuccessorCorroborationResult("defer")
+    observed: list[tuple[SuccessorLookupPlan, str, dict[str, Any]]] = []
+    for plan in plans:
+        result, evidence = _wpm2_lookup(
+            dict(plan.first_result.metadata),
+            plan.payload_hash,
+            plan.started_at,
+            copy.deepcopy(plan.evidence_at_first_lookup),
+        )
+        observed.append((plan, result, evidence))
+        if result == "hit":
+            return SuccessorCorroborationResult(
+                "confirmed", plan.attempt_uuid, copy.deepcopy(evidence)
+            )
+    for plan, result, evidence in observed:
+        if result != "absent" or plan.first_ref is None:
+            return SuccessorCorroborationResult("defer")
+        if _lookup_ref(evidence) != plan.first_ref:
+            return SuccessorCorroborationResult("defer")
+    return SuccessorCorroborationResult("authorize")
+
+
+def _successor_lookup_plan(
+    attempt: dict[str, Any],
+    evidence_snapshot: dict[str, Any],
+    result: str,
+    lookup_evidence: dict[str, Any],
+    metadata: dict[str, Any],
+) -> SuccessorLookupPlan:
+    return SuccessorLookupPlan(
+        attempt_uuid=attempt["attempt_uuid"],
+        payload_hash=attempt["payload_hash"],
+        started_at=attempt.get("started_at"),
+        evidence_at_first_lookup=copy.deepcopy(evidence_snapshot),
+        first_result=FirstLookupResult(
+            result, copy.deepcopy(lookup_evidence), copy.deepcopy(metadata)
+        ),
+        first_ref=_lookup_ref(lookup_evidence),
+    )
+
+
+def _confirmed_settlement(operation: Callable[[], Any]) -> Any:
+    from cli_agent_orchestrator.services.stalled_callback_watchdog import (
+        stalled_callback_watchdog,
+    )
+
+    with stalled_callback_watchdog.confirmed_settlement_guard():
+        return operation()
+
+
 def _redelivery_tag(prior_attempt_uuid: str) -> str:
     return (
         f"[redelivery of attempt {prior_attempt_uuid[:8]} - prior delivery unconfirmed; "
@@ -156,11 +269,9 @@ _get_delivery_lock = get_delivery_lock
 
 
 def clear_terminal_delivery_state(terminal_id: str) -> None:
-    """Remove the receiver lock and its wake sequence together on teardown."""
-    with _delivery_locks_guard:
-        _delivery_locks.pop(terminal_id, None)
-        with _delivery_seq_guard:
-            _delivery_wake_seq.pop(terminal_id, None)
+    """Clear per-terminal state while retaining permanent delivery-lock identity."""
+    with _delivery_seq_guard:
+        _delivery_wake_seq.pop(terminal_id, None)
     service = globals().get("inbox_service")
     if isinstance(service, InboxService):
         service._clear_identity_authority(terminal_id)
@@ -481,6 +592,8 @@ class InboxService:
             stalled_callback_watchdog,
         )
 
+        if sender_id.startswith("watchdog:"):
+            return
         stalled_callback_watchdog.record_callback_if_to_caller(sender_id, terminal_id)
         if metadata.get("caller_id") and (
             orchestration_type == OrchestrationType.ASSIGN
@@ -563,24 +676,33 @@ class InboxService:
 
         lookup_result = "unresolved"
         prior_lookups: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
+        successor_plans: list[SuccessorLookupPlan] = []
         for prior in reversed(ambiguous):
             prior_evidence = decoded[prior["attempt_uuid"]]
+            evidence_snapshot = copy.deepcopy(prior_evidence)
             lookup_result, lookup_evidence = _wpm2_lookup(
                 metadata,
                 prior["payload_hash"],
                 prior.get("started_at"),
                 prior_evidence,
             )
+            successor_plans.append(
+                _successor_lookup_plan(
+                    prior, evidence_snapshot, lookup_result, lookup_evidence, metadata
+                )
+            )
             prior_lookups.append((prior, lookup_result, prior_evidence))
             if lookup_result == "hit":
-                result = settle_wpm1_terminal_batch(
-                    message_ids,
-                    MessageStatus.DELIVERED,
-                    terminal_id,
-                    confirmation_evidence=(prior["attempt_uuid"], lookup_evidence),
-                    on_confirmed=lambda: self._commit_watchdog_ops(
-                        terminal_id, sender_id, orchestration_type, metadata
-                    ),
+                result = _confirmed_settlement(
+                    lambda: settle_wpm1_terminal_batch(
+                        message_ids,
+                        MessageStatus.DELIVERED,
+                        terminal_id,
+                        confirmation_evidence=(prior["attempt_uuid"], lookup_evidence),
+                        on_confirmed=lambda: self._commit_watchdog_ops(
+                            terminal_id, sender_id, orchestration_type, metadata
+                        ),
+                    )
                 )
                 return "stop", None
             corroboration = lookup_evidence.get("queue_corroboration")
@@ -610,14 +732,16 @@ class InboxService:
         if stale_resolution is not None:
             state, stale_prior, stale_evidence, _ = stale_resolution
             if state == "hit" and stale_prior is not None:
-                settle_wpm1_terminal_batch(
-                    message_ids,
-                    MessageStatus.DELIVERED,
-                    terminal_id,
-                    confirmation_evidence=(stale_prior["attempt_uuid"], stale_evidence),
-                    on_confirmed=lambda: self._commit_watchdog_ops(
-                        terminal_id, sender_id, orchestration_type, metadata
-                    ),
+                _confirmed_settlement(
+                    lambda: settle_wpm1_terminal_batch(
+                        message_ids,
+                        MessageStatus.DELIVERED,
+                        terminal_id,
+                        confirmation_evidence=(stale_prior["attempt_uuid"], stale_evidence),
+                        on_confirmed=lambda: self._commit_watchdog_ops(
+                            terminal_id, sender_id, orchestration_type, metadata
+                        ),
+                    )
                 )
             return "stop", None
 
@@ -697,14 +821,16 @@ class InboxService:
                 metadata, newest["payload_hash"], newest.get("started_at"), newest_evidence
             )
             if fresh == "hit":
-                result = settle_wpm1_terminal_batch(
-                    message_ids,
-                    MessageStatus.DELIVERED,
-                    terminal_id,
-                    confirmation_evidence=(newest["attempt_uuid"], fresh_evidence),
-                    on_confirmed=lambda: self._commit_watchdog_ops(
-                        terminal_id, sender_id, orchestration_type, metadata
-                    ),
+                result = _confirmed_settlement(
+                    lambda: settle_wpm1_terminal_batch(
+                        message_ids,
+                        MessageStatus.DELIVERED,
+                        terminal_id,
+                        confirmation_evidence=(newest["attempt_uuid"], fresh_evidence),
+                        on_confirmed=lambda: self._commit_watchdog_ops(
+                            terminal_id, sender_id, orchestration_type, metadata
+                        ),
+                    )
                 )
                 return "stop", None
             if fresh == "absent":
@@ -759,13 +885,15 @@ class InboxService:
                         decoded[newest["attempt_uuid"]],
                     )
                     if barrier == "hit":
-                        result = settle_wpm1_terminal_batch(
-                            message_ids,
-                            MessageStatus.DELIVERED,
-                            terminal_id,
-                            on_confirmed=lambda: self._commit_watchdog_ops(
-                                terminal_id, sender_id, orchestration_type, metadata
-                            ),
+                        result = _confirmed_settlement(
+                            lambda: settle_wpm1_terminal_batch(
+                                message_ids,
+                                MessageStatus.DELIVERED,
+                                terminal_id,
+                                on_confirmed=lambda: self._commit_watchdog_ops(
+                                    terminal_id, sender_id, orchestration_type, metadata
+                                ),
+                            )
                         )
                     elif barrier == "absent":
                         result = settle_wpm1_terminal_batch(
@@ -786,6 +914,7 @@ class InboxService:
                 evidence = transcript_ref(resolution)
                 evidence["boundary_authorized"] = now_z
                 evidence["_wpm1_prior_attempt_uuid"] = newest["attempt_uuid"]
+                evidence["_successor_lookup_plans"] = tuple(successor_plans)
                 return "inject", evidence
 
         # Threshold decisions are deliberately after every proof/terminal arm.
@@ -1049,6 +1178,12 @@ class InboxService:
                         if gate_state == "inject" and isinstance(gate_evidence, dict)
                         else transcript_ref(resolution)
                     )
+                    successor_plans: list[SuccessorLookupPlan] = []
+                    carried_plans = persisted_evidence.pop("_successor_lookup_plans", ())
+                    if isinstance(carried_plans, tuple) and all(
+                        isinstance(item, SuccessorLookupPlan) for item in carried_plans
+                    ):
+                        successor_plans.extend(carried_plans)
                     if gate_state == "normal":
                         # A hit wins across the entire exact-batch history. An
                         # unresolved older row must not hide a later hit or the
@@ -1063,21 +1198,33 @@ class InboxService:
                                 prior_evidence = {}
                             if not isinstance(prior_evidence, dict):
                                 prior_evidence = {}
+                            evidence_snapshot = copy.deepcopy(prior_evidence)
                             result, lookup_evidence = _wpm2_lookup(
                                 metadata,
                                 prior["payload_hash"],
                                 prior.get("started_at"),
                                 prior_evidence,
                             )
+                            successor_plans.append(
+                                _successor_lookup_plan(
+                                    prior,
+                                    evidence_snapshot,
+                                    result,
+                                    lookup_evidence,
+                                    metadata,
+                                )
+                            )
                             prior_lookups.append((prior, result, prior_evidence))
                             if result != "hit":
                                 continue
-                            won = confirm_batch_from_prior_attempt(
-                                message_ids,
-                                prior["attempt_uuid"],
-                                on_confirmed=lambda: self._commit_watchdog_ops(
-                                    terminal_id, sender_id, orchestration_type, metadata
-                                ),
+                            won = _confirmed_settlement(
+                                lambda: confirm_batch_from_prior_attempt(
+                                    message_ids,
+                                    prior["attempt_uuid"],
+                                    on_confirmed=lambda: self._commit_watchdog_ops(
+                                        terminal_id, sender_id, orchestration_type, metadata
+                                    ),
+                                )
                             )
                             if not won:
                                 return
@@ -1095,14 +1242,16 @@ class InboxService:
                             state, stale_prior, _, candidate = stale_resolution
                             if state != "hit" or stale_prior is None:
                                 return
-                            won = confirm_batch_from_prior_attempt(
-                                message_ids,
-                                stale_prior["attempt_uuid"],
-                                on_confirmed=lambda: self._commit_watchdog_ops(
-                                    terminal_id,
-                                    sender_id,
-                                    orchestration_type,
-                                    metadata,
+                            won = _confirmed_settlement(
+                                lambda: confirm_batch_from_prior_attempt(
+                                    message_ids,
+                                    stale_prior["attempt_uuid"],
+                                    on_confirmed=lambda: self._commit_watchdog_ops(
+                                        terminal_id,
+                                        sender_id,
+                                        orchestration_type,
+                                        metadata,
+                                    ),
                                 ),
                             )
                             if not won:
@@ -1255,6 +1404,47 @@ class InboxService:
                         if not isinstance(probe_meta, dict):
                             return
                         persisted_evidence["screen_probe"] = probe_meta
+                    if successor_source is not None and metadata.get("provider") == "claude_code":
+                        corroboration = corroborate_claude_successor(tuple(successor_plans))
+                        if corroboration.kind == "defer":
+                            logger.info("redelivery_deferred_unquiescent terminal=%s", terminal_id)
+                            return
+                        if corroboration.kind == "confirmed":
+                            assert corroboration.hit_attempt_uuid is not None
+                            assert corroboration.hit_evidence is not None
+                            from cli_agent_orchestrator.services.stalled_callback_watchdog import (
+                                stalled_callback_watchdog,
+                            )
+
+                            with stalled_callback_watchdog.confirmed_settlement_guard():
+                                if gate_state == "inject":
+                                    settle_wpm1_terminal_batch(
+                                        message_ids,
+                                        MessageStatus.DELIVERED,
+                                        terminal_id,
+                                        confirmation_evidence=(
+                                            corroboration.hit_attempt_uuid,
+                                            corroboration.hit_evidence,
+                                        ),
+                                        on_confirmed=lambda: self._commit_watchdog_ops(
+                                            terminal_id,
+                                            sender_id,
+                                            orchestration_type,
+                                            metadata,
+                                        ),
+                                    )
+                                else:
+                                    confirm_batch_from_prior_attempt(
+                                        message_ids,
+                                        corroboration.hit_attempt_uuid,
+                                        on_confirmed=lambda: self._commit_watchdog_ops(
+                                            terminal_id,
+                                            sender_id,
+                                            orchestration_type,
+                                            metadata,
+                                        ),
+                                    )
+                            return
                     opener_args = (
                         batch,
                         terminal_id,
@@ -1467,17 +1657,28 @@ class InboxService:
                     if submit_evidence is not None:
                         evidence.update(submit_evidence)
                     if outcome in {"hit", "unverified"}:
-                        settle_delivery_attempt(
-                            attempt_uuid,
-                            MessageStatus.DELIVERED,
-                            "confirmed",
-                            evidence=json.dumps(evidence),
-                            settled_status_gen=status_monitor.get_status_gen(terminal_id),
-                            on_confirmed=lambda: self._commit_watchdog_ops(
-                                terminal_id, sender_id, orchestration_type, metadata
+                        _confirmed_settlement(
+                            lambda: settle_delivery_attempt(
+                                attempt_uuid,
+                                MessageStatus.DELIVERED,
+                                "confirmed",
+                                evidence=json.dumps(evidence),
+                                settled_status_gen=status_monitor.get_status_gen(terminal_id),
+                                on_confirmed=lambda: self._commit_watchdog_ops(
+                                    terminal_id, sender_id, orchestration_type, metadata
+                                ),
                             ),
                         )
                     else:
+                        try:
+                            receiver_status = status_monitor.get_status(terminal_id)
+                        except Exception:
+                            receiver_status = None
+                        evidence["receiver_status_at_settle"] = (
+                            receiver_status.value
+                            if isinstance(receiver_status, TerminalStatus)
+                            else "unknown"
+                        )
                         settle_delivery_attempt(
                             attempt_uuid,
                             MessageStatus.PENDING,
@@ -1835,17 +2036,19 @@ class InboxService:
             if stale_note:
                 evidence["binding_stale"] = stale_note
             if result == "hit":
-                settle_delivery_attempt(
-                    attempt_uuid,
-                    MessageStatus.DELIVERED,
-                    "confirmed",
-                    reason="startup_sweep",
-                    evidence=json.dumps(evidence),
-                    on_confirmed=lambda: self._commit_watchdog_ops(
-                        message.receiver_id,
-                        attempt["sender_id"],
-                        OrchestrationType(attempt["orchestration_type"]),
-                        metadata,
+                _confirmed_settlement(
+                    lambda: settle_delivery_attempt(
+                        attempt_uuid,
+                        MessageStatus.DELIVERED,
+                        "confirmed",
+                        reason="startup_sweep",
+                        evidence=json.dumps(evidence),
+                        on_confirmed=lambda: self._commit_watchdog_ops(
+                            message.receiver_id,
+                            attempt["sender_id"],
+                            OrchestrationType(attempt["orchestration_type"]),
+                            metadata,
+                        ),
                     ),
                 )
             elif result == "absent":

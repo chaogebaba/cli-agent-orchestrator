@@ -24,6 +24,7 @@ class MessageStatus(str, Enum):
     DELIVERY_FAILED = "delivery_failed"
     FAILED = "failed"
     DIGESTED = "digested"
+    CANCELLED = "cancelled"
 
 
 class InboxMessage(BaseModel):

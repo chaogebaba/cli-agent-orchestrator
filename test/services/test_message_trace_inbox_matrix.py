@@ -409,12 +409,12 @@ def test_messages_trace_cli_table_and_json(monkeypatch):
     assert '"status": "delivered"' in json_result.output
 
 
-def test_terminal_delete_state_cleans_lock_and_wake_seq_together():
-    module._get_delivery_lock("cleanup-target")
+def test_terminal_delete_state_retains_lock_identity_and_cleans_wake_seq():
+    lock = module._get_delivery_lock("cleanup-target")
     with module._delivery_seq_guard:
         module._delivery_wake_seq["cleanup-target"] = 4
     module.clear_terminal_delivery_state("cleanup-target")
-    assert "cleanup-target" not in module._delivery_locks
+    assert module._get_delivery_lock("cleanup-target") is lock
     assert "cleanup-target" not in module._delivery_wake_seq
 
 
