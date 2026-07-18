@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -33,6 +35,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Session, declarative_base, deferred, sessionmaker
+from tzlocal import get_localzone
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.flow import Flow
@@ -305,6 +308,27 @@ class InboxDeliveryAttemptMemberModel(Base):
     attempt_uuid = Column(String, primary_key=True)
     message_id = Column(Integer, primary_key=True, index=True)
     position = Column(Integer, nullable=False)
+
+
+class InboxMessageTraceEventModel(Base):
+    """Append-only message trace evidence shared by delivery and compact recovery."""
+
+    __tablename__ = "inbox_message_trace_event"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    message_id = Column(Integer, ForeignKey("inbox.id"), nullable=False)
+    kind = Column(String, nullable=False)
+    payload = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    __table_args__ = (
+        Index("ix_inbox_message_trace_event_message_id", "message_id"),
+        Index(
+            "ix_inbox_message_trace_event_kind_created_message",
+            "kind",
+            "created_at",
+            "message_id",
+        ),
+    )
 
 
 class MemoryMetadataModel(Base):
@@ -3126,9 +3150,12 @@ def begin_delivery_attempt_if_no_other_delivering(
     pre_status_gen=None,
     evidence: str = "{}",
     prior_attempt_uuid: str | None = None,
+    challenge_sha256: str | None = None,
     admission_proof: AdmissionProof | None = None,
 ) -> AttemptOpenResult:
     ids = sorted({int(message.id) for message in messages})
+    if challenge_sha256 is not None and len(ids) != 1:
+        raise ValueError("delivery challenges require a singleton attempt")
     proof = admission_proof or make_admission_proof(
         "corrective" if prior_attempt_uuid else "ordinary", ids, prior_attempt_uuid
     )
@@ -3256,6 +3283,17 @@ def begin_delivery_attempt_if_no_other_delivering(
                     attempt_uuid=attempt_uuid, message_id=message_id, position=position
                 )
             )
+        if challenge_sha256 is not None:
+            db.add(
+                InboxMessageTraceEventModel(
+                    message_id=ids[0],
+                    kind="attempt_challenge",
+                    payload={
+                        "attempt_uuid": attempt_uuid,
+                        "challenge_sha256": challenge_sha256,
+                    },
+                )
+            )
         db.flush()
         terminal_open = _delivering_authority_in_db(db, receiver_terminal_id)
         if {row["attempt_uuid"] for row in terminal_open} != {attempt_uuid}:
@@ -3348,7 +3386,10 @@ def begin_delivery_attempt(
     pre_status_gen=None,
     evidence: str = "{}",
     prior_attempt_uuid: str | None = None,
+    challenge_sha256: str | None = None,
 ) -> str:
+    if challenge_sha256 is not None and len(messages) != 1:
+        raise ValueError("delivery challenges require a singleton attempt")
     attempt_uuid = str(uuid.uuid4())
     with SessionLocal.begin() as db:
         attempt_evidence = _evidence_object(evidence)
@@ -3411,6 +3452,17 @@ def begin_delivery_attempt(
             db.add(
                 InboxDeliveryAttemptMemberModel(
                     attempt_uuid=attempt_uuid, message_id=message.id, position=position
+                )
+            )
+        if challenge_sha256 is not None:
+            db.add(
+                InboxMessageTraceEventModel(
+                    message_id=messages[0].id,
+                    kind="attempt_challenge",
+                    payload={
+                        "attempt_uuid": attempt_uuid,
+                        "challenge_sha256": challenge_sha256,
+                    },
                 )
             )
     return attempt_uuid
@@ -3622,6 +3674,162 @@ def confirm_batch_from_prior_attempt(
         return True
 
 
+def _reply_created_at_utc(value: datetime) -> datetime:
+    """Normalize local-naive inbox clocks with the pinned fold=0 policy."""
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc)
+    return value.replace(tzinfo=get_localzone(), fold=0).astimezone(timezone.utc)
+
+
+def _attempt_started_at_utc(value: datetime) -> datetime:
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc)
+    return value.replace(tzinfo=timezone.utc)
+
+
+def find_inferred_delivery_evidence(
+    message_id: int,
+    attempted_receiver: str,
+) -> dict[str, Any] | None:
+    """Find a reply quoting a wire-only challenge for this message's exact attempt."""
+    pattern = re.compile(
+        rf"(?<![0-9a-f])mid {message_id}:([0-9a-f]{{32}})(?![0-9a-f])"
+    )
+    with SessionLocal() as db:
+        events = (
+            db.query(InboxMessageTraceEventModel)
+            .filter_by(message_id=message_id, kind="attempt_challenge")
+            .order_by(InboxMessageTraceEventModel.created_at.asc(), InboxMessageTraceEventModel.id)
+            .all()
+        )
+        if not events:
+            return None
+        replies = (
+            db.query(InboxModel)
+            .filter(InboxModel.sender_id == attempted_receiver)
+            .order_by(InboxModel.created_at.asc(), InboxModel.id.asc())
+            .all()
+        )
+        for event_row in events:
+            payload: dict[str, Any] = (
+                event_row.payload if isinstance(event_row.payload, dict) else {}
+            )
+            attempt_uuid = payload.get("attempt_uuid")
+            challenge_sha256 = payload.get("challenge_sha256")
+            if not isinstance(attempt_uuid, str) or not isinstance(challenge_sha256, str):
+                continue
+            attempt = (
+                db.query(InboxDeliveryAttemptModel)
+                .join(
+                    InboxDeliveryAttemptMemberModel,
+                    InboxDeliveryAttemptMemberModel.attempt_uuid
+                    == InboxDeliveryAttemptModel.attempt_uuid,
+                )
+                .filter(
+                    InboxDeliveryAttemptModel.attempt_uuid == attempt_uuid,
+                    InboxDeliveryAttemptMemberModel.message_id == message_id,
+                )
+                .one_or_none()
+            )
+            if attempt is None:
+                continue
+            anchor = _attempt_started_at_utc(attempt.started_at)
+            for reply in replies:
+                normalized_reply = _reply_created_at_utc(reply.created_at)
+                if normalized_reply <= anchor:
+                    continue
+                for raw_token in pattern.findall(str(reply.message)):
+                    if hashlib.sha256(raw_token.encode()).hexdigest() != challenge_sha256:
+                        continue
+                    return {
+                        "reply_message_id": reply.id,
+                        "challenge_sha256": challenge_sha256,
+                        "anchor_attempt_uuid": attempt_uuid,
+                        "normalized_reply_at": normalized_reply.isoformat().replace(
+                            "+00:00", "Z"
+                        ),
+                    }
+    return None
+
+
+def settle_open_attempt_inferred_delivered(
+    attempt_uuid: str,
+    evidence: dict[str, Any],
+    on_confirmed: Callable[[], None] | None = None,
+) -> bool:
+    """Atomically settle one open attempt and its DELIVERING parent from challenge proof."""
+    with SessionLocal.begin() as db:
+        row = (
+            db.query(InboxDeliveryAttemptModel)
+            .filter_by(attempt_uuid=attempt_uuid, settled_at=None)
+            .one_or_none()
+        )
+        if row is None:
+            return False
+        message_ids = [
+            member.message_id
+            for member in db.query(InboxDeliveryAttemptMemberModel)
+            .filter_by(attempt_uuid=attempt_uuid)
+            .all()
+        ]
+        if len(message_ids) != 1:
+            return False
+        changed = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.id == message_ids[0],
+                InboxModel.status == MessageStatus.DELIVERING.value,
+            )
+            .update({InboxModel.status: MessageStatus.DELIVERED.value}, synchronize_session=False)
+        )
+        if changed != 1:
+            return False
+        now = _utcnow()
+        row.outcome = "confirmed"
+        row.reason = "inferred_by_reply"
+        row.settled_at = row.last_at = now
+        db.add(
+            InboxMessageTraceEventModel(
+                message_id=message_ids[0],
+                kind="inferred_delivered",
+                payload=dict(evidence),
+                created_at=now,
+            )
+        )
+        if on_confirmed is not None:
+            on_confirmed()
+        return True
+
+
+def transition_pending_to_inferred_delivered(
+    message_id: int,
+    evidence: dict[str, Any],
+    on_confirmed: Callable[[], None] | None = None,
+) -> bool:
+    """Cap seam: atomically CAS PENDING to DELIVERED and append inferred evidence."""
+    with SessionLocal.begin() as db:
+        changed = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.id == message_id,
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .update({InboxModel.status: MessageStatus.DELIVERED.value}, synchronize_session=False)
+        )
+        if changed != 1:
+            return False
+        db.add(
+            InboxMessageTraceEventModel(
+                message_id=message_id,
+                kind="inferred_delivered",
+                payload=dict(evidence),
+            )
+        )
+        if on_confirmed is not None:
+            on_confirmed()
+        return True
+
+
 def get_message_trace(message_id: int) -> Optional[Dict[str, Any]]:
     with SessionLocal() as db:
         msg = db.query(InboxModel).filter_by(id=message_id).first()
@@ -3649,6 +3857,22 @@ def get_message_trace(message_id: int) -> Optional[Dict[str, Any]]:
             except Exception:
                 item["evidence"] = {}
             attempts.append(item)
+        event_rows = (
+            db.query(InboxMessageTraceEventModel)
+            .filter_by(message_id=message_id)
+            .order_by(InboxMessageTraceEventModel.created_at, InboxMessageTraceEventModel.id)
+            .all()
+        )
+        events: list[dict[str, Any]] = [
+            {
+                "id": row.id,
+                "message_id": row.message_id,
+                "kind": row.kind,
+                "payload": row.payload if isinstance(row.payload, dict) else {},
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in event_rows
+        ]
         return {
             "message": {
                 "id": msg.id,
@@ -3661,6 +3885,7 @@ def get_message_trace(message_id: int) -> Optional[Dict[str, Any]]:
                 "created_at": msg.created_at.isoformat(),
             },
             "attempts": attempts,
+            "events": events,
         }
 
 

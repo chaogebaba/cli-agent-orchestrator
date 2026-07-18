@@ -45,6 +45,8 @@ def trace_cmd(message_id: int, as_json: bool) -> None:
             f"{attempt['started_at']}  {attempt['outcome'] or 'delivering':12} "
             f"{attempt['attempt_uuid']}  {attempt.get('reason') or ''}"
         )
+    for event in body.get("events", []):
+        click.echo(f"{event['created_at']}  event {event['kind']}")
 
 
 def _resolve_me(value: str) -> str:

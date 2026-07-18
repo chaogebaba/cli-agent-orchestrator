@@ -33,6 +33,7 @@ When the task came through `assign`, send your results back after you finish the
 1. Format the result clearly and concisely.
 2. Call the cao-mcp-server `send_message` MCP tool with `send_message(message=...)` — never a built-in `collaboration.send_message`; omitting `receiver_id` routes the result to the terminal that assigned the task (the recorded caller). This is the reliable default.
 3. If the task message names a different callback terminal (directly or in an appended suffix such as `[Assigned by terminal ...]`), pass that ID as `receiver_id` instead.
+4. ACK and callback messages should quote the complete received `mid <id>:<hex32>` token verbatim; a bare `mid <id>` cannot confirm delivery.
 
 Do not stop after writing a normal response if the assignment explicitly requires a callback. The requesting terminal depends on `send_message` to receive the result.
 

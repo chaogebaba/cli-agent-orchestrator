@@ -5,8 +5,10 @@ Consumer: terminal.{id}.status
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -51,11 +53,14 @@ from cli_agent_orchestrator.clients.database import (
     recover_transcript_binding_if_current,
     recover_wpm2_stale_attempt,
     settle_delivery_attempt,
+    settle_open_attempt_inferred_delivered,
     settle_delivery_attempt_proof_safe,
     settle_pending_orphan_messages,
     settle_pending_receiver_gone_if_generation,
     settle_wpm1_terminal_batch,
     transition_pending_to_delivery_failed,
+    transition_pending_to_inferred_delivered,
+    find_inferred_delivery_evidence,
     update_message_status,
 )
 
@@ -219,6 +224,26 @@ def _redelivery_tag(prior_attempt_uuid: str) -> str:
         f"[redelivery of attempt {prior_attempt_uuid[:8]} - prior delivery unconfirmed; "
         "ignore if already received]"
     )
+
+
+def _wire_with_attempt_challenge(
+    wire: str,
+    sender_id: str,
+    message_id: int,
+) -> tuple[str, str | None]:
+    """Splice a wire-only singleton challenge into the last authentic wrapper suffix."""
+    prefix = f"[Message from terminal {sender_id}. "
+    suffix = prefix + (
+        "Use the cao-mcp-server send_message MCP tool for any follow-up work — "
+        "never a built-in collaboration.send_message.]"
+    )
+    if not wire.endswith(suffix):
+        return wire, None
+    index = len(wire) - len(suffix)
+    raw_challenge = secrets.token_hex(16)
+    replacement = f"[Message from terminal {sender_id} | mid {message_id}:{raw_challenge}. "
+    challenged = wire[:index] + replacement + suffix[len(prefix) :]
+    return challenged, hashlib.sha256(raw_challenge.encode()).hexdigest()
 
 
 def classify_permanently_d2_only(attempt: dict, current_observation_epoch: str | None) -> str:
@@ -1302,6 +1327,28 @@ class InboxService:
                         )
                         if decision.kind == "stop":
                             if decision.evidence.get("reason") == "attempt_cap":
+                                inferred = (
+                                    find_inferred_delivery_evidence(message_ids[0], terminal_id)
+                                    if len(message_ids) == 1
+                                    else None
+                                )
+                                if inferred is not None:
+                                    cap_evidence: dict[str, Any] = inferred
+                                    won = _confirmed_settlement(
+                                        lambda: transition_pending_to_inferred_delivered(
+                                            message_ids[0],
+                                            cap_evidence,
+                                            on_confirmed=lambda: self._commit_watchdog_ops(
+                                                terminal_id,
+                                                sender_id,
+                                                orchestration_type,
+                                                metadata,
+                                            ),
+                                        )
+                                    )
+                                    if won:
+                                        self._evict_defer_state(batch)
+                                        return
                                 if transition_pending_to_delivery_failed(message_ids):
                                     self._notify_delivery_failed(terminal_id, message_ids)
                                 logger.warning(
@@ -1371,6 +1418,13 @@ class InboxService:
                         if successor_source is not None
                         else base_prepared
                     )
+                    challenge_sha256 = None
+                    if len(batch) == 1:
+                        wire_prepared, challenge_sha256 = _wire_with_attempt_challenge(
+                            wire_prepared,
+                            sender_id,
+                            batch[0].id,
+                        )
                     digest = wire_hash(wire_prepared)
                     normalized_fingerprint = normalized_confirmation_fingerprint(wire_prepared)
                     if normalized_fingerprint is not None:
@@ -1457,6 +1511,7 @@ class InboxService:
                     opener_kwargs: dict[str, str | None] = {
                         "evidence": json.dumps(persisted_evidence),
                         "prior_attempt_uuid": successor_source,
+                        "challenge_sha256": challenge_sha256,
                     }
 
                     def evidence_at_submit(value):
@@ -1656,6 +1711,29 @@ class InboxService:
                         evidence = {**current_attempt.get("evidence", {}), **evidence}
                     if submit_evidence is not None:
                         evidence.update(submit_evidence)
+                    inferred = (
+                        find_inferred_delivery_evidence(batch[0].id, terminal_id)
+                        if len(batch) == 1 and outcome not in {"hit", "unverified"}
+                        else None
+                    )
+                    if inferred is not None:
+                        won = _confirmed_settlement(
+                            lambda: settle_open_attempt_inferred_delivered(
+                                attempt_uuid,
+                                inferred,
+                                on_confirmed=lambda: self._commit_watchdog_ops(
+                                    terminal_id, sender_id, orchestration_type, metadata
+                                ),
+                            )
+                        )
+                        if won:
+                            logger.info(
+                                "Inferred delivery for terminal %s message %s from challenge reply",
+                                terminal_id,
+                                batch[0].id,
+                            )
+                            self._evict_defer_state(batch)
+                            return
                     if outcome in {"hit", "unverified"}:
                         _confirmed_settlement(
                             lambda: settle_delivery_attempt(

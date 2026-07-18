@@ -12,6 +12,7 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients.database import (
     Base,
     FlowModel,
+    InboxMessageTraceEventModel,
     InboxModel,
     TerminalModel,
     TranscriptBindingModel,
@@ -683,6 +684,24 @@ class TestMessageTraceTransactions:
 
 class TestInboxOperations:
     """Tests for inbox database operations."""
+
+    def test_wpq5_trace_event_schema_is_single_append_only_table(self, test_db):
+        engine = test_db.kw["bind"]
+        inspector = inspect(engine)
+
+        assert "inbox_message_trace_event" in inspector.get_table_names()
+        assert {column["name"] for column in inspector.get_columns("inbox_message_trace_event")} == {
+            "id",
+            "message_id",
+            "kind",
+            "payload",
+            "created_at",
+        }
+        assert {index["name"] for index in inspector.get_indexes("inbox_message_trace_event")} == {
+            "ix_inbox_message_trace_event_message_id",
+            "ix_inbox_message_trace_event_kind_created_message",
+        }
+        assert InboxMessageTraceEventModel.__tablename__ == "inbox_message_trace_event"
 
     def test_message_status_storage_is_additive_unconstrained_text(self):
         """Database-facing enum exposes all seven honest delivery states."""
