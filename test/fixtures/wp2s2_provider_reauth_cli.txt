@@ -1,2 +1,3 @@
 Recovery: cao-s (codex)
 deadbeef: rebound
+NOTE: recovered terminal deadbeef is IDLE until messaged — send a continue nudge.

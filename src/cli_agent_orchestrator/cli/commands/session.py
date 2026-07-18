@@ -276,6 +276,10 @@ def recover(
         )
         label = item.get("terminal_id") or item.get("base")
         click.echo(f"{label}: {item['status']}{detail}{reconciliation}")
+        if reason == "provider-reauth" and item["status"] == "rebound":
+            click.echo(
+                f"NOTE: recovered terminal {label} is IDLE until messaged — send a continue nudge."
+            )
     if reason == "epoch":
         for item in result.get("respawn_candidates", []):
             click.echo(

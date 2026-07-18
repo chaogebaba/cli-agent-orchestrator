@@ -1,5 +1,6 @@
 """Tests for the session CLI command."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -113,24 +114,125 @@ class TestRecover:
     def test_recover_json_contract(self, mock_post, runner):
         mock_post.return_value.json.return_value = {
             "session": "cao-test",
-            "results": [{
-                "terminal_id": "term-a", "status": "rebound", "retryable": False,
-                "error_code": None, "interrupted_turn": True,
-                "requires_supervisor_reconciliation": True,
-            }],
+            "results": [
+                {
+                    "terminal_id": "term-a",
+                    "status": "rebound",
+                    "retryable": False,
+                    "error_code": None,
+                    "interrupted_turn": True,
+                    "requires_supervisor_reconciliation": True,
+                }
+            ],
             "manifest_error": None,
         }
-        result = runner.invoke(session, [
-            "recover", "cao-test", "--reason", "provider-reauth",
-            "--terminal", "term-a", "--interrupt", "--json",
-        ])
+        result = runner.invoke(
+            session,
+            [
+                "recover",
+                "cao-test",
+                "--reason",
+                "provider-reauth",
+                "--terminal",
+                "term-a",
+                "--interrupt",
+                "--json",
+            ],
+        )
         assert result.exit_code == 0
-        assert __import__("json").loads(result.output)["results"][0]["interrupted_turn"] is True
+        assert json.loads(result.output)["results"][0]["interrupted_turn"] is True
+        assert (
+            result.output == json.dumps(mock_post.return_value.json.return_value, indent=2) + "\n"
+        )
+        assert "IDLE until messaged" not in result.output
         assert mock_post.call_args.kwargs["json"] == {
-            "reason": "provider-reauth", "provider": "codex",
-            "terminal_ids": ["term-a"], "interrupt": True,
+            "reason": "provider-reauth",
+            "provider": "codex",
+            "terminal_ids": ["term-a"],
+            "interrupt": True,
             "acknowledge_ownership": False,
         }
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_recover_rebound_prints_idle_until_messaged_reminder(self, mock_post, runner):
+        mock_post.return_value.json.return_value = {
+            "session": "cao-test",
+            "results": [{"terminal_id": "term-a", "status": "rebound", "error_code": None}],
+            "manifest_error": None,
+        }
+
+        result = runner.invoke(
+            session,
+            ["recover", "cao-test", "--reason", "provider-reauth", "--terminal", "term-a"],
+        )
+
+        assert result.exit_code == 0
+        assert (
+            result.output.count(
+                "NOTE: recovered terminal term-a is IDLE until messaged — send a continue nudge."
+            )
+            == 1
+        )
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_recover_rebound_with_error_still_prints_reminder(self, mock_post, runner):
+        mock_post.return_value.json.return_value = {
+            "session": "cao-test",
+            "results": [
+                {
+                    "terminal_id": "term-a",
+                    "status": "rebound",
+                    "error_code": "delivery_guard_release_failed",
+                }
+            ],
+            "manifest_error": None,
+        }
+
+        result = runner.invoke(
+            session,
+            ["recover", "cao-test", "--reason", "provider-reauth", "--terminal", "term-a"],
+        )
+
+        assert result.exit_code == 0
+        assert "term-a: rebound [delivery_guard_release_failed]" in result.output
+        assert (
+            result.output.count(
+                "NOTE: recovered terminal term-a is IDLE until messaged — send a continue nudge."
+            )
+            == 1
+        )
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_recover_skipped_busy_prints_no_reminder(self, mock_post, runner):
+        mock_post.return_value.json.return_value = {
+            "session": "cao-test",
+            "results": [{"terminal_id": "term-a", "status": "skipped_busy"}],
+            "manifest_error": None,
+        }
+
+        result = runner.invoke(
+            session,
+            ["recover", "cao-test", "--reason", "provider-reauth", "--terminal", "term-a"],
+        )
+
+        assert result.exit_code == 0
+        assert "IDLE until messaged" not in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_recover_resume_failed_prints_no_reminder(self, mock_post, runner):
+        mock_post.return_value.json.return_value = {
+            "session": "cao-test",
+            "results": [{"terminal_id": "term-a", "status": "resume_failed"}],
+            "manifest_error": None,
+        }
+
+        result = runner.invoke(
+            session,
+            ["recover", "cao-test", "--reason", "provider-reauth", "--terminal", "term-a"],
+        )
+
+        assert result.exit_code == 0
+        assert "IDLE until messaged" not in result.output
 
     def test_recover_requires_explicit_reason(self, runner):
         result = runner.invoke(session, ["recover", "cao-test"])
@@ -138,10 +240,16 @@ class TestRecover:
         assert "--reason" in result.output
 
     def test_acknowledge_ownership_requires_exactly_one_terminal(self, runner):
-        result = runner.invoke(session, [
-            "recover", "cao-test", "--reason", "provider-reauth",
-            "--acknowledge-ownership",
-        ])
+        result = runner.invoke(
+            session,
+            [
+                "recover",
+                "cao-test",
+                "--reason",
+                "provider-reauth",
+                "--acknowledge-ownership",
+            ],
+        )
         assert result.exit_code != 0
         assert "exactly one --terminal" in result.output
 
@@ -152,9 +260,13 @@ class TestLegacyStatus:
         response = MagicMock(status_code=200)
         response.json.return_value = {
             "schema_version": "cao.session-status/v1",
-            "session": {"name": "cao-test"}, "backend_present": True,
-            "epoch": None, "ready_bases": [], "warm_intents": [],
-            "quarantined": [], "ledger": {"available": False, "count": None},
+            "session": {"name": "cao-test"},
+            "backend_present": True,
+            "epoch": None,
+            "ready_bases": [],
+            "warm_intents": [],
+            "quarantined": [],
+            "ledger": {"available": False, "count": None},
         }
         mock_get.return_value = response
         result = runner.invoke(session, ["status", "cao-test", "--json"])
@@ -172,9 +284,13 @@ class TestLegacyStatus:
     def test_human_render_is_v1_not_conductor_output(self, mock_get, runner):
         response = MagicMock(status_code=200)
         response.json.return_value = {
-            "session": {"name": "cao-test"}, "backend_present": False,
-            "epoch": {"count": 2}, "ready_bases": [{}], "warm_intents": [],
-            "quarantined": [{}, {}], "ledger": {"available": False, "count": None},
+            "session": {"name": "cao-test"},
+            "backend_present": False,
+            "epoch": {"count": 2},
+            "ready_bases": [{}],
+            "warm_intents": [],
+            "quarantined": [{}, {}],
+            "ledger": {"available": False, "count": None},
         }
         mock_get.return_value = response
         result = runner.invoke(session, ["status", "cao-test"])
@@ -187,9 +303,13 @@ class TestLegacyStatus:
     def test_status_uses_single_v1_endpoint(self, mock_get, runner):
         response = MagicMock(status_code=200)
         response.json.return_value = {
-            "session": {"name": "cao-test"}, "backend_present": True,
-            "epoch": None, "ready_bases": [], "warm_intents": [],
-            "quarantined": [], "ledger": {"available": False, "count": None},
+            "session": {"name": "cao-test"},
+            "backend_present": True,
+            "epoch": None,
+            "ready_bases": [],
+            "warm_intents": [],
+            "quarantined": [],
+            "ledger": {"available": False, "count": None},
         }
         mock_get.return_value = response
         assert runner.invoke(session, ["status", "cao-test"]).exit_code == 0
@@ -208,10 +328,15 @@ class TestLegacyStatus:
         response = MagicMock(status_code=200)
         response.json.return_value = {
             "schema_version": "cao.session-status/v1",
-            "session": {"name": "cao-test"}, "backend_present": False,
-            "manifest": None, "manifest_error": "no_terminals", "epoch": None,
-            "ready_bases": [{"base_name": "codex"}], "warm_intents": [],
-            "quarantined": [], "ledger": {"available": False, "count": None},
+            "session": {"name": "cao-test"},
+            "backend_present": False,
+            "manifest": None,
+            "manifest_error": "no_terminals",
+            "epoch": None,
+            "ready_bases": [{"base_name": "codex"}],
+            "warm_intents": [],
+            "quarantined": [],
+            "ledger": {"available": False, "count": None},
         }
         mock_get.return_value = response
         result = runner.invoke(session, ["status", "cao-test", "--json"])
@@ -222,9 +347,13 @@ class TestLegacyStatus:
     def test_human_ledger_never_renders_zero(self, mock_get, runner):
         response = MagicMock(status_code=200)
         response.json.return_value = {
-            "session": {"name": "cao-test"}, "backend_present": True,
-            "epoch": None, "ready_bases": [], "warm_intents": [],
-            "quarantined": [], "ledger": {"available": False, "count": None},
+            "session": {"name": "cao-test"},
+            "backend_present": True,
+            "epoch": None,
+            "ready_bases": [],
+            "warm_intents": [],
+            "quarantined": [],
+            "ledger": {"available": False, "count": None},
         }
         mock_get.return_value = response
         result = runner.invoke(session, ["status", "cao-test"])
