@@ -4,6 +4,7 @@ import json
 import subprocess
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -196,18 +197,130 @@ def test_wpq8_m2_eager_waiting_is_vetoed_before_attempt(wpq8_db):
     assert trace["attempts"] == []
 
 
-def test_wpq8_m9_all_admission_kinds_share_one_preopen_safety_call():
-    source = (
-        Path(__file__).parents[2]
-        / "src"
-        / "cli_agent_orchestrator"
-        / "services"
-        / "inbox_service.py"
-    ).read_text(encoding="utf-8")
-    assert source.count("safety = self._inject_safe(terminal_id, provider, probe_meta)") == 1
-    safety_seat = source.index("safety = self._inject_safe")
-    opener_seat = source.index("opened = begin_delivery_attempt_if_no_other_delivering")
-    assert safety_seat < opener_seat
+@pytest.mark.parametrize(
+    ("admission_path", "initial_status", "final_status", "gate_state", "decision_kind"),
+    [
+        ("ordinary", TerminalStatus.IDLE, TerminalStatus.IDLE, "normal", "ordinary"),
+        (
+            "eager_waiting",
+            TerminalStatus.PROCESSING,
+            TerminalStatus.WAITING_USER_ANSWER,
+            "normal",
+            "ordinary",
+        ),
+        (
+            "eager_processing",
+            TerminalStatus.PROCESSING,
+            TerminalStatus.PROCESSING,
+            "normal",
+            "ordinary",
+        ),
+        ("corrective", TerminalStatus.IDLE, TerminalStatus.IDLE, "inject", "inject"),
+        (
+            "tagged_replay",
+            TerminalStatus.IDLE,
+            TerminalStatus.IDLE,
+            "normal",
+            "tagged_replay",
+        ),
+    ],
+)
+def test_wpq8_m9_every_admission_path_calls_safety_once_before_open(
+    wpq8_db,
+    admission_path,
+    initial_status,
+    final_status,
+    gate_state,
+    decision_kind,
+):
+    database.create_terminal("worker", "session", "window", "grok_cli")
+    message = database.create_inbox_message("sender", "worker", "payload")
+    observation = BoundaryObservation("epoch", initial_status, 1, 1, 1, None, 1)
+    monitor = MagicMock()
+    monitor.get_boundary_observation.return_value = observation
+    monitor.get_status.return_value = initial_status
+    monitor.get_input_gen.return_value = 1
+    monitor.get_status_gen.return_value = 1
+    events = []
+    probe_meta = _probe_meta(final_status.value)
+    monitor.probe_screen_status.side_effect = lambda _terminal: (
+        events.append("probe") or final_status,
+        probe_meta,
+    )
+    provider = MagicMock(accepts_input_while_processing=True)
+    service = InboxService()
+    actual_safety = service._inject_safe
+
+    def safety(*args):
+        events.append("safety")
+        return actual_safety(*args)
+
+    def attempt_open(*_args, **_kwargs):
+        events.append("attempt")
+        return database.AttemptOpenResult("busy_aborted")
+
+    prior = "prior-attempt"
+    gate_evidence = (
+        {
+            "_wpm1_prior_attempt_uuid": prior,
+            "boundary_authorized": {"seq": 1},
+        }
+        if gate_state == "inject"
+        else None
+    )
+    decision_evidence = (
+        {
+            "prior_attempt_uuid": prior,
+            "redelivery_tag": {"version": 1, "prior_attempt_uuid": prior},
+        }
+        if decision_kind in {"inject", "tagged_replay"}
+        else {}
+    )
+    decision = SimpleNamespace(kind=decision_kind, evidence=decision_evidence)
+
+    with (
+        patch("cli_agent_orchestrator.services.inbox_service.status_monitor", monitor),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
+            return_value=provider,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
+            return_value=None,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.terminal_service.prepare_input",
+            side_effect=lambda _terminal, value, _kind: value,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.run_post_auth_engine",
+            return_value=decision,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt_if_no_other_delivering",
+            side_effect=attempt_open,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
+            return_value=None,
+        ),
+        patch.object(service, "_handle_wpm1_gate", return_value=(gate_state, gate_evidence)),
+        patch.object(service, "_inject_safe", side_effect=safety) as safety_call,
+        patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True),
+    ):
+        service.deliver_pending("worker")
+
+    assert monitor.probe_screen_status.call_count == 1
+    assert safety_call.call_count == 1
+    assert events[:2] == ["probe", "safety"]
+    if admission_path == "eager_waiting":
+        assert events == ["probe", "safety"]
+    else:
+        assert events == ["probe", "safety", "attempt"]
+    trace = database.get_message_trace(message.id)
+    assert trace["attempts"] == []
+    with wpq8_db() as db:
+        assert db.query(database.InboxMessageTraceEventModel).count() == 0
 
 
 def test_wpq8_m7_m10_hazard_comes_from_one_fresh_probe_frame(monkeypatch):
@@ -519,10 +632,10 @@ def _constructor_owners(path: Path) -> tuple[set[str], dict[str, bool]]:
     return owners, stamped
 
 
-def test_wpq8_m16_all_twelve_inbox_writers_use_the_stamp_helper():
+def test_wpq8_m16_inbox_writer_constructor_topology_is_exactly_twelve():
     root = Path(__file__).parents[2] / "src" / "cli_agent_orchestrator"
-    db_owners, db_stamped = _constructor_owners(root / "clients" / "database.py")
-    mailbox_owners, mailbox_stamped = _constructor_owners(root / "services" / "mailbox_service.py")
+    db_owners, _ = _constructor_owners(root / "clients" / "database.py")
+    mailbox_owners, _ = _constructor_owners(root / "services" / "mailbox_service.py")
     owners = db_owners | mailbox_owners
     expected = {
         "claim_deferred_init_failure",
@@ -539,10 +652,324 @@ def test_wpq8_m16_all_twelve_inbox_writers_use_the_stamp_helper():
         "delete_mailbox",
     }
     assert owners == expected
-    unstamped = {
-        owner for owner, stamped in {**db_stamped, **mailbox_stamped}.items() if not stamped
-    }
-    assert unstamped == set()
+
+
+def _seed_writer_attempt(db, attempt_uuid: str) -> int:
+    message = InboxModel(
+        sender_id="receiver",
+        receiver_id="worker",
+        enqueue_generation=3,
+        message=f"source-{attempt_uuid}",
+        orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+        status=MessageStatus.PENDING.value,
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(message)
+    db.flush()
+    now = datetime.now(timezone.utc)
+    db.add(
+        database.InboxDeliveryAttemptModel(
+            attempt_uuid=attempt_uuid,
+            receiver_terminal_id="worker",
+            provider="codex",
+            outcome="ambiguous",
+            reason="confirmation_timeout",
+            payload_hash=attempt_uuid,
+            payload_length=1,
+            evidence="{}",
+            sender_id="receiver",
+            orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+            started_at=now,
+            last_at=now,
+            settled_at=now,
+        )
+    )
+    db.add(
+        database.InboxDeliveryAttemptMemberModel(
+            attempt_uuid=attempt_uuid,
+            message_id=message.id,
+            position=0,
+        )
+    )
+    return int(message.id)
+
+
+@pytest.mark.parametrize(
+    "writer",
+    [
+        "claim_deferred_init_failure",
+        "_fire_open_barrier_in_db",
+        "_insert_routed_inbox_row",
+        "insert_barrier_escalation_message",
+        "insert_watchdog_auto_resume_message",
+        "insert_identity_authority_notice",
+        "_record_p5_orphan_notices",
+        "record_wpm1_stalled_notice",
+        "settle_wpm1_terminal_batch",
+        "publish_supervisor_incarnation",
+        "digest_stale_pending_for_terminal",
+        "delete_mailbox",
+    ],
+)
+def test_wpq8_m16_each_pending_writer_persists_runtime_generation(wpq8_db, writer):
+    with wpq8_db.begin() as db:
+        db.add_all(
+            [
+                TerminalModel(
+                    id="receiver",
+                    tmux_session="session",
+                    tmux_window="receiver",
+                    provider="codex",
+                    lifecycle_generation=7,
+                ),
+                TerminalModel(
+                    id="worker",
+                    tmux_session="session",
+                    tmux_window="worker",
+                    provider="codex",
+                    caller_id="receiver",
+                    lifecycle_generation=3,
+                    init_state="init_pending",
+                    init_started_at=datetime.now(timezone.utc),
+                    init_owner_epoch="22222222-2222-2222-2222-222222222222",
+                    init_deadline_s=30.0,
+                ),
+                TerminalModel(
+                    id="old",
+                    tmux_session="session",
+                    tmux_window="old",
+                    provider="codex",
+                    lifecycle_generation=5,
+                ),
+            ]
+        )
+
+    expected_generation = 7
+    message_id = None
+    if writer == "claim_deferred_init_failure":
+        result = database.claim_deferred_init_failure(
+            "worker",
+            caller_id="receiver",
+            failure_token="11111111-1111-1111-1111-111111111111",
+            notice="matrix-deferred",
+        )
+        assert result["status"] == "claimed_notified"
+        with wpq8_db() as db:
+            message_id = db.query(InboxModel.id).filter_by(message="matrix-deferred").scalar()
+    elif writer == "_fire_open_barrier_in_db":
+        with wpq8_db.begin() as db:
+            barrier = database.CallbackBarrierModel(
+                owner_terminal_id="receiver",
+                owner_generation=7,
+                label="matrix-fire",
+                state="OPEN",
+                timeout_at=datetime.now() + timedelta(minutes=1),
+                created_at=datetime.now(),
+            )
+            db.add(barrier)
+            db.flush()
+            message_id = database._fire_open_barrier_in_db(
+                db,
+                barrier,
+                state="FIRED_TIMEOUT",
+                close_reason="timeout",
+            )
+    elif writer == "_insert_routed_inbox_row":
+        with wpq8_db.begin() as db:
+            row = database._insert_routed_inbox_row(
+                db,
+                sender_id="matrix-route",
+                receiver_id="receiver",
+                logical_receiver_id=None,
+                message="matrix-route",
+                orchestration_type=OrchestrationType.SEND_MESSAGE,
+            )
+            message_id = int(row.id)
+    elif writer == "insert_barrier_escalation_message":
+        with wpq8_db.begin() as db:
+            barrier = database.CallbackBarrierModel(
+                owner_terminal_id="receiver",
+                owner_generation=7,
+                label="matrix-alert",
+                state="OPEN",
+                timeout_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+                created_at=datetime.now(timezone.utc),
+            )
+            db.add(barrier)
+            db.flush()
+            db.add(
+                database.CallbackBarrierMemberModel(
+                    barrier_id=barrier.id,
+                    member_key="worker",
+                    position=0,
+                    terminal_id="worker",
+                    lifecycle_generation=3,
+                    state="AWAITING",
+                )
+            )
+        result = database.insert_barrier_escalation_message(
+            "worker", "receiver", "matrix-alert", "quota_or_auth"
+        )
+        assert result is not None
+        message_id = result.message_id
+    elif writer == "insert_watchdog_auto_resume_message":
+        result = database.insert_watchdog_auto_resume_message("receiver", "matrix-watchdog")
+        assert result.kind == "inserted"
+        message_id = result.message_id
+    elif writer == "insert_identity_authority_notice":
+        result = database.insert_identity_authority_notice(
+            "matrix-identity", "receiver", "matrix-identity"
+        )
+        assert result == database.NoticeInsertOutcome.INSERTED
+        with wpq8_db() as db:
+            message_id = db.query(InboxModel.id).filter_by(message="matrix-identity").scalar()
+    elif writer == "_record_p5_orphan_notices":
+        with wpq8_db.begin() as db:
+            orphan = InboxModel(
+                sender_id="receiver",
+                receiver_id="gone",
+                enqueue_generation=1,
+                message="matrix-orphan-source",
+                orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+                status=MessageStatus.DELIVERY_FAILED.value,
+            )
+            db.add(orphan)
+            db.flush()
+            assert database._record_p5_orphan_notices(db, [orphan]) == (1, 0)
+        with wpq8_db() as db:
+            message_id = (
+                db.query(InboxModel.id)
+                .filter(InboxModel.sender_id == "message-trace:gone")
+                .scalar()
+            )
+    elif writer == "record_wpm1_stalled_notice":
+        with wpq8_db.begin() as db:
+            source_id = _seed_writer_attempt(db, "matrix-stalled")
+        assert (
+            database.record_wpm1_stalled_notice(
+                "matrix-stalled", [source_id], "worker", "2030-01-01T00:00:00Z"
+            )
+            == "recorded"
+        )
+        with wpq8_db() as db:
+            message_id = (
+                db.query(InboxModel.id)
+                .filter(InboxModel.message.startswith("wpm1-notice kind=stalled"))
+                .scalar()
+            )
+    elif writer == "settle_wpm1_terminal_batch":
+        with wpq8_db.begin() as db:
+            source_id = _seed_writer_attempt(db, "matrix-corrective")
+        assert (
+            database.record_wpm1_stalled_notice(
+                "matrix-corrective", [source_id], "worker", "2030-01-01T00:00:00Z"
+            )
+            == "recorded"
+        )
+        assert (
+            database.settle_wpm1_terminal_batch([source_id], MessageStatus.DELIVERED, "worker")
+            == "settled"
+        )
+        with wpq8_db() as db:
+            message_id = (
+                db.query(InboxModel.id)
+                .filter(InboxModel.message.startswith("wpm1-notice kind=corrective"))
+                .scalar()
+            )
+    elif writer == "publish_supervisor_incarnation":
+        expected_generation = 11
+        with wpq8_db.begin() as db:
+            mailbox = database.MailboxModel(
+                id="mb_publish",
+                session_name="matrix",
+                role="supervisor",
+                current_terminal_id="old",
+                generation=10,
+                consumed_through_id=0,
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+            db.add(mailbox)
+            db.add(
+                database.MailboxIncarnationModel(
+                    mailbox_id=mailbox.id,
+                    generation=10,
+                    terminal_id="old",
+                    published_at=datetime.now(timezone.utc),
+                )
+            )
+            db.add(
+                InboxModel(
+                    sender_id="sender",
+                    receiver_id="old",
+                    logical_receiver_id=mailbox.id,
+                    enqueue_generation=10,
+                    message="matrix-stale-publish",
+                    orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+                    status=MessageStatus.PENDING.value,
+                )
+            )
+        result = mailbox_service.publish_supervisor_incarnation(
+            mailbox_service.MailboxClaim("matrix", "supervisor", "mb_publish", 10),
+            "receiver",
+        )
+        message_id = result["digest_message_id"]
+    elif writer == "digest_stale_pending_for_terminal":
+        with wpq8_db.begin() as db:
+            db.add(
+                InboxModel(
+                    sender_id="sender",
+                    receiver_id="receiver",
+                    enqueue_generation=6,
+                    message="matrix-stale-direct",
+                    orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+                    status=MessageStatus.PENDING.value,
+                )
+            )
+        assert mailbox_service.digest_stale_pending_for_terminal("receiver") == 1
+        with wpq8_db() as db:
+            message_id = db.query(InboxModel.id).filter_by(sender_id="mailbox-digest").scalar()
+    elif writer == "delete_mailbox":
+        with wpq8_db.begin() as db:
+            mailbox = database.MailboxModel(
+                id="mb_delete",
+                session_name="matrix-delete",
+                role="supervisor",
+                current_terminal_id=None,
+                generation=11,
+                consumed_through_id=0,
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+            db.add(mailbox)
+            db.add(
+                InboxModel(
+                    sender_id="receiver",
+                    receiver_id="old",
+                    logical_receiver_id=mailbox.id,
+                    enqueue_generation=11,
+                    message="matrix-delete-source",
+                    orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+                    status=MessageStatus.PENDING.value,
+                )
+            )
+        assert mailbox_service.delete_mailbox("mb_delete") == {
+            "settled_pending": 1,
+            "notices_sent": 1,
+        }
+        with wpq8_db() as db:
+            message_id = (
+                db.query(InboxModel.id)
+                .filter(InboxModel.sender_id == "message-trace:mb_delete")
+                .scalar()
+            )
+
+    assert type(message_id) is int
+    with wpq8_db() as db:
+        row = db.get(InboxModel, message_id)
+        assert row.status == MessageStatus.PENDING.value
+        assert row.enqueue_generation == expected_generation
+        assert type(row.enqueue_generation) is int
 
 
 def test_wpq8_lifecycle_increments_run_under_delivery_lock():

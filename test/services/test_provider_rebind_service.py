@@ -298,6 +298,40 @@ async def test_herdr_backend_proof_requires_new_native_event_and_both_maps(monke
 
 
 @pytest.mark.asyncio
+async def test_herdr_backend_proof_registers_under_real_held_delivery_guard(monkeypatch):
+    backend = MagicMock()
+    backend.supports_event_inbox.return_value = True
+    backend.get_pane_id.return_value = "pane-new"
+    inbox = HerdrInboxService(socket_path="/tmp/test-real-guard.sock")
+    monkeypatch.setattr(service, "get_backend", lambda: backend)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.herdr_inbox_registry.get_herdr_inbox_service",
+        lambda: inbox,
+    )
+    guard = service.DeliveryGuard("term", asyncio.get_running_loop())
+    await guard.acquire()
+    try:
+        proof = asyncio.create_task(
+            service._wait_for_backend_proof(
+                "term",
+                {"tmux_session": "s", "tmux_window": "w"},
+                MagicMock(),
+                0,
+                guard,
+            )
+        )
+        await asyncio.sleep(0)
+        assert inbox._terminal_to_pane["term"] == "pane-new"
+        assert inbox._pane_to_terminal["pane-new"] == "term"
+        with inbox._identity_guard:
+            inbox._native_event_gen[("term", "pane-new")] = 1
+        await asyncio.wait_for(proof, timeout=0.5)
+    finally:
+        await guard.close()
+    assert guard.active is False
+
+
+@pytest.mark.asyncio
 async def test_herdr_proof_waits_for_exact_new_pane_native_event(monkeypatch):
     backend = MagicMock()
     backend.supports_event_inbox.return_value = True
