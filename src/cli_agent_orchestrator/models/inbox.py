@@ -19,6 +19,7 @@ class MessageStatus(str, Enum):
     """Message status enumeration."""
 
     PENDING = "pending"
+    HELD = "held"
     DELIVERING = "delivering"
     DELIVERED = "delivered"
     DELIVERY_FAILED = "delivery_failed"
@@ -49,5 +50,9 @@ class InboxMessage(BaseModel):
     )
     enqueue_generation: int | None = Field(
         default=None, description="Logical mailbox generation captured at enqueue"
+    )
+    barrier_id: int | None = Field(default=None, description="Callback barrier owning this row")
+    barrier_member_key: str | None = Field(
+        default=None, description="Callback barrier member that produced this row"
     )
     created_at: datetime = Field(..., description="Creation timestamp")

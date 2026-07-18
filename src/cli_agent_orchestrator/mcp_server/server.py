@@ -173,6 +173,9 @@ def _create_terminal(
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
     fork_context=None,
     refresh_base_name: Optional[str] = None,
+    barrier: Optional[str] = None,
+    barrier_timeout_seconds: Optional[int] = None,
+    barrier_member_key: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -229,7 +232,7 @@ def _create_terminal(
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
-        json_body = None
+        json_body: dict[str, Any] | None = None
         if defer_init:
             params["defer_init"] = "true"
             json_body = {}
@@ -245,6 +248,10 @@ def _create_terminal(
                 json_body["fork_context"] = fork_context.model_dump()
             if refresh_base_name is not None:
                 json_body["refresh_base_name"] = refresh_base_name
+            if barrier is not None:
+                json_body["barrier"] = barrier
+                json_body["barrier_timeout_seconds"] = barrier_timeout_seconds
+                json_body["barrier_member_key"] = barrier_member_key
 
         response = cao_http.post(
             f"/sessions/{session_name}/terminals",
@@ -680,7 +687,14 @@ def _parse_run_step_error(
     return None, fallback, None
 
 
-def _send_to_inbox(receiver_id: str, message: str, refresh_ingest: bool = False) -> Dict[str, Any]:
+def _send_to_inbox(
+    receiver_id: str,
+    message: str,
+    refresh_ingest: bool = False,
+    barrier: str | None = None,
+    barrier_timeout_seconds: int | None = None,
+    barrier_member_key: str | None = None,
+) -> Dict[str, Any]:
     """Send message to another terminal's inbox (queued delivery when IDLE).
 
     Args:
@@ -698,13 +712,20 @@ def _send_to_inbox(receiver_id: str, message: str, refresh_ingest: bool = False)
     if not sender_id:
         raise ValueError("CAO_TERMINAL_ID not set - cannot determine sender")
 
+    params: dict[str, Any] = {
+        "sender_id": sender_id,
+        "message": message,
+        "refresh_ingest": refresh_ingest,
+    }
+    if barrier is not None:
+        params["barrier"] = barrier
+    if barrier_timeout_seconds is not None:
+        params["barrier_timeout_seconds"] = barrier_timeout_seconds
+    if barrier_member_key is not None:
+        params["barrier_member_key"] = barrier_member_key
     response = cao_http.post(
         f"/terminals/{receiver_id}/inbox/messages",
-        params={
-            "sender_id": sender_id,
-            "message": message,
-            "refresh_ingest": refresh_ingest,
-        },
+        params=params,
         timeout=_mcp_timeout(),
     )
     response.raise_for_status()
@@ -1048,6 +1069,9 @@ def _assign_impl(
     working_directory: Optional[str] = None,
     fork_from: Optional[str] = None,
     resume: bool = False,
+    barrier: Optional[str] = None,
+    barrier_timeout_seconds: Optional[int] = None,
+    barrier_member_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1205,6 +1229,9 @@ def _assign_impl(
             initial_message_orchestration_type=OrchestrationType.ASSIGN,
             fork_context=fork_context,
             refresh_base_name=refresh_base_name,
+            barrier=barrier,
+            barrier_timeout_seconds=barrier_timeout_seconds,
+            barrier_member_key=barrier_member_key,
         )
 
         return {
@@ -1310,8 +1337,24 @@ async def assign(
         default=None, description="Registered base name, UUID, or terminal id"
     ),
     resume: bool = Field(default=False, description="Resume instead of fork"),
+    barrier: Optional[str] = Field(default=None, description="Callback barrier label"),
+    barrier_timeout_seconds: Optional[int] = Field(
+        default=None, description="Timeout honored when creating the barrier"
+    ),
+    barrier_member_key: Optional[str] = Field(
+        default=None, description="Stable member key for duplicate profiles or re-arm"
+    ),
 ) -> Dict[str, Any]:
-    return _assign_impl(agent_profile, message, working_directory, fork_from, resume)
+    return _assign_impl(
+        agent_profile,
+        message,
+        working_directory,
+        fork_from,
+        resume,
+        barrier,
+        barrier_timeout_seconds,
+        barrier_member_key,
+    )
 
 
 @mcp.tool(description="Mark the caller's provider-native session as a ready fork base.")
@@ -1370,7 +1413,12 @@ async def unregister_base(
 
 # Implementation function for send_message
 def _send_message_impl(
-    receiver_id: Optional[str], message: str, refresh_ingest: bool = False
+    receiver_id: Optional[str],
+    message: str,
+    refresh_ingest: bool = False,
+    barrier: str | None = None,
+    barrier_timeout_seconds: int | None = None,
+    barrier_member_key: str | None = None,
 ) -> Dict[str, Any]:
     """Implementation of send_message logic."""
     try:
@@ -1446,7 +1494,14 @@ def _send_message_impl(
                 "never a built-in collaboration.send_message.]"
             )
 
-        return _send_to_inbox(receiver_id, message, refresh_ingest=refresh_ingest)
+        inbox_kwargs: dict[str, Any] = {"refresh_ingest": refresh_ingest}
+        if barrier is not None:
+            inbox_kwargs.update(
+                barrier=barrier,
+                barrier_timeout_seconds=barrier_timeout_seconds,
+                barrier_member_key=barrier_member_key,
+            )
+        return _send_to_inbox(receiver_id, message, **inbox_kwargs)
     except requests.HTTPError as exc:
         # e.g. the receiver terminal (a recorded caller included) was deleted
         # before this reply — surface the API detail instead of a raw
@@ -1651,6 +1706,13 @@ async def send_message(
         default=False,
         description="Allow an explicit refresh-ingest dispatch to a ready base terminal",
     ),
+    barrier: Optional[str] = Field(default=None, description="Callback barrier label"),
+    barrier_timeout_seconds: Optional[int] = Field(
+        default=None, description="Timeout honored when creating the barrier"
+    ),
+    barrier_member_key: Optional[str] = Field(
+        default=None, description="Stable member key for duplicate profiles or re-arm"
+    ),
 ) -> Dict[str, Any]:
     """Send a message to another terminal's inbox.
 
@@ -1668,7 +1730,67 @@ async def send_message(
     Returns:
         Dict with success status and message details
     """
-    return _send_message_impl(receiver_id, message, refresh_ingest)
+    return _send_message_impl(
+        receiver_id,
+        message,
+        refresh_ingest,
+        barrier,
+        barrier_timeout_seconds,
+        barrier_member_key,
+    )
+
+
+def _barrier_params(
+    barrier_id: int | None,
+    barrier_label: str | None,
+) -> dict[str, Any]:
+    if (barrier_id is None) == (barrier_label is None):
+        raise ValueError("provide exactly one of barrier_id or barrier_label")
+    params: dict[str, Any] = {}
+    if barrier_id is not None:
+        params["barrier_id"] = barrier_id
+    else:
+        owner = os.environ.get("CAO_TERMINAL_ID")
+        if not owner:
+            raise ValueError("CAO_TERMINAL_ID required for barrier label lookup")
+        params.update({"barrier_label": barrier_label, "owner": owner})
+    return params
+
+
+@mcp.tool()
+async def barrier_status(
+    barrier_id: Optional[int] = Field(default=None, description="Numeric barrier id"),
+    barrier_label: Optional[str] = Field(default=None, description="Exact barrier label"),
+) -> Dict[str, Any]:
+    """Inspect a callback barrier by typed id-or-label selector."""
+    try:
+        response = cao_http.get(
+            "/barriers/status",
+            params=_barrier_params(barrier_id, barrier_label),
+            timeout=_mcp_timeout(),
+        )
+        response.raise_for_status()
+        return response.json()
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+@mcp.tool()
+async def cancel_barrier(
+    barrier_id: Optional[int] = Field(default=None, description="Numeric barrier id"),
+    barrier_label: Optional[str] = Field(default=None, description="Exact barrier label"),
+) -> Dict[str, Any]:
+    """Cancel a callback barrier and release its held callbacks."""
+    try:
+        response = cao_http.post(
+            "/barriers/cancel",
+            params=_barrier_params(barrier_id, barrier_label),
+            timeout=_mcp_timeout(),
+        )
+        response.raise_for_status()
+        return response.json()
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
 
 
 @mcp.tool()

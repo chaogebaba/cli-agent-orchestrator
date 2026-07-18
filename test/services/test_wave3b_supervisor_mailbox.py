@@ -69,8 +69,8 @@ from cli_agent_orchestrator.services.mailbox_service import (
     digest_stale_pending_for_terminal,
     get_mailbox_authority_lock,
     list_messages,
-    publish_supervisor_incarnation,
     publish_compact_boundary_digest,
+    publish_supervisor_incarnation,
 )
 from cli_agent_orchestrator.services.message_trace_service import (
     TranscriptLiveReference,
@@ -155,6 +155,46 @@ def inbox(
     db.add(row)
     db.flush()
     return row
+
+
+def test_wpq7_open_barrier_blocks_delete_and_historical_generation_rebind_digests_held(
+    scratch_db,
+):
+    with scratch_db.begin() as db:
+        mailbox(db)
+        terminal(db, "11111111")
+        terminal(db, "22222222")
+        terminal(db, "33333333")
+        terminal(db, "44444444")
+    create_inbox_message(
+        "11111111",
+        "22222222",
+        "task",
+        dispatch_barrier={"label": "mailbox-gate"},
+    )
+    create_inbox_message(
+        "11111111",
+        "44444444",
+        "peer task",
+        dispatch_barrier={"label": "mailbox-gate"},
+    )
+    held = create_logical_inbox_message(
+        sender_id="22222222",
+        mailbox_id="mb_aaaaaaaa",
+        message="answer",
+    )
+    assert held.status == MessageStatus.HELD
+    with pytest.raises(MailboxDomainError, match="mailbox_busy"):
+        delete_mailbox("mb_aaaaaaaa")
+
+    result = publish_supervisor_incarnation(claim_mailbox("cao-wave3b"), "33333333")
+    assert result["generation"] == 2
+    with scratch_db() as db:
+        barrier = db.query(database.CallbackBarrierModel).one()
+        assert barrier.state == "DIGESTED_REBIND"
+        source = db.query(InboxModel).filter_by(id=held.id).one()
+        assert source.status == MessageStatus.DIGESTED.value
+        assert source.digested_into == result["digest_message_id"]
 
 
 def deliver_with_real_attempt(

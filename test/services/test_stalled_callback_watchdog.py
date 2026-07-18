@@ -1,5 +1,5 @@
-from contextlib import contextmanager
 import threading
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -7,7 +7,10 @@ import pytest
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
-from cli_agent_orchestrator.services.stalled_callback_watchdog import StalledCallbackWatchdog
+from cli_agent_orchestrator.services.stalled_callback_watchdog import (
+    StalledCallbackWatchdog,
+    WatchdogNotice,
+)
 
 _WPQ4_T07_FRAME = """
 ◆ Task started: Sleep 90s then echo WPQ4_DONE
@@ -33,6 +36,10 @@ Grok 4.5 (medium) · always-approve · 13K / 500K (3%) · ctrl+o transcript
 
 def _mark_screen_sampled(svc, terminal_id="worker1"):
     svc._episodes[terminal_id].last_screen_fp = "sample"
+
+
+def _notice(message: str, idle_reason: str | None = None) -> WatchdogNotice:
+    return WatchdogNotice("worker1", "caller1", message, idle_reason)
 
 
 def _armed_due_watchdog():
@@ -108,11 +115,7 @@ def test_watchdog_pushes_exactly_one_due_notification():
     ):
         assert svc.collect_due_notifications(now=12.0) == []
         assert svc.collect_due_notifications(now=13.0) == [
-            (
-                "worker1",
-                "caller1",
-                "[watchdog] worker worker1 (developer) idle 3s without callback",
-            )
+            _notice("[watchdog] worker worker1 (developer) idle 3s without callback")
         ]
         assert svc.collect_due_notifications(now=14.0) == []
 
@@ -136,11 +139,7 @@ def test_watchdog_polls_idle_status_when_no_post_task_status_event():
     ):
         assert svc.collect_due_notifications(now=12.0) == []
         assert svc.collect_due_notifications(now=13.0) == [
-            (
-                "worker1",
-                "caller1",
-                "[watchdog] worker worker1 (developer) idle 3s without callback",
-            )
+            _notice("[watchdog] worker worker1 (developer) idle 3s without callback")
         ]
         assert svc.collect_due_notifications(now=14.0) == []
 
@@ -193,11 +192,7 @@ def test_watchdog_screen_fingerprint_change_resets_idle_timer_then_static_fires(
         assert svc.collect_due_notifications(now=14.0) == []
         svc.refresh_screen_fingerprints(now=14.0)
         assert svc.collect_due_notifications(now=15.0) == [
-            (
-                "worker1",
-                "caller1",
-                "[watchdog] worker worker1 (developer) idle 3s without callback",
-            )
+            _notice("[watchdog] worker worker1 (developer) idle 3s without callback")
         ]
 
     backend.get_history.assert_any_call(
@@ -251,11 +246,7 @@ def test_watchdog_excludes_rotating_codex_prompt_from_liveness_fingerprint():
         svc.refresh_screen_fingerprints(now=10.5)
         svc.refresh_screen_fingerprints(now=12.0)
         assert svc.collect_due_notifications(now=13.0) == [
-            (
-                "worker1",
-                "caller1",
-                "[watchdog] worker worker1 (developer) idle 3s without callback",
-            )
+            _notice("[watchdog] worker worker1 (developer) idle 3s without callback")
         ]
 
 
@@ -348,11 +339,7 @@ def test_watchdog_resets_on_new_task_after_firing():
         _mark_screen_sampled(svc)
 
         assert svc.collect_due_notifications(now=23.0) == [
-            (
-                "worker1",
-                "caller1",
-                "[watchdog] worker worker1 (developer) idle 3s without callback",
-            )
+            _notice("[watchdog] worker worker1 (developer) idle 3s without callback")
         ]
 
 
@@ -501,11 +488,7 @@ def test_watchdog_due_t10_newer_completion_emits_notice():
 
     with _watchdog_guard_fakes(_WPQ4_T10_FRAME) as (backend, callback_status):
         assert svc.collect_due_notifications(now=13.0) == [
-            (
-                "worker1",
-                "caller1",
-                "[watchdog] worker worker1 (developer) idle 3s without callback",
-            )
+            _notice("[watchdog] worker worker1 (developer) idle 3s without callback")
         ]
 
     backend.capture_viewport.assert_called_once_with("cao-test", "worker1")
@@ -648,9 +631,14 @@ def test_notify_due_sends_only_to_caller():
         patch(
             "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending"
         ) as mock_deliver,
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "insert_barrier_escalation_message",
+            return_value=None,
+        ),
         patch.object(svc, "collect_due_notifications") as mock_due,
     ):
-        mock_due.return_value = [("worker1", "caller1", "notice")]
+        mock_due.return_value = [WatchdogNotice("worker1", "caller1", "notice", None)]
         svc.notify_due()
 
     mock_create.assert_called_once_with("watchdog:worker1", "caller1", "notice")

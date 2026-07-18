@@ -35,7 +35,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
@@ -46,8 +46,11 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     TRANSCRIPT_BINDING_SOURCES,
     adopt_mailbox_rows_at_startup,
+    callback_barrier_status,
+    cancel_callback_barrier,
     create_inbox_message,
     create_transcript_binding,
+    fire_due_barriers,
     get_inbox_messages,
     get_message_trace,
     get_terminal_metadata,
@@ -55,6 +58,8 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
+    CALLBACK_BARRIER_POLL_INTERVAL,
+    CALLBACK_BARRIER_TIMEOUT_MAX_SECONDS,
     CAO_HOME_DIR,
     CORS_ORIGINS,
     DEFAULT_PROVIDER,
@@ -215,6 +220,25 @@ async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
         await asyncio.sleep(INBOX_RECONCILE_INTERVAL)
 
 
+async def callback_barrier_daemon() -> None:
+    """Fire overdue callback barriers; deadlines never move on sweep failure."""
+    while True:
+        try:
+            fired = await asyncio.to_thread(fire_due_barriers, datetime.now(timezone.utc))
+            for message_id in fired:
+                trace = await asyncio.to_thread(get_message_trace, message_id)
+                if trace is not None:
+                    await asyncio.to_thread(
+                        inbox_service.deliver_pending,
+                        trace["message"]["receiver_id"],
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Callback barrier sweep failed")
+        await asyncio.sleep(CALLBACK_BARRIER_POLL_INTERVAL)
+
+
 # Response Models
 class TerminalOutputResponse(BaseModel):
     output: str
@@ -235,6 +259,38 @@ class CreateTerminalBody(BaseModel):
     initial_message_orchestration_type: Optional[str] = None
     fork_context: Optional[ForkContext] = None
     refresh_base_name: Optional[str] = None
+    barrier: Optional[str] = None
+    barrier_timeout_seconds: Optional[StrictInt] = None
+    barrier_member_key: Optional[str] = None
+
+    @field_validator("barrier")
+    @classmethod
+    def validate_barrier_label(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("invalid_barrier_label")
+        return value
+
+    @field_validator("barrier_timeout_seconds")
+    @classmethod
+    def validate_barrier_timeout(cls, value: int | None) -> int | None:
+        if value is not None and (value <= 0 or value > CALLBACK_BARRIER_TIMEOUT_MAX_SECONDS):
+            raise ValueError("invalid_barrier_timeout")
+        return value
+
+    @field_validator("barrier_member_key")
+    @classmethod
+    def validate_barrier_member_key(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("invalid_barrier_member_key")
+        return value
+
+    @model_validator(mode="after")
+    def validate_barrier_fields(self) -> "CreateTerminalBody":
+        if self.barrier is None and (
+            self.barrier_timeout_seconds is not None or self.barrier_member_key is not None
+        ):
+            raise ValueError("barrier is required when barrier options are supplied")
+        return self
 
 
 class RunStepRequest(BaseModel):
@@ -612,6 +668,7 @@ async def lifespan(app: FastAPI):
     inbox_service.recover_stale_deliveries()
     adopt_mailbox_rows_at_startup()
     inbox_service.reconcile_pending_orphans()
+    await asyncio.to_thread(fire_due_barriers, datetime.now(timezone.utc))
     registry = PluginRegistry()
     await registry.load()
     app.state.plugin_registry = registry
@@ -646,6 +703,7 @@ async def lifespan(app: FastAPI):
     # the immediate and event-driven status paths missed (issue #131).
     inbox_reconcile_task = asyncio.create_task(inbox_reconciliation_daemon(registry))
     watchdog_task = asyncio.create_task(stalled_callback_watchdog.run(registry))
+    callback_barrier_task = asyncio.create_task(callback_barrier_daemon())
 
     # Herdr delivers inbox via its own socket events; the tmux backend uses the
     # FIFO -> EventBus pipeline (StatusMonitor / LogWriter / InboxService) started
@@ -683,6 +741,7 @@ async def lifespan(app: FastAPI):
     log_writer_task.cancel()
     inbox_service_task.cancel()
     watchdog_task.cancel()
+    callback_barrier_task.cancel()
     # Cancel daemon on shutdown
     if daemon_task is not None:
         daemon_task.cancel()
@@ -693,6 +752,7 @@ async def lifespan(app: FastAPI):
             log_writer_task,
             inbox_service_task,
             watchdog_task,
+            callback_barrier_task,
             *([daemon_task] if daemon_task is not None else []),
             return_exceptions=True,
         )
@@ -1999,6 +2059,15 @@ async def create_terminal_in_session(
             initial_message_orchestration_type=orch_type,
             fork_context=fork_context,
             refresh_base_name=body.refresh_base_name if body else None,
+            dispatch_barrier=(
+                {
+                    "label": body.barrier,
+                    "timeout_seconds": body.barrier_timeout_seconds,
+                    "member_key": body.barrier_member_key,
+                }
+                if body and body.barrier is not None
+                else None
+            ),
         )
         return result
     except HTTPException:
@@ -2011,7 +2080,9 @@ async def create_terminal_in_session(
             detail={"code": e.code, "message": e.detail},
         ) from e
     except ValueError as e:
-        if str(e).startswith("invalid_working_directory: "):
+        if str(e).startswith(
+            ("invalid_working_directory: ", "invalid_barrier", "barrier_", "ambiguous_barrier")
+        ):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -2997,24 +3068,46 @@ async def create_inbox_message_endpoint(
     sender_id: str,
     message: str,
     refresh_ingest: bool = False,
+    barrier: Optional[str] = None,
+    barrier_timeout_seconds: Optional[StrictInt] = None,
+    barrier_member_key: Optional[str] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
+    if barrier is None and (barrier_timeout_seconds is not None or barrier_member_key is not None):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="barrier is required when barrier options are supplied",
+        )
     if receiver_id.startswith("mb_"):
         from cli_agent_orchestrator.services.mailbox_service import create_logical_inbox_message
 
         try:
+            logical_kwargs: dict[str, Any] = {}
+            if barrier is not None:
+                logical_kwargs["dispatch_barrier"] = {
+                    "label": barrier,
+                    "timeout_seconds": barrier_timeout_seconds,
+                    "member_key": barrier_member_key,
+                }
             inbox_msg = await asyncio.to_thread(
                 create_logical_inbox_message,
                 sender_id=sender_id,
                 mailbox_id=receiver_id,
                 message=message,
                 refresh_ingest=refresh_ingest,
+                **logical_kwargs,
             )
         except MailboxDomainError as exc:
             raise _mailbox_http_exception(exc) from exc
         except TerminalProtectionError as exc:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        except ValueError as exc:
+            code = str(exc)
+            raise HTTPException(
+                status_code=400,
+                detail={"code": code, "message": code.replace("_", " ")},
+            ) from exc
         try:
             inbox_service.deliver_pending(
                 inbox_msg.receiver_id, registry=get_plugin_registry(request)
@@ -3059,13 +3152,25 @@ async def create_inbox_message_endpoint(
         )
 
     try:
+        raw_kwargs: dict[str, Any] = {}
+        if barrier is not None:
+            raw_kwargs["dispatch_barrier"] = {
+                "label": barrier,
+                "timeout_seconds": barrier_timeout_seconds,
+                "member_key": barrier_member_key,
+            }
         inbox_msg = create_inbox_message(
             sender_id,
             receiver_id,
             message,
+            **raw_kwargs,
         )
     except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+        code = str(e)
+        raise HTTPException(
+            status_code=(400 if code.startswith(("invalid_barrier", "ambiguous_barrier")) else 404),
+            detail={"code": code, "message": code.replace("_", " ")},
+        )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -3117,7 +3222,7 @@ async def get_inbox_messages_endpoint(
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=(
-                        "Invalid status: %s. Valid values: pending, delivering, delivered, "
+                        "Invalid status: %s. Valid values: pending, held, delivering, delivered, "
                         "delivery_failed, failed, digested, cancelled" % status_param
                     ),
                 )
@@ -3138,6 +3243,8 @@ async def get_inbox_messages_endpoint(
                     "status": msg.status.value,
                     "digested_into": msg.digested_into,
                     "enqueue_generation": msg.enqueue_generation,
+                    "barrier_id": msg.barrier_id,
+                    "barrier_member_key": msg.barrier_member_key,
                     "created_at": msg.created_at.isoformat() if msg.created_at else None,
                 }
             )
@@ -3190,6 +3297,56 @@ async def list_messages_endpoint(
         )
     except MailboxDomainError as exc:
         raise _mailbox_http_exception(exc) from exc
+
+
+@app.get("/barriers/status")
+async def callback_barrier_status_endpoint(
+    barrier_id: Optional[int] = None,
+    barrier_label: Optional[str] = None,
+    owner: Optional[str] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(
+            callback_barrier_status,
+            barrier_id=barrier_id,
+            barrier_label=barrier_label,
+            owner_id=owner,
+        )
+    except ValueError as exc:
+        code = str(exc)
+        raise HTTPException(
+            status_code=(status.HTTP_404_NOT_FOUND if code == "barrier_not_found" else 400),
+            detail={"code": code, "message": code.replace("_", " ")},
+        ) from exc
+
+
+@app.post("/barriers/cancel")
+async def cancel_callback_barrier_endpoint(
+    barrier_id: Optional[int] = None,
+    barrier_label: Optional[str] = None,
+    owner: Optional[str] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        result = await asyncio.to_thread(
+            cancel_callback_barrier,
+            barrier_id=barrier_id,
+            barrier_label=barrier_label,
+            owner_id=owner,
+        )
+        for receiver_id in result.get("receiver_ids", []):
+            await asyncio.to_thread(
+                inbox_service.deliver_pending,
+                receiver_id,
+            )
+        return result
+    except ValueError as exc:
+        code = str(exc)
+        raise HTTPException(
+            status_code=(status.HTTP_404_NOT_FOUND if code == "barrier_not_found" else 400),
+            detail={"code": code, "message": code.replace("_", " ")},
+        ) from exc
 
 
 @app.post("/messages/ack")
@@ -3308,6 +3465,7 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         preexec_fn=os.setsid,
         env=pty_env,
     )
+
     os.close(slave_fd)
 
     # Make master_fd non-blocking for event-driven reads

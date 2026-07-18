@@ -13,6 +13,41 @@ class TestCreateTerminalProviderResolution:
     """Tests for provider resolution used by dispatched worker terminals."""
 
     @patch(
+        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools",
+        return_value=None,
+    )
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="codex")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_deferred_assign_threads_barrier_in_create_body(
+        self, mock_requests, _resolve_provider, _allowed_tools, monkeypatch
+    ):
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        metadata = MagicMock()
+        metadata.json.return_value = {
+            "provider": "codex",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        created = MagicMock()
+        created.json.return_value = {"id": "worker-1"}
+        mock_requests.get.return_value = metadata
+        mock_requests.post.return_value = created
+        monkeypatch.setenv("CAO_TERMINAL_ID", "aaaaaaaa")
+        _create_terminal(
+            "reviewer",
+            defer_init=True,
+            initial_message="task",
+            barrier="gate",
+            barrier_timeout_seconds=90,
+            barrier_member_key="lane-a",
+        )
+        body = mock_requests.post.call_args.kwargs["json"]
+        assert body["barrier"] == "gate"
+        assert body["barrier_timeout_seconds"] == 90
+        assert body["barrier_member_key"] == "lane-a"
+
+    @patch(
         "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
     )
     @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="claude_code")
@@ -196,8 +231,7 @@ class TestAssignSenderIdInjection:
         assert "[Assigned by terminal supervisor-abc123" in sent_message
         assert (
             "send results back to terminal supervisor-abc123 using the cao-mcp-server "
-            "send_message MCP tool — never a built-in collaboration.send_message]"
-            in sent_message
+            "send_message MCP tool — never a built-in collaboration.send_message]" in sent_message
         )
         assert "collaboration.send_message" in sent_message
         # And the orchestration_type is ASSIGN so plugin events see it

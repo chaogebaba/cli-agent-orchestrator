@@ -15,10 +15,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from cli_agent_orchestrator.clients.database import (
-    create_inbox_message,
     cancel_pending_watchdog_message,
+    create_inbox_message,
     get_callback_status_since,
     get_terminal_metadata,
+    insert_barrier_escalation_message,
     insert_watchdog_auto_resume_message,
     list_pending_receiver_ids,
     list_ready_backlog_observations,
@@ -104,6 +105,31 @@ class AutoResumeAction:
     idle_since: float
     last_screen_fp: str
     body: str
+
+
+@dataclass(frozen=True, eq=False)
+class WatchdogNotice:
+    terminal_id: str
+    caller_id: str
+    message: str
+    idle_reason: str | None
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, WatchdogNotice):
+            return (
+                self.terminal_id,
+                self.caller_id,
+                self.message,
+                self.idle_reason,
+            ) == (
+                other.terminal_id,
+                other.caller_id,
+                other.message,
+                other.idle_reason,
+            )
+        if isinstance(other, tuple) and len(other) == 3:
+            return (self.terminal_id, self.caller_id, self.message) == other
+        return NotImplemented
 
 
 @dataclass
@@ -226,7 +252,10 @@ class StalledCallbackWatchdog:
 
     def record_callback_if_to_caller(self, sender_id: str, receiver_id: str) -> None:
         meta = get_terminal_metadata(sender_id)
-        if not meta or meta.get("caller_id") != receiver_id:
+        if not meta or receiver_id not in {
+            meta.get("caller_id"),
+            meta.get("caller_mailbox_id"),
+        }:
             return
         with self._lock:
             if sender_id in self._paused:
@@ -364,7 +393,7 @@ class StalledCallbackWatchdog:
         except Exception:
             return False, None
 
-    def collect_due_notifications(self, now: float | None = None) -> list[tuple[str, str, str]]:
+    def collect_due_notifications(self, now: float | None = None) -> list[WatchdogNotice]:
         now = time.monotonic() if now is None else now
         candidates: list[PreflightCandidate] = []
         with self._lock:
@@ -397,7 +426,7 @@ class StalledCallbackWatchdog:
                     )
                 )
 
-        due: list[tuple[str, str, str]] = []
+        due: list[WatchdogNotice] = []
         for candidate in candidates:
             metadata = get_terminal_metadata(candidate.terminal_id)
             callback_status = get_callback_status_since(
@@ -438,13 +467,18 @@ class StalledCallbackWatchdog:
                 assert current_episode.idle_since is not None
                 if int(now - current_episode.idle_since) < self.grace_seconds:
                     continue
-                if callback_status in {MessageStatus.PENDING, MessageStatus.DELIVERING}:
+                if callback_status in {
+                    MessageStatus.PENDING,
+                    MessageStatus.HELD,
+                    MessageStatus.DELIVERING,
+                }:
                     continue
                 if callback_status == MessageStatus.DELIVERED:
                     current_episode.callback_seen = True
                     continue
                 if second_callback_status in {
                     MessageStatus.PENDING,
+                    MessageStatus.HELD,
                     MessageStatus.DELIVERING,
                 }:
                     continue
@@ -460,7 +494,7 @@ class StalledCallbackWatchdog:
                         f" (auto-resume attempted at {current_episode.auto_resume_attempted_at})"
                     )
                     due.append(
-                        self._push_tuple(
+                        self._push_notice(
                             candidate,
                             current_episode,
                             suffix,
@@ -471,7 +505,7 @@ class StalledCallbackWatchdog:
                 if not auto_resume_applicable:
                     current_episode.fired = True
                     due.append(
-                        self._push_tuple(
+                        self._push_notice(
                             candidate,
                             current_episode,
                             idle_reason=fallback_idle_reason,
@@ -522,30 +556,31 @@ class StalledCallbackWatchdog:
         )
 
     @staticmethod
-    def _push_tuple(
+    def _push_notice(
         candidate: PreflightCandidate | AutoResumeAction,
         episode: _Episode,
         suffix: str = "",
         idle_seconds: int | None = None,
         idle_reason: str | None = None,
-    ) -> tuple[str, str, str]:
+    ) -> WatchdogNotice:
         if idle_seconds is None:
             idle_seconds = (
                 candidate.idle_seconds
                 if isinstance(candidate, PreflightCandidate)
                 else int(time.monotonic() - (episode.idle_since or time.monotonic()))
             )
-        return (
-            candidate.terminal_id,
-            candidate.caller_id,
-            f"[watchdog] worker {candidate.terminal_id} ({episode.profile}) "
+        return WatchdogNotice(
+            terminal_id=candidate.terminal_id,
+            caller_id=candidate.caller_id,
+            message=f"[watchdog] worker {candidate.terminal_id} ({episode.profile}) "
             f"idle {idle_seconds}s without callback"
             f"{f' [reason: {idle_reason}]' if idle_reason is not None else ''}{suffix}",
+            idle_reason=idle_reason,
         )
 
     def _execute_auto_resume(
         self, action: AutoResumeAction, enqueue_monotonic: float
-    ) -> tuple[str, str, str] | None:
+    ) -> WatchdogNotice | None:
         from cli_agent_orchestrator.services.auto_responder import auto_responder
         from cli_agent_orchestrator.services.inbox_service import get_delivery_lock, inbox_service
         from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -575,7 +610,7 @@ class StalledCallbackWatchdog:
                 assert episode is not None
                 episode.resume_reserved_at = None
                 episode.fired = True
-                return self._push_tuple(
+                return self._push_notice(
                     action,
                     episode,
                     idle_seconds=int(enqueue_monotonic - (episode.idle_since or enqueue_monotonic)),
@@ -618,7 +653,7 @@ class StalledCallbackWatchdog:
                         should_deliver = True
                     else:
                         episode.fired = True
-                        return self._push_tuple(
+                        return self._push_notice(
                             action,
                             episode,
                             idle_seconds=int(
@@ -650,10 +685,21 @@ class StalledCallbackWatchdog:
     def notify_due(self, registry: PluginRegistry | None = None) -> None:
         from cli_agent_orchestrator.services.inbox_service import inbox_service
 
-        for terminal_id, caller_id, message in self.collect_due_notifications():
+        for notice in self.collect_due_notifications():
             try:
-                create_inbox_message(f"watchdog:{terminal_id}", caller_id, message)
-                inbox_service.deliver_pending(caller_id, registry=registry)
+                handled = insert_barrier_escalation_message(
+                    notice.terminal_id,
+                    notice.caller_id,
+                    notice.message,
+                    notice.idle_reason,
+                )
+                if handled is None:
+                    create_inbox_message(
+                        f"watchdog:{notice.terminal_id}",
+                        notice.caller_id,
+                        notice.message,
+                    )
+                inbox_service.deliver_pending(notice.caller_id, registry=registry)
             except Exception:
                 logger.exception("Failed to push stalled-callback watchdog notification")
 

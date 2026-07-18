@@ -8,9 +8,24 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from cli_agent_orchestrator.api.main import app
+from cli_agent_orchestrator.api.main import CreateTerminalBody, app
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import Terminal
+
+
+def test_create_terminal_body_barrier_validation_and_strict_timeout():
+    body = CreateTerminalBody.model_validate(
+        {
+            "barrier": "gate",
+            "barrier_timeout_seconds": 90,
+            "barrier_member_key": "lane-a",
+        }
+    )
+    assert body.barrier == "gate" and body.barrier_timeout_seconds == 90
+    with pytest.raises(ValueError):
+        CreateTerminalBody.model_validate({"barrier_timeout_seconds": 90})
+    with pytest.raises(ValueError):
+        CreateTerminalBody.model_validate({"barrier": "gate", "barrier_timeout_seconds": True})
 
 
 class TestTranscriptBindingEndpoint:

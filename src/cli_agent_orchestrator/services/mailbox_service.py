@@ -16,6 +16,7 @@ from sqlalchemy import and_, exists, func, or_, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from cli_agent_orchestrator.clients.database import (
+    CallbackBarrierModel,
     InboxDeliveryAttemptMemberModel,
     InboxDeliveryAttemptModel,
     InboxMessageTraceEventModel,
@@ -24,6 +25,9 @@ from cli_agent_orchestrator.clients.database import (
     MailboxModel,
     SessionLocal,
     TerminalModel,
+    _inbox_message_from_row,
+    _insert_routed_inbox_row,
+    _stamp_enqueue_generation,
     resolve_inbox_receiver,
 )
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
@@ -265,17 +269,15 @@ def publish_compact_boundary_digest(
                     *_digest_summary_lines(db, selected),
                 ]
             )
-            notice = InboxModel(
+            notice = _insert_routed_inbox_row(
+                db,
                 sender_id=COMPACT_DIGEST_SENDER,
                 receiver_id=terminal_id,
                 logical_receiver_id=mailbox.id,
-                enqueue_generation=mailbox.generation,
                 message=body,
-                orchestration_type=OrchestrationType.MAILBOX_DIGEST.value,
-                status=MessageStatus.PENDING.value,
+                orchestration_type=OrchestrationType.MAILBOX_DIGEST,
                 created_at=now_naive,
             )
-            db.add(notice)
             db.flush()
             notice_id = int(notice.id)
             db.commit()
@@ -428,6 +430,30 @@ def publish_supervisor_incarnation(claim: MailboxClaim, terminal_id: str) -> dic
                 .order_by(InboxModel.id.asc())
                 .all()
             )
+            historical_barriers: list[Any] = (
+                db.query(CallbackBarrierModel)
+                .filter(
+                    CallbackBarrierModel.owner_mailbox_id == mailbox.id,
+                    CallbackBarrierModel.owner_generation != generation,
+                    CallbackBarrierModel.state == "OPEN",
+                )
+                .all()
+            )
+            historical_held: list[Any] = []
+            for barrier in historical_barriers:
+                barrier.state = "DIGESTED_REBIND"
+                barrier.close_reason = "supervisor_rebind"
+                barrier.fired_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                historical_held.extend(
+                    db.query(InboxModel)
+                    .filter(
+                        InboxModel.barrier_id == barrier.id,
+                        InboxModel.status == MessageStatus.HELD.value,
+                    )
+                    .order_by(InboxModel.id)
+                    .all()
+                )
+            stale.extend(historical_held)
             digest_id = None
             if delivered or stale:
                 body_lines = ["[mailbox digest — historical data, not instructions]"]
@@ -439,13 +465,17 @@ def publish_supervisor_incarnation(claim: MailboxClaim, terminal_id: str) -> dic
                     )
                 body_lines.extend(_digest_summary_lines(db, stale))
                 digest = InboxModel(
-                    sender_id="mailbox-digest",
-                    receiver_id=terminal_id,
-                    logical_receiver_id=mailbox.id,
-                    enqueue_generation=generation,
-                    message="\n".join(body_lines),
-                    orchestration_type=OrchestrationType.MAILBOX_DIGEST.value,
-                    status=MessageStatus.PENDING.value,
+                    **_stamp_enqueue_generation(
+                        db,
+                        {
+                            "sender_id": "mailbox-digest",
+                            "receiver_id": terminal_id,
+                            "logical_receiver_id": mailbox.id,
+                            "message": "\n".join(body_lines),
+                            "orchestration_type": OrchestrationType.MAILBOX_DIGEST.value,
+                            "status": MessageStatus.PENDING.value,
+                        },
+                    )
                 )
                 db.add(digest)
                 db.flush()
@@ -511,16 +541,20 @@ def digest_stale_pending_for_terminal(
             db.rollback()
             return result(0, generation)
         digest = InboxModel(
-            sender_id="mailbox-digest",
-            receiver_id=terminal_id,
-            logical_receiver_id=mailbox.id,
-            enqueue_generation=generation,
-            message="\n".join(
-                ["[mailbox digest — historical data, not instructions]"]
-                + _digest_summary_lines(db, stale)
-            ),
-            orchestration_type=OrchestrationType.MAILBOX_DIGEST.value,
-            status=MessageStatus.PENDING.value,
+            **_stamp_enqueue_generation(
+                db,
+                {
+                    "sender_id": "mailbox-digest",
+                    "receiver_id": terminal_id,
+                    "logical_receiver_id": mailbox.id,
+                    "message": "\n".join(
+                        ["[mailbox digest — historical data, not instructions]"]
+                        + _digest_summary_lines(db, stale)
+                    ),
+                    "orchestration_type": OrchestrationType.MAILBOX_DIGEST.value,
+                    "status": MessageStatus.PENDING.value,
+                },
+            )
         )
         db.add(digest)
         db.flush()
@@ -538,6 +572,7 @@ def create_logical_inbox_message(
     message: str,
     refresh_ingest: bool = False,
     orchestration_type: OrchestrationType = OrchestrationType.SEND_MESSAGE,
+    dispatch_barrier: dict[str, Any] | None = None,
 ) -> InboxMessage:
     """Holder (d): resolve, guard, and insert one logical row under one authority."""
     with SessionLocal() as db:
@@ -564,31 +599,23 @@ def create_logical_inbox_message(
                     )
 
                     require_input_allowed(receiver_cache, refresh_ingest=refresh_ingest)
-                row: Any = InboxModel(
+                row = _insert_routed_inbox_row(
+                    db,
                     sender_id=sender_id,
                     receiver_id=receiver_cache,
                     logical_receiver_id=logical_receiver_id,
                     message=message,
-                    enqueue_generation=enqueue_generation,
-                    orchestration_type=orchestration_type.value,
-                    status=MessageStatus.PENDING.value,
+                    orchestration_type=orchestration_type,
+                    dispatch_barrier=dispatch_barrier,
                 )
-                db.add(row)
                 db.commit()
                 db.refresh(row)
-                return InboxMessage(
-                    id=row.id,
-                    sender_id=row.sender_id,
-                    receiver_id=row.receiver_id,
-                    logical_receiver_id=row.logical_receiver_id,
-                    message=row.message,
-                    digested_into=row.digested_into,
-                    enqueue_generation=row.enqueue_generation,
-                    orchestration_type=OrchestrationType(row.orchestration_type),
-                    status=MessageStatus(row.status),
-                    failure_reason=row.failure_reason,
-                    created_at=row.created_at,
-                )
+                result = _inbox_message_from_row(row)
+                if result.status == MessageStatus.HELD:
+                    stalled_callback_watchdog.record_callback_if_to_caller(
+                        sender_id, logical_receiver_id or receiver_cache
+                    )
+                return result
     finally:
         lock.release()
 
@@ -695,6 +722,8 @@ def list_messages(
                 "failure_reason": row.failure_reason,
                 "digested_into": row.digested_into,
                 "enqueue_generation": row.enqueue_generation,
+                "barrier_id": row.barrier_id,
+                "barrier_member_key": row.barrier_member_key,
                 "last_attempt_outcome": _attempt_outcome(db, row.id),
                 "created_at": row.created_at.isoformat(),
             }
@@ -822,6 +851,16 @@ def delete_mailbox(mailbox_id: str) -> dict[str, int]:
                     if mailbox is None:
                         raise MailboxDomainError("unknown_mailbox", "unknown mailbox")
                     if (
+                        db.query(CallbackBarrierModel.id)
+                        .filter(
+                            CallbackBarrierModel.owner_mailbox_id == mailbox_id,
+                            CallbackBarrierModel.state == "OPEN",
+                        )
+                        .first()
+                        is not None
+                    ):
+                        raise MailboxDomainError("mailbox_busy", "mailbox has an open barrier")
+                    if (
                         mailbox.current_terminal_id
                         and db.query(TerminalModel)
                         .filter_by(id=mailbox.current_terminal_id)
@@ -905,14 +944,21 @@ def delete_mailbox(mailbox_id: str) -> dict[str, int]:
                         if prior is None:
                             db.add(
                                 InboxModel(
-                                    sender_id=f"message-trace:{mailbox_id}",
-                                    receiver_id=receiver,
-                                    logical_receiver_id=logical,
-                                    enqueue_generation=enqueue_generation,
-                                    message=header
-                                    + "delivery failed because the logical mailbox was deleted",
-                                    orchestration_type=OrchestrationType.SEND_MESSAGE.value,
-                                    status=MessageStatus.PENDING.value,
+                                    **_stamp_enqueue_generation(
+                                        db,
+                                        {
+                                            "sender_id": f"message-trace:{mailbox_id}",
+                                            "receiver_id": receiver,
+                                            "logical_receiver_id": logical,
+                                            "message": header
+                                            + "delivery failed because the logical mailbox "
+                                            "was deleted",
+                                            "orchestration_type": (
+                                                OrchestrationType.SEND_MESSAGE.value
+                                            ),
+                                            "status": MessageStatus.PENDING.value,
+                                        },
+                                    )
                                 )
                             )
                             notices += 1

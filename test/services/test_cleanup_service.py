@@ -84,11 +84,18 @@ class TestCleanupOldData:
     ):
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
+
         from cli_agent_orchestrator.clients import database as db_mod
         from cli_agent_orchestrator.clients.database import (
-            Base, InboxDeliveryAttemptMemberModel, InboxDeliveryAttemptModel, InboxModel,
-            begin_delivery_attempt, create_inbox_message, create_terminal,
-            get_pending_messages, settle_delivery_attempt,
+            Base,
+            InboxDeliveryAttemptMemberModel,
+            InboxDeliveryAttemptModel,
+            InboxModel,
+            begin_delivery_attempt,
+            create_inbox_message,
+            create_terminal,
+            get_pending_messages,
+            settle_delivery_attempt,
         )
         from cli_agent_orchestrator.models.inbox import MessageStatus
         from cli_agent_orchestrator.services import cleanup_service as cleanup_mod
@@ -107,17 +114,59 @@ class TestCleanupOldData:
         attempt = begin_delivery_attempt([message], "receiver", "claude_code", "hash", 4)
         settle_delivery_attempt(attempt, MessageStatus.DELIVERED, "confirmed")
         with test_db.begin() as db:
-            db.query(InboxModel).filter_by(id=message.id).update({
-                InboxModel.created_at: datetime.now() - timedelta(days=30)})
+            db.query(InboxModel).filter_by(id=message.id).update(
+                {InboxModel.created_at: datetime.now() - timedelta(days=30)}
+            )
 
         cleanup_old_data()
 
         with test_db() as db:
             assert db.query(InboxModel).filter_by(id=message.id).count() == 0
-            assert db.query(InboxDeliveryAttemptMemberModel).filter_by(
-                attempt_uuid=attempt).count() == 0
-            assert db.query(InboxDeliveryAttemptModel).filter_by(
-                attempt_uuid=attempt).count() == 0
+            assert (
+                db.query(InboxDeliveryAttemptMemberModel).filter_by(attempt_uuid=attempt).count()
+                == 0
+            )
+            assert db.query(InboxDeliveryAttemptModel).filter_by(attempt_uuid=attempt).count() == 0
+
+    def test_barrier_member_message_id_is_explicitly_nulled_with_foreign_keys_off(
+        self, monkeypatch, tmp_path
+    ):
+        from sqlalchemy import create_engine, text
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients import database as db_mod
+        from cli_agent_orchestrator.clients.database import (
+            Base,
+            CallbackBarrierMemberModel,
+            InboxModel,
+            create_inbox_message,
+            create_terminal,
+        )
+        from cli_agent_orchestrator.services import cleanup_service as cleanup_mod
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(bind=engine)
+        test_db = sessionmaker(bind=engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", test_db)
+        monkeypatch.setattr(cleanup_mod, "SessionLocal", test_db)
+        monkeypatch.setattr(cleanup_mod, "TERMINAL_LOG_DIR", tmp_path / "term-logs")
+        monkeypatch.setattr(cleanup_mod, "LOG_DIR", tmp_path / "logs")
+        create_terminal("owner", "s", "owner", "codex", "supervisor")
+        create_terminal("worker", "s", "worker", "codex", "reviewer", caller_id="owner")
+        create_inbox_message("owner", "worker", "task", dispatch_barrier={"label": "cleanup"})
+        reply = create_inbox_message("worker", "owner", "answer")
+        with test_db.begin() as db:
+            assert db.execute(text("PRAGMA foreign_keys")).scalar_one() == 0
+            db.query(InboxModel).filter_by(id=reply.id).update(
+                {InboxModel.created_at: datetime.now() - timedelta(days=30)}
+            )
+
+        cleanup_old_data()
+
+        with test_db() as db:
+            assert db.query(InboxModel).filter_by(id=reply.id).count() == 0
+            member = db.query(CallbackBarrierMemberModel).one()
+            assert member.message_id is None
 
     @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
     @patch("cli_agent_orchestrator.services.cleanup_service.RETENTION_DAYS", 7)

@@ -27,6 +27,11 @@ class TestCliMain:
         assert result.exit_code == 0
         assert "Launch" in result.output or "launch" in result.output.lower()
 
+    def test_cli_has_barrier_command(self):
+        result = CliRunner().invoke(cli, ["barrier", "--help"])
+        assert result.exit_code == 0
+        assert "callback barriers" in result.output.lower()
+
     def test_cli_has_init_command(self):
         """Test CLI has init command."""
         runner = CliRunner()

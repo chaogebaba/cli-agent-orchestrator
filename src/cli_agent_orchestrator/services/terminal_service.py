@@ -27,7 +27,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, Optional, cast
+from typing import Any, Dict, Optional, Protocol, cast
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
@@ -107,6 +107,47 @@ from cli_agent_orchestrator.utils.terminal import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _LegacyCreateTerminalPublisher(Protocol):
+    def __call__(
+        self,
+        terminal_id: str,
+        tmux_session: str,
+        tmux_window: str,
+        provider: str,
+        agent_profile: Optional[str] = None,
+        allowed_tools: Optional[list[str]] = None,
+        shell_command: Optional[str] = None,
+        caller_id: Optional[str] = None,
+        provider_session_id: Optional[str] = None,
+        init_state: str = "ready",
+        init_started_at: Optional[datetime] = None,
+        init_owner_epoch: Optional[str] = None,
+        init_deadline_s: Optional[float] = None,
+    ) -> Dict[str, Any]: ...
+
+
+class _LegacyWarmTerminalPublisher(Protocol):
+    def __call__(
+        self,
+        *,
+        terminal_id: str,
+        tmux_session: str,
+        tmux_window: str,
+        provider: str,
+        agent_profile: Optional[str],
+        allowed_tools: Optional[list[str]],
+        caller_id: Optional[str],
+        parent_base_name: Optional[str],
+        fork_mode: Optional[str],
+        cas_hook: Any = None,
+        init_state: str = "ready",
+        init_started_at: Optional[datetime] = None,
+        init_owner_epoch: Optional[str] = None,
+        init_deadline_s: Optional[float] = None,
+    ) -> Dict[str, Any]: ...
+
 
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
@@ -571,6 +612,7 @@ async def create_terminal(
     session_lifecycle_lease_token=None,
     fallback_source_terminal_id: str | None = None,
     fallback_source_lease_token=None,
+    dispatch_barrier: dict[str, object] | None = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -849,43 +891,88 @@ async def create_terminal(
             with delivery_authority:
                 with mailbox_authority:
                     if fork_context and fork_context.mode == "fork":
-                        create_terminal_with_warm_intent(
-                            terminal_id=terminal_id,
-                            tmux_session=session_name,
-                            tmux_window=window_name,
-                            provider=provider,
-                            agent_profile=agent_profile,
-                            allowed_tools=allowed_tools,
-                            caller_id=caller_id,
-                            parent_base_name=fork_context.base_name,
-                            fork_mode=fork_context.mode,
-                            **init_fields,
-                        )
-                    else:
-                        attempted_resume_uuid = resume_uuid
-                        if attempted_resume_uuid:
-                            db_create_terminal(
-                                terminal_id,
-                                session_name,
-                                window_name,
-                                provider,
-                                agent_profile,
-                                allowed_tools,
+                        if dispatch_barrier is None:
+                            cast(
+                                _LegacyWarmTerminalPublisher,
+                                create_terminal_with_warm_intent,
+                            )(
+                                terminal_id=terminal_id,
+                                tmux_session=session_name,
+                                tmux_window=window_name,
+                                provider=provider,
+                                agent_profile=agent_profile,
+                                allowed_tools=allowed_tools,
                                 caller_id=caller_id,
-                                provider_session_id=attempted_resume_uuid,
+                                parent_base_name=fork_context.base_name,
+                                fork_mode=fork_context.mode,
                                 **init_fields,
                             )
                         else:
-                            db_create_terminal(
-                                terminal_id,
-                                session_name,
-                                window_name,
-                                provider,
-                                agent_profile,
-                                allowed_tools,
+                            cast(Any, create_terminal_with_warm_intent)(
+                                terminal_id=terminal_id,
+                                tmux_session=session_name,
+                                tmux_window=window_name,
+                                provider=provider,
+                                agent_profile=agent_profile,
+                                allowed_tools=allowed_tools,
                                 caller_id=caller_id,
+                                parent_base_name=fork_context.base_name,
+                                fork_mode=fork_context.mode,
+                                dispatch_barrier=dispatch_barrier,
                                 **init_fields,
                             )
+                    else:
+                        attempted_resume_uuid = resume_uuid
+                        if attempted_resume_uuid:
+                            if dispatch_barrier is None:
+                                cast(_LegacyCreateTerminalPublisher, db_create_terminal)(
+                                    terminal_id,
+                                    session_name,
+                                    window_name,
+                                    provider,
+                                    agent_profile,
+                                    allowed_tools,
+                                    caller_id=caller_id,
+                                    provider_session_id=attempted_resume_uuid,
+                                    **init_fields,
+                                )
+                            else:
+                                cast(Any, db_create_terminal)(
+                                    terminal_id,
+                                    session_name,
+                                    window_name,
+                                    provider,
+                                    agent_profile,
+                                    allowed_tools,
+                                    caller_id=caller_id,
+                                    provider_session_id=attempted_resume_uuid,
+                                    dispatch_barrier=dispatch_barrier,
+                                    **init_fields,
+                                )
+                        else:
+                            if dispatch_barrier is None:
+                                cast(_LegacyCreateTerminalPublisher, db_create_terminal)(
+                                    terminal_id,
+                                    session_name,
+                                    window_name,
+                                    provider,
+                                    agent_profile,
+                                    allowed_tools,
+                                    caller_id=caller_id,
+                                    **init_fields,
+                                )
+                            else:
+                                cast(Any, db_create_terminal)(
+                                    terminal_id,
+                                    session_name,
+                                    window_name,
+                                    provider,
+                                    agent_profile,
+                                    allowed_tools,
+                                    caller_id=caller_id,
+                                    dispatch_barrier=dispatch_barrier,
+                                    **init_fields,
+                                )
         except Exception as exc:
             if lease_token is not None:
                 raise RuntimeError("db_publish_failed") from exc
@@ -3168,12 +3255,12 @@ def _delete_terminal_under_lease(
         provider_manager.cleanup_provider(terminal_id)
         with _memory_injected_lock:
             _memory_injected_terminals.discard(terminal_id)
-        from cli_agent_orchestrator.services.stalled_callback_watchdog import (
-            stalled_callback_watchdog,
-        )
         from cli_agent_orchestrator.services.inbox_service import (
             clear_terminal_delivery_state,
             get_delivery_lock,
+        )
+        from cli_agent_orchestrator.services.stalled_callback_watchdog import (
+            stalled_callback_watchdog,
         )
 
         delivery_lock = get_delivery_lock(terminal_id)

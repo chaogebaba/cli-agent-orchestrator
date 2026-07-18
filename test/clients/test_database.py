@@ -11,6 +11,8 @@ from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import (
     Base,
+    CallbackBarrierMemberModel,
+    CallbackBarrierModel,
     FlowModel,
     InboxMessageTraceEventModel,
     InboxModel,
@@ -685,6 +687,24 @@ class TestMessageTraceTransactions:
 class TestInboxOperations:
     """Tests for inbox database operations."""
 
+    def test_wpq7_callback_barrier_schema_and_null_safe_indexes(self, test_db):
+        inspector = inspect(test_db.kw["bind"])
+        assert {"callback_barrier", "callback_barrier_member"} <= set(inspector.get_table_names())
+        inbox_columns = {column["name"] for column in inspector.get_columns("inbox")}
+        assert {"barrier_id", "barrier_member_key"} <= inbox_columns
+        indexes = {index["name"] for index in inspector.get_indexes("callback_barrier")}
+        assert {
+            "uq_callback_barrier_open_mailbox",
+            "uq_callback_barrier_open_terminal",
+            "uq_callback_barrier_combined_message",
+        } <= indexes
+        member_columns = {
+            column["name"]: column for column in inspector.get_columns("callback_barrier_member")
+        }
+        assert member_columns["message_id"]["nullable"] is True
+        assert CallbackBarrierModel.__tablename__ == "callback_barrier"
+        assert CallbackBarrierMemberModel.__tablename__ == "callback_barrier_member"
+
     def test_wpq5_trace_event_schema_is_single_append_only_table(self, test_db):
         engine = test_db.kw["bind"]
         inspector = inspect(engine)
@@ -706,9 +726,10 @@ class TestInboxOperations:
         assert InboxMessageTraceEventModel.__tablename__ == "inbox_message_trace_event"
 
     def test_message_status_storage_is_additive_unconstrained_text(self):
-        """Database-facing enum exposes all seven honest delivery states."""
+        """Database-facing enum exposes all eight honest delivery states."""
         assert [status.value for status in MessageStatus] == [
             "pending",
+            "held",
             "delivering",
             "delivered",
             "delivery_failed",

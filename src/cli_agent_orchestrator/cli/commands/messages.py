@@ -81,6 +81,7 @@ def _resolve_me(value: str) -> str:
     type=click.Choice(
         [
             "pending",
+            "held",
             "delivering",
             "delivered",
             "delivery_failed",

@@ -4,6 +4,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 import click
 
+from cli_agent_orchestrator.cli.commands.barrier import barrier
 from cli_agent_orchestrator.cli.commands.base import base
 from cli_agent_orchestrator.cli.commands.config import config
 from cli_agent_orchestrator.cli.commands.env import env
@@ -25,8 +26,8 @@ from cli_agent_orchestrator.cli.commands.shutdown import shutdown
 from cli_agent_orchestrator.cli.commands.skills import skills
 from cli_agent_orchestrator.cli.commands.suite import suite
 from cli_agent_orchestrator.cli.commands.terminal import terminal
-from cli_agent_orchestrator.cli.commands.verify import verify
 from cli_agent_orchestrator.cli.commands.update import update
+from cli_agent_orchestrator.cli.commands.verify import verify
 from cli_agent_orchestrator.cli.commands.workflow import workflow
 
 try:
@@ -44,6 +45,7 @@ def cli():
 # Register commands
 cli.add_command(profile)
 cli.add_command(base)
+cli.add_command(barrier)
 cli.add_command(launch)
 cli.add_command(config)
 cli.add_command(init)
