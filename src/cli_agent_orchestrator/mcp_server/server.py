@@ -732,6 +732,58 @@ def _send_to_inbox(
     return response.json()
 
 
+def _barrier_dispatch_is_supervisor_owned(sender_id: str, receiver_id: str) -> bool:
+    """Fail closed unless the target records sender as its supervisor."""
+    try:
+        target_id = receiver_id
+        mailbox_items: list[dict[str, Any]] | None = None
+        if receiver_id.startswith("mb_"):
+            mailbox_response = cao_http.get(
+                "/mailboxes",
+                timeout=_mcp_timeout(),
+                headers=_api_headers(),
+            )
+            mailbox_response.raise_for_status()
+            mailbox_items = mailbox_response.json().get("items", [])
+            target_candidate = next(
+                (
+                    item.get("current_terminal_id")
+                    for item in mailbox_items
+                    if item.get("id") == receiver_id
+                ),
+                None,
+            )
+            if not isinstance(target_candidate, str) or not target_candidate:
+                return False
+            target_id = target_candidate
+        target_response = cao_http.get(
+            f"/terminals/{target_id}",
+            timeout=_mcp_timeout(),
+            headers=_api_headers(),
+        )
+        target_response.raise_for_status()
+        target = target_response.json()
+        if target.get("caller_id") == sender_id:
+            return True
+        caller_mailbox_id = target.get("caller_mailbox_id")
+        if not isinstance(caller_mailbox_id, str) or not caller_mailbox_id:
+            return False
+        if mailbox_items is None:
+            mailbox_response = cao_http.get(
+                "/mailboxes",
+                timeout=_mcp_timeout(),
+                headers=_api_headers(),
+            )
+            mailbox_response.raise_for_status()
+            mailbox_items = mailbox_response.json().get("items", [])
+        return any(
+            item.get("id") == caller_mailbox_id and item.get("current_terminal_id") == sender_id
+            for item in mailbox_items
+        )
+    except Exception:
+        return False
+
+
 def _extract_error_detail(response: requests.Response, fallback: str) -> str:
     """Extract a human-readable error detail from an API response."""
     try:
@@ -1483,6 +1535,15 @@ def _send_message_impl(
                 ),
             }
 
+        if barrier is not None:
+            if not own_terminal_id or not _barrier_dispatch_is_supervisor_owned(
+                own_terminal_id, receiver_id
+            ):
+                return {
+                    "success": False,
+                    "error": "callback barriers require supervisor ownership of the receiver",
+                }
+
         # Auto-inject sender terminal ID suffix when enabled. Skipped when
         # CAO_TERMINAL_ID is unset — never inject 'unknown' as a routable
         # address (issue #284); _send_to_inbox raises a clear error for that
@@ -1746,14 +1807,14 @@ def _barrier_params(
 ) -> dict[str, Any]:
     if (barrier_id is None) == (barrier_label is None):
         raise ValueError("provide exactly one of barrier_id or barrier_label")
-    params: dict[str, Any] = {}
+    owner = os.environ.get("CAO_TERMINAL_ID")
+    if not owner:
+        raise ValueError("CAO_TERMINAL_ID required for callback barrier control")
+    params: dict[str, Any] = {"owner": owner}
     if barrier_id is not None:
         params["barrier_id"] = barrier_id
     else:
-        owner = os.environ.get("CAO_TERMINAL_ID")
-        if not owner:
-            raise ValueError("CAO_TERMINAL_ID required for barrier label lookup")
-        params.update({"barrier_label": barrier_label, "owner": owner})
+        params["barrier_label"] = barrier_label
     return params
 
 

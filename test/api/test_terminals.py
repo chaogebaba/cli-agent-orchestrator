@@ -771,6 +771,27 @@ class TestCreateInboxMessageEndpoint:
             )
             mock_inbox.deliver_pending.assert_called_once_with("abcd1234", registry=ANY)
 
+    def test_worker_cannot_create_barrier_for_unowned_receiver(self, client):
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.callback_barrier_dispatch_allowed",
+                return_value=False,
+            ) as allowed,
+            patch("cli_agent_orchestrator.api.main.create_inbox_message") as create,
+        ):
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={
+                    "sender_id": "worker-terminal",
+                    "message": "task",
+                    "barrier": "worker-created",
+                },
+            )
+        assert response.status_code == 403
+        assert response.json()["detail"]["code"] == "barrier_supervisor_only"
+        allowed.assert_called_once_with("worker-terminal", "abcd1234")
+        create.assert_not_called()
+
     def test_create_inbox_message_delivery_failure_still_succeeds(self, client):
         """Immediate delivery failure should not fail the API response."""
         mock_msg = MagicMock()

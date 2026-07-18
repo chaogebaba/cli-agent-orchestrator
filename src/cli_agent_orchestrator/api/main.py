@@ -46,6 +46,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     TRANSCRIPT_BINDING_SOURCES,
     adopt_mailbox_rows_at_startup,
+    callback_barrier_dispatch_allowed,
     callback_barrier_status,
     cancel_callback_barrier,
     create_inbox_message,
@@ -3078,6 +3079,18 @@ async def create_inbox_message_endpoint(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="barrier is required when barrier options are supplied",
+        )
+    if barrier is not None and not await asyncio.to_thread(
+        callback_barrier_dispatch_allowed,
+        sender_id,
+        receiver_id,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "barrier_supervisor_only",
+                "message": "callback barriers require supervisor ownership of the receiver",
+            },
         )
     if receiver_id.startswith("mb_"):
         from cli_agent_orchestrator.services.mailbox_service import create_logical_inbox_message

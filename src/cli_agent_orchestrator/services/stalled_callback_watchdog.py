@@ -107,29 +107,12 @@ class AutoResumeAction:
     body: str
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True)
 class WatchdogNotice:
     terminal_id: str
     caller_id: str
     message: str
     idle_reason: str | None
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, WatchdogNotice):
-            return (
-                self.terminal_id,
-                self.caller_id,
-                self.message,
-                self.idle_reason,
-            ) == (
-                other.terminal_id,
-                other.caller_id,
-                other.message,
-                other.idle_reason,
-            )
-        if isinstance(other, tuple) and len(other) == 3:
-            return (self.terminal_id, self.caller_id, self.message) == other
-        return NotImplemented
 
 
 @dataclass

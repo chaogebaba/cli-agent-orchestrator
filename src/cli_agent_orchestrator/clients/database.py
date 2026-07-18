@@ -1245,6 +1245,24 @@ def resolve_inbox_receiver(db: Any, receiver_id: str) -> tuple[str, str | None, 
     return receiver_id, mailbox_id, cast(int | None, generation)
 
 
+def callback_barrier_dispatch_allowed(sender_id: str, receiver_id: str) -> bool:
+    """Return whether sender owns the target worker's callback route."""
+    with SessionLocal() as db:
+        try:
+            receiver_cache, _, _ = resolve_inbox_receiver(db, receiver_id)
+        except ValueError:
+            return False
+        receiver = db.query(TerminalModel).filter_by(id=receiver_cache).one_or_none()
+        if receiver is None:
+            return False
+        if receiver.caller_id == sender_id:
+            return True
+        sender_mailbox_id = _mailbox_id_for_terminal(db, sender_id)
+        return bool(
+            sender_mailbox_id is not None and receiver.caller_mailbox_id == sender_mailbox_id
+        )
+
+
 def get_current_mailbox_generation(mailbox_id: str) -> int | None:
     """Return the current logical generation without rewriting receiver caches."""
     with SessionLocal() as db:
@@ -3115,6 +3133,15 @@ def _select_callback_barrier(
         raise ValueError("barrier_selector_requires_exactly_one")
     if barrier_id is not None:
         row = db.query(CallbackBarrierModel).filter_by(id=barrier_id).one_or_none()
+        if row is not None and owner_id is not None:
+            owner = _barrier_owner_values(db, owner_id)
+            owner_matches = (
+                row.owner_generation == owner["owner_generation"]
+                and row.owner_mailbox_id == owner["owner_mailbox_id"]
+                and row.owner_terminal_id == owner["owner_terminal_id"]
+            )
+            if not owner_matches:
+                row = None
     else:
         if owner_id is None:
             raise ValueError("barrier_owner_required")

@@ -6,6 +6,7 @@ import ast
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -17,12 +18,14 @@ from cli_agent_orchestrator.clients.database import (
     CallbackBarrierMemberModel,
     CallbackBarrierModel,
     InboxDeliveryAttemptMemberModel,
+    InboxDeliveryAttemptModel,
     InboxMessageTraceEventModel,
     InboxModel,
     MailboxIncarnationModel,
     MailboxModel,
     TerminalModel,
     _fire_open_barrier_in_db,
+    callback_barrier_dispatch_allowed,
     callback_barrier_status,
     cancel_callback_barrier,
     create_inbox_message,
@@ -34,7 +37,12 @@ from cli_agent_orchestrator.clients.database import (
     settle_terminal_rebound,
     transition_pending_to_delivery_failed,
 )
+from cli_agent_orchestrator.mcp_server import server as mcp_server
 from cli_agent_orchestrator.models.inbox import MessageStatus
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services import inbox_service as inbox_module
+from cli_agent_orchestrator.services.inbox_service import InboxService
+from cli_agent_orchestrator.services.status_monitor import BoundaryObservation
 
 
 @pytest.fixture
@@ -289,6 +297,36 @@ def test_failure_notice_quota_is_single_alert_transient_preserves_watchdog(barri
         assert members["worker-b"].failure_class == "transient_api_error"
 
 
+def test_supervisor_only_dispatch_and_barrier_control_are_owner_scoped(barrier_db):
+    _seed_raw(barrier_db)
+    assert callback_barrier_dispatch_allowed("owner", "worker-a") is True
+    assert callback_barrier_dispatch_allowed("worker-b", "worker-a") is False
+    create_inbox_message("owner", "worker-a", "task", dispatch_barrier={"label": "owned"})
+    with barrier_db() as db:
+        barrier_id = int(db.query(CallbackBarrierModel.id).scalar())
+    with pytest.raises(ValueError, match="barrier_not_found"):
+        callback_barrier_status(barrier_id=barrier_id, owner_id="worker-a")
+
+
+def test_stale_worker_generation_cannot_fill_unrearmed_member(barrier_db):
+    _seed_raw(barrier_db, workers=("worker-a",))
+    create_inbox_message(
+        "owner",
+        "worker-a",
+        "task",
+        dispatch_barrier={"label": "generation-fence", "member_key": "lane-a"},
+    )
+    assert settle_terminal_rebound("worker-a", "session", "zsh") == 2
+    callback = create_inbox_message("worker-a", "owner", "stale generation callback")
+    assert callback.status == MessageStatus.PENDING
+    assert callback.barrier_id is None
+    with barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        member = db.query(CallbackBarrierMemberModel).one()
+        assert barrier.state == "OPEN" and barrier.combined_message_id is None
+        assert member.lifecycle_generation == 1 and member.state == "AWAITING"
+
+
 def test_rebind_increments_generation_and_explicit_rearm_reuses_member(barrier_db):
     _seed_raw(barrier_db, workers=("worker-a",))
     create_inbox_message(
@@ -364,16 +402,30 @@ def test_utf8_cap_preserves_codepoint_and_points_to_durable_sources(barrier_db):
         assert "list_messages/message trace" in combined.message
 
 
-def test_composed_pending_writer_count_is_twelve_and_each_seat_stamps():
+def test_composed_pending_writer_count_is_twelve_and_each_seat_stamps(barrier_db):
     root = Path(__file__).parents[2] / "src" / "cli_agent_orchestrator"
-    seats = []
+    expected = {
+        "clients/database.py::claim_deferred_init_failure",
+        "clients/database.py::_fire_open_barrier_in_db",
+        "clients/database.py::_insert_routed_inbox_row",
+        "clients/database.py::insert_barrier_escalation_message",
+        "clients/database.py::insert_watchdog_auto_resume_message",
+        "clients/database.py::insert_identity_authority_notice",
+        "clients/database.py::_record_p5_orphan_notices",
+        "clients/database.py::record_wpm1_stalled_notice.operation",
+        "clients/database.py::settle_wpm1_terminal_batch.operation",
+        "services/mailbox_service.py::publish_supervisor_incarnation",
+        "services/mailbox_service.py::digest_stale_pending_for_terminal",
+        "services/mailbox_service.py::delete_mailbox",
+    }
+    seats: dict[str, bool] = {}
     for path in root.rglob("*.py"):
         tree = ast.parse(path.read_text())
-        stack: list[str] = []
+        stack: list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]] = []
 
         class Visitor(ast.NodeVisitor):
             def visit_FunctionDef(self, node):
-                stack.append(node.name)
+                stack.append((node.name, node))
                 self.generic_visit(node)
                 stack.pop()
 
@@ -381,14 +433,154 @@ def test_composed_pending_writer_count_is_twelve_and_each_seat_stamps():
 
             def visit_Call(self, node):
                 if isinstance(node.func, ast.Name) and node.func.id == "InboxModel":
-                    seats.append((path.name, ".".join(stack)))
+                    qualified = f"{path.relative_to(root).as_posix()}::" + ".".join(
+                        name for name, _ in stack
+                    )
+                    expansions = [keyword.value for keyword in node.keywords if keyword.arg is None]
+                    assert len(expansions) == 1
+                    expansion = expansions[0]
+                    direct = (
+                        isinstance(expansion, ast.Call)
+                        and isinstance(expansion.func, ast.Name)
+                        and expansion.func.id == "_stamp_enqueue_generation"
+                    )
+                    stamped_names: set[str] = set()
+                    if stack:
+                        for candidate in ast.walk(stack[-1][1]):
+                            if (
+                                not isinstance(candidate, ast.Assign)
+                                or candidate.lineno >= node.lineno
+                            ):
+                                continue
+                            if (
+                                isinstance(candidate.value, ast.Call)
+                                and isinstance(candidate.value.func, ast.Name)
+                                and candidate.value.func.id == "_stamp_enqueue_generation"
+                            ):
+                                stamped_names.update(
+                                    target.id
+                                    for target in candidate.targets
+                                    if isinstance(target, ast.Name)
+                                )
+                    seats[qualified] = direct or (
+                        isinstance(expansion, ast.Name) and expansion.id in stamped_names
+                    )
                 self.generic_visit(node)
 
         Visitor().visit(tree)
-    assert len(seats) == 12
-    assert ("database.py", "_insert_routed_inbox_row") in seats
-    assert ("database.py", "_fire_open_barrier_in_db") in seats
-    assert ("database.py", "insert_barrier_escalation_message") in seats
+    assert seats == {qualified: True for qualified in expected}
+
+    _seed_raw(barrier_db)
+    with barrier_db.begin() as db:
+        db.get(TerminalModel, "owner").lifecycle_generation = 7
+    _dispatch_pair("stamp-composed")
+    create_inbox_message("worker-a", "owner", "answer a")
+    create_inbox_message("worker-b", "owner", "answer b")
+    with barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        combined = db.get(InboxModel, barrier.combined_message_id)
+        assert combined.enqueue_generation == 7
+
+
+def test_quota_rearm_completion_delivers_two_groups_and_only_combined_is_challenged(
+    barrier_db, monkeypatch
+):
+    _seed_raw(barrier_db)
+    create_inbox_message(
+        "owner",
+        "worker-a",
+        "task a",
+        dispatch_barrier={"label": "dual-lane", "member_key": "lane-a"},
+    )
+    create_inbox_message(
+        "owner",
+        "worker-b",
+        "task b",
+        dispatch_barrier={"label": "dual-lane", "member_key": "lane-b"},
+    )
+    alert = insert_barrier_escalation_message("worker-a", "owner", "quota notice", "quota_or_auth")
+    assert alert is not None and alert.message_id is not None
+    assert settle_terminal_rebound("worker-a", "session", "zsh") == 2
+    create_inbox_message(
+        "owner",
+        "worker-a",
+        "retry a",
+        dispatch_barrier={"label": "dual-lane", "member_key": "lane-a"},
+    )
+    create_inbox_message("worker-a", "owner", "answer a")
+    create_inbox_message("worker-b", "owner", "answer b")
+
+    with barrier_db.begin() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        combined = db.get(InboxModel, barrier.combined_message_id)
+        combined_id = int(combined.id)
+        captured: dict[str, str] = {}
+
+        def capture(_receiver_id, message, **_kwargs):
+            captured["message"] = message
+            return {"success": True}
+
+        monkeypatch.setenv("CAO_TERMINAL_ID", combined.sender_id)
+        monkeypatch.setattr(mcp_server, "ENABLE_SENDER_ID_INJECTION", True)
+        monkeypatch.setattr(mcp_server, "_send_to_inbox", capture)
+        assert mcp_server._send_message_impl("owner", combined.message) == {"success": True}
+        combined.message = captured["message"]
+
+    observation = BoundaryObservation("epoch", TerminalStatus.IDLE, 3, 1, 4, 2, 4)
+    monitor = MagicMock()
+    monitor.get_boundary_observation.return_value = observation
+    monitor.get_status.return_value = TerminalStatus.IDLE
+    monitor.get_input_gen.return_value = 1
+    monitor.get_status_gen.return_value = 3
+    monitor.probe_screen_status.return_value = (
+        TerminalStatus.IDLE,
+        {"result_status": "idle", "law_signal": {"class": "chrome"}},
+    )
+    monkeypatch.setattr(inbox_module, "status_monitor", monitor)
+    monkeypatch.setattr(inbox_module, "resolve_session_transcript", lambda _meta: None)
+    monkeypatch.setattr(
+        inbox_module,
+        "_wpm2_lookup",
+        lambda *_args, **_kwargs: ("unresolved", {}),
+    )
+    monkeypatch.setattr(
+        inbox_module.terminal_service,
+        "prepare_input",
+        lambda _terminal, value, _shape: value,
+    )
+
+    def send(_terminal, _wire, **kwargs):
+        kwargs["on_submitted"](observation)
+        return observation
+
+    monkeypatch.setattr(inbox_module.terminal_service, "send_prepared_input", send)
+    monkeypatch.setattr(
+        inbox_module,
+        "confirm_delivery",
+        lambda *_args, **_kwargs: ("hit", {"kind": "screen_confirmed"}),
+    )
+    service = InboxService()
+    service._commit_watchdog_ops = MagicMock()
+    service.deliver_pending("owner", num_messages=0)
+
+    with barrier_db() as db:
+        attempts = db.query(InboxDeliveryAttemptModel).all()
+        assert len(attempts) == 2
+        membership = {
+            tuple(
+                message_id
+                for message_id, in db.query(InboxDeliveryAttemptMemberModel.message_id)
+                .filter_by(attempt_uuid=attempt.attempt_uuid)
+                .order_by(InboxDeliveryAttemptMemberModel.position)
+                .all()
+            )
+            for attempt in attempts
+        }
+        assert membership == {(int(alert.message_id),), (combined_id,)}
+        events = db.query(InboxMessageTraceEventModel).all()
+        assert [(event.message_id, event.kind) for event in events] == [
+            (combined_id, "attempt_challenge")
+        ]
 
 
 @pytest.mark.parametrize("mailbox_owner", [False, True])
