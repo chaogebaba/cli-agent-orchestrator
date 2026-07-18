@@ -82,22 +82,32 @@ def prepare_native_stash_before_send(
     defer_on_dialog: bool = False,
 ) -> PreparedNativeStash:
     """Authorize only a stable empty native composer without emitting keys."""
-    reader = getattr(provider, "read_composer_draft_state", None)
-    if not callable(reader):
+    authority_reader = getattr(provider, "read_composer_draft_authority", None)
+    state_reader = getattr(provider, "read_composer_draft_state", None)
+    if callable(authority_reader) and callable(
+        getattr(type(provider), "read_composer_draft_authority", None)
+    ):
+        try:
+            state, chip_present = authority_reader(defer_on_dialog=defer_on_dialog)
+        except Exception:
+            state, chip_present = "unresolved", False
+    elif callable(state_reader):
+        try:
+            state = state_reader(defer_on_dialog=defer_on_dialog)
+        except Exception:
+            state = "unresolved"
+        chip_present = False
+    else:
         raise DeliveryDeferredError(
             f"Composer state is unreadable for terminal {terminal_id}"
         )
-    try:
-        state = reader(defer_on_dialog=defer_on_dialog)
-    except Exception:
-        state = "unresolved"
     if state == "dialog":
         raise DeliveryDeferredError("Claude dialog is active")
     if state != "empty":
         raise DeliveryDeferredError(
             f"Composer state is {state or 'unresolved'} for terminal {terminal_id}"
         )
-    return PreparedNativeStash()
+    return PreparedNativeStash(chip_present=chip_present)
 
 
 def apply_prepared_native_stash(prepared: PreparedNativeStash) -> bool:

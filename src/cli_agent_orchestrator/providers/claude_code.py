@@ -1143,8 +1143,10 @@ class ClaudeCodeProvider(BaseProvider):
                 return "\n".join(lines)
         return None
 
-    def read_composer_draft_state(self, *, defer_on_dialog: bool = False) -> str:
-        """Return empty/nonempty/unresolved without changing the composer."""
+    def read_composer_draft_authority(
+        self, *, defer_on_dialog: bool = False
+    ) -> tuple[str, bool]:
+        """Return stable composer state and chip presence without mutation."""
         try:
             from cli_agent_orchestrator.backends.registry import get_backend
             from cli_agent_orchestrator.constants import PYTE_SCREEN_ROWS
@@ -1166,14 +1168,23 @@ class ClaudeCodeProvider(BaseProvider):
                 CLAUDE_DIALOG_PATTERN.search(strip_terminal_escapes(frame))
                 for frame in (first, second)
             ):
-                return "dialog"
+                return "dialog", False
             one = self.read_composer_draft(first.splitlines())
             two = self.read_composer_draft(second.splitlines())
-            if one is None or two is None or one != two:
-                return "unresolved"
-            return "empty" if two == "" else "nonempty"
+            one_chip = bool(self.composer_stashed_chip_pattern.search(first))
+            two_chip = bool(self.composer_stashed_chip_pattern.search(second))
+            if one is None or two is None or one != two or one_chip != two_chip:
+                return "unresolved", False
+            return ("empty" if two == "" else "nonempty"), two_chip
         except Exception:
-            return "unresolved"
+            return "unresolved", False
+
+    def read_composer_draft_state(self, *, defer_on_dialog: bool = False) -> str:
+        """Return empty/nonempty/unresolved without changing the composer."""
+        state, _chip_present = self.read_composer_draft_authority(
+            defer_on_dialog=defer_on_dialog
+        )
+        return state
 
     @property
     def paste_submit_delay(self) -> float:

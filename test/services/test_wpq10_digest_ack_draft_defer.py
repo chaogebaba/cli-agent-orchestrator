@@ -394,7 +394,7 @@ def _configure_prepared_send(monkeypatch, state: str, events: list[str]):
     backend.send_keys.side_effect = lambda *_a, **_k: events.append("paste_submit")
     provider = MagicMock()
     provider.composer_stash_keys = ["C-s"]
-    provider.paste_enter_count = 1
+    provider.paste_enter_count = 2
     provider.paste_submit_delay = 0.3
     provider.read_composer_draft_state.side_effect = (
         lambda **_kwargs: events.append("classify") or state
@@ -468,8 +468,38 @@ def test_wpq10_empty_native_composer_preserves_send_sequence(monkeypatch):
     terminal_service.send_prepared_input("receiver", "payload", defer_on_dialog=True)
     assert events == ["classify", "notify", "clear", "stash", "paste_submit"]
     backend.send_keys.assert_called_once()
+    assert backend.send_keys.call_args.kwargs["enter_count"] == 2
     backend.send_special_key.assert_not_called()
     assert "receiver" in terminal_service._memory_injected_terminals
+    terminal_service._memory_injected_terminals.discard("receiver")
+
+
+def test_wpq10_existing_native_chip_uses_single_enter(monkeypatch):
+    events: list[str] = []
+    backend, _provider = _configure_prepared_send(monkeypatch, "empty", events)
+    real_provider = ClaudeCodeProvider("receiver", "session", "window")
+    capture = (
+        Path(__file__).parents[1]
+        / "fixtures"
+        / "fx2"
+        / "stashed-chip-sgr.txt"
+    ).read_text()
+    backend.get_history.return_value = capture
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.backends.registry.get_backend", lambda: backend
+    )
+    monkeypatch.setattr(
+        terminal_service.provider_manager,
+        "get_provider",
+        lambda _terminal: real_provider,
+    )
+
+    terminal_service.send_prepared_input("receiver", "payload")
+
+    assert events == ["notify", "clear", "stash", "paste_submit"]
+    backend.send_keys.assert_called_once()
+    assert backend.send_keys.call_args.kwargs["enter_count"] == 1
+    backend.send_special_key.assert_not_called()
     terminal_service._memory_injected_terminals.discard("receiver")
 
 
@@ -654,6 +684,7 @@ def test_wpq10_digest_defer_then_empty_delivery_advances_once(wpq10_db, monkeypa
     selected = [item for item in get_pending_messages("receiver") if item.id == digest_id]
     second_attempt = begin_delivery_attempt(selected, "receiver", "claude_code", "h2", 1)
     terminal_service.send_prepared_input("receiver", "digest")
+    assert _backend.send_keys.call_args.kwargs["enter_count"] == 2
     assert settle_delivery_attempt(
         second_attempt, MessageStatus.DELIVERED, "confirmed"
     )
