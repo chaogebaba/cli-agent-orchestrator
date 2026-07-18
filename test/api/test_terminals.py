@@ -771,26 +771,34 @@ class TestCreateInboxMessageEndpoint:
             )
             mock_inbox.deliver_pending.assert_called_once_with("abcd1234", registry=ANY)
 
-    def test_worker_cannot_create_barrier_for_unowned_receiver(self, client):
+    @pytest.mark.parametrize(
+        ("barrier_field", "value"),
+        (
+            ("barrier", "spoofed-supervisor"),
+            ("barrier_timeout_seconds", 90),
+            ("barrier_member_key", "lane-a"),
+        ),
+    )
+    def test_http_barrier_dispatch_rejects_spoofed_supervisor_without_insert(
+        self, client, monkeypatch, barrier_field, value
+    ):
+        monkeypatch.setenv("CAO_TERMINAL_ID", "worker-terminal")
         with (
-            patch(
-                "cli_agent_orchestrator.api.main.callback_barrier_dispatch_allowed",
-                return_value=False,
-            ) as allowed,
             patch("cli_agent_orchestrator.api.main.create_inbox_message") as create,
+            patch("cli_agent_orchestrator.api.main.inbox_service") as inbox,
         ):
             response = client.post(
                 "/terminals/abcd1234/inbox/messages",
                 params={
-                    "sender_id": "worker-terminal",
+                    "sender_id": "supervisor-terminal",
                     "message": "task",
-                    "barrier": "worker-created",
+                    barrier_field: value,
                 },
             )
         assert response.status_code == 403
-        assert response.json()["detail"]["code"] == "barrier_supervisor_only"
-        allowed.assert_called_once_with("worker-terminal", "abcd1234")
+        assert response.json()["detail"]["code"] == "barrier_mcp_only"
         create.assert_not_called()
+        inbox.deliver_pending.assert_not_called()
 
     def test_create_inbox_message_delivery_failure_still_succeeds(self, client):
         """Immediate delivery failure should not fail the API response."""

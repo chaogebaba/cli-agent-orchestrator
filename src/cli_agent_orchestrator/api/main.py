@@ -46,7 +46,6 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     TRANSCRIPT_BINDING_SOURCES,
     adopt_mailbox_rows_at_startup,
-    callback_barrier_dispatch_allowed,
     callback_barrier_status,
     cancel_callback_barrier,
     create_inbox_message,
@@ -3070,26 +3069,17 @@ async def create_inbox_message_endpoint(
     message: str,
     refresh_ingest: bool = False,
     barrier: Optional[str] = None,
-    barrier_timeout_seconds: Optional[StrictInt] = None,
+    barrier_timeout_seconds: Optional[int] = None,
     barrier_member_key: Optional[str] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
-    if barrier is None and (barrier_timeout_seconds is not None or barrier_member_key is not None):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="barrier is required when barrier options are supplied",
-        )
-    if barrier is not None and not await asyncio.to_thread(
-        callback_barrier_dispatch_allowed,
-        sender_id,
-        receiver_id,
-    ):
+    if any(value is not None for value in (barrier, barrier_timeout_seconds, barrier_member_key)):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
-                "code": "barrier_supervisor_only",
-                "message": "callback barriers require supervisor ownership of the receiver",
+                "code": "barrier_mcp_only",
+                "message": "callback barrier dispatch is available only through MCP",
             },
         )
     if receiver_id.startswith("mb_"):
@@ -3319,6 +3309,14 @@ async def callback_barrier_status_endpoint(
     owner: Optional[str] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
 ) -> Dict[str, Any]:
+    if owner is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "barrier_owner_mcp_only",
+                "message": "callback barrier owner scope is available only through MCP",
+            },
+        )
     try:
         return await asyncio.to_thread(
             callback_barrier_status,
@@ -3341,6 +3339,14 @@ async def cancel_callback_barrier_endpoint(
     owner: Optional[str] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict[str, Any]:
+    if owner is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "barrier_owner_mcp_only",
+                "message": "callback barrier owner scope is available only through MCP",
+            },
+        )
     try:
         result = await asyncio.to_thread(
             cancel_callback_barrier,

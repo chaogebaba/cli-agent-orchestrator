@@ -308,6 +308,43 @@ def test_supervisor_only_dispatch_and_barrier_control_are_owner_scoped(barrier_d
         callback_barrier_status(barrier_id=barrier_id, owner_id="worker-a")
 
 
+def test_mcp_supervisor_barrier_path_remains_functional_end_to_end(barrier_db, monkeypatch):
+    _seed_raw(barrier_db, workers=("worker-a",))
+    monkeypatch.setenv("CAO_TERMINAL_ID", "owner")
+    post = MagicMock()
+    deliver = MagicMock()
+    monkeypatch.setattr(mcp_server.cao_http, "post", post)
+    monkeypatch.setattr(inbox_module.inbox_service, "deliver_pending", deliver)
+
+    result = mcp_server._send_message_impl(
+        "worker-a",
+        "task",
+        barrier="mcp-only",
+        barrier_timeout_seconds=90,
+        barrier_member_key="lane-a",
+    )
+
+    assert result["success"] is True
+    post.assert_not_called()
+    deliver.assert_called_once_with("worker-a")
+    with barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        member = db.query(CallbackBarrierMemberModel).one()
+        task = db.query(InboxModel).one()
+        assert (barrier.label, barrier.state) == ("mcp-only", "OPEN")
+        assert (member.member_key, member.terminal_id, member.state) == (
+            "lane-a",
+            "worker-a",
+            "AWAITING",
+        )
+        assert (task.sender_id, task.receiver_id, task.barrier_id, task.status) == (
+            "owner",
+            "worker-a",
+            None,
+            MessageStatus.PENDING.value,
+        )
+
+
 def test_stale_worker_generation_cannot_fill_unrearmed_member(barrier_db):
     _seed_raw(barrier_db, workers=("worker-a",))
     create_inbox_message(

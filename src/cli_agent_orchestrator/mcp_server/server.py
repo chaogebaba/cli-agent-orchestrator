@@ -1,5 +1,6 @@
 """CLI Agent Orchestrator MCP Server implementation."""
 
+import asyncio
 import json
 import logging
 import os
@@ -691,9 +692,6 @@ def _send_to_inbox(
     receiver_id: str,
     message: str,
     refresh_ingest: bool = False,
-    barrier: str | None = None,
-    barrier_timeout_seconds: int | None = None,
-    barrier_member_key: str | None = None,
 ) -> Dict[str, Any]:
     """Send message to another terminal's inbox (queued delivery when IDLE).
 
@@ -717,12 +715,6 @@ def _send_to_inbox(
         "message": message,
         "refresh_ingest": refresh_ingest,
     }
-    if barrier is not None:
-        params["barrier"] = barrier
-    if barrier_timeout_seconds is not None:
-        params["barrier_timeout_seconds"] = barrier_timeout_seconds
-    if barrier_member_key is not None:
-        params["barrier_member_key"] = barrier_member_key
     response = cao_http.post(
         f"/terminals/{receiver_id}/inbox/messages",
         params=params,
@@ -732,54 +724,38 @@ def _send_to_inbox(
     return response.json()
 
 
+def _send_barrier_to_inbox(
+    receiver_id: str,
+    message: str,
+    *,
+    refresh_ingest: bool,
+    barrier: str,
+    barrier_timeout_seconds: int | None,
+    barrier_member_key: str | None,
+) -> Dict[str, Any]:
+    """Create an MCP-only callback-barrier dispatch through the local DB seam."""
+    from cli_agent_orchestrator.services import callback_barrier_service
+
+    sender_id = os.getenv("CAO_TERMINAL_ID")
+    if not sender_id:
+        raise ValueError("CAO_TERMINAL_ID not set - cannot determine sender")
+    return callback_barrier_service.dispatch(
+        sender_id=sender_id,
+        receiver_id=receiver_id,
+        message=message,
+        refresh_ingest=refresh_ingest,
+        barrier=barrier,
+        barrier_timeout_seconds=barrier_timeout_seconds,
+        barrier_member_key=barrier_member_key,
+    )
+
+
 def _barrier_dispatch_is_supervisor_owned(sender_id: str, receiver_id: str) -> bool:
     """Fail closed unless the target records sender as its supervisor."""
     try:
-        target_id = receiver_id
-        mailbox_items: list[dict[str, Any]] | None = None
-        if receiver_id.startswith("mb_"):
-            mailbox_response = cao_http.get(
-                "/mailboxes",
-                timeout=_mcp_timeout(),
-                headers=_api_headers(),
-            )
-            mailbox_response.raise_for_status()
-            mailbox_items = mailbox_response.json().get("items", [])
-            target_candidate = next(
-                (
-                    item.get("current_terminal_id")
-                    for item in mailbox_items
-                    if item.get("id") == receiver_id
-                ),
-                None,
-            )
-            if not isinstance(target_candidate, str) or not target_candidate:
-                return False
-            target_id = target_candidate
-        target_response = cao_http.get(
-            f"/terminals/{target_id}",
-            timeout=_mcp_timeout(),
-            headers=_api_headers(),
-        )
-        target_response.raise_for_status()
-        target = target_response.json()
-        if target.get("caller_id") == sender_id:
-            return True
-        caller_mailbox_id = target.get("caller_mailbox_id")
-        if not isinstance(caller_mailbox_id, str) or not caller_mailbox_id:
-            return False
-        if mailbox_items is None:
-            mailbox_response = cao_http.get(
-                "/mailboxes",
-                timeout=_mcp_timeout(),
-                headers=_api_headers(),
-            )
-            mailbox_response.raise_for_status()
-            mailbox_items = mailbox_response.json().get("items", [])
-        return any(
-            item.get("id") == caller_mailbox_id and item.get("current_terminal_id") == sender_id
-            for item in mailbox_items
-        )
+        from cli_agent_orchestrator.services import callback_barrier_service
+
+        return callback_barrier_service.dispatch_allowed(sender_id, receiver_id)
     except Exception:
         return False
 
@@ -1555,14 +1531,16 @@ def _send_message_impl(
                 "never a built-in collaboration.send_message.]"
             )
 
-        inbox_kwargs: dict[str, Any] = {"refresh_ingest": refresh_ingest}
         if barrier is not None:
-            inbox_kwargs.update(
+            return _send_barrier_to_inbox(
+                receiver_id,
+                message,
+                refresh_ingest=refresh_ingest,
                 barrier=barrier,
                 barrier_timeout_seconds=barrier_timeout_seconds,
                 barrier_member_key=barrier_member_key,
             )
-        return _send_to_inbox(receiver_id, message, **inbox_kwargs)
+        return _send_to_inbox(receiver_id, message, refresh_ingest=refresh_ingest)
     except requests.HTTPError as exc:
         # e.g. the receiver terminal (a recorded caller included) was deleted
         # before this reply — surface the API detail instead of a raw
@@ -1810,7 +1788,7 @@ def _barrier_params(
     owner = os.environ.get("CAO_TERMINAL_ID")
     if not owner:
         raise ValueError("CAO_TERMINAL_ID required for callback barrier control")
-    params: dict[str, Any] = {"owner": owner}
+    params: dict[str, Any] = {"owner_id": owner}
     if barrier_id is not None:
         params["barrier_id"] = barrier_id
     else:
@@ -1825,13 +1803,12 @@ async def barrier_status(
 ) -> Dict[str, Any]:
     """Inspect a callback barrier by typed id-or-label selector."""
     try:
-        response = cao_http.get(
-            "/barriers/status",
-            params=_barrier_params(barrier_id, barrier_label),
-            timeout=_mcp_timeout(),
+        from cli_agent_orchestrator.services import callback_barrier_service
+
+        return await asyncio.to_thread(
+            callback_barrier_service.status,
+            **_barrier_params(barrier_id, barrier_label),
         )
-        response.raise_for_status()
-        return response.json()
     except Exception as exc:
         return {"success": False, "error": str(exc)}
 
@@ -1843,13 +1820,12 @@ async def cancel_barrier(
 ) -> Dict[str, Any]:
     """Cancel a callback barrier and release its held callbacks."""
     try:
-        response = cao_http.post(
-            "/barriers/cancel",
-            params=_barrier_params(barrier_id, barrier_label),
-            timeout=_mcp_timeout(),
+        from cli_agent_orchestrator.services import callback_barrier_service
+
+        return await asyncio.to_thread(
+            callback_barrier_service.cancel,
+            **_barrier_params(barrier_id, barrier_label),
         )
-        response.raise_for_status()
-        return response.json()
     except Exception as exc:
         return {"success": False, "error": str(exc)}
 
