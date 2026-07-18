@@ -53,6 +53,13 @@ If the task asks for progress updates, use `send_message` for those updates too.
 
 If the task asks you to create files, write them before reporting completion. When sending results back to a supervisor, include absolute file paths so the supervisor can continue the workflow without ambiguity.
 
+### Working-directory discipline
+
+- Never `cd` into a directory you may later delete; run cleanup from outside the disposable directory.
+- If every command fails with `getcwd`/`ENOENT`, stop issuing commands and report the cwd brick to your supervisor via `send_message` immediately; do not retry.
+
+After resolving Python merge conflicts, run `python scripts/verify_resolved_python.py --all-changed` before reporting success. The helper compiles every changed Python file and performs pytest collection for changed test files.
+
 ## Forbidden Operations (absolute, regardless of task wording)
 
 You run INSIDE the CAO server you may be asked to test or modify. Some operations
