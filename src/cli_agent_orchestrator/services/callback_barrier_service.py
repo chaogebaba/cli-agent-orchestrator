@@ -1,6 +1,7 @@
 """Principal-bound in-process callback-barrier operations for MCP."""
 
 import logging
+import os
 from typing import Any
 
 from cli_agent_orchestrator.clients.database import (
@@ -17,14 +18,20 @@ from cli_agent_orchestrator.services.terminal_guard_service import require_input
 logger = logging.getLogger(__name__)
 
 
-def dispatch_allowed(sender_id: str, receiver_id: str) -> bool:
-    """Return whether the process-bound sender owns the receiver callback route."""
-    return _dispatch_allowed(sender_id, receiver_id)
+def _terminal_principal() -> str:
+    principal = os.environ.get("CAO_TERMINAL_ID")
+    if not principal:
+        raise ValueError("CAO_TERMINAL_ID required for callback barrier operations")
+    return principal
+
+
+def dispatch_allowed(receiver_id: str) -> bool:
+    """Return whether the process terminal owns the receiver callback route."""
+    return _dispatch_allowed(_terminal_principal(), receiver_id)
 
 
 def dispatch(
     *,
-    sender_id: str,
     receiver_id: str,
     message: str,
     refresh_ingest: bool,
@@ -33,7 +40,8 @@ def dispatch(
     barrier_member_key: str | None,
 ) -> dict[str, Any]:
     """Create and best-effort deliver one supervisor-owned barrier dispatch."""
-    if not dispatch_allowed(sender_id, receiver_id):
+    sender_id = _terminal_principal()
+    if not _dispatch_allowed(sender_id, receiver_id):
         raise ValueError("callback barriers require supervisor ownership of the receiver")
     dispatch_barrier = {
         "label": barrier,
@@ -75,13 +83,12 @@ def status(
     *,
     barrier_id: int | None = None,
     barrier_label: str | None = None,
-    owner_id: str,
 ) -> dict[str, Any]:
     """Inspect one barrier scoped to the process-bound owner identity."""
     return callback_barrier_status(
         barrier_id=barrier_id,
         barrier_label=barrier_label,
-        owner_id=owner_id,
+        owner_id=_terminal_principal(),
     )
 
 
@@ -89,13 +96,12 @@ def cancel(
     *,
     barrier_id: int | None = None,
     barrier_label: str | None = None,
-    owner_id: str,
 ) -> dict[str, Any]:
     """Cancel one owner-scoped barrier and wake each released receiver."""
     result = cancel_callback_barrier(
         barrier_id=barrier_id,
         barrier_label=barrier_label,
-        owner_id=owner_id,
+        owner_id=_terminal_principal(),
     )
     for receiver_id in result.get("receiver_ids", []):
         inbox_service.deliver_pending(receiver_id)

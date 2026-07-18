@@ -9,11 +9,8 @@ from cli_agent_orchestrator.mcp_server import server
 
 def test_typed_selector_requires_exactly_one(monkeypatch):
     monkeypatch.setenv("CAO_TERMINAL_ID", "aaaaaaaa")
-    assert server._barrier_params(7, None) == {"barrier_id": 7, "owner_id": "aaaaaaaa"}
-    assert server._barrier_params(None, "123") == {
-        "barrier_label": "123",
-        "owner_id": "aaaaaaaa",
-    }
+    assert server._barrier_params(7, None) == {"barrier_id": 7}
+    assert server._barrier_params(None, "123") == {"barrier_label": "123"}
     with pytest.raises(ValueError):
         server._barrier_params(None, None)
     with pytest.raises(ValueError):
@@ -34,7 +31,6 @@ async def test_barrier_status_and_cancel_use_principal_bound_internal_seam(monke
     assert result == {"id": 4, "state": "OPEN"}
     status.assert_called_once_with(
         barrier_label="gate",
-        owner_id="aaaaaaaa",
     )
     get.assert_not_called()
     with (
@@ -48,7 +44,6 @@ async def test_barrier_status_and_cancel_use_principal_bound_internal_seam(monke
     assert result["state"] == "CANCELLED"
     cancel.assert_called_once_with(
         barrier_id=4,
-        owner_id="aaaaaaaa",
     )
     post.assert_not_called()
 

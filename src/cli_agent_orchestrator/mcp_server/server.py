@@ -736,11 +736,7 @@ def _send_barrier_to_inbox(
     """Create an MCP-only callback-barrier dispatch through the local DB seam."""
     from cli_agent_orchestrator.services import callback_barrier_service
 
-    sender_id = os.getenv("CAO_TERMINAL_ID")
-    if not sender_id:
-        raise ValueError("CAO_TERMINAL_ID not set - cannot determine sender")
     return callback_barrier_service.dispatch(
-        sender_id=sender_id,
         receiver_id=receiver_id,
         message=message,
         refresh_ingest=refresh_ingest,
@@ -750,12 +746,12 @@ def _send_barrier_to_inbox(
     )
 
 
-def _barrier_dispatch_is_supervisor_owned(sender_id: str, receiver_id: str) -> bool:
-    """Fail closed unless the target records sender as its supervisor."""
+def _barrier_dispatch_is_supervisor_owned(receiver_id: str) -> bool:
+    """Fail closed unless the process terminal owns the receiver."""
     try:
         from cli_agent_orchestrator.services import callback_barrier_service
 
-        return callback_barrier_service.dispatch_allowed(sender_id, receiver_id)
+        return callback_barrier_service.dispatch_allowed(receiver_id)
     except Exception:
         return False
 
@@ -1512,9 +1508,7 @@ def _send_message_impl(
             }
 
         if barrier is not None:
-            if not own_terminal_id or not _barrier_dispatch_is_supervisor_owned(
-                own_terminal_id, receiver_id
-            ):
+            if not _barrier_dispatch_is_supervisor_owned(receiver_id):
                 return {
                     "success": False,
                     "error": "callback barriers require supervisor ownership of the receiver",
@@ -1785,10 +1779,7 @@ def _barrier_params(
 ) -> dict[str, Any]:
     if (barrier_id is None) == (barrier_label is None):
         raise ValueError("provide exactly one of barrier_id or barrier_label")
-    owner = os.environ.get("CAO_TERMINAL_ID")
-    if not owner:
-        raise ValueError("CAO_TERMINAL_ID required for callback barrier control")
-    params: dict[str, Any] = {"owner_id": owner}
+    params: dict[str, Any] = {}
     if barrier_id is not None:
         params["barrier_id"] = barrier_id
     else:

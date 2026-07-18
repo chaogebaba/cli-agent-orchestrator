@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -40,6 +41,7 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.mcp_server import server as mcp_server
 from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services import callback_barrier_service
 from cli_agent_orchestrator.services import inbox_service as inbox_module
 from cli_agent_orchestrator.services.inbox_service import InboxService
 from cli_agent_orchestrator.services.status_monitor import BoundaryObservation
@@ -343,6 +345,79 @@ def test_mcp_supervisor_barrier_path_remains_functional_end_to_end(barrier_db, m
             None,
             MessageStatus.PENDING.value,
         )
+
+
+def test_direct_barrier_service_derives_process_principal_and_rejects_caller_selected_owner(
+    barrier_db, monkeypatch
+):
+    _seed_raw(barrier_db, workers=("worker-a", "worker-process"))
+    create_inbox_message(
+        "owner",
+        "worker-a",
+        "task",
+        dispatch_barrier={"label": "principal-bound", "member_key": "lane-a"},
+    )
+    with barrier_db() as db:
+        barrier_id = int(db.query(CallbackBarrierModel.id).scalar())
+
+    assert "sender_id" not in inspect.signature(callback_barrier_service.dispatch).parameters
+    assert (
+        "sender_id" not in inspect.signature(callback_barrier_service.dispatch_allowed).parameters
+    )
+    assert "owner_id" not in inspect.signature(callback_barrier_service.status).parameters
+    assert "owner_id" not in inspect.signature(callback_barrier_service.cancel).parameters
+
+    with pytest.raises(TypeError, match="sender_id"):
+        callback_barrier_service.dispatch(
+            sender_id="owner",
+            receiver_id="worker-a",
+            message="caller-selected task",
+            refresh_ingest=False,
+            barrier="principal-bound",
+            barrier_timeout_seconds=None,
+            barrier_member_key=None,
+        )
+    with pytest.raises(TypeError, match="owner_id"):
+        callback_barrier_service.status(barrier_id=barrier_id, owner_id="owner")
+    with pytest.raises(TypeError, match="owner_id"):
+        callback_barrier_service.cancel(barrier_id=barrier_id, owner_id="owner")
+
+    monkeypatch.setenv("CAO_TERMINAL_ID", "worker-process")
+    allowed = MagicMock(wraps=callback_barrier_dispatch_allowed)
+    status = MagicMock(wraps=callback_barrier_status)
+    cancel = MagicMock(wraps=cancel_callback_barrier)
+    monkeypatch.setattr(callback_barrier_service, "_dispatch_allowed", allowed)
+    monkeypatch.setattr(callback_barrier_service, "callback_barrier_status", status)
+    monkeypatch.setattr(callback_barrier_service, "cancel_callback_barrier", cancel)
+
+    with pytest.raises(ValueError, match="supervisor ownership"):
+        callback_barrier_service.dispatch(
+            receiver_id="worker-a",
+            message="derived worker task",
+            refresh_ingest=False,
+            barrier="principal-bound",
+            barrier_timeout_seconds=None,
+            barrier_member_key=None,
+        )
+    with pytest.raises(ValueError, match="barrier_not_found"):
+        callback_barrier_service.status(barrier_id=barrier_id)
+    with pytest.raises(ValueError, match="barrier_not_found"):
+        callback_barrier_service.cancel(barrier_id=barrier_id)
+
+    allowed.assert_called_once_with("worker-process", "worker-a")
+    status.assert_called_once_with(
+        barrier_id=barrier_id,
+        barrier_label=None,
+        owner_id="worker-process",
+    )
+    cancel.assert_called_once_with(
+        barrier_id=barrier_id,
+        barrier_label=None,
+        owner_id="worker-process",
+    )
+    with barrier_db() as db:
+        assert db.get(CallbackBarrierModel, barrier_id).state == "OPEN"
+        assert db.query(InboxModel).count() == 1
 
 
 def test_stale_worker_generation_cannot_fill_unrearmed_member(barrier_db):
