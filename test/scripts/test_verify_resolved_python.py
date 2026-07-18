@@ -100,6 +100,21 @@ def test_all_changed_includes_untracked_new_test(helper, tmp_path, capsys):
     assert "test/test_untracked.py" in capsys.readouterr().err
 
 
+def test_all_changed_unions_tracked_change_and_untracked_new_test(helper, tmp_path, capsys):
+    _init_git_repo(tmp_path)
+    tracked = tmp_path / "tracked.py"
+    tracked.write_text("VALUE = 1\n")
+    _commit_all(tmp_path)
+    tracked.write_text("VALUE = 2\n")
+    test_dir = tmp_path / "test"
+    test_dir.mkdir()
+    untracked = test_dir / "test_untracked.py"
+    untracked.write_text("VALUE = (\n")
+
+    assert helper.main(["--all-changed"]) != 0
+    assert "test/test_untracked.py" in capsys.readouterr().err
+
+
 def test_all_changed_excludes_deleted_tracked_file(helper, tmp_path, capsys):
     _init_git_repo(tmp_path)
     deleted = tmp_path / "deleted.py"
