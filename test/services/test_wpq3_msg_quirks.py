@@ -369,7 +369,13 @@ def _armed(provider="codex"):
     service.record_inbound_task("worker", "caller", "developer")
     service.record_status("worker", TerminalStatus.IDLE, now=10.0)
     service._episodes["worker"].last_screen_fp = "stable"
-    metadata = {"id": "worker", "caller_id": "caller", "provider": provider}
+    metadata = {
+        "id": "worker",
+        "caller_id": "caller",
+        "provider": provider,
+        "tmux_session": "cao-test",
+        "tmux_window": "worker",
+    }
     return service, metadata
 
 
@@ -631,9 +637,15 @@ def test_d5_failed_before_commit_pushes_without_marking_auto_resumed(monkeypatch
         "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
         lambda *_args: None,
     )
+    probe = MagicMock(
+        return_value=(
+            TerminalStatus.IDLE,
+            {"transient_api_error": True, "idle_reason": "transient_api_error"},
+        )
+    )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
-        lambda _terminal: (TerminalStatus.IDLE, {"transient_api_error": True}),
+        probe,
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
@@ -652,13 +664,290 @@ def test_d5_failed_before_commit_pushes_without_marking_auto_resumed(monkeypatch
     )
 
     assert service.collect_due_notifications(now=13.0) == [
-        ("worker", "caller", "[watchdog] worker worker (developer) idle 3s without callback")
+        (
+            "worker",
+            "caller",
+            "[watchdog] worker worker (developer) idle 3s without callback "
+            "[reason: transient_api_error]",
+        )
     ]
+    probe.assert_called_once_with("worker")
     episode = service._episodes["worker"]
     assert episode.fired
     assert episode.auto_resumed is False
     assert episode.resume_reserved_at is None
     deliver.assert_not_called()
+
+
+def test_wpq6_a_g_capacity_auto_resumes_then_pushes_composed_reason(monkeypatch):
+    service, metadata = _armed()
+    backend = MagicMock()
+    backend.capture_viewport.return_value = (
+        "⚠ Selected model is at capacity. Please try a different model.\n"
+        "› \n"
+        "  gpt-5.6-sol high · ~/project\n"
+    )
+    provider = CodexProvider("worker", "cao-test", "worker")
+    callback_status = MagicMock(side_effect=[None, None, None, None])
+    deliver = MagicMock()
+    insert = MagicMock(return_value=WatchdogInsertResult("inserted", 91))
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        lambda _terminal: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+        callback_status,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
+        lambda _terminal: (
+            TerminalStatus.IDLE,
+            {"transient_api_error": True, "idle_reason": "transient_api_error"},
+        ),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
+        lambda _terminal: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
+        lambda _terminal: threading.Lock(),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
+        insert,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending", deliver
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
+        lambda _terminal: provider,
+    )
+
+    assert service.collect_due_notifications(now=13.0) == []
+    attempted_at = service._episodes["worker"].auto_resume_attempted_at
+    assert service.collect_due_notifications(now=16.0) == [
+        (
+            "worker",
+            "caller",
+            "[watchdog] worker worker (developer) idle 3s without callback "
+            f"[reason: transient_api_error] (auto-resume attempted at {attempted_at})",
+        )
+    ]
+    insert.assert_called_once_with("worker", AUTO_RESUME_BODY)
+    deliver.assert_called_once_with("worker")
+    backend.capture_viewport.assert_called_once_with("cao-test", "worker")
+    assert callback_status.call_count == 4
+
+
+@pytest.mark.parametrize(
+    "banner",
+    [
+        "429 Too Many Requests: usage limit",
+        "502 Bad Gateway — 403 Forbidden",
+        "400 Bad Request: unauthorized",
+    ],
+)
+def test_wpq6_c_excluded_collision_pushes_reason_without_auto_resume(monkeypatch, banner):
+    service, metadata = _armed()
+    provider = CodexProvider("worker", "cao-test", "worker")
+    rows = [banner, "› "]
+    classification = provider.classify_screen(rows)
+    insert = MagicMock()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        lambda _terminal: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
+        lambda _terminal: (
+            classification.status,
+            {"idle_reason": provider.classify_idle_reason(rows, classification)},
+        ),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
+        insert,
+    )
+
+    assert service.collect_due_notifications(now=13.0) == [
+        (
+            "worker",
+            "caller",
+            "[watchdog] worker worker (developer) idle 3s without callback "
+            "[reason: quota_or_auth]",
+        )
+    ]
+    insert.assert_not_called()
+
+
+def test_wpq6_b_progress_frame_never_auto_resumes(monkeypatch):
+    service, metadata = _armed()
+    insert = MagicMock()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        lambda _terminal: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
+        lambda _terminal: (
+            TerminalStatus.PROCESSING,
+            {"idle_reason": "transient_api_error"},
+        ),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
+        insert,
+    )
+
+    assert len(service.collect_due_notifications(now=13.0)) == 1
+    insert.assert_not_called()
+
+
+def test_wpq6_b_processing_reason_is_gate_free_without_auto_resume(monkeypatch):
+    service, metadata = _armed()
+    provider = CodexProvider("worker", "cao-test", "worker")
+    rows = [
+        "⚠ Selected model is at capacity. Please try a different model.",
+        "• Working (5s • esc to interrupt)",
+        "› ",
+        "  gpt-5.6-sol high · ~/project",
+    ]
+    classification = provider.classify_screen(rows)
+    idle_reason = provider.classify_idle_reason(rows, classification)
+    insert = MagicMock()
+
+    assert classification.status == TerminalStatus.PROCESSING
+    assert not provider.transient_error_detected(rows, classification)
+    assert idle_reason == "transient_api_error"
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        lambda _terminal: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
+        lambda _terminal: (
+            classification.status,
+            {
+                "transient_api_error": provider.transient_error_detected(rows, classification),
+                "idle_reason": idle_reason,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
+        insert,
+    )
+
+    assert service.collect_due_notifications(now=13.0)[0][2].endswith(
+        "[reason: transient_api_error]"
+    )
+    insert.assert_not_called()
+
+
+def test_wpq6_a2_ghost_composer_reason_does_not_relax_nudge_gate(monkeypatch):
+    service, metadata = _armed()
+    provider = CodexProvider("worker", "cao-test", "worker")
+    rows = [
+        "⚠ Selected model is at capacity. Please try a different model.",
+        "› Write tests for @filename",
+        "  gpt-5.6-sol high · ~/project",
+    ]
+    classification = provider.classify_screen(rows)
+    insert = MagicMock()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        lambda _terminal: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
+        lambda _terminal: (
+            classification.status,
+            {"idle_reason": provider.classify_idle_reason(rows, classification)},
+        ),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
+        insert,
+    )
+
+    assert service.collect_due_notifications(now=13.0)[0][2].endswith(
+        "[reason: transient_api_error]"
+    )
+    insert.assert_not_called()
+
+
+def test_wpq6_e_error_banner_pushes_reason_without_auto_resume(monkeypatch):
+    service, metadata = _armed()
+    insert = MagicMock()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        lambda _terminal: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
+        lambda _terminal: (TerminalStatus.IDLE, {"idle_reason": "error_banner"}),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
+        insert,
+    )
+
+    assert service.collect_due_notifications(now=13.0)[0][2].endswith("[reason: error_banner]")
+    insert.assert_not_called()
+
+
+def test_wpq6_w_cropped_indented_capacity_never_auto_resumes(monkeypatch):
+    service, metadata = _armed()
+    provider = CodexProvider("worker", "cao-test", "worker")
+    rows = ["  ⚠ Selected model is at capacity", "› ", "  gpt-5.6-sol high · ~/project"]
+    classification = provider.classify_screen(rows)
+    insert = MagicMock()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        lambda _terminal: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
+        lambda _terminal: (classification.status, {}),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.insert_watchdog_auto_resume_message",
+        insert,
+    )
+
+    assert service.collect_due_notifications(now=13.0)[0][2] == (
+        "[watchdog] worker worker (developer) idle 3s without callback"
+    )
+    insert.assert_not_called()
 
 
 def test_d5_watchdog_sender_commit_does_not_rearm_episode(monkeypatch):

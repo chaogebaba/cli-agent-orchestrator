@@ -100,12 +100,14 @@ TRANSIENT_API_ERROR_PATTERNS = (
     r"(?i)502 bad gateway",
     r"(?i)nginx(/[0-9.]+)?",
     r"(?i)stream (error|disconnected)",
+    r"(?i)^⚠ Selected model is at capacity",
 )
 TRANSIENT_ERROR_EXCLUSIONS = (
     r"(?i)invalid_api_key|authentication|unauthorized",
     r"(?i)model_not_found|unknown model",
     r"(?i)usage limit|insufficient_quota|quota",
     r"(?i)content policy|safety",
+    r"(?i)\b403\b|forbidden",
 )
 
 # Codex TUI footer indicators (status bar below the idle prompt).
@@ -1060,6 +1062,51 @@ class CodexProvider(BaseProvider):
             and strict_idle
             and classification.status == TerminalStatus.IDLE
         )
+
+    def classify_idle_reason(
+        self, rows: list[str], classification: ScreenClassificationResult
+    ) -> str | None:
+        clean_rows = [strip_terminal_escapes(row) for row in rows]
+        state = "neutral"
+        banner_rows: list[str] = []
+
+        for row in clean_rows:
+            if re.search(USER_PREFIX_PATTERN, row):
+                state = "user"
+                continue
+            if re.search(ASSISTANT_PREFIX_PATTERN, row):
+                state = "assistant"
+                continue
+            if re.search(TUI_FOOTER_PATTERN, row) or re.search(
+                IDLE_PROMPT_STRICT_PATTERN, row, re.IGNORECASE
+            ):
+                state = "neutral"
+                continue
+
+            override_banner = row.startswith("⚠") or re.search(ERROR_PATTERN, row) is not None
+            neutral_http_banner = state == "neutral" and re.search(r"^\d{3} ", row) is not None
+            if override_banner or neutral_http_banner:
+                state = "banner"
+                banner_rows.append(row)
+                continue
+            if state == "banner":
+                banner_rows.append(row)
+
+        if any(
+            re.search(pattern, row) is not None
+            for pattern in TRANSIENT_ERROR_EXCLUSIONS
+            for row in banner_rows
+        ):
+            return "quota_or_auth"
+        if any(
+            re.search(pattern, row) is not None
+            for pattern in TRANSIENT_API_ERROR_PATTERNS
+            for row in banner_rows
+        ):
+            return "transient_api_error"
+        if any(re.search(ERROR_PATTERN, row) is not None for row in banner_rows):
+            return "error_banner"
+        return None
 
     def get_status_from_screen(self, screen_lines: list[str]) -> TerminalStatus:
         return self.classify_screen(screen_lines).status

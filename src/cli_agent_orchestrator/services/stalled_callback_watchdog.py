@@ -341,7 +341,7 @@ class StalledCallbackWatchdog:
                     episode.idle_since = now
                     episode.last_screen_fp = fingerprint
 
-    def _fresh_frame_decides_running(self, terminal_id: str) -> bool:
+    def _fresh_frame_decides_running(self, terminal_id: str) -> tuple[bool, str | None]:
         from cli_agent_orchestrator.backends.registry import get_backend
         from cli_agent_orchestrator.providers.manager import provider_manager
 
@@ -349,17 +349,20 @@ class StalledCallbackWatchdog:
             metadata = get_terminal_metadata(terminal_id)
             provider = provider_manager.get_provider(terminal_id)
             if metadata is None or provider is None:
-                return False
+                return False, None
             frame = get_backend().capture_viewport(
                 metadata["tmux_session"], metadata["tmux_window"]
             )
-            classification = provider.classify_screen(frame.splitlines())
+            rows = frame.splitlines()
+            classification = provider.classify_screen(rows)
+            idle_reason = provider.classify_idle_reason(rows, classification)
             return (
                 classification.status == TerminalStatus.PROCESSING
-                and classification.provider_signal == "RUNNING_PATTERN"
+                and classification.provider_signal == "RUNNING_PATTERN",
+                idle_reason if isinstance(idle_reason, str) else None,
             )
         except Exception:
-            return False
+            return False, None
 
     def collect_due_notifications(self, now: float | None = None) -> list[tuple[str, str, str]]:
         now = time.monotonic() if now is None else now
@@ -407,13 +410,17 @@ class StalledCallbackWatchdog:
                 self._auto_resume_enabled() and provider in AUTO_RESUME_PROVIDERS
             )
             suppress = False
+            fallback_idle_reason = None
             second_callback_status = None
             if (
                 metadata is not None
                 and callback_status is None
-                and not auto_resume_applicable
+                and (not auto_resume_applicable or candidate.episode.auto_resumed)
             ):
-                suppress = self._fresh_frame_decides_running(candidate.terminal_id)
+                frame_decides_running, fallback_idle_reason = self._fresh_frame_decides_running(
+                    candidate.terminal_id
+                )
+                suppress = frame_decides_running and not auto_resume_applicable
                 second_callback_status = get_callback_status_since(
                     candidate.terminal_id,
                     candidate.caller_id,
@@ -449,12 +456,27 @@ class StalledCallbackWatchdog:
                     continue
                 if current_episode.auto_resumed:
                     current_episode.fired = True
-                    suffix = f" (auto-resume attempted at {current_episode.auto_resume_attempted_at})"
-                    due.append(self._push_tuple(candidate, current_episode, suffix))
+                    suffix = (
+                        f" (auto-resume attempted at {current_episode.auto_resume_attempted_at})"
+                    )
+                    due.append(
+                        self._push_tuple(
+                            candidate,
+                            current_episode,
+                            suffix,
+                            idle_reason=fallback_idle_reason,
+                        )
+                    )
                     continue
                 if not auto_resume_applicable:
                     current_episode.fired = True
-                    due.append(self._push_tuple(candidate, current_episode))
+                    due.append(
+                        self._push_tuple(
+                            candidate,
+                            current_episode,
+                            idle_reason=fallback_idle_reason,
+                        )
+                    )
                     continue
                 current_episode.resume_reserved_at = now
                 action = AutoResumeAction(
@@ -505,6 +527,7 @@ class StalledCallbackWatchdog:
         episode: _Episode,
         suffix: str = "",
         idle_seconds: int | None = None,
+        idle_reason: str | None = None,
     ) -> tuple[str, str, str]:
         if idle_seconds is None:
             idle_seconds = (
@@ -516,7 +539,8 @@ class StalledCallbackWatchdog:
             candidate.terminal_id,
             candidate.caller_id,
             f"[watchdog] worker {candidate.terminal_id} ({episode.profile}) "
-            f"idle {idle_seconds}s without callback{suffix}",
+            f"idle {idle_seconds}s without callback"
+            f"{f' [reason: {idle_reason}]' if idle_reason is not None else ''}{suffix}",
         )
 
     def _execute_auto_resume(
@@ -526,8 +550,11 @@ class StalledCallbackWatchdog:
         from cli_agent_orchestrator.services.inbox_service import get_delivery_lock, inbox_service
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
+        idle_reason = None
         try:
             probe_status, probe_meta = status_monitor.probe_screen_status(action.terminal_id)
+            if isinstance(probe_meta, dict) and isinstance(probe_meta.get("idle_reason"), str):
+                idle_reason = probe_meta["idle_reason"]
             applicable = (
                 isinstance(probe_meta, dict)
                 and probe_meta.get("transient_api_error") is True
@@ -552,6 +579,7 @@ class StalledCallbackWatchdog:
                     action,
                     episode,
                     idle_seconds=int(enqueue_monotonic - (episode.idle_since or enqueue_monotonic)),
+                    idle_reason=idle_reason,
                 )
 
         delivery_lock = get_delivery_lock(action.terminal_id)
@@ -596,6 +624,7 @@ class StalledCallbackWatchdog:
                             idle_seconds=int(
                                 enqueue_monotonic - (episode.idle_since or enqueue_monotonic)
                             ),
+                            idle_reason=idle_reason,
                         )
                 else:
                     if episode is not None and episode.generation == action.generation:

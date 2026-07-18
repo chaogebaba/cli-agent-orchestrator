@@ -64,6 +64,7 @@ class ScreenProbeMeta(TypedDict):
     identity_proof_failure: NotRequired[str]
     temporal_demotion: NotRequired["ScreenProbeTemporalDemotion"]
     transient_api_error: NotRequired[bool]
+    idle_reason: NotRequired[str]
 
 
 class ScreenProbeTemporalDemotion(TypedDict):
@@ -1283,6 +1284,12 @@ class StatusMonitor:
                     meta["transient_api_error"] = True
             except Exception:
                 logger.exception("Error evaluating transient-error signal for %s", terminal_id)
+            try:
+                idle_reason = provider.classify_idle_reason(rows, classification)
+                if idle_reason is not None:
+                    meta["idle_reason"] = idle_reason
+            except Exception:
+                logger.exception("Error classifying idle reason for %s", terminal_id)
         return classification.status, meta
 
     def get_rendered_screen(self, terminal_id: str) -> Optional[List[str]]:
