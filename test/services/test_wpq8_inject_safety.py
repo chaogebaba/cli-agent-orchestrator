@@ -223,6 +223,13 @@ def test_wpq8_m2_eager_waiting_is_vetoed_before_attempt(wpq8_db):
             "normal",
             "tagged_replay",
         ),
+        (
+            "claude_s4_initial",
+            TerminalStatus.PROCESSING,
+            TerminalStatus.IDLE,
+            "normal",
+            "ordinary",
+        ),
     ],
 )
 def test_wpq8_m9_every_admission_path_calls_safety_once_before_open(
@@ -233,8 +240,23 @@ def test_wpq8_m9_every_admission_path_calls_safety_once_before_open(
     gate_state,
     decision_kind,
 ):
-    database.create_terminal("worker", "session", "window", "grok_cli")
+    provider_name = "claude_code" if admission_path == "claude_s4_initial" else "grok_cli"
+    database.create_terminal("worker", "session", "window", provider_name)
     message = database.create_inbox_message("sender", "worker", "payload")
+    if admission_path == "claude_s4_initial":
+        deferred = database.begin_delivery_attempt(
+            [message], "worker", "claude_code", "deferred", 8
+        )
+        assert database.settle_delivery_attempt(
+            deferred,
+            MessageStatus.PENDING,
+            "deferred",
+            reason="delivery_deferred",
+            evidence="{}",
+        )
+    initial_attempt_count = len(database.get_message_trace(message.id)["attempts"])
+    with wpq8_db() as db:
+        initial_event_count = db.query(database.InboxMessageTraceEventModel).count()
     observation = BoundaryObservation("epoch", initial_status, 1, 1, 1, None, 1)
     monitor = MagicMock()
     monitor.get_boundary_observation.return_value = observation
@@ -248,15 +270,18 @@ def test_wpq8_m9_every_admission_path_calls_safety_once_before_open(
         probe_meta,
     )
     provider = MagicMock(accepts_input_while_processing=True)
+    provider.read_composer_draft_state.return_value = "empty"
     service = InboxService()
     actual_safety = service._inject_safe
+    opened_kinds = []
 
     def safety(*args):
         events.append("safety")
         return actual_safety(*args)
 
-    def attempt_open(*_args, **_kwargs):
+    def attempt_open(*_args, **kwargs):
         events.append("attempt")
+        opened_kinds.append(kwargs["admission_proof"].kind)
         return database.AttemptOpenResult("busy_aborted")
 
     prior = "prior-attempt"
@@ -315,12 +340,19 @@ def test_wpq8_m9_every_admission_path_calls_safety_once_before_open(
     assert events[:2] == ["probe", "safety"]
     if admission_path == "eager_waiting":
         assert events == ["probe", "safety"]
+        assert opened_kinds == []
     else:
         assert events == ["probe", "safety", "attempt"]
+        expected_kind = {
+            "corrective": "corrective",
+            "tagged_replay": "tagged_replay",
+            "claude_s4_initial": "s4_initial",
+        }.get(admission_path, "ordinary")
+        assert opened_kinds == [expected_kind]
     trace = database.get_message_trace(message.id)
-    assert trace["attempts"] == []
+    assert len(trace["attempts"]) == initial_attempt_count
     with wpq8_db() as db:
-        assert db.query(database.InboxMessageTraceEventModel).count() == 0
+        assert db.query(database.InboxMessageTraceEventModel).count() == initial_event_count
 
 
 def test_wpq8_m7_m10_hazard_comes_from_one_fresh_probe_frame(monkeypatch):
