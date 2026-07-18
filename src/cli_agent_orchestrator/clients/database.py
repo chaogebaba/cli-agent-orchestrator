@@ -4357,6 +4357,33 @@ def begin_delivery_attempt(
     return attempt_uuid
 
 
+def _advance_digest_cursor_in_db(db: Session, message_ids: list[int]) -> None:
+    """Advance a publication mailbox cursor inside the winning delivery transaction."""
+    ids = sorted(set(message_ids))
+    if not ids:
+        return
+    rows = (
+        db.query(InboxModel.logical_receiver_id, InboxMessageTraceEventModel.payload)
+        .join(
+            InboxMessageTraceEventModel,
+            InboxMessageTraceEventModel.message_id == InboxModel.id,
+        )
+        .filter(
+            InboxModel.id.in_(ids),
+            InboxModel.orchestration_type == OrchestrationType.MAILBOX_DIGEST.value,
+            InboxMessageTraceEventModel.kind == "digest_high_water",
+        )
+        .all()
+    )
+    for mailbox_id, payload in rows:
+        high_water = payload.get("high_water") if isinstance(payload, dict) else None
+        if not isinstance(mailbox_id, str) or type(high_water) is not int:
+            continue
+        mailbox = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
+        if mailbox is not None and high_water > int(mailbox.consumed_through_id):
+            mailbox.consumed_through_id = high_water
+
+
 def settle_delivery_attempt(
     attempt_uuid: str,
     status: MessageStatus,
@@ -4436,6 +4463,8 @@ def settle_delivery_attempt(
         changed = query.update({InboxModel.status: status.value}, synchronize_session=False)
         if status == MessageStatus.DELIVERED and changed != len(ids):
             raise RuntimeError("delivery confirmation compare-and-set lost")
+        if status == MessageStatus.DELIVERED:
+            _advance_digest_cursor_in_db(db, ids)
         if status == MessageStatus.DELIVERED and on_confirmed is not None:
             on_confirmed()
         return True
@@ -4558,6 +4587,7 @@ def confirm_batch_from_prior_attempt(
         )
         if changed != len(message_ids):
             return False
+        _advance_digest_cursor_in_db(db, message_ids)
         if on_confirmed is not None:
             on_confirmed()
         return True
@@ -4681,6 +4711,7 @@ def settle_open_attempt_inferred_delivered(
                 created_at=now,
             )
         )
+        _advance_digest_cursor_in_db(db, message_ids)
         if on_confirmed is not None:
             on_confirmed()
         return True
@@ -4710,6 +4741,7 @@ def transition_pending_to_inferred_delivered(
                 payload=dict(evidence),
             )
         )
+        _advance_digest_cursor_in_db(db, [message_id])
         if on_confirmed is not None:
             on_confirmed()
         return True
@@ -5386,6 +5418,7 @@ def settle_wpm1_terminal_batch(
             db.rollback()
             return "stale"
         if status == MessageStatus.DELIVERED:
+            _advance_digest_cursor_in_db(db, ids)
             any_stalled = any(
                 _evidence_object(row.evidence).get("stalled_notified_at") for row in attempts
             )

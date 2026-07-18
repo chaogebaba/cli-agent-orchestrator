@@ -478,6 +478,18 @@ def publish_supervisor_incarnation(claim: MailboxClaim, terminal_id: str) -> dic
                 db.add(digest)
                 db.flush()
                 digest_id = digest.id
+                db.add(
+                    InboxMessageTraceEventModel(
+                        message_id=digest_id,
+                        kind="digest_high_water",
+                        payload={
+                            "high_water": max(
+                                (int(row.id) for row in delivered),
+                                default=None,
+                            )
+                        },
+                    )
+                )
                 incarnation.digest_message_id = digest_id
                 for row in stale:
                     row.status = MessageStatus.DIGESTED.value

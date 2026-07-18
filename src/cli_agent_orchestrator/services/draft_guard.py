@@ -68,6 +68,43 @@ class ComposerSnapshot:
     draft: str | None
 
 
+@dataclass(frozen=True)
+class PreparedNativeStash:
+    """Final pre-mutation authorization for a native-stash provider send."""
+
+    chip_present: bool = False
+
+
+def prepare_native_stash_before_send(
+    terminal_id: str,
+    provider: Any,
+    *,
+    defer_on_dialog: bool = False,
+) -> PreparedNativeStash:
+    """Authorize only a stable empty native composer without emitting keys."""
+    reader = getattr(provider, "read_composer_draft_state", None)
+    if not callable(reader):
+        raise DeliveryDeferredError(
+            f"Composer state is unreadable for terminal {terminal_id}"
+        )
+    try:
+        state = reader(defer_on_dialog=defer_on_dialog)
+    except Exception:
+        state = "unresolved"
+    if state == "dialog":
+        raise DeliveryDeferredError("Claude dialog is active")
+    if state != "empty":
+        raise DeliveryDeferredError(
+            f"Composer state is {state or 'unresolved'} for terminal {terminal_id}"
+        )
+    return PreparedNativeStash()
+
+
+def apply_prepared_native_stash(prepared: PreparedNativeStash) -> bool:
+    """Apply the already-authorized no-op stash state without reclassification."""
+    return prepared.chip_present
+
+
 def stash_draft_before_send(
     terminal_id: str,
     metadata: dict[str, Any],

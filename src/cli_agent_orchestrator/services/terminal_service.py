@@ -80,6 +80,8 @@ from cli_agent_orchestrator.services.deferred_dispatcher import (
 )
 from cli_agent_orchestrator.services.draft_guard import (
     DeliveryDeferredError,
+    apply_prepared_native_stash,
+    prepare_native_stash_before_send,
     preserve_draft_before_send,
     stash_draft_before_send,
 )
@@ -2798,10 +2800,17 @@ def send_prepared_input(
             raise PaneIdentityMismatchError(identity_failure)
     provider = provider_manager.get_provider(terminal_id)
     enter_count = provider.paste_enter_count if provider else 1
+    prepared_stash = None
+    if isinstance(getattr(provider, "composer_stash_keys", None), list):
+        prepared_stash = prepare_native_stash_before_send(
+            terminal_id,
+            provider,
+            defer_on_dialog=defer_on_dialog,
+        )
     status_monitor.notify_input_sent(terminal_id)
     status_monitor.clear_rolling_buffer(terminal_id)
-    if isinstance(getattr(provider, "composer_stash_keys", None), list):
-        if stash_draft_before_send(terminal_id, metadata, provider, defer_on_dialog):
+    if prepared_stash is not None:
+        if apply_prepared_native_stash(prepared_stash):
             enter_count = 1
         preserved = None
     else:

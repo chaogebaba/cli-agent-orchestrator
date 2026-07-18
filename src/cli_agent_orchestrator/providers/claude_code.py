@@ -1143,7 +1143,7 @@ class ClaudeCodeProvider(BaseProvider):
                 return "\n".join(lines)
         return None
 
-    def read_composer_draft_state(self) -> str:
+    def read_composer_draft_state(self, *, defer_on_dialog: bool = False) -> str:
         """Return empty/nonempty/unresolved without changing the composer."""
         try:
             from cli_agent_orchestrator.backends.registry import get_backend
@@ -1162,6 +1162,11 @@ class ClaudeCodeProvider(BaseProvider):
                 tail_lines=PYTE_SCREEN_ROWS,
                 strip_escapes=False,
             )
+            if defer_on_dialog and any(
+                CLAUDE_DIALOG_PATTERN.search(strip_terminal_escapes(frame))
+                for frame in (first, second)
+            ):
+                return "dialog"
             one = self.read_composer_draft(first.splitlines())
             two = self.read_composer_draft(second.splitlines())
             if one is None or two is None or one != two:
