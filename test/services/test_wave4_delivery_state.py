@@ -792,6 +792,7 @@ def test_probe_08_every_emitted_provider_signal_names_a_module_constant():
         grok_cli: {
             "WAITING_USER_ANSWER_PATTERN",
             "PROCESSING_PATTERN",
+            "RUNNING_PATTERN",
             "COMPLETION_PATTERN",
             "ERROR_PATTERN",
             "IDLE_PROMPT_PATTERN",
@@ -1055,11 +1056,19 @@ def test_livefix_p1_stale_incremental_ready_fresh_busy_defers_without_overwrite(
     message = create_inbox_message("sender", "receiver", "do not inject while busy")
     incremental_rows = ["❯", "Grok 4.5 · always-approve · ctrl+o transcript"]
     fresh_rows = [
-        "⠹ Thinking… 1.1s",
         "Worked for 19s. 2 commands still running.",
         "❯",
         "Grok 4.5 · always-approve · ctrl+o transcript",
     ]
+    classification = _grok().classify_screen(fresh_rows)
+    running_signal = next(
+        signal
+        for signal in classification.signals
+        if signal.provider_signal == "RUNNING_PATTERN"
+    )
+    assert classification.status == TerminalStatus.PROCESSING
+    assert classification.provider_signal == "RUNNING_PATTERN"
+    assert running_signal.temporal_policy == "exempt"
     observation = BoundaryObservation("epoch", TerminalStatus.IDLE, 1, 1, 1, None, 1)
     monitor = StatusMonitor()
     screen = SimpleNamespace(display=incremental_rows, columns=220, lines=50)
@@ -1070,12 +1079,7 @@ def test_livefix_p1_stale_incremental_ready_fresh_busy_defers_without_overwrite(
     monitor.get_status_gen = MagicMock(return_value=1)
     backend = MagicMock()
     backend.get_pane_size.return_value = (220, 50)
-    animated_rows = [row.replace("⠹", "⠸") for row in fresh_rows]
-    backend.capture_viewport.side_effect = [
-        "\n".join(fresh_rows),
-        "\n".join(fresh_rows),
-        "\n".join(animated_rows),
-    ]
+    backend.capture_viewport.return_value = "\n".join(fresh_rows)
 
     with (
         patch("cli_agent_orchestrator.services.inbox_service.status_monitor", monitor),
@@ -1091,8 +1095,7 @@ def test_livefix_p1_stale_incremental_ready_fresh_busy_defers_without_overwrite(
     ):
         InboxService().deliver_pending("receiver")
 
-    assert backend.capture_viewport.call_count == 3
-    backend.capture_viewport.assert_called_with("session", "receiver")
+    backend.capture_viewport.assert_called_once_with("session", "receiver")
     assert paste.call_count == 0
     assert get_message_trace(message.id)["attempts"] == []
     assert screen.display == incremental_rows

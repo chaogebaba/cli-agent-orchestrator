@@ -52,6 +52,7 @@ PROCESSING_PATTERN = (
     r"| - (?:Waiting for response|Thinking|Responding) - "
 )
 COMPLETION_PATTERN = r"^\s*(?:Turn completed in [\d.]+s\.|Worked for [\d.]+s\.)\s*$"
+RUNNING_PATTERN = r"^\s*Worked for [\d.]+s\.\s+\d+ commands? still running\.\s*$"
 WAITING_USER_ANSWER_PATTERN = (
     r"Run Grok Build in a project directory\?" r"|↑/↓ navigate" r"|Enter:submit"
 )
@@ -343,6 +344,7 @@ class GrokCliProvider(BaseProvider):
             return TerminalStatus.WAITING_USER_ANSWER
 
         last_processing = self._last_match(PROCESSING_PATTERN, clean_output)
+        last_running = self._last_match(RUNNING_PATTERN, clean_output)
         last_completed = self._last_match(COMPLETION_PATTERN, clean_output)
         last_idle = self._last_idle_match(clean_output)
         tail = "\n".join(clean_output.splitlines()[-12:])
@@ -352,6 +354,11 @@ class GrokCliProvider(BaseProvider):
 
         if last_processing and (
             last_completed is None or last_completed.start() < last_processing.start()
+        ):
+            return TerminalStatus.PROCESSING
+
+        if last_running and (
+            last_completed is None or last_completed.start() < last_running.start()
         ):
             return TerminalStatus.PROCESSING
 
@@ -394,6 +401,10 @@ class GrokCliProvider(BaseProvider):
                     signals.append(
                         ScreenSignal("progress", "PROCESSING_PATTERN", index, row, "corroborable")
                     )
+            if re.search(RUNNING_PATTERN, row):
+                signals.append(
+                    ScreenSignal("progress", "RUNNING_PATTERN", index, row, "exempt")
+                )
             if re.search(COMPLETION_PATTERN, row):
                 signals.append(ScreenSignal("completion", "COMPLETION_PATTERN", index))
             # Grok errors are effective only after the newest completion.
