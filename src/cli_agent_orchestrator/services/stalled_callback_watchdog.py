@@ -50,9 +50,7 @@ def _filtered_liveness_tail(tail: str, patterns: list[str]) -> str:
         return tail
     compiled = [re.compile(pattern) for pattern in patterns]
     return "\n".join(
-        line
-        for line in tail.splitlines()
-        if not any(pattern.search(line) for pattern in compiled)
+        line for line in tail.splitlines() if not any(pattern.search(line) for pattern in compiled)
     )
 
 
@@ -264,7 +262,9 @@ class StalledCallbackWatchdog:
             terminal_ids = [
                 terminal_id
                 for terminal_id, episode in self._episodes.items()
-                if terminal_id not in self._paused and not episode.callback_seen and not episode.fired
+                if terminal_id not in self._paused
+                and not episode.callback_seen
+                and not episode.fired
             ]
 
         if not terminal_ids:
@@ -754,9 +754,7 @@ class StalledCallbackWatchdog:
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         now = time.monotonic() if now is None else now
-        observations = {
-            item.receiver_id: item for item in list_ready_backlog_observations()
-        }
+        observations = {item.receiver_id: item for item in list_ready_backlog_observations()}
         with self._lock:
             for terminal_id in set(self._ready_backlog_episodes) - set(observations):
                 self._ready_backlog_episodes.pop(terminal_id, None)
@@ -770,8 +768,7 @@ class StalledCallbackWatchdog:
             status = status_monitor.get_status(terminal_id)
             if (
                 status not in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
-                or observation.oldest_pending_age_seconds
-                <= CAO_WAITING_INBOX_GRACE_SECONDS
+                or observation.oldest_pending_age_seconds <= CAO_WAITING_INBOX_GRACE_SECONDS
                 or observation.has_open_delivering_attempt
             ):
                 with self._lock:

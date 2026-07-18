@@ -402,9 +402,7 @@ class GrokCliProvider(BaseProvider):
                         ScreenSignal("progress", "PROCESSING_PATTERN", index, row, "corroborable")
                     )
             if re.search(RUNNING_PATTERN, row):
-                signals.append(
-                    ScreenSignal("progress", "RUNNING_PATTERN", index, row, "exempt")
-                )
+                signals.append(ScreenSignal("progress", "RUNNING_PATTERN", index, row, "exempt"))
             if re.search(COMPLETION_PATTERN, row):
                 signals.append(ScreenSignal("completion", "COMPLETION_PATTERN", index))
             # Grok errors are effective only after the newest completion.

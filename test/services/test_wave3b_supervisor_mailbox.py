@@ -1654,9 +1654,7 @@ def test_wpq5_i_compact_digest_selects_confirmed_and_inferred_deliveries_with_12
             )
         )
 
-    notice_id = publish_compact_boundary_digest(
-        "22222222", window_min=15, now_utc=now
-    )
+    notice_id = publish_compact_boundary_digest("22222222", window_min=15, now_utc=now)
     assert notice_id is not None
     with scratch_db() as db:
         notice = db.get(InboxModel, notice_id)

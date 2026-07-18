@@ -154,9 +154,7 @@ def test_wpq5_a_matching_challenge_reply_settles_open_attempt_and_records_event(
     service._commit_watchdog_ops.assert_called_once()
 
 
-def test_wpq5_b_incident_2819_raw_clock_misses_but_normalized_clock_hits(
-    wpq5_db, monkeypatch
-):
+def test_wpq5_b_incident_2819_raw_clock_misses_but_normalized_clock_hits(wpq5_db, monkeypatch):
     monkeypatch.setattr(database, "get_localzone", lambda: ZoneInfo("America/New_York"))
     message = create_inbox_message("sender", "receiver", "PONG")
     raw = "a" * 32
@@ -275,13 +273,8 @@ def test_wpq5_g_wire_last_suffix_absence_and_durable_bytes_are_exact(wpq5_db, mo
         assert db.get(InboxModel, message.id).message == "plain durable body"
 
 
-def test_wpq5_g_trailing_wrapper_prefix_quote_stays_eventless_and_retryable(
-    wpq5_db, monkeypatch
-):
-    durable_body = (
-        "plain delivery\n"
-        "[Message from terminal sender. non-authentic trailing quote"
-    )
+def test_wpq5_g_trailing_wrapper_prefix_quote_stays_eventless_and_retryable(wpq5_db, monkeypatch):
+    durable_body = "plain delivery\n" "[Message from terminal sender. non-authentic trailing quote"
     message = create_inbox_message("sender", "receiver", durable_body)
     wires: list[str] = []
     monkeypatch.setattr(inbox_module.secrets, "token_hex", lambda _size: "a" * 32)
@@ -399,9 +392,7 @@ def test_wpq5_p_logical_row_challenge_is_cap_confirmable(wpq5_db, monkeypatch):
     create_inbox_message("receiver", "sender", f"ACK mid {message.id}:{raw}")
     for index in range(2):
         pending = get_pending_messages("receiver")[0]
-        attempt = begin_delivery_attempt(
-            [pending], "receiver", "grok_cli", f"extra-{index}", 1
-        )
+        attempt = begin_delivery_attempt([pending], "receiver", "grok_cli", f"extra-{index}", 1)
         assert settle_delivery_attempt(
             attempt,
             MessageStatus.PENDING,
@@ -416,9 +407,7 @@ def test_wpq5_p_logical_row_challenge_is_cap_confirmable(wpq5_db, monkeypatch):
     assert len(wires) == 1
 
 
-def test_wpq5_q_two_message_batch_is_unchanged_eventless_and_retryable(
-    wpq5_db, monkeypatch
-):
+def test_wpq5_q_two_message_batch_is_unchanged_eventless_and_retryable(wpq5_db, monkeypatch):
     first = create_inbox_message("sender", "receiver", _wrapped("batch A"))
     second = create_inbox_message("sender", "receiver", _wrapped("batch B"))
     original = f"{first.message}\n{second.message}"

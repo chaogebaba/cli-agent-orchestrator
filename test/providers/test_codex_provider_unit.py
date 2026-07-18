@@ -1424,9 +1424,7 @@ class TestCodexIdleReasonClassification:
                 is None
             )
         you_rows = ["You asked about authentication middleware", "429 Too Many Requests"]
-        assert provider.classify_idle_reason(
-            you_rows, provider.classify_screen(you_rows)
-        ) is None
+        assert provider.classify_idle_reason(you_rows, provider.classify_screen(you_rows)) is None
 
     def test_wpq6_u_system_notice_bullet_is_conversational(self):
         rows = ["• You have 3 usage limit resets available. Run /usage to use one."]

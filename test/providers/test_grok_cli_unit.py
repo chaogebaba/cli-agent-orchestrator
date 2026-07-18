@@ -79,9 +79,7 @@ def test_grok_status_processing_minimal() -> None:
 
 
 def test_grok_screen_status_processing_from_real_tool_capture() -> None:
-    fixture = (
-        Path(__file__).parents[1] / "fixtures" / "fx4" / "fx4-grok-toollist-capture.txt"
-    )
+    fixture = Path(__file__).parents[1] / "fixtures" / "fx4" / "fx4-grok-toollist-capture.txt"
     screen = [
         line
         for line in fixture.read_text(encoding="utf-8").splitlines()
@@ -92,12 +90,7 @@ def test_grok_screen_status_processing_from_real_tool_capture() -> None:
 
 
 def test_grok_screen_status_processing_from_topanchored_capture() -> None:
-    fixture = (
-        Path(__file__).parents[1]
-        / "fixtures"
-        / "fx5"
-        / "fx5-topanchored-capture.txt"
-    )
+    fixture = Path(__file__).parents[1] / "fixtures" / "fx5" / "fx5-topanchored-capture.txt"
     screen = fixture.read_text(encoding="utf-8").splitlines()
 
     assert _provider().get_status_from_screen(screen) == TerminalStatus.PROCESSING
@@ -219,8 +212,7 @@ def test_grok_status_waiting_for_project_directory_picker() -> None:
 
     assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
     assert (
-        provider.get_status_from_screen(output.splitlines())
-        == TerminalStatus.WAITING_USER_ANSWER
+        provider.get_status_from_screen(output.splitlines()) == TerminalStatus.WAITING_USER_ANSWER
     )
 
 
@@ -360,9 +352,7 @@ def test_grok_read_empty_composer() -> None:
     assert provider.read_composer_draft(screen) == ""
 
 
-def test_ensure_grok_mcp_servers_upserts_user_config_without_clobber(
-    tmp_path, monkeypatch
-) -> None:
+def test_ensure_grok_mcp_servers_upserts_user_config_without_clobber(tmp_path, monkeypatch) -> None:
     config_file = tmp_path / "config.toml"
     config_file.write_text(
         "[ui]\n"
@@ -404,9 +394,7 @@ def test_ensure_grok_mcp_servers_upserts_user_config_without_clobber(
     assert 'command = "old"' not in text
 
 
-def test_ensure_grok_mcp_servers_preserves_config_when_replace_fails(
-    tmp_path, monkeypatch
-) -> None:
+def test_ensure_grok_mcp_servers_preserves_config_when_replace_fails(tmp_path, monkeypatch) -> None:
     config_file = tmp_path / "config.toml"
     original = '[ui]\ntheme = "dark"\n'
     config_file.write_text(original, encoding="utf-8")
@@ -453,9 +441,7 @@ def test_grok_command_uses_default_model_when_profile_unset(
     assert "-m grok-composer-2.5-fast" in command
 
 
-def test_grok_command_default_model_wins_over_profile(
-    provider_defaults_file, monkeypatch
-) -> None:
+def test_grok_command_default_model_wins_over_profile(provider_defaults_file, monkeypatch) -> None:
     profile = type(
         "Profile",
         (),
@@ -547,9 +533,7 @@ def test_grok_command_absent_defaults_preserves_current_behavior(monkeypatch) ->
     assert " -m " not in command
 
 
-def test_grok_command_per_profile_effort_wins(
-    provider_defaults_file, monkeypatch
-) -> None:
+def test_grok_command_per_profile_effort_wins(provider_defaults_file, monkeypatch) -> None:
     provider_defaults_file.write_text(
         "[grok_cli]\n"
         'reasoning_effort = "low"\n'
@@ -633,9 +617,7 @@ def test_grok_command_empty_per_profile_effort_clears_lower_tiers(
     assert "high" not in command
 
 
-def test_grok_command_per_profile_model_wins(
-    provider_defaults_file, monkeypatch
-) -> None:
+def test_grok_command_per_profile_model_wins(provider_defaults_file, monkeypatch) -> None:
     provider_defaults_file.write_text(
         "[grok_cli]\n"
         'model = "grok-provider-model"\n'

@@ -19,19 +19,32 @@ from cli_agent_orchestrator.cli.commands.messages import messages
 
 
 def _message(status=MessageStatus.PENDING):
-    return InboxMessage(id=1, sender_id="sender", receiver_id="receiver", message="raw",
-                        orchestration_type=OrchestrationType.SEND_MESSAGE,
-                        status=status, created_at=datetime.now())
+    return InboxMessage(
+        id=1,
+        sender_id="sender",
+        receiver_id="receiver",
+        message="raw",
+        orchestration_type=OrchestrationType.SEND_MESSAGE,
+        status=status,
+        created_at=datetime.now(),
+    )
 
 
 @pytest.fixture
 def delivery(monkeypatch):
     message = _message()
     monkeypatch.setattr(module, "get_pending_messages", lambda *_a, **_k: [message])
-    monkeypatch.setattr(module, "get_terminal_metadata", lambda _id: {
-        "id": "receiver", "provider": "claude_code", "caller_id": None,
-        "tmux_session": "s", "tmux_window": "w",
-    })
+    monkeypatch.setattr(
+        module,
+        "get_terminal_metadata",
+        lambda _id: {
+            "id": "receiver",
+            "provider": "claude_code",
+            "caller_id": None,
+            "tmux_session": "s",
+            "tmux_window": "w",
+        },
+    )
     monkeypatch.setattr(module.status_monitor, "get_status", lambda _id: TerminalStatus.IDLE)
     monkeypatch.setattr(module.status_monitor, "get_input_gen", lambda _id: 1)
     monkeypatch.setattr(module.status_monitor, "get_status_gen", lambda _id: 2)
@@ -40,10 +53,19 @@ def delivery(monkeypatch):
     monkeypatch.setattr(module, "resolve_session_transcript", lambda _meta: Path("/trace"))
     monkeypatch.setattr(module, "transcript_ref", lambda _path: {"path": "/trace", "size": 0})
     monkeypatch.setattr(module, "begin_delivery_attempt", lambda *_a, **_k: "attempt-1")
-    monkeypatch.setattr(module, "get_message_trace", lambda _id: {"attempts": [{
-        "attempt_uuid": "attempt-1", "started_at": datetime.now().isoformat(),
-        "evidence": {"path": "/trace", "size": 0},
-    }]})
+    monkeypatch.setattr(
+        module,
+        "get_message_trace",
+        lambda _id: {
+            "attempts": [
+                {
+                    "attempt_uuid": "attempt-1",
+                    "started_at": datetime.now().isoformat(),
+                    "evidence": {"path": "/trace", "size": 0},
+                }
+            ]
+        },
+    )
     monkeypatch.setattr(module.terminal_service, "prepare_input", lambda *_a, **_k: "wire")
     send = MagicMock()
     monkeypatch.setattr(module.terminal_service, "send_prepared_input", send)
@@ -55,10 +77,19 @@ def delivery(monkeypatch):
 
 def test_prior_attempt_hit_deduplicates_without_paste(monkeypatch, delivery):
     _message_row, send, _settle = delivery
-    monkeypatch.setattr(module, "list_message_attempts", lambda _ids: [{
-        "attempt_uuid": "old", "outcome": "ambiguous", "payload_hash": "hash",
-        "started_at": datetime.now(), "evidence": "{}",
-    }])
+    monkeypatch.setattr(
+        module,
+        "list_message_attempts",
+        lambda _ids: [
+            {
+                "attempt_uuid": "old",
+                "outcome": "ambiguous",
+                "payload_hash": "hash",
+                "started_at": datetime.now(),
+                "evidence": "{}",
+            }
+        ],
+    )
     monkeypatch.setattr(module, "_wpm2_lookup", lambda *_a, **_k: ("hit", {}))
     confirm = MagicMock(return_value=True)
     monkeypatch.setattr(module, "confirm_batch_from_prior_attempt", confirm)
@@ -72,16 +103,21 @@ def test_delivery_persists_resolution_kind_at_begin_and_settle(monkeypatch, deli
     begin = MagicMock(return_value="attempt-1")
     monkeypatch.setattr(module, "begin_delivery_attempt", begin)
     monkeypatch.setattr(
-        module, "transcript_ref",
-        lambda _resolution: {"path": "/trace", "inode": 7, "size": 0,
-                             "resolution_kind": "binding"},
+        module,
+        "transcript_ref",
+        lambda _resolution: {"path": "/trace", "inode": 7, "size": 0, "resolution_kind": "binding"},
     )
     monkeypatch.setattr(
-        module, "confirm_delivery",
+        module,
+        "confirm_delivery",
         lambda *_a, **_k: (
             "hit",
-            {"kind": "transcript_user_turn", "path": "/trace", "inode": 7,
-             "resolution_kind": "binding"},
+            {
+                "kind": "transcript_user_turn",
+                "path": "/trace",
+                "inode": 7,
+                "resolution_kind": "binding",
+            },
         ),
     )
     InboxService().deliver_pending("receiver")
@@ -94,10 +130,19 @@ def test_delivery_persists_resolution_kind_at_begin_and_settle(monkeypatch, deli
 
 def test_prior_attempt_miss_performs_retry_paste(monkeypatch, delivery):
     _message_row, send, _settle = delivery
-    monkeypatch.setattr(module, "list_message_attempts", lambda _ids: [{
-        "attempt_uuid": "old", "outcome": "ambiguous", "payload_hash": "hash",
-        "started_at": datetime.now(), "evidence": "{}",
-    }])
+    monkeypatch.setattr(
+        module,
+        "list_message_attempts",
+        lambda _ids: [
+            {
+                "attempt_uuid": "old",
+                "outcome": "ambiguous",
+                "payload_hash": "hash",
+                "started_at": datetime.now(),
+                "evidence": "{}",
+            }
+        ],
+    )
     monkeypatch.setattr(module, "_wpm2_lookup", lambda *_a, **_k: ("absent", {}))
     monkeypatch.setattr(module, "confirm_delivery", lambda *_a, **_k: ("unverified", {}))
     InboxService().deliver_pending("receiver")
@@ -107,54 +152,71 @@ def test_prior_attempt_miss_performs_retry_paste(monkeypatch, delivery):
 def test_retry_reshapes_and_persists_each_wire_hash_not_raw(monkeypatch, delivery):
     _message_row, _send, _settle = delivery
     prepared = iter(["memory|contract|raw", "contract|raw"])
-    monkeypatch.setattr(module.terminal_service, "prepare_input",
-                        lambda *_a, **_k: next(prepared))
+    monkeypatch.setattr(module.terminal_service, "prepare_input", lambda *_a, **_k: next(prepared))
     captured = []
-    monkeypatch.setattr(module, "begin_delivery_attempt",
-                        lambda _batch, _receiver, _provider, digest, length, *_a, **_k:
-                        captured.append((digest, length)) or f"attempt-{len(captured)}")
-    monkeypatch.setattr(module, "get_message_trace", lambda _id: {"attempts": [{
-        "attempt_uuid": f"attempt-{len(captured)}", "started_at": datetime.now().isoformat(),
-        "evidence": {},
-    }]})
+    monkeypatch.setattr(
+        module,
+        "begin_delivery_attempt",
+        lambda _batch, _receiver, _provider, digest, length, *_a, **_k: captured.append(
+            (digest, length)
+        )
+        or f"attempt-{len(captured)}",
+    )
+    monkeypatch.setattr(
+        module,
+        "get_message_trace",
+        lambda _id: {
+            "attempts": [
+                {
+                    "attempt_uuid": f"attempt-{len(captured)}",
+                    "started_at": datetime.now().isoformat(),
+                    "evidence": {},
+                }
+            ]
+        },
+    )
     outcomes = iter([("ambiguous", {}), ("unverified", {})])
     monkeypatch.setattr(module, "confirm_delivery", lambda *_a, **_k: next(outcomes))
     svc = InboxService()
     svc.deliver_pending("receiver")
     svc.deliver_pending("receiver")
     assert [item[0] for item in captured] == [
-        module.wire_hash("memory|contract|raw"), module.wire_hash("contract|raw")]
+        module.wire_hash("memory|contract|raw"),
+        module.wire_hash("contract|raw"),
+    ]
     assert all(item[0] != module.wire_hash("raw") for item in captured)
 
 
 def test_real_contract_and_first_memory_shape_bind_transcript_hash(monkeypatch, tmp_path):
     terminal_service._memory_injected_terminals.discard("receiver")
     metadata = {
-        "id": "receiver", "tmux_session": "s", "tmux_window": "w",
+        "id": "receiver",
+        "tmux_session": "s",
+        "tmux_window": "w",
         "agent_profile": "worker",
     }
     monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda _id: metadata)
     profile = MagicMock(messageContract="return through CAO")
     monkeypatch.setattr(terminal_service, "load_agent_profile", lambda _name: profile)
     monkeypatch.setattr(
-        terminal_service.MemoryService, "get_curated_memory_context",
-        lambda *_a, **_k: "<cao-memory>remember this</cao-memory>")
+        terminal_service.MemoryService,
+        "get_curated_memory_context",
+        lambda *_a, **_k: "<cao-memory>remember this</cao-memory>",
+    )
 
-    first = terminal_service.prepare_input(
-        "receiver", "raw", OrchestrationType.SEND_MESSAGE)
+    first = terminal_service.prepare_input("receiver", "raw", OrchestrationType.SEND_MESSAGE)
     assert first == (
-        "<cao-memory>remember this</cao-memory>\n\n"
-        "raw\n\n[Contract: return through CAO]")
+        "<cao-memory>remember this</cao-memory>\n\n" "raw\n\n[Contract: return through CAO]"
+    )
     with terminal_service._memory_injected_lock:
         terminal_service._memory_injected_terminals.add("receiver")
-    second = terminal_service.prepare_input(
-        "receiver", "raw", OrchestrationType.SEND_MESSAGE)
+    second = terminal_service.prepare_input("receiver", "raw", OrchestrationType.SEND_MESSAGE)
     assert second == "raw\n\n[Contract: return through CAO]"
 
     transcript = tmp_path / "session.jsonl"
     transcript.write_text(
-        "\n".join(json.dumps({"type": "user", "message": value})
-                    for value in (first, second)) + "\n",
+        "\n".join(json.dumps({"type": "user", "message": value}) for value in (first, second))
+        + "\n",
         encoding="utf-8",
     )
     assert transcript_lookup(transcript, wire_hash(first))[0] == "hit"
@@ -260,7 +322,8 @@ def test_generic_send_exception_settles_failed_durably(monkeypatch, delivery):
 def test_ambiguous_outcome_settles_pending_with_evidence(monkeypatch, delivery):
     _message_row, _send, settle = delivery
     monkeypatch.setattr(
-        module, "confirm_delivery",
+        module,
+        "confirm_delivery",
         lambda *_a, **_k: ("ambiguous", {"kind": "transcript_absent"}),
     )
     InboxService().deliver_pending("receiver")
@@ -280,14 +343,33 @@ def test_ambiguous_outcome_settles_pending_with_evidence(monkeypatch, delivery):
 def test_startup_sweep_oracle_matrix(monkeypatch, path, lookup, status, outcome):
     message = _message(MessageStatus.DELIVERING)
     monkeypatch.setattr(module, "list_stale_delivering_messages", lambda: [message])
-    monkeypatch.setattr(module, "get_message_trace", lambda _id: {"attempts": [{
-        "attempt_uuid": "attempt", "payload_hash": "hash", "started_at": datetime.now(),
-        "evidence": {}, "sender_id": "sender", "orchestration_type": "send_message",
-    }]})
+    monkeypatch.setattr(
+        module,
+        "get_message_trace",
+        lambda _id: {
+            "attempts": [
+                {
+                    "attempt_uuid": "attempt",
+                    "payload_hash": "hash",
+                    "started_at": datetime.now(),
+                    "evidence": {},
+                    "sender_id": "sender",
+                    "orchestration_type": "send_message",
+                }
+            ]
+        },
+    )
     monkeypatch.setattr(module, "list_attempt_member_ids", lambda _id: [1])
-    monkeypatch.setattr(module, "get_terminal_metadata", lambda _id: {
-        "id": "receiver", "tmux_session": "s", "tmux_window": "w", "caller_id": None,
-    })
+    monkeypatch.setattr(
+        module,
+        "get_terminal_metadata",
+        lambda _id: {
+            "id": "receiver",
+            "tmux_session": "s",
+            "tmux_window": "w",
+            "caller_id": None,
+        },
+    )
     backend = MagicMock()
     monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
     monkeypatch.setattr(module, "resolve_session_transcript", lambda _meta: path)
@@ -305,10 +387,22 @@ def test_startup_sweep_oracle_matrix(monkeypatch, path, lookup, status, outcome)
 def test_startup_sweep_metadata_gone_is_failed(monkeypatch):
     message = _message(MessageStatus.DELIVERING)
     monkeypatch.setattr(module, "list_stale_delivering_messages", lambda: [message])
-    monkeypatch.setattr(module, "get_message_trace", lambda _id: {"attempts": [{
-        "attempt_uuid": "attempt", "payload_hash": "hash", "started_at": datetime.now(),
-        "evidence": {}, "sender_id": "sender", "orchestration_type": "send_message",
-    }]})
+    monkeypatch.setattr(
+        module,
+        "get_message_trace",
+        lambda _id: {
+            "attempts": [
+                {
+                    "attempt_uuid": "attempt",
+                    "payload_hash": "hash",
+                    "started_at": datetime.now(),
+                    "evidence": {},
+                    "sender_id": "sender",
+                    "orchestration_type": "send_message",
+                }
+            ]
+        },
+    )
     monkeypatch.setattr(module, "list_attempt_member_ids", lambda _id: [1])
     monkeypatch.setattr(module, "get_terminal_metadata", lambda _id: None)
     settle = MagicMock()
@@ -320,13 +414,28 @@ def test_startup_sweep_metadata_gone_is_failed(monkeypatch):
 def test_startup_sweep_pane_gap_requeues_without_transcript_reader(monkeypatch):
     message = _message(MessageStatus.DELIVERING)
     monkeypatch.setattr(module, "list_stale_delivering_messages", lambda: [message])
-    monkeypatch.setattr(module, "get_message_trace", lambda _id: {"attempts": [{
-        "attempt_uuid": "attempt", "payload_hash": "hash", "started_at": datetime.now(),
-        "evidence": {}, "sender_id": "sender", "orchestration_type": "send_message",
-    }]})
+    monkeypatch.setattr(
+        module,
+        "get_message_trace",
+        lambda _id: {
+            "attempts": [
+                {
+                    "attempt_uuid": "attempt",
+                    "payload_hash": "hash",
+                    "started_at": datetime.now(),
+                    "evidence": {},
+                    "sender_id": "sender",
+                    "orchestration_type": "send_message",
+                }
+            ]
+        },
+    )
     monkeypatch.setattr(module, "list_attempt_member_ids", lambda _id: [1])
-    monkeypatch.setattr(module, "get_terminal_metadata", lambda _id: {
-        "id": "receiver", "tmux_session": "s", "tmux_window": "w"})
+    monkeypatch.setattr(
+        module,
+        "get_terminal_metadata",
+        lambda _id: {"id": "receiver", "tmux_session": "s", "tmux_window": "w"},
+    )
     backend = MagicMock()
     backend.get_history.side_effect = RuntimeError("pane gap")
     monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
@@ -341,16 +450,36 @@ def test_startup_sweep_pane_gap_requeues_without_transcript_reader(monkeypatch):
 
 def test_startup_sweep_unresolved_notifies_once_and_is_idempotent(monkeypatch):
     message = _message(MessageStatus.DELIVERING)
-    monkeypatch.setattr(module, "list_stale_delivering_messages", MagicMock(
-        side_effect=[[message], []]))
-    monkeypatch.setattr(module, "get_message_trace", lambda _id: {"attempts": [{
-        "attempt_uuid": "attempt", "payload_hash": "hash", "started_at": datetime.now(),
-        "evidence": {}, "sender_id": "sender", "orchestration_type": "send_message",
-    }]})
+    monkeypatch.setattr(
+        module, "list_stale_delivering_messages", MagicMock(side_effect=[[message], []])
+    )
+    monkeypatch.setattr(
+        module,
+        "get_message_trace",
+        lambda _id: {
+            "attempts": [
+                {
+                    "attempt_uuid": "attempt",
+                    "payload_hash": "hash",
+                    "started_at": datetime.now(),
+                    "evidence": {},
+                    "sender_id": "sender",
+                    "orchestration_type": "send_message",
+                }
+            ]
+        },
+    )
     monkeypatch.setattr(module, "list_attempt_member_ids", lambda _id: [1])
-    monkeypatch.setattr(module, "get_terminal_metadata", lambda _id: {
-        "id": "receiver", "tmux_session": "s", "tmux_window": "w", "caller_id": "caller",
-    })
+    monkeypatch.setattr(
+        module,
+        "get_terminal_metadata",
+        lambda _id: {
+            "id": "receiver",
+            "tmux_session": "s",
+            "tmux_window": "w",
+            "caller_id": "caller",
+        },
+    )
     monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", MagicMock())
     static_reader = MagicMock(return_value=Path("/trace"))
     monkeypatch.setattr(module, "resolve_session_transcript", static_reader)
@@ -359,8 +488,11 @@ def test_startup_sweep_unresolved_notifies_once_and_is_idempotent(monkeypatch):
         "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
         live_provider_lookup,
     )
-    monkeypatch.setattr(module, "transcript_lookup", lambda *_a, **_k: (
-        "unresolved", {"kind": "transcript_unreadable"}))
+    monkeypatch.setattr(
+        module,
+        "transcript_lookup",
+        lambda *_a, **_k: ("unresolved", {"kind": "transcript_unreadable"}),
+    )
     settle = MagicMock(return_value=True)
     monkeypatch.setattr(module, "settle_delivery_attempt", settle)
     notify = MagicMock()
@@ -394,12 +526,14 @@ def test_messages_trace_cli_table_and_json(monkeypatch):
     response = MagicMock(status_code=200)
     response.json.return_value = {
         "message": {"status": "delivered"},
-        "attempts": [{"started_at": "now", "outcome": "confirmed",
-                      "attempt_uuid": "attempt", "reason": None}],
+        "attempts": [
+            {"started_at": "now", "outcome": "confirmed", "attempt_uuid": "attempt", "reason": None}
+        ],
         "events": [{"created_at": "later", "kind": "inferred_delivered"}],
     }
-    monkeypatch.setattr("cli_agent_orchestrator.cli.commands.messages.requests.get",
-                        lambda *_a, **_k: response)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.cli.commands.messages.requests.get", lambda *_a, **_k: response
+    )
     runner = CliRunner()
     table = runner.invoke(messages, ["trace", "7"])
     assert table.exit_code == 0
@@ -423,9 +557,14 @@ def test_terminal_delete_state_retains_lock_identity_and_cleans_wake_seq():
 
 def test_prepared_send_consumes_memory_before_backend_io_exception(monkeypatch):
     terminal_service._memory_injected_terminals.discard("receiver")
-    monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda _id: {
-        "tmux_session": "s", "tmux_window": "w",
-    })
+    monkeypatch.setattr(
+        terminal_service,
+        "get_terminal_metadata",
+        lambda _id: {
+            "tmux_session": "s",
+            "tmux_window": "w",
+        },
+    )
     provider = MagicMock()
     provider.paste_enter_count = 1
     provider.paste_submit_delay = 0.3

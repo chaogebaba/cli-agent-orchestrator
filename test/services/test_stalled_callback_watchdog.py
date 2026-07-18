@@ -9,7 +9,6 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
 from cli_agent_orchestrator.services.stalled_callback_watchdog import StalledCallbackWatchdog
 
-
 _WPQ4_T07_FRAME = """
 ◆ Task started: Sleep 90s then echo WPQ4_DONE
 ◆ Thought for 0.0s
@@ -80,8 +79,7 @@ def _watchdog_guard_fakes(
     }
     with (
         patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "get_terminal_metadata",
+            "cli_agent_orchestrator.services.stalled_callback_watchdog." "get_terminal_metadata",
             return_value=metadata,
         ),
         patch(
@@ -319,7 +317,9 @@ def test_msgtrace_confirmed_commit_performs_watchdog_operations_exactly_once():
     ) as watchdog:
         watchdog.has_episode.return_value = True
         service._commit_watchdog_ops(
-            "worker1", "caller1", OrchestrationType.SEND_MESSAGE,
+            "worker1",
+            "caller1",
+            OrchestrationType.SEND_MESSAGE,
             {"caller_id": "caller1", "agent_profile": "developer"},
         )
         watchdog.record_callback_if_to_caller.assert_called_once_with("caller1", "worker1")
@@ -405,17 +405,14 @@ def test_join_keeps_first_assignment_as_d4_suppression_lower_bound():
     assert not episode.fired
 
 
-@pytest.mark.parametrize(
-    "status", [MessageStatus.PENDING, MessageStatus.DELIVERING]
-)
+@pytest.mark.parametrize("status", [MessageStatus.PENDING, MessageStatus.DELIVERING])
 def test_watchdog_provisional_callback_suppresses_and_requeries(status):
     svc = _armed_due_watchdog()
     episode = svc._episodes["worker1"]
 
     with (
         patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "get_terminal_metadata",
+            "cli_agent_orchestrator.services.stalled_callback_watchdog." "get_terminal_metadata",
             return_value={"id": "worker1"},
         ),
         patch(
@@ -438,8 +435,7 @@ def test_watchdog_delivered_callback_durably_suppresses_without_requery():
 
     with (
         patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "get_terminal_metadata",
+            "cli_agent_orchestrator.services.stalled_callback_watchdog." "get_terminal_metadata",
             return_value={"id": "worker1"},
         ),
         patch(
@@ -462,8 +458,7 @@ def test_watchdog_refresh_rearm_pending_callback_prevents_second_fire():
 
     with (
         patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "get_terminal_metadata",
+            "cli_agent_orchestrator.services.stalled_callback_watchdog." "get_terminal_metadata",
             return_value={"id": "worker1", "caller_id": "caller1"},
         ),
         patch(

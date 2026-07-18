@@ -690,7 +690,9 @@ class TestInboxOperations:
         inspector = inspect(engine)
 
         assert "inbox_message_trace_event" in inspector.get_table_names()
-        assert {column["name"] for column in inspector.get_columns("inbox_message_trace_event")} == {
+        assert {
+            column["name"] for column in inspector.get_columns("inbox_message_trace_event")
+        } == {
             "id",
             "message_id",
             "kind",

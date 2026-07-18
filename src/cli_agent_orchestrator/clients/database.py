@@ -3692,9 +3692,7 @@ def find_inferred_delivery_evidence(
     attempted_receiver: str,
 ) -> dict[str, Any] | None:
     """Find a reply quoting a wire-only challenge for this message's exact attempt."""
-    pattern = re.compile(
-        rf"(?<![0-9a-f])mid {message_id}:([0-9a-f]{{32}})(?![0-9a-f])"
-    )
+    pattern = re.compile(rf"(?<![0-9a-f])mid {message_id}:([0-9a-f]{{32}})(?![0-9a-f])")
     with SessionLocal() as db:
         events = (
             db.query(InboxMessageTraceEventModel)
@@ -3745,9 +3743,7 @@ def find_inferred_delivery_evidence(
                         "reply_message_id": reply.id,
                         "challenge_sha256": challenge_sha256,
                         "anchor_attempt_uuid": attempt_uuid,
-                        "normalized_reply_at": normalized_reply.isoformat().replace(
-                            "+00:00", "Z"
-                        ),
+                        "normalized_reply_at": normalized_reply.isoformat().replace("+00:00", "Z"),
                     }
     return None
 

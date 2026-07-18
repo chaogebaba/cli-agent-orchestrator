@@ -1062,9 +1062,7 @@ def test_livefix_p1_stale_incremental_ready_fresh_busy_defers_without_overwrite(
     ]
     classification = _grok().classify_screen(fresh_rows)
     running_signal = next(
-        signal
-        for signal in classification.signals
-        if signal.provider_signal == "RUNNING_PATTERN"
+        signal for signal in classification.signals if signal.provider_signal == "RUNNING_PATTERN"
     )
     assert classification.status == TerminalStatus.PROCESSING
     assert classification.provider_signal == "RUNNING_PATTERN"
