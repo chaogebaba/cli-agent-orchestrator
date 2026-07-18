@@ -2671,6 +2671,8 @@ def _stamp_enqueue_generation(db: Any, row_fields: dict[str, Any]) -> dict[str, 
             .filter(TerminalModel.id == fields.get("receiver_id"))
             .scalar()
         )
+    if fields.get("status") == MessageStatus.PENDING.value and type(generation) is not int:
+        raise ValueError("pending_receiver_generation_unavailable")
     fields["enqueue_generation"] = cast(int | None, generation)
     return fields
 

@@ -204,23 +204,41 @@ class AutoResponder:
         self._wait_rule_active: Dict[str, tuple[str, float]] = {}
         self._retry_exhausted: set[str] = set()
 
+    def _waiting_gate_locked(self, terminal_id: str) -> str | tuple[str, str] | None:
+        state = self._unknown_state.get(terminal_id)
+        if state is not None and state.episode_open:
+            return "unknown_dialog"
+        wait_state = self._wait_rule_active.get(terminal_id)
+        if wait_state is not None:
+            return ("wait_rule", wait_state[0])
+        if terminal_id in self._retry_exhausted:
+            return "retry_exhausted"
+        return None
+
+    @staticmethod
+    def _gate_transition(
+        terminal_id: str,
+        before: str | tuple[str, str] | None,
+        after: str | tuple[str, str] | None,
+    ) -> None:
+        if before is None or after is not None:
+            return
+        from cli_agent_orchestrator.services.inbox_service import inbox_service
+
+        inbox_service.schedule_delivery_wake(terminal_id)
+
     def waiting_gate(self, terminal_id: str) -> str | tuple[str, str] | None:
         with self._lock:
-            state = self._unknown_state.get(terminal_id)
-            if state is not None and state.episode_open:
-                return "unknown_dialog"
-            wait_state = self._wait_rule_active.get(terminal_id)
-            if wait_state is not None:
-                return ("wait_rule", wait_state[0])
-            if terminal_id in self._retry_exhausted:
-                return "retry_exhausted"
-            return None
+            return self._waiting_gate_locked(terminal_id)
 
     def record_published_status(self, terminal_id: str, status: TerminalStatus) -> None:
         try:
             with self._lock:
+                before = self._waiting_gate_locked(terminal_id)
                 if status != TerminalStatus.WAITING_USER_ANSWER:
                     self._retry_exhausted.discard(terminal_id)
+                after = self._waiting_gate_locked(terminal_id)
+            self._gate_transition(terminal_id, before, after)
         except BaseException:
             try:
                 logger.warning(
@@ -239,7 +257,10 @@ class AutoResponder:
 
     def _clear_wait_rule(self, terminal_id: str) -> None:
         with self._lock:
+            before = self._waiting_gate_locked(terminal_id)
             self._wait_rule_active.pop(terminal_id, None)
+            after = self._waiting_gate_locked(terminal_id)
+        self._gate_transition(terminal_id, before, after)
 
     def on_screen(
         self, terminal_id: str, provider: Any, lines: List[str]
@@ -496,6 +517,7 @@ class AutoResponder:
         """Apply the existing two-clean-tick close rule to a confirmed clean frame."""
         close_episode = False
         with self._lock:
+            before = self._waiting_gate_locked(terminal_id)
             state = self._unknown_state.get(terminal_id)
             if state and state.episode_open:
                 state.non_dialog_ticks += 1
@@ -503,6 +525,8 @@ class AutoResponder:
                     state.episode_open = False
                     state.non_dialog_ticks = 0
                     close_episode = True
+            after = self._waiting_gate_locked(terminal_id)
+        self._gate_transition(terminal_id, before, after)
         if state and state.episode_open and not close_episode:
             return TerminalStatus.WAITING_USER_ANSWER
         return None

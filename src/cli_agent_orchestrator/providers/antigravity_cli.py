@@ -599,6 +599,13 @@ class AntigravityCliProvider(BaseProvider):
     # viewport resolves the in-place redraw, leaving only the live footer.
     supports_screen_detection = True
 
+    def classify_injection_hazard(self, rows: List[str]) -> str | None:
+        return (
+            "interactive_dialog"
+            if self.get_status_from_screen(rows) == TerminalStatus.WAITING_USER_ANSWER
+            else None
+        )
+
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         """Detect agy status from a pyte-composited viewport (escape-free rows).
 

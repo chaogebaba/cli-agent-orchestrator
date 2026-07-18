@@ -6,7 +6,7 @@ Core services depend only on this ABC, never on a concrete backend directly.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
@@ -42,6 +42,23 @@ class PaneIdentityReadResult:
             raise ValueError(f"invalid pane identity failure reason: {self.reason}")
 
 
+@dataclass(frozen=True)
+class NativeIdentityResult:
+    """Backend-native agent identity for panes without env readback."""
+
+    agent: str | None
+    foreground_process: str | None
+    verdict: Literal["match", "mismatch", "unavailable"]
+
+    def __post_init__(self) -> None:
+        if self.verdict == "match" and self.agent is None:
+            raise ValueError("native identity match requires an agent marker")
+        if self.verdict == "mismatch" and self.agent is None:
+            raise ValueError("native identity mismatch requires an agent marker")
+        if self.verdict == "unavailable" and self.agent is not None:
+            raise ValueError("unavailable native identity cannot carry an agent marker")
+
+
 class TerminalBackend(ABC):
     """Abstract base class defining the terminal backend contract.
 
@@ -51,6 +68,16 @@ class TerminalBackend(ABC):
     """
 
     supports_identity_readback = False
+
+    def read_native_identity(
+        self,
+        terminal_id: str,
+        session_name: str,
+        window_name: str,
+        expected_provider: str,
+    ) -> NativeIdentityResult:
+        """Return provider identity from a backend-native authority when available."""
+        return NativeIdentityResult(None, None, "unavailable")
 
     # --- Session lifecycle ---
 

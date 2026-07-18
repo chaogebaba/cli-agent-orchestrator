@@ -261,6 +261,10 @@ class BaseProvider(ABC):
         """Classify an idle frame for watchdog reporting without backend I/O."""
         return None
 
+    def classify_injection_hazard(self, rows: List[str]) -> str | None:
+        """Classify interactive chrome that must never receive injected text."""
+        return None
+
     # Opt-in flag for preserving an unsent human composer draft before CAO
     # injects orchestrated input. Providers that set this True must implement
     # read_composer_draft() against rendered screen lines and provide a single

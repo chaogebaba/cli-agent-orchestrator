@@ -1061,6 +1061,7 @@ class TestFlowOperations:
 
         # Receiver terminal exists
         mock_session.query.return_value.filter.return_value.first.return_value = MagicMock()
+        mock_session.query.return_value.filter.return_value.scalar.return_value = 1
 
         # Setup mock to update message attributes on refresh
         def mock_refresh(msg):

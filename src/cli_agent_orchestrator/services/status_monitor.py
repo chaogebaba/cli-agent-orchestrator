@@ -32,6 +32,10 @@ class PaneIdentityProofFailure(RuntimeError):
     """Internal control flow for a fail-closed admission identity proof."""
 
 
+class EmptyProbeCapture(RuntimeError):
+    """The backend returned no usable rows for the final admission frame."""
+
+
 ScreenProbeResult = Literal[
     "waiting_user_answer", "error", "processing", "completed", "idle", "unknown"
 ]
@@ -65,6 +69,10 @@ class ScreenProbeMeta(TypedDict):
     temporal_demotion: NotRequired["ScreenProbeTemporalDemotion"]
     transient_api_error: NotRequired[bool]
     idle_reason: NotRequired[str]
+    injection_hazard: NotRequired[str]
+    probe_failure: NotRequired[
+        Literal["empty_capture", "malformed_meta", "provider_hook_exception"]
+    ]
 
 
 class ScreenProbeTemporalDemotion(TypedDict):
@@ -1068,6 +1076,9 @@ class StatusMonitor:
 
         frame_source: ScreenProbeFrameSource = "incremental"
         identity_proof_failure: str | None = None
+        probe_failure: (
+            Literal["empty_capture", "malformed_meta", "provider_hook_exception"] | None
+        ) = None
 
         backend = None
         metadata = None
@@ -1094,7 +1105,7 @@ class StatusMonitor:
             )
             captured_rows = captured.splitlines()
             if not captured_rows or not any(row.strip() for row in captured_rows):
-                raise ValueError("Fresh viewport capture was empty")
+                raise EmptyProbeCapture("Fresh viewport capture was empty")
             if (
                 isinstance(pane_size, tuple)
                 and len(pane_size) == 2
@@ -1115,11 +1126,23 @@ class StatusMonitor:
             nonlocal identity_proof_failure
             route_backend, route_metadata = load_route()
             if getattr(route_backend, "supports_identity_readback", False) is not True:
-                logger.warning(
-                    "pane_identity_proof_unsupported terminal=%s backend=%s",
+                result = route_backend.read_native_identity(
                     terminal_id,
-                    type(route_backend).__name__,
+                    route_metadata["tmux_session"],
+                    route_metadata["tmux_window"],
+                    route_metadata.get("provider", "unknown"),
                 )
+                verdict = getattr(result, "verdict", None)
+                if verdict not in {"match", "mismatch", "unavailable"}:
+                    logger.warning(
+                        "pane_identity_proof_unsupported terminal=%s backend=%s",
+                        terminal_id,
+                        type(route_backend).__name__,
+                    )
+                    return
+                if verdict != "match":
+                    identity_proof_failure = f"native_identity_{verdict}"
+                    raise PaneIdentityProofFailure(identity_proof_failure)
                 return
             from cli_agent_orchestrator.services.pane_identity_service import (
                 pane_identity_failure,
@@ -1150,8 +1173,13 @@ class StatusMonitor:
             except PaneIdentityProofFailure:
                 rows, columns, row_count = [], 0, 0
                 classification = screen_classification_result([])
+            except EmptyProbeCapture:
+                probe_failure = "empty_capture"
+                rows, columns, row_count = [], 0, 0
+                classification = screen_classification_result([])
             except Exception:
                 logger.exception("Error refreshing admission screen for %s", terminal_id)
+                probe_failure = "empty_capture"
                 rows, columns, row_count = [], 0, 0
                 classification = screen_classification_result([])
 
@@ -1212,8 +1240,12 @@ class StatusMonitor:
                             "frames": corroboration_frames,
                             "multiset_sha256": _row_multiset_hash(previous),
                         }
+            except EmptyProbeCapture:
+                probe_failure = "empty_capture"
+                classification = processing_result()
             except Exception:
                 logger.exception("Error corroborating admission screen for %s", terminal_id)
+                probe_failure = "empty_capture"
                 classification = processing_result()
 
             if temporal_demotion is not None:
@@ -1248,9 +1280,38 @@ class StatusMonitor:
                 except PaneIdentityProofFailure:
                     rows, columns, row_count = [], 0, 0
                     classification = screen_classification_result([])
+                except EmptyProbeCapture:
+                    probe_failure = "empty_capture"
+                    rows, columns, row_count = [], 0, 0
+                    classification = screen_classification_result([])
                 except Exception:
                     logger.exception("Error finalizing admission screen for %s", terminal_id)
                     classification = processing_result()
+
+        if provider is not None and frame_source == "incremental" and probe_failure is None:
+            frame_source = "fresh_capture"
+            try:
+                prove_identity()
+                rows, columns, row_count, classification = capture()
+            except PaneIdentityProofFailure:
+                rows, columns, row_count = [], 0, 0
+                classification = screen_classification_result([])
+            except EmptyProbeCapture:
+                probe_failure = "empty_capture"
+                rows, columns, row_count = [], 0, 0
+                classification = screen_classification_result([])
+            except Exception:
+                logger.exception("Error refreshing final admission screen for %s", terminal_id)
+                probe_failure = "empty_capture"
+                rows, columns, row_count = [], 0, 0
+                classification = screen_classification_result([])
+
+        if (
+            classification.status == TerminalStatus.UNKNOWN
+            and probe_failure is None
+            and identity_proof_failure is None
+        ):
+            probe_failure = "malformed_meta"
 
         status_values: Dict[TerminalStatus, ScreenProbeResult] = {
             TerminalStatus.WAITING_USER_ANSWER: "waiting_user_answer",
@@ -1276,9 +1337,18 @@ class StatusMonitor:
         }
         if identity_proof_failure is not None:
             meta["identity_proof_failure"] = identity_proof_failure
+        if probe_failure is not None:
+            meta["probe_failure"] = probe_failure
         if temporal_demotion is not None:
             meta["temporal_demotion"] = temporal_demotion
         if provider is not None:
+            try:
+                injection_hazard = provider.classify_injection_hazard(rows)
+                if injection_hazard is not None:
+                    meta["injection_hazard"] = injection_hazard
+            except Exception:
+                meta["probe_failure"] = "provider_hook_exception"
+                logger.exception("Error classifying injection hazard for %s", terminal_id)
             try:
                 if provider.transient_error_detected(rows, classification):
                     meta["transient_api_error"] = True

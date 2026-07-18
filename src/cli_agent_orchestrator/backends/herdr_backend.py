@@ -18,9 +18,10 @@ import shlex
 import subprocess
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, cast
+from typing import Dict, List, Literal, Optional, cast
 
 from cli_agent_orchestrator.backends.base import (
+    NativeIdentityResult,
     TerminalBackend,
     TerminalBackendError,
     TerminalNotFoundError,
@@ -113,6 +114,18 @@ def _sanitize_herdr_args(args: List[str]) -> List[str]:
 # _resolve_workspace_id(). _resolve_pane_id_from_window() never caches pane_ids —
 # herdr renumbers panes on deletion, so it resolves the pane fresh every call.
 _PANE_CACHE_TTL = 5.0
+_PROVIDER_AGENT_MARKERS = {
+    "claude_code": "claude",
+    "codex": "codex",
+    "copilot_cli": "copilot",
+    "kimi_cli": "kimi",
+    "kiro_cli": "kiro",
+    "opencode_cli": "opencode",
+    "cursor_cli": "cursor",
+    "antigravity_cli": "antigravity",
+    "hermes": "hermes",
+    "grok_cli": "grok",
+}
 
 
 class HerdrBackend(TerminalBackend):
@@ -583,6 +596,43 @@ class HerdrBackend(TerminalBackend):
             return cast(Optional[str], pane_info.get("foreground_process"))
         except (json.JSONDecodeError, AttributeError):
             return None
+
+    def read_native_identity(
+        self,
+        terminal_id: str,
+        session_name: str,
+        window_name: str,
+        expected_provider: str,
+    ) -> NativeIdentityResult:
+        """Read the cached event agent and corroborate its current pane route."""
+        from cli_agent_orchestrator.services.herdr_inbox_registry import (
+            get_herdr_inbox_service,
+        )
+
+        service = get_herdr_inbox_service()
+        expected_agent = _PROVIDER_AGENT_MARKERS.get(expected_provider)
+        if service is None or expected_agent is None:
+            return NativeIdentityResult(None, None, "unavailable")
+        try:
+            resolved_pane = self._resolve_pane_id_from_window(session_name, window_name)
+        except TerminalBackendError:
+            return NativeIdentityResult(None, None, "unavailable")
+        result = self._run_herdr(["pane", "get", resolved_pane], check=False)
+        foreground_process: str | None = None
+        if result.returncode == 0:
+            try:
+                data = self._parse_herdr_json(result.stdout)
+                pane_info = data.get("pane", data) if isinstance(data, dict) else data
+                foreground_process = cast(str | None, pane_info.get("foreground_process"))
+            except (json.JSONDecodeError, AttributeError):
+                foreground_process = None
+        marker = service.read_identity_marker(terminal_id)
+        if marker is None or marker.pane_id != resolved_pane:
+            return NativeIdentityResult(None, foreground_process, "unavailable")
+        verdict: Literal["match", "mismatch"] = (
+            "match" if marker.agent == expected_agent else "mismatch"
+        )
+        return NativeIdentityResult(marker.agent, foreground_process, verdict)
 
     # --- Attach ---
 

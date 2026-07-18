@@ -344,15 +344,25 @@ def test_probe_08_typed_screen_probe_uses_one_frame_and_named_source_signal():
         SimpleNamespace(display=rows, columns=220, lines=50),
         object(),
     )
+    backend.get_pane_size.return_value = (220, 50)
+    backend.capture_viewport.return_value = "\n".join(rows)
     with (
         patch(
             "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
             return_value=_grok(),
         ),
         patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+        patch(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            return_value={
+                "tmux_session": "session",
+                "tmux_window": "receiver",
+                "provider": "grok_cli",
+            },
+        ),
     ):
         status, meta = monitor.probe_screen_status("receiver")
-    assert backend.mock_calls == []
+    backend.capture_viewport.assert_called_once_with("session", "receiver")
     assert status == TerminalStatus.PROCESSING
     assert set(meta) == {
         "probed_at",
@@ -363,7 +373,7 @@ def test_probe_08_typed_screen_probe_uses_one_frame_and_named_source_signal():
         "law_signal",
     }
     assert set(get_args(ScreenProbeFrameSource)) == {"incremental", "fresh_capture"}
-    assert meta["frame_source"] == "incremental"
+    assert meta["frame_source"] == "fresh_capture"
     assert meta["geometry"] == {"columns": 220, "rows": 50}
     assert len(meta["frame_rows_hash"]) == 64
     signal = meta["law_signal"]["provider_signal"]
@@ -376,6 +386,7 @@ def test_probe_08_typed_screen_probe_uses_one_frame_and_named_source_signal():
         SimpleNamespace(display=codex_rows, columns=220, lines=50),
         object(),
     )
+    backend.reset_mock()
     backend.get_native_status.side_effect = [None, TerminalStatus.PROCESSING]
     backend.get_pane_size.return_value = (220, 50)
     backend.capture_viewport.return_value = "\n".join(codex_rows)
@@ -578,7 +589,7 @@ def test_wpq1_logical_proof1_token_equals_routed_generation_for_null_and_nonnull
 def test_wpq1_logical_proof1_keeps_pre_rollback_generation_during_immediate_rollover(
     wave4_db, monkeypatch
 ):
-    message_id = _logical_identity_message(wave4_db, None)
+    message_id = _logical_identity_message(wave4_db, 7)
     rolled = False
 
     class RolloverSession(Session):

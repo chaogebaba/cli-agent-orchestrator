@@ -31,6 +31,7 @@ from cli_agent_orchestrator.clients.database import (
     confirm_batch_from_prior_attempt,
     count_ambiguous_attempts,
     create_inbox_message,
+    find_inferred_delivery_evidence,
     get_attempt_mailbox_authority,
     get_current_mailbox_terminal,
     get_message_trace,
@@ -53,14 +54,13 @@ from cli_agent_orchestrator.clients.database import (
     recover_transcript_binding_if_current,
     recover_wpm2_stale_attempt,
     settle_delivery_attempt,
-    settle_open_attempt_inferred_delivered,
     settle_delivery_attempt_proof_safe,
+    settle_open_attempt_inferred_delivered,
     settle_pending_orphan_messages,
     settle_pending_receiver_gone_if_generation,
     settle_wpm1_terminal_batch,
     transition_pending_to_delivery_failed,
     transition_pending_to_inferred_delivered,
-    find_inferred_delivery_evidence,
     update_message_status,
 )
 
@@ -97,7 +97,7 @@ from cli_agent_orchestrator.services.replay_policy import (
     ObservedFact,
     run_post_auth_engine,
 )
-from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.status_monitor import ScreenProbeMeta, status_monitor
 from cli_agent_orchestrator.services.terminal_service import TerminalInputBlockedError
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
@@ -144,6 +144,30 @@ class SuccessorCorroborationResult:
     kind: Literal["confirmed", "defer", "authorize"]
     hit_attempt_uuid: str | None = None
     hit_evidence: dict[str, Any] | None = None
+
+
+InjectSafetyReason = Literal[
+    "waiting_status",
+    "waiting_gate",
+    "dialog_hazard",
+    "identity_unverified",
+    "safety_unverified",
+]
+
+
+@dataclass(frozen=True)
+class InjectSafetyResult:
+    verdict: Literal["safe", "veto"]
+    reason: InjectSafetyReason | None = None
+    gate_episode: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.verdict == "safe" and (self.reason is not None or self.gate_episode is not None):
+            raise ValueError("safe injection result cannot carry veto detail")
+        if self.verdict == "veto" and self.reason is None:
+            raise ValueError("veto injection result requires a closed reason")
+        if self.reason != "waiting_gate" and self.gate_episode is not None:
+            raise ValueError("only waiting-gate vetoes carry a gate episode")
 
 
 def _lookup_ref(evidence: dict[str, Any]) -> tuple[str, int | None, int] | None:
@@ -306,18 +330,6 @@ def clear_terminal_delivery_state(terminal_id: str) -> None:
     clear_binding_staleness_state(terminal_id)
 
 
-def _should_defer_waiting(terminal_id: str, provider=None) -> bool:
-    status = status_monitor.get_status(terminal_id)
-    if status != TerminalStatus.WAITING_USER_ANSWER:
-        return False
-    if provider is None:
-        provider = provider_manager.get_provider(terminal_id)
-    return (
-        provider is not None
-        and getattr(provider, "blocks_orchestrated_input_while_waiting_user_answer", False) is True
-    )
-
-
 def _defer_messages(terminal_id: str, messages) -> None:
     for message in messages:
         update_message_status(message.id, MessageStatus.PENDING)
@@ -341,6 +353,120 @@ class InboxService:
         self._binding_lock = threading.Lock()
         self._gone_streaks: dict[str, int] = {}
         self._gone_lock = threading.Lock()
+        self._delivery_loop: asyncio.AbstractEventLoop | None = None
+        self._delivery_registry: PluginRegistry | None = None
+        self._posted_delivery_wakes: set[tuple[str, int]] = set()
+        self._delivery_tasks: set[asyncio.Task[None]] = set()
+        self._prestart_wake_logged = False
+
+    @staticmethod
+    def _gate_episode(value: object) -> str:
+        if isinstance(value, tuple) and len(value) == 2:
+            return f"{value[0]}:{value[1]}"
+        return f"{value}:-"
+
+    def _inject_safe(
+        self,
+        terminal_id: str,
+        provider: object | None,
+        probe_meta: ScreenProbeMeta | dict[str, Any] | object,
+    ) -> InjectSafetyResult:
+        """Return the closed pre-open safety decision from one final probe."""
+        if not isinstance(probe_meta, dict) or probe_meta.get("result_status") not in {
+            "waiting_user_answer",
+            "error",
+            "processing",
+            "completed",
+            "idle",
+            "unknown",
+        }:
+            logger.warning(
+                "inject_safety_probe_failure terminal=%s kind=malformed_meta", terminal_id
+            )
+            return InjectSafetyResult("veto", "safety_unverified")
+        if probe_meta.get("probe_failure") is not None:
+            logger.warning(
+                "inject_safety_probe_failure terminal=%s kind=%s",
+                terminal_id,
+                probe_meta.get("probe_failure"),
+            )
+            return InjectSafetyResult("veto", "safety_unverified")
+        if probe_meta["result_status"] == "waiting_user_answer":
+            return InjectSafetyResult("veto", "waiting_status")
+        try:
+            from cli_agent_orchestrator.services.auto_responder import auto_responder
+
+            gate = auto_responder.waiting_gate(terminal_id)
+        except Exception:
+            logger.warning(
+                "inject_safety_probe_failure terminal=%s kind=waiting_gate_exception",
+                terminal_id,
+                exc_info=True,
+            )
+            return InjectSafetyResult("veto", "safety_unverified")
+        if gate is not None:
+            return InjectSafetyResult(
+                "veto",
+                "waiting_gate",
+                self._gate_episode(gate),
+            )
+        if probe_meta.get("injection_hazard") is not None:
+            return InjectSafetyResult("veto", "dialog_hazard")
+        if probe_meta.get("identity_proof_failure") is not None:
+            return InjectSafetyResult("veto", "identity_unverified")
+        if provider is None:
+            logger.warning(
+                "inject_safety_probe_failure terminal=%s kind=provider_missing", terminal_id
+            )
+            return InjectSafetyResult("veto", "safety_unverified")
+        return InjectSafetyResult("safe")
+
+    def schedule_delivery_wake(self, terminal_id: str) -> bool:
+        """Post one coalesced, non-blocking retry onto the owning API loop."""
+        with _delivery_seq_guard:
+            loop = self._delivery_loop
+            registry = self._delivery_registry
+            if loop is None or loop.is_closed() or registry is None:
+                if not self._prestart_wake_logged:
+                    logger.warning("delivery_wake_dropped_service_not_running")
+                    self._prestart_wake_logged = True
+                return False
+            key = (terminal_id, _delivery_wake_seq.get(terminal_id, 0))
+            if key in self._posted_delivery_wakes:
+                return False
+            self._posted_delivery_wakes.add(key)
+        try:
+            loop.call_soon_threadsafe(self._start_delivery_wake, key)
+        except RuntimeError:
+            with _delivery_seq_guard:
+                self._posted_delivery_wakes.discard(key)
+            logger.warning("delivery_wake_dropped_loop_closed terminal=%s", terminal_id)
+            return False
+        return True
+
+    def _start_delivery_wake(self, key: tuple[str, int]) -> None:
+        with _delivery_seq_guard:
+            self._posted_delivery_wakes.discard(key)
+            registry = self._delivery_registry
+        if registry is None:
+            return
+
+        async def deliver() -> None:
+            await asyncio.to_thread(self.deliver_pending, key[0], registry=registry)
+
+        task = asyncio.create_task(deliver())
+        self._delivery_tasks.add(task)
+
+        def completed(value: asyncio.Task[None]) -> None:
+            self._delivery_tasks.discard(value)
+            try:
+                value.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("scheduled delivery wake failed terminal=%s", key[0])
+
+        task.add_done_callback(completed)
 
     def _clear_identity_authority(self, terminal_id: str) -> None:
         with self._identity_lock:
@@ -967,24 +1093,38 @@ class InboxService:
 
     async def run(self, registry: PluginRegistry | None = None) -> None:
         queue = bus.subscribe("terminal.*.status")
+        with _delivery_seq_guard:
+            self._delivery_loop = asyncio.get_running_loop()
+            self._delivery_registry = registry
+            self._prestart_wake_logged = False
         logger.info("InboxService started")
 
-        while True:
-            try:
-                event = await queue.get()
-                status_value = event["data"]["status"]
-                if status_value in (TerminalStatus.IDLE.value, TerminalStatus.COMPLETED.value):
-                    terminal_id = terminal_id_from_topic(event["topic"])
-                    # deliver_pending does blocking DB + tmux I/O. Offload it to a
-                    # worker thread so this consumer keeps yielding to the event loop
-                    # (StatusMonitor/LogWriter must not be starved — see the threading
-                    # note in docs/event-driven-architecture.md). The registry is
-                    # threaded through so status-driven deliveries fire
-                    # PostSendMessageEvent hooks with the same attribution as the
-                    # immediate and OpenCode-poller paths.
-                    await asyncio.to_thread(self.deliver_pending, terminal_id, registry=registry)
-            except Exception as e:
-                logger.error(f"Error in InboxService: {e}")
+        try:
+            while True:
+                try:
+                    event = await queue.get()
+                    status_value = event["data"]["status"]
+                    if status_value in (
+                        TerminalStatus.IDLE.value,
+                        TerminalStatus.COMPLETED.value,
+                    ):
+                        terminal_id = terminal_id_from_topic(event["topic"])
+                        await asyncio.to_thread(
+                            self.deliver_pending, terminal_id, registry=registry
+                        )
+                except Exception as e:
+                    logger.error(f"Error in InboxService: {e}")
+        finally:
+            with _delivery_seq_guard:
+                self._delivery_loop = None
+                self._delivery_registry = None
+                self._posted_delivery_wakes.clear()
+            tasks = list(self._delivery_tasks)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            self._delivery_tasks.clear()
 
     def deliver_pending(
         self,
@@ -1135,8 +1275,13 @@ class InboxService:
                         and gate_evidence.get("_wpm1_retry_pre_paste") is True
                     )
                     admission_kind = "corrective" if gate_state == "inject" else "ordinary"
+                    eager_eligible = False
                     if gate_state == "normal":
-                        if _should_defer_waiting(terminal_id, provider):
+                        if (
+                            legacy_test_seam
+                            and status_monitor.get_status(terminal_id)
+                            == TerminalStatus.WAITING_USER_ANSWER
+                        ):
                             return
                         if not legacy_test_seam:
                             try:
@@ -1174,7 +1319,6 @@ class InboxService:
                                         return
                                     admission_kind = "s4_initial"
                         if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
-                            eager_eligible = False
                             if metadata.get("provider") == "claude_code":
                                 if provider is None:
                                     provider = provider_manager.get_provider(terminal_id)
@@ -1367,7 +1511,12 @@ class InboxService:
                             persisted_evidence["redelivery_tag"] = decision.evidence[
                                 "redelivery_tag"
                             ]
-                    if gate_state == "normal" and _should_defer_waiting(terminal_id, provider):
+                    if (
+                        legacy_test_seam
+                        and gate_state == "normal"
+                        and status_monitor.get_status(terminal_id)
+                        == TerminalStatus.WAITING_USER_ANSWER
+                    ):
                         _defer_messages(terminal_id, messages[sent_count:])
                         return
                     if gate_state == "inject":
@@ -1435,15 +1584,48 @@ class InboxService:
                     if not legacy_test_seam and list_delivering_attempts_for_terminal(terminal_id):
                         return
                     if not legacy_test_seam:
+                        if provider is None:
+                            provider = provider_manager.get_provider(terminal_id)
                         probe_result = status_monitor.probe_screen_status(terminal_id)
                         if not isinstance(probe_result, tuple) or len(probe_result) != 2:
                             return
                         probe_status, probe_meta = probe_result
-                        identity_failure = (
-                            probe_meta.get("identity_proof_failure")
-                            if isinstance(probe_meta, dict)
-                            else None
-                        )
+                        safety = self._inject_safe(terminal_id, provider, probe_meta)
+                        if safety.verdict == "veto":
+                            identity_failure = (
+                                probe_meta.get("identity_proof_failure")
+                                if isinstance(probe_meta, dict)
+                                else None
+                            )
+                            if safety.reason == "identity_unverified" and isinstance(
+                                identity_failure, str
+                            ):
+                                self._record_identity_authority_failure(
+                                    terminal_id,
+                                    batch,
+                                    metadata,
+                                    identity_failure,
+                                    routed_generation=routed_generation,
+                                )
+                            with _delivery_seq_guard:
+                                _delivery_wake_seq[terminal_id] = (
+                                    _delivery_wake_seq.get(terminal_id, 0) + 1
+                                )
+                            logger.info(
+                                "delivery_preopen_veto terminal=%s reason=%s gate=%s",
+                                terminal_id,
+                                safety.reason,
+                                safety.gate_episode,
+                            )
+                            return
+                        if probe_status not in {
+                            TerminalStatus.IDLE,
+                            TerminalStatus.COMPLETED,
+                        } and not (eager_eligible and probe_status == TerminalStatus.PROCESSING):
+                            return
+                        if not isinstance(probe_meta, dict):
+                            return
+                        identity_failure = probe_meta.get("identity_proof_failure")
                         if isinstance(identity_failure, str):
                             self._record_identity_authority_failure(
                                 terminal_id,
@@ -1452,10 +1634,6 @@ class InboxService:
                                 identity_failure,
                                 routed_generation=routed_generation,
                             )
-                            return
-                        if probe_status not in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}:
-                            return
-                        if not isinstance(probe_meta, dict):
                             return
                         persisted_evidence["screen_probe"] = probe_meta
                     if successor_source is not None and metadata.get("provider") == "claude_code":

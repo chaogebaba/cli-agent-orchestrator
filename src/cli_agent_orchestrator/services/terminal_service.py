@@ -79,6 +79,7 @@ from cli_agent_orchestrator.services.deferred_dispatcher import (
     dispatcher,
 )
 from cli_agent_orchestrator.services.draft_guard import (
+    DeliveryDeferredError,
     preserve_draft_before_send,
     stash_draft_before_send,
 )
@@ -2757,12 +2758,27 @@ def send_prepared_input(
     if not metadata:
         raise ValueError(f"Terminal '{terminal_id}' not found")
     backend = get_backend()
-    if getattr(backend, "supports_identity_readback", False) is not True:
-        logger.warning(
-            "pane_identity_proof_unsupported terminal=%s backend=%s",
-            terminal_id,
-            type(backend).__name__,
+    if status_monitor.get_status(terminal_id) == TerminalStatus.WAITING_USER_ANSWER:
+        raise TerminalInputBlockedError(
+            f"Terminal {terminal_id} is waiting for a user answer. "
+            "Use answer_user_prompt before sending inbox input."
         )
+    if getattr(backend, "supports_identity_readback", False) is not True:
+        native_identity = backend.read_native_identity(
+            terminal_id,
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            metadata.get("provider", "unknown"),
+        )
+        native_verdict = getattr(native_identity, "verdict", None)
+        if native_verdict == "mismatch":
+            from cli_agent_orchestrator.services.pane_identity_service import (
+                PaneIdentityMismatchError,
+            )
+
+            raise PaneIdentityMismatchError("native_identity_mismatch")
+        if native_verdict == "unavailable":
+            raise DeliveryDeferredError("identity_unverified")
     else:
         from cli_agent_orchestrator.services.pane_identity_service import (
             PaneIdentityMismatchError,

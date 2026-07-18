@@ -412,6 +412,13 @@ class CopilotCliProvider(BaseProvider):
             break
         return trimmed
 
+    def classify_injection_hazard(self, rows: list[str]) -> str | None:
+        return (
+            "interactive_dialog"
+            if self.get_status_from_screen(rows) == TerminalStatus.WAITING_USER_ANSWER
+            else None
+        )
+
     def get_status(self, output: str) -> TerminalStatus:
         # Native status (herdr): trust the backend's agent state when available,
         # before the tmux capture-pane fallback below (which is a tmux-only path).

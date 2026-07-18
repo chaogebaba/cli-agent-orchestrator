@@ -249,6 +249,7 @@ async def test_f15_preclaim_validation_is_critical_deadletter(tmp_path, monkeypa
 def test_f23_identity_notice_wrapper_reports_commit_phase(monkeypatch, phase, expected):
     session = MagicMock()
     session.query.return_value.filter.return_value.first.return_value = object()
+    session.query.return_value.filter.return_value.scalar.return_value = 1
     session.add.side_effect = lambda row: setattr(row, "id", 1)
     if phase is not None:
         getattr(session, phase).side_effect = RuntimeError(phase)
