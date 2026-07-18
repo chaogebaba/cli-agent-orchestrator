@@ -1102,6 +1102,13 @@ class ClaudeCodeProvider(BaseProvider):
             signals.append(ScreenSignal("chrome", "NEW_TUI_BOX_PATTERN", index))
         return screen_classification_result(signals)
 
+    def classify_injection_hazard(self, rows: List[str]) -> str | None:
+        return (
+            "interactive_dialog"
+            if self.get_status_from_screen(rows) == TerminalStatus.WAITING_USER_ANSWER
+            else None
+        )
+
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         return self.classify_screen(screen_lines).status
 

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypeVar, cast
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     CheckConstraint,
     Column,
@@ -22,7 +23,6 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
-    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -30,10 +30,11 @@ from sqlalchemy import (
     create_engine,
     event,
     exists,
+    func,
     or_,
     text,
 )
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import DeclarativeBase, Session, declarative_base, deferred, sessionmaker
 from tzlocal import get_localzone
 
@@ -267,7 +268,95 @@ class InboxModel(Base):
     failure_reason = Column(Text, nullable=True)
     digested_into = deferred(Column(Integer, nullable=True))
     enqueue_generation = deferred(Column(Integer, nullable=True))
+    barrier_id = deferred(Column(Integer, nullable=True))
+    barrier_member_key = deferred(Column(String, nullable=True))
     created_at = Column(DateTime, default=datetime.now)
+
+
+class CallbackBarrierModel(Base):
+    """One supervisor-owned callback aggregation episode."""
+
+    __tablename__ = "callback_barrier"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    owner_mailbox_id = Column(String, nullable=True)
+    owner_terminal_id = Column(String, nullable=True)
+    owner_generation = Column(Integer, nullable=False)
+    label = Column(String, nullable=False)
+    state = Column(String, nullable=False, default="OPEN", server_default="OPEN")
+    close_reason = Column(Text, nullable=True)
+    timeout_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    fired_at = Column(DateTime(timezone=True), nullable=True)
+    combined_message_id = Column(Integer, nullable=True)
+    __table_args__ = (
+        CheckConstraint(
+            "((owner_mailbox_id IS NOT NULL AND owner_terminal_id IS NULL) OR "
+            "(owner_mailbox_id IS NULL AND owner_terminal_id IS NOT NULL)) "
+            "AND owner_generation IS NOT NULL",
+            name="ck_callback_barrier_exactly_one_owner",
+        ),
+        CheckConstraint(
+            "state IN ('OPEN','FIRED_COMPLETE','FIRED_TIMEOUT','CANCELLED','DIGESTED_REBIND')",
+            name="ck_callback_barrier_state",
+        ),
+        Index(
+            "uq_callback_barrier_open_mailbox",
+            "owner_mailbox_id",
+            "owner_generation",
+            "label",
+            unique=True,
+            sqlite_where=text("state = 'OPEN' AND owner_mailbox_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_callback_barrier_open_terminal",
+            "owner_terminal_id",
+            "owner_generation",
+            "label",
+            unique=True,
+            sqlite_where=text("state = 'OPEN' AND owner_terminal_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_callback_barrier_combined_message",
+            "combined_message_id",
+            unique=True,
+            sqlite_where=text("combined_message_id IS NOT NULL"),
+        ),
+    )
+
+
+class CallbackBarrierMemberModel(Base):
+    """One terminal incarnation expected to answer a callback barrier."""
+
+    __tablename__ = "callback_barrier_member"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    barrier_id = Column(Integer, ForeignKey("callback_barrier.id"), nullable=False)
+    member_key = Column(String, nullable=False)
+    position = Column(Integer, nullable=False)
+    terminal_id = Column(String, nullable=False)
+    lifecycle_generation = Column(Integer, nullable=False)
+    state = Column(String, nullable=False, default="AWAITING", server_default="AWAITING")
+    failure_class = Column(String, nullable=True)
+    message_id = Column(
+        Integer,
+        ForeignKey("inbox.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    arrived_at = Column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('AWAITING','ARRIVED','FAILED','GONE')",
+            name="ck_callback_barrier_member_state",
+        ),
+        UniqueConstraint("barrier_id", "member_key", name="uq_callback_barrier_member_key"),
+        UniqueConstraint(
+            "barrier_id",
+            "terminal_id",
+            "lifecycle_generation",
+            name="uq_callback_barrier_member_binding",
+        ),
+    )
 
 
 class InboxDeliveryAttemptModel(Base):
@@ -453,6 +542,7 @@ def init_db() -> None:
     _migrate_project_aliases_schema()
     Base.metadata.create_all(bind=engine)
     _migrate_mailbox_columns()
+    _migrate_callback_barrier_columns()
     _migrate_transcript_bindings_inode_nullable()
     _migrate_provider_sessions_status()
     _migrate_provider_sessions_session_name()
@@ -620,6 +710,17 @@ def _migrate_mailbox_columns() -> None:
             row["name"] for row in terminal_columns
         }:
             connection.execute(text("ALTER TABLE terminals ADD COLUMN caller_mailbox_id TEXT"))
+
+
+def _migrate_callback_barrier_columns() -> None:
+    """Add WPQ7's nullable inbox routing tags to legacy databases."""
+    with engine.begin() as connection:
+        columns = connection.execute(text("PRAGMA table_info(inbox)")).mappings().all()
+        names = {column["name"] for column in columns}
+        if columns and "barrier_id" not in names:
+            connection.execute(text("ALTER TABLE inbox ADD COLUMN barrier_id INTEGER"))
+        if columns and "barrier_member_key" not in names:
+            connection.execute(text("ALTER TABLE inbox ADD COLUMN barrier_member_key TEXT"))
 
 
 def _restrict_db_file_permissions() -> None:
@@ -1144,6 +1245,24 @@ def resolve_inbox_receiver(db: Any, receiver_id: str) -> tuple[str, str | None, 
     return receiver_id, mailbox_id, cast(int | None, generation)
 
 
+def callback_barrier_dispatch_allowed(sender_id: str, receiver_id: str) -> bool:
+    """Return whether sender owns the target worker's callback route."""
+    with SessionLocal() as db:
+        try:
+            receiver_cache, _, _ = resolve_inbox_receiver(db, receiver_id)
+        except ValueError:
+            return False
+        receiver = db.query(TerminalModel).filter_by(id=receiver_cache).one_or_none()
+        if receiver is None:
+            return False
+        if receiver.caller_id == sender_id:
+            return True
+        sender_mailbox_id = _mailbox_id_for_terminal(db, sender_id)
+        return bool(
+            sender_mailbox_id is not None and receiver.caller_mailbox_id == sender_mailbox_id
+        )
+
+
 def get_current_mailbox_generation(mailbox_id: str) -> int | None:
     """Return the current logical generation without rewriting receiver caches."""
     with SessionLocal() as db:
@@ -1173,6 +1292,7 @@ def create_terminal(
     init_started_at: Optional[datetime] = None,
     init_owner_epoch: Optional[str] = None,
     init_deadline_s: Optional[float] = None,
+    dispatch_barrier: dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -1203,6 +1323,16 @@ def create_terminal(
             synchronize_session=False,
         )
         db.refresh(terminal)
+        if dispatch_barrier is not None:
+            if caller_id is None:
+                raise ValueError("barrier_owner_not_found")
+            attach_terminal_dispatch_barrier(
+                db,
+                sender_id=caller_id,
+                terminal_id=terminal_id,
+                profile_name=agent_profile,
+                dispatch_barrier=dispatch_barrier,
+            )
         db.commit()
         return {
             "id": terminal.id,
@@ -1251,6 +1381,7 @@ def create_terminal_with_warm_intent(
     init_started_at: Optional[datetime] = None,
     init_owner_epoch: Optional[str] = None,
     init_deadline_s: Optional[float] = None,
+    dispatch_barrier: dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Publish terminal metadata and a fork-only warm intent together."""
     import json as _json
@@ -1279,6 +1410,17 @@ def create_terminal_with_warm_intent(
             {TerminalModel.lifecycle_generation: (TerminalModel.lifecycle_generation + 1)},
             synchronize_session=False,
         )
+        db.refresh(terminal)
+        if dispatch_barrier is not None:
+            if caller_id is None:
+                raise ValueError("barrier_owner_not_found")
+            attach_terminal_dispatch_barrier(
+                db,
+                sender_id=caller_id,
+                terminal_id=terminal_id,
+                profile_name=agent_profile,
+                dispatch_barrier=dispatch_barrier,
+            )
         if fork_mode == "fork" and parent_base_name and agent_profile:
             claimed = False
             for attempt in range(3):
@@ -1501,24 +1643,20 @@ def settle_terminal_rebound(
     terminal_id: str,
     session_uuid: str,
     shell_command: str,
-) -> bool:
+) -> int:
     """Atomically persist proven runtime identity and the healthy projection."""
     with SessionLocal.begin() as db:
-        changed = (
-            db.query(TerminalModel)
-            .filter_by(id=terminal_id)
-            .update(
-                {
-                    "provider_session_id": session_uuid,
-                    "shell_command": shell_command,
-                    "recovery_state": "rebound",
-                    "recovery_error": None,
-                    "recovery_updated_at": _utcnow(),
-                },
-                synchronize_session=False,
-            )
-        )
-        return changed > 0
+        row = db.query(TerminalModel).filter_by(id=terminal_id).one_or_none()
+        if row is None:
+            return 0
+        row.provider_session_id = session_uuid
+        row.shell_command = shell_command
+        row.recovery_state = "rebound"
+        row.recovery_error = None
+        row.recovery_updated_at = _utcnow()
+        row.lifecycle_generation = int(row.lifecycle_generation) + 1
+        db.flush()
+        return int(row.lifecycle_generation)
 
 
 def set_terminal_recovery_state(
@@ -1776,6 +1914,7 @@ def delete_terminal_and_warm_intent(
 ) -> Dict[str, bool]:
     """Delete the terminal and, unless retained, its warm intent atomically."""
     with SessionLocal.begin() as db:
+        _mark_barrier_member_gone_in_db(db, terminal_id)
         intent_deleted = False
         if not preserve_warm_intent:
             intent_deleted = (
@@ -2139,19 +2278,24 @@ def claim_deferred_init_failure(
                     row.init_state = "init_failed_notified"
                     db.add(
                         InboxModel(
-                            sender_id=terminal_id,
-                            receiver_id=receiver_cache,
-                            logical_receiver_id=logical_receiver_id,
-                            enqueue_generation=enqueue_generation,
-                            message=notice,
-                            orchestration_type=OrchestrationType.SEND_MESSAGE.value,
-                            status=MessageStatus.PENDING.value,
+                            **_stamp_enqueue_generation(
+                                db,
+                                {
+                                    "sender_id": terminal_id,
+                                    "receiver_id": receiver_cache,
+                                    "logical_receiver_id": logical_receiver_id,
+                                    "message": notice,
+                                    "orchestration_type": OrchestrationType.SEND_MESSAGE.value,
+                                    "status": MessageStatus.PENDING.value,
+                                },
+                            )
                         )
                     )
                     status = "claimed_notified"
                 else:
                     row.init_state = "init_failed_caller_gone"
                     status = "claimed_caller_gone"
+                _mark_barrier_member_gone_in_db(db, terminal_id)
                 db.flush()
                 db.commit()
                 return {"status": status, "init_state": row.init_state, "token": failure_token}
@@ -2501,18 +2645,752 @@ def delete_terminals_by_session(tmux_session: str) -> int:
     )
 
 
+_BARRIER_INTERNAL_PREFIXES = (
+    "watchdog:",
+    "message-trace:",
+    "mailbox-digest",
+    "compact-digest",
+    "barrier:",
+    "barrier-alert:",
+)
+
+
+def _stamp_enqueue_generation(db: Any, row_fields: dict[str, Any]) -> dict[str, Any]:
+    """Stamp every PENDING writer on the mailbox-or-lifecycle generation axis."""
+    fields = dict(row_fields)
+    logical_receiver_id = fields.get("logical_receiver_id")
+    if logical_receiver_id:
+        generation = (
+            db.query(MailboxModel.generation)
+            .filter(MailboxModel.id == logical_receiver_id)
+            .scalar()
+        )
+    else:
+        generation = (
+            db.query(TerminalModel.lifecycle_generation)
+            .filter(TerminalModel.id == fields.get("receiver_id"))
+            .scalar()
+        )
+    if fields.get("status") == MessageStatus.PENDING.value and type(generation) is not int:
+        raise ValueError("pending_receiver_generation_unavailable")
+    fields["enqueue_generation"] = cast(int | None, generation)
+    return fields
+
+
+def _inbox_message_from_row(row: Any) -> InboxMessage:
+    return InboxMessage(
+        id=row.id,
+        sender_id=row.sender_id,
+        receiver_id=row.receiver_id,
+        logical_receiver_id=row.logical_receiver_id,
+        message=row.message,
+        orchestration_type=OrchestrationType(row.orchestration_type),
+        status=MessageStatus(row.status),
+        failure_reason=row.failure_reason,
+        digested_into=row.digested_into,
+        enqueue_generation=row.enqueue_generation,
+        barrier_id=row.barrier_id,
+        barrier_member_key=row.barrier_member_key,
+        created_at=row.created_at,
+    )
+
+
+def _validate_dispatch_barrier(dispatch_barrier: dict[str, Any]) -> tuple[str, int, str | None]:
+    from cli_agent_orchestrator.constants import (
+        CALLBACK_BARRIER_TIMEOUT_MAX_SECONDS,
+        CALLBACK_BARRIER_TIMEOUT_SECONDS,
+    )
+
+    label = dispatch_barrier.get("label")
+    if not isinstance(label, str) or not label.strip():
+        raise ValueError("invalid_barrier_label")
+    timeout = dispatch_barrier.get("timeout_seconds")
+    if timeout is None:
+        timeout = CALLBACK_BARRIER_TIMEOUT_SECONDS
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, int)
+        or timeout <= 0
+        or timeout > CALLBACK_BARRIER_TIMEOUT_MAX_SECONDS
+    ):
+        raise ValueError("invalid_barrier_timeout")
+    member_key = dispatch_barrier.get("member_key")
+    if member_key is not None and (not isinstance(member_key, str) or not member_key.strip()):
+        raise ValueError("invalid_barrier_member_key")
+    return label, timeout, cast(str | None, member_key)
+
+
+def _barrier_now() -> datetime:
+    return _utcnow().replace(tzinfo=None)
+
+
+def _barrier_owner_values(db: Any, sender_id: str) -> dict[str, Any]:
+    terminal = db.query(TerminalModel).filter(TerminalModel.id == sender_id).one_or_none()
+    if terminal is None:
+        raise ValueError("barrier_owner_not_found")
+    mailbox_id = _mailbox_id_for_terminal(db, sender_id)
+    if mailbox_id is not None:
+        generation = db.query(MailboxModel.generation).filter_by(id=mailbox_id).scalar()
+        return {
+            "owner_mailbox_id": mailbox_id,
+            "owner_terminal_id": None,
+            "owner_generation": int(generation),
+        }
+    return {
+        "owner_mailbox_id": None,
+        "owner_terminal_id": sender_id,
+        "owner_generation": int(terminal.lifecycle_generation),
+    }
+
+
+def _open_barrier_query(db: Any, owner: dict[str, Any], label: str) -> Any:
+    query = db.query(CallbackBarrierModel).filter(
+        CallbackBarrierModel.state == "OPEN",
+        CallbackBarrierModel.owner_generation == owner["owner_generation"],
+        CallbackBarrierModel.label == label,
+    )
+    if owner["owner_mailbox_id"] is not None:
+        return query.filter(CallbackBarrierModel.owner_mailbox_id == owner["owner_mailbox_id"])
+    return query.filter(CallbackBarrierModel.owner_terminal_id == owner["owner_terminal_id"])
+
+
+def _attach_dispatch_barrier_in_db(
+    db: Any,
+    *,
+    sender_id: str,
+    terminal_id: str,
+    dispatch_barrier: dict[str, Any],
+    profile_name: str | None = None,
+) -> CallbackBarrierMemberModel:
+    """Create/reuse a barrier and attach or re-arm one terminal incarnation."""
+    label, timeout_seconds, explicit_key = _validate_dispatch_barrier(dispatch_barrier)
+    owner = _barrier_owner_values(db, sender_id)
+    barrier = _open_barrier_query(db, owner, label).one_or_none()
+    if barrier is None:
+        from sqlalchemy.dialects.sqlite import insert
+
+        db.execute(
+            insert(CallbackBarrierModel)
+            .values(
+                **owner,
+                label=label,
+                state="OPEN",
+                timeout_at=_barrier_now() + timedelta(seconds=timeout_seconds),
+            )
+            .on_conflict_do_nothing()
+        )
+        db.flush()
+        barrier = _open_barrier_query(db, owner, label).one()
+    terminal = db.query(TerminalModel).filter_by(id=terminal_id).one_or_none()
+    if terminal is None:
+        raise ValueError("barrier_member_terminal_not_found")
+
+    failed_query = db.query(CallbackBarrierMemberModel).filter_by(
+        barrier_id=barrier.id, state="FAILED"
+    )
+    if explicit_key is not None:
+        member = failed_query.filter_by(member_key=explicit_key).one_or_none()
+        existing = (
+            db.query(CallbackBarrierMemberModel)
+            .filter_by(barrier_id=barrier.id, member_key=explicit_key)
+            .one_or_none()
+        )
+        if existing is not None and member is None:
+            raise ValueError("barrier_member_key_in_use")
+    else:
+        failed = failed_query.order_by(CallbackBarrierMemberModel.position).all()
+        if len(failed) > 1:
+            raise ValueError("ambiguous_barrier_member")
+        member = failed[0] if failed else None
+    if member is not None:
+        member.terminal_id = terminal_id
+        member.lifecycle_generation = int(terminal.lifecycle_generation)
+        member.state = "AWAITING"
+        member.failure_class = None
+        member.message_id = None
+        member.arrived_at = None
+        return cast(CallbackBarrierMemberModel, member)
+
+    if explicit_key is None:
+        base = (profile_name or terminal.agent_profile or terminal_id).strip() or terminal_id
+        keys = {
+            key
+            for key, in db.query(CallbackBarrierMemberModel.member_key)
+            .filter_by(barrier_id=barrier.id)
+            .all()
+        }
+        explicit_key = base
+        ordinal = 2
+        while explicit_key in keys:
+            explicit_key = f"{base}-{ordinal}"
+            ordinal += 1
+    position = (
+        db.query(func.max(CallbackBarrierMemberModel.position))
+        .filter_by(barrier_id=barrier.id)
+        .scalar()
+    )
+    member = CallbackBarrierMemberModel(
+        barrier_id=barrier.id,
+        member_key=explicit_key,
+        position=int(position if position is not None else -1) + 1,
+        terminal_id=terminal_id,
+        lifecycle_generation=int(terminal.lifecycle_generation),
+        state="AWAITING",
+    )
+    db.add(member)
+    db.flush()
+    return member
+
+
+def _owner_matches_receiver(
+    barrier: Any, receiver_id: str, logical_receiver_id: str | None
+) -> bool:
+    if barrier.owner_mailbox_id is not None:
+        return bool(barrier.owner_mailbox_id == logical_receiver_id)
+    return bool(barrier.owner_terminal_id == receiver_id and logical_receiver_id is None)
+
+
+def _barrier_member_for_callback(
+    db: Any,
+    *,
+    sender_id: str,
+    receiver_id: str,
+    logical_receiver_id: str | None,
+    open_only: bool,
+) -> tuple[Any, Any] | None:
+    terminal = db.query(TerminalModel).filter_by(id=sender_id).one_or_none()
+    if terminal is None:
+        return None
+    query = (
+        db.query(CallbackBarrierModel, CallbackBarrierMemberModel)
+        .join(
+            CallbackBarrierMemberModel,
+            CallbackBarrierMemberModel.barrier_id == CallbackBarrierModel.id,
+        )
+        .filter(
+            CallbackBarrierMemberModel.terminal_id == sender_id,
+            CallbackBarrierMemberModel.lifecycle_generation == int(terminal.lifecycle_generation),
+        )
+    )
+    query = query.filter(
+        CallbackBarrierModel.state == "OPEN" if open_only else CallbackBarrierModel.state != "OPEN"
+    )
+    rows = query.order_by(CallbackBarrierModel.created_at.desc()).all()
+    return next(
+        (
+            (barrier, member)
+            for barrier, member in rows
+            if _owner_matches_receiver(barrier, receiver_id, logical_receiver_id)
+        ),
+        None,
+    )
+
+
+def _truncate_barrier_message(body: str, message_ids: list[int], limit: int = 16 * 1024) -> str:
+    encoded = body.encode("utf-8")
+    if len(encoded) <= limit:
+        return body
+    marker = (
+        "\n[truncated; full callback bodies remain in DIGESTED message ids "
+        + ",".join(str(value) for value in message_ids)
+        + "; use list_messages/message trace]\n"
+    ).encode("utf-8")
+    prefix = encoded[: max(0, limit - len(marker))]
+    while True:
+        try:
+            return prefix.decode("utf-8") + marker.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            prefix = prefix[: exc.start]
+
+
+def _render_callback_barrier(db: Any, barrier: Any, members: list[Any], fired_at: datetime) -> str:
+    partial = any(member.state != "ARRIVED" for member in members)
+    arrived = sum(member.state == "ARRIVED" for member in members)
+    elapsed = max(0, int((fired_at - barrier.created_at).total_seconds()))
+    lines = [
+        f"[callback barrier {'PARTIAL' if partial else 'COMPLETE'}] "
+        f"{barrier.label} — {arrived}/{len(members)} in {elapsed}s"
+    ]
+    message_ids: list[int] = []
+    for member in members:
+        rows = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.barrier_id == barrier.id,
+                InboxModel.barrier_member_key == member.member_key,
+            )
+            .order_by(InboxModel.created_at, InboxModel.id)
+            .all()
+        )
+        message_ids.extend(int(row.id) for row in rows)
+        received = max(
+            0,
+            int(((member.arrived_at or fired_at) - barrier.created_at).total_seconds()),
+        )
+        lines.append(
+            f"--- BEGIN {member.member_key} (terminal {member.terminal_id}, "
+            f"received +{received}s) ---"
+        )
+        if rows:
+            lines.extend(row.message for row in rows)
+        elif member.state == "FAILED":
+            lines.append(f"[FAILED: {member.failure_class or 'unknown'}]")
+        elif member.state == "GONE":
+            lines.append("[GONE: terminal unavailable]")
+        else:
+            lines.append("[MISSING: no callback before barrier close]")
+        lines.append(f"--- END {member.member_key} ---")
+    return _truncate_barrier_message("\n".join(lines), message_ids)
+
+
+def _fire_open_barrier_in_db(
+    db: Any,
+    barrier: Any,
+    *,
+    state: str,
+    close_reason: str,
+    now: datetime | None = None,
+) -> int | None:
+    """CAS one OPEN barrier to a single combined PENDING message."""
+    now = now or _barrier_now()
+    if now.tzinfo is not None:
+        now = now.astimezone(timezone.utc).replace(tzinfo=None)
+    changed = (
+        db.query(CallbackBarrierModel)
+        .filter(CallbackBarrierModel.id == barrier.id, CallbackBarrierModel.state == "OPEN")
+        .update(
+            {
+                CallbackBarrierModel.state: state,
+                CallbackBarrierModel.close_reason: close_reason,
+                CallbackBarrierModel.fired_at: now,
+            },
+            synchronize_session=False,
+        )
+    )
+    if changed != 1:
+        return None
+    members = (
+        db.query(CallbackBarrierMemberModel)
+        .filter_by(barrier_id=barrier.id)
+        .order_by(CallbackBarrierMemberModel.position)
+        .all()
+    )
+    if barrier.owner_mailbox_id is not None:
+        mailbox = db.query(MailboxModel).filter_by(id=barrier.owner_mailbox_id).one()
+        receiver_id = mailbox.current_terminal_id or mailbox.id
+        logical_receiver_id = mailbox.id
+    else:
+        receiver_id = barrier.owner_terminal_id
+        logical_receiver_id = None
+    row_fields = _stamp_enqueue_generation(
+        db,
+        {
+            "sender_id": f"barrier:{barrier.id}",
+            "receiver_id": receiver_id,
+            "logical_receiver_id": logical_receiver_id,
+            "message": _render_callback_barrier(db, barrier, members, now),
+            "orchestration_type": OrchestrationType.SEND_MESSAGE.value,
+            "status": MessageStatus.PENDING.value,
+        },
+    )
+    combined = InboxModel(**row_fields)
+    db.add(combined)
+    db.flush()
+    db.query(InboxModel).filter(
+        InboxModel.barrier_id == barrier.id,
+        InboxModel.status == MessageStatus.HELD.value,
+    ).update(
+        {
+            InboxModel.status: MessageStatus.DIGESTED.value,
+            InboxModel.digested_into: combined.id,
+        },
+        synchronize_session=False,
+    )
+    db.query(CallbackBarrierModel).filter_by(id=barrier.id).update(
+        {CallbackBarrierModel.combined_message_id: combined.id},
+        synchronize_session=False,
+    )
+    return int(combined.id)
+
+
+def _maybe_fire_completed_barrier(db: Any, barrier: Any) -> int | None:
+    states = [
+        state
+        for state, in db.query(CallbackBarrierMemberModel.state)
+        .filter_by(barrier_id=barrier.id)
+        .all()
+    ]
+    if states and all(state in {"ARRIVED", "GONE"} for state in states):
+        return _fire_open_barrier_in_db(
+            db,
+            barrier,
+            state="FIRED_COMPLETE",
+            close_reason="complete",
+        )
+    return None
+
+
+def _insert_routed_inbox_row(
+    db: Any,
+    *,
+    sender_id: str,
+    receiver_id: str,
+    logical_receiver_id: str | None,
+    message: str,
+    orchestration_type: OrchestrationType,
+    dispatch_barrier: dict[str, Any] | None = None,
+    profile_name: str | None = None,
+    created_at: datetime | None = None,
+) -> Any:
+    """The single raw/logical insert choke point for WPQ7 routing."""
+    if dispatch_barrier is not None:
+        _attach_dispatch_barrier_in_db(
+            db,
+            sender_id=sender_id,
+            terminal_id=receiver_id,
+            dispatch_barrier=dispatch_barrier,
+            profile_name=profile_name,
+        )
+    status = MessageStatus.PENDING
+    barrier_id = None
+    barrier_member_key = None
+    routed_message = message
+    match = None
+    if dispatch_barrier is None and not sender_id.startswith(_BARRIER_INTERNAL_PREFIXES):
+        match = _barrier_member_for_callback(
+            db,
+            sender_id=sender_id,
+            receiver_id=receiver_id,
+            logical_receiver_id=logical_receiver_id,
+            open_only=True,
+        )
+        if match is not None:
+            barrier, member = match
+            status = MessageStatus.HELD
+            barrier_id = int(barrier.id)
+            barrier_member_key = str(member.member_key)
+        else:
+            closed = _barrier_member_for_callback(
+                db,
+                sender_id=sender_id,
+                receiver_id=receiver_id,
+                logical_receiver_id=logical_receiver_id,
+                open_only=False,
+            )
+            if closed is not None:
+                routed_message = f"[late callback after barrier {closed[0].label}]\n{message}"
+    fields = _stamp_enqueue_generation(
+        db,
+        {
+            "sender_id": sender_id,
+            "receiver_id": receiver_id,
+            "logical_receiver_id": logical_receiver_id,
+            "message": routed_message,
+            "orchestration_type": orchestration_type.value,
+            "status": status.value,
+            "barrier_id": barrier_id,
+            "barrier_member_key": barrier_member_key,
+            **({"created_at": created_at} if created_at is not None else {}),
+        },
+    )
+    row = InboxModel(**fields)
+    db.add(row)
+    db.flush()
+    if match is not None:
+        barrier, member = match
+        if member.state == "AWAITING":
+            member.state = "ARRIVED"
+            member.failure_class = None
+            member.message_id = int(row.id)
+            member.arrived_at = _barrier_now()
+        _maybe_fire_completed_barrier(db, barrier)
+    return row
+
+
+def attach_terminal_dispatch_barrier(
+    db: Any,
+    *,
+    sender_id: str,
+    terminal_id: str,
+    profile_name: str | None,
+    dispatch_barrier: dict[str, Any],
+) -> None:
+    _attach_dispatch_barrier_in_db(
+        db,
+        sender_id=sender_id,
+        terminal_id=terminal_id,
+        profile_name=profile_name,
+        dispatch_barrier=dispatch_barrier,
+    )
+
+
+def _select_callback_barrier(
+    db: Any,
+    *,
+    barrier_id: int | None,
+    barrier_label: str | None,
+    owner_id: str | None,
+) -> Any:
+    if (barrier_id is None) == (barrier_label is None):
+        raise ValueError("barrier_selector_requires_exactly_one")
+    if barrier_id is not None:
+        row = db.query(CallbackBarrierModel).filter_by(id=barrier_id).one_or_none()
+        if row is not None and owner_id is not None:
+            owner = _barrier_owner_values(db, owner_id)
+            owner_matches = (
+                row.owner_generation == owner["owner_generation"]
+                and row.owner_mailbox_id == owner["owner_mailbox_id"]
+                and row.owner_terminal_id == owner["owner_terminal_id"]
+            )
+            if not owner_matches:
+                row = None
+    else:
+        if owner_id is None:
+            raise ValueError("barrier_owner_required")
+        owner = _barrier_owner_values(db, owner_id)
+        query = db.query(CallbackBarrierModel).filter(
+            CallbackBarrierModel.label == barrier_label,
+            CallbackBarrierModel.owner_generation == owner["owner_generation"],
+        )
+        if owner["owner_mailbox_id"] is not None:
+            query = query.filter(CallbackBarrierModel.owner_mailbox_id == owner["owner_mailbox_id"])
+        else:
+            query = query.filter(
+                CallbackBarrierModel.owner_terminal_id == owner["owner_terminal_id"]
+            )
+        row = query.order_by(CallbackBarrierModel.created_at.desc()).first()
+    if row is None:
+        raise ValueError("barrier_not_found")
+    return row
+
+
+def callback_barrier_status(
+    *,
+    barrier_id: int | None = None,
+    barrier_label: str | None = None,
+    owner_id: str | None = None,
+) -> dict[str, Any]:
+    with SessionLocal() as db:
+        barrier = _select_callback_barrier(
+            db,
+            barrier_id=barrier_id,
+            barrier_label=barrier_label,
+            owner_id=owner_id,
+        )
+        members = (
+            db.query(CallbackBarrierMemberModel)
+            .filter_by(barrier_id=barrier.id)
+            .order_by(CallbackBarrierMemberModel.position)
+            .all()
+        )
+        return {
+            "id": int(barrier.id),
+            "label": barrier.label,
+            "state": barrier.state,
+            "close_reason": barrier.close_reason,
+            "owner_mailbox_id": barrier.owner_mailbox_id,
+            "owner_terminal_id": barrier.owner_terminal_id,
+            "owner_generation": int(barrier.owner_generation),
+            "timeout_at": barrier.timeout_at,
+            "created_at": barrier.created_at,
+            "fired_at": barrier.fired_at,
+            "combined_message_id": barrier.combined_message_id,
+            "members": [
+                {
+                    "member_key": member.member_key,
+                    "position": int(member.position),
+                    "terminal_id": member.terminal_id,
+                    "lifecycle_generation": int(member.lifecycle_generation),
+                    "state": member.state,
+                    "failure_class": member.failure_class,
+                    "message_id": member.message_id,
+                    "arrived_at": member.arrived_at,
+                    "held_message_ids": [
+                        int(value)
+                        for value, in db.query(InboxModel.id)
+                        .filter(
+                            InboxModel.barrier_id == barrier.id,
+                            InboxModel.barrier_member_key == member.member_key,
+                        )
+                        .order_by(InboxModel.id)
+                        .all()
+                    ],
+                }
+                for member in members
+            ],
+        }
+
+
+def cancel_callback_barrier(
+    *,
+    barrier_id: int | None = None,
+    barrier_label: str | None = None,
+    owner_id: str | None = None,
+) -> dict[str, Any]:
+    with SessionLocal.begin() as db:
+        barrier = _select_callback_barrier(
+            db,
+            barrier_id=barrier_id,
+            barrier_label=barrier_label,
+            owner_id=owner_id,
+        )
+        if barrier.state != "OPEN":
+            return {
+                "id": int(barrier.id),
+                "state": barrier.state,
+                "released": 0,
+                "receiver_ids": [],
+            }
+        receiver_ids = [
+            value
+            for value, in db.query(InboxModel.receiver_id)
+            .filter(
+                InboxModel.barrier_id == barrier.id,
+                InboxModel.status == MessageStatus.HELD.value,
+            )
+            .distinct()
+            .all()
+        ]
+        released = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.barrier_id == barrier.id,
+                InboxModel.status == MessageStatus.HELD.value,
+            )
+            .update({InboxModel.status: MessageStatus.PENDING.value}, synchronize_session=False)
+        )
+        barrier.state = "CANCELLED"
+        barrier.close_reason = "cancelled"
+        barrier.fired_at = _barrier_now()
+        return {
+            "id": int(barrier.id),
+            "state": barrier.state,
+            "released": int(released),
+            "receiver_ids": receiver_ids,
+        }
+
+
+def fire_due_barriers(now: datetime | None = None) -> list[int]:
+    now = now or _barrier_now()
+    if now.tzinfo is not None:
+        now = now.astimezone(timezone.utc).replace(tzinfo=None)
+    fired: list[int] = []
+    with SessionLocal.begin() as db:
+        due = (
+            db.query(CallbackBarrierModel)
+            .filter(
+                CallbackBarrierModel.state == "OPEN",
+                CallbackBarrierModel.timeout_at <= now,
+            )
+            .order_by(CallbackBarrierModel.timeout_at, CallbackBarrierModel.id)
+            .all()
+        )
+        for barrier in due:
+            message_id = _fire_open_barrier_in_db(
+                db,
+                barrier,
+                state="FIRED_TIMEOUT",
+                close_reason="timeout",
+                now=now,
+            )
+            if message_id is not None:
+                fired.append(message_id)
+    return fired
+
+
+def _mark_barrier_member_gone_in_db(db: Any, terminal_id: str) -> list[int]:
+    fired: list[int] = []
+    rows = (
+        db.query(CallbackBarrierModel, CallbackBarrierMemberModel)
+        .join(
+            CallbackBarrierMemberModel,
+            CallbackBarrierMemberModel.barrier_id == CallbackBarrierModel.id,
+        )
+        .filter(
+            CallbackBarrierModel.state == "OPEN",
+            CallbackBarrierMemberModel.terminal_id == terminal_id,
+            CallbackBarrierMemberModel.state.in_(("AWAITING", "FAILED")),
+        )
+        .all()
+    )
+    for barrier, member in rows:
+        member.state = "GONE"
+        member.failure_class = "terminal_gone"
+        message_id = _maybe_fire_completed_barrier(db, barrier)
+        if message_id is not None:
+            fired.append(message_id)
+    return fired
+
+
+def insert_barrier_escalation_message(
+    terminal_id: str,
+    caller_id: str,
+    message: str,
+    idle_reason: str | None,
+) -> WatchdogInsertResult | None:
+    """Atomically persist member failure state and its single owner notification."""
+    with SessionLocal.begin() as db:
+        receiver_cache, logical_receiver_id, _ = resolve_inbox_receiver(db, caller_id)
+        match = _barrier_member_for_callback(
+            db,
+            sender_id=terminal_id,
+            receiver_id=receiver_cache,
+            logical_receiver_id=logical_receiver_id,
+            open_only=True,
+        )
+        if match is None:
+            return None
+        barrier, member = match
+        quota = idle_reason == "quota_or_auth"
+        if quota and member.state == "FAILED" and member.failure_class == idle_reason:
+            return WatchdogInsertResult("inserted", None)
+        member.failure_class = idle_reason
+        if quota:
+            member.state = "FAILED"
+            sender = f"barrier-alert:{barrier.id}"
+            body = (
+                f"[callback barrier {barrier.label}] member {member.member_key} "
+                f"({terminal_id}) requires recovery: quota_or_auth"
+            )
+        else:
+            sender = f"watchdog:{terminal_id}"
+            body = message
+        fields = _stamp_enqueue_generation(
+            db,
+            {
+                "sender_id": sender,
+                "receiver_id": receiver_cache,
+                "logical_receiver_id": logical_receiver_id,
+                "message": body,
+                "orchestration_type": OrchestrationType.SEND_MESSAGE.value,
+                "status": MessageStatus.PENDING.value,
+            },
+        )
+        row = InboxModel(**fields)
+        db.add(row)
+        db.flush()
+        return WatchdogInsertResult("inserted", int(row.id))
+
+
 def create_inbox_message(
     sender_id: str,
     receiver_id: str,
     message: str,
     orchestration_type: OrchestrationType = OrchestrationType.SEND_MESSAGE,
+    dispatch_barrier: dict[str, Any] | None = None,
 ) -> InboxMessage:
     from cli_agent_orchestrator.services.stalled_callback_watchdog import (
         stalled_callback_watchdog,
     )
 
     with stalled_callback_watchdog.callback_insert_guard(sender_id):
-        return _create_inbox_message_unfenced(sender_id, receiver_id, message, orchestration_type)
+        return _create_inbox_message_unfenced(
+            sender_id,
+            receiver_id,
+            message,
+            orchestration_type,
+            dispatch_barrier=dispatch_barrier,
+        )
 
 
 def _create_inbox_message_unfenced(
@@ -2520,6 +3398,8 @@ def _create_inbox_message_unfenced(
     receiver_id: str,
     message: str,
     orchestration_type: OrchestrationType = OrchestrationType.SEND_MESSAGE,
+    *,
+    dispatch_barrier: dict[str, Any] | None = None,
 ) -> InboxMessage:
     """Create inbox message with status=MessageStatus.PENDING.
 
@@ -2536,32 +3416,28 @@ def _create_inbox_message_unfenced(
             and not db.query(TerminalModel).filter(TerminalModel.id == receiver_cache).first()
         ):
             raise ValueError(f"Terminal '{receiver_id}' not found")
-        inbox_kwargs = dict(
+        inbox_msg = _insert_routed_inbox_row(
+            db,
             sender_id=sender_id,
             receiver_id=receiver_cache,
+            logical_receiver_id=logical_receiver_id if mailbox_schema else None,
             message=message,
-            orchestration_type=orchestration_type.value,
-            status=MessageStatus.PENDING.value,
+            orchestration_type=orchestration_type,
+            dispatch_barrier=dispatch_barrier,
         )
-        if mailbox_schema:
-            inbox_kwargs["logical_receiver_id"] = logical_receiver_id
-            inbox_kwargs["enqueue_generation"] = enqueue_generation
-        inbox_msg = InboxModel(**inbox_kwargs)
-        db.add(inbox_msg)
         db.commit()
         db.refresh(inbox_msg)
-        return InboxMessage(
-            id=inbox_msg.id,
-            sender_id=inbox_msg.sender_id,
-            receiver_id=inbox_msg.receiver_id,
-            logical_receiver_id=(inbox_msg.logical_receiver_id if mailbox_schema else None),
-            digested_into=(inbox_msg.digested_into if mailbox_schema else None),
-            enqueue_generation=(inbox_msg.enqueue_generation if mailbox_schema else None),
-            message=inbox_msg.message,
-            orchestration_type=OrchestrationType(inbox_msg.orchestration_type),
-            status=MessageStatus(inbox_msg.status),
-            created_at=inbox_msg.created_at,
-        )
+        result = _inbox_message_from_row(inbox_msg)
+        if result.status == MessageStatus.HELD:
+            from cli_agent_orchestrator.services.stalled_callback_watchdog import (
+                stalled_callback_watchdog,
+            )
+
+            stalled_callback_watchdog.record_callback_if_to_caller(
+                sender_id,
+                logical_receiver_id or receiver_cache,
+            )
+        return result
 
 
 def insert_watchdog_auto_resume_message(terminal_id: str, message: str) -> WatchdogInsertResult:
@@ -2575,11 +3451,16 @@ def insert_watchdog_auto_resume_message(terminal_id: str, message: str) -> Watch
         if db.query(TerminalModel.id).filter(TerminalModel.id == terminal_id).first() is None:
             return WatchdogInsertResult("failed_before_commit")
         row = InboxModel(
-            sender_id=f"watchdog:{terminal_id}",
-            receiver_id=terminal_id,
-            message=message,
-            orchestration_type=OrchestrationType.SEND_MESSAGE.value,
-            status=MessageStatus.PENDING.value,
+            **_stamp_enqueue_generation(
+                db,
+                {
+                    "sender_id": f"watchdog:{terminal_id}",
+                    "receiver_id": terminal_id,
+                    "message": message,
+                    "orchestration_type": OrchestrationType.SEND_MESSAGE.value,
+                    "status": MessageStatus.PENDING.value,
+                },
+            )
         )
         db.add(row)
         db.flush()
@@ -2640,13 +3521,17 @@ def insert_identity_authority_notice(
                 db.rollback()
                 return NoticeInsertOutcome.FAILED_BEFORE_COMMIT
             row = InboxModel(
-                sender_id=sender_id,
-                receiver_id=receiver_cache,
-                logical_receiver_id=logical_receiver_id,
-                enqueue_generation=enqueue_generation,
-                message=message,
-                orchestration_type=OrchestrationType.SEND_MESSAGE.value,
-                status=MessageStatus.PENDING.value,
+                **_stamp_enqueue_generation(
+                    db,
+                    {
+                        "sender_id": sender_id,
+                        "receiver_id": receiver_cache,
+                        "logical_receiver_id": logical_receiver_id,
+                        "message": message,
+                        "orchestration_type": OrchestrationType.SEND_MESSAGE.value,
+                        "status": MessageStatus.PENDING.value,
+                    },
+                )
             )
             db.add(row)
             db.flush()
@@ -2719,6 +3604,8 @@ def get_pending_messages(
                 logical_receiver_id=row.logical_receiver_id if mailbox_schema else None,
                 digested_into=row.digested_into if mailbox_schema else None,
                 enqueue_generation=row.enqueue_generation if mailbox_schema else None,
+                barrier_id=row.barrier_id,
+                barrier_member_key=row.barrier_member_key,
                 message=row.message,
                 orchestration_type=OrchestrationType(row.orchestration_type),
                 status=MessageStatus(row.status),
@@ -2791,6 +3678,8 @@ def get_inbox_messages(
                 logical_receiver_id=msg.logical_receiver_id if mailbox_schema else None,
                 digested_into=msg.digested_into if mailbox_schema else None,
                 enqueue_generation=msg.enqueue_generation if mailbox_schema else None,
+                barrier_id=msg.barrier_id,
+                barrier_member_key=msg.barrier_member_key,
                 message=msg.message,
                 orchestration_type=OrchestrationType(msg.orchestration_type),
                 status=MessageStatus(msg.status),
@@ -3878,6 +4767,8 @@ def get_message_trace(message_id: int) -> Optional[Dict[str, Any]]:
                 "failure_reason": msg.failure_reason,
                 "digested_into": msg.digested_into,
                 "enqueue_generation": msg.enqueue_generation,
+                "barrier_id": msg.barrier_id,
+                "barrier_member_key": msg.barrier_member_key,
                 "created_at": msg.created_at.isoformat(),
             },
             "attempts": attempts,
@@ -4048,17 +4939,22 @@ def _record_p5_orphan_notices(db: Any, rows: list[InboxModel]) -> tuple[int, int
         if existing is None:
             db.add(
                 InboxModel(
-                    sender_id=notice_sender,
-                    receiver_id=notice_receiver,
-                    logical_receiver_id=logical_receiver_id,
-                    enqueue_generation=enqueue_generation,
-                    message=(
-                        header
-                        + f"[message-trace] delivery to terminal {receiver_id} failed because "
-                        f"the receiver terminal no longer exists for message(s) {ids}."
-                    ),
-                    orchestration_type=OrchestrationType.SEND_MESSAGE.value,
-                    status=MessageStatus.PENDING.value,
+                    **_stamp_enqueue_generation(
+                        db,
+                        {
+                            "sender_id": notice_sender,
+                            "receiver_id": notice_receiver,
+                            "logical_receiver_id": logical_receiver_id,
+                            "message": (
+                                header
+                                + f"[message-trace] delivery to terminal {receiver_id} failed "
+                                f"because the receiver terminal no longer exists for "
+                                f"message(s) {ids}."
+                            ),
+                            "orchestration_type": OrchestrationType.SEND_MESSAGE.value,
+                            "status": MessageStatus.PENDING.value,
+                        },
+                    )
                 )
             )
             notification_count += 1
@@ -4388,15 +5284,20 @@ def record_wpm1_stalled_notice(
             )
             db.add(
                 InboxModel(
-                    sender_id=sender,
-                    receiver_id=notice_receiver,
-                    logical_receiver_id=logical_receiver_id,
-                    enqueue_generation=enqueue_generation,
-                    message=header
-                    + "delivery stalled: receiver shows no progress / payload not yet "
-                    "confirmed; no reinjection will occur while unproven; will confirm if consumed",
-                    orchestration_type=OrchestrationType.SEND_MESSAGE.value,
-                    status=MessageStatus.PENDING.value,
+                    **_stamp_enqueue_generation(
+                        db,
+                        {
+                            "sender_id": sender,
+                            "receiver_id": notice_receiver,
+                            "logical_receiver_id": logical_receiver_id,
+                            "message": header
+                            + "delivery stalled: receiver shows no progress / payload not yet "
+                            "confirmed; no reinjection will occur while unproven; will confirm "
+                            "if consumed",
+                            "orchestration_type": OrchestrationType.SEND_MESSAGE.value,
+                            "status": MessageStatus.PENDING.value,
+                        },
+                    )
                 )
             )
         return "recorded"
@@ -4522,14 +5423,18 @@ def settle_wpm1_terminal_batch(
                         ) = resolve_inbox_receiver(db, stalled.receiver_id)
                         db.add(
                             InboxModel(
-                                sender_id=sender,
-                                receiver_id=notice_receiver,
-                                logical_receiver_id=logical_receiver_id,
-                                enqueue_generation=enqueue_generation,
-                                message=corrective_header
-                                + "previously-stalled message was delivered",
-                                orchestration_type=OrchestrationType.SEND_MESSAGE.value,
-                                status=MessageStatus.PENDING.value,
+                                **_stamp_enqueue_generation(
+                                    db,
+                                    {
+                                        "sender_id": sender,
+                                        "receiver_id": notice_receiver,
+                                        "logical_receiver_id": logical_receiver_id,
+                                        "message": corrective_header
+                                        + "previously-stalled message was delivered",
+                                        "orchestration_type": OrchestrationType.SEND_MESSAGE.value,
+                                        "status": MessageStatus.PENDING.value,
+                                    },
+                                )
                             )
                         )
                 else:
@@ -4548,15 +5453,23 @@ def get_callback_status_since(
 ) -> MessageStatus | None:
     """Return a newer callback status that suppresses the watchdog."""
     with SessionLocal() as db:
+        mailbox_id = _mailbox_id_for_terminal(db, receiver_id)
+        receiver_predicate = InboxModel.receiver_id == receiver_id
+        if mailbox_id is not None:
+            receiver_predicate = or_(
+                receiver_predicate,
+                InboxModel.logical_receiver_id == mailbox_id,
+            )
         row = (
             db.query(InboxModel.status)
             .filter(
                 InboxModel.sender_id == sender_id,
-                InboxModel.receiver_id == receiver_id,
+                receiver_predicate,
                 InboxModel.created_at > since,
                 InboxModel.status.in_(
                     (
                         MessageStatus.PENDING.value,
+                        MessageStatus.HELD.value,
                         MessageStatus.DELIVERING.value,
                         MessageStatus.DELIVERED.value,
                     )

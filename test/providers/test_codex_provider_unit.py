@@ -2403,3 +2403,39 @@ class TestCodexProviderTrustPrompt:
         mock_tmux.return_value.send_special_key.assert_called_with(
             "test-session", "window-0", "Enter"
         )
+
+
+class TestWPQ8ContentPolicyRefusal:
+    def test_m18_real_refusal_sample_is_classify_only(self):
+        rows = load_fixture("codex_content_policy_refusal_2026-07-17.txt").splitlines()
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        classification = provider.classify_screen(rows)
+
+        assert provider.classify_idle_reason(rows, classification) == ("content_policy_refusal")
+        assert provider.transient_error_detected(rows, classification) is False
+
+    def test_m18_indented_refusal_quote_is_not_banner_owned(self):
+        rows = [
+            "assistant: The review quotes the backend message:",
+            "  ⓘ This content can't be shown",
+            "› ",
+            "  gpt-5.6-sol high · ~/project",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        classification = provider.classify_screen(rows)
+
+        assert provider.classify_idle_reason(rows, classification) is None
+        assert provider.transient_error_detected(rows, classification) is False
+
+    def test_m19_refusal_wins_over_transient_positive(self):
+        rows = [
+            "502 Bad Gateway",
+            "ⓘ This content can't be shown",
+            "› ",
+            "  gpt-5.6-sol high · ~/project",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        classification = provider.classify_screen(rows)
+
+        assert provider.classify_idle_reason(rows, classification) == ("content_policy_refusal")
+        assert provider.transient_error_detected(rows, classification) is False

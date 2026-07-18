@@ -325,18 +325,29 @@ def test_temporal_exempt_progress_never_enters_corroboration(kind, rows, provide
         object(),
     )
     backend = MagicMock()
+    backend.capture_viewport.return_value = "\n".join(rows)
+    backend.get_pane_size.return_value = (100, 20)
     with (
         patch(
             "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
             return_value=_provider(kind),
         ),
         patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+        patch(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            return_value={
+                "tmux_session": "session",
+                "tmux_window": "receiver",
+                "provider": kind,
+            },
+        ),
     ):
         status, meta = monitor.probe_screen_status("receiver")
     assert status == TerminalStatus.PROCESSING
     assert meta["law_signal"]["provider_signal"] == provider_signal
     assert "temporal_demotion" not in meta
-    assert backend.mock_calls == []
+    backend.capture_viewport.assert_called_once_with("session", "receiver")
+    assert meta["frame_source"] == "fresh_capture"
 
 
 def test_static_demotion_requires_identity_proof_before_final_capture():

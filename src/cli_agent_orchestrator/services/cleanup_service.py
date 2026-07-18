@@ -1,15 +1,20 @@
 """Cleanup service for old terminals, messages, and logs."""
 
+import json
 import logging
 import re
-import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from cli_agent_orchestrator.clients.database import (
+    CallbackBarrierMemberModel,
+    CallbackBarrierModel,
+    InboxDeliveryAttemptMemberModel,
+    InboxDeliveryAttemptModel,
+    InboxModel,
+    SessionLocal,
+    TerminalModel,
     delete_terminal_and_warm_intent,
-    InboxModel, InboxDeliveryAttemptMemberModel, InboxDeliveryAttemptModel,
-    SessionLocal, TerminalModel,
 )
 from cli_agent_orchestrator.constants import (
     LOG_DIR,
@@ -35,21 +40,28 @@ def cleanup_old_data():
         # Clean up old terminals (stop FIFO readers and clear state first)
         with SessionLocal() as db:
             old_terminals = (
-                db.query(TerminalModel).filter(
+                db.query(TerminalModel)
+                .filter(
                     (TerminalModel.last_active < cutoff_date)
                     & (TerminalModel.init_state == "ready"),
-                ).all()
+                )
+                .all()
             )
             for terminal in old_terminals:
                 fifo_manager.stop_reader(terminal.id)
                 status_monitor.clear_terminal(terminal.id)
-            skipped = db.query(TerminalModel).filter(
-                (TerminalModel.last_active < cutoff_date)
-                & (TerminalModel.init_state != "ready"),
-            ).count()
+            skipped = (
+                db.query(TerminalModel)
+                .filter(
+                    (TerminalModel.last_active < cutoff_date)
+                    & (TerminalModel.init_state != "ready"),
+                )
+                .count()
+            )
         deleted_terminals = sum(
             delete_terminal_and_warm_intent(
-                terminal.id, preserve_warm_intent=False,
+                terminal.id,
+                preserve_warm_intent=False,
             )["terminal_deleted"]
             for terminal in old_terminals
         )
@@ -61,14 +73,19 @@ def cleanup_old_data():
         with SessionLocal() as db:
             old_rows = db.query(InboxModel).filter(InboxModel.created_at < cutoff_date).all()
             old_ids_all = {row.id for row in old_rows}
-            gated_rows = (db.query(InboxDeliveryAttemptModel, InboxDeliveryAttemptMemberModel)
-                          .join(InboxDeliveryAttemptMemberModel,
-                                InboxDeliveryAttemptMemberModel.attempt_uuid ==
-                                InboxDeliveryAttemptModel.attempt_uuid)
-                          .filter(InboxDeliveryAttemptModel.outcome == "ambiguous",
-                                  InboxDeliveryAttemptModel.reason.in_((
-                                      "confirmation_timeout", "receiver_gone")))
-                          .all())
+            gated_rows = (
+                db.query(InboxDeliveryAttemptModel, InboxDeliveryAttemptMemberModel)
+                .join(
+                    InboxDeliveryAttemptMemberModel,
+                    InboxDeliveryAttemptMemberModel.attempt_uuid
+                    == InboxDeliveryAttemptModel.attempt_uuid,
+                )
+                .filter(
+                    InboxDeliveryAttemptModel.outcome == "ambiguous",
+                    InboxDeliveryAttemptModel.reason.in_(("confirmation_timeout", "receiver_gone")),
+                )
+                .all()
+            )
             batch_by_attempt: dict[str, set[int]] = {}
             for attempt, member in gated_rows:
                 batch_by_attempt.setdefault(attempt.attempt_uuid, set()).add(member.message_id)
@@ -78,6 +95,19 @@ def cleanup_old_data():
                 if attempt not in attempts_by_batch.setdefault(key, []):
                     attempts_by_batch[key].append(attempt)
             retained_ids: set[int] = set()
+            retained_ids.update(
+                row[0]
+                for row in db.query(InboxModel.id)
+                .join(
+                    CallbackBarrierModel,
+                    CallbackBarrierModel.id == InboxModel.barrier_id,
+                )
+                .filter(
+                    InboxModel.status == "held",
+                    CallbackBarrierModel.state == "OPEN",
+                )
+                .all()
+            )
             exempt_batches = 0
             now_cutoff = cutoff_date.replace(tzinfo=timezone.utc)
             for key, attempts in attempts_by_batch.items():
@@ -103,7 +133,9 @@ def cleanup_old_data():
                 pending = any(row.status == "pending" for row in rows)
                 retain = pending
                 if malformed:
-                    logger.warning("Malformed WPM1 terminal_settled_at for batch %s; retaining", key)
+                    logger.warning(
+                        "Malformed WPM1 terminal_settled_at for batch %s; retaining", key
+                    )
                     retain = True
                 elif not clocks:
                     logger.warning("Absent WPM1 terminal_settled_at for batch %s; retaining", key)
@@ -116,7 +148,8 @@ def cleanup_old_data():
 
             # Durable notice keys live exactly as long as their referenced batch.
             notice_pattern = re.compile(
-                r"^wpm1-notice kind=(?:stalled|corrective) batch=([0-9]+(?:,[0-9]+)*)\n")
+                r"^wpm1-notice kind=(?:stalled|corrective) batch=([0-9]+(?:,[0-9]+)*)\n"
+            )
             for row in old_rows:
                 if not row.sender_id.startswith("message-trace:"):
                     continue
@@ -125,26 +158,38 @@ def cleanup_old_data():
                     retained_ids.add(row.id)
             old_ids = list(old_ids_all - retained_ids)
             logger.info("Exempted %s gated WPM1 batch(es) from inbox cleanup", exempt_batches)
-            attempt_ids = [x[0] for x in db.query(InboxDeliveryAttemptMemberModel.attempt_uuid)
-                           .filter(InboxDeliveryAttemptMemberModel.message_id.in_(old_ids)).all()]
+            attempt_ids = [
+                x[0]
+                for x in db.query(InboxDeliveryAttemptMemberModel.attempt_uuid)
+                .filter(InboxDeliveryAttemptMemberModel.message_id.in_(old_ids))
+                .all()
+            ]
             if old_ids:
+                db.query(CallbackBarrierMemberModel).filter(
+                    CallbackBarrierMemberModel.message_id.in_(old_ids)
+                ).update(
+                    {CallbackBarrierMemberModel.message_id: None},
+                    synchronize_session=False,
+                )
                 db.query(InboxDeliveryAttemptMemberModel).filter(
-                    InboxDeliveryAttemptMemberModel.message_id.in_(old_ids)).delete(
-                    synchronize_session=False)
+                    InboxDeliveryAttemptMemberModel.message_id.in_(old_ids)
+                ).delete(synchronize_session=False)
             if attempt_ids:
                 remaining_attempt_ids = {
                     row[0]
                     for row in db.query(InboxDeliveryAttemptMemberModel.attempt_uuid)
-                    .filter(InboxDeliveryAttemptMemberModel.attempt_uuid.in_(attempt_ids)).all()
+                    .filter(InboxDeliveryAttemptMemberModel.attempt_uuid.in_(attempt_ids))
+                    .all()
                 }
                 orphaned_attempt_ids = set(attempt_ids) - remaining_attempt_ids
                 if orphaned_attempt_ids:
                     db.query(InboxDeliveryAttemptModel).filter(
-                        InboxDeliveryAttemptModel.attempt_uuid.in_(orphaned_attempt_ids)).delete(
-                        synchronize_session=False)
+                        InboxDeliveryAttemptModel.attempt_uuid.in_(orphaned_attempt_ids)
+                    ).delete(synchronize_session=False)
             deleted_messages = (
-                db.query(InboxModel).filter(InboxModel.id.in_(old_ids)).delete(
-                    synchronize_session=False)
+                db.query(InboxModel)
+                .filter(InboxModel.id.in_(old_ids))
+                .delete(synchronize_session=False)
             )
             db.commit()
             logger.info(f"Deleted {deleted_messages} old inbox messages from database")

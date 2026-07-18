@@ -210,6 +210,9 @@ EAGER_INBOX_DELIVERY = os.environ.get("CAO_EAGER_INBOX_DELIVERY", "false").lower
 # for those terminals; the event bus remains the primary delivery path for all
 # other providers.
 INBOX_POLLING_INTERVAL = 5
+CALLBACK_BARRIER_POLL_INTERVAL = 1.0
+CALLBACK_BARRIER_TIMEOUT_SECONDS = _env_int("CAO_BARRIER_TIMEOUT_SECONDS", 1800)
+CALLBACK_BARRIER_TIMEOUT_MAX_SECONDS = _env_int("CAO_BARRIER_TIMEOUT_MAX_SECONDS", 86400)
 
 # Reconciliation sweep for orphaned inbox messages.
 # The fast delivery paths — the immediate attempt on POST and the event-driven

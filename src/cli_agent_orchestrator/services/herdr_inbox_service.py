@@ -16,8 +16,10 @@ import json
 import logging
 import re
 import subprocess
+import threading
 import time
-from typing import Callable, Dict, Optional, Set
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Literal, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,28 @@ _BACKOFF_MULTIPLIER = 2.0
 _KIRO_WORKING_THRESHOLD = 30.0  # seconds
 INTENT_ACK_WAIT_S = 5.0
 TEARDOWN_INTENT_TTL_S = 60.0
+RECONNECT_GRACE_S = 30.0
+
+
+@dataclass(frozen=True)
+class IdentityMarker:
+    agent: str
+    pane_id: str
+    native_event_gen: int
+
+
+@dataclass(frozen=True)
+class ReconcileOutcome:
+    status: Literal["ok", "failed"]
+    confirmed: frozenset[tuple[str, str, int]] = frozenset()
+
+
+@dataclass
+class _IdentityRecord:
+    marker: IdentityMarker
+    received_monotonic: float
+    quarantined: bool = False
+    grace_started: float | None = None
 
 
 class HerdrInboxService:
@@ -62,6 +86,8 @@ class HerdrInboxService:
         self._pane_to_terminal: Dict[str, str] = {}  # pane_id → terminal_id
         self._terminal_to_pane: Dict[str, str] = {}  # terminal_id → pane_id
         self._native_event_gen: Dict[tuple[str, str], int] = {}
+        self._identity_guard = threading.Lock()
+        self._identity_records: Dict[tuple[str, str, int], _IdentityRecord] = {}
 
         # Kiro-specific tracking for supplement check
         self._kiro_terminals: Set[str] = set()  # terminal_ids using kiro-cli
@@ -101,6 +127,24 @@ class HerdrInboxService:
             return f"{config_home}/herdr/herdr.sock"
         return f"{config_home}/herdr/sessions/{session_name}/herdr.sock"
 
+    def _invalidate_terminal_identity_locked(self, terminal_id: str) -> None:
+        for key in [key for key in self._identity_records if key[0] == terminal_id]:
+            self._identity_records.pop(key, None)
+
+    def _register_terminal_locked(self, terminal_id: str, pane_id: str, is_kiro: bool) -> None:
+        prior_pane = self._terminal_to_pane.get(terminal_id)
+        self._invalidate_terminal_identity_locked(terminal_id)
+        if prior_pane and prior_pane != pane_id:
+            self._pane_to_terminal.pop(prior_pane, None)
+        self._pane_to_terminal[pane_id] = terminal_id
+        self._terminal_to_pane[terminal_id] = pane_id
+        if is_kiro:
+            self._kiro_terminals.add(terminal_id)
+
+    def _schedule_reconnect(self) -> None:
+        if self._connected and self._loop is not None:
+            asyncio.run_coroutine_threadsafe(self._force_reconnect(), self._loop)
+
     def register_terminal(self, terminal_id: str, pane_id: str, is_kiro: bool = False) -> None:
         """Register a terminal for event-based inbox delivery.
 
@@ -109,13 +153,11 @@ class HerdrInboxService:
             pane_id: Current herdr compact pane_id
             is_kiro: Whether this terminal runs kiro-cli (enables supplement check)
         """
-        prior_pane = self._terminal_to_pane.get(terminal_id)
-        if prior_pane and prior_pane != pane_id:
-            self._pane_to_terminal.pop(prior_pane, None)
-        self._pane_to_terminal[pane_id] = terminal_id
-        self._terminal_to_pane[terminal_id] = pane_id
-        if is_kiro:
-            self._kiro_terminals.add(terminal_id)
+        from cli_agent_orchestrator.services.inbox_service import get_delivery_lock
+
+        with get_delivery_lock(terminal_id):
+            with self._identity_guard:
+                self._register_terminal_locked(terminal_id, pane_id, is_kiro)
 
         logger.info(f"Registered terminal {terminal_id} (pane={pane_id}, kiro={is_kiro})")
 
@@ -131,8 +173,21 @@ class HerdrInboxService:
         # register_terminal() may be called from a synchronous/non-event-loop
         # thread, so we schedule the reconnect onto the captured loop via
         # run_coroutine_threadsafe instead of create_task.
-        if self._connected and self._loop is not None:
-            asyncio.run_coroutine_threadsafe(self._force_reconnect(), self._loop)
+        self._schedule_reconnect()
+
+    def _register_terminal_under_guard(
+        self,
+        terminal_id: str,
+        pane_id: str,
+        is_kiro: bool,
+        guard: Any,
+    ) -> None:
+        """Register while a same-terminal active DeliveryGuard owns the lock."""
+        if getattr(guard, "terminal_id", None) != terminal_id or guard.active is not True:
+            raise RuntimeError("delivery_guard_not_active_for_terminal")
+        with self._identity_guard:
+            self._register_terminal_locked(terminal_id, pane_id, is_kiro)
+        self._schedule_reconnect()
 
     def unregister_terminal(self, terminal_id: str) -> None:
         """Remove a terminal from managed set.
@@ -140,12 +195,88 @@ class HerdrInboxService:
         Args:
             terminal_id: Terminal to unregister
         """
-        pane_id = self._terminal_to_pane.pop(terminal_id, None)
-        if pane_id:
-            self._pane_to_terminal.pop(pane_id, None)
-        self._kiro_terminals.discard(terminal_id)
-        self._working_since.pop(terminal_id, None)
+        from cli_agent_orchestrator.services.inbox_service import get_delivery_lock
+
+        with get_delivery_lock(terminal_id):
+            with self._identity_guard:
+                pane_id = self._terminal_to_pane.pop(terminal_id, None)
+                if pane_id:
+                    self._pane_to_terminal.pop(pane_id, None)
+                self._kiro_terminals.discard(terminal_id)
+                self._working_since.pop(terminal_id, None)
+                self._invalidate_terminal_identity_locked(terminal_id)
         logger.info(f"Unregistered terminal {terminal_id}")
+
+    def read_identity_marker(self, terminal_id: str) -> IdentityMarker | None:
+        """Copy the authoritative marker for the terminal's current pane incarnation."""
+        now = time.monotonic()
+        with self._identity_guard:
+            pane_id = self._terminal_to_pane.get(terminal_id)
+            if pane_id is None:
+                return None
+            generation = self._native_event_gen.get((terminal_id, pane_id), 0)
+            record = self._identity_records.get((terminal_id, pane_id, generation))
+            if record is None or record.quarantined:
+                return None
+            if record.grace_started is not None and now - record.grace_started < RECONNECT_GRACE_S:
+                return None
+            return record.marker
+
+    def _quarantine_identity_markers(self) -> None:
+        with self._identity_guard:
+            for record in self._identity_records.values():
+                record.quarantined = True
+
+    def _apply_reconcile_outcome(self, outcome: ReconcileOutcome) -> None:
+        now = time.monotonic()
+        with self._identity_guard:
+            if outcome.status == "failed":
+                for record in self._identity_records.values():
+                    record.quarantined = True
+                return
+            for key in list(self._identity_records):
+                record = self._identity_records[key]
+                if key not in outcome.confirmed:
+                    self._identity_records.pop(key, None)
+                    continue
+                record.quarantined = False
+                record.grace_started = now
+
+    def _confirmed_incarnations(self) -> frozenset[tuple[str, str, int]]:
+        with self._identity_guard:
+            return frozenset(
+                (
+                    terminal_id,
+                    pane_id,
+                    self._native_event_gen.get((terminal_id, pane_id), 0),
+                )
+                for terminal_id, pane_id in self._terminal_to_pane.items()
+            )
+
+    def _remap_terminal_identity(
+        self, terminal_id: str, old_pane_id: str, new_pane_id: str
+    ) -> None:
+        from cli_agent_orchestrator.services.inbox_service import get_delivery_lock
+
+        with get_delivery_lock(terminal_id):
+            with self._identity_guard:
+                if self._terminal_to_pane.get(terminal_id) != old_pane_id:
+                    return
+                self._pane_to_terminal.pop(old_pane_id, None)
+                self._pane_to_terminal[new_pane_id] = terminal_id
+                self._terminal_to_pane[terminal_id] = new_pane_id
+                self._invalidate_terminal_identity_locked(terminal_id)
+
+    def _drop_terminal_identity(self, terminal_id: str, pane_id: str) -> None:
+        from cli_agent_orchestrator.services.inbox_service import get_delivery_lock
+
+        with get_delivery_lock(terminal_id):
+            with self._identity_guard:
+                self._pane_to_terminal.pop(pane_id, None)
+                self._terminal_to_pane.pop(terminal_id, None)
+                self._kiro_terminals.discard(terminal_id)
+                self._working_since.pop(terminal_id, None)
+                self._invalidate_terminal_identity_locked(terminal_id)
 
     async def start(self) -> None:
         """Start the event loop: wait for first terminal, then connect and listen."""
@@ -226,7 +357,8 @@ class HerdrInboxService:
                     if term.get("init_state") != "ready":
                         logger.warning(
                             "herdr_startup_cleanup_skipped_non_ready terminal=%s init_state=%r",
-                            term["id"], term.get("init_state"),
+                            term["id"],
+                            term.get("init_state"),
                         )
                         continue
                     logger.info(
@@ -273,7 +405,10 @@ class HerdrInboxService:
                 self._connected = True
 
                 # Reconcile map against live herdr state before subscribing
-                await self._reconcile()
+                reconcile = await self._reconcile()
+                self._apply_reconcile_outcome(reconcile)
+                if reconcile.status == "failed":
+                    raise ConnectionError("Herdr reconciliation failed")
 
                 # Subscribe to everything in ONE events.subscribe call: every
                 # managed pane's agent-status plus the lifecycle events. herdr
@@ -289,13 +424,14 @@ class HerdrInboxService:
             except (ConnectionError, OSError, asyncio.IncompleteReadError) as e:
                 logger.warning(f"Herdr socket disconnected: {e}")
                 self._connected = False
+                self._quarantine_identity_markers()
 
                 # Exponential backoff
                 logger.info(f"Reconnecting in {self._backoff}s...")
                 await asyncio.sleep(self._backoff)
                 self._backoff = min(self._backoff * _BACKOFF_MULTIPLIER, _BACKOFF_MAX)
 
-    async def _reconcile(self) -> None:
+    async def _reconcile(self) -> ReconcileOutcome:
         """Reconcile _pane_to_terminal map against live herdr state.
 
         Prunes stale pane entries, deletes orphaned DB terminal records,
@@ -313,7 +449,7 @@ class HerdrInboxService:
         )
         if result.returncode != 0:
             logger.warning(f"Reconcile: herdr pane list failed: {result.stderr}")
-            return
+            return ReconcileOutcome("failed")
 
         try:
             data = json.loads(result.stdout)
@@ -321,7 +457,7 @@ class HerdrInboxService:
             live_pane_ids = {p["pane_id"] for p in panes}
         except (json.JSONDecodeError, KeyError) as e:
             logger.warning(f"Reconcile: failed to parse pane list: {e}")
-            return
+            return ReconcileOutcome("failed")
 
         # Build workspace_id -> session_name mapping
         ws_result = subprocess.run(
@@ -334,15 +470,20 @@ class HerdrInboxService:
             try:
                 ws_data = json.loads(ws_result.stdout)
                 workspaces = ws_data.get("result", {}).get("workspaces", [])
-                self._workspace_to_session = {ws["workspace_id"]: ws["label"] for ws in workspaces}
+                with self._identity_guard:
+                    self._workspace_to_session = {
+                        ws["workspace_id"]: ws["label"] for ws in workspaces
+                    }
                 from cli_agent_orchestrator.clients.database import record_workspace_mapping
+
                 for ws_id, session_name in self._workspace_to_session.items():
                     try:
                         record_workspace_mapping(ws_id, session_name)
                     except Exception:
                         logger.exception(
                             "herdr_workspace_map_backfill_failed workspace=%s session=%s",
-                            ws_id, session_name,
+                            ws_id,
+                            session_name,
                         )
             except (json.JSONDecodeError, KeyError):
                 pass
@@ -400,7 +541,7 @@ class HerdrInboxService:
         stale_pane_ids = set(self._pane_to_terminal.keys()) - live_pane_ids
         if not stale_pane_ids:
             logger.debug("Reconcile: all panes live, nothing to prune")
-            return
+            return ReconcileOutcome("ok", self._confirmed_incarnations())
 
         # Live workspace labels, used to gate workspace teardown below: never
         # kill a workspace whose label is still present in herdr.
@@ -444,9 +585,12 @@ class HerdrInboxService:
                         e,
                     )
                 else:
-                    self._pane_to_terminal.pop(pane_id, None)
-                    self._pane_to_terminal[new_pane_id] = terminal_id
-                    self._terminal_to_pane[terminal_id] = new_pane_id
+                    await asyncio.to_thread(
+                        self._remap_terminal_identity,
+                        terminal_id,
+                        pane_id,
+                        new_pane_id,
+                    )
                     logger.info(
                         "Reconcile: re-mapped %s %s -> %s (pane renumbered, tab still live)",
                         terminal_id,
@@ -458,10 +602,7 @@ class HerdrInboxService:
 
             # Tab label genuinely gone (or re-resolve failed): prune maps and
             # delete the orphaned DB record.
-            self._pane_to_terminal.pop(pane_id, None)
-            self._terminal_to_pane.pop(terminal_id, None)
-            self._kiro_terminals.discard(terminal_id)
-            self._working_since.pop(terminal_id, None)
+            await asyncio.to_thread(self._drop_terminal_identity, terminal_id, pane_id)
 
             try:
                 if meta and await self._route_spontaneous_terminal(meta):
@@ -497,6 +638,7 @@ class HerdrInboxService:
             remapped,
             deleted,
         )
+        return ReconcileOutcome("ok", self._confirmed_incarnations())
 
     async def _connect(self) -> None:
         """Connect to the herdr socket."""
@@ -585,11 +727,20 @@ class HerdrInboxService:
             status = data.get("agent_status", "")
 
             # Only process events for managed panes
-            terminal_id = self._pane_to_terminal.get(pane_id)
-            if not terminal_id:
-                continue
-            key = (terminal_id, pane_id)
-            self._native_event_gen[key] = self._native_event_gen.get(key, 0) + 1
+            with self._identity_guard:
+                terminal_id = self._pane_to_terminal.get(pane_id)
+                if not terminal_id:
+                    continue
+                key = (terminal_id, pane_id)
+                generation = self._native_event_gen.get(key, 0) + 1
+                self._native_event_gen[key] = generation
+                agent = data.get("agent")
+                if isinstance(agent, str) and agent:
+                    self._invalidate_terminal_identity_locked(terminal_id)
+                    marker = IdentityMarker(agent, pane_id, generation)
+                    self._identity_records[(terminal_id, pane_id, generation)] = _IdentityRecord(
+                        marker, time.monotonic()
+                    )
 
             if status in ("idle", "done"):
                 # Clear working timestamp
@@ -605,7 +756,8 @@ class HerdrInboxService:
 
     def get_native_event_gen(self, terminal_id: str, pane_id: str) -> int:
         """Return native status events routed from this exact pane incarnation."""
-        return self._native_event_gen.get((terminal_id, pane_id), 0)
+        with self._identity_guard:
+            return self._native_event_gen.get((terminal_id, pane_id), 0)
 
     def _label_still_live(self, window_name: str) -> bool:
         """Return True if a tab with this label is still live in herdr.
@@ -676,13 +828,14 @@ class HerdrInboxService:
             try:
                 await terminal_service.quiesce_deferred_terminal(terminal_id)
             except Exception as exc:
-                logger.error(
-                    "herdr_class2_quiesce_failed terminal=%s code=%s", terminal_id, exc
-                )
+                logger.error("herdr_class2_quiesce_failed terminal=%s code=%s", terminal_id, exc)
                 return False
             await terminal_service._claim_and_settle_deferred_failure(
-                terminal_id, f"herdr-{time.monotonic_ns()}", metadata,
-                "worker_vanished", None,
+                terminal_id,
+                f"herdr-{time.monotonic_ns()}",
+                metadata,
+                "worker_vanished",
+                None,
             )
             return True
         if state == "ready":
@@ -690,13 +843,18 @@ class HerdrInboxService:
             return True
         if state in {"init_failed_notified", "init_failed_caller_gone"}:
             await terminal_service.dispatcher.run(
-                terminal_id, "herdr-settle", "mutating", "settlement",
-                terminal_service._settle_deferred_failure_sync, terminal_id,
+                terminal_id,
+                "herdr-settle",
+                "mutating",
+                "settlement",
+                terminal_service._settle_deferred_failure_sync,
+                terminal_id,
             )
             return True
         logger.error(
             "herdr_cleanup_skipped_invalid_init_state terminal=%s init_state=%r",
-            terminal_id, state,
+            terminal_id,
+            state,
         )
         return False
 
@@ -729,18 +887,22 @@ class HerdrInboxService:
         intent = None
         if proven:
             intent = consume_current_teardown_intent(
-                workspace_id, ttl_s=TEARDOWN_INTENT_TTL_S,
+                workspace_id,
+                ttl_s=TEARDOWN_INTENT_TTL_S,
             )
             if intent is None:
                 proven = False
-        session_name = intent.get("session_name") if intent else resolve_workspace_mapping(workspace_id)
+        session_name = (
+            intent.get("session_name") if intent else resolve_workspace_mapping(workspace_id)
+        )
         if not session_name:
             logger.error("workspace_close_unroutable workspace=%s", workspace_id)
             return
         if current_workspace_for_session(session_name) != workspace_id:
             logger.warning(
                 "workspace_close_stale_generation workspace=%s session=%s",
-                workspace_id, session_name,
+                workspace_id,
+                session_name,
             )
             retire_workspace_mapping(workspace_id)
             return
@@ -759,16 +921,19 @@ class HerdrInboxService:
         finally:
             if completed:
                 retire_workspace_mapping(workspace_id)
-                self._workspace_to_session.pop(workspace_id, None)
+                with self._identity_guard:
+                    self._workspace_to_session.pop(workspace_id, None)
 
     async def _handle_lifecycle_event_async(self, event_type: str, data: dict) -> None:
         from cli_agent_orchestrator.clients.database import (
-            get_teardown_intent, get_terminal_metadata,
+            get_teardown_intent,
+            get_terminal_metadata,
         )
 
         if event_type == "pane.closed":
             pane_id = data.get("pane_id", "")
-            terminal_id = self._pane_to_terminal.get(pane_id)
+            with self._identity_guard:
+                terminal_id = self._pane_to_terminal.get(pane_id)
             if not terminal_id:
                 return
             metadata = get_terminal_metadata(terminal_id)
@@ -778,15 +943,13 @@ class HerdrInboxService:
             if window_name and self._label_still_live(window_name):
                 logger.info(
                     "pane.closed: ignoring stale close for %s (pane=%s)",
-                    terminal_id, pane_id,
+                    terminal_id,
+                    pane_id,
                 )
                 return
             if not await self._route_spontaneous_terminal(metadata):
                 return
-            self._pane_to_terminal.pop(pane_id, None)
-            self._terminal_to_pane.pop(terminal_id, None)
-            self._kiro_terminals.discard(terminal_id)
-            self._working_since.pop(terminal_id, None)
+            await asyncio.to_thread(self._drop_terminal_identity, terminal_id, pane_id)
             return
 
         if event_type != "workspace.closed":

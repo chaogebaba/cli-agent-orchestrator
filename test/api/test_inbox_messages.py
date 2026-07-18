@@ -116,7 +116,7 @@ class TestGetInboxMessagesEndpoint:
         assert "detail" in data
         assert "Invalid status" in data["detail"]
         assert (
-            "pending, delivering, delivered, delivery_failed, failed, digested, cancelled"
+            "pending, held, delivering, delivered, delivery_failed, failed, digested, cancelled"
             in data["detail"]
         )
 

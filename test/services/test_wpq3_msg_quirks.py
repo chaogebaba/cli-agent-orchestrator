@@ -23,8 +23,13 @@ from cli_agent_orchestrator.services.message_trace_service import transcript_loo
 from cli_agent_orchestrator.services.stalled_callback_watchdog import (
     AUTO_RESUME_BODY,
     StalledCallbackWatchdog,
+    WatchdogNotice,
 )
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+
+def _watchdog_notice(message: str, idle_reason: str | None = None) -> WatchdogNotice:
+    return WatchdogNotice("worker", "caller", message, idle_reason)
 
 
 def _plan(*, evidence=None, first_ref=("/tmp/transcript", 7, 10), attempt="a"):
@@ -448,7 +453,7 @@ def test_d5_kill_switch_preserves_ordinary_push(monkeypatch, disabled):
     )
     due = service.collect_due_notifications(now=13.0)
     assert due == [
-        ("worker", "caller", "[watchdog] worker worker (developer) idle 3s without callback")
+        _watchdog_notice("[watchdog] worker worker (developer) idle 3s without callback")
     ]
 
 
@@ -583,7 +588,7 @@ def test_d5_auto_resume_is_one_shot_and_suffix_preserves_mark(monkeypatch):
     due = service.collect_due_notifications(now=16.0)
 
     assert len(due) == 1
-    assert "auto-resume attempted at" in due[0][2]
+    assert "auto-resume attempted at" in due[0].message
     assert service._episodes["worker"].auto_resumed is True
     assert service._episodes["worker"].fired is True
     insert.assert_called_once_with("worker", AUTO_RESUME_BODY)
@@ -664,11 +669,10 @@ def test_d5_failed_before_commit_pushes_without_marking_auto_resumed(monkeypatch
     )
 
     assert service.collect_due_notifications(now=13.0) == [
-        (
-            "worker",
-            "caller",
+        _watchdog_notice(
             "[watchdog] worker worker (developer) idle 3s without callback "
             "[reason: transient_api_error]",
+            "transient_api_error",
         )
     ]
     probe.assert_called_once_with("worker")
@@ -730,11 +734,10 @@ def test_wpq6_a_g_capacity_auto_resumes_then_pushes_composed_reason(monkeypatch)
     assert service.collect_due_notifications(now=13.0) == []
     attempted_at = service._episodes["worker"].auto_resume_attempted_at
     assert service.collect_due_notifications(now=16.0) == [
-        (
-            "worker",
-            "caller",
+        _watchdog_notice(
             "[watchdog] worker worker (developer) idle 3s without callback "
             f"[reason: transient_api_error] (auto-resume attempted at {attempted_at})",
+            "transient_api_error",
         )
     ]
     insert.assert_called_once_with("worker", AUTO_RESUME_BODY)
@@ -778,11 +781,10 @@ def test_wpq6_c_excluded_collision_pushes_reason_without_auto_resume(monkeypatch
     )
 
     assert service.collect_due_notifications(now=13.0) == [
-        (
-            "worker",
-            "caller",
+        _watchdog_notice(
             "[watchdog] worker worker (developer) idle 3s without callback "
             "[reason: quota_or_auth]",
+            "quota_or_auth",
         )
     ]
     insert.assert_not_called()
@@ -855,7 +857,7 @@ def test_wpq6_b_processing_reason_is_gate_free_without_auto_resume(monkeypatch):
         insert,
     )
 
-    assert service.collect_due_notifications(now=13.0)[0][2].endswith(
+    assert service.collect_due_notifications(now=13.0)[0].message.endswith(
         "[reason: transient_api_error]"
     )
     insert.assert_not_called()
@@ -891,7 +893,7 @@ def test_wpq6_a2_ghost_composer_reason_does_not_relax_nudge_gate(monkeypatch):
         insert,
     )
 
-    assert service.collect_due_notifications(now=13.0)[0][2].endswith(
+    assert service.collect_due_notifications(now=13.0)[0].message.endswith(
         "[reason: transient_api_error]"
     )
     insert.assert_not_called()
@@ -917,7 +919,7 @@ def test_wpq6_e_error_banner_pushes_reason_without_auto_resume(monkeypatch):
         insert,
     )
 
-    assert service.collect_due_notifications(now=13.0)[0][2].endswith("[reason: error_banner]")
+    assert service.collect_due_notifications(now=13.0)[0].message.endswith("[reason: error_banner]")
     insert.assert_not_called()
 
 
@@ -944,7 +946,7 @@ def test_wpq6_w_cropped_indented_capacity_never_auto_resumes(monkeypatch):
         insert,
     )
 
-    assert service.collect_due_notifications(now=13.0)[0][2] == (
+    assert service.collect_due_notifications(now=13.0)[0].message == (
         "[watchdog] worker worker (developer) idle 3s without callback"
     )
     insert.assert_not_called()

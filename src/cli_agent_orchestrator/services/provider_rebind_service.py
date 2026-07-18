@@ -64,6 +64,7 @@ class DeliveryGuard:
     """A dedicated thread owns both acquire and release of a delivery lock."""
 
     def __init__(self, terminal_id: str, loop: asyncio.AbstractEventLoop):
+        self.terminal_id = terminal_id
         self.lock = get_delivery_lock(terminal_id)
         self.loop = loop
         self.cancel = threading.Event()
@@ -72,6 +73,15 @@ class DeliveryGuard:
         self.done = loop.create_future()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.started = False
+
+    @property
+    def active(self) -> bool:
+        return (
+            self.started
+            and self.acquired.done()
+            and bool(self.acquired.result())
+            and not self.done.done()
+        )
 
     def _set(self, future, value):
         if not future.done():
@@ -139,7 +149,11 @@ async def _wait_for_shell_baseline(
 
 
 async def _wait_for_backend_proof(
-    terminal_id: str, metadata: dict, candidate, before_output_gen: int,
+    terminal_id: str,
+    metadata: dict,
+    candidate,
+    before_output_gen: int,
+    guard: DeliveryGuard | None = None,
 ) -> None:
     """Prove the staged provider reached the existing backend event pipeline."""
     backend = get_backend()
@@ -164,7 +178,10 @@ async def _wait_for_backend_proof(
         terminal_id, metadata["tmux_session"], metadata["tmux_window"]
     )
     before_event_gen = svc.get_native_event_gen(terminal_id, pane)
-    svc.register_terminal(terminal_id, pane, False)
+    if guard is None:
+        svc.register_terminal(terminal_id, pane, False)
+    else:
+        svc._register_terminal_under_guard(terminal_id, pane, False, guard)
     if svc._terminal_to_pane.get(terminal_id) != pane or svc._pane_to_terminal.get(pane) != terminal_id:
         raise RuntimeError("herdr_mapping_proof_failed")
     while time.monotonic() < deadline:
@@ -334,7 +351,9 @@ async def rebind_terminal(
         phase = "p10"
         provider_manager.commit_provider(terminal_id, candidate, expected_current=old_provider)
         phase = "p11"
-        await _wait_for_backend_proof(terminal_id, metadata, candidate, before_output_gen)
+        await _wait_for_backend_proof(
+            terminal_id, metadata, candidate, before_output_gen, guard
+        )
         phase = "p12"
         raw = status_monitor.get_raw_status(terminal_id, provider_override=candidate)
         if raw not in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}:

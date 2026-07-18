@@ -10,14 +10,40 @@ from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
 from cli_agent_orchestrator.services import provider_rebind_service as service
 from cli_agent_orchestrator.services import terminal_service
-from cli_agent_orchestrator.services.inbox_service import InboxService, get_delivery_lock
-from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
+from cli_agent_orchestrator.services.inbox_service import InboxService, get_delivery_lock
 from cli_agent_orchestrator.services.rebind_lease import (
     acquire_rebind_lease,
     release_rebind_lease,
     validate_rebind_lease,
 )
+from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+
+def test_same_id_rebind_advances_lifecycle_generation(monkeypatch):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.clients.database import Base, TerminalModel
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    sessions = sessionmaker(bind=engine)
+    monkeypatch.setattr(database, "SessionLocal", sessions)
+    with sessions.begin() as db:
+        db.add(
+            TerminalModel(
+                id="worker",
+                tmux_session="cao-test",
+                tmux_window="worker",
+                provider="codex",
+                lifecycle_generation=1,
+            )
+        )
+    assert database.settle_terminal_rebound("worker", "session", "zsh") == 2
+    with sessions() as db:
+        assert db.query(TerminalModel).filter_by(id="worker").one().lifecycle_generation == 2
 
 
 def test_rebind_lease_is_non_reentrant_and_generation_bound():
@@ -76,10 +102,16 @@ async def test_duplicate_rebind_returns_deterministic_busy(monkeypatch):
     ],
 )
 async def test_quiescence_policy(monkeypatch, raw, interrupt, allowed):
-    monkeypatch.setattr(service, "get_terminal_metadata", lambda _tid: {
-        "id": "q-a", "recovery_state": None, "shell_command": None,
-        "tmux_session": "cao-test",
-    })
+    monkeypatch.setattr(
+        service,
+        "get_terminal_metadata",
+        lambda _tid: {
+            "id": "q-a",
+            "recovery_state": None,
+            "shell_command": None,
+            "tmux_session": "cao-test",
+        },
+    )
     monkeypatch.setattr(service, "has_unsettled_delivery_attempt", lambda _tid: False)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.has_deferred_init",
@@ -101,11 +133,15 @@ async def test_quiescence_policy(monkeypatch, raw, interrupt, allowed):
 
 @pytest.mark.asyncio
 async def test_fleet_runs_stable_one_at_a_time_and_manifest_failure_is_separate(monkeypatch):
-    monkeypatch.setattr(service, "list_terminals_by_session", lambda _name: [
-        {"id": "b", "provider": "codex", "recovery_state": None},
-        {"id": "excluded", "provider": "codex", "recovery_state": "fallback_ready"},
-        {"id": "a", "provider": "codex", "recovery_state": "rebound"},
-    ])
+    monkeypatch.setattr(
+        service,
+        "list_terminals_by_session",
+        lambda _name: [
+            {"id": "b", "provider": "codex", "recovery_state": None},
+            {"id": "excluded", "provider": "codex", "recovery_state": "fallback_ready"},
+            {"id": "a", "provider": "codex", "recovery_state": "rebound"},
+        ],
+    )
     seen = []
 
     async def fake_rebind(terminal_id, interrupt=False, acknowledge_ownership=False):
@@ -137,7 +173,8 @@ async def test_fleet_eligibility_is_exact_and_promotes_abandoned_midstate(monkey
     monkeypatch.setattr(service, "list_terminals_by_session", lambda _name: rows)
     promoted = []
     monkeypatch.setattr(
-        service, "set_terminal_recovery_state",
+        service,
+        "set_terminal_recovery_state",
         lambda tid, state, error=None: promoted.append((tid, state, error)) or True,
     )
     seen = []
@@ -165,15 +202,15 @@ async def test_tmux_backend_proof_uses_preexisting_fifo_without_reregistration(m
     backend = MagicMock()
     backend.supports_event_inbox.return_value = False
     monkeypatch.setattr(service, "get_backend", lambda: backend)
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.backends.registry.get_backend", lambda: backend
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.fifo_reader.fifo_manager.has_reader",
         lambda _tid: True,
     )
     generations = iter([10, 11])
-    monkeypatch.setattr(service.status_monitor, "get_fifo_frame_gen", lambda _tid: next(generations))
+    monkeypatch.setattr(
+        service.status_monitor, "get_fifo_frame_gen", lambda _tid: next(generations)
+    )
     monkeypatch.setattr(service.asyncio, "sleep", AsyncMock())
     await service._wait_for_backend_proof("term", {}, MagicMock(), 10)
     backend.pipe_pane.assert_not_called()
@@ -261,6 +298,40 @@ async def test_herdr_backend_proof_requires_new_native_event_and_both_maps(monke
 
 
 @pytest.mark.asyncio
+async def test_herdr_backend_proof_registers_under_real_held_delivery_guard(monkeypatch):
+    backend = MagicMock()
+    backend.supports_event_inbox.return_value = True
+    backend.get_pane_id.return_value = "pane-new"
+    inbox = HerdrInboxService(socket_path="/tmp/test-real-guard.sock")
+    monkeypatch.setattr(service, "get_backend", lambda: backend)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.herdr_inbox_registry.get_herdr_inbox_service",
+        lambda: inbox,
+    )
+    guard = service.DeliveryGuard("term", asyncio.get_running_loop())
+    await guard.acquire()
+    try:
+        proof = asyncio.create_task(
+            service._wait_for_backend_proof(
+                "term",
+                {"tmux_session": "s", "tmux_window": "w"},
+                MagicMock(),
+                0,
+                guard,
+            )
+        )
+        await asyncio.sleep(0)
+        assert inbox._terminal_to_pane["term"] == "pane-new"
+        assert inbox._pane_to_terminal["pane-new"] == "term"
+        with inbox._identity_guard:
+            inbox._native_event_gen[("term", "pane-new")] = 1
+        await asyncio.wait_for(proof, timeout=0.5)
+    finally:
+        await guard.close()
+    assert guard.active is False
+
+
+@pytest.mark.asyncio
 async def test_herdr_proof_waits_for_exact_new_pane_native_event(monkeypatch):
     backend = MagicMock()
     backend.supports_event_inbox.return_value = True
@@ -273,15 +344,20 @@ async def test_herdr_proof_waits_for_exact_new_pane_native_event(monkeypatch):
         lambda: inbox,
     )
     metadata = {"tmux_session": "s", "tmux_window": "w"}
-    task = asyncio.create_task(
-        service._wait_for_backend_proof("term", metadata, MagicMock(), 0)
-    )
+    task = asyncio.create_task(service._wait_for_backend_proof("term", metadata, MagicMock(), 0))
     await asyncio.sleep(0)
     assert not task.done()
-    event = __import__("json").dumps({
-        "event": "pane.agent_status_changed",
-        "data": {"pane_id": "pane-new", "agent_status": "working"},
-    }).encode() + b"\n"
+    event = (
+        __import__("json")
+        .dumps(
+            {
+                "event": "pane.agent_status_changed",
+                "data": {"pane_id": "pane-new", "agent_status": "working"},
+            }
+        )
+        .encode()
+        + b"\n"
+    )
     inbox._reader = AsyncMock()
     inbox._reader.readline.side_effect = [event, asyncio.CancelledError()]
     with pytest.raises(asyncio.CancelledError):
@@ -291,9 +367,7 @@ async def test_herdr_proof_waits_for_exact_new_pane_native_event(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider_cls", [CodexProvider, GrokCliProvider])
-async def test_real_candidate_staged_init_uses_explicit_raw_seams(
-    monkeypatch, provider_cls
-):
+async def test_real_candidate_staged_init_uses_explicit_raw_seams(monkeypatch, provider_cls):
     terminal_id = "staged01"
     candidate = provider_cls(terminal_id, "cao-test", "worker", None)
     old = MagicMock()
@@ -320,11 +394,14 @@ async def test_real_candidate_staged_init_uses_explicit_raw_seams(
         monkeypatch.setattr(candidate, "_build_grok_command", lambda: "grok --resume uuid")
     raw_calls = []
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.get_backend", lambda: backend,
+        "cli_agent_orchestrator.services.status_monitor.get_backend",
+        lambda: backend,
         raising=False,
     )
     monkeypatch.setattr(
-        __import__("cli_agent_orchestrator.services.status_monitor", fromlist=["status_monitor"]).status_monitor,
+        __import__(
+            "cli_agent_orchestrator.services.status_monitor", fromlist=["status_monitor"]
+        ).status_monitor,
         "get_raw_status",
         lambda tid, provider_override=None: raw_calls.append((tid, provider_override))
         or TerminalStatus.IDLE,
@@ -344,9 +421,7 @@ def test_real_monitor_projected_error_diverges_from_candidate_raw(monkeypatch):
     candidate.get_status.return_value = TerminalStatus.IDLE
     backend = MagicMock()
     backend.supports_event_inbox.return_value = True
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.backends.registry.get_backend", lambda: backend
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.get_terminal_metadata",
         lambda _tid: {"recovery_state": "rebind_failed"},
@@ -367,25 +442,36 @@ async def test_transaction_p12_uses_real_raw_monitor_under_error_overlay(monkeyp
     candidate.get_status.return_value = TerminalStatus.IDLE
     candidate.initialize = AsyncMock()
     metadata = {
-        "id": "txn", "recovery_state": None, "shell_command": "bash",
-        "provider_session_id": "uuid", "provider": "codex", "tmux_session": "cao-test",
-        "tmux_window": "worker", "agent_profile": "dev", "allowed_tools": None,
+        "id": "txn",
+        "recovery_state": None,
+        "shell_command": "bash",
+        "provider_session_id": "uuid",
+        "provider": "codex",
+        "tmux_session": "cao-test",
+        "tmux_window": "worker",
+        "agent_profile": "dev",
+        "allowed_tools": None,
     }
     monkeypatch.setattr(service, "status_monitor", monitor)
     monkeypatch.setattr(service, "get_backend", lambda: backend)
+    monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
     monkeypatch.setattr(
-        "cli_agent_orchestrator.backends.registry.get_backend", lambda: backend
+        service, "get_terminal_metadata", lambda _tid: metadata | {"recovery_state": state["value"]}
     )
-    monkeypatch.setattr(service, "get_terminal_metadata", lambda _tid: metadata | {"recovery_state": state["value"]})
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.get_terminal_metadata",
         lambda _tid: {"recovery_state": state["value"]},
     )
     monkeypatch.setattr(
-        service, "set_terminal_recovery_state",
+        service,
+        "set_terminal_recovery_state",
         lambda _tid, value, error=None, **_kw: state.__setitem__("value", value) or True,
     )
-    monkeypatch.setattr(service, "settle_terminal_rebound", lambda *_a: state.__setitem__("value", "rebound") or True)
+    monkeypatch.setattr(
+        service,
+        "settle_terminal_rebound",
+        lambda *_a: state.__setitem__("value", "rebound") or True,
+    )
     monkeypatch.setattr(service, "_wait_for_backend_proof", AsyncMock())
     result = await service.rebind_terminal("txn")
     assert result["status"] == "rebound", result
@@ -393,7 +479,9 @@ async def test_transaction_p12_uses_real_raw_monitor_under_error_overlay(monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("live_marker", "expected"), [(object(), "exit_failed"), (None, "exit_uncertain")])
+@pytest.mark.parametrize(
+    ("live_marker", "expected"), [(object(), "exit_failed"), (None, "exit_uncertain")]
+)
 async def test_exit_classification_distinguishes_live_provider(monkeypatch, live_marker, expected):
     backend = MagicMock()
     backend.get_pane_current_command.return_value = "codex"
@@ -409,9 +497,14 @@ async def test_exit_classification_distinguishes_live_provider(monkeypatch, live
 
 def _install_transaction_harness(monkeypatch, *, pause_error=None, resume_error=None):
     metadata = {
-        "id": "txn", "recovery_state": None, "shell_command": "bash",
-        "provider_session_id": "uuid", "provider": "codex",
-        "tmux_session": "cao-test", "tmux_window": "worker", "agent_profile": "dev",
+        "id": "txn",
+        "recovery_state": None,
+        "shell_command": "bash",
+        "provider_session_id": "uuid",
+        "provider": "codex",
+        "tmux_session": "cao-test",
+        "tmux_window": "worker",
+        "agent_profile": "dev",
         "allowed_tools": None,
     }
     old = MagicMock(supports_reauth_rebind=True)
@@ -427,7 +520,9 @@ def _install_transaction_harness(monkeypatch, *, pause_error=None, resume_error=
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.exit_terminal_cli", lambda _tid: None
     )
-    monkeypatch.setattr(service.status_monitor, "get_raw_status", lambda *_a, **_k: TerminalStatus.IDLE)
+    monkeypatch.setattr(
+        service.status_monitor, "get_raw_status", lambda *_a, **_k: TerminalStatus.IDLE
+    )
     monkeypatch.setattr(service.status_monitor, "reset_buffer", lambda _tid: None)
     monkeypatch.setattr(service.status_monitor, "get_fifo_frame_gen", lambda _tid: 1)
     monkeypatch.setattr(service.provider_manager, "get_provider", lambda _tid: old)
@@ -436,12 +531,15 @@ def _install_transaction_harness(monkeypatch, *, pause_error=None, resume_error=
     monkeypatch.setattr(service, "pane_pid", lambda *_a: 123)
     monkeypatch.setattr(service, "pane_launch_epoch", lambda _pid: 1.0)
     monkeypatch.setattr(service, "_launch_context", lambda _meta: None)
-    monkeypatch.setattr(service, "_wait_for_shell_baseline", AsyncMock(return_value="exit_confirmed"))
+    monkeypatch.setattr(
+        service, "_wait_for_shell_baseline", AsyncMock(return_value="exit_confirmed")
+    )
     monkeypatch.setattr(service, "_wait_for_backend_proof", AsyncMock())
     monkeypatch.setattr(service, "settle_terminal_rebound", lambda *_a: True)
     monkeypatch.setattr(service, "_fallback", AsyncMock(return_value={"status": "respawned"}))
     monkeypatch.setattr(
-        service, "set_terminal_recovery_state",
+        service,
+        "set_terminal_recovery_state",
         lambda _tid, state, error=None, **_kw: states.append((state, error)) or True,
     )
     backend = MagicMock()
@@ -450,11 +548,19 @@ def _install_transaction_harness(monkeypatch, *, pause_error=None, resume_error=
     monkeypatch.setattr(service.DeliveryGuard, "acquire", AsyncMock())
     monkeypatch.setattr(service.DeliveryGuard, "close", AsyncMock())
     if pause_error:
-        monkeypatch.setattr(service.stalled_callback_watchdog, "pause_terminal", MagicMock(side_effect=pause_error))
+        monkeypatch.setattr(
+            service.stalled_callback_watchdog, "pause_terminal", MagicMock(side_effect=pause_error)
+        )
     else:
-        monkeypatch.setattr(service.stalled_callback_watchdog, "pause_terminal", lambda _tid: (None, 0.0))
+        monkeypatch.setattr(
+            service.stalled_callback_watchdog, "pause_terminal", lambda _tid: (None, 0.0)
+        )
     if resume_error:
-        monkeypatch.setattr(service.stalled_callback_watchdog, "resume_terminal", MagicMock(side_effect=resume_error))
+        monkeypatch.setattr(
+            service.stalled_callback_watchdog,
+            "resume_terminal",
+            MagicMock(side_effect=resume_error),
+        )
     else:
         monkeypatch.setattr(service.stalled_callback_watchdog, "resume_terminal", lambda *_a: None)
     return old, candidate, states
@@ -479,9 +585,15 @@ async def test_p6_pause_failure_restores_p1_state_without_exit(monkeypatch):
 async def test_capture_failed_vs_unresumable_are_p4_only(monkeypatch):
     old, _candidate, _states = _install_transaction_harness(monkeypatch)
     base = {
-        "id": "txn", "recovery_state": None, "shell_command": "bash",
-        "provider_session_id": None, "provider": "codex", "tmux_session": "cao-test",
-        "tmux_window": "worker", "agent_profile": "dev", "allowed_tools": None,
+        "id": "txn",
+        "recovery_state": None,
+        "shell_command": "bash",
+        "provider_session_id": None,
+        "provider": "codex",
+        "tmux_session": "cao-test",
+        "tmux_window": "worker",
+        "agent_profile": "dev",
+        "allowed_tools": None,
     }
     monkeypatch.setattr(service, "get_terminal_metadata", lambda _tid: base.copy())
     old.capture_session_uuid.side_effect = RuntimeError("transient")
@@ -501,9 +613,15 @@ async def test_capture_failed_vs_unresumable_are_p4_only(monkeypatch):
 async def test_abandoned_mid_rebind_promotes_when_lease_free(monkeypatch):
     _old, _candidate, states = _install_transaction_harness(monkeypatch)
     metadata = {
-        "id": "txn", "recovery_state": "rebind_starting", "shell_command": None,
-        "provider_session_id": "uuid", "provider": "codex", "tmux_session": "cao-test",
-        "tmux_window": "worker", "agent_profile": "dev", "allowed_tools": None,
+        "id": "txn",
+        "recovery_state": "rebind_starting",
+        "shell_command": None,
+        "provider_session_id": "uuid",
+        "provider": "codex",
+        "tmux_session": "cao-test",
+        "tmux_window": "worker",
+        "agent_profile": "dev",
+        "allowed_tools": None,
     }
     monkeypatch.setattr(service, "get_terminal_metadata", lambda _tid: metadata.copy())
     result = await service.rebind_terminal("txn")
@@ -554,37 +672,54 @@ async def test_phase_failure_matrix(
     fallback = AsyncMock(return_value={"status": "respawned"})
     monkeypatch.setattr(service, "_fallback", fallback)
     if phase == "p2":
-        monkeypatch.setattr(service.DeliveryGuard, "acquire", AsyncMock(side_effect=RuntimeError("p2")))
+        monkeypatch.setattr(
+            service.DeliveryGuard, "acquire", AsyncMock(side_effect=RuntimeError("p2"))
+        )
     elif phase in {"p5", "p7_persist"}:
         target = "rebind_starting" if phase == "p5" else "rebind_exiting"
         original = service.set_terminal_recovery_state
         monkeypatch.setattr(
-            service, "set_terminal_recovery_state",
-            lambda tid, state, error=None, **kw: False if state == target else original(tid, state, error, **kw),
+            service,
+            "set_terminal_recovery_state",
+            lambda tid, state, error=None, **kw: (
+                False if state == target else original(tid, state, error, **kw)
+            ),
         )
     elif phase == "p7_send":
         exit_cli.side_effect = RuntimeError("raised after backend send")
     elif phase == "p7_death_raise":
         monkeypatch.setattr(
-            service, "_wait_for_shell_baseline",
+            service,
+            "_wait_for_shell_baseline",
             AsyncMock(side_effect=RuntimeError("pane probe failed")),
         )
     elif phase == "p8":
-        monkeypatch.setattr(service.provider_manager, "construct_provider", MagicMock(side_effect=RuntimeError("p8")))
+        monkeypatch.setattr(
+            service.provider_manager,
+            "construct_provider",
+            MagicMock(side_effect=RuntimeError("p8")),
+        )
     elif phase == "p9":
         candidate.initialize.side_effect = RuntimeError("p9")
     elif phase == "p10":
-        monkeypatch.setattr(service.provider_manager, "commit_provider", MagicMock(side_effect=RuntimeError("p10")))
+        monkeypatch.setattr(
+            service.provider_manager, "commit_provider", MagicMock(side_effect=RuntimeError("p10"))
+        )
     elif phase == "p11":
-        monkeypatch.setattr(service, "_wait_for_backend_proof", AsyncMock(side_effect=RuntimeError("p11")))
+        monkeypatch.setattr(
+            service, "_wait_for_backend_proof", AsyncMock(side_effect=RuntimeError("p11"))
+        )
     elif phase == "p12":
         statuses = iter([TerminalStatus.IDLE, TerminalStatus.UNKNOWN])
-        monkeypatch.setattr(service.status_monitor, "get_raw_status", lambda *_a, **_kw: next(statuses))
+        monkeypatch.setattr(
+            service.status_monitor, "get_raw_status", lambda *_a, **_kw: next(statuses)
+        )
     elif phase == "p13":
         monkeypatch.setattr(service, "settle_terminal_rebound", lambda *_a: False)
     elif phase == "p15":
         monkeypatch.setattr(
-            service.DeliveryGuard, "close",
+            service.DeliveryGuard,
+            "close",
             AsyncMock(side_effect=[RuntimeError("p15"), None]),
         )
     result = await service.rebind_terminal("txn")
@@ -630,15 +765,20 @@ async def test_p7_post_send_exception_and_retry_emit_exactly_one_exit(monkeypatc
     _old, _candidate, _states = _install_transaction_harness(monkeypatch)
     durable = {"state": None, "error": None}
     base = {
-        "id": "txn", "shell_command": "bash", "provider_session_id": "uuid",
-        "provider": "codex", "tmux_session": "cao-test", "tmux_window": "worker",
-        "agent_profile": "dev", "allowed_tools": None,
+        "id": "txn",
+        "shell_command": "bash",
+        "provider_session_id": "uuid",
+        "provider": "codex",
+        "tmux_session": "cao-test",
+        "tmux_window": "worker",
+        "agent_profile": "dev",
+        "allowed_tools": None,
     }
     monkeypatch.setattr(
-        service, "get_terminal_metadata",
-        lambda _tid: base | {
-            "recovery_state": durable["state"], "recovery_error": durable["error"]
-        },
+        service,
+        "get_terminal_metadata",
+        lambda _tid: base
+        | {"recovery_state": durable["state"], "recovery_error": durable["error"]},
     )
 
     def persist(_tid, state, error=None, **_kwargs):
@@ -668,15 +808,20 @@ def _install_ownership_state(monkeypatch, error="exit_uncertain"):
     _old, _candidate, _states = _install_transaction_harness(monkeypatch)
     durable = {"state": "rebind_failed", "error": error}
     base = {
-        "id": "txn", "shell_command": "bash", "provider_session_id": "uuid",
-        "provider": "codex", "tmux_session": "cao-test", "tmux_window": "worker",
-        "agent_profile": "dev", "allowed_tools": None,
+        "id": "txn",
+        "shell_command": "bash",
+        "provider_session_id": "uuid",
+        "provider": "codex",
+        "tmux_session": "cao-test",
+        "tmux_window": "worker",
+        "agent_profile": "dev",
+        "allowed_tools": None,
     }
     monkeypatch.setattr(
-        service, "get_terminal_metadata",
-        lambda _tid: base | {
-            "recovery_state": durable["state"], "recovery_error": durable["error"]
-        },
+        service,
+        "get_terminal_metadata",
+        lambda _tid: base
+        | {"recovery_state": durable["state"], "recovery_error": durable["error"]},
     )
 
     def persist(_tid, state, recovery_error=None, **_kwargs):
@@ -784,7 +929,8 @@ async def test_success_order_is_initialize_then_cas_backend_raw_persist(monkeypa
     order = []
     candidate.initialize = AsyncMock(side_effect=lambda **_kwargs: order.append("initialize"))
     monkeypatch.setattr(
-        service.provider_manager, "commit_provider",
+        service.provider_manager,
+        "commit_provider",
         lambda *_a, **_k: order.append("cas"),
     )
 
@@ -793,12 +939,17 @@ async def test_success_order_is_initialize_then_cas_backend_raw_persist(monkeypa
 
     monkeypatch.setattr(service, "_wait_for_backend_proof", backend_proof)
     monkeypatch.setattr(
-        service.status_monitor, "get_raw_status",
-        lambda *_a, **kw: order.append("raw-final") or TerminalStatus.IDLE
-        if kw.get("provider_override") else TerminalStatus.IDLE,
+        service.status_monitor,
+        "get_raw_status",
+        lambda *_a, **kw: (
+            order.append("raw-final") or TerminalStatus.IDLE
+            if kw.get("provider_override")
+            else TerminalStatus.IDLE
+        ),
     )
     monkeypatch.setattr(
-        service, "settle_terminal_rebound",
+        service,
+        "settle_terminal_rebound",
         lambda *_a: order.append("persist-rebound") or True,
     )
     result = await service.rebind_terminal("txn")
@@ -809,7 +960,9 @@ async def test_success_order_is_initialize_then_cas_backend_raw_persist(monkeypa
 @pytest.mark.asyncio
 async def test_candidate_exit_uncertain_blocks_fallback(monkeypatch):
     _old, _candidate, states = _install_transaction_harness(monkeypatch)
-    monkeypatch.setattr(service, "_wait_for_backend_proof", AsyncMock(side_effect=RuntimeError("proof")))
+    monkeypatch.setattr(
+        service, "_wait_for_backend_proof", AsyncMock(side_effect=RuntimeError("proof"))
+    )
     waits = AsyncMock(side_effect=["exit_confirmed", "exit_uncertain"])
     monkeypatch.setattr(service, "_wait_for_shell_baseline", waits)
     fallback = AsyncMock()
@@ -829,7 +982,8 @@ def test_eager_identity_helper_orders_capture_validate_then_atomic_persist(monke
     provider.capture_session_uuid.side_effect = lambda *_a: order.append("capture") or "uuid"
     provider.validate_session_artifact.side_effect = lambda *_a: order.append("validate")
     monkeypatch.setattr(
-        terminal_service, "get_terminal_metadata",
+        terminal_service,
+        "get_terminal_metadata",
         lambda _tid: {"tmux_session": "s", "tmux_window": "w"},
     )
     monkeypatch.setattr(terminal_service, "pane_pid", lambda *_a: 1, raising=False)
@@ -853,7 +1007,8 @@ def test_eager_identity_helper_orders_capture_validate_then_atomic_persist(monke
 def test_public_delete_passes_current_lease_token_to_single_teardown_body(monkeypatch):
     seen = []
     monkeypatch.setattr(
-        terminal_service, "_delete_terminal_under_lease",
+        terminal_service,
+        "_delete_terminal_under_lease",
         lambda terminal_id, token, registry=None: seen.append((terminal_id, token)) or True,
     )
     assert terminal_service.delete_terminal("delete-a") is True
@@ -898,12 +1053,16 @@ async def test_delete_is_busy_with_zero_teardown_at_commit_boundaries(monkeypatc
         teardown.assert_not_called()
 
     if boundary == "before_cas":
+
         async def initialize(**_kwargs):
             assert_delete_blocked("before_cas")
+
         candidate.initialize = initialize
     elif boundary == "after_cas_p11":
+
         async def backend_proof(*_args):
             assert_delete_blocked("after_cas_p11")
+
         monkeypatch.setattr(service, "_wait_for_backend_proof", backend_proof)
     else:
         raw_calls = 0

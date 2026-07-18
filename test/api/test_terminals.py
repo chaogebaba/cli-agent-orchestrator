@@ -8,9 +8,24 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from cli_agent_orchestrator.api.main import app
+from cli_agent_orchestrator.api.main import CreateTerminalBody, app
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import Terminal
+
+
+def test_create_terminal_body_barrier_validation_and_strict_timeout():
+    body = CreateTerminalBody.model_validate(
+        {
+            "barrier": "gate",
+            "barrier_timeout_seconds": 90,
+            "barrier_member_key": "lane-a",
+        }
+    )
+    assert body.barrier == "gate" and body.barrier_timeout_seconds == 90
+    with pytest.raises(ValueError):
+        CreateTerminalBody.model_validate({"barrier_timeout_seconds": 90})
+    with pytest.raises(ValueError):
+        CreateTerminalBody.model_validate({"barrier": "gate", "barrier_timeout_seconds": True})
 
 
 class TestTranscriptBindingEndpoint:
@@ -755,6 +770,35 @@ class TestCreateInboxMessageEndpoint:
                 "hello",
             )
             mock_inbox.deliver_pending.assert_called_once_with("abcd1234", registry=ANY)
+
+    @pytest.mark.parametrize(
+        ("barrier_field", "value"),
+        (
+            ("barrier", "spoofed-supervisor"),
+            ("barrier_timeout_seconds", 90),
+            ("barrier_member_key", "lane-a"),
+        ),
+    )
+    def test_http_barrier_dispatch_rejects_spoofed_supervisor_without_insert(
+        self, client, monkeypatch, barrier_field, value
+    ):
+        monkeypatch.setenv("CAO_TERMINAL_ID", "worker-terminal")
+        with (
+            patch("cli_agent_orchestrator.api.main.create_inbox_message") as create,
+            patch("cli_agent_orchestrator.api.main.inbox_service") as inbox,
+        ):
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={
+                    "sender_id": "supervisor-terminal",
+                    "message": "task",
+                    barrier_field: value,
+                },
+            )
+        assert response.status_code == 403
+        assert response.json()["detail"]["code"] == "barrier_mcp_only"
+        create.assert_not_called()
+        inbox.deliver_pending.assert_not_called()
 
     def test_create_inbox_message_delivery_failure_still_succeeds(self, client):
         """Immediate delivery failure should not fail the API response."""

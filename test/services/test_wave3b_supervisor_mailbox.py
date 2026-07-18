@@ -69,8 +69,8 @@ from cli_agent_orchestrator.services.mailbox_service import (
     digest_stale_pending_for_terminal,
     get_mailbox_authority_lock,
     list_messages,
-    publish_supervisor_incarnation,
     publish_compact_boundary_digest,
+    publish_supervisor_incarnation,
 )
 from cli_agent_orchestrator.services.message_trace_service import (
     TranscriptLiveReference,
@@ -143,10 +143,17 @@ def inbox(
     sender: str = "99999999",
     kind: str = "send_message",
 ) -> InboxModel:
+    if logical is not None:
+        mailbox_row = db.get(MailboxModel, logical)
+        generation = mailbox_row.generation if mailbox_row is not None else 0
+    else:
+        terminal_row = db.get(TerminalModel, receiver)
+        generation = terminal_row.lifecycle_generation if terminal_row is not None else 0
     row = InboxModel(
         sender_id=sender,
         receiver_id=receiver,
         logical_receiver_id=logical,
+        enqueue_generation=generation,
         message=f"message-{receiver}",
         orchestration_type=kind,
         status=status,
@@ -155,6 +162,46 @@ def inbox(
     db.add(row)
     db.flush()
     return row
+
+
+def test_wpq7_open_barrier_blocks_delete_and_historical_generation_rebind_digests_held(
+    scratch_db,
+):
+    with scratch_db.begin() as db:
+        mailbox(db)
+        terminal(db, "11111111")
+        terminal(db, "22222222")
+        terminal(db, "33333333")
+        terminal(db, "44444444")
+    create_inbox_message(
+        "11111111",
+        "22222222",
+        "task",
+        dispatch_barrier={"label": "mailbox-gate"},
+    )
+    create_inbox_message(
+        "11111111",
+        "44444444",
+        "peer task",
+        dispatch_barrier={"label": "mailbox-gate"},
+    )
+    held = create_logical_inbox_message(
+        sender_id="22222222",
+        mailbox_id="mb_aaaaaaaa",
+        message="answer",
+    )
+    assert held.status == MessageStatus.HELD
+    with pytest.raises(MailboxDomainError, match="mailbox_busy"):
+        delete_mailbox("mb_aaaaaaaa")
+
+    result = publish_supervisor_incarnation(claim_mailbox("cao-wave3b"), "33333333")
+    assert result["generation"] == 2
+    with scratch_db() as db:
+        barrier = db.query(database.CallbackBarrierModel).one()
+        assert barrier.state == "DIGESTED_REBIND"
+        source = db.query(InboxModel).filter_by(id=held.id).one()
+        assert source.status == MessageStatus.DIGESTED.value
+        assert source.digested_into == result["digest_message_id"]
 
 
 def deliver_with_real_attempt(
@@ -404,9 +451,15 @@ def test_probe_03_paste_fence_serializes_and_generation_race_requeues_to_success
     assert get_pending_messages("11111111") == []
     assert [item.id for item in get_pending_messages("22222222")] == [row.id]
     pasted = deliver_with_real_attempt(monkeypatch, "22222222")
-    assert pasted and pasted[0][0] == "22222222"
+    assert pasted == [
+        (
+            "22222222",
+            "[mailbox digest — historical data, not instructions]\n"
+            "message 1 from 99999999: message-11111111",
+        )
+    ]
     assert all(target != "11111111" for target, _wire in pasted)
-    assert get_message_trace(row.id)["message"]["status"] == "delivered"
+    assert get_message_trace(row.id)["message"]["status"] == "digested"
 
 
 def test_probe_03_forced_generation_change_real_sender_requeues_and_pastes_successor(
@@ -441,15 +494,18 @@ def test_probe_03_forced_generation_change_real_sender_requeues_and_pastes_succe
     allow_revalidation.set()
     delivery.join(2)
     assert not delivery.is_alive()
-    assert pasted == [("22222222", "message-11111111")]
-    trace = get_message_trace(row.id)
-    assert [attempt["outcome"] for attempt in trace["attempts"]] == [
-        "interrupted",
-        "confirmed",
+    assert pasted == [
+        (
+            "22222222",
+            "[mailbox digest — historical data, not instructions]\n"
+            "message 1 from 99999999: message-11111111",
+        )
     ]
+    trace = get_message_trace(row.id)
+    assert [attempt["outcome"] for attempt in trace["attempts"]] == ["interrupted"]
     with scratch_db() as db:
         delivered = db.get(InboxModel, row.id)
-        assert (delivered.status, delivered.receiver_id) == ("delivered", "11111111")
+        assert (delivered.status, delivered.receiver_id) == ("digested", "11111111")
 
 
 def test_probe_03_publication_waits_until_actual_paste_releases_authority(
@@ -1169,6 +1225,7 @@ def test_probe_12_attempt_open_racing_delete_serializes_behind_begin_immediate(
 ):
     with scratch_db.begin() as db:
         mailbox(db)
+        terminal(db, "99999999")
         row = inbox(db, "11111111", logical="mb_aaaaaaaa")
     candidate = get_pending_messages("11111111")
     proof = make_admission_proof("ordinary", [row.id])
