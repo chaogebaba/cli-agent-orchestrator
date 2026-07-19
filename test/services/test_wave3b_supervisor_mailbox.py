@@ -32,6 +32,7 @@ from cli_agent_orchestrator.clients.database import (
     Base,
     InboxDeliveryAttemptMemberModel,
     InboxDeliveryAttemptModel,
+    InboxMessageTraceEventModel,
     InboxModel,
     MailboxIncarnationModel,
     MailboxModel,
@@ -1674,19 +1675,77 @@ def test_wpq12_i_compact_digest_publisher_and_constants_are_deleted():
     assert not hasattr(mailbox_service, "COMPACT_DIGEST_HEADER")
 
 
-def test_wpq12_j_compact_binding_route_has_no_digest_push_or_window_env_read():
-    from cli_agent_orchestrator.api import main as api_main
+def test_wpq12_j_compact_binding_with_old_publish_preconditions_is_pull_only(
+    scratch_db, client, tmp_path
+):
+    terminal_id = "22222222"
+    now = datetime.now()
+    with scratch_db.begin() as db:
+        mailbox(db, terminal_id=terminal_id)
+        terminal(db, terminal_id)
+        delivered = inbox(db, terminal_id, status="delivered", logical="mb_aaaaaaaa")
+        delivered.created_at = now - timedelta(minutes=2)
+        db.add(
+            InboxMessageTraceEventModel(
+                message_id=delivered.id,
+                kind="inferred_delivered",
+                payload={"reply_message_id": 7},
+                created_at=now - timedelta(minutes=1),
+            )
+        )
 
-    source = Path(api_main.__file__).read_text(encoding="utf-8")
-    assert "publish_compact_boundary_digest" not in source
-    assert "CAO_COMPACT_DIGEST_WINDOW_MIN" not in source
+    transcript = tmp_path / ".claude" / "projects" / "repo" / "session.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text('{"type":"user"}\n', encoding="utf-8")
+    retired = {
+        "CAO_COMPACT_DIGEST_WINDOW_MIN",
+        "CAO_COMPACT_DIGEST_FENCE_MIN",
+    }
+    original_get = os.environ.get
+
+    def reject_retired_reads(key, default=None):
+        if key in retired:
+            raise AssertionError(f"retired environment variable read: {key}")
+        return original_get(key, default)
+
+    with (
+        patch("cli_agent_orchestrator.api.main.Path.home", return_value=tmp_path),
+        patch(
+            "cli_agent_orchestrator.api.main.get_terminal_metadata",
+            return_value={"id": terminal_id},
+        ),
+        patch.object(inbox_service_module.inbox_service, "deliver_pending") as deliver,
+        patch.object(inbox_service_module.inbox_service, "schedule_delivery_wake") as wake,
+        patch.object(os.environ, "get", side_effect=reject_retired_reads),
+    ):
+        response = client.post(
+            f"/terminals/{terminal_id}/transcript-binding",
+            json={
+                "terminal_id": terminal_id,
+                "session_id": "session",
+                "transcript_path": str(transcript),
+                "cwd": "/work",
+                "source": "compact",
+            },
+        )
+
+    assert response.status_code == 200
+    deliver.assert_not_called()
+    wake.assert_not_called()
+    with scratch_db() as db:
+        rows = db.query(InboxModel).order_by(InboxModel.id).all()
+        assert [row.id for row in rows] == [delivered.id]
 
 
-def test_wpq12_k_mailbox_keeps_shared_helpers_but_retires_fence_reader():
-    source = Path(mailbox_service.__file__).read_text(encoding="utf-8")
-    assert "def _bounded_utf8" in source
-    assert "def _digest_summary_lines" in source
-    assert "CAO_COMPACT_DIGEST_FENCE_MIN" not in source
+def test_wpq12_k_shared_digest_helpers_remain_runtime_usable(scratch_db):
+    with scratch_db.begin() as db:
+        row = inbox(db, "22222222", status="delivered")
+        row.message = "line\nwith controls\u200b"
+        lines = mailbox_service._digest_summary_lines(db, [row])
+
+    assert lines and "message" in lines[0]
+    assert "\u200b" not in lines[0]
+    assert len(mailbox_service._bounded_utf8("é" * 200, 120).encode("utf-8")) <= 120
 
 
 def test_wpq1_superseded_digest_chain_uses_direct_structural_counts(scratch_db):

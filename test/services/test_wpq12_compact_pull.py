@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from pathlib import Path
+import os
 from unittest.mock import Mock, patch
 
 import pytest
@@ -17,11 +17,13 @@ from cli_agent_orchestrator.clients.database import (
     Base,
     InboxMessageTraceEventModel,
     InboxModel,
+    MailboxModel,
     TranscriptBindingModel,
     get_latest_compact_transcript_binding,
 )
 from cli_agent_orchestrator.mcp_server import server as mcp_server
 from cli_agent_orchestrator.plugins import PluginRegistry
+from cli_agent_orchestrator.services import inbox_service as inbox_service_module
 from cli_agent_orchestrator.services import mailbox_service
 from cli_agent_orchestrator.services.mailbox_service import list_messages
 
@@ -53,12 +55,54 @@ def _binding_payload(transcript, source: str = "compact") -> dict[str, str]:
     }
 
 
-def test_compact_bind_twice_persists_markers_without_notice_or_push(
-    scratch_db, client, tmp_path
-):
+def _seed_publish_preconditions(sessions, terminal_id: str = "abcd1234") -> int:
+    """Recreate the old publisher's positive selection preconditions."""
+    now = datetime.now()
+    with sessions.begin() as db:
+        db.add(
+            MailboxModel(
+                id="mb_probe",
+                session_name="probe",
+                role="supervisor",
+                current_terminal_id=terminal_id,
+                generation=1,
+                consumed_through_id=0,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        delivered = InboxModel(
+            sender_id="worker",
+            receiver_id=terminal_id,
+            logical_receiver_id="mb_probe",
+            message="recent delivered callback",
+            orchestration_type="send_message",
+            status="delivered",
+            created_at=now - timedelta(minutes=2),
+        )
+        db.add(delivered)
+        db.flush()
+        db.add(
+            InboxMessageTraceEventModel(
+                message_id=delivered.id,
+                kind="inferred_delivered",
+                payload={"reply_message_id": 7},
+                created_at=now - timedelta(minutes=1),
+            )
+        )
+        return int(delivered.id)
+
+
+def _transcript(tmp_path):
     transcript = tmp_path / ".claude" / "projects" / "repo" / "session.jsonl"
     transcript.parent.mkdir(parents=True)
     transcript.write_text('{"type":"user"}\n', encoding="utf-8")
+    return transcript
+
+
+def test_compact_bind_twice_persists_markers_without_notice_or_push(scratch_db, client, tmp_path):
+    delivered_id = _seed_publish_preconditions(scratch_db)
+    transcript = _transcript(tmp_path)
 
     with (
         patch("cli_agent_orchestrator.api.main.Path.home", return_value=tmp_path),
@@ -67,9 +111,10 @@ def test_compact_bind_twice_persists_markers_without_notice_or_push(
             return_value={"id": "abcd1234"},
         ),
         patch(
-            "cli_agent_orchestrator.services.inbox_service.inbox_service."
-            "reset_binding_episodes"
+            "cli_agent_orchestrator.services.inbox_service.inbox_service." "reset_binding_episodes"
         ) as reset,
+        patch.object(inbox_service_module.inbox_service, "deliver_pending") as deliver_pending,
+        patch.object(inbox_service_module.inbox_service, "schedule_delivery_wake") as schedule_wake,
     ):
         first = client.post(
             "/terminals/abcd1234/transcript-binding",
@@ -83,9 +128,50 @@ def test_compact_bind_twice_persists_markers_without_notice_or_push(
     assert first.status_code == 200
     assert second.status_code == 200
     assert reset.call_count == 2
+    deliver_pending.assert_not_called()
+    schedule_wake.assert_not_called()
     with scratch_db() as db:
         assert db.query(TranscriptBindingModel).filter_by(source="compact").count() == 2
-        assert db.query(InboxModel).count() == 0
+        rows = db.query(InboxModel).order_by(InboxModel.id).all()
+        assert [row.id for row in rows] == [delivered_id]
+
+
+def test_compact_bind_runtime_traps_retired_environment_reads(scratch_db, client, tmp_path):
+    delivered_id = _seed_publish_preconditions(scratch_db)
+    transcript = _transcript(tmp_path)
+    retired = {
+        "CAO_COMPACT_DIGEST_WINDOW_MIN",
+        "CAO_COMPACT_DIGEST_FENCE_MIN",
+    }
+    original_get = os.environ.get
+
+    def reject_retired_reads(key, default=None):
+        if key in retired:
+            raise AssertionError(f"retired environment variable read: {key}")
+        return original_get(key, default)
+
+    with (
+        patch("cli_agent_orchestrator.api.main.Path.home", return_value=tmp_path),
+        patch(
+            "cli_agent_orchestrator.api.main.get_terminal_metadata",
+            return_value={"id": "abcd1234"},
+        ),
+        patch.object(inbox_service_module.inbox_service, "reset_binding_episodes"),
+        patch.object(inbox_service_module.inbox_service, "deliver_pending") as deliver_pending,
+        patch.object(inbox_service_module.inbox_service, "schedule_delivery_wake") as schedule_wake,
+        patch.object(os.environ, "get", side_effect=reject_retired_reads),
+    ):
+        response = client.post(
+            "/terminals/abcd1234/transcript-binding",
+            json=_binding_payload(transcript),
+        )
+
+    assert response.status_code == 200
+    deliver_pending.assert_not_called()
+    schedule_wake.assert_not_called()
+    with scratch_db() as db:
+        rows = db.query(InboxModel).order_by(InboxModel.id).all()
+        assert [row.id for row in rows] == [delivered_id]
 
 
 def test_latest_compact_helper_returns_full_row_and_ignores_later_startup(scratch_db):
@@ -131,9 +217,7 @@ def test_latest_compact_helper_returns_full_row_and_ignores_later_startup(scratc
     }
 
 
-def test_latest_compact_helper_missing_table_and_empty_terminal_are_no_row(
-    tmp_path, monkeypatch
-):
+def test_latest_compact_helper_missing_table_and_empty_terminal_are_no_row(tmp_path, monkeypatch):
     engine = create_engine(f"sqlite:///{tmp_path / 'empty.sqlite'}")
     monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
     try:
@@ -243,13 +327,3 @@ async def test_mcp_get_compact_marker_returns_http_json_unchanged(body):
         headers=mcp_server._api_headers(),
         timeout=mcp_server._mcp_timeout(),
     )
-
-
-def test_both_compact_digest_environment_readers_are_retired():
-    from cli_agent_orchestrator.api import main as api_main
-
-    api_source = Path(api_main.__file__).read_text(encoding="utf-8")
-    mailbox_source = Path(mailbox_service.__file__).read_text(encoding="utf-8")
-    combined = api_source + mailbox_source
-    assert "CAO_COMPACT_DIGEST_WINDOW_MIN" not in combined
-    assert "CAO_COMPACT_DIGEST_FENCE_MIN" not in combined

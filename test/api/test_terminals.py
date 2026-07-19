@@ -73,7 +73,65 @@ class TestTranscriptBindingEndpoint:
         assert response.status_code == 200
         assert create.call_args.args[3] == transcript.stat().st_ino
 
-    def test_wpq12_compact_and_noncompact_bindings_do_not_publish(self, client, tmp_path):
+    def test_wpq12_compact_and_noncompact_bindings_do_not_publish(
+        self, client, tmp_path, monkeypatch
+    ):
+        from datetime import datetime, timedelta
+
+        from cli_agent_orchestrator.clients import database as db_mod
+        from cli_agent_orchestrator.clients.database import (
+            InboxMessageTraceEventModel,
+            InboxModel,
+            MailboxModel,
+            TranscriptBindingModel,
+        )
+        from cli_agent_orchestrator.services import mailbox_service
+        from cli_agent_orchestrator.services.inbox_service import inbox_service
+
+        test_engine = create_engine(
+            f"sqlite:///{tmp_path / 'wpq12-bindings.db'}",
+            connect_args={"check_same_thread": False},
+        )
+        db_mod.Base.metadata.create_all(bind=test_engine)
+        sessions = sessionmaker(bind=test_engine, expire_on_commit=False)
+        monkeypatch.setattr(db_mod, "SessionLocal", sessions)
+        monkeypatch.setattr(mailbox_service, "SessionLocal", sessions)
+
+        now = datetime.now()
+        with sessions.begin() as db:
+            db.add(
+                MailboxModel(
+                    id="mb_wpq12",
+                    session_name="wpq12",
+                    role="supervisor",
+                    current_terminal_id="abcd1234",
+                    generation=1,
+                    consumed_through_id=0,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            delivered = InboxModel(
+                sender_id="worker",
+                receiver_id="abcd1234",
+                logical_receiver_id="mb_wpq12",
+                message="recent delivered callback",
+                orchestration_type="send_message",
+                status="delivered",
+                created_at=now - timedelta(minutes=2),
+            )
+            db.add(delivered)
+            db.flush()
+            delivered_id = int(delivered.id)
+            db.add(
+                InboxMessageTraceEventModel(
+                    message_id=delivered.id,
+                    kind="inferred_delivered",
+                    payload={"reply_message_id": 7},
+                    created_at=now - timedelta(minutes=1),
+                )
+            )
+
         transcript = tmp_path / ".claude" / "projects" / "repo" / "session.jsonl"
         transcript.parent.mkdir(parents=True)
         transcript.write_text('{"type":"user"}\n', encoding="utf-8")
@@ -90,10 +148,8 @@ class TestTranscriptBindingEndpoint:
                 "cli_agent_orchestrator.api.main.get_terminal_metadata",
                 return_value={"id": "abcd1234"},
             ),
-            patch(
-                "cli_agent_orchestrator.api.main.create_transcript_binding",
-                return_value={"id": 1},
-            ) as create,
+            patch.object(inbox_service, "deliver_pending") as deliver,
+            patch.object(inbox_service, "schedule_delivery_wake") as wake,
         ):
             compact = client.post("/terminals/abcd1234/transcript-binding", json=payload)
             payload["source"] = "startup"
@@ -101,7 +157,16 @@ class TestTranscriptBindingEndpoint:
 
         assert compact.status_code == 200
         assert startup.status_code == 200
-        assert create.call_count == 2
+        deliver.assert_not_called()
+        wake.assert_not_called()
+        with sessions() as db:
+            assert [
+                row.source
+                for row in db.query(TranscriptBindingModel).order_by(TranscriptBindingModel.id)
+            ] == ["compact", "startup"]
+            rows = db.query(InboxModel).order_by(InboxModel.id).all()
+            assert [row.id for row in rows] == [delivered_id]
+        test_engine.dispose()
 
     def test_compact_latest_returns_pinned_wire_shape_with_exact_second(self, client):
         from datetime import datetime
@@ -119,9 +184,7 @@ class TestTranscriptBindingEndpoint:
             "cli_agent_orchestrator.api.main.get_latest_compact_transcript_binding",
             return_value=row,
         ) as lookup:
-            response = client.get(
-                "/terminals/abcd1234/transcript-binding/compact-latest"
-            )
+            response = client.get("/terminals/abcd1234/transcript-binding/compact-latest")
 
         assert response.status_code == 200
         assert response.json() == {
@@ -137,9 +200,7 @@ class TestTranscriptBindingEndpoint:
             "cli_agent_orchestrator.api.main.get_latest_compact_transcript_binding",
             return_value=None,
         ):
-            response = client.get(
-                "/terminals/abcd1234/transcript-binding/compact-latest"
-            )
+            response = client.get("/terminals/abcd1234/transcript-binding/compact-latest")
 
         assert response.status_code == 404
         assert response.json() == {
@@ -157,15 +218,11 @@ class TestTranscriptBindingEndpoint:
         with patch(
             "cli_agent_orchestrator.api.main.get_latest_compact_transcript_binding"
         ) as lookup:
-            response = client.get(
-                "/terminals/abcd1234/transcript-binding/compact-latest"
-            )
+            response = client.get("/terminals/abcd1234/transcript-binding/compact-latest")
         assert response.status_code == 401
         lookup.assert_not_called()
 
-    def test_compact_latest_write_only_scope_is_403_without_read(
-        self, client, monkeypatch
-    ):
+    def test_compact_latest_write_only_scope_is_403_without_read(self, client, monkeypatch):
         from cli_agent_orchestrator.security import auth
 
         async def write_only():
@@ -177,9 +234,7 @@ class TestTranscriptBindingEndpoint:
             with patch(
                 "cli_agent_orchestrator.api.main.get_latest_compact_transcript_binding"
             ) as lookup:
-                response = client.get(
-                    "/terminals/abcd1234/transcript-binding/compact-latest"
-                )
+                response = client.get("/terminals/abcd1234/transcript-binding/compact-latest")
             assert response.status_code == 403
             lookup.assert_not_called()
         finally:
