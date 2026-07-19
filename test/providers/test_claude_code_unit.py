@@ -2,6 +2,7 @@
 
 import json
 import shlex
+import shutil
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, mock_open, patch
@@ -151,9 +152,25 @@ class TestClaudeCodeProviderInitialization:
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_initialize_with_missing_profile_falls_back_to_native_agent(
-        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load, _
+        self,
+        mock_tmux,
+        mock_wait_status,
+        mock_wait_shell,
+        mock_load,
+        _,
+        tmp_path,
+        monkeypatch,
     ):
         """Test missing CAO profile falls back to --agent <name> for native agent store."""
+        defaults = tmp_path / "providers.toml"
+        defaults.write_text(
+            '[claude_code]\nreasoning_effort = "high"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.PROVIDER_DEFAULTS_FILE",
+            defaults,
+        )
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         mock_load.side_effect = FileNotFoundError("Profile not found")
@@ -175,7 +192,9 @@ class TestClaudeCodeProviderInitialization:
             if len(send_keys_call[0]) > 2
             else send_keys_call[1].get("keys", "")
         )
-        assert "--agent my-native-agent" in command
+        args = shlex.split(command)
+        assert args[args.index("--agent") + 1] == "my-native-agent"
+        assert "--effort" not in args
 
     @pytest.mark.asyncio
     @_PATCH_SETTINGS
@@ -1513,6 +1532,174 @@ class TestClaudeCodeProviderModelFlag:
 
         assert "--agent native" in command
         assert "--model" not in command
+
+
+class TestClaudeCodeProviderEffortFlag:
+    """Tests that effort overlays affect only full CAO profiles."""
+
+    @staticmethod
+    def _profile(
+        *,
+        name: str = "agent",
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        native_agent: str | None = None,
+    ) -> AgentProfile:
+        return AgentProfile(
+            name=name,
+            description="test profile",
+            model=model,
+            reasoningEffort=reasoning_effort,
+            native_agent=native_agent,
+        )
+
+    @staticmethod
+    def _set_defaults(tmp_path, monkeypatch, content: str) -> Path:
+        defaults = tmp_path / "providers.toml"
+        defaults.write_text(content, encoding="utf-8")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.PROVIDER_DEFAULTS_FILE",
+            defaults,
+        )
+        return defaults
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_provider_effort_applies(self, mock_load, tmp_path, monkeypatch):
+        self._set_defaults(
+            tmp_path,
+            monkeypatch,
+            '[claude_code]\nreasoning_effort = "medium"\n',
+        )
+        mock_load.return_value = self._profile(reasoning_effort="low")
+
+        args = shlex.split(
+            ClaudeCodeProvider("tid", "sess", "win", "agent")._build_claude_command()
+        )
+
+        assert args[args.index("--effort") + 1] == "medium"
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_per_profile_effort_wins_over_provider(
+        self, mock_load, tmp_path, monkeypatch
+    ):
+        self._set_defaults(
+            tmp_path,
+            monkeypatch,
+            '[claude_code]\nreasoning_effort = "low"\n'
+            '[claude_code.profiles.agent]\nreasoning_effort = "high"\n',
+        )
+        mock_load.return_value = self._profile(reasoning_effort="medium")
+
+        args = shlex.split(
+            ClaudeCodeProvider("tid", "sess", "win", "agent")._build_claude_command()
+        )
+
+        assert args[args.index("--effort") + 1] == "high"
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_frontmatter_effort_fallback_when_toml_absent(
+        self, mock_load, tmp_path, monkeypatch
+    ):
+        self._set_defaults(tmp_path, monkeypatch, "")
+        mock_load.return_value = self._profile(reasoning_effort="xhigh")
+
+        args = shlex.split(
+            ClaudeCodeProvider("tid", "sess", "win", "agent")._build_claude_command()
+        )
+
+        assert args[args.index("--effort") + 1] == "xhigh"
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_empty_profile_effort_clears_lower_tiers(
+        self, mock_load, tmp_path, monkeypatch
+    ):
+        self._set_defaults(
+            tmp_path,
+            monkeypatch,
+            '[claude_code]\nreasoning_effort = "medium"\n'
+            '[claude_code.profiles.agent]\nreasoning_effort = ""\n',
+        )
+        mock_load.return_value = self._profile(reasoning_effort="high")
+
+        args = shlex.split(
+            ClaudeCodeProvider("tid", "sess", "win", "agent")._build_claude_command()
+        )
+
+        assert "--effort" not in args
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_absent_effort_omits_flag(self, mock_load, tmp_path, monkeypatch):
+        self._set_defaults(tmp_path, monkeypatch, "")
+        mock_load.return_value = self._profile()
+
+        args = shlex.split(
+            ClaudeCodeProvider("tid", "sess", "win", "agent")._build_claude_command()
+        )
+
+        assert "--effort" not in args
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_native_agent_branch_ignores_effort(
+        self, mock_load, tmp_path, monkeypatch
+    ):
+        self._set_defaults(
+            tmp_path,
+            monkeypatch,
+            '[claude_code]\nreasoning_effort = "high"\n',
+        )
+        mock_load.return_value = self._profile(
+            native_agent="native",
+            reasoning_effort="medium",
+        )
+
+        args = shlex.split(
+            ClaudeCodeProvider("tid", "sess", "win", "agent")._build_claude_command()
+        )
+
+        assert args[args.index("--agent") + 1] == "native"
+        assert "--effort" not in args
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_model_and_effort_combine_in_stable_order(
+        self, mock_load, tmp_path, monkeypatch
+    ):
+        self._set_defaults(
+            tmp_path,
+            monkeypatch,
+            '[claude_code]\nmodel = "sonnet"\nreasoning_effort = "high"\n',
+        )
+        mock_load.return_value = self._profile()
+
+        args = shlex.split(
+            ClaudeCodeProvider("tid", "sess", "win", "agent")._build_claude_command()
+        )
+        model_index = args.index("--model")
+        effort_index = args.index("--effort")
+
+        assert args[model_index + 1] == "sonnet"
+        assert args[effort_index + 1] == "high"
+        assert model_index < effort_index
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_real_seed_applies_fable_designer_effort(
+        self, mock_load, tmp_path, monkeypatch
+    ):
+        outer_template = Path(__file__).resolve().parents[3] / "providers.toml.default"
+        defaults = tmp_path / "providers.toml"
+        shutil.copyfile(outer_template, defaults)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.PROVIDER_DEFAULTS_FILE",
+            defaults,
+        )
+        mock_load.return_value = self._profile(name="fable_designer")
+
+        args = shlex.split(
+            ClaudeCodeProvider(
+                "tid", "sess", "win", "fable_designer"
+            )._build_claude_command()
+        )
+
+        assert args[args.index("--effort") + 1] == "high"
 
 
 class TestClaudeCodeProviderPermissionMode:

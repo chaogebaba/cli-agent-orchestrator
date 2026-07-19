@@ -410,6 +410,11 @@ class ClaudeCodeProvider(BaseProvider):
             )
             if model:
                 command_parts.extend(["--model", model])
+            effort = resolve_provider_string_option(
+                profile_defaults, defaults, profile, "reasoning_effort", "reasoningEffort"
+            )
+            if effort:
+                command_parts.extend(["--effort", effort])
 
             # Add system prompt - escape newlines to prevent tmux chunking issues
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""

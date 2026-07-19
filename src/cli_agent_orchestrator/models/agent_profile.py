@@ -73,7 +73,7 @@ class AgentProfile(BaseModel):
     hooks: Optional[Dict[str, Any]] = None
     useLegacyMcpJson: Optional[bool] = None
     model: Optional[str] = None
-    # Generic model-effort hint; consumed by grok_cli today.
+    # Generic model-effort hint; consumed by grok_cli and claude_code.
     reasoningEffort: Optional[str] = Field(default=None, min_length=1)
     permissionMode: Optional[PermissionMode] = None
     native_agent: Optional[str] = None  # Claude Code native agent name (thin-wrapper mode)
