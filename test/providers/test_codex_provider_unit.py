@@ -2422,8 +2422,11 @@ class TestWPQ8ContentPolicyRefusal:
         )
         assert CONTENT_POLICY_SCREEN_RULE_ID != CONTENT_POLICY_ARTIFACT_RULE_ID
 
-    def test_wpd1_classification_equivalent_redraw_keeps_rule_identity(self):
-        from cli_agent_orchestrator.services.wpd1_decontam import screen_rule_id_for_reason
+    def test_wpd1_classification_equivalent_redraw_keeps_rule_identity(self, tmp_path):
+        from cli_agent_orchestrator.services.wpd1_decontam import (
+            incident_directory,
+            screen_rule_id_for_reason,
+        )
 
         rows = load_fixture("codex_content_policy_refusal_2026-07-17.txt").splitlines()
         provider = CodexProvider("test1234", "test-session", "window-0")
@@ -2432,7 +2435,14 @@ class TestWPQ8ContentPolicyRefusal:
             [*rows, ""], provider.classify_screen([*rows, ""])
         )
         assert original == redrawn == "content_policy_refusal"
-        assert screen_rule_id_for_reason(original) == screen_rule_id_for_reason(redrawn)
+        original_rule = screen_rule_id_for_reason(original)
+        redrawn_rule = screen_rule_id_for_reason(redrawn)
+        assert original_rule == redrawn_rule
+        assert incident_directory(
+            "term", 7, original_rule, log_dir=tmp_path
+        ) == incident_directory(
+            "term", 7, redrawn_rule, log_dir=tmp_path
+        )
 
     def test_m18_real_refusal_sample_is_classify_only(self):
         rows = load_fixture("codex_content_policy_refusal_2026-07-17.txt").splitlines()

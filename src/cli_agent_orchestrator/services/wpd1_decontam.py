@@ -13,7 +13,7 @@ import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence, cast
 
@@ -714,6 +714,7 @@ def discover_cpa_spans(
     if not isinstance(proposals, list):
         return CpaDiscoveryResult((), 0, truncated, False)
     dropped = max(0, len(proposals) - 64)
+    truncated = truncated or dropped > 0
     proposals = proposals[:64]
     source_candidates = _decoded_candidates(records)
     spans: list[Span] = []
@@ -865,7 +866,7 @@ def validate_incident_record(record: Any) -> None:
         raise DecontaminationError("incident_version_or_provider_invalid", "validate")
     if record["classified_reason"] != CLASSIFIED_REASON:
         raise DecontaminationError("incident_reason_invalid", "validate")
-    if not _RULE_ID_RE.fullmatch(record["rule_id"]):
+    if record["rule_id"] != CONTENT_POLICY_SCREEN_RULE_ID:
         raise DecontaminationError("incident_rule_invalid", "validate")
     if record["prior_incident"] is not None and not isinstance(record["prior_incident"], str):
         raise DecontaminationError("incident_prior_invalid", "validate")
@@ -924,9 +925,11 @@ def _validate_attempt(attempt: Any) -> None:
     fields = {"started_at", "finished_at", "final_stage", "result", "scrub_summary"}
     if not isinstance(attempt, dict) or set(attempt) != fields:
         raise DecontaminationError("incident_attempt_fields_invalid", "validate")
-    if not isinstance(attempt["started_at"], str):
+    if not _is_iso8601_utc(attempt["started_at"]):
         raise DecontaminationError("incident_attempt_started_invalid", "validate")
-    if attempt["finished_at"] is not None and not isinstance(attempt["finished_at"], str):
+    if attempt["finished_at"] is not None and not _is_iso8601_utc(
+        attempt["finished_at"]
+    ):
         raise DecontaminationError("incident_attempt_finished_invalid", "validate")
     if attempt["final_stage"] not in FINAL_STAGES:
         raise DecontaminationError("incident_attempt_stage_invalid", "validate")
@@ -953,6 +956,16 @@ def _validate_attempt(attempt: Any) -> None:
         summary["artifact_sha256_after"], str
     ):
         raise DecontaminationError("incident_scrub_summary_invalid", "validate")
+
+
+def _is_iso8601_utc(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() == timedelta(0)
 
 
 def mutate_incident(

@@ -121,6 +121,7 @@ from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_old_data,
 )
 from cli_agent_orchestrator.services.config_service import ConfigService
+from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.event_log_service import RING_CAPACITY
 from cli_agent_orchestrator.services.event_primitives import KINDS as EVENT_KINDS
@@ -1882,8 +1883,18 @@ async def _send_recovery_nudge(
             inbox_service.deliver_pending(
                 inbox_msg.receiver_id, registry=get_plugin_registry(request)
             )
-        except Exception as exc:
+        except (DeliveryDeferredError, TerminalInputBlockedError) as exc:
             logger.warning("Recovery nudge delivery deferred for %s: %s", terminal_id, exc)
+        except Exception as exc:
+            logger.warning("Recovery nudge delivery failed for %s: %s", terminal_id, exc)
+            return {"status": "failed"}
+        trace = get_message_trace(inbox_msg.id)
+        message = trace.get("message") if isinstance(trace, dict) else None
+        if isinstance(message, dict) and message.get("status") in {
+            MessageStatus.FAILED.value,
+            MessageStatus.DELIVERY_FAILED.value,
+        }:
+            return {"status": "failed"}
         return {"status": "sent", "nudge_message_id": inbox_msg.id}
     except Exception as exc:
         logger.warning("Recovery nudge failed for %s: %s", terminal_id, exc)

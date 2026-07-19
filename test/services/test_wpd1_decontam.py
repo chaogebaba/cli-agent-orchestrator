@@ -106,10 +106,14 @@ def test_each_shape_rejects_missing_required_unknown_extra_and_wrong_type(family
         service.validate_record(wrong)
 
 
-def test_unknown_family_and_nested_variant_fail_closed():
+@pytest.mark.parametrize(
+    ("family", "variant"),
+    [("response_item", "message"), ("event_msg", "agent_message")],
+)
+def test_unknown_family_and_each_nested_variant_family_fail_closed(family, variant):
     with pytest.raises(service.DecontaminationError, match="unknown_top_level_family"):
         service.validate_record({"timestamp": "t", "type": "future", "payload": {}})
-    record = _record("response_item", "message")
+    record = _record(family, variant)
     record["payload"]["type"] = "future_variant"
     with pytest.raises(service.DecontaminationError, match="unknown_nested_discriminator"):
         service.validate_record(record)
@@ -203,6 +207,31 @@ def test_every_closed_stage_value_is_valid(stage):
 def test_unknown_incident_stage_is_rejected():
     with pytest.raises(service.DecontaminationError, match="stage_invalid"):
         service.validate_incident_record(_incident(stage="future"))
+
+
+def test_incident_rejects_unknown_top_level_field_and_unregistered_rule_identity():
+    unknown = _incident()
+    unknown["future_field"] = "value"
+    wrong_rule = _incident()
+    wrong_rule["rule_id"] = "codex.screen.grammar-valid-but-unregistered.v1"
+    with pytest.raises(service.DecontaminationError, match="incident_fields_invalid"):
+        service.validate_incident_record(unknown)
+    with pytest.raises(service.DecontaminationError, match="incident_rule_invalid"):
+        service.validate_incident_record(wrong_rule)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("started_at", "not-a-timestamp", "started_invalid"),
+        ("finished_at", "2026-01-01T01:00:00+01:00", "finished_invalid"),
+    ],
+)
+def test_incident_attempt_timestamps_must_parse_as_iso8601_utc(field, value, error):
+    record = _incident()
+    record["attempts"][0][field] = value
+    with pytest.raises(service.DecontaminationError, match=error):
+        service.validate_incident_record(record)
 
 
 @pytest.mark.parametrize(
@@ -334,6 +363,79 @@ def test_prepare_install_backup_audit_and_repeated_success_fence(monkeypatch, tm
         )
 
 
+@pytest.mark.parametrize("prior_result", ["failed", "aborted"])
+def test_failed_and_aborted_attempts_do_not_fence(monkeypatch, tmp_path, prior_result):
+    _install_fixture_home(monkeypatch, tmp_path)
+    log_dir = tmp_path / "logs"
+    incident_dir = service.incident_directory("term", 1, log_dir=log_dir)
+    prior = _incident()
+    prior["attempts"][0]["result"] = prior_result
+    prior["attempts"][0]["finished_at"] = "2026-01-01T00:00:01+00:00"
+    service.mutate_incident(incident_dir, lambda _current: prior)
+
+    prepared = service.prepare_content_recovery(
+        terminal_id="term", lifecycle_generation=1, session_uuid=POSITIVE_UUID,
+        invoker="supervisor", caller_mailbox_id="mb_1",
+        caller_terminal_id="caller", gating_basis="retry", force=False,
+        show=False, use_cpa=False, log_dir=log_dir,
+    )
+    try:
+        record = json.loads(prepared.incident_path.read_text())
+        assert len(record["attempts"]) == 2
+    finally:
+        service.restore_backup(prepared)
+        service.release_prepared_recovery(prepared)
+
+
+def _complete_then_restore(prepared):
+    service.mark_recovery_complete(prepared)
+    service.restore_backup(prepared)
+    service.release_prepared_recovery(prepared)
+
+
+def test_force_override_and_new_generation_bypass_only_the_exact_fence(monkeypatch, tmp_path):
+    artifact, first = _prepare(monkeypatch, tmp_path)
+    first_incident_dir = first.incident_path.parent
+    _complete_then_restore(first)
+    assert artifact.read_bytes() == POSITIVE.read_bytes()
+
+    forced = service.prepare_content_recovery(
+        terminal_id="term", lifecycle_generation=1, session_uuid=POSITIVE_UUID,
+        invoker="human-cli", caller_mailbox_id="mb_1", caller_terminal_id="caller",
+        gating_basis="human-force", force=True, show=False, use_cpa=False,
+        log_dir=tmp_path / "logs",
+    )
+    try:
+        forced_record = json.loads(forced.incident_path.read_text())
+        assert forced_record["force"] is True
+        assert forced_record["prior_incident"] == str(forced.incident_path)
+    finally:
+        service.restore_backup(forced)
+        service.release_prepared_recovery(forced)
+
+    next_generation = service.prepare_content_recovery(
+        terminal_id="term", lifecycle_generation=2, session_uuid=POSITIVE_UUID,
+        invoker="supervisor", caller_mailbox_id="mb_1", caller_terminal_id="caller",
+        gating_basis="new-generation", force=False, show=False, use_cpa=False,
+        log_dir=tmp_path / "logs",
+    )
+    try:
+        assert next_generation.incident_path.parent != first_incident_dir
+    finally:
+        service.restore_backup(next_generation)
+        service.release_prepared_recovery(next_generation)
+
+
+def test_incident_identity_distinguishes_rule_id(tmp_path):
+    first = service.incident_directory(
+        "term", 1, service.CONTENT_POLICY_SCREEN_RULE_ID, log_dir=tmp_path
+    )
+    second = service.incident_directory(
+        "term", 1, "codex.screen.future-amended-rule.v2", log_dir=tmp_path
+    )
+    assert first != second
+
+
 def test_post_initialize_nonappend_restores_but_retains_backup(monkeypatch, tmp_path):
     artifact, prepared = _prepare(monkeypatch, tmp_path)
     backup = prepared.backup_path
@@ -358,40 +460,139 @@ def test_post_initialize_append_preserves_newer_artifact(monkeypatch, tmp_path):
         service.release_prepared_recovery(prepared)
 
 
-def test_plan_replace_drift_aborts_without_overwriting_newer_file(monkeypatch, tmp_path):
+def test_plan_replace_drift_two_actor_barrier_aborts_without_overwrite(monkeypatch, tmp_path):
     artifact = _install_fixture_home(monkeypatch, tmp_path)
-    original_rewrite = service.rewrite_jsonl
+    decision_boundary = threading.Barrier(2)
+    writer_done = threading.Event()
+    original_validate_lease = service._validate_artifact_lease
+    errors = []
 
-    def racing_rewrite(content, spans):
-        result = original_rewrite(content, spans)
-        artifact.write_bytes(content + (json.dumps(_record("world_state")) + "\n").encode())
-        return result
+    def pause_at_decision(lease):
+        decision_boundary.wait()
+        assert writer_done.wait(timeout=2)
+        original_validate_lease(lease)
 
-    monkeypatch.setattr(service, "rewrite_jsonl", racing_rewrite)
-    with pytest.raises(service.DecontaminationError, match="artifact_drift_before_install"):
-        service.prepare_content_recovery(
-            terminal_id="term", lifecycle_generation=1, session_uuid=POSITIVE_UUID,
-            invoker="supervisor", caller_mailbox_id=None, caller_terminal_id=None,
-            gating_basis="race", force=False, show=False, use_cpa=False,
-            log_dir=tmp_path / "logs",
-        )
-    assert len(artifact.read_bytes()) > len(POSITIVE.read_bytes())
-
-
-def test_artifact_lease_serializes_duplicate_scrub(monkeypatch, tmp_path):
-    _install_fixture_home(monkeypatch, tmp_path)
-    held = service.acquire_artifact_lease(POSITIVE_UUID)
-    assert held is not None
-    try:
-        with pytest.raises(service.DecontaminationError, match="artifact_lease_busy"):
+    def scrubber():
+        try:
             service.prepare_content_recovery(
                 terminal_id="term", lifecycle_generation=1, session_uuid=POSITIVE_UUID,
                 invoker="supervisor", caller_mailbox_id=None, caller_terminal_id=None,
                 gating_basis="race", force=False, show=False, use_cpa=False,
                 log_dir=tmp_path / "logs",
             )
-    finally:
-        service.release_artifact_lease(held)
+        except Exception as exc:
+            errors.append(exc)
+
+    def competing_writer():
+        decision_boundary.wait()
+        artifact.write_bytes(
+            POSITIVE.read_bytes() + (json.dumps(_record("world_state")) + "\n").encode()
+        )
+        writer_done.set()
+
+    monkeypatch.setattr(service, "_validate_artifact_lease", pause_at_decision)
+    actors = [threading.Thread(target=scrubber), threading.Thread(target=competing_writer)]
+    for actor in actors:
+        actor.start()
+    for actor in actors:
+        actor.join(timeout=3)
+    assert all(not actor.is_alive() for actor in actors)
+    assert len(errors) == 1
+    assert isinstance(errors[0], service.DecontaminationError)
+    assert "artifact_drift_before_install" in str(errors[0])
+    assert len(artifact.read_bytes()) > len(POSITIVE.read_bytes())
+
+
+def test_artifact_lease_two_actor_race_allows_exactly_one_scrub(monkeypatch, tmp_path):
+    _install_fixture_home(monkeypatch, tmp_path)
+    start = threading.Barrier(3)
+    winner_at_plan = threading.Event()
+    loser_done = threading.Event()
+    original_find = service.find_artifact
+    results = []
+    errors = []
+
+    def hold_winner(session_uuid):
+        winner_at_plan.set()
+        assert loser_done.wait(timeout=2)
+        return original_find(session_uuid)
+
+    def actor(name):
+        start.wait()
+        prepared = None
+        try:
+            prepared = service.prepare_content_recovery(
+                terminal_id=name, lifecycle_generation=1, session_uuid=POSITIVE_UUID,
+                invoker="supervisor", caller_mailbox_id=None, caller_terminal_id=None,
+                gating_basis="race", force=False, show=False, use_cpa=False,
+                log_dir=tmp_path / "logs",
+            )
+            results.append(name)
+        except Exception as exc:
+            errors.append(exc)
+            loser_done.set()
+        finally:
+            service.release_prepared_recovery(prepared)
+
+    monkeypatch.setattr(service, "find_artifact", hold_winner)
+    actors = [threading.Thread(target=actor, args=(name,)) for name in ("term-a", "term-b")]
+    for thread in actors:
+        thread.start()
+    start.wait()
+    assert winner_at_plan.wait(timeout=2)
+    for thread in actors:
+        thread.join(timeout=4)
+    assert all(not thread.is_alive() for thread in actors)
+    assert len(results) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], service.DecontaminationError)
+    assert "artifact_lease_busy" in str(errors[0])
+
+
+def test_lease_lost_after_plan_two_actor_barrier_aborts_before_replace(monkeypatch, tmp_path):
+    artifact = _install_fixture_home(monkeypatch, tmp_path)
+    boundary = threading.Barrier(2)
+    lease_removed = threading.Event()
+    original_validate = service._validate_artifact_lease
+    errors = []
+
+    def validate_after_disruption(lease):
+        boundary.wait()
+        assert lease_removed.wait(timeout=2)
+        try:
+            original_validate(lease)
+        finally:
+            with service._artifact_lease_lock:
+                service._artifact_leases.setdefault(lease.session_uuid, lease.generation)
+
+    def scrubber():
+        try:
+            service.prepare_content_recovery(
+                terminal_id="term", lifecycle_generation=1, session_uuid=POSITIVE_UUID,
+                invoker="supervisor", caller_mailbox_id=None, caller_terminal_id=None,
+                gating_basis="lease-loss", force=False, show=False, use_cpa=False,
+                log_dir=tmp_path / "logs",
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    def lease_disruptor():
+        boundary.wait()
+        with service._artifact_lease_lock:
+            service._artifact_leases.pop(POSITIVE_UUID, None)
+        lease_removed.set()
+
+    monkeypatch.setattr(service, "_validate_artifact_lease", validate_after_disruption)
+    actors = [threading.Thread(target=scrubber), threading.Thread(target=lease_disruptor)]
+    for actor in actors:
+        actor.start()
+    for actor in actors:
+        actor.join(timeout=3)
+    assert all(not actor.is_alive() for actor in actors)
+    assert len(errors) == 1
+    assert isinstance(errors[0], service.DecontaminationError)
+    assert "artifact_lease_lost" in str(errors[0])
+    assert artifact.read_bytes() == POSITIVE.read_bytes()
 
 
 def test_symlink_artifact_is_rejected(monkeypatch, tmp_path):
@@ -449,6 +650,32 @@ def test_cpa_candidate_caps_force_human_gate():
     assert len(rows) <= 512
     assert all(len(row["text"]) <= 8192 for row in rows)
     assert truncated is True
+
+
+def test_cpa_proposal_overflow_forces_human_gate(monkeypatch, tmp_path):
+    records = service.validate_artifact_bytes(
+        CONTROL.read_bytes(), CONTROL_UUID, f"rollout-{CONTROL_UUID}.jsonl"
+    )
+    candidate = service._decoded_candidates(records)[0][2]
+    digest = hashlib.sha256(candidate[:1].encode()).hexdigest()
+    response = json.dumps({"proposals": [
+        {"candidate_index": 0, "start": 0, "end": 1, "preimage_sha256": digest}
+        for _ in range(65)
+    ]}).encode()
+
+    class FakeResponse:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def read(self, _limit): return response
+
+    config = tmp_path / "providers.json"
+    config.write_text(json.dumps({"cpa": {"url": "https://example.invalid"}}))
+    monkeypatch.setenv("CPA_API_KEY", "test-key")
+    monkeypatch.setattr(service.urllib.request, "urlopen", lambda *_a, **_kw: FakeResponse())
+    result = service.discover_cpa_spans(records, config_path=config)
+    assert len(result.spans) == 64
+    assert result.dropped == 1
+    assert result.human_gate_required is True
 
 
 def test_public_summary_discloses_span_detail_only_with_show(monkeypatch, tmp_path):
