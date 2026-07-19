@@ -479,7 +479,11 @@ MEMORY_ARCHIVE_MAX_GZIP_RATIO = 100  # reject > 100x expansion
 # kept off the network (no WebFetch/WebSearch), shrinking their exfiltration surface.
 ROLE_TOOL_DEFAULTS = {
     "supervisor": ["@cao-mcp-server", "fs_read", "fs_list"],
-    "reviewer": ["@builtin", "fs_read", "fs_list", "@cao-mcp-server"],
+    # Reviewer read-only discipline is a PROMPT contract, not a tool ban
+    # (user ruling 2026-07-19): a shell-less reviewer cannot run git diff /
+    # tests, which gutted a live diff-gate review. Tool-identical to
+    # developer; the no-edit rule lives in each reviewer profile's body.
+    "reviewer": ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"],
     "developer": ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"],
 }
 

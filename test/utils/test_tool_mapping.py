@@ -23,11 +23,11 @@ class TestResolveAllowedTools:
         assert result == ["@cao-mcp-server", "fs_read", "fs_list"]
 
     def test_reviewer_role_defaults(self):
+        """Reviewer is tool-identical to developer; read-only is a prompt
+        contract in the profile body, not a tool ban (2026-07-19 ruling)."""
         result = resolve_allowed_tools(None, "reviewer")
-        assert "@builtin" in result
-        assert "fs_read" in result
-        assert "fs_list" in result
-        assert "execute_bash" not in result
+        assert result == resolve_allowed_tools(None, "developer")
+        assert "execute_bash" in result
 
     def test_developer_role_defaults(self):
         result = resolve_allowed_tools(None, "developer")
