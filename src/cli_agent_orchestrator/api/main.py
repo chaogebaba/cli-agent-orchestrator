@@ -577,12 +577,15 @@ class SessionRecoverRequest(BaseModel):
     interrupt: bool = False
     acknowledge_ownership: bool = False
     base_names: List[str] = Field(default_factory=list)
+    show: bool = False
+    force: bool = False
+    nudge: Optional[bool] = None
 
     @field_validator("reason")
     @classmethod
     def validate_reason(cls, value: str) -> str:
-        if value not in {"provider-reauth", "epoch"}:
-            raise ValueError("reason must be 'provider-reauth' or 'epoch'")
+        if value not in {"provider-reauth", "epoch", "content-flag"}:
+            raise ValueError("reason must be 'provider-reauth', 'epoch', or 'content-flag'")
         return value
 
     @field_validator("provider")
@@ -1851,8 +1854,88 @@ async def get_session_status_endpoint(session_name: str) -> Dict:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
 
+async def _send_recovery_nudge(
+    request: Request,
+    *,
+    terminal_id: str,
+) -> dict[str, Any]:
+    from cli_agent_orchestrator.clients.database import get_current_mailbox_terminal
+    from cli_agent_orchestrator.services.wpd1_decontam import RECOVERY_NUDGE_MESSAGE
+
+    metadata = get_terminal_metadata(terminal_id)
+    mailbox_id = metadata.get("caller_mailbox_id") if metadata else None
+    sender_id = (
+        get_current_mailbox_terminal(mailbox_id) if isinstance(mailbox_id, str) else None
+    )
+    if not sender_id:
+        return {"status": "skipped", "skip_reason": "caller-unresolvable"}
+    try:
+        require_input_allowed(terminal_id)
+        if not metadata:
+            raise ValueError("terminal_missing")
+        backend = get_backend()
+        if not backend.session_exists(metadata["tmux_session"]):
+            raise ValueError("terminal_session_missing")
+        backend.get_history(metadata["tmux_session"], metadata["tmux_window"], tail_lines=1)
+        inbox_msg = create_inbox_message(sender_id, terminal_id, RECOVERY_NUDGE_MESSAGE)
+        try:
+            inbox_service.deliver_pending(
+                inbox_msg.receiver_id, registry=get_plugin_registry(request)
+            )
+        except Exception as exc:
+            logger.warning("Recovery nudge delivery deferred for %s: %s", terminal_id, exc)
+        return {"status": "sent", "nudge_message_id": inbox_msg.id}
+    except Exception as exc:
+        logger.warning("Recovery nudge failed for %s: %s", terminal_id, exc)
+        return {"status": "failed"}
+
+
+async def _apply_recovery_nudges(
+    request: Request,
+    result: dict[str, Any],
+    *,
+    reason: str,
+    nudge: bool | None,
+) -> dict[str, Any]:
+    engaged = reason == "content-flag" or nudge is True
+    if not engaged:
+        return result
+    from cli_agent_orchestrator.services.wpd1_decontam import (
+        update_incident_nudge,
+        validate_nudge_object,
+    )
+
+    success_statuses = {"rebound", "resumed"}
+    for item in result.get("results", []):
+        if item.get("status") not in success_statuses:
+            nudge_result = {"status": "not_attempted"}
+        elif nudge is False:
+            nudge_result = {"status": "skipped", "skip_reason": "no-nudge-flag"}
+        else:
+            terminal_id = item.get("terminal_id")
+            nudge_result = (
+                await _send_recovery_nudge(request, terminal_id=terminal_id)
+                if isinstance(terminal_id, str)
+                else {"status": "skipped", "skip_reason": "caller-unresolvable"}
+            )
+        item["nudge"] = validate_nudge_object(nudge_result)
+        if reason == "content-flag":
+            detail = item.get("decontamination")
+            incident_path = detail.get("incident_path") if isinstance(detail, dict) else None
+            if isinstance(incident_path, str):
+                raw_message_id = nudge_result.get("nudge_message_id")
+                update_incident_nudge(
+                    Path(incident_path),
+                    status=nudge_result["status"],
+                    skip_reason=nudge_result.get("skip_reason"),
+                    message_id=(raw_message_id if type(raw_message_id) is int else None),
+                )
+    return result
+
+
 @app.post("/sessions/{session_name}/recover")
 async def recover_session(
+    request: Request,
     session_name: str,
     body: SessionRecoverRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
@@ -1867,17 +1950,40 @@ async def recover_session(
                 )
             from cli_agent_orchestrator.services.epoch_recovery_service import recover_epoch
 
-            return await recover_epoch(session_name, body.base_names or None)
+            if body.show or body.force:
+                raise ValueError("epoch recovery rejects show and force")
+            result = await recover_epoch(session_name, body.base_names or None)
+            return await _apply_recovery_nudges(
+                request, result, reason=body.reason, nudge=body.nudge
+            )
         if body.base_names:
-            raise ValueError("provider-reauth rejects base_names")
+            raise ValueError(f"{body.reason} rejects base_names")
+        if body.reason != "content-flag" and (body.show or body.force):
+            raise ValueError("provider-reauth rejects show and force")
+        if body.reason == "content-flag" and body.provider != "codex":
+            raise ValueError("content-flag recovery requires provider codex")
         from cli_agent_orchestrator.services.provider_rebind_service import recover_provider_reauth
 
-        return await recover_provider_reauth(
-            session_name,
-            provider=body.provider,
-            terminal_ids=body.terminal_ids or None,
-            interrupt=body.interrupt,
-            acknowledge_ownership=body.acknowledge_ownership,
+        if body.reason == "content-flag":
+            result = await recover_provider_reauth(
+                session_name,
+                provider=body.provider,
+                terminal_ids=body.terminal_ids or None,
+                interrupt=body.interrupt,
+                acknowledge_ownership=body.acknowledge_ownership,
+                reason=body.reason,
+                content_options={"show": body.show, "force": body.force},
+            )
+        else:
+            result = await recover_provider_reauth(
+                session_name,
+                provider=body.provider,
+                terminal_ids=body.terminal_ids or None,
+                interrupt=body.interrupt,
+                acknowledge_ownership=body.acknowledge_ownership,
+            )
+        return await _apply_recovery_nudges(
+            request, result, reason=body.reason, nudge=body.nudge
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))

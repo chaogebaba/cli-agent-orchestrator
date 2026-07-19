@@ -253,6 +253,99 @@ class TestRecover:
         assert result.exit_code != 0
         assert "exactly one --terminal" in result.output
 
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_content_recovery_default_on_payload_and_sent_render(self, mock_post, runner):
+        mock_post.return_value.json.return_value = {
+            "session": "cao-test",
+            "results": [{
+                "terminal_id": "term-a", "status": "rebound", "error_code": None,
+                "nudge": {"status": "sent", "nudge_message_id": 41},
+            }],
+            "manifest_error": None,
+        }
+        result = runner.invoke(
+            session,
+            ["recover", "cao-test", "--reason", "content-flag", "--terminal", "term-a"],
+        )
+        assert result.exit_code == 0
+        assert "term-a: nudge sent [message 41]" in result.output
+        assert mock_post.call_args.kwargs["json"] == {
+            "reason": "content-flag", "provider": "codex", "terminal_ids": ["term-a"],
+            "interrupt": False, "acknowledge_ownership": False,
+            "show": False, "force": False,
+        }
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_content_recovery_no_nudge_and_caller_skip_render_idle_reminder(
+        self, mock_post, runner
+    ):
+        for skip_reason in ("no-nudge-flag", "caller-unresolvable"):
+            mock_post.return_value.json.return_value = {
+                "session": "cao-test",
+                "results": [{
+                    "terminal_id": "term-a", "status": "rebound", "error_code": None,
+                    "nudge": {"status": "skipped", "skip_reason": skip_reason},
+                }],
+                "manifest_error": None,
+            }
+            args = ["recover", "cao-test", "--reason", "content-flag"]
+            if skip_reason == "no-nudge-flag":
+                args.append("--no-nudge")
+            result = runner.invoke(session, args)
+            assert result.exit_code == 0
+            assert f"nudge skipped [{skip_reason}]" in result.output
+            assert "IDLE until messaged" in result.output
+        assert mock_post.call_args_list[0].kwargs["json"]["nudge"] is False
+        assert "nudge" not in mock_post.call_args_list[1].kwargs["json"]
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    @pytest.mark.parametrize("status", ["failed", "not_attempted"])
+    def test_content_recovery_closed_status_render(self, mock_post, runner, status):
+        mock_post.return_value.json.return_value = {
+            "session": "cao-test",
+            "results": [{
+                "terminal_id": "term-a",
+                "status": "rebound" if status == "failed" else "resume_failed",
+                "error_code": None,
+                "nudge": {"status": status},
+            }],
+            "manifest_error": None,
+        }
+        result = runner.invoke(session, ["recover", "cao-test", "--reason", "content-flag"])
+        assert result.exit_code == 0
+        assert f"nudge {status}" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    @pytest.mark.parametrize(
+        "nudge",
+        [
+            {"status": "failed", "nudge_message_id": 1},
+            {"status": "sent"},
+            {"status": "skipped"},
+            {"status": "failed", "skip_reason": "no-nudge-flag"},
+        ],
+    )
+    def test_content_recovery_rejects_nudge_field_presence_violations(
+        self, mock_post, runner, nudge
+    ):
+        mock_post.return_value.json.return_value = {
+            "session": "cao-test",
+            "results": [{"terminal_id": "term-a", "status": "rebound", "nudge": nudge}],
+            "manifest_error": None,
+        }
+        result = runner.invoke(session, ["recover", "cao-test", "--reason", "content-flag"])
+        assert result.exit_code != 0
+        assert "invalid recovery nudge result" in result.output
+
+    def test_content_recovery_flag_validation(self, runner):
+        assert runner.invoke(
+            session, ["recover", "cao-test", "--reason", "provider-reauth", "--force"]
+        ).exit_code != 0
+        assert runner.invoke(
+            session,
+            ["recover", "cao-test", "--reason", "content-flag", "--provider", "grok_cli"],
+        ).exit_code != 0
+
 
 class TestLegacyStatus:
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
