@@ -9,6 +9,8 @@ import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.codex import (
+    CONTENT_POLICY_ARTIFACT_RULE_ID,
+    CONTENT_POLICY_SCREEN_RULE_ID,
     CodexProvider,
     ProviderError,
     _toml_override,
@@ -2406,6 +2408,42 @@ class TestCodexProviderTrustPrompt:
 
 
 class TestWPQ8ContentPolicyRefusal:
+    def test_wpd1_rule_identity_is_stable_and_split_by_surface(self):
+        from cli_agent_orchestrator.services.wpd1_decontam import (
+            SCREEN_TO_ARTIFACT_RULE,
+            screen_rule_id_for_reason,
+        )
+
+        assert screen_rule_id_for_reason("content_policy_refusal") == (
+            CONTENT_POLICY_SCREEN_RULE_ID
+        )
+        assert SCREEN_TO_ARTIFACT_RULE[CONTENT_POLICY_SCREEN_RULE_ID] == (
+            CONTENT_POLICY_ARTIFACT_RULE_ID
+        )
+        assert CONTENT_POLICY_SCREEN_RULE_ID != CONTENT_POLICY_ARTIFACT_RULE_ID
+
+    def test_wpd1_classification_equivalent_redraw_keeps_rule_identity(self, tmp_path):
+        from cli_agent_orchestrator.services.wpd1_decontam import (
+            incident_directory,
+            screen_rule_id_for_reason,
+        )
+
+        rows = load_fixture("codex_content_policy_refusal_2026-07-17.txt").splitlines()
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        original = provider.classify_idle_reason(rows, provider.classify_screen(rows))
+        redrawn = provider.classify_idle_reason(
+            [*rows, ""], provider.classify_screen([*rows, ""])
+        )
+        assert original == redrawn == "content_policy_refusal"
+        original_rule = screen_rule_id_for_reason(original)
+        redrawn_rule = screen_rule_id_for_reason(redrawn)
+        assert original_rule == redrawn_rule
+        assert incident_directory(
+            "term", 7, original_rule, log_dir=tmp_path
+        ) == incident_directory(
+            "term", 7, redrawn_rule, log_dir=tmp_path
+        )
+
     def test_m18_real_refusal_sample_is_classify_only(self):
         rows = load_fixture("codex_content_policy_refusal_2026-07-17.txt").splitlines()
         provider = CodexProvider("test1234", "test-session", "window-0")

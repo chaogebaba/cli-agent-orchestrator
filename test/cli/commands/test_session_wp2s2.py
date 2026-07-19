@@ -61,8 +61,51 @@ def test_d1_epoch_rejects_reauth_only_cli_flags(args):
 
 def test_d1_api_reason_and_flag_validation():
     assert SessionRecoverRequest(reason="epoch", base_names=["b"]).reason == "epoch"
+    assert SessionRecoverRequest(reason="content-flag").nudge is None
+    assert SessionRecoverRequest(reason="content-flag", nudge=False).nudge is False
     with pytest.raises(ValidationError):
         SessionRecoverRequest(reason="unknown")
+
+
+def test_wpd1_content_payload_and_json_result_share_structured_nudge_contract():
+    payload = {
+        "session": "cao-s",
+        "reason": "content-flag",
+        "results": [{
+            "terminal_id": "t", "status": "rebound", "error_code": None,
+            "nudge": {"status": "sent", "nudge_message_id": 12},
+        }],
+        "manifest_error": None,
+    }
+    with patch(
+        "cli_agent_orchestrator.cli.commands.session.requests.post",
+        return_value=_response(payload),
+    ) as post:
+        result = CliRunner().invoke(
+            session,
+            ["recover", "cao-s", "--reason", "content-flag", "--show", "--json"],
+        )
+    assert result.exit_code == 0
+    assert json.loads(result.output)["results"][0]["nudge"]["status"] == "sent"
+    assert post.call_args.kwargs["json"] == {
+        "reason": "content-flag", "provider": "codex", "terminal_ids": [],
+        "interrupt": False, "acknowledge_ownership": False,
+        "show": True, "force": False,
+    }
+
+
+def test_wpd1_noncontent_explicit_nudge_is_additive_and_default_absence_is_legacy():
+    payload = {"session": "cao-s", "reason": "epoch", "results": [],
+               "respawn_candidates": [], "manifest_error": None}
+    with patch(
+        "cli_agent_orchestrator.cli.commands.session.requests.post",
+        return_value=_response(payload),
+    ) as post:
+        result = CliRunner().invoke(
+            session, ["recover", "cao-s", "--reason", "epoch", "--nudge"]
+        )
+    assert result.exit_code == 0
+    assert post.call_args.kwargs["json"]["nudge"] is True
 
 
 def test_close_cli_contract():

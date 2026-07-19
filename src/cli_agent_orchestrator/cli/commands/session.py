@@ -216,12 +216,19 @@ def list_sessions(as_json):
 
 @session.command("recover")
 @click.argument("session_name")
-@click.option("--reason", required=True, type=click.Choice(["provider-reauth", "epoch"]))
+@click.option(
+    "--reason",
+    required=True,
+    type=click.Choice(["provider-reauth", "epoch", "content-flag"]),
+)
 @click.option("--provider", default="codex", type=click.Choice(["codex", "grok_cli"]))
 @click.option("--terminal", "terminal_ids", multiple=True)
 @click.option("--interrupt", is_flag=True)
 @click.option("--acknowledge-ownership", is_flag=True)
 @click.option("--base", "base_names", multiple=True)
+@click.option("--show", is_flag=True)
+@click.option("--force", is_flag=True)
+@click.option("--nudge/--no-nudge", default=None)
 @click.option("--json", "as_json", is_flag=True)
 def recover(
     session_name,
@@ -231,6 +238,9 @@ def recover(
     interrupt,
     acknowledge_ownership,
     base_names,
+    show,
+    force,
+    nudge,
     as_json,
 ):
     """Explicitly rebind provider sessions after authentication changes."""
@@ -244,6 +254,12 @@ def recover(
         )
     if reason == "provider-reauth" and base_names:
         raise click.ClickException("provider-reauth rejects --base")
+    if reason == "content-flag" and base_names:
+        raise click.ClickException("content-flag rejects --base")
+    if reason != "content-flag" and (show or force):
+        raise click.ClickException(f"{reason} rejects --show and --force")
+    if reason == "content-flag" and provider != "codex":
+        raise click.ClickException("content-flag requires --provider codex")
     payload = {
         "reason": reason,
         "provider": provider,
@@ -253,6 +269,11 @@ def recover(
     }
     if reason == "epoch":
         payload["base_names"] = list(base_names)
+    if reason == "content-flag":
+        payload["show"] = show
+        payload["force"] = force
+    if nudge is not None:
+        payload["nudge"] = nudge
     try:
         response = cao_http.post(
             f"/sessions/{quote(session_name, safe='')}/recover",
@@ -265,7 +286,7 @@ def recover(
     if as_json:
         click.echo(json.dumps(result, indent=2))
         return
-    if reason == "provider-reauth":
+    if reason in {"provider-reauth", "content-flag"}:
         click.echo(f"Recovery: {result.get('session', session_name)} ({provider})")
     else:
         click.echo(f"Recovery: {result.get('session', session_name)} (epoch)")
@@ -276,9 +297,33 @@ def recover(
         )
         label = item.get("terminal_id") or item.get("base")
         click.echo(f"{label}: {item['status']}{detail}{reconciliation}")
-        if reason == "provider-reauth" and item["status"] == "rebound":
+        nudge_result = item.get("nudge")
+        if nudge_result is not None:
+            from cli_agent_orchestrator.services.wpd1_decontam import validate_nudge_object
+
+            try:
+                validated = validate_nudge_object(nudge_result)
+            except ValueError as exc:
+                raise click.ClickException(f"invalid recovery nudge result: {exc}") from exc
+            if validated["status"] == "sent":
+                click.echo(f"{label}: nudge sent [message {validated['nudge_message_id']}]")
+            elif validated["status"] == "skipped":
+                click.echo(f"{label}: nudge skipped [{validated['skip_reason']}]")
+                click.echo(
+                    f"NOTE: recovered terminal {label} is IDLE until messaged — send a continue nudge."
+                )
+            else:
+                click.echo(f"{label}: nudge {validated['status']}")
+        elif reason == "provider-reauth" and item["status"] == "rebound":
             click.echo(
                 f"NOTE: recovered terminal {label} is IDLE until messaged — send a continue nudge."
+            )
+        if reason == "content-flag" and show and isinstance(
+            item.get("decontamination"), dict
+        ):
+            click.echo(
+                f"{label}: decontamination "
+                + json.dumps(item["decontamination"], sort_keys=True)
             )
     if reason == "epoch":
         for item in result.get("respawn_candidates", []):

@@ -228,7 +228,12 @@ async def _fallback(metadata: dict, session_uuid: str, source_lease, lifecycle_l
 
 
 async def rebind_terminal(
-    terminal_id: str, *, interrupt: bool = False, acknowledge_ownership: bool = False,
+    terminal_id: str,
+    *,
+    interrupt: bool = False,
+    acknowledge_ownership: bool = False,
+    reason: str = "provider-reauth",
+    content_options: dict | None = None,
 ) -> dict:
     initial_metadata = get_terminal_metadata(terminal_id)
     if not initial_metadata:
@@ -251,6 +256,7 @@ async def rebind_terminal(
     metadata = None
     previous_state = None
     guard_released = False
+    prepared_recovery = None
     phase = "p2"
     try:
         await guard.acquire()
@@ -331,6 +337,36 @@ async def rebind_terminal(
             return _result(terminal_id, "resume_failed", error_code=death, interrupt=interrupt,
                            retryable=False)
         exited = True
+        if reason == "content-flag":
+            if metadata.get("provider") != "codex" or not isinstance(
+                metadata.get("lifecycle_generation"), int
+            ):
+                raise RuntimeError("content_recovery_provider_or_generation_invalid")
+            from cli_agent_orchestrator.clients.database import get_current_mailbox_terminal
+            from cli_agent_orchestrator.services.wpd1_decontam import (
+                prepare_content_recovery,
+            )
+
+            options = content_options or {}
+            caller_mailbox_id = metadata.get("caller_mailbox_id")
+            caller_terminal_id = (
+                get_current_mailbox_terminal(caller_mailbox_id)
+                if isinstance(caller_mailbox_id, str)
+                else None
+            )
+            prepared_recovery = prepare_content_recovery(
+                terminal_id=terminal_id,
+                lifecycle_generation=metadata["lifecycle_generation"],
+                session_uuid=session_uuid,
+                invoker=options.get("invoker") or caller_terminal_id or "human-cli",
+                caller_mailbox_id=caller_mailbox_id,
+                caller_terminal_id=caller_terminal_id,
+                gating_basis=options.get("gating_basis") or "supervisor-invoked",
+                force=bool(options.get("force")),
+                show=bool(options.get("show")),
+                ad_hoc_spans=options.get("ad_hoc_spans", ()),
+                use_cpa=bool(options.get("use_cpa", True)),
+            )
         phase = "p8"
         status_monitor.reset_buffer(terminal_id)
         before_output_gen = status_monitor.get_fifo_frame_gen(terminal_id)
@@ -371,22 +407,90 @@ async def rebind_terminal(
             )
             watchdog_snapshot = None
             set_terminal_recovery_state(terminal_id, "rebind_failed", "watchdog_resume_failed")
-            return _result(
+            if prepared_recovery is not None:
+                from cli_agent_orchestrator.services.terminal_service import exit_terminal_cli
+                from cli_agent_orchestrator.services.wpd1_decontam import (
+                    mark_recovery_failure,
+                    post_initialize_failure,
+                    public_scrub_summary,
+                )
+
+                candidate_death_confirmed = False
+                try:
+                    exit_terminal_cli(terminal_id)
+                    candidate_pid = pane_pid(metadata["tmux_session"], metadata["tmux_window"])
+                    candidate_death_confirmed = (
+                        await _wait_for_shell_baseline(
+                            metadata, baseline, candidate, candidate_pid
+                        )
+                        == "exit_confirmed"
+                    )
+                except Exception:
+                    candidate_death_confirmed = False
+                if candidate_death_confirmed:
+                    post_initialize_failure(prepared_recovery, "settle")
+                else:
+                    mark_recovery_failure(
+                        prepared_recovery, "settle", restored=False
+                    )
+            result = _result(
                 terminal_id, "resume_failed", error_code="watchdog_resume_failed",
                 interrupt=interrupt,
             )
+            if prepared_recovery is not None:
+                result["decontamination"] = public_scrub_summary(
+                    prepared_recovery, show=bool((content_options or {}).get("show"))
+                )
+            return result
         phase = "p15"
         try:
             await guard.close()
             guard_released = True
         except Exception:
-            return _result(
+            result = _result(
                 terminal_id, "rebound", error_code="delivery_guard_release_failed",
                 interrupt=interrupt,
             )
+            if prepared_recovery is not None:
+                from cli_agent_orchestrator.services.wpd1_decontam import (
+                    mark_recovery_complete,
+                    public_scrub_summary,
+                )
+
+                mark_recovery_complete(prepared_recovery)
+                result["decontamination"] = public_scrub_summary(
+                    prepared_recovery, show=bool((content_options or {}).get("show"))
+                )
+            return result
+        if prepared_recovery is not None:
+            from cli_agent_orchestrator.services.wpd1_decontam import (
+                mark_recovery_complete,
+                public_scrub_summary,
+            )
+
+            try:
+                mark_recovery_complete(prepared_recovery)
+            except Exception:
+                result = _result(
+                    terminal_id,
+                    "rebound",
+                    error_code="incident_update_failed",
+                    interrupt=interrupt,
+                )
+                result["decontamination"] = public_scrub_summary(
+                    prepared_recovery, show=bool((content_options or {}).get("show"))
+                )
+                return result
         if old_provider is not candidate:
             old_provider.cleanup()
-        return _result(terminal_id, "rebound", interrupt=interrupt)
+        result = _result(terminal_id, "rebound", interrupt=interrupt)
+        if prepared_recovery is not None:
+            from cli_agent_orchestrator.services.wpd1_decontam import public_scrub_summary
+
+            result["decontamination"] = public_scrub_summary(
+                prepared_recovery, show=bool((content_options or {}).get("show"))
+            )
+        return result
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -407,17 +511,54 @@ async def rebind_terminal(
                     if not candidate_death_confirmed:
                         ownership_error = candidate_death
                         set_terminal_recovery_state(terminal_id, "rebind_failed", candidate_death)
-                if session_uuid and candidate_death_confirmed:
+                if reason == "content-flag":
+                    if prepared_recovery is not None:
+                        from cli_agent_orchestrator.services.wpd1_decontam import (
+                            post_initialize_failure,
+                            public_scrub_summary,
+                            restore_backup,
+                        )
+
+                        if candidate is None:
+                            restore_backup(prepared_recovery)
+                            from cli_agent_orchestrator.services.wpd1_decontam import (
+                                mark_recovery_failure,
+                            )
+
+                            mark_recovery_failure(
+                                prepared_recovery, "resume", restored=True
+                            )
+                        elif candidate_death_confirmed:
+                            post_initialize_failure(
+                                prepared_recovery,
+                                "settle" if phase in {"p13", "p14", "p15"} else "resume",
+                            )
+                    fallback = None
+                elif session_uuid and candidate_death_confirmed:
                     fallback = await _fallback(metadata, session_uuid, lease, lifecycle_lease)
             except Exception as fallback_exc:
                 set_terminal_recovery_state(terminal_id, "rebind_failed", str(fallback_exc))
                 fallback = {"status": "failed", "new_terminal_id": None}
-            return _result(
+            result = _result(
                 terminal_id, "resume_failed",
-                error_code=ownership_error or "resume_failed",
+                error_code=(
+                    ownership_error
+                    or (
+                        f"{getattr(exc, 'stage', 'resume')}:{getattr(exc, 'code', type(exc).__name__)}"
+                        if reason == "content-flag"
+                        else "resume_failed"
+                    )
+                ),
                 interrupt=interrupt, fallback=fallback,
                 retryable=False if ownership_error else True,
             )
+            if prepared_recovery is not None:
+                from cli_agent_orchestrator.services.wpd1_decontam import public_scrub_summary
+
+                result["decontamination"] = public_scrub_summary(
+                    prepared_recovery, show=bool((content_options or {}).get("show"))
+                )
+            return result
         if metadata and phase in {"p7_send", "p7_death"}:
             set_terminal_recovery_state(terminal_id, "rebind_failed", "exit_uncertain")
             return _result(
@@ -444,12 +585,23 @@ async def rebind_terminal(
             try:
                 release_rebind_lease(lease)
             finally:
-                release_session_lifecycle_lease(lifecycle_lease)
+                try:
+                    if prepared_recovery is not None:
+                        from cli_agent_orchestrator.services.wpd1_decontam import (
+                            release_prepared_recovery,
+                        )
+
+                        release_prepared_recovery(prepared_recovery)
+                finally:
+                    release_session_lifecycle_lease(lifecycle_lease)
 
 
 async def recover_provider_reauth(
     session_name: str, provider: str = "codex", terminal_ids: list[str] | None = None,
     interrupt: bool = False, acknowledge_ownership: bool = False,
+    *,
+    reason: str = "provider-reauth",
+    content_options: dict | None = None,
 ) -> dict:
     if acknowledge_ownership and (terminal_ids is None or len(terminal_ids) != 1):
         raise ValueError("acknowledge_ownership requires exactly one --terminal selector")
@@ -468,10 +620,24 @@ async def recover_provider_reauth(
     selected.sort()
     results = []
     for terminal_id in selected:
-        results.append(await rebind_terminal(
-            terminal_id, interrupt=interrupt,
-            acknowledge_ownership=acknowledge_ownership,
-        ))
+        if reason == "content-flag":
+            results.append(
+                await rebind_terminal(
+                    terminal_id,
+                    interrupt=interrupt,
+                    acknowledge_ownership=acknowledge_ownership,
+                    reason=reason,
+                    content_options=content_options,
+                )
+            )
+        else:
+            results.append(
+                await rebind_terminal(
+                    terminal_id,
+                    interrupt=interrupt,
+                    acknowledge_ownership=acknowledge_ownership,
+                )
+            )
     manifest = None
     manifest_error = None
     try:
@@ -481,7 +647,7 @@ async def recover_provider_reauth(
         manifest_error = str(exc)
     return {
         "schema_version": "cao.session-recover/v1", "session": session_name,
-        "reason": "provider-reauth", "provider": provider, "started_at": started,
+        "reason": reason, "provider": provider, "started_at": started,
         "finished_at": datetime.now(timezone.utc).isoformat(), "results": results,
         "manifest": manifest, "manifest_error": manifest_error,
     }

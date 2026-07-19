@@ -198,6 +198,38 @@ async def test_fleet_eligibility_is_exact_and_promotes_abandoned_midstate(monkey
 
 
 @pytest.mark.asyncio
+async def test_wpd1_fleet_forwards_content_options_without_changing_legacy_calls(monkeypatch):
+    monkeypatch.setattr(
+        service,
+        "list_terminals_by_session",
+        lambda _name: [{"id": "worker", "provider": "codex", "recovery_state": None}],
+    )
+    calls = []
+
+    async def fake_rebind(terminal_id, **kwargs):
+        calls.append((terminal_id, kwargs))
+        return service._result(terminal_id, "rebound")
+
+    monkeypatch.setattr(service, "rebind_terminal", fake_rebind)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.session_manifest_service.build_session_manifest",
+        lambda _name: {},
+    )
+    result = await service.recover_provider_reauth(
+        "cao-test",
+        reason="content-flag",
+        content_options={"show": True, "force": False},
+    )
+    assert result["reason"] == "content-flag"
+    assert calls == [("worker", {
+        "interrupt": False,
+        "acknowledge_ownership": False,
+        "reason": "content-flag",
+        "content_options": {"show": True, "force": False},
+    })]
+
+
+@pytest.mark.asyncio
 async def test_tmux_backend_proof_uses_preexisting_fifo_without_reregistration(monkeypatch):
     backend = MagicMock()
     backend.supports_event_inbox.return_value = False
@@ -564,6 +596,155 @@ def _install_transaction_harness(monkeypatch, *, pause_error=None, resume_error=
     else:
         monkeypatch.setattr(service.stalled_callback_watchdog, "resume_terminal", lambda *_a: None)
     return old, candidate, states
+
+
+@pytest.mark.asyncio
+async def test_wpd1_scrub_runs_after_proven_death_and_before_candidate_initialize(monkeypatch):
+    _old, candidate, _states = _install_transaction_harness(monkeypatch)
+    from cli_agent_orchestrator.services import wpd1_decontam
+
+    metadata = {
+        "id": "txn",
+        "recovery_state": None,
+        "shell_command": "bash",
+        "provider_session_id": "uuid",
+        "provider": "codex",
+        "tmux_session": "cao-test",
+        "tmux_window": "worker",
+        "agent_profile": "dev",
+        "allowed_tools": None,
+        "lifecycle_generation": 4,
+        "caller_mailbox_id": "mb_owner",
+    }
+    monkeypatch.setattr(service, "get_terminal_metadata", lambda _tid: metadata.copy())
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_current_mailbox_terminal",
+        lambda _mailbox: "caller-live",
+    )
+    events = []
+    prepared = SimpleNamespace()
+    monkeypatch.setattr(
+        wpd1_decontam,
+        "prepare_content_recovery",
+        lambda **kwargs: events.append(("scrub", kwargs)) or prepared,
+    )
+    candidate.initialize = AsyncMock(side_effect=lambda **_kwargs: events.append(("initialize", {})))
+    monkeypatch.setattr(wpd1_decontam, "mark_recovery_complete", lambda _p: events.append(("complete", {})))
+    monkeypatch.setattr(wpd1_decontam, "release_prepared_recovery", lambda _p: None)
+    monkeypatch.setattr(
+        wpd1_decontam,
+        "public_scrub_summary",
+        lambda _p, show: {"incident_path": "/tmp/incident", "show": show},
+    )
+    insert = MagicMock()
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.create_inbox_message", insert)
+
+    result = await service.rebind_terminal(
+        "txn",
+        reason="content-flag",
+        content_options={"show": True, "force": False, "use_cpa": False},
+    )
+
+    assert result["status"] == "rebound"
+    assert [name for name, _details in events] == ["scrub", "initialize", "complete"]
+    assert events[0][1]["caller_terminal_id"] == "caller-live"
+    assert result["decontamination"]["show"] is True
+    insert.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_wpd1_resume_failure_disables_unsanitized_fallback(monkeypatch):
+    _old, candidate, _states = _install_transaction_harness(monkeypatch)
+    from cli_agent_orchestrator.services import wpd1_decontam
+
+    metadata = {
+        "id": "txn", "recovery_state": None, "shell_command": "bash",
+        "provider_session_id": "uuid", "provider": "codex", "tmux_session": "cao-test",
+        "tmux_window": "worker", "agent_profile": "dev", "allowed_tools": None,
+        "lifecycle_generation": 4, "caller_mailbox_id": None,
+    }
+    monkeypatch.setattr(service, "get_terminal_metadata", lambda _tid: metadata.copy())
+    prepared = SimpleNamespace()
+    monkeypatch.setattr(wpd1_decontam, "prepare_content_recovery", lambda **_kwargs: prepared)
+    monkeypatch.setattr(wpd1_decontam, "release_prepared_recovery", lambda _p: None)
+    monkeypatch.setattr(wpd1_decontam, "post_initialize_failure", lambda *_a: True)
+    monkeypatch.setattr(
+        wpd1_decontam, "public_scrub_summary",
+        lambda _p, show: {"incident_path": "/tmp/incident"},
+    )
+    candidate.initialize.side_effect = RuntimeError("candidate failed")
+    fallback = AsyncMock()
+    monkeypatch.setattr(service, "_fallback", fallback)
+
+    result = await service.rebind_terminal("txn", reason="content-flag")
+
+    assert result["status"] == "resume_failed"
+    assert result["fallback"] is None
+    fallback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_wpd1_watchdog_resume_failure_runs_post_append_authority_law(monkeypatch):
+    _old, _candidate, _states = _install_transaction_harness(
+        monkeypatch, resume_error=RuntimeError("watchdog")
+    )
+    from cli_agent_orchestrator.services import wpd1_decontam
+
+    metadata = {
+        "id": "txn", "recovery_state": None, "shell_command": "bash",
+        "provider_session_id": "uuid", "provider": "codex", "tmux_session": "cao-test",
+        "tmux_window": "worker", "agent_profile": "dev", "allowed_tools": None,
+        "lifecycle_generation": 4, "caller_mailbox_id": None,
+    }
+    monkeypatch.setattr(service, "get_terminal_metadata", lambda _tid: metadata.copy())
+    prepared = SimpleNamespace()
+    monkeypatch.setattr(wpd1_decontam, "prepare_content_recovery", lambda **_kw: prepared)
+    monkeypatch.setattr(wpd1_decontam, "release_prepared_recovery", lambda _p: None)
+    post = MagicMock(return_value=True)
+    monkeypatch.setattr(wpd1_decontam, "post_initialize_failure", post)
+    monkeypatch.setattr(wpd1_decontam, "mark_recovery_failure", MagicMock())
+    monkeypatch.setattr(
+        wpd1_decontam, "public_scrub_summary",
+        lambda _p, show: {"incident_path": "/tmp/incident"},
+    )
+
+    result = await service.rebind_terminal("txn", reason="content-flag")
+
+    assert result["status"] == "resume_failed"
+    assert result["error_code"] == "watchdog_resume_failed"
+    post.assert_called_once_with(prepared, "settle")
+
+
+@pytest.mark.asyncio
+async def test_wpd1_guard_release_error_still_closes_incident_complete(monkeypatch):
+    _old, _candidate, _states = _install_transaction_harness(monkeypatch)
+    from cli_agent_orchestrator.services import wpd1_decontam
+
+    metadata = {
+        "id": "txn", "recovery_state": None, "shell_command": "bash",
+        "provider_session_id": "uuid", "provider": "codex", "tmux_session": "cao-test",
+        "tmux_window": "worker", "agent_profile": "dev", "allowed_tools": None,
+        "lifecycle_generation": 4, "caller_mailbox_id": None,
+    }
+    monkeypatch.setattr(service, "get_terminal_metadata", lambda _tid: metadata.copy())
+    prepared = SimpleNamespace()
+    monkeypatch.setattr(wpd1_decontam, "prepare_content_recovery", lambda **_kw: prepared)
+    monkeypatch.setattr(wpd1_decontam, "release_prepared_recovery", lambda _p: None)
+    complete = MagicMock()
+    monkeypatch.setattr(wpd1_decontam, "mark_recovery_complete", complete)
+    monkeypatch.setattr(
+        wpd1_decontam, "public_scrub_summary",
+        lambda _p, show: {"incident_path": "/tmp/incident"},
+    )
+    monkeypatch.setattr(
+        service.DeliveryGuard, "close", AsyncMock(side_effect=[RuntimeError("close"), None])
+    )
+
+    result = await service.rebind_terminal("txn", reason="content-flag")
+
+    assert result["status"] == "rebound"
+    assert result["error_code"] == "delivery_guard_release_failed"
+    complete.assert_called_once_with(prepared)
 
 
 @pytest.mark.asyncio

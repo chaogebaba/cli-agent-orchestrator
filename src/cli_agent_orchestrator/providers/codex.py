@@ -92,6 +92,8 @@ PROCESSING_PATTERN = r"\b(thinking|working|running|executing|processing|analyzin
 WAITING_PROMPT_PATTERN = r"^(?:Approve|Allow)\b.*\b(?:y/n|yes/no|yes|no)\b"
 ERROR_PATTERN = r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|panic:)"
 CONTENT_POLICY_REFUSAL_PATTERN = r"(?i)^ⓘ This content can't be shown"
+CONTENT_POLICY_SCREEN_RULE_ID = "codex.screen.content-policy-refusal.v1"
+CONTENT_POLICY_ARTIFACT_RULE_ID = "codex.artifact.refusal-echo.v1"
 
 TRANSIENT_API_ERROR_PATTERNS = (
     r"(?i)invalid_request_error",
