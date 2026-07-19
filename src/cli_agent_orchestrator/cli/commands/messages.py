@@ -87,12 +87,23 @@ def _resolve_me(value: str) -> str:
             "delivery_failed",
             "failed",
             "digested",
+            "parked",
             "cancelled",
         ]
     ),
 )
+@click.option("--generation")
+@click.option("--original-receiver-id")
+@click.option("--audit-browse", is_flag=True)
 def list_cmd(
-    receiver: str, since: str | None, after_id: int | None, limit: int, status_value: str | None
+    receiver: str,
+    since: str | None,
+    after_id: int | None,
+    limit: int,
+    status_value: str | None,
+    generation: str | None,
+    original_receiver_id: str | None,
+    audit_browse: bool,
 ) -> None:
     """List durable inbox messages in ascending id order."""
     params: dict[str, object] = {"to": _resolve_me(receiver), "limit": limit}
@@ -102,6 +113,12 @@ def list_cmd(
         params["after_id"] = after_id
     if status_value is not None:
         params["status"] = status_value
+    if generation is not None:
+        params["generation"] = generation
+    if original_receiver_id is not None:
+        params["original_receiver_id"] = original_receiver_id
+    if audit_browse:
+        params["audit_browse"] = True
     try:
         response = cao_http.get(
             f"/messages",

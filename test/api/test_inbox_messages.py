@@ -116,7 +116,7 @@ class TestGetInboxMessagesEndpoint:
         assert "detail" in data
         assert "Invalid status" in data["detail"]
         assert (
-            "pending, held, delivering, delivered, delivery_failed, failed, digested, cancelled"
+            "pending, held, delivering, delivered, delivery_failed, failed, digested, parked, cancelled"
             in data["detail"]
         )
 
@@ -139,6 +139,52 @@ class TestGetInboxMessagesEndpoint:
         assert response.json()[0]["digested_into"] == 10
         assert response.json()[0]["enqueue_generation"] == 1
         get.assert_called_once_with("abcdef12", limit=10, status=MessageStatus.DIGESTED)
+
+    def test_wpq11_parked_requires_incarnation_selector(self, client):
+        response = client.get("/terminals/abcdef12/inbox/messages?status=parked")
+        assert response.status_code == 400
+        assert response.json()["detail"]["code"] == "parked_query_requires_incarnation"
+
+    def test_wpq11_parked_selector_and_owner_fields_are_public(self, client):
+        row = InboxMessage(
+            id=11,
+            sender_id="sender",
+            receiver_id="abcdef12",
+            message="parked",
+            status=MessageStatus.PARKED,
+            owner_receiver_id="abcdef12",
+            owner_generation=3,
+            dead_to_successor=True,
+            created_at=datetime(2026, 7, 18, 12, 0, 0),
+        )
+        with patch("cli_agent_orchestrator.api.main.get_inbox_messages", return_value=[row]) as get:
+            response = client.get("/terminals/abcdef12/inbox/messages?status=parked&generation=3")
+        assert response.status_code == 200
+        assert response.json()[0]["owner_receiver_id"] == "abcdef12"
+        assert response.json()[0]["owner_generation"] == 3
+        assert response.json()[0]["dead_to_successor"] is True
+        get.assert_called_once_with(
+            "abcdef12",
+            limit=10,
+            status=MessageStatus.PARKED,
+            generation=3,
+            original_receiver_id=None,
+            audit_browse=False,
+        )
+
+    def test_wpq11_query_selector_types_remain_fastapi_owned(self, client):
+        assert (
+            client.get(
+                "/terminals/abcdef12/inbox/messages?status=parked&generation=not-an-int"
+            ).status_code
+            == 422
+        )
+        assert (
+            client.get(
+                "/terminals/abcdef12/inbox/messages?status=parked&original_receiver_id=BAD"
+            ).status_code
+            == 422
+        )
 
     def test_limit_exceeds_maximum(self, client):
         """Test that limit parameter is properly validated."""
@@ -215,7 +261,10 @@ class TestGetInboxMessagesEndpoint:
             with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
                 mock_get.return_value = filtered_messages
 
-                response = client.get(f"/terminals/abcdef12/inbox/messages?status={status_value}")
+                suffix = "&generation=1" if status_value == "parked" else ""
+                response = client.get(
+                    f"/terminals/abcdef12/inbox/messages?status={status_value}{suffix}"
+                )
 
                 assert response.status_code == 200
                 data = response.json()
@@ -223,6 +272,36 @@ class TestGetInboxMessagesEndpoint:
 
                 for msg_data in data:
                     assert msg_data["status"] == status_value
+
+
+class TestListMessagesEndpoint:
+    def test_wpq11_forwards_parked_query_contract(self, client):
+        payload = {"items": [], "next_after_id": None, "has_more": False}
+        with patch(
+            "cli_agent_orchestrator.services.mailbox_service.list_messages",
+            return_value=payload,
+        ) as listed:
+            response = client.get(
+                "/messages?to=abcdef12&status=parked&generation=3&"
+                "original_receiver_id=abcdef12&audit_browse=true"
+            )
+        assert response.status_code == 200
+        assert response.json() == payload
+        listed.assert_called_once_with(
+            "abcdef12",
+            since=None,
+            after_id=None,
+            limit=25,
+            status=MessageStatus.PARKED,
+            generation=3,
+            original_receiver_id="abcdef12",
+            audit_browse=True,
+        )
+
+    def test_wpq11_parked_missing_selector_is_stable_domain_error(self, client):
+        response = client.get("/messages?to=abcdef12&status=parked")
+        assert response.status_code == 400
+        assert response.json()["detail"]["code"] == "parked_query_requires_incarnation"
 
 
 class TestMessageTraceEndpoint:

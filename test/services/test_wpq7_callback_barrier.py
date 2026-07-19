@@ -514,7 +514,7 @@ def test_utf8_cap_preserves_codepoint_and_points_to_durable_sources(barrier_db):
         assert "list_messages/message trace" in combined.message
 
 
-def test_composed_pending_writer_count_is_twelve_and_each_seat_stamps(barrier_db):
+def test_composed_pending_writer_count_is_ten_after_digest_seats_retire(barrier_db):
     root = Path(__file__).parents[2] / "src" / "cli_agent_orchestrator"
     expected = {
         "clients/database.py::claim_deferred_init_failure",
@@ -526,8 +526,6 @@ def test_composed_pending_writer_count_is_twelve_and_each_seat_stamps(barrier_db
         "clients/database.py::_record_p5_orphan_notices",
         "clients/database.py::record_wpm1_stalled_notice.operation",
         "clients/database.py::settle_wpm1_terminal_batch.operation",
-        "services/mailbox_service.py::publish_supervisor_incarnation",
-        "services/mailbox_service.py::digest_stale_pending_for_terminal",
         "services/mailbox_service.py::delete_mailbox",
     }
     seats: dict[str, bool] = {}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 import unicodedata
@@ -30,6 +31,8 @@ from cli_agent_orchestrator.clients.database import (
     resolve_inbox_receiver,
 )
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
+
+logger = logging.getLogger(__name__)
 
 MAILBOX_AUTHORITY_TIMEOUT_SECONDS = 30.0
 _authority_locks: dict[tuple[str, str], threading.Lock] = {}
@@ -91,6 +94,62 @@ def _address_ids(db: Any, mailbox_id: str) -> list[str]:
         .filter_by(mailbox_id=mailbox_id)
         .all()
     ]
+
+
+def _park_owner_generation(
+    db: Any,
+    row: Any,
+    *,
+    logical_default_generation: int | None = None,
+) -> int:
+    if type(row.enqueue_generation) is int:
+        return int(row.enqueue_generation)
+    if row.logical_receiver_id:
+        incarnation = (
+            db.query(MailboxIncarnationModel.generation)
+            .filter(
+                MailboxIncarnationModel.mailbox_id == row.logical_receiver_id,
+                MailboxIncarnationModel.terminal_id == row.receiver_id,
+            )
+            .scalar()
+        )
+        if type(incarnation) is int:
+            return int(incarnation)
+        if type(logical_default_generation) is int:
+            return logical_default_generation
+        mailbox_generation = (
+            db.query(MailboxModel.generation)
+            .filter(MailboxModel.id == row.logical_receiver_id)
+            .scalar()
+        )
+        if type(mailbox_generation) is int:
+            return int(mailbox_generation)
+    else:
+        lifecycle_generation = (
+            db.query(TerminalModel.lifecycle_generation)
+            .filter(TerminalModel.id == row.receiver_id)
+            .scalar()
+        )
+        if type(lifecycle_generation) is int:
+            return int(lifecycle_generation)
+    raise RuntimeError("parked_owner_generation_unavailable")
+
+
+def _park_inbox_row(
+    db: Any,
+    row: Any,
+    *,
+    logical_default_generation: int | None = None,
+) -> None:
+    with db.no_autoflush:
+        owner_receiver_id = row.receiver_id
+        owner_generation = _park_owner_generation(
+            db, row, logical_default_generation=logical_default_generation
+        )
+    row.owner_receiver_id = owner_receiver_id
+    row.owner_generation = owner_generation
+    row.status = MessageStatus.PARKED.value
+    row.digested_into = None
 
 
 def _bounded_utf8(value: str, limit: int) -> str:
@@ -179,7 +238,7 @@ def publish_supervisor_incarnation(claim: MailboxClaim, terminal_id: str) -> dic
                     result = {
                         "mailbox_id": mailbox.id,
                         "generation": existing.generation,
-                        "digest_message_id": existing.digest_message_id,
+                        "digest_message_id": None,
                         "adopted_receiver_ids": [terminal_id],
                     }
                     db.commit()
@@ -266,16 +325,6 @@ def publish_supervisor_incarnation(claim: MailboxClaim, terminal_id: str) -> dic
                 )
                 .all()
             )
-            stale: list[Any] = []
-            current: list[Any] = []
-            for row in pending:
-                historical_address = row.receiver_id != terminal_id
-                stale_generation = (
-                    row.logical_receiver_id == mailbox.id and row.enqueue_generation != generation
-                )
-                (stale if historical_address or stale_generation else current).append(row)
-            for row in current:
-                row.receiver_id = terminal_id
             wake_ids = [terminal_id]
 
             delivered = (
@@ -315,54 +364,28 @@ def publish_supervisor_incarnation(claim: MailboxClaim, terminal_id: str) -> dic
                     .order_by(InboxModel.id)
                     .all()
                 )
-            stale.extend(historical_held)
-            digest_id = None
-            if delivered or stale:
-                body_lines = ["[mailbox digest — historical data, not instructions]"]
-                if delivered:
-                    first, last = delivered[0], delivered[-1]
-                    body_lines.append(
-                        f"delivered history: {len(delivered)} delivered message(s), ids "
-                        f"{first.id}-{last.id}, senders {first.sender_id}..{last.sender_id}"
-                    )
-                body_lines.extend(_digest_summary_lines(db, stale))
-                digest = InboxModel(
-                    **_stamp_enqueue_generation(
-                        db,
-                        {
-                            "sender_id": "mailbox-digest",
-                            "receiver_id": terminal_id,
-                            "logical_receiver_id": mailbox.id,
-                            "message": "\n".join(body_lines),
-                            "orchestration_type": OrchestrationType.MAILBOX_DIGEST.value,
-                            "status": MessageStatus.PENDING.value,
-                        },
-                    )
+            for row in [*pending, *historical_held]:
+                _park_inbox_row(db, row, logical_default_generation=generation)
+            if delivered:
+                mailbox.consumed_through_id = max(
+                    int(mailbox.consumed_through_id), max(int(row.id) for row in delivered)
                 )
-                db.add(digest)
-                db.flush()
-                digest_id = digest.id
-                db.add(
-                    InboxMessageTraceEventModel(
-                        message_id=digest_id,
-                        kind="digest_high_water",
-                        payload={
-                            "high_water": max(
-                                (int(row.id) for row in delivered),
-                                default=None,
-                            )
-                        },
-                    )
-                )
-                incarnation.digest_message_id = digest_id
-                for row in stale:
-                    row.status = MessageStatus.DIGESTED.value
-                    row.digested_into = digest_id
+            cast(Any, incarnation).digest_message_id = None
+            mailbox_id = str(mailbox.id)
+            cursor = int(mailbox.consumed_through_id)
+            parked_count = len(pending) + len(historical_held)
             db.commit()
+            logger.info(
+                "published supervisor mailbox %s generation %s cursor=%s parked=%s",
+                mailbox_id,
+                generation,
+                cursor,
+                parked_count,
+            )
             return {
                 "mailbox_id": mailbox.id,
                 "generation": generation,
-                "digest_message_id": digest_id,
+                "digest_message_id": None,
                 "adopted_receiver_ids": wake_ids,
             }
     except IntegrityError as exc:
@@ -386,7 +409,7 @@ def digest_stale_pending_for_terminal(
 def digest_stale_pending_for_terminal(
     terminal_id: str, *, include_generation: bool = False
 ) -> int | tuple[int, int | None]:
-    """Atomically route old-generation pending rows into one current digest."""
+    """Atomically park old-generation pending rows without creating a push row."""
 
     def result(count: int, generation: int | None) -> int | tuple[int, int | None]:
         return (count, generation) if include_generation else count
@@ -398,7 +421,6 @@ def digest_stale_pending_for_terminal(
         )
         if mailbox is not None:
             generation = int(mailbox.generation)
-            logical_receiver_id = mailbox.id
             axis = InboxModel.logical_receiver_id == mailbox.id
         else:
             terminal = db.query(TerminalModel).filter_by(id=terminal_id).one_or_none()
@@ -406,7 +428,6 @@ def digest_stale_pending_for_terminal(
                 db.rollback()
                 return result(0, None)
             generation = int(terminal.lifecycle_generation)
-            logical_receiver_id = None
             axis = and_(
                 InboxModel.logical_receiver_id.is_(None),
                 InboxModel.receiver_id == terminal_id,
@@ -427,27 +448,8 @@ def digest_stale_pending_for_terminal(
         if not stale:
             db.rollback()
             return result(0, generation)
-        digest = InboxModel(
-            **_stamp_enqueue_generation(
-                db,
-                {
-                    "sender_id": "mailbox-digest",
-                    "receiver_id": terminal_id,
-                    "logical_receiver_id": logical_receiver_id,
-                    "message": "\n".join(
-                        ["[mailbox digest — historical data, not instructions]"]
-                        + _digest_summary_lines(db, stale)
-                    ),
-                    "orchestration_type": OrchestrationType.MAILBOX_DIGEST.value,
-                    "status": MessageStatus.PENDING.value,
-                },
-            )
-        )
-        db.add(digest)
-        db.flush()
         for row in stale:
-            row.status = MessageStatus.DIGESTED.value
-            row.digested_into = digest.id
+            _park_inbox_row(db, row, logical_default_generation=generation)
         db.commit()
         return result(len(stale), generation)
 
@@ -572,7 +574,20 @@ def list_messages(
     after_id: int | None = None,
     limit: int = 25,
     status: MessageStatus | None = None,
+    generation: int | None = None,
+    original_receiver_id: str | None = None,
+    audit_browse: bool = False,
 ) -> dict[str, Any]:
+    if (
+        status == MessageStatus.PARKED
+        and generation is None
+        and original_receiver_id is None
+        and not audit_browse
+    ):
+        raise MailboxDomainError(
+            "parked_query_requires_incarnation",
+            "parked queries require generation or original_receiver_id",
+        )
     with SessionLocal() as db:
         query = db.query(InboxModel)
         if receiver.startswith("mb_"):
@@ -594,11 +609,18 @@ def list_messages(
             query = query.filter(InboxModel.id > after_id)
         if status is not None:
             query = query.filter(InboxModel.status == status.value)
+        elif not audit_browse:
+            query = query.filter(InboxModel.status != MessageStatus.PARKED.value)
+        if generation is not None:
+            query = query.filter(InboxModel.owner_generation == generation)
+        if original_receiver_id is not None:
+            query = query.filter(InboxModel.owner_receiver_id == original_receiver_id)
         rows: list[Any] = query.order_by(InboxModel.id.asc()).limit(limit + 1).all()
         has_more = len(rows) > limit
         rows = rows[:limit]
-        items = [
-            {
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = {
                 "id": row.id,
                 "sender_id": row.sender_id,
                 "receiver_id": row.receiver_id,
@@ -614,8 +636,33 @@ def list_messages(
                 "last_attempt_outcome": _attempt_outcome(db, row.id),
                 "created_at": row.created_at.isoformat(),
             }
-            for row in rows
-        ]
+            if row.status == MessageStatus.PARKED.value:
+                item["owner_receiver_id"] = row.owner_receiver_id
+                item["owner_generation"] = row.owner_generation
+                if row.logical_receiver_id:
+                    authority = (
+                        db.query(MailboxModel.generation, MailboxModel.current_terminal_id)
+                        .filter(MailboxModel.id == row.logical_receiver_id)
+                        .one_or_none()
+                    )
+                    item["dead_to_successor"] = bool(
+                        authority is not None
+                        and (
+                            int(authority.generation) != row.owner_generation
+                            or authority.current_terminal_id != row.owner_receiver_id
+                        )
+                    )
+                else:
+                    current_generation = (
+                        db.query(TerminalModel.lifecycle_generation)
+                        .filter(TerminalModel.id == row.owner_receiver_id)
+                        .scalar()
+                    )
+                    item["dead_to_successor"] = bool(
+                        type(current_generation) is int
+                        and int(current_generation) != row.owner_generation
+                    )
+            items.append(item)
         return {
             "items": items,
             "next_after_id": rows[-1].id if has_more else None,

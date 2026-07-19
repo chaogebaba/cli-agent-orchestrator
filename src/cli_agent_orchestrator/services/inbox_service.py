@@ -35,6 +35,7 @@ from cli_agent_orchestrator.clients.database import (
     get_attempt_mailbox_authority,
     get_current_mailbox_terminal,
     get_message_trace,
+    get_owned_legacy_parked_messages,
     get_pending_messages,
     get_pending_messages_by_ids,
     get_terminal_metadata,
@@ -1157,6 +1158,7 @@ class InboxService:
                 return
             legacy_test_seam = begin_delivery_attempt is not _PRODUCTION_BEGIN_DELIVERY_ATTEMPT
             routed_generation: int | None = None
+            provider = None
             if not legacy_test_seam:
                 from cli_agent_orchestrator.services.mailbox_service import (
                     digest_stale_pending_for_terminal,
@@ -1174,11 +1176,33 @@ class InboxService:
                     # cannot open, leave every row pending for the next wake;
                     # proceeding could expose a stale row to normal delivery.
                     return
+                legacy_parked = get_owned_legacy_parked_messages(terminal_id)
+                if legacy_parked:
+                    if provider is None:
+                        provider = provider_manager.get_provider(terminal_id)
+                    probe_result = status_monitor.probe_screen_status(terminal_id)
+                    if isinstance(probe_result, tuple) and len(probe_result) == 2:
+                        _probe_status, probe_meta = probe_result
+                        safety = self._inject_safe(terminal_id, provider, probe_meta)
+                        identity_failure = (
+                            probe_meta.get("identity_proof_failure")
+                            if isinstance(probe_meta, dict)
+                            else None
+                        )
+                        if safety.reason == "identity_unverified" and isinstance(
+                            identity_failure, str
+                        ):
+                            self._record_identity_authority_failure(
+                                terminal_id,
+                                legacy_parked,
+                                metadata,
+                                identity_failure,
+                                routed_generation=routed_generation,
+                            )
             with _delivery_seq_guard:
                 if _delivery_wake_seq.get(terminal_id, 0) > captured_wake:
                     return
             limit = num_messages if num_messages > 0 else 100
-            provider = None
             excluded: set[int] = set()
             scanned: set[int] = set()
             # Classify protected sets before the SQL LIMIT/grouping seam. This

@@ -1560,6 +1560,9 @@ def _list_messages_impl(
     after_id: Optional[int] = None,
     limit: int = 25,
     status: Optional[str] = None,
+    generation: Optional[int | str] = None,
+    original_receiver_id: Optional[str] = None,
+    audit_browse: bool = False,
 ) -> Dict[str, Any]:
     target = receiver_id
     if target is None:
@@ -1589,6 +1592,12 @@ def _list_messages_impl(
         params["after_id"] = after_id
     if status is not None:
         params["status"] = status
+    if generation is not None:
+        params["generation"] = generation
+    if original_receiver_id is not None:
+        params["original_receiver_id"] = original_receiver_id
+    if audit_browse:
+        params["audit_browse"] = True
     try:
         response = cao_http.get(
             f"/messages",
@@ -1830,9 +1839,25 @@ async def list_messages(
     after_id: Optional[int] = Field(default=None, ge=0, description="Exclusive message cursor"),
     limit: int = Field(default=25, ge=1, le=100),
     status: Optional[str] = Field(default=None, description="Optional inbox status"),
+    generation: Optional[int | str] = Field(
+        default=None, description="Owning generation selector (forwarded to HTTP validation)"
+    ),
+    original_receiver_id: Optional[str] = Field(
+        default=None, description="Original terminal-incarnation selector"
+    ),
+    audit_browse: bool = Field(default=False, description="Include parked audit history"),
 ) -> Dict[str, Any]:
     """List durable inbox messages through the scoped HTTP replay surface."""
-    return _list_messages_impl(receiver_id, since, after_id, limit, status)
+    return _list_messages_impl(
+        receiver_id,
+        since,
+        after_id,
+        limit,
+        status,
+        generation,
+        original_receiver_id,
+        audit_browse,
+    )
 
 
 @mcp.tool()

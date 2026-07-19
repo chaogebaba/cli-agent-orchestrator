@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from datetime import datetime, timezone
@@ -29,6 +30,8 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.stalled_callback_watchdog import stalled_callback_watchdog
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
+
+logger = logging.getLogger(__name__)
 
 RESULT_RETRYABLE = {
     "rebound": False,
@@ -58,7 +61,6 @@ def _result(terminal_id: str, status: str, *, error_code: str | None = None,
         "interrupted_turn": bool(interrupt),
         "requires_supervisor_reconciliation": bool(interrupt),
     }
-
 
 class DeliveryGuard:
     """A dedicated thread owns both acquire and release of a delivery lock."""
@@ -257,6 +259,7 @@ async def rebind_terminal(
     previous_state = None
     guard_released = False
     prepared_recovery = None
+    wake_terminal_id: str | None = None
     phase = "p2"
     try:
         await guard.acquire()
@@ -397,6 +400,7 @@ async def rebind_terminal(
         phase = "p13"
         if not settle_terminal_rebound(terminal_id, session_uuid, baseline):
             raise RuntimeError("identity_persist_failed")
+        wake_terminal_id = terminal_id
         phase = "p14"
         try:
             stalled_callback_watchdog.resume_terminal(terminal_id, watchdog_snapshot)
@@ -536,6 +540,8 @@ async def rebind_terminal(
                     fallback = None
                 elif session_uuid and candidate_death_confirmed:
                     fallback = await _fallback(metadata, session_uuid, lease, lifecycle_lease)
+                    if fallback.get("status") == "respawned":
+                        wake_terminal_id = fallback.get("new_terminal_id")
             except Exception as fallback_exc:
                 set_terminal_recovery_state(terminal_id, "rebind_failed", str(fallback_exc))
                 fallback = {"status": "failed", "new_terminal_id": None}
@@ -581,6 +587,7 @@ async def rebind_terminal(
         try:
             if not guard_released:
                 await guard.close()
+                guard_released = True
         finally:
             try:
                 release_rebind_lease(lease)
@@ -594,6 +601,13 @@ async def rebind_terminal(
                         release_prepared_recovery(prepared_recovery)
                 finally:
                     release_session_lifecycle_lease(lifecycle_lease)
+        if wake_terminal_id is not None:
+            try:
+                from cli_agent_orchestrator.services.inbox_service import inbox_service
+
+                await asyncio.to_thread(inbox_service.deliver_pending, wake_terminal_id)
+            except Exception:
+                logger.exception("parked inbox wake failed after recovery for %s", wake_terminal_id)
 
 
 async def recover_provider_reauth(

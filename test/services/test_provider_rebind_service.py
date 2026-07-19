@@ -748,6 +748,34 @@ async def test_wpd1_guard_release_error_still_closes_incident_complete(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_wpq11_reactivation_wake_runs_only_after_delivery_guard_release(monkeypatch):
+    _old, _candidate, _states = _install_transaction_harness(monkeypatch)
+    order: list[str] = []
+
+    def settle(*_args):
+        order.append("settle")
+        return 1
+
+    async def close(_self):
+        order.append("guard-close")
+
+    def deliver(terminal_id):
+        order.append(f"deliver:{terminal_id}")
+
+    monkeypatch.setattr(service, "settle_terminal_rebound", settle)
+    monkeypatch.setattr(service.DeliveryGuard, "close", close)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",
+        deliver,
+    )
+
+    result = await service.rebind_terminal("txn")
+
+    assert result["status"] == "rebound"
+    assert order == ["settle", "guard-close", "deliver:txn"]
+
+
+@pytest.mark.asyncio
 async def test_p6_pause_failure_restores_p1_state_without_exit(monkeypatch):
     _old, _candidate, states = _install_transaction_harness(
         monkeypatch, pause_error=RuntimeError("pause")

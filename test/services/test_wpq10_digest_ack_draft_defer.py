@@ -179,15 +179,9 @@ def _confirm_family(wpq10_db, family: str, digest_id: int) -> None:
     if family == "normal":
         with wpq10_db() as db:
             receiver_id = db.get(InboxModel, digest_id).receiver_id
-        selected = [
-            row for row in get_pending_messages(receiver_id) if row.id == digest_id
-        ]
-        attempt_uuid = begin_delivery_attempt(
-            selected, receiver_id, "claude_code", "h", 1
-        )
-        assert settle_delivery_attempt(
-            attempt_uuid, MessageStatus.DELIVERED, "confirmed"
-        )
+        selected = [row for row in get_pending_messages(receiver_id) if row.id == digest_id]
+        attempt_uuid = begin_delivery_attempt(selected, receiver_id, "claude_code", "h", 1)
+        assert settle_delivery_attempt(attempt_uuid, MessageStatus.DELIVERED, "confirmed")
     elif family == "prior":
         with wpq10_db.begin() as db:
             attempt_uuid = _attempt(db, digest_id)
@@ -196,9 +190,7 @@ def _confirm_family(wpq10_db, family: str, digest_id: int) -> None:
         with wpq10_db.begin() as db:
             _attempt(db, digest_id, outcome="ambiguous")
         assert (
-            settle_wpm1_terminal_batch(
-                [digest_id], MessageStatus.DELIVERED, "receiver"
-            )
+            settle_wpm1_terminal_batch([digest_id], MessageStatus.DELIVERED, "receiver")
             == "settled"
         )
     elif family == "inferred_open":
@@ -212,10 +204,8 @@ def _confirm_family(wpq10_db, family: str, digest_id: int) -> None:
         raise AssertionError(family)
 
 
-@pytest.mark.parametrize(
-    "family", ["normal", "prior", "wpm1", "inferred_open", "inferred_cap"]
-)
-def test_wpq10_all_confirmation_families_advance_build_cursor(wpq10_db, family):
+@pytest.mark.parametrize("family", ["normal", "prior", "wpm1", "inferred_open", "inferred_cap"])
+def test_wpq11_confirmation_families_do_not_mutate_publication_cursor(wpq10_db, family):
     with wpq10_db.begin() as db:
         _mailbox(db, terminal_id="receiver")
         _terminal(db, "receiver")
@@ -223,29 +213,32 @@ def test_wpq10_all_confirmation_families_advance_build_cursor(wpq10_db, family):
     _confirm_family(wpq10_db, family, digest_id)
     with wpq10_db() as db:
         assert db.get(InboxModel, digest_id).status == MessageStatus.DELIVERED.value
-        assert db.get(MailboxModel, "mb_wpq10aa").consumed_through_id == high_water
-
-
-def test_wpq10_digest_delivery_and_cursor_share_one_transaction(
-    wpq10_db, monkeypatch
-):
-    with wpq10_db.begin() as db:
-        _mailbox(db, terminal_id="receiver")
-        _terminal(db, "receiver")
-        digest_id, _ = _direct_digest(db)
-    selected = get_pending_messages("receiver")
-    attempt_uuid = begin_delivery_attempt(selected, "receiver", "claude_code", "h", 1)
-
-    def interrupt(_db, _ids):
-        raise RuntimeError("cursor write interrupted")
-
-    monkeypatch.setattr(database, "_advance_digest_cursor_in_db", interrupt)
-    with pytest.raises(RuntimeError, match="cursor write interrupted"):
-        settle_delivery_attempt(attempt_uuid, MessageStatus.DELIVERED, "confirmed")
-    with wpq10_db() as db:
-        assert db.get(InboxModel, digest_id).status == MessageStatus.DELIVERING.value
+        assert high_water > 0
         assert db.get(MailboxModel, "mb_wpq10aa").consumed_through_id == 0
-        assert db.get(InboxDeliveryAttemptModel, attempt_uuid).settled_at is None
+
+
+def test_wpq11_publication_cursor_and_parking_share_one_transaction(wpq10_db, monkeypatch):
+    with wpq10_db.begin() as db:
+        _mailbox(db)
+        _terminal(db, "old")
+        _terminal(db, "next")
+        delivered = _message(db, "old", status=MessageStatus.DELIVERED)
+        pending = _message(db, "old")
+
+    original = mailbox_service._park_inbox_row
+
+    def interrupt(db, row, **kwargs):
+        original(db, row, **kwargs)
+        raise RuntimeError("parking interrupted")
+
+    monkeypatch.setattr(mailbox_service, "_park_inbox_row", interrupt)
+    with pytest.raises(RuntimeError, match="parking interrupted"):
+        publish_supervisor_incarnation(claim_mailbox("wpq10-session"), "next")
+    with wpq10_db() as db:
+        assert db.get(InboxModel, pending.id).status == MessageStatus.PENDING.value
+        assert db.get(MailboxModel, "mb_wpq10aa").consumed_through_id == 0
+        assert db.get(MailboxModel, "mb_wpq10aa").current_terminal_id == "old"
+        assert db.get(InboxModel, delivered.id).status == MessageStatus.DELIVERED.value
 
 
 def test_wpq10_relaunch_consumes_only_persisted_publication_history(wpq10_db):
@@ -256,31 +249,26 @@ def test_wpq10_relaunch_consumes_only_persisted_publication_history(wpq10_db):
         _terminal(db, "later")
         history = _message(db, "old", status=MessageStatus.DELIVERED)
     first = publish_supervisor_incarnation(claim_mailbox("wpq10-session"), "next")
-    digest_id = first["digest_message_id"]
-    assert digest_id is not None
-    _confirm_family(wpq10_db, "normal", digest_id)
+    assert first["digest_message_id"] is None
     second = publish_supervisor_incarnation(claim_mailbox("wpq10-session"), "later")
     assert second["digest_message_id"] is None
     with wpq10_db() as db:
         assert db.get(MailboxModel, "mb_wpq10aa").consumed_through_id == history.id
 
 
-def test_wpq10_failed_publication_delivery_repeats_without_cursor_loss(wpq10_db):
+def test_wpq11_publication_has_no_digest_delivery_to_fail(wpq10_db):
     with wpq10_db.begin() as db:
         _mailbox(db)
         for terminal_id in ("old", "next", "later"):
             _terminal(db, terminal_id)
         _message(db, "old", status=MessageStatus.DELIVERED)
     first = publish_supervisor_incarnation(claim_mailbox("wpq10-session"), "next")
-    selected = get_pending_messages("next")
-    attempt_uuid = begin_delivery_attempt(selected, "next", "claude_code", "h", 1)
-    assert settle_delivery_attempt(
-        attempt_uuid, MessageStatus.DELIVERY_FAILED, "failed", reason="not_confirmed"
-    )
+    assert first["digest_message_id"] is None
+    assert get_pending_messages("next") == []
     with wpq10_db() as db:
-        assert db.get(MailboxModel, "mb_wpq10aa").consumed_through_id == 0
+        assert db.get(MailboxModel, "mb_wpq10aa").consumed_through_id > 0
     second = publish_supervisor_incarnation(claim_mailbox("wpq10-session"), "later")
-    assert second["digest_message_id"] is not None
+    assert second["digest_message_id"] is None
 
 
 def test_wpq10_late_delivery_below_digest_id_is_not_consumed(wpq10_db):
@@ -291,11 +279,10 @@ def test_wpq10_late_delivery_below_digest_id_is_not_consumed(wpq10_db):
         summarized = _message(db, "old", status=MessageStatus.DELIVERED)
         late = _message(db, "old", status=MessageStatus.PENDING)
     publication = publish_supervisor_incarnation(claim_mailbox("wpq10-session"), "next")
-    digest_id = publication["digest_message_id"]
-    assert summarized.id < late.id < digest_id
+    assert publication["digest_message_id"] is None
+    assert summarized.id < late.id
     with wpq10_db.begin() as db:
         db.get(InboxModel, late.id).status = MessageStatus.DELIVERED.value
-    _confirm_family(wpq10_db, "normal", digest_id)
     with wpq10_db() as db:
         assert db.get(MailboxModel, "mb_wpq10aa").consumed_through_id == summarized.id
 
@@ -336,7 +323,7 @@ def test_wpq10_lower_auto_cursor_cannot_overwrite_higher_explicit_ack(wpq10_db):
         assert db.get(MailboxModel, "mb_wpq10aa").consumed_through_id == high.id
 
 
-def test_wpq10_digest_cursor_isolated_by_mailbox(wpq10_db):
+def test_wpq11_publication_cursor_isolated_by_mailbox(wpq10_db):
     with wpq10_db.begin() as db:
         _mailbox(db, terminal_id="receiver")
         _mailbox(
@@ -347,8 +334,9 @@ def test_wpq10_digest_cursor_isolated_by_mailbox(wpq10_db):
         )
         _terminal(db, "receiver")
         _terminal(db, "other")
-        digest_id, high_water = _direct_digest(db)
-    _confirm_family(wpq10_db, "inferred_cap", digest_id)
+        high_water = _message(db, "receiver", status=MessageStatus.DELIVERED).id
+        _terminal(db, "next")
+    publish_supervisor_incarnation(claim_mailbox("wpq10-session"), "next")
     with wpq10_db() as db:
         assert db.get(MailboxModel, "mb_wpq10aa").consumed_through_id == high_water
         assert db.get(MailboxModel, "mb_wpq10bb").consumed_through_id == 0
@@ -361,31 +349,14 @@ def test_wpq10_stale_only_publication_records_null_and_does_not_advance(wpq10_db
         _terminal(db, "next")
         _message(db, "old", status=MessageStatus.PENDING)
     publication = publish_supervisor_incarnation(claim_mailbox("wpq10-session"), "next")
-    digest_id = publication["digest_message_id"]
+    assert publication["digest_message_id"] is None
     with wpq10_db() as db:
-        event = db.query(InboxMessageTraceEventModel).filter_by(
-            message_id=digest_id, kind="digest_high_water"
-        ).one()
-        assert event.payload == {"high_water": None}
-    _confirm_family(wpq10_db, "normal", digest_id)
-    with wpq10_db() as db:
-        assert db.get(MailboxModel, "mb_wpq10aa").consumed_through_id == 0
-
-
-def test_wpq10_digest_without_high_water_event_is_cursor_noop(wpq10_db):
-    with wpq10_db.begin() as db:
-        _mailbox(db, terminal_id="receiver")
-        _terminal(db, "receiver")
-        digest = _message(
-            db,
-            "receiver",
-            status=MessageStatus.PENDING,
-            kind=OrchestrationType.MAILBOX_DIGEST,
+        assert (
+            db.query(InboxMessageTraceEventModel).filter_by(kind="digest_high_water").count() == 0
         )
-        digest_id = int(digest.id)
-    _confirm_family(wpq10_db, "normal", digest_id)
-    with wpq10_db() as db:
         assert db.get(MailboxModel, "mb_wpq10aa").consumed_through_id == 0
+        parked = db.query(InboxModel).filter_by(status=MessageStatus.PARKED.value).one()
+        assert parked.digested_into is None
 
 
 def _configure_prepared_send(monkeypatch, state: str, events: list[str]):
@@ -427,9 +398,7 @@ def _configure_prepared_send(monkeypatch, state: str, events: list[str]):
         "clear_rolling_buffer",
         lambda _terminal: events.append("clear"),
     )
-    observation = BoundaryObservation(
-        "wpq10", TerminalStatus.IDLE, 1, 1, 1, 1, 1
-    )
+    observation = BoundaryObservation("wpq10", TerminalStatus.IDLE, 1, 1, 1, 1, 1)
     monkeypatch.setattr(
         terminal_service.status_monitor,
         "mark_injection_completed",
@@ -447,15 +416,11 @@ def _configure_prepared_send(monkeypatch, state: str, events: list[str]):
 
 
 @pytest.mark.parametrize("state", ["nonempty", "unresolved", "dialog"])
-def test_wpq10_nonempty_or_unresolved_native_composer_has_zero_mutation(
-    monkeypatch, state
-):
+def test_wpq10_nonempty_or_unresolved_native_composer_has_zero_mutation(monkeypatch, state):
     events: list[str] = []
     backend, _provider = _configure_prepared_send(monkeypatch, state, events)
     with pytest.raises(DeliveryDeferredError):
-        terminal_service.send_prepared_input(
-            "receiver", "payload", defer_on_dialog=True
-        )
+        terminal_service.send_prepared_input("receiver", "payload", defer_on_dialog=True)
     assert events == ["classify"]
     backend.send_keys.assert_not_called()
     backend.send_special_key.assert_not_called()
@@ -478,16 +443,9 @@ def test_wpq10_existing_native_chip_uses_single_enter(monkeypatch):
     events: list[str] = []
     backend, _provider = _configure_prepared_send(monkeypatch, "empty", events)
     real_provider = ClaudeCodeProvider("receiver", "session", "window")
-    capture = (
-        Path(__file__).parents[1]
-        / "fixtures"
-        / "fx2"
-        / "stashed-chip-sgr.txt"
-    ).read_text()
+    capture = (Path(__file__).parents[1] / "fixtures" / "fx2" / "stashed-chip-sgr.txt").read_text()
     backend.get_history.return_value = capture
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.backends.registry.get_backend", lambda: backend
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
     monkeypatch.setattr(
         terminal_service.provider_manager,
         "get_provider",
@@ -511,9 +469,7 @@ def test_wpq10_changed_authority_snapshots_defer_before_mutation(monkeypatch):
         "❯ \n────────────────────",
         "❯ human text\n────────────────────",
     ]
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.backends.registry.get_backend", lambda: backend
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
     monkeypatch.setattr(
         terminal_service.provider_manager,
         "get_provider",
@@ -532,9 +488,7 @@ def test_wpq10_authority_capture_failure_defers_before_mutation(monkeypatch):
     backend, _provider = _configure_prepared_send(monkeypatch, "empty", events)
     real_provider = ClaudeCodeProvider("receiver", "session", "window")
     backend.get_history.side_effect = RuntimeError("capture unavailable")
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.backends.registry.get_backend", lambda: backend
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
     monkeypatch.setattr(
         terminal_service.provider_manager,
         "get_provider",
@@ -593,18 +547,14 @@ def test_wpq10_deferred_composer_attempt_stays_pending(wpq10_db, monkeypatch):
         assert (attempt.outcome, attempt.reason) == ("deferred", "delivery_deferred")
 
 
-def test_wpq10_delivery_engine_uses_native_composer_defer_path(
-    wpq10_db, monkeypatch
-):
+def test_wpq10_delivery_engine_uses_native_composer_defer_path(wpq10_db, monkeypatch):
     with wpq10_db.begin() as db:
         _mailbox(db, terminal_id="receiver")
         _terminal(db, "receiver")
         row = _message(db, "receiver")
     events: list[str] = []
     backend, provider = _configure_prepared_send(monkeypatch, "nonempty", events)
-    observation = BoundaryObservation(
-        "wpq10-delivery", TerminalStatus.IDLE, 1, 1, 1, 1, 1
-    )
+    observation = BoundaryObservation("wpq10-delivery", TerminalStatus.IDLE, 1, 1, 1, 1, 1)
     monitor = MagicMock()
     monitor.get_boundary_observation.return_value = observation
     monitor.get_status.return_value = TerminalStatus.IDLE
@@ -659,7 +609,9 @@ def test_wpq10_delivery_engine_uses_native_composer_defer_path(
         )
 
 
-def test_wpq10_digest_defer_then_empty_delivery_advances_once(wpq10_db, monkeypatch):
+def test_wpq10_compact_digest_defer_then_empty_delivery_does_not_move_publication_cursor(
+    wpq10_db, monkeypatch
+):
     with wpq10_db.begin() as db:
         _mailbox(db, terminal_id="receiver")
         _terminal(db, "receiver")
@@ -685,15 +637,11 @@ def test_wpq10_digest_defer_then_empty_delivery_advances_once(wpq10_db, monkeypa
     second_attempt = begin_delivery_attempt(selected, "receiver", "claude_code", "h2", 1)
     terminal_service.send_prepared_input("receiver", "digest")
     assert _backend.send_keys.call_args.kwargs["enter_count"] == 2
-    assert settle_delivery_attempt(
-        second_attempt, MessageStatus.DELIVERED, "confirmed"
-    )
+    assert settle_delivery_attempt(second_attempt, MessageStatus.DELIVERED, "confirmed")
     with wpq10_db() as db:
         assert db.get(InboxModel, digest_id).status == MessageStatus.DELIVERED.value
-        assert db.get(MailboxModel, "mb_wpq10aa").consumed_through_id == high_water
+        assert high_water > 0
+        assert db.get(MailboxModel, "mb_wpq10aa").consumed_through_id == 0
         assert (
-            db.query(InboxDeliveryAttemptMemberModel)
-            .filter_by(message_id=digest_id)
-            .count()
-            == 2
+            db.query(InboxDeliveryAttemptMemberModel).filter_by(message_id=digest_id).count() == 2
         )

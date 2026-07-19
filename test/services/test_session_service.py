@@ -1,6 +1,6 @@
 """Tests for the session service."""
 
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -11,6 +11,7 @@ from cli_agent_orchestrator.services.session_service import (
     get_session,
     list_sessions,
 )
+from cli_agent_orchestrator.services import session_service
 
 
 def test_canonical_session_env_uses_working_directory(tmp_path):
@@ -95,6 +96,51 @@ class TestCreateSession:
             "KEEP": "yes",
             "CAO_ARTIFACTS_DIR": str(tmp_path.resolve() / "tmp" / "orch"),
         }
+
+    @pytest.mark.asyncio
+    async def test_wpq11_fresh_supervisor_publication_has_no_synthetic_push(self, monkeypatch):
+        terminal = MagicMock(id="22222222", session_name="cao-wpq11")
+        create = AsyncMock(return_value=terminal)
+        publish = MagicMock(
+            return_value={
+                "mailbox_id": "mb_aaaaaaaa",
+                "generation": 2,
+                "digest_message_id": None,
+                "adopted_receiver_ids": ["22222222"],
+            }
+        )
+        deliver = MagicMock()
+        monkeypatch.setattr(session_service, "create_terminal", create)
+        monkeypatch.setattr(
+            session_service, "load_agent_profile", lambda _name: MagicMock(role="supervisor")
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.seed_resume_bootstrap",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.mailbox_service.claim_mailbox",
+            lambda *_args: MagicMock(),
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.mailbox_service.publish_supervisor_incarnation",
+            publish,
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",
+            deliver,
+        )
+        monkeypatch.setattr(session_service, "dispatch_plugin_event", MagicMock())
+
+        await create_session(
+            provider="codex",
+            agent_profile="code_supervisor",
+            session_name="cao-wpq11",
+        )
+
+        publish.assert_called_once()
+        assert publish.return_value["digest_message_id"] is None
+        deliver.assert_called_once_with("22222222", registry=ANY)
 
 
 class TestListSessions:
