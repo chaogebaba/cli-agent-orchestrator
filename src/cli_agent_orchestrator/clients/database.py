@@ -268,6 +268,8 @@ class InboxModel(Base):
     failure_reason = Column(Text, nullable=True)
     digested_into = deferred(Column(Integer, nullable=True))
     enqueue_generation = deferred(Column(Integer, nullable=True))
+    owner_receiver_id = deferred(Column(String, nullable=True))
+    owner_generation = deferred(Column(Integer, nullable=True))
     barrier_id = deferred(Column(Integer, nullable=True))
     barrier_member_key = deferred(Column(String, nullable=True))
     created_at = Column(DateTime, default=datetime.now)
@@ -705,6 +707,21 @@ def _migrate_mailbox_columns() -> None:
             connection.execute(text("ALTER TABLE inbox ADD COLUMN digested_into INTEGER"))
         if inbox_columns and "enqueue_generation" not in inbox_column_names:
             connection.execute(text("ALTER TABLE inbox ADD COLUMN enqueue_generation INTEGER"))
+        if inbox_columns and "owner_receiver_id" not in inbox_column_names:
+            connection.execute(text("ALTER TABLE inbox ADD COLUMN owner_receiver_id TEXT"))
+        if inbox_columns and "owner_generation" not in inbox_column_names:
+            connection.execute(text("ALTER TABLE inbox ADD COLUMN owner_generation INTEGER"))
+        if inbox_columns:
+            connection.execute(
+                text(
+                    "CREATE TRIGGER IF NOT EXISTS inbox_parked_owner_immutable "
+                    "BEFORE UPDATE OF owner_receiver_id, owner_generation ON inbox "
+                    "WHEN (OLD.owner_receiver_id IS NOT NULL OR OLD.owner_generation IS NOT NULL) "
+                    "AND (NEW.owner_receiver_id IS NOT OLD.owner_receiver_id "
+                    "OR NEW.owner_generation IS NOT OLD.owner_generation) "
+                    "BEGIN SELECT RAISE(ABORT, 'parked_owner_immutable'); END"
+                )
+            )
         terminal_columns = connection.execute(text("PRAGMA table_info(terminals)")).mappings().all()
         if terminal_columns and "caller_mailbox_id" not in {
             row["name"] for row in terminal_columns
@@ -1639,6 +1656,67 @@ def update_terminal_runtime_identity(
         return True
 
 
+def _reactivate_parked_rows_in_db(
+    db: Session,
+    *,
+    source_terminal_id: str,
+    source_lifecycle_generation: int,
+    target_terminal_id: str,
+    target_lifecycle_generation: int,
+    move_mailbox_authority: bool,
+) -> int:
+    """Reactivate only mail owned by the exact resumed source incarnation."""
+    changed = 0
+    incarnation = (
+        db.query(MailboxIncarnationModel).filter_by(terminal_id=source_terminal_id).one_or_none()
+    )
+    if incarnation is not None:
+        mailbox = db.query(MailboxModel).filter_by(id=incarnation.mailbox_id).one_or_none()
+        if (
+            mailbox is not None
+            and mailbox.current_terminal_id == source_terminal_id
+            and int(mailbox.generation) == int(incarnation.generation)
+        ):
+            if move_mailbox_authority:
+                mailbox.current_terminal_id = target_terminal_id
+                mailbox.updated_at = datetime.now()
+            changed += (
+                db.query(InboxModel)
+                .filter(
+                    InboxModel.status == MessageStatus.PARKED.value,
+                    InboxModel.logical_receiver_id == incarnation.mailbox_id,
+                    InboxModel.owner_receiver_id == source_terminal_id,
+                    InboxModel.owner_generation == int(incarnation.generation),
+                )
+                .update(
+                    {
+                        InboxModel.status: MessageStatus.PENDING.value,
+                        InboxModel.receiver_id: target_terminal_id,
+                        InboxModel.enqueue_generation: int(mailbox.generation),
+                    },
+                    synchronize_session=False,
+                )
+            )
+    changed += (
+        db.query(InboxModel)
+        .filter(
+            InboxModel.status == MessageStatus.PARKED.value,
+            InboxModel.logical_receiver_id.is_(None),
+            InboxModel.owner_receiver_id == source_terminal_id,
+            InboxModel.owner_generation == source_lifecycle_generation,
+        )
+        .update(
+            {
+                InboxModel.status: MessageStatus.PENDING.value,
+                InboxModel.receiver_id: target_terminal_id,
+                InboxModel.enqueue_generation: target_lifecycle_generation,
+            },
+            synchronize_session=False,
+        )
+    )
+    return changed
+
+
 def settle_terminal_rebound(
     terminal_id: str,
     session_uuid: str,
@@ -1649,14 +1727,88 @@ def settle_terminal_rebound(
         row = db.query(TerminalModel).filter_by(id=terminal_id).one_or_none()
         if row is None:
             return 0
+        source_generation = int(row.lifecycle_generation)
         row.provider_session_id = session_uuid
         row.shell_command = shell_command
         row.recovery_state = "rebound"
         row.recovery_error = None
         row.recovery_updated_at = _utcnow()
-        row.lifecycle_generation = int(row.lifecycle_generation) + 1
+        row.lifecycle_generation = source_generation + 1
         db.flush()
+        _reactivate_parked_rows_in_db(
+            db,
+            source_terminal_id=terminal_id,
+            source_lifecycle_generation=source_generation,
+            target_terminal_id=terminal_id,
+            target_lifecycle_generation=int(row.lifecycle_generation),
+            move_mailbox_authority=False,
+        )
         return int(row.lifecycle_generation)
+
+
+def fail_terminal_rebound(
+    terminal_id: str,
+    lifecycle_generation: int,
+    error: str,
+) -> int:
+    """Atomically fail a proven rebound and re-park its reactivated mail."""
+    with SessionLocal.begin() as db:
+        terminal = db.query(TerminalModel).filter_by(id=terminal_id).one_or_none()
+        if terminal is None:
+            raise RuntimeError("terminal_missing_after_rebound")
+        if int(terminal.lifecycle_generation) != lifecycle_generation:
+            raise RuntimeError("rebound_generation_changed")
+
+        terminal.recovery_state = "rebind_failed"
+        terminal.recovery_error = error[:2048]
+        terminal.recovery_updated_at = _utcnow()
+
+        changed = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.logical_receiver_id.is_(None),
+                InboxModel.receiver_id == terminal_id,
+                InboxModel.enqueue_generation == lifecycle_generation,
+                InboxModel.owner_receiver_id == terminal_id,
+                InboxModel.owner_generation == lifecycle_generation - 1,
+            )
+            .update(
+                {
+                    InboxModel.status: MessageStatus.PARKED.value,
+                    InboxModel.digested_into: None,
+                },
+                synchronize_session=False,
+            )
+        )
+
+        incarnation = (
+            db.query(MailboxIncarnationModel).filter_by(terminal_id=terminal_id).one_or_none()
+        )
+        if incarnation is not None:
+            mailbox_generation = (
+                db.query(MailboxModel.generation).filter_by(id=incarnation.mailbox_id).scalar()
+            )
+            if type(mailbox_generation) is int:
+                changed += (
+                    db.query(InboxModel)
+                    .filter(
+                        InboxModel.status == MessageStatus.PENDING.value,
+                        InboxModel.logical_receiver_id == incarnation.mailbox_id,
+                        InboxModel.receiver_id == terminal_id,
+                        InboxModel.enqueue_generation == int(mailbox_generation),
+                        InboxModel.owner_receiver_id == terminal_id,
+                        InboxModel.owner_generation == int(incarnation.generation),
+                    )
+                    .update(
+                        {
+                            InboxModel.status: MessageStatus.PARKED.value,
+                            InboxModel.digested_into: None,
+                        },
+                        synchronize_session=False,
+                    )
+                )
+        return int(changed)
 
 
 def set_terminal_recovery_state(
@@ -1726,13 +1878,34 @@ def settle_terminal_fallback(old_terminal_id: str, new_terminal_id: str) -> int:
             raise RuntimeError("fallback_terminal_missing")
         if not new.provider_session_id:
             raise RuntimeError("fallback_terminal_identity_missing")
-        changed = (
+        changed = 0
+        pending_rows = (
             db.query(InboxModel)
             .filter(
                 InboxModel.receiver_id == old_terminal_id,
                 InboxModel.status == MessageStatus.PENDING.value,
             )
-            .update({"receiver_id": new_terminal_id}, synchronize_session=False)
+            .all()
+        )
+        for pending in pending_rows:
+            pending.receiver_id = new_terminal_id
+            if pending.logical_receiver_id:
+                mailbox_generation = (
+                    db.query(MailboxModel.generation)
+                    .filter_by(id=pending.logical_receiver_id)
+                    .scalar()
+                )
+                pending.enqueue_generation = cast(int | None, mailbox_generation)
+            else:
+                pending.enqueue_generation = int(new.lifecycle_generation)
+            changed += 1
+        changed += _reactivate_parked_rows_in_db(
+            db,
+            source_terminal_id=old_terminal_id,
+            source_lifecycle_generation=int(old.lifecycle_generation),
+            target_terminal_id=new_terminal_id,
+            target_lifecycle_generation=int(new.lifecycle_generation),
+            move_mailbox_authority=True,
         )
         old.fallback_terminal_id = new_terminal_id
         old.recovery_state = "fallback_ready"
@@ -2713,6 +2886,8 @@ def _inbox_message_from_row(row: Any) -> InboxMessage:
         failure_reason=row.failure_reason,
         digested_into=row.digested_into,
         enqueue_generation=row.enqueue_generation,
+        owner_receiver_id=row.owner_receiver_id,
+        owner_generation=row.owner_generation,
         barrier_id=row.barrier_id,
         barrier_member_key=row.barrier_member_key,
         created_at=row.created_at,
@@ -3672,8 +3847,38 @@ def get_pending_messages_by_ids(receiver_id: str, message_ids: list[int]) -> Lis
         ]
 
 
+def get_owned_legacy_parked_messages(receiver_id: str, limit: int = 100) -> List[InboxMessage]:
+    """Return null-generation logical rows parked for this still-current incarnation."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.status == MessageStatus.PARKED.value,
+                InboxModel.owner_receiver_id == receiver_id,
+                InboxModel.logical_receiver_id.is_not(None),
+                InboxModel.enqueue_generation.is_(None),
+                exists().where(
+                    and_(
+                        MailboxModel.id == InboxModel.logical_receiver_id,
+                        MailboxModel.current_terminal_id == receiver_id,
+                    )
+                ),
+            )
+            .order_by(InboxModel.created_at.asc(), InboxModel.id.asc())
+            .limit(limit)
+            .all()
+        )
+        return [_inbox_message_from_row(row) for row in rows]
+
+
 def get_inbox_messages(
-    receiver_id: str, limit: int = 10, status: Optional[MessageStatus] = None
+    receiver_id: str,
+    limit: int = 10,
+    status: Optional[MessageStatus] = None,
+    *,
+    generation: int | None = None,
+    original_receiver_id: str | None = None,
+    audit_browse: bool = False,
 ) -> List[InboxMessage]:
     """Get inbox messages with optional status filter ordered by created_at ASC (oldest first).
 
@@ -3691,26 +3896,62 @@ def get_inbox_messages(
 
         if status is not None:
             query = query.filter(InboxModel.status == status.value)
+        elif not audit_browse:
+            query = query.filter(InboxModel.status != MessageStatus.PARKED.value)
+        if generation is not None:
+            query = query.filter(InboxModel.owner_generation == generation)
+        if original_receiver_id is not None:
+            query = query.filter(InboxModel.owner_receiver_id == original_receiver_id)
 
         messages = query.order_by(InboxModel.created_at.asc()).limit(limit).all()
 
-        return [
-            InboxMessage(
-                id=msg.id,
-                sender_id=msg.sender_id,
-                receiver_id=msg.receiver_id,
-                logical_receiver_id=msg.logical_receiver_id if mailbox_schema else None,
-                digested_into=msg.digested_into if mailbox_schema else None,
-                enqueue_generation=msg.enqueue_generation if mailbox_schema else None,
-                barrier_id=msg.barrier_id,
-                barrier_member_key=msg.barrier_member_key,
-                message=msg.message,
-                orchestration_type=OrchestrationType(msg.orchestration_type),
-                status=MessageStatus(msg.status),
-                created_at=msg.created_at,
+        result: list[InboxMessage] = []
+        for msg in messages:
+            dead_to_successor: bool | None = None
+            if msg.status == MessageStatus.PARKED.value:
+                if msg.logical_receiver_id:
+                    authority = (
+                        db.query(MailboxModel.generation, MailboxModel.current_terminal_id)
+                        .filter(MailboxModel.id == msg.logical_receiver_id)
+                        .one_or_none()
+                    )
+                    dead_to_successor = bool(
+                        authority is not None
+                        and (
+                            int(authority.generation) != msg.owner_generation
+                            or authority.current_terminal_id != msg.owner_receiver_id
+                        )
+                    )
+                else:
+                    current_generation = (
+                        db.query(TerminalModel.lifecycle_generation)
+                        .filter(TerminalModel.id == msg.owner_receiver_id)
+                        .scalar()
+                    )
+                    dead_to_successor = bool(
+                        type(current_generation) is int
+                        and int(current_generation) != msg.owner_generation
+                    )
+            result.append(
+                InboxMessage(
+                    id=msg.id,
+                    sender_id=msg.sender_id,
+                    receiver_id=msg.receiver_id,
+                    logical_receiver_id=msg.logical_receiver_id if mailbox_schema else None,
+                    digested_into=msg.digested_into if mailbox_schema else None,
+                    enqueue_generation=msg.enqueue_generation if mailbox_schema else None,
+                    owner_receiver_id=msg.owner_receiver_id if mailbox_schema else None,
+                    owner_generation=msg.owner_generation if mailbox_schema else None,
+                    dead_to_successor=dead_to_successor,
+                    barrier_id=msg.barrier_id,
+                    barrier_member_key=msg.barrier_member_key,
+                    message=msg.message,
+                    orchestration_type=OrchestrationType(msg.orchestration_type),
+                    status=MessageStatus(msg.status),
+                    created_at=msg.created_at,
+                )
             )
-            for msg in messages
-        ]
+        return result
 
 
 def record_project_alias(project_id: str, alias: str, kind: str) -> None:
@@ -4381,33 +4622,6 @@ def begin_delivery_attempt(
     return attempt_uuid
 
 
-def _advance_digest_cursor_in_db(db: Session, message_ids: list[int]) -> None:
-    """Advance a publication mailbox cursor inside the winning delivery transaction."""
-    ids = sorted(set(message_ids))
-    if not ids:
-        return
-    rows = (
-        db.query(InboxModel.logical_receiver_id, InboxMessageTraceEventModel.payload)
-        .join(
-            InboxMessageTraceEventModel,
-            InboxMessageTraceEventModel.message_id == InboxModel.id,
-        )
-        .filter(
-            InboxModel.id.in_(ids),
-            InboxModel.orchestration_type == OrchestrationType.MAILBOX_DIGEST.value,
-            InboxMessageTraceEventModel.kind == "digest_high_water",
-        )
-        .all()
-    )
-    for mailbox_id, payload in rows:
-        high_water = payload.get("high_water") if isinstance(payload, dict) else None
-        if not isinstance(mailbox_id, str) or type(high_water) is not int:
-            continue
-        mailbox = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
-        if mailbox is not None and high_water > int(mailbox.consumed_through_id):
-            mailbox.consumed_through_id = high_water
-
-
 def settle_delivery_attempt(
     attempt_uuid: str,
     status: MessageStatus,
@@ -4487,8 +4701,6 @@ def settle_delivery_attempt(
         changed = query.update({InboxModel.status: status.value}, synchronize_session=False)
         if status == MessageStatus.DELIVERED and changed != len(ids):
             raise RuntimeError("delivery confirmation compare-and-set lost")
-        if status == MessageStatus.DELIVERED:
-            _advance_digest_cursor_in_db(db, ids)
         if status == MessageStatus.DELIVERED and on_confirmed is not None:
             on_confirmed()
         return True
@@ -4611,7 +4823,6 @@ def confirm_batch_from_prior_attempt(
         )
         if changed != len(message_ids):
             return False
-        _advance_digest_cursor_in_db(db, message_ids)
         if on_confirmed is not None:
             on_confirmed()
         return True
@@ -4735,7 +4946,6 @@ def settle_open_attempt_inferred_delivered(
                 created_at=now,
             )
         )
-        _advance_digest_cursor_in_db(db, message_ids)
         if on_confirmed is not None:
             on_confirmed()
         return True
@@ -4765,7 +4975,6 @@ def transition_pending_to_inferred_delivered(
                 payload=dict(evidence),
             )
         )
-        _advance_digest_cursor_in_db(db, [message_id])
         if on_confirmed is not None:
             on_confirmed()
         return True
@@ -5442,7 +5651,6 @@ def settle_wpm1_terminal_batch(
             db.rollback()
             return "stale"
         if status == MessageStatus.DELIVERED:
-            _advance_digest_cursor_in_db(db, ids)
             any_stalled = any(
                 _evidence_object(row.evidence).get("stalled_notified_at") for row in attempts
             )

@@ -726,7 +726,7 @@ class TestInboxOperations:
         assert InboxMessageTraceEventModel.__tablename__ == "inbox_message_trace_event"
 
     def test_message_status_storage_is_additive_unconstrained_text(self):
-        """Database-facing enum exposes all eight honest delivery states."""
+        """Database-facing enum exposes all nine honest delivery states."""
         assert [status.value for status in MessageStatus] == [
             "pending",
             "held",
@@ -735,6 +735,7 @@ class TestInboxOperations:
             "delivery_failed",
             "failed",
             "digested",
+            "parked",
             "cancelled",
         ]
 

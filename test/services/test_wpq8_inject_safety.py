@@ -591,7 +591,7 @@ async def test_wpq8_m24_guard_capability_registration_and_states():
     assert cancelled.active is False
 
 
-def test_wpq8_m4_m5_null_and_mismatched_direct_rows_are_digested(wpq8_db):
+def test_wpq11_null_and_mismatched_direct_rows_are_parked_with_owners(wpq8_db):
     with wpq8_db.begin() as db:
         terminal = TerminalModel(
             id="worker",
@@ -624,9 +624,10 @@ def test_wpq8_m4_m5_null_and_mismatched_direct_rows_are_digested(wpq8_db):
     assert mailbox_service.digest_stale_pending_for_terminal("worker") == 2
     with wpq8_db() as db:
         rows = db.query(InboxModel).order_by(InboxModel.id).all()
-        assert [row.status for row in rows[:2]] == ["digested", "digested"]
-        assert rows[2].status == "pending"
-        assert rows[2].enqueue_generation == 3
+        assert [row.status for row in rows] == ["parked", "parked"]
+        assert [row.owner_receiver_id for row in rows] == ["worker", "worker"]
+        assert [row.owner_generation for row in rows] == [3, 2]
+        assert all(row.digested_into is None for row in rows)
 
 
 def _constructor_owners(path: Path) -> tuple[set[str], dict[str, bool]]:
@@ -664,7 +665,7 @@ def _constructor_owners(path: Path) -> tuple[set[str], dict[str, bool]]:
     return owners, stamped
 
 
-def test_wpq8_m16_inbox_writer_constructor_topology_is_exactly_twelve():
+def test_wpq11_inbox_writer_constructor_topology_drops_two_digest_seats():
     root = Path(__file__).parents[2] / "src" / "cli_agent_orchestrator"
     db_owners, _ = _constructor_owners(root / "clients" / "database.py")
     mailbox_owners, _ = _constructor_owners(root / "services" / "mailbox_service.py")
@@ -679,8 +680,6 @@ def test_wpq8_m16_inbox_writer_constructor_topology_is_exactly_twelve():
         "_record_p5_orphan_notices",
         "record_wpm1_stalled_notice.operation",
         "settle_wpm1_terminal_batch.operation",
-        "publish_supervisor_incarnation",
-        "digest_stale_pending_for_terminal",
         "delete_mailbox",
     }
     assert owners == expected
@@ -738,8 +737,6 @@ def _seed_writer_attempt(db, attempt_uuid: str) -> int:
         "_record_p5_orphan_notices",
         "record_wpm1_stalled_notice",
         "settle_wpm1_terminal_batch",
-        "publish_supervisor_incarnation",
-        "digest_stale_pending_for_terminal",
         "delete_mailbox",
     ],
 )

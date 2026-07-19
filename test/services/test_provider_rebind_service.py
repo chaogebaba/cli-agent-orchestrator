@@ -568,6 +568,11 @@ def _install_transaction_harness(monkeypatch, *, pause_error=None, resume_error=
     )
     monkeypatch.setattr(service, "_wait_for_backend_proof", AsyncMock())
     monkeypatch.setattr(service, "settle_terminal_rebound", lambda *_a: True)
+    monkeypatch.setattr(
+        service,
+        "fail_terminal_rebound",
+        lambda _tid, _generation, error: states.append(("rebind_failed", error)) or 0,
+    )
     monkeypatch.setattr(service, "_fallback", AsyncMock(return_value={"status": "respawned"}))
     monkeypatch.setattr(
         service,
@@ -748,6 +753,34 @@ async def test_wpd1_guard_release_error_still_closes_incident_complete(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_wpq11_reactivation_wake_runs_only_after_delivery_guard_release(monkeypatch):
+    _old, _candidate, _states = _install_transaction_harness(monkeypatch)
+    order: list[str] = []
+
+    def settle(*_args):
+        order.append("settle")
+        return 1
+
+    async def close(_self):
+        order.append("guard-close")
+
+    def deliver(terminal_id):
+        order.append(f"deliver:{terminal_id}")
+
+    monkeypatch.setattr(service, "settle_terminal_rebound", settle)
+    monkeypatch.setattr(service.DeliveryGuard, "close", close)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",
+        deliver,
+    )
+
+    result = await service.rebind_terminal("txn")
+
+    assert result["status"] == "rebound"
+    assert order == ["settle", "guard-close", "deliver:txn"]
+
+
+@pytest.mark.asyncio
 async def test_p6_pause_failure_restores_p1_state_without_exit(monkeypatch):
     _old, _candidate, states = _install_transaction_harness(
         monkeypatch, pause_error=RuntimeError("pause")
@@ -816,12 +849,121 @@ async def test_p14_resume_failure_demotes_proven_candidate_without_fallback(monk
         monkeypatch, resume_error=RuntimeError("resume watchdog")
     )
     fallback = AsyncMock()
+    deliver = MagicMock()
     monkeypatch.setattr(service, "_fallback", fallback)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",
+        deliver,
+    )
     result = await service.rebind_terminal("txn")
     assert result["status"] == "resume_failed"
     assert result["error_code"] == "watchdog_resume_failed"
     assert states[-1] == ("rebind_failed", "watchdog_resume_failed")
     fallback.assert_not_awaited()
+    deliver.assert_not_called()
+
+
+def _install_real_reactivated_row(monkeypatch, tmp_path):
+    from datetime import datetime
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.clients.database import Base, InboxModel, TerminalModel
+    from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'p14-repark.sqlite'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "SessionLocal", sessions)
+    monkeypatch.setattr(service, "settle_terminal_rebound", database.settle_terminal_rebound)
+    monkeypatch.setattr(service, "fail_terminal_rebound", database.fail_terminal_rebound)
+    with sessions.begin() as db:
+        db.add(
+            TerminalModel(
+                id="txn",
+                tmux_session="cao-test",
+                tmux_window="worker",
+                provider="codex",
+                lifecycle_generation=3,
+                init_state="ready",
+            )
+        )
+        row = InboxModel(
+            sender_id="99999999",
+            receiver_id="txn",
+            enqueue_generation=3,
+            owner_receiver_id="txn",
+            owner_generation=3,
+            message="owned callback",
+            orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+            status=MessageStatus.PARKED.value,
+            created_at=datetime.now(),
+        )
+        db.add(row)
+        db.flush()
+        message_id = int(row.id)
+    return engine, sessions, message_id
+
+
+@pytest.mark.asyncio
+async def test_p14_failure_atomically_reparks_reactivated_rows_without_wake(monkeypatch, tmp_path):
+    _install_transaction_harness(monkeypatch, resume_error=RuntimeError("resume watchdog"))
+    engine, sessions, message_id = _install_real_reactivated_row(monkeypatch, tmp_path)
+    deliver = MagicMock()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",
+        deliver,
+    )
+
+    result = await service.rebind_terminal("txn")
+
+    assert result["status"] == "resume_failed"
+    deliver.assert_not_called()
+    with sessions() as db:
+        from cli_agent_orchestrator.clients.database import InboxModel, TerminalModel
+        from cli_agent_orchestrator.models.inbox import MessageStatus
+
+        assert db.get(InboxModel, message_id).status == MessageStatus.PARKED.value
+        terminal = db.get(TerminalModel, "txn")
+        assert (terminal.recovery_state, terminal.recovery_error) == (
+            "rebind_failed",
+            "watchdog_resume_failed",
+        )
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_p14_cancellation_reparks_reactivated_rows_without_wake(monkeypatch, tmp_path):
+    _install_transaction_harness(monkeypatch)
+    engine, sessions, message_id = _install_real_reactivated_row(monkeypatch, tmp_path)
+    resume = MagicMock(side_effect=[asyncio.CancelledError(), None])
+    deliver = MagicMock()
+    monkeypatch.setattr(service.stalled_callback_watchdog, "resume_terminal", resume)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",
+        deliver,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.rebind_terminal("txn")
+
+    deliver.assert_not_called()
+    with sessions() as db:
+        from cli_agent_orchestrator.clients.database import InboxModel, TerminalModel
+        from cli_agent_orchestrator.models.inbox import MessageStatus
+
+        assert db.get(InboxModel, message_id).status == MessageStatus.PARKED.value
+        terminal = db.get(TerminalModel, "txn")
+        assert (terminal.recovery_state, terminal.recovery_error) == (
+            "rebind_failed",
+            "rebind_cancelled",
+        )
+    engine.dispose()
 
 
 @pytest.mark.asyncio

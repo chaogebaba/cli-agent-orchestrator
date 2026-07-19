@@ -3329,6 +3329,9 @@ async def get_inbox_messages_endpoint(
     status_param: Optional[str] = Query(
         default=None, alias="status", description="Filter by message status"
     ),
+    generation: Optional[int] = Query(default=None, ge=0),
+    original_receiver_id: Optional[TerminalId] = None,
+    audit_browse: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
 ) -> List[Dict]:
     """Get inbox messages for a terminal.
@@ -3352,31 +3355,58 @@ async def get_inbox_messages_endpoint(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=(
                         "Invalid status: %s. Valid values: pending, held, delivering, delivered, "
-                        "delivery_failed, failed, digested, cancelled" % status_param
+                        "delivery_failed, failed, digested, parked, cancelled" % status_param
                     ),
                 )
 
+        if (
+            status_filter == MessageStatus.PARKED
+            and generation is None
+            and original_receiver_id is None
+            and not audit_browse
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "parked_query_requires_incarnation",
+                    "message": "parked queries require generation or original_receiver_id",
+                },
+            )
+
         # Get messages using existing database function
-        messages = get_inbox_messages(terminal_id, limit=limit, status=status_filter)
+        if generation is None and original_receiver_id is None and not audit_browse:
+            messages = get_inbox_messages(terminal_id, limit=limit, status=status_filter)
+        else:
+            messages = get_inbox_messages(
+                terminal_id,
+                limit=limit,
+                status=status_filter,
+                generation=generation,
+                original_receiver_id=original_receiver_id,
+                audit_browse=audit_browse,
+            )
 
         # Convert to response format
         result = []
         for msg in messages:
-            result.append(
-                {
-                    "id": msg.id,
-                    "sender_id": msg.sender_id,
-                    "receiver_id": msg.receiver_id,
-                    "message": msg.message,
-                    "orchestration_type": msg.orchestration_type.value,
-                    "status": msg.status.value,
-                    "digested_into": msg.digested_into,
-                    "enqueue_generation": msg.enqueue_generation,
-                    "barrier_id": msg.barrier_id,
-                    "barrier_member_key": msg.barrier_member_key,
-                    "created_at": msg.created_at.isoformat() if msg.created_at else None,
-                }
-            )
+            item = {
+                "id": msg.id,
+                "sender_id": msg.sender_id,
+                "receiver_id": msg.receiver_id,
+                "message": msg.message,
+                "orchestration_type": msg.orchestration_type.value,
+                "status": msg.status.value,
+                "digested_into": msg.digested_into,
+                "enqueue_generation": msg.enqueue_generation,
+                "barrier_id": msg.barrier_id,
+                "barrier_member_key": msg.barrier_member_key,
+                "created_at": msg.created_at.isoformat() if msg.created_at else None,
+            }
+            if msg.status == MessageStatus.PARKED:
+                item["owner_receiver_id"] = msg.owner_receiver_id
+                item["owner_generation"] = msg.owner_generation
+                item["dead_to_successor"] = msg.dead_to_successor
+            result.append(item)
 
         return result
 
@@ -3399,6 +3429,9 @@ async def list_messages_endpoint(
     after_id: Optional[int] = Query(default=None, ge=0),
     limit: int = Query(default=25, ge=1, le=100),
     status_param: Optional[MessageStatus] = Query(default=None, alias="status"),
+    generation: Optional[int] = Query(default=None, ge=0),
+    original_receiver_id: Optional[TerminalId] = None,
+    audit_browse: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
 ) -> Dict:
     """Replay a deterministic logical or incarnation-provenance message page."""
@@ -3416,14 +3449,19 @@ async def list_messages_endpoint(
     from cli_agent_orchestrator.services.mailbox_service import list_messages
 
     try:
-        return await asyncio.to_thread(
-            list_messages,
-            to,
-            since=parsed_since,
-            after_id=after_id,
-            limit=limit,
-            status=status_param,
-        )
+        kwargs: dict[str, Any] = {
+            "since": parsed_since,
+            "after_id": after_id,
+            "limit": limit,
+            "status": status_param,
+        }
+        if generation is not None:
+            kwargs["generation"] = generation
+        if original_receiver_id is not None:
+            kwargs["original_receiver_id"] = original_receiver_id
+        if audit_browse:
+            kwargs["audit_browse"] = True
+        return await asyncio.to_thread(list_messages, to, **kwargs)
     except MailboxDomainError as exc:
         raise _mailbox_http_exception(exc) from exc
 

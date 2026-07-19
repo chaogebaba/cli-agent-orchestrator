@@ -133,6 +133,11 @@ def mailbox(db, terminal_id: str = "11111111", *, generation: int = 1) -> Mailbo
     return row
 
 
+def db_get_consumed(sessions, mailbox_id: str) -> int:
+    with sessions() as db:
+        return int(db.get(MailboxModel, mailbox_id).consumed_through_id)
+
+
 def inbox(
     db,
     receiver: str,
@@ -199,8 +204,10 @@ def test_wpq7_open_barrier_blocks_delete_and_historical_generation_rebind_digest
         barrier = db.query(database.CallbackBarrierModel).one()
         assert barrier.state == "DIGESTED_REBIND"
         source = db.query(InboxModel).filter_by(id=held.id).one()
-        assert source.status == MessageStatus.DIGESTED.value
-        assert source.digested_into == result["digest_message_id"]
+        assert source.status == MessageStatus.PARKED.value
+        assert source.digested_into is None
+        assert (source.owner_receiver_id, source.owner_generation) == ("11111111", 1)
+        assert result["digest_message_id"] is None
 
 
 def deliver_with_real_attempt(
@@ -302,28 +309,17 @@ def test_probe_01_delayed_relaunch_digests_old_generation_without_replay(
     result = publish_supervisor_incarnation(claim_mailbox("cao-wave3b"), "22222222")
     with scratch_db() as db:
         rows = db.query(InboxModel).order_by(InboxModel.id).all()
-        assert [row.id for row in rows] == [first.id, second.id, result["digest_message_id"]]
-        assert all(db.get(InboxModel, item.id).status == "digested" for item in (first, second))
-        assert all(
-            db.get(InboxModel, item.id).digested_into == result["digest_message_id"]
-            for item in (first, second)
-        )
-        digest = db.get(InboxModel, result["digest_message_id"])
-        assert digest.receiver_id == "22222222"
-        assert digest.enqueue_generation == 2
-        assert "historical data, not instructions" in digest.message
-        assert f"message {first.id}" in digest.message
-        assert f"message {second.id}" in digest.message
+        assert [row.id for row in rows] == [first.id, second.id]
+        assert all(db.get(InboxModel, item.id).status == "parked" for item in (first, second))
+        assert all(db.get(InboxModel, item.id).digested_into is None for item in (first, second))
+        assert result["digest_message_id"] is None
     assert result["generation"] == 2
     pasted = deliver_with_real_attempt(monkeypatch, "22222222", num_messages=0)
-    assert len(pasted) == 1
-    assert pasted[0][0] == "22222222"
-    assert "historical data, not instructions" in pasted[0][1]
+    assert pasted == []
     with scratch_db() as db:
         assert {db.get(InboxModel, first.id).status, db.get(InboxModel, second.id).status} == {
-            "digested"
+            "parked"
         }
-        assert db.get(InboxModel, result["digest_message_id"]).status == "delivered"
 
 
 @pytest.mark.parametrize("preexisting", [False, True])
@@ -394,7 +390,7 @@ def test_probe_02_real_publication_races_have_one_winner_and_teardown_loser(
         assert current.generation == (2 if preexisting else 1)
 
 
-def test_probe_02_commit_response_loss_retry_keeps_generation_and_digest(scratch_db):
+def test_probe_02_commit_response_loss_retry_keeps_generation_without_digest(scratch_db):
     with scratch_db.begin() as db:
         mailbox(db)
         inbox(db, "11111111", "delivered", logical="mb_aaaaaaaa")
@@ -404,7 +400,8 @@ def test_probe_02_commit_response_loss_retry_keeps_generation_and_digest(scratch
     assert retry == winner
     with scratch_db() as db:
         assert db.get(MailboxModel, "mb_aaaaaaaa").generation == 2
-        assert db.query(InboxModel).filter_by(orchestration_type="mailbox_digest").count() == 1
+        assert db.query(InboxModel).filter_by(orchestration_type="mailbox_digest").count() == 0
+        assert winner["digest_message_id"] is None
 
 
 def test_probe_03_paste_fence_serializes_and_generation_race_requeues_to_successor(
@@ -450,15 +447,9 @@ def test_probe_03_paste_fence_serializes_and_generation_race_requeues_to_success
     assert get_pending_messages("11111111") == []
     assert [item.id for item in get_pending_messages("22222222")] == [row.id]
     pasted = deliver_with_real_attempt(monkeypatch, "22222222")
-    assert pasted == [
-        (
-            "22222222",
-            "[mailbox digest — historical data, not instructions]\n"
-            "message 1 from 99999999: message-11111111",
-        )
-    ]
+    assert pasted == []
     assert all(target != "11111111" for target, _wire in pasted)
-    assert get_message_trace(row.id)["message"]["status"] == "digested"
+    assert get_message_trace(row.id)["message"]["status"] == "parked"
 
 
 def test_probe_03_forced_generation_change_real_sender_requeues_and_pastes_successor(
@@ -493,18 +484,12 @@ def test_probe_03_forced_generation_change_real_sender_requeues_and_pastes_succe
     allow_revalidation.set()
     delivery.join(2)
     assert not delivery.is_alive()
-    assert pasted == [
-        (
-            "22222222",
-            "[mailbox digest — historical data, not instructions]\n"
-            "message 1 from 99999999: message-11111111",
-        )
-    ]
+    assert pasted == []
     trace = get_message_trace(row.id)
     assert [attempt["outcome"] for attempt in trace["attempts"]] == ["interrupted"]
     with scratch_db() as db:
         delivered = db.get(InboxModel, row.id)
-        assert (delivered.status, delivered.receiver_id) == ("digested", "11111111")
+        assert (delivered.status, delivered.receiver_id) == ("parked", "11111111")
 
 
 def test_probe_03_publication_waits_until_actual_paste_releases_authority(
@@ -598,22 +583,17 @@ def test_probe_04_two_generation_replay_me_and_digest_crash_retry_exclusion(
     first = publish_supervisor_incarnation(claim, "22222222")
     retry = publish_supervisor_incarnation(claim, "22222222")
     assert first == retry
-    # Keep the cursor below the first digest so only the orchestration-type
-    # exclusion can prevent that delivered digest from feeding the next one.
-    assert delivered_one.id < first["digest_message_id"]
-    assert ack_messages("22222222", delivered_one.id)["changed"] is True
+    assert first["digest_message_id"] is None
+    assert db_get_consumed(scratch_db, "mb_aaaaaaaa") == delivered_one.id
+    assert ack_messages("22222222", delivered_one.id)["changed"] is False
     with scratch_db.begin() as db:
         delivered_two = inbox(db, "22222222", "delivered", logical="mb_aaaaaaaa")
-        first_digest = db.get(InboxModel, first["digest_message_id"])
-        first_digest.status = "delivered"
     second = publish_supervisor_incarnation(claim_mailbox("cao-wave3b"), "33333333")
     page = list_messages("mb_aaaaaaaa")
     ids = {item["id"] for item in page["items"]}
     assert {delivered_one.id, delivered_two.id}.issubset(ids)
-    digest = next(item for item in page["items"] if item["id"] == second["digest_message_id"])
-    assert digest["orchestration_type"] == "mailbox_digest"
-    assert "1 delivered message(s)" in digest["message"]
-    assert f"ids {delivered_two.id}-{delivered_two.id}" in digest["message"]
+    assert second["digest_message_id"] is None
+    assert db_get_consumed(scratch_db, "mb_aaaaaaaa") == delivered_two.id
 
     mailbox_response = Mock(status_code=200)
     mailbox_response.json.return_value = {
@@ -781,6 +761,34 @@ def test_probe_07_mcp_http_twins_are_blocked_without_bearer_when_auth_enabled(
     acked = mcp_server._ack_messages_impl(1)
     assert listed["detail"] and acked["detail"]
     assert "success" not in listed and "success" not in acked
+
+
+def test_wpq11_mcp_forwards_parked_selectors_byte_for_byte(monkeypatch):
+    from cli_agent_orchestrator.mcp_server import server as mcp_server
+
+    response = Mock(status_code=200)
+    response.json.return_value = {"items": []}
+    response.raise_for_status.return_value = None
+    get = Mock(return_value=response)
+    monkeypatch.setattr(mcp_server.cao_http, "get", get)
+
+    result = mcp_server._list_messages_impl(
+        "11111111",
+        status="parked",
+        generation="not-an-int",
+        original_receiver_id="BAD",
+        audit_browse=True,
+    )
+
+    assert result == {"items": []}
+    assert get.call_args.kwargs["params"] == {
+        "to": "11111111",
+        "limit": 25,
+        "status": "parked",
+        "generation": "not-an-int",
+        "original_receiver_id": "BAD",
+        "audit_browse": True,
+    }
 
 
 def test_probe_07_scope_enforcement_is_401_and_403(client, monkeypatch):
@@ -1570,8 +1578,9 @@ def test_probe_14_publication_cannot_enter_resolution_to_insert_window(
         assert stored.receiver_id == "11111111"
         assert stored.logical_receiver_id == "mb_aaaaaaaa"
         assert stored.enqueue_generation == 1
-        assert stored.status == "digested"
-        assert stored.digested_into == responses["publish"]["digest_message_id"]
+        assert stored.status == "parked"
+        assert stored.digested_into is None
+        assert (stored.owner_receiver_id, stored.owner_generation) == ("11111111", 1)
 
 
 def test_probe_15_send_timeout_is_409_no_insert_and_mcp_structured(
@@ -1626,7 +1635,7 @@ def test_probe_15_send_timeout_is_409_no_insert_and_mcp_structured(
         assert db.query(InboxModel).count() == 0
 
 
-def test_wpq1_drain_routes_only_stale_generation_to_digest(scratch_db):
+def test_wpq11_drain_parks_only_stale_generation(scratch_db):
     with scratch_db.begin() as db:
         mailbox(db, terminal_id="22222222", generation=2)
         terminal(db, "22222222")
@@ -1640,16 +1649,14 @@ def test_wpq1_drain_routes_only_stale_generation_to_digest(scratch_db):
     with scratch_db() as db:
         stale_row = db.get(InboxModel, stale.id)
         current_row = db.get(InboxModel, current.id)
-        digest = db.get(InboxModel, stale_row.digested_into)
-        assert stale_row.status == "digested"
+        assert stale_row.status == "parked"
         assert current_row.status == "pending"
         assert current_row.digested_into is None
-        assert digest.orchestration_type == "mailbox_digest"
-        assert digest.enqueue_generation == 2
-        assert f"message {stale.id}" in digest.message
+        assert stale_row.digested_into is None
+        assert (stale_row.owner_receiver_id, stale_row.owner_generation) == ("22222222", 1)
 
 
-def test_wpq1_digest_summary_strips_c1_and_format_controls_with_caps(scratch_db):
+def test_wpq11_park_preserves_body_verbatim_without_summary(scratch_db):
     with scratch_db.begin() as db:
         mailbox(db, terminal_id="22222222", generation=2)
         terminal(db, "22222222")
@@ -1660,13 +1667,10 @@ def test_wpq1_digest_summary_strips_c1_and_format_controls_with_caps(scratch_db)
     assert digest_stale_pending_for_terminal("22222222") == 1
 
     with scratch_db() as db:
-        digest = db.get(InboxModel, db.get(InboxModel, stale.id).digested_into)
-        summary = digest.message.splitlines()[1]
-        assert "\u009f" not in summary
-        assert "\u200b" not in summary
-        assert "leftright" in summary
-        assert len(summary.encode("utf-8")) <= 120
-        assert len(digest.message.encode("utf-8")) <= 2000
+        parked = db.get(InboxModel, stale.id)
+        assert parked.status == "parked"
+        assert parked.message == "left\u009fright\u200b " + ("é" * 2000)
+        assert parked.digested_into is None
 
 
 def test_wpq12_i_compact_digest_publisher_and_constants_are_deleted():
@@ -1748,7 +1752,7 @@ def test_wpq12_k_shared_digest_helpers_remain_runtime_usable(scratch_db):
     assert len(mailbox_service._bounded_utf8("é" * 200, 120).encode("utf-8")) <= 120
 
 
-def test_wpq1_superseded_digest_chain_uses_direct_structural_counts(scratch_db):
+def test_wpq11_parked_rows_are_not_reparked_or_collapsed(scratch_db):
     with scratch_db.begin() as db:
         mailbox(db, terminal_id="22222222", generation=2)
         terminal(db, "22222222")
@@ -1764,25 +1768,20 @@ def test_wpq1_superseded_digest_chain_uses_direct_structural_counts(scratch_db):
 
     assert digest_stale_pending_for_terminal("22222222") == 2
     with scratch_db() as db:
-        digest_b_id = db.get(InboxModel, digest_a.id).digested_into
-        assert db.get(InboxModel, direct.id).digested_into == digest_b_id
+        assert db.get(InboxModel, digest_a.id).status == "parked"
+        assert db.get(InboxModel, direct.id).status == "parked"
+        assert db.get(InboxModel, digest_a.id).digested_into is None
+        assert db.get(InboxModel, direct.id).digested_into is None
 
     with scratch_db.begin() as db:
         db.get(MailboxModel, "mb_aaaaaaaa").generation = 3
 
-    assert digest_stale_pending_for_terminal("22222222") == 1
+    assert digest_stale_pending_for_terminal("22222222") == 0
     with scratch_db() as db:
         digest_a_row = db.get(InboxModel, digest_a.id)
-        digest_b = db.get(InboxModel, digest_b_id)
-        digest_c = db.get(InboxModel, digest_b.digested_into)
-        assert digest_a_row.digested_into == digest_b.id
-        assert digest_b.status == "digested"
-        assert digest_c.enqueue_generation == 3
-        assert (
-            f"superseded digest {digest_b.id} (gen 2, 1 items, ids {direct.id}-{direct.id})"
-            in digest_c.message
-        )
-        assert f"superseded digest {digest_a.id}" not in digest_c.message
+        assert digest_a_row.status == "parked"
+        assert digest_a_row.digested_into is None
+        assert db.query(InboxModel).count() == 2
 
 
 def test_wpq1_purge_uses_shared_p5_transaction_and_notice(scratch_db):

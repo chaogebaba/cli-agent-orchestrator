@@ -25,6 +25,7 @@ class MessageStatus(str, Enum):
     DELIVERY_FAILED = "delivery_failed"
     FAILED = "failed"
     DIGESTED = "digested"
+    PARKED = "parked"
     CANCELLED = "cancelled"
 
 
@@ -50,6 +51,15 @@ class InboxMessage(BaseModel):
     )
     enqueue_generation: int | None = Field(
         default=None, description="Logical mailbox generation captured at enqueue"
+    )
+    owner_receiver_id: str | None = Field(
+        default=None, description="Immutable terminal incarnation that owns parked mail"
+    )
+    owner_generation: int | None = Field(
+        default=None, description="Immutable mailbox/lifecycle generation owning parked mail"
+    )
+    dead_to_successor: bool | None = Field(
+        default=None, description="Whether parked mail belongs to a superseded incarnation"
     )
     barrier_id: int | None = Field(default=None, description="Callback barrier owning this row")
     barrier_member_key: str | None = Field(
