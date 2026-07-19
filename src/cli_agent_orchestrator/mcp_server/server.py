@@ -1830,6 +1830,64 @@ async def cancel_barrier(
         return {"success": False, "error": str(exc)}
 
 
+def _authority_pin_error(exc: Exception) -> dict[str, Any]:
+    code = getattr(exc, "code", str(exc))
+    return {"success": False, "error": {"code": code}}
+
+
+@mcp.tool()
+async def pin_authority(
+    worker_terminal_id: str = Field(description="Eight-character worker terminal id"),
+    pins: list[dict[str, str]] = Field(
+        description="Non-empty ordered list of absolute file paths and lowercase SHA-256 values"
+    ),
+) -> Dict[str, Any]:
+    """Register version-one authority-file hashes for an owned worker."""
+    try:
+        from cli_agent_orchestrator.services import authority_pin_service
+
+        return await asyncio.to_thread(
+            authority_pin_service.pin_authority,
+            worker_terminal_id,
+            pins,
+        )
+    except Exception as exc:
+        return _authority_pin_error(exc)
+
+
+@mcp.tool()
+async def update_pin(
+    worker_terminal_id: str = Field(description="Eight-character worker terminal id"),
+    file_path: str = Field(description="Absolute authority-file path"),
+    sha256: str = Field(description="Lowercase SHA-256 value"),
+) -> Dict[str, Any]:
+    """Append one authority-pin version and return its complete chain."""
+    try:
+        from cli_agent_orchestrator.services import authority_pin_service
+
+        return await asyncio.to_thread(
+            authority_pin_service.update_pin,
+            worker_terminal_id,
+            file_path,
+            sha256,
+        )
+    except Exception as exc:
+        return _authority_pin_error(exc)
+
+
+@mcp.tool()
+async def verify_pin(
+    file_path: str = Field(description="Absolute authority-file path to hash locally"),
+) -> Dict[str, Any]:
+    """Return this worker's stateless authority-pin verdict."""
+    try:
+        from cli_agent_orchestrator.services import authority_pin_service
+
+        return await asyncio.to_thread(authority_pin_service.verify_pin, file_path)
+    except Exception as exc:
+        return _authority_pin_error(exc)
+
+
 @mcp.tool()
 async def list_messages(
     receiver_id: Optional[str] = Field(

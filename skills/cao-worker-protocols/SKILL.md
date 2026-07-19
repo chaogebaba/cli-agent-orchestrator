@@ -39,6 +39,16 @@ Do not stop after writing a normal response if the assignment explicitly require
 
 Your own `CAO_TERMINAL_ID` identifies your terminal, not the callback target. Never pass it as `receiver_id`.
 
+## Authority Pin Checks
+
+When a task names authority files registered with the authority-pin registry, call `verify_pin(file_path)` for every file at task start, after any suspicion of authority drift, and before every commit.
+
+- `VALID` or `SUPERSEDED`: continue against the current file. `SUPERSEDED` is stateless and may be returned at every checkpoint.
+- `DRIFT`: stop and report the verdict; do not continue against stale or changed authority.
+- `UNPINNED`: use the legacy prose-pin discipline, subject to the task-start ordering below.
+
+At task start, if the dispatch message names a file as registry-pinned and `verify_pin` returns `UNPINNED`, retry up to 3 times at 2-second intervals before treating it as genuinely `UNPINNED` and falling back to legacy prose-pin discipline. `VALID`, `SUPERSEDED`, and `DRIFT` are never retried. Dispatches that name no registry pin take the immediate legacy path, and `UNPINNED` at any later checkpoint is not retried.
+
 ## Message Formatting
 
 Return results that are easy for the supervisor to merge into a larger workflow:

@@ -422,6 +422,34 @@ class InboxMessageTraceEventModel(Base):
     )
 
 
+class AuthorityPinModel(Base):
+    """Append-only authority-file hashes scoped to one worker task."""
+
+    __tablename__ = "authority_pin"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_key = Column(String, nullable=False)
+    file_path = Column(Text, nullable=False)
+    sha256 = Column(String, nullable=False)
+    version = Column(Integer, nullable=False)
+    registered_by = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    __table_args__ = (
+        UniqueConstraint(
+            "task_key",
+            "file_path",
+            "version",
+            name="uq_authority_pin_task_file_version",
+        ),
+        Index(
+            "ix_authority_pin_task_file_version_desc",
+            "task_key",
+            "file_path",
+            version.desc(),
+        ),
+    )
+
+
 class MemoryMetadataModel(Base):
     """SQLAlchemy model for memory metadata (Phase 2 U1).
 
@@ -1262,22 +1290,29 @@ def resolve_inbox_receiver(db: Any, receiver_id: str) -> tuple[str, str | None, 
     return receiver_id, mailbox_id, cast(int | None, generation)
 
 
+def callback_barrier_dispatch_allowed_in_db(
+    db: Any,
+    sender_id: str,
+    receiver_id: str,
+) -> bool:
+    """Return whether sender owns the receiver route in the caller's transaction."""
+    try:
+        receiver_cache, _, _ = resolve_inbox_receiver(db, receiver_id)
+    except ValueError:
+        return False
+    receiver = db.query(TerminalModel).filter_by(id=receiver_cache).one_or_none()
+    if receiver is None:
+        return False
+    if receiver.caller_id == sender_id:
+        return True
+    sender_mailbox_id = _mailbox_id_for_terminal(db, sender_id)
+    return bool(sender_mailbox_id is not None and receiver.caller_mailbox_id == sender_mailbox_id)
+
+
 def callback_barrier_dispatch_allowed(sender_id: str, receiver_id: str) -> bool:
     """Return whether sender owns the target worker's callback route."""
     with SessionLocal() as db:
-        try:
-            receiver_cache, _, _ = resolve_inbox_receiver(db, receiver_id)
-        except ValueError:
-            return False
-        receiver = db.query(TerminalModel).filter_by(id=receiver_cache).one_or_none()
-        if receiver is None:
-            return False
-        if receiver.caller_id == sender_id:
-            return True
-        sender_mailbox_id = _mailbox_id_for_terminal(db, sender_id)
-        return bool(
-            sender_mailbox_id is not None and receiver.caller_mailbox_id == sender_mailbox_id
-        )
+        return callback_barrier_dispatch_allowed_in_db(db, sender_id, receiver_id)
 
 
 def get_current_mailbox_generation(mailbox_id: str) -> int | None:
