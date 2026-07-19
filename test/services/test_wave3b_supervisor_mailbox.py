@@ -32,7 +32,6 @@ from cli_agent_orchestrator.clients.database import (
     Base,
     InboxDeliveryAttemptMemberModel,
     InboxDeliveryAttemptModel,
-    InboxMessageTraceEventModel,
     InboxModel,
     MailboxIncarnationModel,
     MailboxModel,
@@ -69,7 +68,6 @@ from cli_agent_orchestrator.services.mailbox_service import (
     digest_stale_pending_for_terminal,
     get_mailbox_authority_lock,
     list_messages,
-    publish_compact_boundary_digest,
     publish_supervisor_incarnation,
 )
 from cli_agent_orchestrator.services.message_trace_service import (
@@ -1670,119 +1668,25 @@ def test_wpq1_digest_summary_strips_c1_and_format_controls_with_caps(scratch_db)
         assert len(digest.message.encode("utf-8")) <= 2000
 
 
-def test_wpq5_i_compact_digest_selects_confirmed_and_inferred_deliveries_with_120b_lines(
-    scratch_db,
-):
-    now = datetime(2026, 7, 17, 16, 0, tzinfo=timezone.utc)
-    with scratch_db.begin() as db:
-        mailbox(db, terminal_id="22222222", generation=2)
-        terminal(db, "22222222")
-        confirmed = inbox(db, "22222222", status="delivered", logical="mb_aaaaaaaa")
-        confirmed.message = "confirmed\u009f " + ("é" * 200)
-        inferred = inbox(db, "22222222", status="delivered", logical="mb_aaaaaaaa")
-        inferred.message = "inferred callback"
-        db.flush()
-        attempt = InboxDeliveryAttemptModel(
-            attempt_uuid="compact-confirmed",
-            receiver_terminal_id="22222222",
-            provider="codex",
-            started_at=now - timedelta(minutes=4),
-            settled_at=now - timedelta(minutes=3),
-            outcome="confirmed",
-            payload_hash="h",
-            payload_length=1,
-            sender_id=confirmed.sender_id,
-            orchestration_type=confirmed.orchestration_type,
-        )
-        db.add(attempt)
-        db.add(
-            InboxDeliveryAttemptMemberModel(
-                attempt_uuid=attempt.attempt_uuid,
-                message_id=confirmed.id,
-                position=0,
-            )
-        )
-        db.add(
-            InboxMessageTraceEventModel(
-                message_id=inferred.id,
-                kind="inferred_delivered",
-                payload={"reply_message_id": 9},
-                created_at=now - timedelta(minutes=2),
-            )
-        )
-
-    notice_id = publish_compact_boundary_digest("22222222", window_min=15, now_utc=now)
-    assert notice_id is not None
-    with scratch_db() as db:
-        notice = db.get(InboxModel, notice_id)
-        assert notice.sender_id == "compact-digest"
-        assert "cao messages list --to 22222222 --since" in notice.message
-        assert "MCP `list_messages`" in notice.message
-        summaries = notice.message.splitlines()[2:]
-        assert len(summaries) == 2
-        assert all(len(line.encode("utf-8")) <= 120 for line in summaries)
-        assert any(len(line.encode("utf-8")) > 80 for line in summaries)
-        assert "\u009f" not in notice.message
+def test_wpq12_i_compact_digest_publisher_and_constants_are_deleted():
+    assert not hasattr(mailbox_service, "publish_compact_boundary_digest")
+    assert not hasattr(mailbox_service, "COMPACT_DIGEST_SENDER")
+    assert not hasattr(mailbox_service, "COMPACT_DIGEST_HEADER")
 
 
-def test_wpq5_j_compact_retry_ten_seconds_later_is_fenced(scratch_db):
-    now = datetime(2026, 7, 17, 16, 0, tzinfo=timezone.utc)
-    with scratch_db.begin() as db:
-        mailbox(db, terminal_id="22222222")
-        terminal(db, "22222222")
-        row = inbox(db, "22222222", status="delivered", logical="mb_aaaaaaaa")
-        db.flush()
-        db.add(
-            InboxMessageTraceEventModel(
-                message_id=row.id,
-                kind="inferred_delivered",
-                payload={"reply_message_id": 1},
-                created_at=now - timedelta(minutes=1),
-            )
-        )
+def test_wpq12_j_compact_binding_route_has_no_digest_push_or_window_env_read():
+    from cli_agent_orchestrator.api import main as api_main
 
-    first = publish_compact_boundary_digest("22222222", window_min=15, now_utc=now)
-    retry = publish_compact_boundary_digest(
-        "22222222", window_min=15, now_utc=now + timedelta(seconds=10)
-    )
-    assert first is not None and retry is None
-    with scratch_db() as db:
-        assert db.query(InboxModel).filter_by(sender_id="compact-digest").count() == 1
+    source = Path(api_main.__file__).read_text(encoding="utf-8")
+    assert "publish_compact_boundary_digest" not in source
+    assert "CAO_COMPACT_DIGEST_WINDOW_MIN" not in source
 
 
-def test_wpq5_k_real_compact_after_fence_window_publishes_new_digest(scratch_db):
-    now = datetime(2026, 7, 17, 16, 0, tzinfo=timezone.utc)
-    with scratch_db.begin() as db:
-        mailbox(db, terminal_id="22222222")
-        terminal(db, "22222222")
-        row = inbox(db, "22222222", status="delivered", logical="mb_aaaaaaaa")
-        db.flush()
-        db.add(
-            InboxMessageTraceEventModel(
-                message_id=row.id,
-                kind="inferred_delivered",
-                payload={"reply_message_id": 1},
-                created_at=now - timedelta(minutes=1),
-            )
-        )
-
-    first = publish_compact_boundary_digest("22222222", window_min=15, now_utc=now)
-    second = publish_compact_boundary_digest(
-        "22222222", window_min=15, now_utc=now + timedelta(minutes=6)
-    )
-    assert first is not None and second is not None and second != first
-
-
-def test_wpq5_l_empty_zero_window_and_non_mailbox_terminal_publish_nothing(scratch_db):
-    now = datetime(2026, 7, 17, 16, 0, tzinfo=timezone.utc)
-    with scratch_db.begin() as db:
-        mailbox(db, terminal_id="22222222")
-        terminal(db, "22222222")
-        terminal(db, "33333333")
-
-    assert publish_compact_boundary_digest("22222222", window_min=15, now_utc=now) is None
-    assert publish_compact_boundary_digest("22222222", window_min=0, now_utc=now) is None
-    assert publish_compact_boundary_digest("33333333", window_min=15, now_utc=now) is None
+def test_wpq12_k_mailbox_keeps_shared_helpers_but_retires_fence_reader():
+    source = Path(mailbox_service.__file__).read_text(encoding="utf-8")
+    assert "def _bounded_utf8" in source
+    assert "def _digest_summary_lines" in source
+    assert "CAO_COMPACT_DIGEST_FENCE_MIN" not in source
 
 
 def test_wpq1_superseded_digest_chain_uses_direct_structural_counts(scratch_db):

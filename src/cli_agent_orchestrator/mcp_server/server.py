@@ -1836,6 +1836,19 @@ async def list_messages(
 
 
 @mcp.tool()
+async def get_compact_marker(
+    terminal_id: str = Field(description="Terminal whose latest compact marker is requested"),
+) -> Dict[str, Any]:
+    """Return the compact-marker HTTP response body unchanged."""
+    response = cao_http.get(
+        f"/terminals/{terminal_id}/transcript-binding/compact-latest",
+        headers=_api_headers(),
+        timeout=_mcp_timeout(),
+    )
+    return response.json()
+
+
+@mcp.tool()
 async def ack_messages(
     up_to_id: int = Field(gt=0, description="Highest visible message id consumed")
 ) -> Dict[str, Any]:

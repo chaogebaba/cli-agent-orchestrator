@@ -52,6 +52,7 @@ from cli_agent_orchestrator.clients.database import (
     create_transcript_binding,
     fire_due_barriers,
     get_inbox_messages,
+    get_latest_compact_transcript_binding,
     get_message_trace,
     get_terminal_metadata,
     init_db,
@@ -2318,19 +2319,6 @@ async def bind_transcript(
             inode,
             body.source,
         )
-        if body.source == "compact":
-            try:
-                from cli_agent_orchestrator.services.mailbox_service import (
-                    publish_compact_boundary_digest,
-                )
-
-                publish_compact_boundary_digest(
-                    terminal_id,
-                    window_min=int(os.environ.get("CAO_COMPACT_DIGEST_WINDOW_MIN", "15")),
-                    now_utc=datetime.now(timezone.utc),
-                )
-            except Exception:
-                logger.exception("Failed to publish compact digest for terminal %s", terminal_id)
         from cli_agent_orchestrator.services.inbox_service import inbox_service
 
         inbox_service.reset_binding_episodes(terminal_id)
@@ -2340,6 +2328,27 @@ async def bind_transcript(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"invalid_transcript_binding: {exc}",
         ) from exc
+
+
+@app.get("/terminals/{terminal_id}/transcript-binding/compact-latest")
+async def get_latest_compact_transcript_binding_endpoint(
+    terminal_id: TerminalId,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Return the newest persisted compact transcript-binding marker."""
+    row = get_latest_compact_transcript_binding(terminal_id)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "no_compact_binding", "message": "no compact binding"},
+        )
+    received_at = row["received_at"]
+    return {
+        "terminal_id": row["terminal_id"],
+        "source": row["source"],
+        "received_at": received_at.strftime("%Y-%m-%dT%H:%M:%S.%f"),
+        "transcript_path": row["transcript_path"],
+    }
 
 
 @app.post("/terminals/{terminal_id}/input")

@@ -1859,6 +1859,30 @@ def get_current_transcript_binding(terminal_id: str) -> Optional[Dict[str, Any]]
         raise
 
 
+def get_latest_compact_transcript_binding(terminal_id: str) -> Optional[Dict[str, Any]]:
+    """Return the newest compact binding epoch using deterministic ordering."""
+    if not terminal_id:
+        return None
+    try:
+        with SessionLocal() as db:
+            row = (
+                db.query(TranscriptBindingModel)
+                .filter_by(terminal_id=terminal_id, source="compact")
+                .order_by(
+                    TranscriptBindingModel.received_at.desc(),
+                    TranscriptBindingModel.id.desc(),
+                )
+                .first()
+            )
+            if row is None:
+                return None
+            return {column.name: getattr(row, column.name) for column in row.__table__.columns}
+    except Exception as exc:
+        if "no such table: transcript_bindings" in str(exc):
+            return None
+        raise
+
+
 def register_provider_session(*, include_superseded: bool = False, **values: Any) -> Dict[str, Any]:
     """Atomically supersede a ready name and register its replacement."""
     if values.get("name") == "cold":

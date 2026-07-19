@@ -73,9 +73,7 @@ class TestTranscriptBindingEndpoint:
         assert response.status_code == 200
         assert create.call_args.args[3] == transcript.stat().st_ino
 
-    def test_wpq5_m_digest_failure_never_fails_compact_binding_and_noncompact_skips(
-        self, client, tmp_path
-    ):
+    def test_wpq12_compact_and_noncompact_bindings_do_not_publish(self, client, tmp_path):
         transcript = tmp_path / ".claude" / "projects" / "repo" / "session.jsonl"
         transcript.parent.mkdir(parents=True)
         transcript.write_text('{"type":"user"}\n', encoding="utf-8")
@@ -95,12 +93,7 @@ class TestTranscriptBindingEndpoint:
             patch(
                 "cli_agent_orchestrator.api.main.create_transcript_binding",
                 return_value={"id": 1},
-            ),
-            patch(
-                "cli_agent_orchestrator.services.mailbox_service."
-                "publish_compact_boundary_digest",
-                side_effect=RuntimeError("digest unavailable"),
-            ) as digest,
+            ) as create,
         ):
             compact = client.post("/terminals/abcd1234/transcript-binding", json=payload)
             payload["source"] = "startup"
@@ -108,7 +101,89 @@ class TestTranscriptBindingEndpoint:
 
         assert compact.status_code == 200
         assert startup.status_code == 200
-        assert digest.call_count == 1
+        assert create.call_count == 2
+
+    def test_compact_latest_returns_pinned_wire_shape_with_exact_second(self, client):
+        from datetime import datetime
+
+        row = {
+            "id": 9,
+            "terminal_id": "abcd1234",
+            "session_id": "session",
+            "transcript_path": "/tmp/compact.jsonl",
+            "inode": 17,
+            "source": "compact",
+            "received_at": datetime(2026, 7, 18, 12, 34, 56),
+        }
+        with patch(
+            "cli_agent_orchestrator.api.main.get_latest_compact_transcript_binding",
+            return_value=row,
+        ) as lookup:
+            response = client.get(
+                "/terminals/abcd1234/transcript-binding/compact-latest"
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "terminal_id": "abcd1234",
+            "source": "compact",
+            "received_at": "2026-07-18T12:34:56.000000",
+            "transcript_path": "/tmp/compact.jsonl",
+        }
+        lookup.assert_called_once_with("abcd1234")
+
+    def test_compact_latest_missing_returns_pinned_404_envelope(self, client):
+        with patch(
+            "cli_agent_orchestrator.api.main.get_latest_compact_transcript_binding",
+            return_value=None,
+        ):
+            response = client.get(
+                "/terminals/abcd1234/transcript-binding/compact-latest"
+            )
+
+        assert response.status_code == 404
+        assert response.json() == {
+            "detail": {
+                "code": "no_compact_binding",
+                "message": "no compact binding",
+            }
+        }
+
+    def test_compact_latest_auth_enabled_missing_token_is_401_without_read(
+        self, client, monkeypatch
+    ):
+        monkeypatch.setenv("AUTH0_DOMAIN", "tenant.example")
+        monkeypatch.delenv("CAO_AUTH_LOCAL_TOKEN", raising=False)
+        with patch(
+            "cli_agent_orchestrator.api.main.get_latest_compact_transcript_binding"
+        ) as lookup:
+            response = client.get(
+                "/terminals/abcd1234/transcript-binding/compact-latest"
+            )
+        assert response.status_code == 401
+        lookup.assert_not_called()
+
+    def test_compact_latest_write_only_scope_is_403_without_read(
+        self, client, monkeypatch
+    ):
+        from cli_agent_orchestrator.security import auth
+
+        async def write_only():
+            return [auth.SCOPE_WRITE]
+
+        monkeypatch.setenv("CAO_AUTH_JWKS_URI", "https://idp.example/jwks")
+        app.dependency_overrides[auth.get_current_scopes] = write_only
+        try:
+            with patch(
+                "cli_agent_orchestrator.api.main.get_latest_compact_transcript_binding"
+            ) as lookup:
+                response = client.get(
+                    "/terminals/abcd1234/transcript-binding/compact-latest"
+                )
+            assert response.status_code == 403
+            lookup.assert_not_called()
+        finally:
+            app.dependency_overrides.pop(auth.get_current_scopes, None)
 
     @pytest.mark.parametrize("case", ["mismatch", "outside"])
     def test_binding_rejections_are_route_local_400(self, client, tmp_path, case):
