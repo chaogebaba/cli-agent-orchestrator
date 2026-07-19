@@ -74,8 +74,9 @@ from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, Orc
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
+from cli_agent_orchestrator.providers.base import ProviderCapabilities
 from cli_agent_orchestrator.providers.manager import provider_manager
-from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.services import receiver_state_view, terminal_service
 from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.message_trace_service import (
@@ -1301,11 +1302,15 @@ class InboxService:
                     admission_kind = "corrective" if gate_state == "inject" else "ordinary"
                     eager_eligible = False
                     if gate_state == "normal":
-                        if (
-                            legacy_test_seam
-                            and status_monitor.get_status(terminal_id)
-                            == TerminalStatus.WAITING_USER_ANSWER
-                        ):
+                        if legacy_test_seam and (
+                            admission_status := receiver_state_view.snapshot_view(
+                                "delivery.admission_status",
+                                terminal_id,
+                                max_age_s=5.0,
+                                none_behavior="none",
+                                monitor=status_monitor,
+                            )
+                        ) in (None, TerminalStatus.WAITING_USER_ANSWER):
                             return
                         if not legacy_test_seam:
                             try:
@@ -1318,7 +1323,15 @@ class InboxService:
                             getattr(admission_snapshot, "status", None), TerminalStatus
                         ):
                             admission_snapshot = None
-                            status = status_monitor.get_status(terminal_id)
+                            status = receiver_state_view.snapshot_view(
+                                "delivery.admission_status",
+                                terminal_id,
+                                max_age_s=5.0,
+                                none_behavior="none",
+                                monitor=status_monitor,
+                            )
+                            if status is None:
+                                return
                             if metadata.get("provider") == "claude_code" and status not in {
                                 TerminalStatus.IDLE,
                                 TerminalStatus.COMPLETED,
@@ -1353,9 +1366,22 @@ class InboxService:
                             ):
                                 if provider is None:
                                     provider = provider_manager.get_provider(terminal_id)
-                                eager_eligible = provider is not None and getattr(
-                                    provider, "accepts_input_while_processing", False
+                                capabilities = (
+                                    getattr(provider, "capabilities", None)
+                                    if provider is not None
+                                    else None
                                 )
+                                if not isinstance(capabilities, ProviderCapabilities):
+                                    capabilities = ProviderCapabilities(
+                                        accepts_input_while_processing=bool(
+                                            getattr(
+                                                provider,
+                                                "accepts_input_while_processing",
+                                                False,
+                                            )
+                                        )
+                                    )
+                                eager_eligible = capabilities.accepts_input_while_processing
                             if not eager_eligible:
                                 return
                     ambiguous_count = count_ambiguous_attempts(message_ids)
@@ -1538,8 +1564,16 @@ class InboxService:
                     if (
                         legacy_test_seam
                         and gate_state == "normal"
-                        and status_monitor.get_status(terminal_id)
-                        == TerminalStatus.WAITING_USER_ANSWER
+                        and (
+                            admission_status := receiver_state_view.snapshot_view(
+                                "delivery.admission_status",
+                                terminal_id,
+                                max_age_s=5.0,
+                                none_behavior="none",
+                                monitor=status_monitor,
+                            )
+                        )
+                        in (None, TerminalStatus.WAITING_USER_ANSWER)
                     ):
                         _defer_messages(terminal_id, messages[sent_count:])
                         return
