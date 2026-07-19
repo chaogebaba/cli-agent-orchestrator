@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -22,7 +24,9 @@ from cli_agent_orchestrator.clients.database import (
     settle_terminal_rebound,
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import mailbox_service
+from cli_agent_orchestrator.services.inbox_service import InboxService
 from cli_agent_orchestrator.services.mailbox_service import (
     MailboxClaim,
     MailboxDomainError,
@@ -30,6 +34,11 @@ from cli_agent_orchestrator.services.mailbox_service import (
     list_messages,
     publish_supervisor_incarnation,
 )
+from cli_agent_orchestrator.services.message_trace_service import (
+    TranscriptLiveReference,
+    TranscriptResolution,
+)
+from cli_agent_orchestrator.services.status_monitor import BoundaryObservation
 
 
 @pytest.fixture
@@ -107,6 +116,60 @@ def _message(
     db.add(row)
     db.flush()
     return row
+
+
+def _deliver_and_capture(terminal_id: str) -> list[tuple[str, str]]:
+    pasted: list[tuple[str, str]] = []
+    observation = BoundaryObservation("wpq11", TerminalStatus.IDLE, 3, 1, 4, 2, 4)
+    provider = MagicMock()
+    provider.read_composer_draft_state.return_value = "empty"
+    resolution = TranscriptResolution(
+        Path("/trace"),
+        "binding",
+        TranscriptLiveReference(Path("/trace"), 1, 0),
+    )
+
+    def paste(target: str, wire: str, **kwargs):
+        pasted.append((target, wire))
+        callback = kwargs.get("on_submitted")
+        if callback is not None:
+            callback(observation)
+        return observation
+
+    with (
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
+            return_value=provider,
+        ),
+        patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.resolve_session_transcript",
+            return_value=resolution,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.terminal_service.prepare_input",
+            side_effect=lambda _target, value, _kind, **_kwargs: value,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.terminal_service.send_prepared_input",
+            side_effect=paste,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.confirm_delivery",
+            return_value=("unverified", {"kind": "send_returned_unverified"}),
+        ),
+        patch.object(InboxService, "_commit_watchdog_ops"),
+    ):
+        monitor.get_boundary_observation.return_value = observation
+        monitor.get_status.return_value = TerminalStatus.IDLE
+        monitor.get_input_gen.return_value = 1
+        monitor.get_status_gen.return_value = 1
+        monitor.probe_screen_status.return_value = (
+            TerminalStatus.IDLE,
+            {"result_status": "idle", "law_signal": {"class": "chrome"}},
+        )
+        InboxService().deliver_pending(terminal_id, num_messages=0)
+    return pasted
 
 
 def test_fresh_publication_advances_cursor_and_parks_mixed_backlog_without_push(park_db):
@@ -270,3 +333,88 @@ def test_fallback_resume_routes_exact_owner_and_trigger_keeps_owner_immutable(pa
                 text("UPDATE inbox SET owner_receiver_id='22222222' WHERE id=:id"),
                 {"id": raw.id},
             )
+
+
+@pytest.mark.parametrize("variant", ["raw_in_place", "raw_fallback", "logical_fallback"])
+def test_reactivated_row_reaches_ordinary_delivery(park_db, variant):
+    source, replacement = "11111111", "22222222"
+    with park_db.begin() as db:
+        if variant == "raw_in_place":
+            _terminal(db, source, 3)
+            target = source
+            owner_generation = 3
+            logical_receiver_id = None
+        elif variant == "raw_fallback":
+            _terminal(db, source, 5, recovery_state="fallback_starting")
+            _terminal(db, replacement, 7, provider_session_id="provider-session")
+            target = replacement
+            owner_generation = 5
+            logical_receiver_id = None
+        else:
+            _terminal(db, source, 5, recovery_state="fallback_starting")
+            _terminal(db, replacement, 7, provider_session_id="provider-session")
+            _mailbox(db, source, 2)
+            target = replacement
+            owner_generation = 2
+            logical_receiver_id = "mb_aaaaaaaa"
+        row = _message(
+            db,
+            receiver_id=source,
+            status=MessageStatus.PARKED,
+            logical_receiver_id=logical_receiver_id,
+            enqueue_generation=owner_generation,
+            body=variant,
+        )
+        row.owner_receiver_id = source
+        row.owner_generation = owner_generation
+        message_id = int(row.id)
+
+    if variant == "raw_in_place":
+        assert settle_terminal_rebound(source, "provider-session", "codex resume") == 4
+    else:
+        assert settle_terminal_fallback(source, replacement) == 1
+    assert digest_stale_pending_for_terminal(target) == 0
+
+    pasted = _deliver_and_capture(target)
+
+    with park_db() as db:
+        delivered = db.get(InboxModel, message_id)
+        assert delivered.status == MessageStatus.DELIVERED.value
+        assert (delivered.owner_receiver_id, delivered.owner_generation) == (
+            source,
+            owner_generation,
+        )
+    assert len(pasted) == 1
+    assert pasted[0][0] == target
+    assert variant in pasted[0][1]
+
+
+def test_fresh_successor_reparks_fallback_commit_without_rewriting_owner(park_db):
+    source, replacement, successor = "11111111", "22222222", "33333333"
+    with park_db.begin() as db:
+        _terminal(db, source, 5, recovery_state="fallback_starting")
+        _terminal(db, replacement, 7, provider_session_id="provider-session")
+        _terminal(db, successor, 0)
+        _mailbox(db, source, 2)
+        row = _message(
+            db,
+            receiver_id=source,
+            status=MessageStatus.PARKED,
+            logical_receiver_id="mb_aaaaaaaa",
+            enqueue_generation=2,
+            body="callback survives crash-before-wake",
+        )
+        row.owner_receiver_id, row.owner_generation = source, 2
+        message_id = int(row.id)
+
+    assert settle_terminal_fallback(source, replacement) == 1
+    publication = publish_supervisor_incarnation(
+        MailboxClaim("cao-wpq11", "supervisor", "mb_aaaaaaaa", 2), successor
+    )
+
+    assert publication["digest_message_id"] is None
+    with park_db() as db:
+        parked = db.get(InboxModel, message_id)
+        assert parked.status == MessageStatus.PARKED.value
+        assert (parked.owner_receiver_id, parked.owner_generation) == (source, 2)
+        assert parked.receiver_id == replacement

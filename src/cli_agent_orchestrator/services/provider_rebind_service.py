@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
+    fail_terminal_rebound,
     get_terminal_metadata,
     has_unsettled_delivery_attempt,
     list_terminals_by_session,
@@ -260,6 +261,7 @@ async def rebind_terminal(
     guard_released = False
     prepared_recovery = None
     wake_terminal_id: str | None = None
+    rebound_generation: int | None = None
     phase = "p2"
     try:
         await guard.acquire()
@@ -398,9 +400,9 @@ async def rebind_terminal(
         if raw not in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}:
             raise RuntimeError("candidate_not_ready")
         phase = "p13"
-        if not settle_terminal_rebound(terminal_id, session_uuid, baseline):
+        rebound_generation = settle_terminal_rebound(terminal_id, session_uuid, baseline)
+        if not rebound_generation:
             raise RuntimeError("identity_persist_failed")
-        wake_terminal_id = terminal_id
         phase = "p14"
         try:
             stalled_callback_watchdog.resume_terminal(terminal_id, watchdog_snapshot)
@@ -410,6 +412,9 @@ async def rebind_terminal(
                 terminal_id, watchdog_snapshot
             )
             watchdog_snapshot = None
+            if rebound_generation is not None:
+                fail_terminal_rebound(terminal_id, rebound_generation, "watchdog_resume_failed")
+                rebound_generation = None
             set_terminal_recovery_state(terminal_id, "rebind_failed", "watchdog_resume_failed")
             if prepared_recovery is not None:
                 from cli_agent_orchestrator.services.terminal_service import exit_terminal_cli
@@ -446,6 +451,7 @@ async def rebind_terminal(
                     prepared_recovery, show=bool((content_options or {}).get("show"))
                 )
             return result
+        wake_terminal_id = terminal_id
         phase = "p15"
         try:
             await guard.close()
@@ -496,6 +502,10 @@ async def rebind_terminal(
             )
         return result
     except asyncio.CancelledError:
+        if rebound_generation is not None:
+            wake_terminal_id = None
+            fail_terminal_rebound(terminal_id, rebound_generation, "rebind_cancelled")
+            rebound_generation = None
         raise
     except Exception as exc:
         if metadata and exited:

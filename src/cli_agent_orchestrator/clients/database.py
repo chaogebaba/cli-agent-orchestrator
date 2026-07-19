@@ -1746,6 +1746,71 @@ def settle_terminal_rebound(
         return int(row.lifecycle_generation)
 
 
+def fail_terminal_rebound(
+    terminal_id: str,
+    lifecycle_generation: int,
+    error: str,
+) -> int:
+    """Atomically fail a proven rebound and re-park its reactivated mail."""
+    with SessionLocal.begin() as db:
+        terminal = db.query(TerminalModel).filter_by(id=terminal_id).one_or_none()
+        if terminal is None:
+            raise RuntimeError("terminal_missing_after_rebound")
+        if int(terminal.lifecycle_generation) != lifecycle_generation:
+            raise RuntimeError("rebound_generation_changed")
+
+        terminal.recovery_state = "rebind_failed"
+        terminal.recovery_error = error[:2048]
+        terminal.recovery_updated_at = _utcnow()
+
+        changed = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.logical_receiver_id.is_(None),
+                InboxModel.receiver_id == terminal_id,
+                InboxModel.enqueue_generation == lifecycle_generation,
+                InboxModel.owner_receiver_id == terminal_id,
+                InboxModel.owner_generation == lifecycle_generation - 1,
+            )
+            .update(
+                {
+                    InboxModel.status: MessageStatus.PARKED.value,
+                    InboxModel.digested_into: None,
+                },
+                synchronize_session=False,
+            )
+        )
+
+        incarnation = (
+            db.query(MailboxIncarnationModel).filter_by(terminal_id=terminal_id).one_or_none()
+        )
+        if incarnation is not None:
+            mailbox_generation = (
+                db.query(MailboxModel.generation).filter_by(id=incarnation.mailbox_id).scalar()
+            )
+            if type(mailbox_generation) is int:
+                changed += (
+                    db.query(InboxModel)
+                    .filter(
+                        InboxModel.status == MessageStatus.PENDING.value,
+                        InboxModel.logical_receiver_id == incarnation.mailbox_id,
+                        InboxModel.receiver_id == terminal_id,
+                        InboxModel.enqueue_generation == int(mailbox_generation),
+                        InboxModel.owner_receiver_id == terminal_id,
+                        InboxModel.owner_generation == int(incarnation.generation),
+                    )
+                    .update(
+                        {
+                            InboxModel.status: MessageStatus.PARKED.value,
+                            InboxModel.digested_into: None,
+                        },
+                        synchronize_session=False,
+                    )
+                )
+        return int(changed)
+
+
 def set_terminal_recovery_state(
     terminal_id: str,
     state: RecoveryState | None,

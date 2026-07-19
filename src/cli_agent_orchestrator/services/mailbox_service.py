@@ -141,13 +141,16 @@ def _park_inbox_row(
     *,
     logical_default_generation: int | None = None,
 ) -> None:
-    with db.no_autoflush:
-        owner_receiver_id = row.receiver_id
-        owner_generation = _park_owner_generation(
-            db, row, logical_default_generation=logical_default_generation
-        )
-    row.owner_receiver_id = owner_receiver_id
-    row.owner_generation = owner_generation
+    if row.owner_receiver_id is None and row.owner_generation is None:
+        with db.no_autoflush:
+            owner_receiver_id = row.receiver_id
+            owner_generation = _park_owner_generation(
+                db, row, logical_default_generation=logical_default_generation
+            )
+        row.owner_receiver_id = owner_receiver_id
+        row.owner_generation = owner_generation
+    elif row.owner_receiver_id is None or row.owner_generation is None:
+        raise RuntimeError("parked_owner_incomplete")
     row.status = MessageStatus.PARKED.value
     row.digested_into = None
 
