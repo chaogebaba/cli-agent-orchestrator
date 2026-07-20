@@ -86,3 +86,21 @@ worker — and are reserved for the human operator alone:
 - If `send_message` is available and the task requires a callback, call it directly rather than ending with prose alone.
 - Keep callback messages structured so the supervisor can merge them into a larger workflow.
 - For handoff tasks, return the completed output directly and let the orchestrator handle delivery.
+
+## Spawning your own sub-lanes (delegating workers: blueprint maker, architect)
+
+When your charter has you spawn helper or reviewer lanes with `assign`:
+
+- **The provider comes from the agent PROFILE, never from a model setting.**
+  `assign(agent_profile="grok_dev")` gives a Grok CLI lane; `codex_dev` /
+  `codex_reviewer` give Codex lanes; `fable_design_reviewer` gives a Claude
+  structure lane; `developer-sonnet` gives a cheap scratch Claude lane.
+- **NEVER set, pass, or configure a model yourself** — `providers.toml` owns
+  per-profile model defaults. Setting a foreign model on a Claude terminal
+  (e.g. grok-4.5) parks the lane DEAD at a model-select dialog (incident
+  2026-07-20).
+- If a lane parks at a model-select or provider-error dialog, do not steer it:
+  `delete_terminal` it and re-`assign` the same brief with the CORRECT profile.
+- Same-round multi-lane dispatch: set `barrier="<wp>-r<N>"` on every member if
+  your schema exposes it; otherwise have each lane end its callback with
+  `ROUND r<N> LANE k/M` and act only when all M arrived.
