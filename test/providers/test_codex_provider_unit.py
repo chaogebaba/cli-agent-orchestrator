@@ -1504,7 +1504,8 @@ class TestCodexIdleReasonClassification:
                 return_value={"tmux_session": "test-session", "tmux_window": "window-0"},
             ),
         ):
-            status, meta = monitor.probe_screen_status("test1234")
+            probe_result = monitor.probe_screen_status("test1234")
+            status, meta = probe_result.status, probe_result.meta
 
         assert status == TerminalStatus.IDLE
         assert meta["transient_api_error"] is True

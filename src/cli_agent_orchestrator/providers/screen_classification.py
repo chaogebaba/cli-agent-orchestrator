@@ -1,6 +1,7 @@
 """Compatibility imports for the kernel-owned screen-classification law."""
 
 from cli_agent_orchestrator.kernel.receiver_state.classification import (
+    AnchorSpec,
     ScreenClassification,
     ScreenClassificationResult,
     ScreenSignal,
@@ -11,6 +12,7 @@ from cli_agent_orchestrator.kernel.receiver_state.classification import (
 )
 
 __all__ = [
+    "AnchorSpec",
     "ScreenClassification",
     "ScreenClassificationResult",
     "ScreenSignal",

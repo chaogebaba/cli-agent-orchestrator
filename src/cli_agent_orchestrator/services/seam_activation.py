@@ -27,6 +27,10 @@ ConsumerOp: TypeAlias = Literal[
     "watchdog.ready_backlog_gate",
     "agent_step.status_reads",
     "delivery.admission_status",
+    "watchdog.pane_classify",
+    "delivery.fresh_probe",
+    "delivery.park_identity_probe",
+    "auto_responder.frame_classify",
 ]
 
 

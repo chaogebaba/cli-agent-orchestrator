@@ -380,7 +380,8 @@ def test_wpq8_m7_m10_hazard_comes_from_one_fresh_probe_frame(monkeypatch):
         },
     )
 
-    status, meta = monitor.probe_screen_status("worker")
+    probe_result = monitor.probe_screen_status("worker")
+    status, meta = probe_result.status, probe_result.meta
 
     assert status == TerminalStatus.WAITING_USER_ANSWER
     assert meta["frame_source"] == "fresh_capture"

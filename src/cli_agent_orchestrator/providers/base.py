@@ -29,8 +29,11 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
 from cli_agent_orchestrator.providers.screen_classification import (
+    AnchorSpec,
     ScreenClassification,
     ScreenClassificationResult,
+    ScreenSignal,
+    classify_screen_signals,
     screen_classification_result,
 )
 
@@ -45,6 +48,8 @@ class ProviderCapabilities:
     supports_screen_detection: bool = False
     accepts_input_while_processing: bool = False
     paste_enter_count: int = 1
+    signal_kinds: frozenset[str] = frozenset()
+    liveness_anchor: AnchorSpec | None = None
 
 
 class ArtifactValidationError(Exception):
@@ -71,6 +76,8 @@ class BaseProvider(ABC):
     supports_fork_context: bool = False
     supports_reauth_rebind: bool = False
     supports_seed_resume_identity: bool = False
+    signal_kinds: frozenset[str] = frozenset()
+    liveness_anchor: AnchorSpec | None = None
     """Abstract base class for CLI tool providers.
 
     All CLI providers must inherit from this class and implement the abstract methods.
@@ -174,6 +181,8 @@ class BaseProvider(ABC):
             supports_screen_detection=bool(self.supports_screen_detection),
             accepts_input_while_processing=bool(self.accepts_input_while_processing),
             paste_enter_count=int(self.paste_enter_count),
+            signal_kinds=frozenset(self.signal_kinds),
+            liveness_anchor=self.liveness_anchor,
         )
 
     @property
@@ -259,6 +268,9 @@ class BaseProvider(ABC):
         Providers migrated to the shared law override this. The fallback keeps
         third-party providers source-compatible but deliberately emits no signal.
         """
+        if type(self).emit_screen_signals is not BaseProvider.emit_screen_signals:
+            signals = self.emit_screen_signals(screen_lines)
+            return screen_classification_result(signals)
         status = self.get_status_from_screen(screen_lines)
         if status == TerminalStatus.RENDER_UNCERTAIN:
             status = TerminalStatus.UNKNOWN
@@ -266,6 +278,10 @@ class BaseProvider(ABC):
         if status == TerminalStatus.UNKNOWN:
             return result
         return ScreenClassificationResult(ScreenClassification(status, "none", None, None), ())
+
+    def emit_screen_signals(self, screen_lines: List[str]) -> tuple[ScreenSignal, ...]:
+        """Return raw producer signals; signal-emitting providers override this."""
+        return ()
 
     def transient_error_detected(
         self, rows: List[str], classification: ScreenClassificationResult

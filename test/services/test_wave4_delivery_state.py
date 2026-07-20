@@ -91,7 +91,8 @@ def _assert_animated_probe_stays_processing(provider, initial_rows, animated_row
         ),
         patch("cli_agent_orchestrator.services.status_monitor.time.sleep"),
     ):
-        status, meta = monitor.probe_screen_status("receiver")
+        probe_result = monitor.probe_screen_status("receiver")
+        status, meta = probe_result.status, probe_result.meta
     assert status == TerminalStatus.PROCESSING
     assert "temporal_demotion" not in meta
     assert backend.capture_viewport.call_count == 2
@@ -361,7 +362,8 @@ def test_probe_08_typed_screen_probe_uses_one_frame_and_named_source_signal():
             },
         ),
     ):
-        status, meta = monitor.probe_screen_status("receiver")
+        probe_result = monitor.probe_screen_status("receiver")
+        status, meta = probe_result.status, probe_result.meta
     backend.capture_viewport.assert_called_once_with("session", "receiver")
     assert status == TerminalStatus.PROCESSING
     assert set(meta) == {
@@ -401,7 +403,8 @@ def test_probe_08_typed_screen_probe_uses_one_frame_and_named_source_signal():
             return_value={"tmux_session": "session", "tmux_window": "receiver"},
         ),
     ):
-        first_status, first_meta = monitor.probe_screen_status("receiver")
+        first_result = monitor.probe_screen_status("receiver")
+        first_status, first_meta = first_result.status, first_result.meta
     assert backend.get_native_status.call_count == 0
     backend.capture_viewport.assert_called_once_with("session", "receiver")
     assert first_status == TerminalStatus.COMPLETED
@@ -436,7 +439,8 @@ def test_wpq1_identity_failure_fences_ready_capture_and_projects_reason(reason):
             return_value={"tmux_session": "session", "tmux_window": "receiver"},
         ),
     ):
-        status, meta = monitor.probe_screen_status("receiver")
+        probe_result = monitor.probe_screen_status("receiver")
+        status, meta = probe_result.status, probe_result.meta
 
     assert status == TerminalStatus.UNKNOWN
     assert meta["identity_proof_failure"] == reason
@@ -836,7 +840,7 @@ def test_probe_08_every_emitted_provider_signal_names_a_module_constant():
         codex: CodexProvider,
     }
     for module, provider in providers.items():
-        tree = ast.parse(textwrap.dedent(inspect.getsource(provider.classify_screen)))
+        tree = ast.parse(textwrap.dedent(inspect.getsource(provider.emit_screen_signals)))
         emitted = {
             call.args[1].value
             for call in ast.walk(tree)

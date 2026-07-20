@@ -361,7 +361,8 @@ def test_d4_transport_uses_only_fresh_final_frame_for_transient_key(monkeypatch)
         lambda _terminal: {"tmux_session": "session", "tmux_window": "window"},
     )
 
-    status, meta = monitor.probe_screen_status("worker")
+    probe_result = monitor.probe_screen_status("worker")
+    status, meta = probe_result.status, probe_result.meta
 
     assert status == TerminalStatus.IDLE
     assert meta["frame_source"] == "fresh_capture"

@@ -380,7 +380,9 @@ class GrokCliProvider(BaseProvider):
 
         return TerminalStatus.PROCESSING
 
-    def classify_screen(self, screen_lines: List[str]) -> ScreenClassificationResult:
+    signal_kinds = frozenset({"waiting", "error", "progress", "completion", "chrome"})
+
+    def emit_screen_signals(self, screen_lines: List[str]) -> tuple[ScreenSignal, ...]:
         rows = [line.rstrip() for line in screen_lines]
         while rows and not rows[-1].strip():
             rows.pop()
@@ -414,7 +416,7 @@ class GrokCliProvider(BaseProvider):
                 signals.append(ScreenSignal("chrome", "IDLE_FOOTER_PATTERN", index))
             if re.search(COMPOSER_PROMPT_PATTERN, row):
                 signals.append(ScreenSignal("chrome", "COMPOSER_PROMPT_PATTERN", index))
-        return screen_classification_result(signals)
+        return tuple(signals)
 
     def classify_injection_hazard(self, rows: List[str]) -> str | None:
         return (

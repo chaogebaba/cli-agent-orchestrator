@@ -5,6 +5,7 @@ Publisher: terminal.{id}.status
 """
 
 import asyncio
+import copy
 import hashlib
 import logging
 import threading
@@ -22,7 +23,9 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.kernel.receiver_state import (
     FreshnessProof,
+    FreshToken,
     PassOutcome,
+    ProbeEvidence,
     ReceiverState,
     ReceiverStateStore,
     pass_outcome_for_source,
@@ -85,6 +88,24 @@ class ScreenProbeMeta(TypedDict):
 class ScreenProbeTemporalDemotion(TypedDict):
     frames: int
     multiset_sha256: str
+
+
+@dataclass(frozen=True)
+class IdentityProof:
+    terminal_id: str
+    method: Literal["pane_readback", "native"]
+    proven_at_mono: float
+    failure: str | None
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    status: TerminalStatus
+    meta: ScreenProbeMeta
+    fresh_token: FreshToken
+
+
+PROOF_MAX_AGE_S = 2.0
 
 
 def _frame_rows_hash(rows: List[str]) -> str:
@@ -224,6 +245,11 @@ class StatusMonitor:
         frame_source: Literal["incremental", "fresh_capture"],
         metadata: dict[str, Any] | None = None,
         freshness_proof: FreshnessProof | None = None,
+        captured_at_mono: float | None = None,
+        raw_classification: object | None = None,
+        probe_evidence: ProbeEvidence | None = None,
+        origin: Literal["incremental", "probe", "forced"] | None = None,
+        fresh_token: FreshToken | None = None,
     ) -> None:
         """Build and publish one receiver observation. Caller holds ``_lock``."""
 
@@ -238,13 +264,171 @@ class StatusMonitor:
                 observation_sequence=self._observation_seq.get(terminal_id, 0),
                 provider=str(metadata["provider"]),
                 frame_source=frame_source,
-                captured_at_mono=time.monotonic(),
+                captured_at_mono=(
+                    time.monotonic() if captured_at_mono is None else captured_at_mono
+                ),
                 frame_hash=None,
                 latched_status=latched_status,
                 pass_outcome=pass_outcome,
                 freshness_proof=freshness_proof or FreshnessProof("not_probed"),
-            )
+                origin=(
+                    origin
+                    if origin is not None
+                    else "forced" if pass_outcome == "forced" else "incremental"
+                ),
+                raw_classification=raw_classification,
+                probe_evidence=probe_evidence,
+            ),
+            fresh_token=fresh_token,
         )
+
+    @staticmethod
+    def _signal_emitting(provider: object) -> bool:
+        from cli_agent_orchestrator.providers.base import BaseProvider
+
+        return (
+            getattr(type(provider), "emit_screen_signals", BaseProvider.emit_screen_signals)
+            is not BaseProvider.emit_screen_signals
+        )
+
+    def _prior_signals(
+        self, terminal_id: str, metadata: dict[str, Any], *, prefer_fresh: bool
+    ) -> tuple[object, ...]:
+        prior = self._receiver_state_store.prior_classification(
+            (
+                terminal_id,
+                int(metadata["lifecycle_generation"]),
+                str(metadata["tmux_window"]),
+            ),
+            prefer_fresh=prefer_fresh,
+        )
+        return () if prior is None else prior.signals
+
+    def _classify_frame(
+        self,
+        terminal_id: str,
+        provider: object,
+        rows: List[str],
+        metadata: dict[str, Any],
+        *,
+        prefer_fresh: bool,
+    ) -> tuple[TerminalStatus, object | None, object]:
+        from cli_agent_orchestrator.providers.screen_classification import (
+            ScreenClassification,
+            ScreenClassificationResult,
+            screen_classification_result,
+        )
+
+        if self._signal_emitting(provider):
+            signals = provider.emit_screen_signals(rows)
+            result = screen_classification_result(
+                signals,
+                self._prior_signals(terminal_id, metadata, prefer_fresh=prefer_fresh),
+                provider.capabilities.liveness_anchor,
+            )
+            return result.status, result, result
+        status = provider.get_status_from_screen(rows)
+        if status == TerminalStatus.RENDER_UNCERTAIN:
+            status = TerminalStatus.UNKNOWN
+        hook_result = ScreenClassificationResult(
+            ScreenClassification(status, "none", None, None), ()
+        )
+        return status, None, hook_result
+
+    def prove_terminal_identity(self, terminal_id: str) -> IdentityProof:
+        """Return a closed identity proof for the terminal's current route."""
+
+        from cli_agent_orchestrator.backends.registry import get_backend
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+        try:
+            metadata = get_terminal_metadata(terminal_id)
+            if not metadata:
+                return IdentityProof(
+                    terminal_id, "pane_readback", time.monotonic(), "metadata_missing"
+                )
+            backend = get_backend()
+            if getattr(backend, "supports_identity_readback", False) is not True:
+                result = backend.read_native_identity(
+                    terminal_id,
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    metadata.get("provider", "unknown"),
+                )
+                verdict = getattr(result, "verdict", None)
+                failure = (
+                    None
+                    if verdict == "match" or verdict not in {"mismatch", "unavailable"}
+                    else f"native_identity_{verdict}"
+                )
+                return IdentityProof(terminal_id, "native", time.monotonic(), failure)
+            from cli_agent_orchestrator.services.pane_identity_service import (
+                pane_identity_failure,
+            )
+
+            failure = pane_identity_failure(terminal_id, metadata, backend)
+            return IdentityProof(terminal_id, "pane_readback", time.monotonic(), failure)
+        except Exception as exc:
+            return IdentityProof(
+                terminal_id,
+                "pane_readback",
+                time.monotonic(),
+                f"identity_exception:{type(exc).__name__}",
+            )
+
+    def publish_fresh_observation(
+        self,
+        terminal_id: str,
+        frame: List[str],
+        frame_captured_at_mono: float,
+        classification: object,
+        frame_source: ScreenProbeFrameSource,
+        proof: IdentityProof,
+    ) -> FreshToken:
+        """Publish one proven capture while containing only publication faults."""
+
+        if proof.terminal_id != terminal_id:
+            raise ValueError("identity proof terminal mismatch")
+        proof_age = frame_captured_at_mono - proof.proven_at_mono
+        if proof_age < 0 or proof_age > PROOF_MAX_AGE_S:
+            raise ValueError("identity proof outside capture age bound")
+        with self._lock:
+            epoch = self._epoch_locked(terminal_id)
+        token = self._receiver_state_store.mint_token(terminal_id, epoch)
+        try:
+            from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+            metadata = get_terminal_metadata(terminal_id)
+            if metadata is None:
+                raise LookupError(f"terminal metadata unavailable for {terminal_id}")
+            raw = (
+                classification
+                if self._signal_emitting(provider_manager.get_provider(terminal_id))
+                else None
+            )
+            status = classification.status
+            with self._lock:
+                self._publish_observation(
+                    terminal_id,
+                    latched_status=status,
+                    pass_outcome="probe",
+                    frame_source=frame_source,
+                    metadata=metadata,
+                    freshness_proof=FreshnessProof(
+                        "identity_ok" if proof.failure is None else "identity_failed",
+                        proof.failure,
+                    ),
+                    captured_at_mono=frame_captured_at_mono,
+                    raw_classification=raw,
+                    origin="probe",
+                    fresh_token=token,
+                )
+        except Exception:
+            try:
+                self._log_receiver_publish_failure(terminal_id)
+            except Exception:
+                pass
+        return token
 
     def _log_receiver_publish_failure(self, terminal_id: str) -> None:
         """Rate-limit hook-failure tracebacks without changing pass behavior."""
@@ -372,6 +556,7 @@ class StatusMonitor:
         trusted_busy: bool = False,
         expected_seq: Optional[int] = None,
         pass_source: Literal["inline", "forced"] = "inline",
+        raw_classification: object | None = None,
     ) -> None:
         """Apply the sticky-latch rules to a freshly detected status and publish
         on change. Shared by the raw and pyte detection paths.
@@ -489,12 +674,18 @@ class StatusMonitor:
                             publish_external = True
             finally:
                 try:
+                    evidence_kwargs = (
+                        {"raw_classification": raw_classification}
+                        if pass_source != "forced" and raw_classification is not None
+                        else {}
+                    )
                     self._publish_observation(
                         terminal_id,
                         latched_status=self._last_status.get(terminal_id, TerminalStatus.UNKNOWN),
                         pass_outcome=pass_outcome,
                         frame_source="incremental",
                         metadata=observation_metadata,
+                        **evidence_kwargs,
                     )
                 except Exception:
                     try:
@@ -582,10 +773,12 @@ class StatusMonitor:
 
     def _detect_screen(self, terminal_id: str, provider) -> TerminalStatus:
         """Detect status from the terminal's composited pyte screen."""
-        detected, _trusted_busy = self._detect_screen_with_trust(terminal_id, provider)
+        detected, _trusted_busy, _raw = self._detect_screen_with_trust(terminal_id, provider)
         return detected
 
-    def _detect_screen_with_trust(self, terminal_id: str, provider) -> Tuple[TerminalStatus, bool]:
+    def _detect_screen_with_trust(
+        self, terminal_id: str, provider
+    ) -> tuple[TerminalStatus, bool, object | None]:
         """Detect screen status plus whether PROCESSING is a trusted screen read."""
         fallback_buffer: Optional[str] = None
         with self._lock:
@@ -605,14 +798,14 @@ class StatusMonitor:
                 lines = []
         if fallback_buffer is not None:
             if provider is None:
-                return TerminalStatus.UNKNOWN, False
+                return TerminalStatus.UNKNOWN, False, None
             try:
-                return provider.get_status(fallback_buffer), False
+                return provider.get_status(fallback_buffer), False, None
             except Exception:
                 logger.exception("Error detecting fallback status for %s", terminal_id)
-                return TerminalStatus.UNKNOWN, False
+                return TerminalStatus.UNKNOWN, False, None
         if not lines or provider is None:
-            return TerminalStatus.UNKNOWN, False
+            return TerminalStatus.UNKNOWN, False, None
 
         # Auto-responder: inspect the same composited screen for whitelisted
         # blocking dialogs (whitelist-only auto-answer, or WAITING_USER_ANSWER
@@ -625,17 +818,36 @@ class StatusMonitor:
 
             override = auto_responder.on_screen(terminal_id, provider, lines)
             if override is not None:
-                return override, False
+                return override, False, None
         except Exception:
             logger.exception("Error in auto-responder for %s", terminal_id)
 
         try:
-            return provider.get_status_from_screen(lines), True
+            legacy_status = provider.get_status_from_screen(lines)
+            raw = None
+            if self._signal_emitting(provider):
+                try:
+                    from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+                    metadata = get_terminal_metadata(terminal_id)
+                    if metadata is not None:
+                        _status, raw, _hooks = self._classify_frame(
+                            terminal_id,
+                            provider,
+                            lines,
+                            metadata,
+                            prefer_fresh=False,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Error producing incremental receiver evidence for %s", terminal_id
+                    )
+            return legacy_status, True, raw
         except Exception:
             # Full traceback: screen detectors are new and can trip on
             # unexpected TUI frames; the stack makes such regressions debuggable.
             logger.exception(f"Error detecting screen status for {terminal_id}")
-            return TerminalStatus.UNKNOWN, False
+            return TerminalStatus.UNKNOWN, False, None
 
     def _schedule_screen_detection(
         self, terminal_id: str, provider, chunk_seq: Optional[int] = None
@@ -654,12 +866,13 @@ class StatusMonitor:
         if loop is None:
             # No event loop (unit tests / offline replay): detect immediately
             # on the current screen — deterministic, no timing.
-            detected, trusted_busy = self._detect_screen_with_trust(terminal_id, provider)
+            detected, trusted_busy, raw = self._detect_screen_with_trust(terminal_id, provider)
             self._apply_detection(
                 terminal_id,
                 detected,
                 trusted_busy=trusted_busy,
                 expected_seq=chunk_seq,
+                raw_classification=raw,
             )
             return
 
@@ -674,21 +887,23 @@ class StatusMonitor:
         self._cancel_quiesce_handle(handle)
 
         if not was_bursting:
-            detected, trusted_busy = self._detect_screen_with_trust(terminal_id, provider)
+            detected, trusted_busy, raw = self._detect_screen_with_trust(terminal_id, provider)
             self._apply_detection(
                 terminal_id,
                 detected,
                 trusted_busy=trusted_busy,
                 expected_seq=chunk_seq,
+                raw_classification=raw,
             )
         elif armed or last_status in _STICKY_READY_STATUSES or last_status is None:
-            detected, trusted_busy = self._detect_screen_with_trust(terminal_id, provider)
+            detected, trusted_busy, raw = self._detect_screen_with_trust(terminal_id, provider)
             if detected == TerminalStatus.PROCESSING:
                 self._apply_detection(
                     terminal_id,
                     detected,
                     trusted_busy=trusted_busy,
                     expected_seq=chunk_seq,
+                    raw_classification=raw,
                 )
 
         self._arm_quiesce_timer(loop, terminal_id, self._on_screen_quiescent, provider, chunk_seq)
@@ -708,7 +923,7 @@ class StatusMonitor:
             self._quiesce_handle.pop(terminal_id, None)
 
         async def _detect_and_apply() -> None:
-            detected, trusted_busy = await asyncio.to_thread(
+            detected, trusted_busy, raw = await asyncio.to_thread(
                 self._detect_screen_with_trust, terminal_id, provider
             )
             with self._lock:
@@ -719,16 +934,18 @@ class StatusMonitor:
                 detected,
                 trusted_busy=trusted_busy,
                 expected_seq=expected_seq,
+                raw_classification=raw,
             )
 
         loop = self._loop or self._running_loop()
         if loop is None:
-            detected, trusted_busy = self._detect_screen_with_trust(terminal_id, provider)
+            detected, trusted_busy, raw = self._detect_screen_with_trust(terminal_id, provider)
             self._apply_detection(
                 terminal_id,
                 detected,
                 trusted_busy=trusted_busy,
                 expected_seq=expected_seq,
+                raw_classification=raw,
             )
         else:
             self._spawn_tracked(loop, _detect_and_apply())
@@ -1135,8 +1352,290 @@ class StatusMonitor:
         """
         self._apply_detection(terminal_id, status, pass_source="forced")
 
-    def probe_screen_status(self, terminal_id: str) -> Tuple[TerminalStatus, ScreenProbeMeta]:
-        """Classify a frame with temporal progress corroboration before admission."""
+    def _probe_screen_status_stage0b(self, terminal_id: str) -> ProbeResult:
+        from cli_agent_orchestrator.backends.registry import get_backend
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+        from cli_agent_orchestrator.providers.screen_classification import (
+            ScreenClassification,
+            ScreenClassificationResult,
+            screen_classification_result,
+        )
+
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except Exception:
+            provider = None
+        metadata = get_terminal_metadata(terminal_id)
+        backend = get_backend()
+
+        with self._lock:
+            screen_state = self._screens.get(terminal_id)
+            if screen_state is None:
+                rows: List[str] = []
+                columns = 0
+                row_count = 0
+            else:
+                screen = screen_state[0]
+                rows = list(getattr(screen, "display", []))
+                columns = int(getattr(screen, "columns", 0))
+                row_count = int(getattr(screen, "lines", len(rows)))
+
+        raw_classification: object | None = None
+
+        def classify_rows(
+            frame_rows: List[str], prior_signals: tuple[object, ...]
+        ) -> ScreenClassificationResult:
+            nonlocal raw_classification
+            if provider is None or not frame_rows:
+                raw_classification = None
+                return screen_classification_result([])
+            if self._signal_emitting(provider):
+                result = screen_classification_result(
+                    provider.emit_screen_signals(frame_rows),
+                    prior_signals,
+                    provider.capabilities.liveness_anchor,
+                )
+                raw_classification = result
+                return result
+            if hasattr(provider, "get_status_from_screen"):
+                status = provider.get_status_from_screen(frame_rows)
+                raw_classification = None
+                return ScreenClassificationResult(
+                    ScreenClassification(status, "none", None, None), ()
+                )
+            # Source-compatible test/third-party fallback; real providers are
+            # structurally classified by the two branches above.
+            result = provider.classify_screen(frame_rows)
+            raw_classification = result
+            return result
+
+        key = None
+        if metadata is not None and "lifecycle_generation" in metadata:
+            key = (
+                terminal_id,
+                int(metadata["lifecycle_generation"]),
+                str(metadata["tmux_window"]),
+            )
+        prior = self._receiver_state_store.prior_classification(key) if key is not None else None
+        prior_signals: tuple[object, ...] = () if prior is None else prior.signals
+        classification = classify_rows(rows, prior_signals)
+        initial_status = classification.status
+        frame_source: ScreenProbeFrameSource = "incremental"
+        identity_failure: str | None = None
+        probe_failure: str | None = None
+        temporal_demotion: ScreenProbeTemporalDemotion | None = None
+        last_proof: IdentityProof | None = None
+        captured_at_mono = time.monotonic()
+
+        def capture(corroboration_prior: tuple[object, ...]):
+            nonlocal last_proof, identity_failure, captured_at_mono
+            if metadata is None:
+                raise LookupError(f"terminal metadata unavailable for {terminal_id}")
+            last_proof = self.prove_terminal_identity(terminal_id)
+            if last_proof.failure is not None:
+                identity_failure = last_proof.failure
+                raise PaneIdentityProofFailure(identity_failure)
+            captured = backend.capture_viewport(metadata["tmux_session"], metadata["tmux_window"])
+            captured_at_mono = time.monotonic()
+            captured_rows = captured.splitlines()
+            if not captured_rows or not any(row.strip() for row in captured_rows):
+                raise EmptyProbeCapture("Fresh viewport capture was empty")
+            pane_size = backend.get_pane_size(metadata["tmux_session"], metadata["tmux_window"])
+            if (
+                isinstance(pane_size, tuple)
+                and len(pane_size) == 2
+                and all(isinstance(value, int) for value in pane_size)
+            ):
+                captured_columns, captured_row_count = pane_size
+            else:
+                captured_columns = max((len(row) for row in captured_rows), default=0)
+                captured_row_count = len(captured_rows)
+            return (
+                captured_rows,
+                captured_columns,
+                captured_row_count,
+                classify_rows(captured_rows, corroboration_prior),
+            )
+
+        try:
+            if provider is not None and classification.status in {
+                TerminalStatus.IDLE,
+                TerminalStatus.COMPLETED,
+            }:
+                rows, columns, row_count, classification = capture(prior_signals)
+                frame_source = "fresh_capture"
+
+            deciding_is_corroborable = any(
+                signal.signal_class == classification.signal_class
+                and signal.provider_signal == classification.provider_signal
+                and signal.row_index == classification.row_index
+                and signal.temporal_policy == "corroborable"
+                for signal in classification.signals
+            )
+            if (
+                provider is not None
+                and classification.status == TerminalStatus.PROCESSING
+                and deciding_is_corroborable
+            ):
+                rows, columns, row_count, classification = capture(prior_signals)
+                frame_source = "fresh_capture"
+                frames = 0
+                previous = _corroborable_rows(classification)
+                changed = classification.status != TerminalStatus.PROCESSING or not previous
+                if changed:
+                    classification = ScreenClassificationResult(
+                        ScreenClassification(TerminalStatus.PROCESSING, "progress", None, None),
+                        classification.signals,
+                    )
+                else:
+                    for _ in range(2):
+                        time.sleep(1.2)
+                        rows, columns, row_count, classification = capture(classification.signals)
+                        frames += 1
+                        current = _corroborable_rows(classification)
+                        if Counter(current) != Counter(previous):
+                            previous = current
+                            changed = True
+                            if classification.status != TerminalStatus.PROCESSING:
+                                classification = ScreenClassificationResult(
+                                    ScreenClassification(
+                                        TerminalStatus.PROCESSING,
+                                        "progress",
+                                        None,
+                                        None,
+                                    ),
+                                    classification.signals,
+                                )
+                            break
+                        previous = current
+                if not changed and previous:
+                    temporal_demotion = {
+                        "frames": frames,
+                        "multiset_sha256": _row_multiset_hash(previous),
+                    }
+                    rows, columns, row_count, classification = capture(classification.signals)
+
+            if provider is not None and frame_source == "incremental":
+                rows, columns, row_count, classification = capture(prior_signals)
+                frame_source = "fresh_capture"
+        except PaneIdentityProofFailure:
+            rows, columns, row_count = [], 0, 0
+            classification = screen_classification_result([])
+            raw_classification = None
+            frame_source = "fresh_capture"
+        except EmptyProbeCapture:
+            probe_failure = "empty_capture"
+            rows, columns, row_count = [], 0, 0
+            classification = (
+                ScreenClassificationResult(
+                    ScreenClassification(TerminalStatus.PROCESSING, "progress", None, None), ()
+                )
+                if initial_status == TerminalStatus.PROCESSING
+                else screen_classification_result([])
+            )
+            raw_classification = None
+            frame_source = "fresh_capture"
+        except Exception:
+            logger.exception("Error refreshing admission screen for %s", terminal_id)
+            probe_failure = "empty_capture"
+            rows, columns, row_count = [], 0, 0
+            classification = (
+                ScreenClassificationResult(
+                    ScreenClassification(TerminalStatus.PROCESSING, "progress", None, None), ()
+                )
+                if initial_status == TerminalStatus.PROCESSING
+                else screen_classification_result([])
+            )
+            raw_classification = None
+            frame_source = "fresh_capture"
+
+        if (
+            classification.status == TerminalStatus.UNKNOWN
+            and probe_failure is None
+            and identity_failure is None
+        ):
+            probe_failure = "malformed_meta"
+        status_values: Dict[TerminalStatus, ScreenProbeResult] = {
+            TerminalStatus.WAITING_USER_ANSWER: "waiting_user_answer",
+            TerminalStatus.ERROR: "error",
+            TerminalStatus.PROCESSING: "processing",
+            TerminalStatus.COMPLETED: "completed",
+            TerminalStatus.IDLE: "idle",
+            TerminalStatus.UNKNOWN: "unknown",
+        }
+        result_status = status_values[classification.status]
+        meta: ScreenProbeMeta = {
+            "probed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "geometry": {"columns": columns, "rows": row_count},
+            "frame_rows_hash": _frame_rows_hash(rows),
+            "frame_source": frame_source,
+            "result_status": result_status,
+            "law_signal": {
+                "class": classification.signal_class,
+                "provider_signal": classification.provider_signal,
+                "row_index": classification.row_index,
+            },
+        }
+        if identity_failure is not None:
+            meta["identity_proof_failure"] = identity_failure
+        if probe_failure is not None:
+            meta["probe_failure"] = probe_failure  # type: ignore[typeddict-item]
+        if temporal_demotion is not None:
+            meta["temporal_demotion"] = temporal_demotion
+        if provider is not None:
+            try:
+                hazard = provider.classify_injection_hazard(rows)
+                if hazard is not None:
+                    meta["injection_hazard"] = hazard
+            except Exception:
+                meta["probe_failure"] = "provider_hook_exception"
+                logger.exception("Error classifying injection hazard for %s", terminal_id)
+            try:
+                if provider.transient_error_detected(rows, classification):
+                    meta["transient_api_error"] = True
+            except Exception:
+                logger.exception("Error evaluating transient-error signal for %s", terminal_id)
+            try:
+                idle_reason = provider.classify_idle_reason(rows, classification)
+                if idle_reason is not None:
+                    meta["idle_reason"] = idle_reason
+            except Exception:
+                logger.exception("Error classifying idle reason for %s", terminal_id)
+
+        with self._lock:
+            epoch = self._epoch_locked(terminal_id)
+        token = self._receiver_state_store.mint_token(terminal_id, epoch)
+        evidence = ProbeEvidence.from_legacy_dict(meta)
+        freshness_kind = (
+            "identity_failed"
+            if identity_failure is not None
+            else "probe_failed" if probe_failure is not None else "identity_ok"
+        )
+        freshness_detail = identity_failure or probe_failure
+        try:
+            with self._lock:
+                self._publish_observation(
+                    terminal_id,
+                    latched_status=classification.status,
+                    pass_outcome="probe",
+                    frame_source="fresh_capture",
+                    metadata=metadata,
+                    freshness_proof=FreshnessProof(freshness_kind, freshness_detail),
+                    captured_at_mono=captured_at_mono,
+                    raw_classification=raw_classification,
+                    probe_evidence=evidence,
+                    origin="probe",
+                    fresh_token=token,
+                )
+        except Exception:
+            try:
+                self._log_receiver_publish_failure(terminal_id)
+            except Exception:
+                pass
+        return ProbeResult(classification.status, copy.deepcopy(meta), token)
+
+    def _probe_screen_status_stage0a_dead(self, terminal_id: str) -> ProbeResult:
+        """Frozen Stage-0a implementation retained for source archaeology."""
         from cli_agent_orchestrator.providers.screen_classification import (
             ScreenClassification,
             ScreenClassificationResult,
@@ -1178,7 +1677,10 @@ class StatusMonitor:
             if not frame_rows or provider is None:
                 return screen_classification_result([])
             try:
-                return provider.classify_screen(frame_rows)
+                status = provider.get_status_from_screen(frame_rows)
+                return ScreenClassificationResult(
+                    ScreenClassification(status, "none", None, None), ()
+                )
             except Exception:
                 logger.exception("Error classifying admission screen for %s", terminal_id)
                 return screen_classification_result([])
@@ -1498,7 +2000,12 @@ class StatusMonitor:
                 self._log_receiver_publish_failure(terminal_id)
             except Exception:
                 pass
-        return classification.status, meta
+        return classification.status, meta  # type: ignore[return-value]
+
+    def probe_screen_status(self, terminal_id: str) -> ProbeResult:
+        """Classify, prove, publish, and return one operation-owned probe."""
+
+        return self._probe_screen_status_stage0b(terminal_id)
 
     def get_rendered_screen(self, terminal_id: str) -> Optional[List[str]]:
         """Return the current pyte-composited screen for a terminal if present."""

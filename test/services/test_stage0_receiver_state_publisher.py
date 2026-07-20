@@ -269,7 +269,8 @@ def test_probe_publishes_settled_result_to_fresh_slot_with_proof(monkeypatch) ->
     )
     monkeypatch.setattr("cli_agent_orchestrator.clients.database.get_terminal_metadata", _metadata)
 
-    status, _meta = monitor.probe_screen_status("t1")
+    probe_result = monitor.probe_screen_status("t1")
+    status, _meta = probe_result.status, probe_result.meta
 
     assert status is TerminalStatus.IDLE
     slots = monitor.receiver_state_store._entries[("t1", 4, "worker-window")]  # type: ignore[attr-defined]

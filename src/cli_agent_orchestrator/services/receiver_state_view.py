@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
-from cli_agent_orchestrator.kernel.receiver_state.store import ReceiverStateStore
+from cli_agent_orchestrator.kernel.receiver_state.store import FreshToken, ReceiverStateStore
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.seam_activation import ConsumerOp, receiver_state_active
 
@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 _backend_failure_last_logged: dict[str, float] = {}
 
 NoneBehavior = Literal["none", "legacy", "watchdog"]
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.services.status_monitor import ProbeResult
 
 
 class _StatusMonitor(Protocol):
@@ -26,7 +29,7 @@ class _StatusMonitor(Protocol):
 
     def get_raw_status(self, terminal_id: str, provider_override: Any = None) -> TerminalStatus: ...
 
-    def probe_screen_status(self, terminal_id: str) -> tuple[TerminalStatus, object]: ...
+    def probe_screen_status(self, terminal_id: str) -> "ProbeResult": ...
 
 
 def _monitor() -> _StatusMonitor:
@@ -42,6 +45,8 @@ def snapshot_view(
     max_age_s: float,
     none_behavior: NoneBehavior,
     monitor: _StatusMonitor | None = None,
+    require_fresh: bool = False,
+    token: FreshToken | None = None,
 ) -> TerminalStatus | None:
     """Read one activated receiver view or preserve the row's legacy behavior."""
 
@@ -75,9 +80,10 @@ def snapshot_view(
                 int(metadata["lifecycle_generation"]),
                 str(metadata["tmux_window"]),
             ),
-            require_fresh=False,
+            require_fresh=require_fresh,
             max_age_s=max_age_s,
             recovery_state=metadata.get("recovery_state"),
+            token=token,
         )
         status = None if view is None else view.latched_status
 
@@ -93,9 +99,10 @@ def snapshot_view(
                     int(metadata["lifecycle_generation"]),
                     str(metadata["tmux_window"]),
                 ),
-                require_fresh=False,
+                require_fresh=require_fresh,
                 max_age_s=max_age_s,
                 recovery_state=metadata.get("recovery_state"),
+                token=token,
             )
         except Exception:
             refreshed = None

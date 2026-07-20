@@ -79,6 +79,10 @@ SEAM_ACTIVATION_CONSUMER_OPS = (
     "watchdog.ready_backlog_gate",
     "agent_step.status_reads",
     "delivery.admission_status",
+    "watchdog.pane_classify",
+    "delivery.fresh_probe",
+    "delivery.park_identity_probe",
+    "auto_responder.frame_classify",
 )
 
 
@@ -660,7 +664,7 @@ def init_db() -> None:
 
 
 def _bootstrap_seam_activation() -> None:
-    """Install the five legacy-default authority rows idempotently."""
+    """Install the nine legacy-default authority rows idempotently."""
 
     with SessionLocal() as db:
         try:

@@ -1105,11 +1105,13 @@ class ClaudeCodeProvider(BaseProvider):
     # detector below is tuned for a COMPOSITED viewport, not the raw stream.
     supports_screen_detection = True
 
-    def classify_screen(self, screen_lines: List[str]) -> ScreenClassificationResult:
+    signal_kinds = frozenset({"waiting", "progress", "completion", "chrome"})
+
+    def emit_screen_signals(self, screen_lines: List[str]) -> tuple[ScreenSignal, ...]:
         """Produce Claude signals and apply the provider-blind Wave 4 law."""
         rows = [line.rstrip() for line in screen_lines if line.strip()]
         if not rows:
-            return screen_classification_result([])
+            return ()
         joined = "\n".join(rows)
         separator_rows = [
             index for index, row in enumerate(rows) if NEW_TUI_BOX_RAIL_PATTERN.search(row)
@@ -1159,7 +1161,7 @@ class ClaudeCodeProvider(BaseProvider):
                 signals.append(ScreenSignal("completion", "EXTRACTION_RESPONSE_PATTERN", index))
         for index in boxed_prompt_rows:
             signals.append(ScreenSignal("chrome", "NEW_TUI_BOX_PATTERN", index))
-        return screen_classification_result(signals)
+        return tuple(signals)
 
     def classify_injection_hazard(self, rows: List[str]) -> str | None:
         return (
@@ -1202,9 +1204,7 @@ class ClaudeCodeProvider(BaseProvider):
                 return "\n".join(lines)
         return None
 
-    def read_composer_draft_authority(
-        self, *, defer_on_dialog: bool = False
-    ) -> tuple[str, bool]:
+    def read_composer_draft_authority(self, *, defer_on_dialog: bool = False) -> tuple[str, bool]:
         """Return stable composer state and chip presence without mutation."""
         try:
             from cli_agent_orchestrator.backends.registry import get_backend
@@ -1240,9 +1240,7 @@ class ClaudeCodeProvider(BaseProvider):
 
     def read_composer_draft_state(self, *, defer_on_dialog: bool = False) -> str:
         """Return empty/nonempty/unresolved without changing the composer."""
-        state, _chip_present = self.read_composer_draft_authority(
-            defer_on_dialog=defer_on_dialog
-        )
+        state, _chip_present = self.read_composer_draft_authority(defer_on_dialog=defer_on_dialog)
         return state
 
     @property

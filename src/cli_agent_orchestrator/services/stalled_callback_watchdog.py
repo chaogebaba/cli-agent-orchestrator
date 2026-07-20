@@ -365,17 +365,100 @@ class StalledCallbackWatchdog:
     def _fresh_frame_decides_running(self, terminal_id: str) -> tuple[bool, str | None]:
         from cli_agent_orchestrator.backends.registry import get_backend
         from cli_agent_orchestrator.providers.manager import provider_manager
+        from cli_agent_orchestrator.services.seam_activation import receiver_state_active
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         try:
             metadata = get_terminal_metadata(terminal_id)
             provider = provider_manager.get_provider(terminal_id)
             if metadata is None or provider is None:
                 return False, None
+            if not receiver_state_active("watchdog.pane_classify"):
+                frame = get_backend().capture_viewport(
+                    metadata["tmux_session"], metadata["tmux_window"]
+                )
+                rows = frame.splitlines()
+                from cli_agent_orchestrator.providers.screen_classification import (
+                    ScreenClassification,
+                    ScreenClassificationResult,
+                    screen_classification_result,
+                )
+
+                if status_monitor._signal_emitting(provider):
+                    classification = screen_classification_result(
+                        provider.emit_screen_signals(rows),
+                        (),
+                        provider.capabilities.liveness_anchor,
+                    )
+                else:
+                    classification = ScreenClassificationResult(
+                        ScreenClassification(
+                            provider.get_status_from_screen(rows), "none", None, None
+                        ),
+                        (),
+                    )
+                idle_reason = provider.classify_idle_reason(rows, classification)
+                return (
+                    classification.status == TerminalStatus.PROCESSING
+                    and classification.provider_signal == "RUNNING_PATTERN",
+                    idle_reason if isinstance(idle_reason, str) else None,
+                )
+            proof = status_monitor.prove_terminal_identity(terminal_id)
             frame = get_backend().capture_viewport(
                 metadata["tmux_session"], metadata["tmux_window"]
             )
+            captured_at = time.monotonic()
             rows = frame.splitlines()
-            classification = provider.classify_screen(rows)
+            if status_monitor._signal_emitting(provider):
+                from cli_agent_orchestrator.providers.screen_classification import (
+                    screen_classification_result,
+                )
+
+                prior = status_monitor.receiver_state_store.prior_classification(
+                    (
+                        terminal_id,
+                        int(metadata["lifecycle_generation"]),
+                        str(metadata["tmux_window"]),
+                    ),
+                    prefer_fresh=True,
+                )
+                classification = screen_classification_result(
+                    provider.emit_screen_signals(rows),
+                    () if prior is None else prior.signals,
+                    provider.capabilities.liveness_anchor,
+                )
+            else:
+                from cli_agent_orchestrator.providers.screen_classification import (
+                    ScreenClassification,
+                    ScreenClassificationResult,
+                )
+
+                legacy_status = provider.get_status_from_screen(rows)
+                classification = ScreenClassificationResult(
+                    ScreenClassification(legacy_status, "none", None, None), ()
+                )
+            token = status_monitor.publish_fresh_observation(
+                terminal_id,
+                rows,
+                captured_at,
+                classification,
+                "fresh_capture",
+                proof,
+            )
+            view = status_monitor.receiver_state_store.snapshot_view(
+                (
+                    terminal_id,
+                    int(metadata["lifecycle_generation"]),
+                    str(metadata["tmux_window"]),
+                ),
+                require_fresh=True,
+                max_age_s=2.0,
+                recovery_state=metadata.get("recovery_state"),
+                token=token,
+            )
+            if view is None or view.raw_classification is None:
+                return False, None
+            classification = view.raw_classification
             idle_reason = provider.classify_idle_reason(rows, classification)
             return (
                 classification.status == TerminalStatus.PROCESSING
@@ -579,7 +662,11 @@ class StalledCallbackWatchdog:
 
         idle_reason = None
         try:
-            probe_status, probe_meta = status_monitor.probe_screen_status(action.terminal_id)
+            probe_result = status_monitor.probe_screen_status(action.terminal_id)
+            if hasattr(probe_result, "status"):
+                probe_status, probe_meta = probe_result.status, probe_result.meta
+            else:
+                probe_status, probe_meta = probe_result[0], probe_result[1]
             if isinstance(probe_meta, dict) and isinstance(probe_meta.get("idle_reason"), str):
                 idle_reason = probe_meta["idle_reason"]
             applicable = (

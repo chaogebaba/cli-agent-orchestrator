@@ -1181,8 +1181,33 @@ class InboxService:
                     if provider is None:
                         provider = provider_manager.get_provider(terminal_id)
                     probe_result = status_monitor.probe_screen_status(terminal_id)
-                    if isinstance(probe_result, tuple) and len(probe_result) == 2:
-                        _probe_status, probe_meta = probe_result
+                    probe_meta = (
+                        probe_result.meta if hasattr(probe_result, "meta") else probe_result[1]
+                    )
+                    from cli_agent_orchestrator.backends.registry import get_backend
+                    from cli_agent_orchestrator.services.seam_activation import (
+                        receiver_state_active,
+                    )
+
+                    if (
+                        receiver_state_active("delivery.park_identity_probe")
+                        and not get_backend().supports_event_inbox()
+                    ):
+                        view = status_monitor.receiver_state_store.snapshot_view(
+                            (
+                                terminal_id,
+                                int(metadata["lifecycle_generation"]),
+                                str(metadata["tmux_window"]),
+                            ),
+                            require_fresh=True,
+                            max_age_s=2.0,
+                            recovery_state=metadata.get("recovery_state"),
+                            token=getattr(probe_result, "fresh_token", None),
+                        )
+                        if view is None or view.probe_evidence is None:
+                            return
+                        probe_meta = view.probe_evidence.to_legacy_dict()
+                    if isinstance(probe_meta, dict):
                         safety = self._inject_safe(terminal_id, provider, probe_meta)
                         identity_failure = (
                             probe_meta.get("identity_proof_failure")
@@ -1635,9 +1660,34 @@ class InboxService:
                         if provider is None:
                             provider = provider_manager.get_provider(terminal_id)
                         probe_result = status_monitor.probe_screen_status(terminal_id)
-                        if not isinstance(probe_result, tuple) or len(probe_result) != 2:
-                            return
-                        probe_status, probe_meta = probe_result
+                        if hasattr(probe_result, "status"):
+                            probe_status, probe_meta = probe_result.status, probe_result.meta
+                        else:
+                            probe_status, probe_meta = probe_result[0], probe_result[1]
+                        from cli_agent_orchestrator.backends.registry import get_backend
+                        from cli_agent_orchestrator.services.seam_activation import (
+                            receiver_state_active,
+                        )
+
+                        if (
+                            receiver_state_active("delivery.fresh_probe")
+                            and not get_backend().supports_event_inbox()
+                        ):
+                            view = status_monitor.receiver_state_store.snapshot_view(
+                                (
+                                    terminal_id,
+                                    int(metadata["lifecycle_generation"]),
+                                    str(metadata["tmux_window"]),
+                                ),
+                                require_fresh=True,
+                                max_age_s=2.0,
+                                recovery_state=metadata.get("recovery_state"),
+                                token=getattr(probe_result, "fresh_token", None),
+                            )
+                            if view is None or view.probe_evidence is None:
+                                return
+                            probe_status = view.latched_status
+                            probe_meta = view.probe_evidence.to_legacy_dict()
                         safety = self._inject_safe(terminal_id, provider, probe_meta)
                         if safety.verdict == "veto":
                             identity_failure = (

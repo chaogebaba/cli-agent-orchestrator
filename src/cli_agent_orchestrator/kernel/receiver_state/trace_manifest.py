@@ -14,6 +14,10 @@ TRACE_SYMBOLS = frozenset(
         "force_status",
         "snapshot_view",
         "get_boundary_observation",
+        "classify_idle_reason",
+        "emit_screen_signals",
+        "publish_fresh_observation",
+        "prove_terminal_identity",
     }
 )
 CONSUMER_MODULES = (

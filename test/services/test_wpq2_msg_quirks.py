@@ -130,15 +130,17 @@ def test_temporal_corroboration_static_demotes_and_animated_stays_busy(
         ):
             return monitor.probe_screen_status("receiver"), backend
 
-    (static_status, static_meta), static_backend = run(
+    static_result, static_backend = run(
         [[progress], [progress], [progress], [progress, *ready]]
     )
+    static_status, static_meta = static_result.status, static_result.meta
     assert static_status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
     assert static_meta["temporal_demotion"]["frames"] == 2
     assert len(static_meta["temporal_demotion"]["multiset_sha256"]) == 64
     assert static_backend.capture_viewport.call_count == 4
 
-    (animated_status, animated_meta), animated_backend = run([[progress], [animated]])
+    animated_result, animated_backend = run([[progress], [animated]])
+    animated_status, animated_meta = animated_result.status, animated_result.meta
     assert animated_status == TerminalStatus.PROCESSING
     assert "temporal_demotion" not in animated_meta
     assert animated_backend.capture_viewport.call_count == 2
@@ -155,6 +157,7 @@ def test_temporal_corroboration_changed_fresh_frame_never_opens(changed_frame):
     backend = MagicMock(supports_identity_readback=True)
     backend.get_pane_size.return_value = (100, 20)
     backend.capture_viewport.side_effect = [progress, "\n".join(changed_frame)]
+    backend.read_pane_identity.return_value = PaneIdentityReadResult(identity="receiver")
     with (
         patch(
             "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
@@ -167,11 +170,12 @@ def test_temporal_corroboration_changed_fresh_frame_never_opens(changed_frame):
         ),
         patch("cli_agent_orchestrator.services.status_monitor.time.sleep"),
     ):
-        status, meta = monitor.probe_screen_status("receiver")
+        probe_result = monitor.probe_screen_status("receiver")
+        status, meta = probe_result.status, probe_result.meta
     assert status == TerminalStatus.PROCESSING
     assert "temporal_demotion" not in meta
     assert backend.capture_viewport.call_count == 2
-    backend.read_pane_identity.assert_not_called()
+    assert backend.read_pane_identity.call_count == 2
 
 
 def test_temporal_first_fresh_ready_frame_is_not_an_open_authority():
@@ -184,6 +188,7 @@ def test_temporal_first_fresh_ready_frame_is_not_an_open_authority():
     backend = MagicMock(supports_identity_readback=True)
     backend.get_pane_size.return_value = (100, 20)
     backend.capture_viewport.return_value = "❯\nalways-approve"
+    backend.read_pane_identity.return_value = PaneIdentityReadResult(identity="receiver")
     with (
         patch(
             "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
@@ -196,11 +201,12 @@ def test_temporal_first_fresh_ready_frame_is_not_an_open_authority():
         ),
         patch("cli_agent_orchestrator.services.status_monitor.time.sleep"),
     ):
-        status, meta = monitor.probe_screen_status("receiver")
+        probe_result = monitor.probe_screen_status("receiver")
+        status, meta = probe_result.status, probe_result.meta
     assert status == TerminalStatus.PROCESSING
     assert meta["frame_source"] == "fresh_capture"
     assert backend.capture_viewport.call_count == 1
-    backend.read_pane_identity.assert_not_called()
+    backend.read_pane_identity.assert_called_once_with("session", "receiver")
 
 
 def test_temporal_initial_sample_is_fresh_not_incremental():
@@ -227,7 +233,8 @@ def test_temporal_initial_sample_is_fresh_not_incremental():
         ),
         patch("cli_agent_orchestrator.services.status_monitor.time.sleep"),
     ):
-        status, meta = monitor.probe_screen_status("receiver")
+        probe_result = monitor.probe_screen_status("receiver")
+        status, meta = probe_result.status, probe_result.meta
     assert status == TerminalStatus.IDLE
     assert meta["temporal_demotion"]["frames"] == 2
 
@@ -259,7 +266,8 @@ def test_delayed_animation_on_final_frame_defers():
         ),
         patch("cli_agent_orchestrator.services.status_monitor.time.sleep"),
     ):
-        status, meta = monitor.probe_screen_status("receiver")
+        probe_result = monitor.probe_screen_status("receiver")
+        status, meta = probe_result.status, probe_result.meta
     assert status == TerminalStatus.PROCESSING
     assert meta["temporal_demotion"]["frames"] == 2
     assert meta["frame_rows_hash"]
@@ -304,7 +312,8 @@ def test_delayed_final_animation_defers_for_every_provider(kind, progress, anima
         ),
         patch("cli_agent_orchestrator.services.status_monitor.time.sleep"),
     ):
-        status, meta = monitor.probe_screen_status("receiver")
+        probe_result = monitor.probe_screen_status("receiver")
+        status, meta = probe_result.status, probe_result.meta
     assert status == TerminalStatus.PROCESSING
     assert meta["temporal_demotion"]["frames"] == 2
     assert meta["frame_rows_hash"] == _frame_rows_hash([animated, *ready])
@@ -342,7 +351,8 @@ def test_temporal_exempt_progress_never_enters_corroboration(kind, rows, provide
             },
         ),
     ):
-        status, meta = monitor.probe_screen_status("receiver")
+        probe_result = monitor.probe_screen_status("receiver")
+        status, meta = probe_result.status, probe_result.meta
     assert status == TerminalStatus.PROCESSING
     assert meta["law_signal"]["provider_signal"] == provider_signal
     assert "temporal_demotion" not in meta
@@ -360,7 +370,12 @@ def test_static_demotion_requires_identity_proof_before_final_capture():
     backend = MagicMock(supports_identity_readback=True)
     backend.get_pane_size.return_value = (100, 20)
     backend.capture_viewport.side_effect = [progress, progress, progress]
-    backend.read_pane_identity.return_value = PaneIdentityReadResult(identity="replacement")
+    backend.read_pane_identity.side_effect = [
+        PaneIdentityReadResult(identity="receiver"),
+        PaneIdentityReadResult(identity="receiver"),
+        PaneIdentityReadResult(identity="receiver"),
+        PaneIdentityReadResult(identity="replacement"),
+    ]
     with (
         patch(
             "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
@@ -373,11 +388,12 @@ def test_static_demotion_requires_identity_proof_before_final_capture():
         ),
         patch("cli_agent_orchestrator.services.status_monitor.time.sleep"),
     ):
-        status, meta = monitor.probe_screen_status("receiver")
+        probe_result = monitor.probe_screen_status("receiver")
+        status, meta = probe_result.status, probe_result.meta
     assert status == TerminalStatus.UNKNOWN
     assert meta["identity_proof_failure"] == "mismatch"
     assert backend.capture_viewport.call_count == 3
-    backend.read_pane_identity.assert_called_once_with("session", "receiver")
+    assert backend.read_pane_identity.call_count == 4
 
 
 @pytest.mark.parametrize(
@@ -415,7 +431,8 @@ def test_temporal_capture_failure_is_fail_closed_processing(captures):
         ),
         patch("cli_agent_orchestrator.services.status_monitor.time.sleep"),
     ):
-        status, _ = monitor.probe_screen_status("receiver")
+        probe_result = monitor.probe_screen_status("receiver")
+        status = probe_result.status
     assert status == TerminalStatus.PROCESSING
 
 
@@ -447,7 +464,8 @@ def test_temporal_final_new_progress_row_defers_and_multiset_hash_is_ordered():
         ),
         patch("cli_agent_orchestrator.services.status_monitor.time.sleep"),
     ):
-        status, meta = monitor.probe_screen_status("receiver")
+        probe_result = monitor.probe_screen_status("receiver")
+        status, meta = probe_result.status, probe_result.meta
     assert status == TerminalStatus.PROCESSING
     assert meta["frame_rows_hash"] == _frame_rows_hash(
         [progress, new_progress, "❯", "always-approve"]
@@ -521,7 +539,7 @@ def test_grok_static_spinner_demotes_then_delivers_through_real_inbox_seam(wpq2_
     ):
         InboxService().deliver_pending("receiver")
     assert backend.capture_viewport.call_count == 4
-    assert backend.read_pane_identity.call_count == 1
+    assert backend.read_pane_identity.call_count == 4
     assert sent.call_count == 1
     trace = get_message_trace(message.id)
     assert len(trace["attempts"]) == 1
@@ -530,7 +548,9 @@ def test_grok_static_spinner_demotes_then_delivers_through_real_inbox_seam(wpq2_
     assert probe["frame_rows_hash"] == _frame_rows_hash(final_rows)
     assert probe["frame_source"] == "fresh_capture"
     sent.assert_called_once_with("receiver", "deliver after demotion")
-    backend.read_pane_identity.assert_called_once_with("session", "receiver")
+    assert backend.read_pane_identity.call_args_list == [
+        (("session", "receiver"), {})
+    ] * 4
 
 
 def test_corroborable_signal_requires_row_bytes():

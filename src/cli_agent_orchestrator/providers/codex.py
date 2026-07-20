@@ -965,7 +965,9 @@ class CodexProvider(BaseProvider):
         r"\btab\s+to\s+queue\s+message\b",
     ]
 
-    def classify_screen(self, screen_lines: list[str]) -> ScreenClassificationResult:
+    signal_kinds = frozenset({"waiting", "error", "progress", "completion", "chrome"})
+
+    def emit_screen_signals(self, screen_lines: list[str]) -> tuple[ScreenSignal, ...]:
         """Produce Codex signals while preserving the existing fixture corpus."""
         joined = "\n".join(screen_lines)
         clean = strip_terminal_escapes(joined)
@@ -1040,7 +1042,7 @@ class CodexProvider(BaseProvider):
                     "exempt",
                 )
             )
-        return screen_classification_result(signals)
+        return tuple(signals)
 
     def transient_error_detected(
         self, rows: list[str], classification: ScreenClassificationResult

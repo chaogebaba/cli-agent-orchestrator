@@ -1,6 +1,7 @@
 """Provider-independent receiver classification and observation state."""
 
 from .classification import (
+    AnchorSpec,
     ScreenClassification,
     ScreenClassificationResult,
     ScreenSignal,
@@ -13,9 +14,15 @@ from .store import (
     FrameSource,
     FreshnessKind,
     FreshnessProof,
+    FreshToken,
+    ObservationOrigin,
     ObservationView,
     PassOutcome,
     PassSource,
+    ProbeEvidence,
+    ProbeGeometry,
+    ProbeLawSignal,
+    ProbeTemporalDemotion,
     ReceiverState,
     ReceiverStateKey,
     ReceiverStateStore,
@@ -24,12 +31,19 @@ from .store import (
 )
 
 __all__ = [
+    "AnchorSpec",
     "FrameSource",
     "FreshnessKind",
     "FreshnessProof",
+    "FreshToken",
+    "ObservationOrigin",
     "ObservationView",
     "PassOutcome",
     "PassSource",
+    "ProbeEvidence",
+    "ProbeGeometry",
+    "ProbeLawSignal",
+    "ProbeTemporalDemotion",
     "ReceiverState",
     "ReceiverStateKey",
     "ReceiverStateStore",

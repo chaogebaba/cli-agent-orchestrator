@@ -124,6 +124,15 @@ class Rule:
         return all(opt in normalized for opt in self.options)
 
 
+@dataclass(frozen=True)
+class AutoResponderDecision:
+    normalized: str
+    lines: tuple[str, ...]
+    status: TerminalStatus
+    raw_classification: object | None
+    fresh_token: tuple[str, float]
+
+
 class _RuleStore:
     """Per-provider rule file, hot-reloaded on mtime change."""
 
@@ -320,13 +329,19 @@ class AutoResponder:
             if not rule.matches(normalized):
                 continue
             if rule.is_wait:
-                fresh = self._capture_fresh(metadata, lines)
-                if fresh is None or not rule.matches(fresh[0]):
+                fresh = self._capture_for_analysis(metadata, lines, terminal_id, provider)
+                if fresh is None:
                     return None
-                try:
-                    if provider.get_status_from_screen(fresh[1]) == TerminalStatus.UNKNOWN:
+                if isinstance(fresh, AutoResponderDecision):
+                    fresh_normalized = fresh.normalized
+                    fresh_status = fresh.status
+                else:
+                    fresh_normalized, fresh_lines = fresh
+                    try:
+                        fresh_status = provider.get_status_from_screen(fresh_lines)
+                    except Exception:
                         return None
-                except Exception:
+                if not rule.matches(fresh_normalized) or fresh_status == TerminalStatus.UNKNOWN:
                     return None
                 with self._lock:
                     self._wait_rule_active[terminal_id] = (rule.name, time.monotonic())
@@ -335,7 +350,7 @@ class AutoResponder:
             state = self._state_for(terminal_id, rule.name)
             if time.monotonic() < state.cooldown_until:
                 return None  # redraw double-fire guard
-            self._fire(terminal_id, metadata, rule, normalized, state)
+            self._fire(terminal_id, metadata, provider, rule, normalized, state)
             return None
 
         self._clear_wait_rule(terminal_id)
@@ -358,27 +373,38 @@ class AutoResponder:
         self,
         terminal_id: str,
         metadata: Dict[str, Any],
+        provider: Any,
         rule: Rule,
         normalized: str,
         state: _RuleState,
-    ) -> None:
+    ) -> bool:
+        if not self._effect_barrier(terminal_id, metadata, provider, rule):
+            return False
         self._send_answer(metadata, rule)
         self._log(terminal_id, rule, "fired", normalized)
         state.cooldown_until = time.monotonic() + COOLDOWN_S
         threading.Thread(
             target=self._verify_and_retry,
-            args=(terminal_id, metadata, rule, state),
+            args=(terminal_id, metadata, provider, rule, state),
             daemon=True,
         ).start()
+        return True
 
     def _verify_and_retry(
-        self, terminal_id: str, metadata: Dict[str, Any], rule: Rule, state: _RuleState
+        self,
+        terminal_id: str,
+        metadata: Dict[str, Any],
+        provider: Any,
+        rule: Rule,
+        state: _RuleState,
     ) -> None:
         """Runs off the event-loop thread: 1s-later recheck, retry <=3 total fires."""
         for attempt in range(2, RETRY_MAX + 1):
             time.sleep(RETRY_DELAY_S)
             normalized = self._current_normalized(terminal_id)
             if normalized is None or not rule.matches(normalized):
+                return
+            if not self._effect_barrier(terminal_id, metadata, provider, rule):
                 return
             self._send_answer(metadata, rule)
             self._log(terminal_id, rule, f"retry-{attempt}", normalized)
@@ -387,7 +413,7 @@ class AutoResponder:
         time.sleep(RETRY_DELAY_S)
         normalized = self._current_normalized(terminal_id)
         if normalized is not None and rule.matches(normalized):
-            self._surface_retry_exhausted(terminal_id, metadata, rule)
+            self._surface_retry_exhausted(terminal_id, metadata, rule, provider)
 
     @staticmethod
     def _current_normalized(terminal_id: str) -> Optional[str]:
@@ -421,10 +447,16 @@ class AutoResponder:
             logger.exception("auto-responder: failed to write log for %s", terminal_id)
 
     def _surface_retry_exhausted(
-        self, terminal_id: str, metadata: Dict[str, Any], rule: Rule
+        self,
+        terminal_id: str,
+        metadata: Dict[str, Any],
+        rule: Rule,
+        provider: Any = None,
     ) -> None:
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
+        if not self._effect_barrier(terminal_id, metadata, provider, rule):
+            return
         status_monitor.force_status(terminal_id, TerminalStatus.WAITING_USER_ANSWER)
         with self._lock:
             self._retry_exhausted.add(terminal_id)
@@ -465,14 +497,25 @@ class AutoResponder:
         if not is_suspect:
             return self._record_unknown_clean_tick(terminal_id)
 
-        fresh = self._capture_fresh(metadata, lines)
+        fresh = self._capture_for_analysis(metadata, lines, terminal_id, provider)
         if fresh is None:
             return None
-        fresh_normalized, fresh_lines = fresh
+        if isinstance(fresh, AutoResponderDecision):
+            fresh_normalized = fresh.normalized
+            fresh_lines = list(fresh.lines)
+            fresh_status = fresh.status
+        else:
+            fresh_normalized, fresh_lines = fresh
+            fresh_status = None
         is_suspect = self._looks_like_dialog(fresh_normalized, provider_name)
         if is_suspect:
             try:
-                is_suspect = provider.get_status_from_screen(fresh_lines) in (
+                status = (
+                    fresh_status
+                    if fresh_status is not None
+                    else provider.get_status_from_screen(fresh_lines)
+                )
+                is_suspect = status in (
                     TerminalStatus.WAITING_USER_ANSWER,
                     TerminalStatus.ERROR,
                 )
@@ -534,11 +577,88 @@ class AutoResponder:
 
     @staticmethod
     def _capture_fresh(
-        metadata: Dict[str, Any], _suspect_lines: List[str]
-    ) -> tuple[str, List[str]] | None:
-        """Capture exactly one fresh viewport without touching StatusMonitor state."""
+        metadata: Dict[str, Any],
+        _suspect_lines: List[str],
+        terminal_id: str | None = None,
+        provider: Any = None,
+    ) -> tuple[str, List[str]] | AutoResponderDecision | None:
+        """Capture once; activated paths prove, publish, and token-read it."""
         try:
             from cli_agent_orchestrator.backends.registry import get_backend
+
+            if terminal_id is not None and provider is not None:
+                from cli_agent_orchestrator.services.seam_activation import (
+                    receiver_state_active,
+                )
+
+                if (
+                    receiver_state_active("auto_responder.frame_classify")
+                    and not get_backend().supports_event_inbox()
+                ):
+                    from cli_agent_orchestrator.providers.screen_classification import (
+                        ScreenClassification,
+                        ScreenClassificationResult,
+                        screen_classification_result,
+                    )
+                    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                    proof = status_monitor.prove_terminal_identity(terminal_id)
+                    captured = get_backend().capture_viewport(
+                        metadata["tmux_session"], metadata["tmux_window"]
+                    )
+                    captured_at = time.monotonic()
+                    lines = captured.splitlines()
+                    normalized = normalize_screen(lines)
+                    if not normalized:
+                        return None
+                    if status_monitor._signal_emitting(provider):
+                        prior = status_monitor.receiver_state_store.prior_classification(
+                            (
+                                terminal_id,
+                                int(metadata["lifecycle_generation"]),
+                                str(metadata["tmux_window"]),
+                            ),
+                            prefer_fresh=True,
+                        )
+                        classification = screen_classification_result(
+                            provider.emit_screen_signals(lines),
+                            () if prior is None else prior.signals,
+                            provider.capabilities.liveness_anchor,
+                        )
+                    else:
+                        status = provider.get_status_from_screen(lines)
+                        classification = ScreenClassificationResult(
+                            ScreenClassification(status, "none", None, None), ()
+                        )
+                    token = status_monitor.publish_fresh_observation(
+                        terminal_id,
+                        lines,
+                        captured_at,
+                        classification,
+                        "fresh_capture",
+                        proof,
+                    )
+                    view = status_monitor.receiver_state_store.snapshot_view(
+                        (
+                            terminal_id,
+                            int(metadata["lifecycle_generation"]),
+                            str(metadata["tmux_window"]),
+                        ),
+                        require_fresh=True,
+                        max_age_s=2.0,
+                        recovery_state=metadata.get("recovery_state"),
+                        token=token,
+                    )
+                    if view is None:
+                        return None
+                    raw = view.raw_classification
+                    return AutoResponderDecision(
+                        normalized,
+                        tuple(lines),
+                        raw.status if raw is not None else view.latched_status,
+                        raw,
+                        token,
+                    )
 
             captured = get_backend().capture_viewport(
                 metadata["tmux_session"], metadata["tmux_window"]
@@ -555,6 +675,48 @@ class AutoResponder:
                 exc_info=True,
             )
             return None
+
+    def _capture_for_analysis(
+        self,
+        metadata: Dict[str, Any],
+        lines: List[str],
+        terminal_id: str,
+        provider: Any,
+    ) -> tuple[str, List[str]] | AutoResponderDecision | None:
+        from cli_agent_orchestrator.backends.registry import get_backend
+        from cli_agent_orchestrator.services.seam_activation import receiver_state_active
+
+        if (
+            receiver_state_active("auto_responder.frame_classify")
+            and not get_backend().supports_event_inbox()
+        ):
+            return self._capture_fresh(metadata, lines, terminal_id, provider)
+        return self._capture_fresh(metadata, lines)
+
+    @classmethod
+    def _effect_barrier(
+        cls,
+        terminal_id: str,
+        metadata: Dict[str, Any],
+        provider: Any,
+        rule: Rule,
+    ) -> bool:
+        from cli_agent_orchestrator.backends.registry import get_backend
+        from cli_agent_orchestrator.services.seam_activation import receiver_state_active
+
+        if (
+            not receiver_state_active("auto_responder.frame_classify")
+            or get_backend().supports_event_inbox()
+        ):
+            return True
+        if provider is None:
+            return False
+        fresh = cls._capture_fresh(metadata, [], terminal_id, provider)
+        return (
+            isinstance(fresh, AutoResponderDecision)
+            and rule.matches(fresh.normalized)
+            and fresh.status != TerminalStatus.UNKNOWN
+        )
 
     @staticmethod
     def _payload_excerpt(normalized: str) -> str:
