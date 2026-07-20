@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -19,7 +19,9 @@ from cli_agent_orchestrator.kernel.receiver_state import (
     screen_classification_result,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import ProviderCapabilities
+from cli_agent_orchestrator.providers.base import BaseProvider, ProviderCapabilities
+from cli_agent_orchestrator.services import auto_responder as ar
+from cli_agent_orchestrator.services.stalled_callback_watchdog import StalledCallbackWatchdog
 from cli_agent_orchestrator.services.status_monitor import (
     PROOF_MAX_AGE_S,
     IdentityProof,
@@ -229,6 +231,54 @@ class _Emitter:
         return None
 
 
+class _StatusOnlyProvider(BaseProvider):
+    supports_screen_detection = True
+
+    def __init__(self, status: TerminalStatus) -> None:
+        super().__init__("terminal", "session", "window")
+        self._test_status = status
+
+    async def initialize(self) -> bool:
+        return True
+
+    def get_status(self, _buffer: str) -> TerminalStatus:
+        return self._test_status
+
+    def extract_last_message_from_script(self, script_output: str) -> str:
+        return script_output
+
+    def exit_cli(self) -> str:
+        return "exit"
+
+    def cleanup(self) -> None:
+        return None
+
+
+class _CorroboratingRunningEmitter:
+    capabilities = ProviderCapabilities(
+        supports_screen_detection=True,
+        signal_kinds=frozenset({"progress"}),
+        liveness_anchor=AnchorSpec("RUNNING_PATTERN", "corroborable"),
+    )
+
+    def __init__(self) -> None:
+        self.emitter_calls = 0
+
+    def emit_screen_signals(self, rows):
+        self.emitter_calls += 1
+        return (
+            ScreenSignal(
+                "progress", "RUNNING_PATTERN", 0, rows[0], "corroborable"
+            ),
+        )
+
+    def get_status_from_screen(self, _rows):
+        return TerminalStatus.PROCESSING
+
+    def classify_idle_reason(self, _rows, _classification):
+        return None
+
+
 def test_d3_probe_proves_before_every_temporal_capture_and_returns_typed_abi(monkeypatch) -> None:
     monitor = StatusMonitor()
     monitor._screens["terminal"] = (
@@ -284,6 +334,299 @@ def test_d6_publish_validates_proof_age_before_containment(monkeypatch) -> None:
         monitor.publish_fresh_observation(
             "terminal", ["prompt"], 10.0, classification, "fresh_capture", old
         )
+
+
+def test_d6_publish_accepts_zero_age_proof_and_token_owned_read(monkeypatch) -> None:
+    monitor = StatusMonitor()
+    provider = _Emitter()
+    classification = screen_classification_result([ScreenSignal("chrome", "prompt", 0)])
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_terminal_metadata", lambda _id: META
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
+        lambda _id: provider,
+    )
+
+    token = monitor.publish_fresh_observation(
+        "terminal",
+        ["prompt"],
+        10.0,
+        classification,
+        "fresh_capture",
+        IdentityProof("terminal", "pane_readback", 10.0, None),
+    )
+
+    view = monitor.receiver_state_store.snapshot_view(
+        KEY, require_fresh=True, max_age_s=2.0, now_mono=10.0, token=token
+    )
+    assert view is not None
+    assert view.raw_classification is classification
+
+
+def test_d1_raw_classification_domain_for_forced_status_only_and_emitters(
+    monkeypatch,
+) -> None:
+    monitor = StatusMonitor()
+    emitter = _Emitter()
+    status_only = _StatusOnlyProvider(TerminalStatus.PROCESSING)
+    classification = screen_classification_result(
+        [ScreenSignal("progress", "RUNNING_PATTERN", 0, "running", "exempt")]
+    )
+    metadata = {
+        "terminal": META,
+        "status": {**META, "tmux_window": "status-window", "provider": "status-only"},
+    }
+    providers = {"terminal": emitter, "status": status_only}
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+        lambda terminal_id: metadata[terminal_id],
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
+        lambda terminal_id: providers[terminal_id],
+    )
+
+    with pytest.raises(ValueError, match="forced observations"):
+        replace(_observation(), origin="forced", raw_classification=classification)
+
+    monitor.receiver_state_store.publish_observation(_observation(raw=classification))
+    incremental = monitor.receiver_state_store.snapshot_view(
+        KEY, require_fresh=False, max_age_s=2.0, now_mono=10.0
+    )
+    assert incremental is not None and incremental.raw_classification is classification
+
+    emitter_token = monitor.publish_fresh_observation(
+        "terminal",
+        ["running"],
+        10.0,
+        classification,
+        "fresh_capture",
+        IdentityProof("terminal", "pane_readback", 10.0, None),
+    )
+    emitter_view = monitor.receiver_state_store.snapshot_view(
+        KEY, require_fresh=True, max_age_s=2.0, now_mono=10.0, token=emitter_token
+    )
+    assert emitter_view is not None and emitter_view.raw_classification is classification
+
+    status_token = monitor.publish_fresh_observation(
+        "status",
+        ["running"],
+        10.0,
+        classification,
+        "fresh_capture",
+        IdentityProof("status", "pane_readback", 10.0, None),
+    )
+    status_view = monitor.receiver_state_store.snapshot_view(
+        ("status", 2, "status-window"),
+        require_fresh=True,
+        max_age_s=2.0,
+        now_mono=10.0,
+        token=status_token,
+    )
+    assert status_view is not None
+    assert status_view.latched_status is TerminalStatus.PROCESSING
+    assert status_view.raw_classification is None
+
+
+def test_d6_status_only_processing_watchdog_never_suppresses(monkeypatch) -> None:
+    monitor = StatusMonitor()
+    provider = _StatusOnlyProvider(TerminalStatus.PROCESSING)
+    metadata = {
+        "id": "terminal",
+        "provider": "status-only",
+        "tmux_session": "session",
+        "tmux_window": "window",
+        "lifecycle_generation": 2,
+    }
+    backend = MagicMock()
+    backend.capture_viewport.return_value = "processing"
+    monkeypatch.setattr(
+        monitor,
+        "prove_terminal_identity",
+        lambda terminal_id: IdentityProof(terminal_id, "pane_readback", 10.0, None),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor", monitor
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        lambda _id: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+        lambda _id: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
+        lambda _id: provider,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.backends.registry.get_backend", lambda: backend
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.seam_activation.receiver_state_active",
+        lambda op: op == "watchdog.pane_classify",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.time.monotonic",
+        lambda: 10.0,
+    )
+
+    result = StalledCallbackWatchdog()._fresh_frame_decides_running("terminal")
+
+    assert result == (False, None)
+    view = monitor.receiver_state_store.prior_classification(KEY, prefer_fresh=True)
+    assert view is None
+
+
+def test_d6_status_only_auto_responder_uses_latched_status_before_enter(
+    monkeypatch,
+) -> None:
+    monitor = StatusMonitor()
+    provider = _StatusOnlyProvider(TerminalStatus.WAITING_USER_ANSWER)
+    engine = ar.AutoResponder()
+    rule = ar.Rule("status-only", True, "contains", "Proceed?", [], ["Enter"])
+    metadata = {
+        "id": "terminal",
+        "provider": "status-only",
+        "tmux_session": "session",
+        "tmux_window": "window",
+        "lifecycle_generation": 2,
+    }
+    order: list[str] = []
+    published: dict[str, object] = {}
+    backend = MagicMock()
+    backend.supports_event_inbox.return_value = False
+    backend.capture_viewport.side_effect = lambda *_args: order.append("capture") or "Proceed?"
+    backend.send_special_key.side_effect = lambda *_args: order.append("effect")
+    real_publish = monitor.publish_fresh_observation
+    real_snapshot = monitor.receiver_state_store.snapshot_view
+
+    def prove(terminal_id):
+        order.append("prove")
+        return IdentityProof(terminal_id, "pane_readback", 10.0, None)
+
+    def publish(*args, **kwargs):
+        order.append("publish")
+        token = real_publish(*args, **kwargs)
+        published["token"] = token
+        return token
+
+    def snapshot(*args, **kwargs):
+        order.append("read")
+        assert kwargs["token"] == published["token"]
+        return real_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(monitor, "prove_terminal_identity", prove)
+    monkeypatch.setattr(monitor, "publish_fresh_observation", publish)
+    monkeypatch.setattr(monitor.receiver_state_store, "snapshot_view", snapshot)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor", monitor
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+        lambda _id: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
+        lambda _id: provider,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.backends.registry.get_backend", lambda: backend
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.seam_activation.receiver_state_active",
+        lambda op: op == "auto_responder.frame_classify",
+    )
+    monkeypatch.setattr(ar.time, "monotonic", lambda: 10.0)
+    monkeypatch.setattr(ar.threading, "Thread", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(engine, "_log", lambda *_args: None)
+
+    fired = engine._fire(
+        "terminal",
+        metadata,
+        provider,
+        rule,
+        "Proceed?",
+        engine._state_for("terminal", rule.name),
+    )
+
+    assert fired
+    backend.send_special_key.assert_called_once_with("session", "window", "Enter")
+    assert order == ["prove", "capture", "publish", "read", "effect"]
+
+
+def test_d6_signal_emitting_watchdog_plumbs_priors_into_running_decision(
+    monkeypatch,
+) -> None:
+    monitor = StatusMonitor()
+    provider = _CorroboratingRunningEmitter()
+    metadata = {
+        "id": "terminal",
+        "provider": "emitter",
+        "tmux_session": "session",
+        "tmux_window": "window",
+        "lifecycle_generation": 2,
+    }
+    backend = MagicMock()
+    backend.capture_viewport.return_value = "same"
+    monkeypatch.setattr(
+        monitor,
+        "prove_terminal_identity",
+        lambda terminal_id: IdentityProof(terminal_id, "pane_readback", 10.0, None),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor", monitor
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        lambda _id: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+        lambda _id: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
+        lambda _id: provider,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.backends.registry.get_backend", lambda: backend
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.seam_activation.receiver_state_active",
+        lambda op: op == "watchdog.pane_classify",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.time.monotonic",
+        lambda: 10.0,
+    )
+    prior_same = screen_classification_result(
+        [ScreenSignal("progress", "RUNNING_PATTERN", 0, "same", "corroborable")]
+    )
+    monitor.receiver_state_store.publish_observation(
+        _observation(status=TerminalStatus.PROCESSING, raw=prior_same)
+    )
+    svc = StalledCallbackWatchdog()
+
+    with patch(
+        "cli_agent_orchestrator.providers.screen_classification.screen_classification_result",
+        wraps=screen_classification_result,
+    ) as reducer:
+        assert svc._fresh_frame_decides_running("terminal") == (False, None)
+        monitor.receiver_state_store.invalidate_terminal("terminal")
+        prior_changed = screen_classification_result(
+            [ScreenSignal("progress", "RUNNING_PATTERN", 0, "old", "corroborable")]
+        )
+        monitor.receiver_state_store.publish_observation(
+            _observation(status=TerminalStatus.PROCESSING, raw=prior_changed)
+        )
+        assert svc._fresh_frame_decides_running("terminal") == (True, None)
+
+    assert provider.emitter_calls == 2
+    assert reducer.call_args_list[0].args[1] == prior_same.signals
+    assert reducer.call_args_list[1].args[1] == prior_changed.signals
 
 
 def test_pin1_publish_fault_returns_unmatched_token(monkeypatch) -> None:
