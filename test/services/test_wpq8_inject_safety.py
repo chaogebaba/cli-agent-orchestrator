@@ -20,6 +20,7 @@ from cli_agent_orchestrator.clients.database import InboxModel, TerminalModel
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
+from cli_agent_orchestrator.providers.base import ProviderCapabilities
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
@@ -93,7 +94,7 @@ def test_wpq8_m1_waiting_gate_is_consulted_and_episode_is_closed():
 def test_wpq8_m3_waiting_status_is_unconditional():
     result = InboxService()._inject_safe(
         "worker",
-        SimpleNamespace(accepts_input_while_processing=True),
+        SimpleNamespace(capabilities=ProviderCapabilities(accepts_input_while_processing=True)),
         _probe_meta("waiting_user_answer"),
     )
     assert result == InjectSafetyResult("veto", "waiting_status")
@@ -145,7 +146,7 @@ def _run_eager_delivery(wpq8_db, final_status):
     message = database.create_inbox_message("sender", "worker", "payload")
     monitor, observation = _runtime_monitor(final_status)
     provider = MagicMock()
-    provider.accepts_input_while_processing = True
+    provider.capabilities = ProviderCapabilities(accepts_input_while_processing=True)
     send = MagicMock()
 
     def submitted(_terminal_id, _wire, **kwargs):
@@ -269,7 +270,7 @@ def test_wpq8_m9_every_admission_path_calls_safety_once_before_open(
         events.append("probe") or final_status,
         probe_meta,
     )
-    provider = MagicMock(accepts_input_while_processing=True)
+    provider = MagicMock(capabilities=ProviderCapabilities(accepts_input_while_processing=True))
     provider.read_composer_draft_state.return_value = "empty"
     service = InboxService()
     actual_safety = service._inject_safe

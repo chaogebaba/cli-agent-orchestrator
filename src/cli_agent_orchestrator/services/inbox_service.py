@@ -74,7 +74,6 @@ from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, Orc
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
-from cli_agent_orchestrator.providers.base import ProviderCapabilities
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import receiver_state_view, terminal_service
 from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
@@ -1367,21 +1366,12 @@ class InboxService:
                                 if provider is None:
                                     provider = provider_manager.get_provider(terminal_id)
                                 capabilities = (
-                                    getattr(provider, "capabilities", None)
-                                    if provider is not None
-                                    else None
+                                    provider.capabilities if provider is not None else None
                                 )
-                                if not isinstance(capabilities, ProviderCapabilities):
-                                    capabilities = ProviderCapabilities(
-                                        accepts_input_while_processing=bool(
-                                            getattr(
-                                                provider,
-                                                "accepts_input_while_processing",
-                                                False,
-                                            )
-                                        )
-                                    )
-                                eager_eligible = capabilities.accepts_input_while_processing
+                                eager_eligible = bool(
+                                    capabilities is not None
+                                    and capabilities.accepts_input_while_processing
+                                )
                             if not eager_eligible:
                                 return
                     ambiguous_count = count_ambiguous_attempts(message_ids)

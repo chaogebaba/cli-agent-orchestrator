@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import ast
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +20,10 @@ from cli_agent_orchestrator.kernel.receiver_state import (
     ReceiverState,
     ReceiverStateStore,
 )
-from cli_agent_orchestrator.kernel.receiver_state.trace_manifest import generate_manifest
+from cli_agent_orchestrator.kernel.receiver_state.trace_manifest import (
+    CONSUMER_MODULES,
+    generate_manifest,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import ProviderCapabilities
 from cli_agent_orchestrator.services import receiver_state_view, seam_activation
@@ -335,6 +339,108 @@ def test_delivery_none_path_defers_without_legacy_fallback(monkeypatch) -> None:
     monitor.get_status.assert_not_called()
 
 
+def test_flipped_processing_read_rechecks_legacy_unstick_side_effect(monkeypatch) -> None:
+    store = ReceiverStateStore()
+    now_mono = time.monotonic()
+    common = dict(
+        terminal_id="t1",
+        lifecycle_generation=1,
+        window_identity="w",
+        observation_epoch="11111111-1111-1111-1111-111111111111",
+        provider="codex",
+        frame_hash=None,
+    )
+    store.publish_observation(
+        ReceiverState(
+            **common,
+            observation_sequence=1,
+            frame_source="incremental",
+            captured_at_mono=now_mono,
+            latched_status=TerminalStatus.PROCESSING,
+            pass_outcome="accepted",
+            freshness_proof=FreshnessProof("not_probed"),
+        )
+    )
+    monitor = _fake_monitor(store)
+
+    def unstick(_terminal_id: str):
+        store.publish_observation(
+            ReceiverState(
+                **common,
+                observation_sequence=2,
+                frame_source="incremental",
+                captured_at_mono=time.monotonic(),
+                latched_status=TerminalStatus.IDLE,
+                pass_outcome="accepted",
+                freshness_proof=FreshnessProof("not_probed"),
+            )
+        )
+        return TerminalStatus.IDLE
+
+    monitor.get_raw_status.side_effect = unstick
+    monkeypatch.setattr(
+        receiver_state_view,
+        "get_backend",
+        lambda: SimpleNamespace(supports_event_inbox=lambda: False),
+    )
+    monkeypatch.setattr(receiver_state_view, "receiver_state_active", lambda _op: True)
+    monkeypatch.setattr(
+        receiver_state_view,
+        "get_terminal_metadata",
+        lambda _id: {"tmux_window": "w", "lifecycle_generation": 1, "recovery_state": None},
+    )
+
+    assert (
+        receiver_state_view.snapshot_view(
+            "agent_step.status_reads", "t1", max_age_s=10.0, none_behavior="none", monitor=monitor
+        )
+        is TerminalStatus.IDLE
+    )
+    monitor.get_raw_status.assert_called_once_with("t1")
+
+
+def test_backend_failure_warning_is_rate_limited_per_terminal(monkeypatch, caplog) -> None:
+    receiver_state_view._backend_failure_last_logged.clear()
+    clock = iter((0.0, 10.0, 61.0))
+    monkeypatch.setattr(receiver_state_view.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(
+        receiver_state_view, "get_backend", MagicMock(side_effect=OSError("backend"))
+    )
+    monitor = _fake_monitor(MagicMock())
+    caplog.set_level("WARNING", logger="cli_agent_orchestrator.services.receiver_state_view")
+
+    for _ in range(3):
+        receiver_state_view.snapshot_view(
+            "agent_step.status_reads", "t1", max_age_s=10.0, none_behavior="none", monitor=monitor
+        )
+
+    assert caplog.text.count("backend check failed") == 2
+
+
+def test_named_capability_sites_read_provider_descriptor() -> None:
+    root = Path(__file__).parents[2] / "src" / "cli_agent_orchestrator" / "services"
+    for filename, owner in (
+        ("auto_responder.py", "on_screen"),
+        ("inbox_service.py", "deliver_pending"),
+    ):
+        tree = ast.parse((root / filename).read_text(encoding="utf-8"))
+        function_nodes = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == owner
+        ]
+        assert function_nodes, filename
+        attrs = [
+            node
+            for node in ast.walk(function_nodes[0])
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "provider"
+            and node.attr == "capabilities"
+        ]
+        assert attrs, filename
+
+
 def test_view_reads_incremental_slot_only(monkeypatch) -> None:
     store = ReceiverStateStore()
     now_mono = time.monotonic()
@@ -395,6 +501,20 @@ def test_trace_manifest_is_byte_exact_and_has_22_hits() -> None:
     expected = manifest_path.read_text(encoding="utf-8")
     assert generate_manifest(Path(__file__).parents[2]) == expected
     assert len([line for line in expected.splitlines() if line]) == 22
+
+
+def test_trace_manifest_matches_bare_name_calls(tmp_path) -> None:
+    for index, relative_path in enumerate(CONSUMER_MODULES):
+        source_path = tmp_path / relative_path
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(
+            'get_status("t1")\n' if index == 0 else "pass\n",
+            encoding="utf-8",
+        )
+
+    assert generate_manifest(tmp_path) == (
+        "src/cli_agent_orchestrator/services/agent_step.py:1:get_status\n"
+    )
 
 
 def test_provider_capabilities_descriptor_is_closed() -> None:

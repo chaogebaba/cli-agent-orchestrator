@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Literal, Protocol
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -12,6 +13,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.seam_activation import ConsumerOp, receiver_state_active
 
 logger = logging.getLogger(__name__)
+_backend_failure_last_logged: dict[str, float] = {}
 
 NoneBehavior = Literal["none", "legacy", "watchdog"]
 
@@ -48,7 +50,13 @@ def snapshot_view(
         if get_backend().supports_event_inbox():
             return monitor.get_status(terminal_id)
     except Exception:
-        logger.warning("Receiver-state backend check failed; using legacy status", exc_info=True)
+        now_mono = time.monotonic()
+        last_logged = _backend_failure_last_logged.get(terminal_id)
+        if last_logged is None or now_mono - last_logged >= 60.0:
+            _backend_failure_last_logged[terminal_id] = now_mono
+            logger.warning(
+                "Receiver-state backend check failed; using legacy status", exc_info=True
+            )
         return monitor.get_status(terminal_id)
 
     if not receiver_state_active(consumer_op):
@@ -72,6 +80,29 @@ def snapshot_view(
             recovery_state=metadata.get("recovery_state"),
         )
         status = None if view is None else view.latched_status
+
+    if status == TerminalStatus.PROCESSING:
+        # Legacy get_raw_status re-checks the live buffer and may advance a
+        # stuck PROCESSING latch. Preserve that side effect for flipped reads,
+        # then prefer the newly published receiver observation.
+        raw_status = monitor.get_raw_status(terminal_id)
+        try:
+            refreshed = monitor.receiver_state_store.snapshot_view(
+                (
+                    terminal_id,
+                    int(metadata["lifecycle_generation"]),
+                    str(metadata["tmux_window"]),
+                ),
+                require_fresh=False,
+                max_age_s=max_age_s,
+                recovery_state=metadata.get("recovery_state"),
+            )
+        except Exception:
+            refreshed = None
+        if raw_status not in (TerminalStatus.PROCESSING, TerminalStatus.UNKNOWN):
+            status = raw_status
+        elif refreshed is not None:
+            status = refreshed.latched_status
 
     if status is not None:
         return status

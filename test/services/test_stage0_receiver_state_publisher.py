@@ -9,12 +9,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.kernel.receiver_state import FreshnessProof, ReceiverState
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.kernel.receiver_state.classification import (
+    ScreenClassification,
+    ScreenClassificationResult,
+)
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 
 
 def _metadata(_terminal_id: str) -> dict[str, object]:
     return {
+        "tmux_session": "worker-session",
         "tmux_window": "worker-window",
         "lifecycle_generation": 4,
         "provider": "codex",
@@ -65,6 +71,7 @@ def test_single_exit_publishes_accepted_and_keeps_external_bus_out_of_lock(
             "latched_status": TerminalStatus.IDLE,
             "pass_outcome": "accepted",
             "frame_source": "incremental",
+            "metadata": None,
         }
     ]
     assert published == ["idle"]
@@ -200,7 +207,15 @@ def test_out_of_lock_bus_failure_is_post_pass_and_not_aborted(monkeypatch) -> No
 
 def test_real_kernel_publish_uses_terminal_key_and_latched_projection(monkeypatch) -> None:
     monitor = StatusMonitor()
-    monkeypatch.setattr("cli_agent_orchestrator.clients.database.get_terminal_metadata", _metadata)
+
+    def metadata_outside_monitor_lock(terminal_id: str):
+        assert not monitor._lock._is_owned()  # type: ignore[attr-defined]
+        return _metadata(terminal_id)
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+        metadata_outside_monitor_lock,
+    )
     monkeypatch.setattr("cli_agent_orchestrator.services.status_monitor.bus", MagicMock())
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.auto_responder.auto_responder", MagicMock()
@@ -221,11 +236,89 @@ def test_real_kernel_publish_uses_terminal_key_and_latched_projection(monkeypatc
     assert view.observation_sequence == 1
 
 
+def test_probe_publishes_settled_result_to_fresh_slot_with_proof(monkeypatch) -> None:
+    monitor = StatusMonitor()
+
+    class Provider:
+        def classify_screen(self, _rows):
+            return ScreenClassificationResult(
+                ScreenClassification(TerminalStatus.IDLE, "chrome", None, None), ()
+            )
+
+        def classify_injection_hazard(self, _rows):
+            return None
+
+        def transient_error_detected(self, _rows, _classification):
+            return False
+
+        def classify_idle_reason(self, _rows, _classification):
+            return None
+
+    backend = MagicMock()
+    backend.supports_identity_readback = True
+    backend.capture_viewport.return_value = "prompt"
+    backend.get_pane_size.return_value = (80, 24)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
+        lambda _terminal_id: Provider(),
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.pane_identity_service.pane_identity_failure",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.get_terminal_metadata", _metadata)
+
+    status, _meta = monitor.probe_screen_status("t1")
+
+    assert status is TerminalStatus.IDLE
+    slots = monitor.receiver_state_store._entries[("t1", 4, "worker-window")]  # type: ignore[attr-defined]
+    observation = slots.latest_fresh.latest
+    assert observation is not None
+    assert observation.frame_source == "fresh_capture"
+    assert observation.pass_outcome == "probe"
+    assert observation.latched_status is TerminalStatus.IDLE
+    assert observation.freshness_proof.identity_ok
+
+
+def test_reset_buffer_invalidates_pre_reset_receiver_observation(monkeypatch) -> None:
+    monitor = StatusMonitor()
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.get_terminal_metadata", _metadata)
+    monitor.receiver_state_store.publish_observation(
+        ReceiverState(
+            terminal_id="t1",
+            lifecycle_generation=4,
+            window_identity="worker-window",
+            observation_epoch="11111111-1111-1111-1111-111111111111",
+            observation_sequence=1,
+            provider="codex",
+            frame_source="incremental",
+            captured_at_mono=time.monotonic(),
+            frame_hash=None,
+            latched_status=TerminalStatus.IDLE,
+            pass_outcome="accepted",
+            freshness_proof=FreshnessProof("not_probed"),
+        )
+    )
+
+    monitor.reset_buffer("t1")
+
+    assert (
+        monitor.receiver_state_store.snapshot_view(
+            ("t1", 4, "worker-window"),
+            require_fresh=False,
+            max_age_s=30.0,
+        )
+        is None
+    )
+
+
 def test_receiver_store_publisher_is_closed_to_other_modules() -> None:
     root = Path(__file__).parents[2] / "src" / "cli_agent_orchestrator"
     violations: list[str] = []
     for source_path in root.rglob("*.py"):
-        if source_path.name == "store.py" or source_path.name == "status_monitor.py":
+        relative_path = source_path.relative_to(root).as_posix()
+        if relative_path in {"kernel/receiver_state/store.py", "services/status_monitor.py"}:
             continue
         tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
         for node in ast.walk(tree):

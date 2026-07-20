@@ -222,12 +222,11 @@ class StatusMonitor:
         latched_status: TerminalStatus,
         pass_outcome: PassOutcome,
         frame_source: Literal["incremental", "fresh_capture"],
+        metadata: dict[str, Any] | None = None,
+        freshness_proof: FreshnessProof | None = None,
     ) -> None:
         """Build and publish one receiver observation. Caller holds ``_lock``."""
 
-        from cli_agent_orchestrator.clients.database import get_terminal_metadata
-
-        metadata = get_terminal_metadata(terminal_id)
         if metadata is None:
             raise LookupError(f"terminal metadata unavailable for {terminal_id}")
         self._receiver_state_store.publish_observation(
@@ -243,7 +242,7 @@ class StatusMonitor:
                 frame_hash=None,
                 latched_status=latched_status,
                 pass_outcome=pass_outcome,
-                freshness_proof=FreshnessProof("not_probed"),
+                freshness_proof=freshness_proof or FreshnessProof("not_probed"),
             )
         )
 
@@ -388,6 +387,12 @@ class StatusMonitor:
         """
         screen_spinner_override: Optional[TerminalStatus] = None
         publish_external = False
+        try:
+            from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+            observation_metadata = get_terminal_metadata(terminal_id)
+        except Exception:
+            observation_metadata = None
         with self._lock:
             pass_outcome: PassOutcome = "aborted"
             try:
@@ -489,6 +494,7 @@ class StatusMonitor:
                         latched_status=self._last_status.get(terminal_id, TerminalStatus.UNKNOWN),
                         pass_outcome=pass_outcome,
                         frame_source="incremental",
+                        metadata=observation_metadata,
                     )
                 except Exception:
                     try:
@@ -988,6 +994,7 @@ class StatusMonitor:
             self._bursting.pop(terminal_id, None)
             self._bump_chunk_seq_locked(terminal_id)
             handle = self._quiesce_handle.pop(terminal_id, None)
+            self._receiver_state_store.invalidate_terminal(terminal_id)
         self._cancel_quiesce_handle(handle)
 
     def reset_buffer(self, terminal_id: str) -> None:
@@ -999,7 +1006,24 @@ class StatusMonitor:
         this, the retry re-derives status from a buffer still full of stale bytes
         from the failed first attempt and can spuriously time out.
         """
+        try:
+            from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+            metadata = get_terminal_metadata(terminal_id)
+            receiver_key = (
+                (
+                    terminal_id,
+                    int(metadata["lifecycle_generation"]),
+                    str(metadata["tmux_window"]),
+                )
+                if metadata is not None
+                else None
+            )
+        except Exception:
+            receiver_key = None
         with self._lock:
+            if receiver_key is not None:
+                self._receiver_state_store.invalidate(receiver_key)
             self._buffers[terminal_id] = ""
             self._last_status.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
@@ -1447,6 +1471,33 @@ class StatusMonitor:
                     meta["idle_reason"] = idle_reason
             except Exception:
                 logger.exception("Error classifying idle reason for %s", terminal_id)
+        freshness_kind = "identity_ok"
+        freshness_detail = None
+        if identity_proof_failure is not None:
+            freshness_kind = "identity_failed"
+            freshness_detail = identity_proof_failure
+        elif probe_failure is not None:
+            freshness_kind = "probe_failed"
+            freshness_detail = probe_failure
+        try:
+            if metadata is None:
+                from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+                metadata = get_terminal_metadata(terminal_id)
+            with self._lock:
+                self._publish_observation(
+                    terminal_id,
+                    latched_status=classification.status,
+                    pass_outcome="probe",
+                    frame_source="fresh_capture",
+                    metadata=metadata,
+                    freshness_proof=FreshnessProof(freshness_kind, freshness_detail),
+                )
+        except Exception:
+            try:
+                self._log_receiver_publish_failure(terminal_id)
+            except Exception:
+                pass
         return classification.status, meta
 
     def get_rendered_screen(self, terminal_id: str) -> Optional[List[str]]:

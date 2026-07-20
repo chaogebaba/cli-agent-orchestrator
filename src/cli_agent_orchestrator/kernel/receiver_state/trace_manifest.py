@@ -33,10 +33,16 @@ def generate_manifest(repo_root: Path | None = None) -> str:
         source_path = root / relative_path
         tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=relative_path)
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            if not isinstance(node, ast.Call):
                 continue
-            if node.func.attr in TRACE_SYMBOLS:
-                rows.append(f"{relative_path}:{node.lineno}:{node.func.attr}")
+            if isinstance(node.func, ast.Attribute):
+                symbol = node.func.attr
+            elif isinstance(node.func, ast.Name):
+                symbol = node.func.id
+            else:
+                continue
+            if symbol in TRACE_SYMBOLS:
+                rows.append(f"{relative_path}:{node.lineno}:{symbol}")
     return "\n".join(sorted(rows)) + "\n"
 
 

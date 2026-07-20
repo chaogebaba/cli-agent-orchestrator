@@ -36,7 +36,6 @@ from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import ProviderCapabilities
 
 logger = logging.getLogger(__name__)
 
@@ -274,13 +273,7 @@ class AutoResponder:
         if os.environ.get("CAO_AUTO_ANSWER", "true").lower() == "false":
             self._clear_wait_rule(terminal_id)
             return None
-        capabilities = getattr(provider, "capabilities", None)
-        if not isinstance(capabilities, ProviderCapabilities):
-            capabilities = ProviderCapabilities(
-                supports_screen_detection=bool(
-                    getattr(provider, "supports_screen_detection", False)
-                )
-            )
+        capabilities = provider.capabilities
         if not capabilities.supports_screen_detection:
             self._clear_wait_rule(terminal_id)
             return None
