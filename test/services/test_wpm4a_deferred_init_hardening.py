@@ -479,6 +479,11 @@ async def test_ready_commits_only_after_initial_send(monkeypatch):
     monkeypatch.setattr(terminals, "send_input", lambda *_a, **_k: events.append("send"))
     monkeypatch.setattr(
         terminals,
+        "_confirm_worker_started_or_resubmit",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        terminals,
         "mark_terminal_init_ready",
         lambda _terminal, **_kwargs: events.append("ready") or True,
     )

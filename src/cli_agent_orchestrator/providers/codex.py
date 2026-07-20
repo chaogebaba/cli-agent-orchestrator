@@ -728,7 +728,18 @@ class CodexProvider(BaseProvider):
                 return
 
             await asyncio.sleep(1.0)
-        logger.warning("Codex trust prompt handler timed out")
+        pane_tail = ""
+        try:
+            output = get_backend().get_history(self.session_name, self.window_name)
+            if output:
+                pane_tail = "\n".join(output.splitlines()[-10:])
+        except Exception:
+            pass
+        logger.error(
+            "Codex trust prompt handler timed out; no trust dialog or welcome "
+            "banner detected. Pane tail:\n%s",
+            pane_tail,
+        )
 
     async def initialize(
         self,
@@ -816,6 +827,15 @@ class CodexProvider(BaseProvider):
         native = self._resolve_native_status(output)
         if native is not None:
             return native
+
+        # This check is intentionally stateful and remains outside the pure
+        # screen-local classifier used by Stage-0b evidence publication.
+        if self._initialized and self.shell_baseline:
+            current_command = get_backend().get_pane_current_command(
+                self.session_name, self.window_name
+            )
+            if current_command == self.shell_baseline:
+                return TerminalStatus.ERROR
 
         # herdr never pushes a buffer (pipe_pane is a no-op there); read live
         # pane content instead of falling through to "no output" on every call.

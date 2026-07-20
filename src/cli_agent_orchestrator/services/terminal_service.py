@@ -21,6 +21,7 @@ import asyncio
 import concurrent.futures
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -56,6 +57,7 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.constants import (
     FIFO_DIR,
     PIPE_LIVENESS_TAIL_LINES,
+    PYTE_SCREEN_ROWS,
     SESSION_PREFIX,
     TERMINAL_LOG_DIR,
 )
@@ -107,6 +109,7 @@ from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
     generate_window_name,
+    wait_until_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -2219,6 +2222,135 @@ async def _prepare_fork_message(
     return f"{preamble}\n\n{initial_message}"
 
 
+# --- deferred-init submit verification ----------------------------------------
+_DEFERRED_SUBMIT_CONFIRM_TIMEOUT = 8.0
+_DEFERRED_SUBMIT_MAX_RESUBMITS = 3
+_DEFERRED_SUBMIT_STABILITY_DELAY = 0.1
+_DEFERRED_STARTED_STATUSES = {
+    TerminalStatus.PROCESSING,
+    TerminalStatus.COMPLETED,
+    TerminalStatus.WAITING_USER_ANSWER,
+}
+
+
+def _normalized_composer_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _message_visible_in_box(terminal_id: str, message: str) -> bool:
+    """Return whether the provider parser sees exactly the expected task draft."""
+    expected = _normalized_composer_text(message)
+    if len(expected) < 8:
+        return False
+    metadata = get_terminal_metadata(terminal_id)
+    provider = provider_manager.get_provider(terminal_id)
+    if not metadata or provider is None:
+        return False
+    try:
+        captured = get_backend().get_history(
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            tail_lines=PYTE_SCREEN_ROWS,
+            strip_escapes=not bool(provider.composer_parse_accepts_escapes),
+        )
+        draft = provider.read_composer_draft(captured.splitlines())
+    except Exception:
+        return False
+    return isinstance(draft, str) and _normalized_composer_text(draft) == expected
+
+
+async def _confirm_worker_started_or_resubmit(
+    terminal_id: str,
+    message: str,
+    registry: PluginRegistry | None,
+    sender_id: str | None,
+    orchestration_type: OrchestrationType | None,
+    *,
+    generation: str | None = None,
+) -> bool:
+    """Confirm deferred input started, retrying only through guarded send seams."""
+
+    async def run_blocking(operation: str, function, *args, **kwargs):
+        if generation is None:
+            return await asyncio.to_thread(function, *args, **kwargs)
+        result, _grant = await _tracked_blocking(
+            terminal_id,
+            generation,
+            "abandonable",
+            operation,
+            function,
+            *args,
+            **kwargs,
+        )
+        return result
+
+    if await wait_until_status(
+        terminal_id,
+        _DEFERRED_STARTED_STATUSES,
+        timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
+        polling_interval=0.5,
+    ):
+        return True
+
+    for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
+        current_status = status_monitor.get_status(terminal_id)
+        if current_status == TerminalStatus.WAITING_USER_ANSWER:
+            raise TerminalInputBlockedError(
+                f"Terminal {terminal_id} is waiting for a user answer during deferred submit"
+            )
+        if current_status == TerminalStatus.ERROR:
+            return False
+
+        task_is_stable = await run_blocking(
+            "deferred_submit_probe", _message_visible_in_box, terminal_id, message
+        )
+        if task_is_stable:
+            await asyncio.sleep(_DEFERRED_SUBMIT_STABILITY_DELAY)
+            task_is_stable = await run_blocking(
+                "deferred_submit_probe",
+                _message_visible_in_box,
+                terminal_id,
+                message,
+            )
+        if task_is_stable:
+            if status_monitor.get_status(terminal_id) == TerminalStatus.WAITING_USER_ANSWER:
+                raise TerminalInputBlockedError(
+                    f"Terminal {terminal_id} entered a user dialog during deferred submit"
+                )
+            logger.warning(
+                "Deferred assign to %s is present but unsubmitted; retrying Enter (attempt %d)",
+                terminal_id,
+                attempt,
+            )
+            await run_blocking("deferred_submit_enter", send_special_key, terminal_id, "Enter")
+        else:
+            logger.warning(
+                "Deferred assign to %s was not accepted; re-delivering through guards "
+                "(attempt %d)",
+                terminal_id,
+                attempt,
+            )
+            await run_blocking(
+                "deferred_submit_send",
+                send_input,
+                terminal_id,
+                message,
+                registry=registry,
+                sender_id=sender_id,
+                orchestration_type=orchestration_type,
+                defer_on_dialog=True,
+                expect_callback=False,
+            )
+        if await wait_until_status(
+            terminal_id,
+            _DEFERRED_STARTED_STATUSES,
+            timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
+            polling_interval=0.5,
+        ):
+            return True
+    return False
+
+
 def _schedule_deferred_init(
     provider_instance,
     terminal_id: str,
@@ -2364,6 +2496,29 @@ def _schedule_deferred_init(
                     sender_id=snapshot.get("caller_id"),
                     orchestration_type=orchestration_type,
                 )
+                started = await _confirm_worker_started_or_resubmit(
+                    terminal_id,
+                    prepared_message,
+                    registry,
+                    snapshot.get("caller_id"),
+                    orchestration_type,
+                    generation=generation,
+                )
+                if not started:
+                    logger.error(
+                        "Deferred init for %s never started after guarded resubmits; "
+                        "notifying caller and tearing down",
+                        terminal_id,
+                    )
+                    await _claim_and_settle_deferred_failure(
+                        terminal_id,
+                        generation,
+                        snapshot,
+                        "deferred_init_internal",
+                        registry,
+                        uuid_lease_token,
+                    )
+                    return
             await _mark_ready_if_generation_current(terminal_id, generation)
         except TerminalInputBlockedError as e:
             # The worker initialized but is parked on an interactive prompt
@@ -2582,18 +2737,26 @@ def send_input(
             if isinstance(orchestration_type, OrchestrationType)
             else str(orchestration_type or "")
         )
-        if (
-            provider
-            and provider.blocks_orchestrated_input_while_waiting_user_answer is True
-            and orchestration_value
-            in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
-            and status_monitor.get_status(terminal_id) == TerminalStatus.WAITING_USER_ANSWER
-        ):
-            raise TerminalInputBlockedError(
-                f"Terminal {terminal_id} is waiting for a user answer. "
-                "Use answer_user_prompt to submit a selection or approval before "
-                f"sending {orchestration_value} input."
-            )
+        if provider:
+            current_status = status_monitor.get_status(terminal_id)
+            # Pre-paste guard order: dead-provider ERROR, interactive WAITING,
+            # then the existing draft guard immediately before injection.
+            # Inbox callers complete their InjectSafetyResult gate before this seam.
+            if current_status == TerminalStatus.ERROR:
+                raise TerminalInputBlockedError(
+                    f"Terminal {terminal_id} provider is in ERROR state; refusing input"
+                )
+            if (
+                provider.blocks_orchestrated_input_while_waiting_user_answer is True
+                and orchestration_value
+                in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
+                and current_status == TerminalStatus.WAITING_USER_ANSWER
+            ):
+                raise TerminalInputBlockedError(
+                    f"Terminal {terminal_id} is waiting for a user answer. "
+                    "Use answer_user_prompt to submit a selection or approval before "
+                    f"sending {orchestration_value} input."
+                )
 
         # Inject profile contracts only for orchestrated deliveries. Direct
         # human pane input and answer_user_prompt keep their literal text.
