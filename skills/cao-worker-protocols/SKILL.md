@@ -124,6 +124,26 @@ When your charter has you spawn helper or reviewer lanes with `assign`:
 - **All lanes**: point at files rather than pasting long content; require
   callbacks to name absolute paths; capture a verbatim pane sample BEFORE any
   recover/kill when a lane misbehaves (sample-first law).
+
+### Token-saving edit discipline (authoring workers: blueprint maker, architect)
+
+- **Edit via commands, never Read-then-Edit.** The Read→Edit-tool cycle pays
+  for the file bytes twice (once reading, once echoing the diff). Instead:
+  - Multi-line/structural edits: `python3 - <<'EOF'` heredoc doing
+    `s.replace(old, new)` with an `assert s.count(old) == 1` guard BEFORE
+    writing — the guard catches stale/line-wrapped anchors before any damage.
+  - One-line substitutions: `sed -i` — but run a count check first
+    (`rg -c 'pattern' file`) so you know exactly how many sites you hit.
+- **Read narrow.** Never read a whole large file to edit one region — locate
+  with `rg -n` / `sed -n 'A,Bp'`, then edit by command. Read a full file only
+  when you must judge all of it.
+- **Verify by re-grepping the anchor, not re-reading the file.** After a
+  command edit, `rg -n` the new text — a few lines, not the whole file.
+- **`git add` explicit paths, never `-A`**; commit messages state what ruling
+  or round the edit lands.
+- If an anchor assert fails, the file drifted (often a line-wrap difference):
+  re-grep the exact bytes (`sed -n`, `cat -A`) and retry — never fall back to
+  the Edit tool on a big file.
 - Same-round multi-lane dispatch: set `barrier="<wp>-r<N>"` on every member if
   your schema exposes it; otherwise have each lane end its callback with
   `ROUND r<N> LANE k/M` and act only when all M arrived.
