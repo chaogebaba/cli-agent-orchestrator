@@ -147,3 +147,7 @@ When your charter has you spawn helper or reviewer lanes with `assign`:
 - Same-round multi-lane dispatch: set `barrier="<wp>-r<N>"` on every member if
   your schema exposes it; otherwise have each lane end its callback with
   `ROUND r<N> LANE k/M` and act only when all M arrived.
+- **Waiting on lane callbacks = go IDLE.** Delivery is event-driven — lane
+  callbacks arrive when you idle. Never poll, busy-wait, or schedule wakeups
+  (e.g. ScheduleWakeup — that tool is /loop-mode only) to check on a lane;
+  end your turn and let the callback wake you (drill D1, 2026-07-20).
