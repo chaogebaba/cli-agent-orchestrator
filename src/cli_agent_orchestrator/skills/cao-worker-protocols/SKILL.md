@@ -86,3 +86,108 @@ worker — and are reserved for the human operator alone:
 - If `send_message` is available and the task requires a callback, call it directly rather than ending with prose alone.
 - Keep callback messages structured so the supervisor can merge them into a larger workflow.
 - For handoff tasks, return the completed output directly and let the orchestrator handle delivery.
+
+## Spawning your own sub-lanes (delegating workers: blueprint maker, architect)
+
+When your charter has you spawn helper or reviewer lanes with `assign`:
+
+- **The provider comes from the agent PROFILE, never from a model setting.**
+  `assign(agent_profile="grok_dev")` gives a Grok CLI lane; `codex_dev` /
+  `codex_reviewer` give Codex lanes; `fable_design_reviewer` gives a Claude
+  structure lane; `developer-sonnet` gives a cheap scratch Claude lane.
+- **NEVER set, pass, or configure a model yourself** — `providers.toml` owns
+  per-profile model defaults.
+- **Grok lanes LOOK like Claude Code** — the grok_cli provider launches a
+  Claude Code binary pointed at a relay grok model; a "Claude Code ... grok-4.5"
+  banner on a grok lane is NORMAL, not a mis-spawn.
+- **Model-select park = provider/relay outage, not your bug.** If a lane sits
+  at "issue with the selected model … Run /model" the relay roster is down for
+  that model (it flaps). Do NOT retry the same profile in a loop: ONE retry
+  max, then either re-`assign` the same brief to a working-provider profile
+  (`developer-sonnet` is the standing fallback for dead grok lanes) or report
+  the outage to your caller. `delete_terminal` the parked lane either way.
+
+### Lane health is the SUPERVISOR'S job (delegating workers: maker, architect)
+
+As a delegating worker you DISPATCH lanes and RECEIVE their reports — nothing
+in between. The supervisor owns keeping every lane in the session healthy:
+
+- If a lane crashes, hangs, hits a provider false-flag/refusal banner, or gets
+  watchdog-flagged: forward the incident to the supervisor via `send_message`
+  (terminal id + what you saw, verbatim) and go back to waiting. The
+  supervisor scrubs/nudges/recovers it; the lane's callback still comes to YOU.
+- Do NOT peek-doctor, steer, or re-spawn a sick lane yourself. The one
+  exception: a lane cleanly DEAD from a known provider outage (model-select
+  park above) — there the documented fallback re-assign applies.
+- Codex false-flag strikes specifically: report to the supervisor, who runs
+  the scrub-and-nudge; never try to talk a codex lane past a refusal banner.
+
+### Codebase recon (delegating workers: maker, architect)
+
+You have the SAME recon toolkit as the supervisor — use it instead of raw
+self-grepping:
+
+- **graphify FIRST**: any repo with `graphify-out/` — `graphify query
+  "<question>"` (scoped subgraph), `graphify path "<A>" "<B>"`
+  (relationships), `graphify explain "<concept>"`. Orient there before
+  reading any source file; read raw lines only after orientation. The CAO
+  fork has its OWN graph inside `cli-agent-orchestrator/` — the root graph
+  cannot see gitignored paths.
+- **Warm grok oracle for exact refs**: if a session `grok_oracle` is alive,
+  send it your codebase questions via `send_message` (ask-then-idle: send,
+  END YOUR TURN, the answer arrives as a message — busy-waiting deadlocks
+  w2w). It returns exact file:line references and snippets. The oracle is
+  SHARED session infrastructure — never delete it, never treat it as your
+  disposable.
+- **grok_dev grunt lane for mechanical recon**: fire `assign(agent_profile=
+  "grok_dev")` for bounded chores — enumerate call sites, collect diffs,
+  build an inventory file, run a probe script. Same lane rules as everywhere:
+  files-not-prose deliverables, absolute paths in callbacks, delete when done.
+- Division of labor: graphify/oracle answer "where/what is X" cheaply;
+  grok_dev produces artifact files; YOU do only the judgment reading —
+  the deciding lines, not the whole tour.
+
+### Provider craft (what the supervisor knows — use it)
+
+- **Codex lanes**: keep briefs terse and concrete (goal, file paths,
+  acceptance criteria, what NOT to do; word-cap answers). When a claim can be
+  tested, have codex RUN it, not reason about it. NEVER quote refusal/wrapper
+  literals or security vocabulary into a codex brief — reference by
+  `file:line`; neutral artifact names; frame reviews as "correctness review of
+  our own orchestrator". A codex "quota exceeded" banner is FALSE on the relay
+  backend, REAL on ChatGPT subscription — report, don't self-diagnose.
+- **Grok lanes**: iterate, don't one-shot — grok does best with short
+  follow-up rounds. Grok summarizing instead of quoting → have it write full
+  output to a file and reference the path. Grok detached-command status
+  (`N commands still running`) over an idle composer is a known false-idle
+  (F29) — don't panic-kill a grok lane for it.
+- **All lanes**: point at files rather than pasting long content; require
+  callbacks to name absolute paths; capture a verbatim pane sample BEFORE any
+  recover/kill when a lane misbehaves (sample-first law).
+
+### Token-saving edit discipline (authoring workers: blueprint maker, architect)
+
+- **Edit via commands, never Read-then-Edit.** The Read→Edit-tool cycle pays
+  for the file bytes twice (once reading, once echoing the diff). Instead:
+  - Multi-line/structural edits: `python3 - <<'EOF'` heredoc doing
+    `s.replace(old, new)` with an `assert s.count(old) == 1` guard BEFORE
+    writing — the guard catches stale/line-wrapped anchors before any damage.
+  - One-line substitutions: `sed -i` — but run a count check first
+    (`rg -c 'pattern' file`) so you know exactly how many sites you hit.
+- **Read narrow.** Never read a whole large file to edit one region — locate
+  with `rg -n` / `sed -n 'A,Bp'`, then edit by command. Read a full file only
+  when you must judge all of it.
+- **Verify by re-grepping the anchor, not re-reading the file.** After a
+  command edit, `rg -n` the new text — a few lines, not the whole file.
+- **`git add` explicit paths, never `-A`**; commit messages state what ruling
+  or round the edit lands.
+- If an anchor assert fails, the file drifted (often a line-wrap difference):
+  re-grep the exact bytes (`sed -n`, `cat -A`) and retry — never fall back to
+  the Edit tool on a big file.
+- Same-round multi-lane dispatch: set `barrier="<wp>-r<N>"` on every member if
+  your schema exposes it; otherwise have each lane end its callback with
+  `ROUND r<N> LANE k/M` and act only when all M arrived.
+- **Waiting on lane callbacks = go IDLE.** Delivery is event-driven — lane
+  callbacks arrive when you idle. Never poll, busy-wait, or schedule wakeups
+  (e.g. ScheduleWakeup — that tool is /loop-mode only) to check on a lane;
+  end your turn and let the callback wake you (drill D1, 2026-07-20).
