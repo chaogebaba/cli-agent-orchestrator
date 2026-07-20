@@ -175,9 +175,17 @@ self-grepping:
     writing — the guard catches stale/line-wrapped anchors before any damage.
   - One-line substitutions: `sed -i` — but run a count check first
     (`rg -c 'pattern' file`) so you know exactly how many sites you hit.
-- **Read narrow.** Never read a whole large file to edit one region — locate
-  with `rg -n` / `sed -n 'A,Bp'`, then edit by command. Read a full file only
-  when you must judge all of it.
+- **Read narrow — for READING as much as editing.** Never read a whole large
+  file to work one region — locate with `rg -n` / `sed -n 'A,Bp'`, then read
+  or edit only that span. Re-reading your own 1000+-line blueprint whole for
+  one fold costs ~40x the scoped read (measured: ~22K vs ~550 tokens, context
+  drill 2026-07-20); ONE lapse per gate loop outweighs every other saving.
+  Read a full file only when you must judge all of it (e.g. a final
+  convergence pass), and say so.
+- **graphify: narrow the query surface.** Default wide BFS answers cost ~2K
+  tokens and truncate; prefer `graphify explain "<concept>"` or a scoped
+  `graphify query` with a tight question, and drill into specific nodes
+  rather than re-running broader queries.
 - **Verify by re-grepping the anchor, not re-reading the file.** After a
   command edit, `rg -n` the new text — a few lines, not the whole file.
 - **`git add` explicit paths, never `-A`**; commit messages state what ruling
