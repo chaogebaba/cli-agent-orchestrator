@@ -107,6 +107,21 @@ When your charter has you spawn helper or reviewer lanes with `assign`:
   (`developer-sonnet` is the standing fallback for dead grok lanes) or report
   the outage to your caller. `delete_terminal` the parked lane either way.
 
+### Lane health is the SUPERVISOR'S job (delegating workers: maker, architect)
+
+As a delegating worker you DISPATCH lanes and RECEIVE their reports — nothing
+in between. The supervisor owns keeping every lane in the session healthy:
+
+- If a lane crashes, hangs, hits a provider false-flag/refusal banner, or gets
+  watchdog-flagged: forward the incident to the supervisor via `send_message`
+  (terminal id + what you saw, verbatim) and go back to waiting. The
+  supervisor scrubs/nudges/recovers it; the lane's callback still comes to YOU.
+- Do NOT peek-doctor, steer, or re-spawn a sick lane yourself. The one
+  exception: a lane cleanly DEAD from a known provider outage (model-select
+  park above) — there the documented fallback re-assign applies.
+- Codex false-flag strikes specifically: report to the supervisor, who runs
+  the scrub-and-nudge; never try to talk a codex lane past a refusal banner.
+
 ### Provider craft (what the supervisor knows — use it)
 
 - **Codex lanes**: keep briefs terse and concrete (goal, file paths,
