@@ -33,6 +33,7 @@ from cli_agent_orchestrator.constants import (
 from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
+from cli_agent_orchestrator.services import receiver_state_view
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
@@ -286,7 +287,15 @@ class StalledCallbackWatchdog:
 
         for terminal_id in terminal_ids:
             try:
-                self.record_status(terminal_id, status_monitor.get_status(terminal_id), now=now)
+                status = receiver_state_view.snapshot_view(
+                    "watchdog.cached_status",
+                    terminal_id,
+                    max_age_s=30.0,
+                    none_behavior="watchdog",
+                    monitor=status_monitor,
+                )
+                if status is not None:
+                    self.record_status(terminal_id, status, now=now)
             except Exception:
                 logger.exception(
                     "Failed to poll status for stalled-callback watchdog: %s",
@@ -708,7 +717,13 @@ class StalledCallbackWatchdog:
                     self._waiting_inbox_episodes.pop(terminal_id, None)
                 continue
 
-            status = status_monitor.get_status(terminal_id)
+            status = receiver_state_view.snapshot_view(
+                "watchdog.waiting_inbox_gate",
+                terminal_id,
+                max_age_s=30.0,
+                none_behavior="watchdog",
+                monitor=status_monitor,
+            )
             if status != TerminalStatus.WAITING_USER_ANSWER:
                 with self._lock:
                     self._waiting_inbox_episodes.pop(terminal_id, None)
@@ -794,7 +809,13 @@ class StalledCallbackWatchdog:
                 with self._lock:
                     self._ready_backlog_episodes.pop(terminal_id, None)
                 continue
-            status = status_monitor.get_status(terminal_id)
+            status = receiver_state_view.snapshot_view(
+                "watchdog.ready_backlog_gate",
+                terminal_id,
+                max_age_s=30.0,
+                none_behavior="watchdog",
+                monitor=status_monitor,
+            )
             if (
                 status not in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
                 or observation.oldest_pending_age_seconds <= CAO_WAITING_INBOX_GRACE_SECONDS

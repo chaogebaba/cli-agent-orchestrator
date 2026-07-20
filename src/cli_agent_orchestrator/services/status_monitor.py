@@ -20,6 +20,13 @@ from cli_agent_orchestrator.constants import (
     PYTE_QUIESCENCE_DELAY_S,
     STATE_BUFFER_MAX,
 )
+from cli_agent_orchestrator.kernel.receiver_state import (
+    FreshnessProof,
+    PassOutcome,
+    ReceiverState,
+    ReceiverStateStore,
+    pass_outcome_for_source,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.event_bus import bus
@@ -199,6 +206,55 @@ class StatusMonitor:
         # a status transition. Tasks remove themselves on completion.
         self._detect_tasks: set = set()
         self._screen_size_deferred_warned: set[str] = set()
+        self._receiver_state_store = ReceiverStateStore()
+        self._receiver_publish_last_logged: Dict[str, float] = {}
+
+    @property
+    def receiver_state_store(self) -> ReceiverStateStore:
+        """Return this monitor's process-local observation store."""
+
+        return self._receiver_state_store
+
+    def _publish_observation(
+        self,
+        terminal_id: str,
+        *,
+        latched_status: TerminalStatus,
+        pass_outcome: PassOutcome,
+        frame_source: Literal["incremental", "fresh_capture"],
+        metadata: dict[str, Any] | None = None,
+        freshness_proof: FreshnessProof | None = None,
+    ) -> None:
+        """Build and publish one receiver observation. Caller holds ``_lock``."""
+
+        if metadata is None:
+            raise LookupError(f"terminal metadata unavailable for {terminal_id}")
+        self._receiver_state_store.publish_observation(
+            ReceiverState(
+                terminal_id=terminal_id,
+                lifecycle_generation=int(metadata["lifecycle_generation"]),
+                window_identity=str(metadata["tmux_window"]),
+                observation_epoch=self._epoch_locked(terminal_id),
+                observation_sequence=self._observation_seq.get(terminal_id, 0),
+                provider=str(metadata["provider"]),
+                frame_source=frame_source,
+                captured_at_mono=time.monotonic(),
+                frame_hash=None,
+                latched_status=latched_status,
+                pass_outcome=pass_outcome,
+                freshness_proof=freshness_proof or FreshnessProof("not_probed"),
+            )
+        )
+
+    def _log_receiver_publish_failure(self, terminal_id: str) -> None:
+        """Rate-limit hook-failure tracebacks without changing pass behavior."""
+
+        now_mono = time.monotonic()
+        last_logged = self._receiver_publish_last_logged.get(terminal_id)
+        if last_logged is not None and now_mono - last_logged < 60.0:
+            return
+        self._receiver_publish_last_logged[terminal_id] = now_mono
+        logger.exception("Failed to publish receiver observation for %s", terminal_id)
 
     def _bump_chunk_seq_locked(self, terminal_id: str) -> int:
         """Advance the terminal generation. Caller holds _lock."""
@@ -315,6 +371,7 @@ class StatusMonitor:
         *,
         trusted_busy: bool = False,
         expected_seq: Optional[int] = None,
+        pass_source: Literal["inline", "forced"] = "inline",
     ) -> None:
         """Apply the sticky-latch rules to a freshly detected status and publish
         on change. Shared by the raw and pyte detection paths.
@@ -329,94 +386,130 @@ class StatusMonitor:
         paste into a busy agent).
         """
         screen_spinner_override: Optional[TerminalStatus] = None
+        publish_external = False
+        try:
+            from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+            observation_metadata = get_terminal_metadata(terminal_id)
+        except Exception:
+            observation_metadata = None
         with self._lock:
-            if expected_seq is not None and self._chunk_seq.get(terminal_id, 0) != expected_seq:
-                return
-            last = self._last_status.get(terminal_id)
-            self._observe_locked(terminal_id, detected)
+            pass_outcome: PassOutcome = "aborted"
+            try:
+                if expected_seq is not None and self._chunk_seq.get(terminal_id, 0) != expected_seq:
+                    pass_outcome = "stale_seq"
+                else:
+                    last = self._last_status.get(terminal_id)
+                    self._observe_locked(terminal_id, detected)
 
-            # UNKNOWN is "no signal", not a state: never let it overwrite a known
-            # status. Mid-turn the screen can momentarily show neither a spinner
-            # nor the prompt (e.g. while a tool runs), which the detector reports
-            # as UNKNOWN; downgrading a known PROCESSING to UNKNOWN there is a
-            # spurious transition (observed live as processing->unknown->completed).
-            #
-            # Do NOT narrow this to "suppress only when not armed" (to let an
-            # armed new turn clear a stale ready status). It does not actually
-            # close that window — the rising-edge frame right after a paste still
-            # composites the PREVIOUS turn's COMPLETED box, so get_status() reports
-            # ready whether or not UNKNOWN is let through — and it opens a worse
-            # one: an armed ready->UNKNOWN->ready re-render (torn paste frame, then
-            # the prior turn repainted before the new spinner draws) makes the
-            # bounce back to COMPLETED a non-ready->ready upgrade that CONSUMES the
-            # revert arm. The genuine PROCESSING that follows is then latch-blocked
-            # and the terminal reads ready for the entire busy turn — exactly what
-            # InboxService must never paste into. See
-            # test_armed_unknown_then_ready_rerender_keeps_processing. The initial
-            # UNKNOWN (last is None, nothing detected yet) is still allowed through.
-            if detected == TerminalStatus.UNKNOWN and last is not None:
-                return
-
-            armed = self._allow_processing_revert.get(terminal_id, False)
-            if not armed:
-                if last in _STICKY_READY_STATUSES and detected in (
-                    TerminalStatus.PROCESSING,
-                    TerminalStatus.UNKNOWN,
-                ):
-                    if trusted_busy and detected == TerminalStatus.PROCESSING:
-                        screen_spinner_override = last
+                    # UNKNOWN is "no signal", not a state: never let it overwrite a known
+                    # status. Mid-turn the screen can momentarily show neither a spinner
+                    # nor the prompt (e.g. while a tool runs), which the detector reports
+                    # as UNKNOWN; downgrading a known PROCESSING to UNKNOWN there is a
+                    # spurious transition (observed live as processing->unknown->completed).
+                    #
+                    # Do NOT narrow this to "suppress only when not armed" (to let an
+                    # armed new turn clear a stale ready status). It does not actually
+                    # close that window — the rising-edge frame right after a paste still
+                    # composites the PREVIOUS turn's COMPLETED box, so get_status() reports
+                    # ready whether or not UNKNOWN is let through — and it opens a worse
+                    # one: an armed ready->UNKNOWN->ready re-render (torn paste frame, then
+                    # the prior turn repainted before the new spinner draws) makes the
+                    # bounce back to COMPLETED a non-ready->ready upgrade that CONSUMES the
+                    # revert arm. The genuine PROCESSING that follows is then latch-blocked
+                    # and the terminal reads ready for the entire busy turn — exactly what
+                    # InboxService must never paste into. See
+                    # test_armed_unknown_then_ready_rerender_keeps_processing. The initial
+                    # UNKNOWN (last is None, nothing detected yet) is still allowed through.
+                    if detected == TerminalStatus.UNKNOWN and last is not None:
+                        pass_outcome = "unknown_suppressed"
                     else:
-                        return
-                if last == TerminalStatus.COMPLETED and detected == TerminalStatus.IDLE:
-                    return
+                        armed = self._allow_processing_revert.get(terminal_id, False)
+                        sticky_rejected = False
+                        if not armed:
+                            if last in _STICKY_READY_STATUSES and detected in (
+                                TerminalStatus.PROCESSING,
+                                TerminalStatus.UNKNOWN,
+                            ):
+                                if trusted_busy and detected == TerminalStatus.PROCESSING:
+                                    screen_spinner_override = last
+                                else:
+                                    sticky_rejected = True
+                            if last == TerminalStatus.COMPLETED and detected == TerminalStatus.IDLE:
+                                sticky_rejected = True
 
-            if detected == last:
-                if detected in _STICKY_READY_STATUSES:
-                    self._status_gen[terminal_id] = self._processing_gen.get(terminal_id, 0)
-                    logger.info(
-                        "Terminal %s accepted %s generation: input_gen=%s "
-                        "processing_gen=%s status_gen=%s",
+                        if sticky_rejected:
+                            pass_outcome = "sticky_rejected"
+                        elif detected == last:
+                            if detected in _STICKY_READY_STATUSES:
+                                self._status_gen[terminal_id] = self._processing_gen.get(
+                                    terminal_id, 0
+                                )
+                                logger.info(
+                                    "Terminal %s accepted %s generation: input_gen=%s "
+                                    "processing_gen=%s status_gen=%s",
+                                    terminal_id,
+                                    detected.value,
+                                    self._input_gen.get(terminal_id, 0),
+                                    self._processing_gen.get(terminal_id, 0),
+                                    self._status_gen.get(terminal_id, 0),
+                                )
+                            pass_outcome = pass_outcome_for_source(pass_source, "no_change")
+                        else:
+                            self._last_status[terminal_id] = detected
+                            if detected == TerminalStatus.PROCESSING:
+                                self._processing_gen[terminal_id] = self._input_gen.get(
+                                    terminal_id, 0
+                                )
+                                self._allow_processing_revert[terminal_id] = False
+                                logger.info(
+                                    "Terminal %s accepted processing generation: input_gen=%s "
+                                    "processing_gen=%s status_gen=%s",
+                                    terminal_id,
+                                    self._input_gen.get(terminal_id, 0),
+                                    self._processing_gen.get(terminal_id, 0),
+                                    self._status_gen.get(terminal_id, 0),
+                                )
+                            elif detected in _STICKY_READY_STATUSES:
+                                self._status_gen[terminal_id] = self._processing_gen.get(
+                                    terminal_id, 0
+                                )
+                                if last not in _STICKY_READY_STATUSES:
+                                    self._allow_processing_revert[terminal_id] = False
+                                logger.info(
+                                    "Terminal %s accepted %s generation: input_gen=%s "
+                                    "processing_gen=%s status_gen=%s",
+                                    terminal_id,
+                                    detected.value,
+                                    self._input_gen.get(terminal_id, 0),
+                                    self._processing_gen.get(terminal_id, 0),
+                                    self._status_gen.get(terminal_id, 0),
+                                )
+                            pass_outcome = pass_outcome_for_source(pass_source, "accepted")
+                            publish_external = True
+            finally:
+                try:
+                    self._publish_observation(
                         terminal_id,
-                        detected.value,
-                        self._input_gen.get(terminal_id, 0),
-                        self._processing_gen.get(terminal_id, 0),
-                        self._status_gen.get(terminal_id, 0),
+                        latched_status=self._last_status.get(terminal_id, TerminalStatus.UNKNOWN),
+                        pass_outcome=pass_outcome,
+                        frame_source="incremental",
+                        metadata=observation_metadata,
                     )
-                return
-
-            self._last_status[terminal_id] = detected
-            if detected == TerminalStatus.PROCESSING:
-                self._processing_gen[terminal_id] = self._input_gen.get(terminal_id, 0)
-                self._allow_processing_revert[terminal_id] = False
-                logger.info(
-                    "Terminal %s accepted processing generation: input_gen=%s "
-                    "processing_gen=%s status_gen=%s",
-                    terminal_id,
-                    self._input_gen.get(terminal_id, 0),
-                    self._processing_gen.get(terminal_id, 0),
-                    self._status_gen.get(terminal_id, 0),
-                )
-            elif detected in _STICKY_READY_STATUSES:
-                self._status_gen[terminal_id] = self._processing_gen.get(terminal_id, 0)
-                if last not in _STICKY_READY_STATUSES:
-                    self._allow_processing_revert[terminal_id] = False
-                logger.info(
-                    "Terminal %s accepted %s generation: input_gen=%s "
-                    "processing_gen=%s status_gen=%s",
-                    terminal_id,
-                    detected.value,
-                    self._input_gen.get(terminal_id, 0),
-                    self._processing_gen.get(terminal_id, 0),
-                    self._status_gen.get(terminal_id, 0),
-                )
+                except Exception:
+                    try:
+                        self._log_receiver_publish_failure(terminal_id)
+                    except Exception:
+                        pass
 
         # Publish outside the lock — subscribers must never be able to
         # re-enter StatusMonitor while the latch state is mid-update.
-        bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
-        __import__(f"{__package__}.auto_responder", fromlist=["auto_responder"]).auto_responder.record_published_status(terminal_id, detected)  # fmt: skip
-        if screen_spinner_override is not None:
-            logger.info("screen spinner override: %s→processing", screen_spinner_override.value)
-        logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
+        if publish_external:
+            bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
+            __import__(f"{__package__}.auto_responder", fromlist=["auto_responder"]).auto_responder.record_published_status(terminal_id, detected)  # fmt: skip
+            if screen_spinner_override is not None:
+                logger.info("screen spinner override: %s→processing", screen_spinner_override.value)
+            logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
 
     # ----- pyte rendered-screen detection (edge-debounced) -------------------
 
@@ -901,6 +994,7 @@ class StatusMonitor:
             self._bursting.pop(terminal_id, None)
             self._bump_chunk_seq_locked(terminal_id)
             handle = self._quiesce_handle.pop(terminal_id, None)
+            self._receiver_state_store.invalidate_terminal(terminal_id)
         self._cancel_quiesce_handle(handle)
 
     def reset_buffer(self, terminal_id: str) -> None:
@@ -912,7 +1006,24 @@ class StatusMonitor:
         this, the retry re-derives status from a buffer still full of stale bytes
         from the failed first attempt and can spuriously time out.
         """
+        try:
+            from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+            metadata = get_terminal_metadata(terminal_id)
+            receiver_key = (
+                (
+                    terminal_id,
+                    int(metadata["lifecycle_generation"]),
+                    str(metadata["tmux_window"]),
+                )
+                if metadata is not None
+                else None
+            )
+        except Exception:
+            receiver_key = None
         with self._lock:
+            if receiver_key is not None:
+                self._receiver_state_store.invalidate(receiver_key)
             self._buffers[terminal_id] = ""
             self._last_status.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
@@ -1022,7 +1133,7 @@ class StatusMonitor:
         off the event loop, so it can't just return an override like
         ``_detect_screen`` callers do).
         """
-        self._apply_detection(terminal_id, status)
+        self._apply_detection(terminal_id, status, pass_source="forced")
 
     def probe_screen_status(self, terminal_id: str) -> Tuple[TerminalStatus, ScreenProbeMeta]:
         """Classify a frame with temporal progress corroboration before admission."""
@@ -1360,6 +1471,33 @@ class StatusMonitor:
                     meta["idle_reason"] = idle_reason
             except Exception:
                 logger.exception("Error classifying idle reason for %s", terminal_id)
+        freshness_kind = "identity_ok"
+        freshness_detail = None
+        if identity_proof_failure is not None:
+            freshness_kind = "identity_failed"
+            freshness_detail = identity_proof_failure
+        elif probe_failure is not None:
+            freshness_kind = "probe_failed"
+            freshness_detail = probe_failure
+        try:
+            if metadata is None:
+                from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+                metadata = get_terminal_metadata(terminal_id)
+            with self._lock:
+                self._publish_observation(
+                    terminal_id,
+                    latched_status=classification.status,
+                    pass_outcome="probe",
+                    frame_source="fresh_capture",
+                    metadata=metadata,
+                    freshness_proof=FreshnessProof(freshness_kind, freshness_detail),
+                )
+        except Exception:
+            try:
+                self._log_receiver_publish_failure(terminal_id)
+            except Exception:
+                pass
         return classification.status, meta
 
     def get_rendered_screen(self, terminal_id: str) -> Optional[List[str]]:

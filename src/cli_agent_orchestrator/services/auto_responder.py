@@ -273,7 +273,8 @@ class AutoResponder:
         if os.environ.get("CAO_AUTO_ANSWER", "true").lower() == "false":
             self._clear_wait_rule(terminal_id)
             return None
-        if not getattr(provider, "supports_screen_detection", False):
+        capabilities = provider.capabilities
+        if not capabilities.supports_screen_detection:
             self._clear_wait_rule(terminal_id)
             return None
         try:

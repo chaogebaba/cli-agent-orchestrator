@@ -23,6 +23,7 @@ import logging
 import re
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 
@@ -37,6 +38,13 @@ if TYPE_CHECKING:
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ProviderCapabilities:
+    supports_screen_detection: bool = False
+    accepts_input_while_processing: bool = False
+    paste_enter_count: int = 1
 
 
 class ArtifactValidationError(Exception):
@@ -157,6 +165,16 @@ class BaseProvider(ABC):
     def status(self) -> TerminalStatus:
         """Get current provider status."""
         return self._status
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        """Project the receiver-state capabilities from legacy provider attributes."""
+
+        return ProviderCapabilities(
+            supports_screen_detection=bool(self.supports_screen_detection),
+            accepts_input_while_processing=bool(self.accepts_input_while_processing),
+            paste_enter_count=int(self.paste_enter_count),
+        )
 
     @property
     def paste_enter_count(self) -> int:

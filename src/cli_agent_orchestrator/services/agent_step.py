@@ -31,7 +31,7 @@ from typing import Callable, Optional
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
-from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.services import receiver_state_view, terminal_service
 from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
@@ -73,7 +73,13 @@ async def _wait_for_completion(
     while time.time() - start < timeout:
         if cancel_signal is not None and cancel_signal.is_set():
             return _CompletionOutcome.CANCELLED
-        current = status_monitor.get_status(terminal_id)
+        current = receiver_state_view.snapshot_view(
+            "agent_step.status_reads",
+            terminal_id,
+            max_age_s=10.0,
+            none_behavior="legacy",
+            monitor=status_monitor,
+        )
         if current == TerminalStatus.ERROR:
             return _CompletionOutcome.ERROR
         if current == TerminalStatus.WAITING_USER_ANSWER:
@@ -364,7 +370,13 @@ async def run_agent_step(
                     kind="cancelled",
                     terminal_id=terminal_id,
                 ) from exc
-            current = status_monitor.get_status(terminal_id)
+            current = receiver_state_view.snapshot_view(
+                "agent_step.status_reads",
+                terminal_id,
+                max_age_s=10.0,
+                none_behavior="legacy",
+                monitor=status_monitor,
+            )
             status_value = current.value if hasattr(current, "value") else str(current)
             raise StepExecutionError(
                 f"terminal {terminal_id} is waiting on a dialog "
@@ -423,7 +435,13 @@ async def run_agent_step(
                 terminal_id=terminal_id,
             )
         if outcome == _CompletionOutcome.TIMEOUT:
-            current = status_monitor.get_status(terminal_id)
+            current = receiver_state_view.snapshot_view(
+                "agent_step.status_reads",
+                terminal_id,
+                max_age_s=10.0,
+                none_behavior="legacy",
+                monitor=status_monitor,
+            )
             if current == TerminalStatus.ERROR:
                 raise StepExecutionError(
                     f"terminal {terminal_id} reached ERROR status",
@@ -436,7 +454,13 @@ async def run_agent_step(
                 terminal_id=terminal_id,
             )
 
-        final_status = status_monitor.get_status(terminal_id)
+        final_status = receiver_state_view.snapshot_view(
+            "agent_step.status_reads",
+            terminal_id,
+            max_age_s=10.0,
+            none_behavior="legacy",
+            monitor=status_monitor,
+        )
         if final_status == TerminalStatus.ERROR:
             raise StepExecutionError(
                 f"terminal {terminal_id} reached ERROR status",

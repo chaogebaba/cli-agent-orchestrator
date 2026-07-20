@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.base import ProviderCapabilities
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
 from cli_agent_orchestrator.services import auto_responder as ar
@@ -15,6 +16,7 @@ from cli_agent_orchestrator.services import auto_responder as ar
 
 class FakeProvider:
     supports_screen_detection = True
+    capabilities = ProviderCapabilities(supports_screen_detection=True)
 
     def get_status_from_screen(self, _lines):
         return TerminalStatus.WAITING_USER_ANSWER
@@ -719,6 +721,7 @@ def test_global_kill_switch_disables_engine(monkeypatch, _reset_engine):
 def test_provider_without_screen_detection_is_skipped(monkeypatch, _reset_engine):
     class NoScreenProvider:
         supports_screen_detection = False
+        capabilities = ProviderCapabilities(supports_screen_detection=False)
 
     called = []
     monkeypatch.setattr(ar.AutoResponder, "_on_screen", lambda self, *a: called.append(a))

@@ -73,6 +73,14 @@ class WatchdogInsertResult:
 
 TRANSCRIPT_BINDING_SOURCES = frozenset({"startup", "resume", "clear", "compact", "server_recovery"})
 
+SEAM_ACTIVATION_CONSUMER_OPS = (
+    "watchdog.cached_status",
+    "watchdog.waiting_inbox_gate",
+    "watchdog.ready_backlog_gate",
+    "agent_step.status_reads",
+    "delivery.admission_status",
+)
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -535,6 +543,66 @@ class FlowModel(Base):
     enabled = Column(Boolean, default=True)
 
 
+class SeamActivationModel(Base):
+    """Durable authority switch for one closed consumer operation."""
+
+    __tablename__ = "seam_activation"
+
+    consumer_op = Column(Text, primary_key=True)
+    active_authority = Column(Text, nullable=False, default="legacy", server_default="legacy")
+    accepted_version = Column(Integer, nullable=False, default=0, server_default="0")
+    active_version = Column(Integer, nullable=False, default=0, server_default="0")
+    rollback_version = Column(Integer, nullable=False, default=0, server_default="0")
+    acceptance_token = Column(Text, nullable=True)
+    evidence_ref = Column(Text, nullable=True)
+    tombstoned_legacy = Column(Integer, nullable=False, default=0, server_default="0")
+    updated_at = Column(Text, nullable=False)
+    __table_args__ = (
+        CheckConstraint(
+            "active_authority IN ('legacy','receiver_state')",
+            name="ck_seam_activation_authority",
+        ),
+        CheckConstraint(
+            "accepted_version >= active_version AND accepted_version <= active_version + 1",
+            name="ck_seam_activation_versions",
+        ),
+        CheckConstraint(
+            "active_version >= rollback_version",
+            name="ck_seam_activation_rollback_version",
+        ),
+        CheckConstraint(
+            "NOT (active_authority='receiver_state' AND active_version=0)",
+            name="ck_seam_activation_active_version",
+        ),
+        CheckConstraint(
+            "NOT (accepted_version > active_version AND acceptance_token IS NULL)",
+            name="ck_seam_activation_acceptance_token",
+        ),
+        CheckConstraint(
+            "tombstoned_legacy IN (0,1)",
+            name="ck_seam_activation_tombstoned",
+        ),
+    )
+
+
+class SeamActivationEvidenceModel(Base):
+    """Append-only evidence history preventing duplicate acceptance replay."""
+
+    __tablename__ = "seam_activation_evidence"
+
+    consumer_op = Column(Text, primary_key=True)
+    evidence_ref = Column(Text, primary_key=True)
+    acceptance_token = Column(Text, nullable=False)
+    created_at = Column(Text, nullable=False)
+    __table_args__ = (
+        UniqueConstraint(
+            "consumer_op",
+            "evidence_ref",
+            name="uq_seam_activation_evidence_ref",
+        ),
+    )
+
+
 def _ensure_db_dir() -> None:
     """Create the DB dir owner-only (0o700).
 
@@ -571,6 +639,7 @@ def init_db() -> None:
     """Initialize database tables and apply schema migrations."""
     _migrate_project_aliases_schema()
     Base.metadata.create_all(bind=engine)
+    _bootstrap_seam_activation()
     _migrate_mailbox_columns()
     _migrate_callback_barrier_columns()
     _migrate_transcript_bindings_inode_nullable()
@@ -588,6 +657,32 @@ def init_db() -> None:
     _migrate_workflow_index()
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+
+
+def _bootstrap_seam_activation() -> None:
+    """Install the five legacy-default authority rows idempotently."""
+
+    with SessionLocal() as db:
+        try:
+            for consumer_op in SEAM_ACTIVATION_CONSUMER_OPS:
+                if db.get(SeamActivationModel, consumer_op) is None:
+                    db.add(
+                        SeamActivationModel(
+                            consumer_op=consumer_op,
+                            active_authority="legacy",
+                            accepted_version=0,
+                            active_version=0,
+                            rollback_version=0,
+                            acceptance_token=None,
+                            evidence_ref=None,
+                            tombstoned_legacy=0,
+                            updated_at=_utcnow().isoformat(),
+                        )
+                    )
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to bootstrap seam activation rows")
 
 
 def _migrate_provider_sessions_status() -> None:
