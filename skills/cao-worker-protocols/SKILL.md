@@ -93,8 +93,9 @@ When your charter has you spawn helper or reviewer lanes with `assign`:
 
 - **The provider comes from the agent PROFILE, never from a model setting.**
   `assign(agent_profile="grok_dev")` gives a Grok CLI lane; `codex_dev` /
-  `codex_reviewer` give Codex lanes; `fable_design_reviewer` gives a Claude
-  structure lane; `developer-sonnet` gives a cheap scratch Claude lane.
+  `codex_reviewer` give Codex lanes; `developer-sonnet` gives a cheap
+  scratch Claude lane. ALL review lanes are `codex_reviewer` — Fable
+  review lanes are RETIRED (user 2026-07-20); never spawn one.
 - **NEVER set, pass, or configure a model yourself** — `providers.toml` owns
   per-profile model defaults.
 - **Grok lanes LOOK like Claude Code** — the grok_cli provider launches a
