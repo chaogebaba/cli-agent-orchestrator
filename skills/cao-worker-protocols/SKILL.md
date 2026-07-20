@@ -96,11 +96,34 @@ When your charter has you spawn helper or reviewer lanes with `assign`:
   `codex_reviewer` give Codex lanes; `fable_design_reviewer` gives a Claude
   structure lane; `developer-sonnet` gives a cheap scratch Claude lane.
 - **NEVER set, pass, or configure a model yourself** — `providers.toml` owns
-  per-profile model defaults. Setting a foreign model on a Claude terminal
-  (e.g. grok-4.5) parks the lane DEAD at a model-select dialog (incident
-  2026-07-20).
-- If a lane parks at a model-select or provider-error dialog, do not steer it:
-  `delete_terminal` it and re-`assign` the same brief with the CORRECT profile.
+  per-profile model defaults.
+- **Grok lanes LOOK like Claude Code** — the grok_cli provider launches a
+  Claude Code binary pointed at a relay grok model; a "Claude Code ... grok-4.5"
+  banner on a grok lane is NORMAL, not a mis-spawn.
+- **Model-select park = provider/relay outage, not your bug.** If a lane sits
+  at "issue with the selected model … Run /model" the relay roster is down for
+  that model (it flaps). Do NOT retry the same profile in a loop: ONE retry
+  max, then either re-`assign` the same brief to a working-provider profile
+  (`developer-sonnet` is the standing fallback for dead grok lanes) or report
+  the outage to your caller. `delete_terminal` the parked lane either way.
+
+### Provider craft (what the supervisor knows — use it)
+
+- **Codex lanes**: keep briefs terse and concrete (goal, file paths,
+  acceptance criteria, what NOT to do; word-cap answers). When a claim can be
+  tested, have codex RUN it, not reason about it. NEVER quote refusal/wrapper
+  literals or security vocabulary into a codex brief — reference by
+  `file:line`; neutral artifact names; frame reviews as "correctness review of
+  our own orchestrator". A codex "quota exceeded" banner is FALSE on the relay
+  backend, REAL on ChatGPT subscription — report, don't self-diagnose.
+- **Grok lanes**: iterate, don't one-shot — grok does best with short
+  follow-up rounds. Grok summarizing instead of quoting → have it write full
+  output to a file and reference the path. Grok detached-command status
+  (`N commands still running`) over an idle composer is a known false-idle
+  (F29) — don't panic-kill a grok lane for it.
+- **All lanes**: point at files rather than pasting long content; require
+  callbacks to name absolute paths; capture a verbatim pane sample BEFORE any
+  recover/kill when a lane misbehaves (sample-first law).
 - Same-round multi-lane dispatch: set `barrier="<wp>-r<N>"` on every member if
   your schema exposes it; otherwise have each lane end its callback with
   `ROUND r<N> LANE k/M` and act only when all M arrived.
