@@ -122,6 +122,31 @@ in between. The supervisor owns keeping every lane in the session healthy:
 - Codex false-flag strikes specifically: report to the supervisor, who runs
   the scrub-and-nudge; never try to talk a codex lane past a refusal banner.
 
+### Codebase recon (delegating workers: maker, architect)
+
+You have the SAME recon toolkit as the supervisor — use it instead of raw
+self-grepping:
+
+- **graphify FIRST**: any repo with `graphify-out/` — `graphify query
+  "<question>"` (scoped subgraph), `graphify path "<A>" "<B>"`
+  (relationships), `graphify explain "<concept>"`. Orient there before
+  reading any source file; read raw lines only after orientation. The CAO
+  fork has its OWN graph inside `cli-agent-orchestrator/` — the root graph
+  cannot see gitignored paths.
+- **Warm grok oracle for exact refs**: if a session `grok_oracle` is alive,
+  send it your codebase questions via `send_message` (ask-then-idle: send,
+  END YOUR TURN, the answer arrives as a message — busy-waiting deadlocks
+  w2w). It returns exact file:line references and snippets. The oracle is
+  SHARED session infrastructure — never delete it, never treat it as your
+  disposable.
+- **grok_dev grunt lane for mechanical recon**: fire `assign(agent_profile=
+  "grok_dev")` for bounded chores — enumerate call sites, collect diffs,
+  build an inventory file, run a probe script. Same lane rules as everywhere:
+  files-not-prose deliverables, absolute paths in callbacks, delete when done.
+- Division of labor: graphify/oracle answer "where/what is X" cheaply;
+  grok_dev produces artifact files; YOU do only the judgment reading —
+  the deciding lines, not the whole tour.
+
 ### Provider craft (what the supervisor knows — use it)
 
 - **Codex lanes**: keep briefs terse and concrete (goal, file paths,
