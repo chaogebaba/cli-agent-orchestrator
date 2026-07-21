@@ -232,6 +232,7 @@ _INK_FOCUS_OPTION_PATTERN = re.compile(r"❯\s*\d+\.")
 _INK_PLAN_HEAD_PATTERN = re.compile(
     r"Would you like to proceed\?|Claude has written up a plan", re.IGNORECASE
 )
+_INK_DISMISSAL_SEPARATOR_PATTERN = re.compile(r"─{20,}")
 _INK_FOOTER_PROXIMITY_ROWS = 12
 _INK_PLAN_PROXIMITY_ROWS = 8
 _INK_RESUME_HEADER_PATTERN = re.compile(r"Resume session")
@@ -281,13 +282,27 @@ def _is_ink_selection_waiting(rendered: str) -> bool:
         if len(nearby_options) >= 2 and nearby_focus:
             return True
 
-    if _INK_PLAN_HEAD_PATTERN.search(joined):
+    plan_rows = [
+        index for index, line in enumerate(lines) if _INK_PLAN_HEAD_PATTERN.search(line)
+    ]
+    if plan_rows:
         for focus_row in focus_rows:
+            preceding_plans = [row for row in plan_rows if row <= focus_row]
+            if not preceding_plans:
+                continue
+            plan_row = preceding_plans[-1]
             nearby_options = [
-                row for row in option_rows if abs(row - focus_row) <= _INK_PLAN_PROXIMITY_ROWS
+                row
+                for row in option_rows
+                if row >= plan_row and abs(row - focus_row) <= _INK_PLAN_PROXIMITY_ROWS
             ]
             if len(nearby_options) >= 2:
-                return True
+                after_options = "\n".join(lines[max(nearby_options) + 1 :])
+                dismissed = _INK_DISMISSAL_SEPARATOR_PATTERN.search(
+                    after_options
+                ) or EXTRACTION_RESPONSE_PATTERN.search(after_options)
+                if not dismissed:
+                    return True
     return False
 
 
