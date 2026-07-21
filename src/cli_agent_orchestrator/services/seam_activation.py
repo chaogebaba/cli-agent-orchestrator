@@ -74,6 +74,18 @@ PromoteResult: TypeAlias = Promoted | PromotionConflict
 RollbackResult: TypeAlias = RolledBack | RollbackConflict
 
 _outage_last_logged: dict[str, float] = {}
+_EVENT_FRAME_OPS = frozenset({"watchdog.pane_classify", "auto_responder.frame_classify"})
+
+
+def _event_frame_refused(consumer_op: ConsumerOp) -> bool:
+    if consumer_op not in _EVENT_FRAME_OPS:
+        return False
+    try:
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        return get_backend().supports_event_inbox()
+    except Exception:
+        return True
 
 
 def _now() -> str:
@@ -83,6 +95,8 @@ def _now() -> str:
 def accept(consumer_op: ConsumerOp, evidence_ref: str) -> AcceptResult:
     """Accept one evidence version and mint its promotion token."""
 
+    if _event_frame_refused(consumer_op):
+        return AcceptConflict()
     acceptance_token = str(uuid.uuid4())
     with SessionLocal() as db:
         try:
@@ -124,6 +138,8 @@ def accept(consumer_op: ConsumerOp, evidence_ref: str) -> AcceptResult:
 def promote(consumer_op: ConsumerOp, acceptance_token: str) -> PromoteResult:
     """Promote exactly the accepted version named by ``acceptance_token``."""
 
+    if _event_frame_refused(consumer_op):
+        return PromotionConflict()
     with SessionLocal() as db:
         try:
             result = db.execute(

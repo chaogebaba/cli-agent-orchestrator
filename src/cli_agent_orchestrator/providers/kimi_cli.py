@@ -240,7 +240,7 @@ class KimiCliProvider(BaseProvider):
         """Kimi CLI's prompt_toolkit submits on single Enter after bracketed paste."""
         return 1
 
-    def mark_input_received(self) -> None:
+    def _after_dispatch_commit_locked(self) -> None:
         """Record a dispatched task (called by terminal_service after send_input).
 
         Latches ``_has_received_input`` (the buffer-evidence latch can miss it
@@ -249,8 +249,10 @@ class KimiCliProvider(BaseProvider):
         check in get_status()) and the shared native-status tracking come from
         ``super().mark_input_received()``.
         """
-        super().mark_input_received()
         self._has_received_input = True
+        # Kimi's UI grace comparison is wall-clock based; keep this
+        # provider-specific stamp separate from the native monotonic reducer.
+        self._last_dispatch_time = time.time()
 
     def _try_load_profile(self):
         """Best-effort profile load for timeout resolution only.

@@ -970,7 +970,7 @@ class CursorCliProvider(BaseProvider):
                 )
         self._tmp_paths = []
 
-    def mark_input_received(self) -> None:
+    def _after_dispatch_commit_locked(self) -> None:
         """Record that a turn has been delivered to the agent.
 
         Called by the terminal service after every ``send_input``.
@@ -988,5 +988,4 @@ class CursorCliProvider(BaseProvider):
         turn, not before — which is what the StatusMonitor's
         stickiness gate expects.
         """
-        super().mark_input_received()
         self._turns += 1

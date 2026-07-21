@@ -129,8 +129,7 @@ class GrokCliProvider(BaseProvider):
     def extraction_tail_lines(self) -> int:
         return 2000
 
-    def mark_input_received(self) -> None:
-        super().mark_input_received()
+    def _after_dispatch_commit_locked(self) -> None:
         self._input_received = True
 
     def _load_profile(self):

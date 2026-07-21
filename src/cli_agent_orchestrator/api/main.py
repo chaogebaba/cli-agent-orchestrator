@@ -135,6 +135,7 @@ from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.mailbox_service import MailboxDomainError
 from cli_agent_orchestrator.services.stalled_callback_watchdog import stalled_callback_watchdog
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.receiver_state_view import activate_native_publisher
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_guard_service import (
     TerminalProtectionError,
@@ -721,10 +722,17 @@ async def lifespan(app: FastAPI):
         def deliver_inbox(terminal_id: str) -> None:
             inbox_service.deliver_pending(terminal_id, registry=registry)
 
+        def publish_native(request) -> None:
+            proof = status_monitor.prove_terminal_identity(request.terminal_id, depth="marker")
+            status_monitor.publish_native_observation(request, proof, request.received_at_mono)
+
         svc = HerdrInboxService(
             herdr_session=backend.herdr_session,
             delivery_callback=deliver_inbox,
+            native_publish_callback=publish_native,
+            native_activation_callback=activate_native_publisher,
         )
+        status_monitor.set_native_event_gen_accessor(svc.get_native_event_gen)
         set_herdr_inbox_service(svc)
         herdr_inbox_task = asyncio.create_task(svc.start())
         logger.info("Herdr inbox service started")
@@ -1866,9 +1874,7 @@ async def _send_recovery_nudge(
 
     metadata = get_terminal_metadata(terminal_id)
     mailbox_id = metadata.get("caller_mailbox_id") if metadata else None
-    sender_id = (
-        get_current_mailbox_terminal(mailbox_id) if isinstance(mailbox_id, str) else None
-    )
+    sender_id = get_current_mailbox_terminal(mailbox_id) if isinstance(mailbox_id, str) else None
     if not sender_id:
         return {"status": "skipped", "skip_reason": "caller-unresolvable"}
     try:
@@ -1994,9 +2000,7 @@ async def recover_session(
                 interrupt=body.interrupt,
                 acknowledge_ownership=body.acknowledge_ownership,
             )
-        return await _apply_recovery_nudges(
-            request, result, reason=body.reason, nudge=body.nudge
-        )
+        return await _apply_recovery_nudges(request, result, reason=body.reason, nudge=body.nudge)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 

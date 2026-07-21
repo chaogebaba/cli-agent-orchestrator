@@ -761,7 +761,6 @@ class AntigravityCliProvider(BaseProvider):
         self._unregister_mcp_servers()
         self._initialized = False
 
-    def mark_input_received(self) -> None:
+    def _after_dispatch_commit_locked(self) -> None:
         """Record that a turn was delivered (IDLE → COMPLETED on next status)."""
-        super().mark_input_received()
         self._turns += 1

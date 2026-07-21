@@ -200,9 +200,8 @@ class KiroCliProvider(BaseProvider):
         the Enter key registers as submit rather than being swallowed."""
         return 1.0
 
-    def mark_input_received(self) -> None:
+    def _after_dispatch_commit_locked(self) -> None:
         """Track that input was sent, enabling separator-free completion detection."""
-        super().mark_input_received()
         self._input_received = True
 
     @property

@@ -22,10 +22,11 @@ and output format to reliably detect status changes.
 import logging
 import re
 import time
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Literal
 
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
 from cli_agent_orchestrator.providers.screen_classification import (
@@ -50,6 +51,14 @@ class ProviderCapabilities:
     paste_enter_count: int = 1
     signal_kinds: frozenset[str] = frozenset()
     liveness_anchor: AnchorSpec | None = None
+    native_status_source: Literal["herdr"] | None = None
+
+
+@dataclass(frozen=True)
+class NativeResolution:
+    status: TerminalStatus | None
+    settlement_deadline_mono: float | None
+    flush_kind: Literal["done", "idle"] | None
 
 
 class ArtifactValidationError(Exception):
@@ -128,6 +137,7 @@ class BaseProvider(ABC):
         self._last_dispatch_time: float = 0.0
         self._done_first_detected: float = 0.0
         self._idle_first_detected: float = 0.0
+        self._flush_lock = threading.RLock()
 
     def build_fork_command(self, session_uuid: str, new_session_uuid: Optional[str]) -> List[str]:
         raise NotImplementedError
@@ -183,7 +193,16 @@ class BaseProvider(ABC):
             paste_enter_count=int(self.paste_enter_count),
             signal_kinds=frozenset(self.signal_kinds),
             liveness_anchor=self.liveness_anchor,
+            native_status_source="herdr" if self._native_backend_enabled() else None,
         )
+
+    def _native_backend_enabled(self) -> bool:
+        try:
+            from cli_agent_orchestrator.backends.registry import get_backend
+
+            return get_backend().supports_event_inbox() is True
+        except Exception:
+            return False
 
     @property
     def paste_enter_count(self) -> int:
@@ -431,10 +450,37 @@ class BaseProvider(ABC):
         but should call ``super().mark_input_received()`` to preserve the shared
         native-status tracking.
         """
+        with self._flush_lock:
+            self._commit_dispatch_locked(time.monotonic())
+
+    def _arm_dispatch_locked(self, begun_at_mono: float) -> dict[str, float | bool]:
+        snapshot = {
+            "task_dispatched": self._task_dispatched,
+            "last_dispatch_time": self._last_dispatch_time,
+            "done_first_detected": self._done_first_detected,
+            "idle_first_detected": self._idle_first_detected,
+        }
         self._task_dispatched = True
-        self._last_dispatch_time = time.time()
+        self._last_dispatch_time = begun_at_mono
         self._done_first_detected = 0.0
         self._idle_first_detected = 0.0
+        return snapshot
+
+    def _commit_dispatch_locked(self, submitted_at_mono: float) -> None:
+        self._task_dispatched = True
+        self._last_dispatch_time = submitted_at_mono
+        self._done_first_detected = 0.0
+        self._idle_first_detected = 0.0
+        self._after_dispatch_commit_locked()
+
+    def _after_dispatch_commit_locked(self) -> None:
+        """Provider hook for load-bearing post-dispatch state."""
+
+    def _restore_dispatch_locked(self, snapshot: dict[str, float | bool]) -> None:
+        self._task_dispatched = bool(snapshot["task_dispatched"])
+        self._last_dispatch_time = float(snapshot["last_dispatch_time"])
+        self._done_first_detected = float(snapshot["done_first_detected"])
+        self._idle_first_detected = float(snapshot["idle_first_detected"])
 
     def _resolve_native_status(self, buffer: Optional[str] = None) -> Optional[TerminalStatus]:
         """Resolve status from the backend's native agent state, if available.
@@ -471,78 +517,64 @@ class BaseProvider(ABC):
         """
         from cli_agent_orchestrator.backends.registry import get_backend
 
-        native = get_backend().get_native_status(self.session_name, self.window_name)
+        with self._flush_lock:
+            backend = get_backend()
+            fetcher = (
+                getattr(backend, "fetch_native_status", None)
+                if type(backend).__name__ == "HerdrBackend"
+                else None
+            )
+            native = (
+                fetcher(self.session_name, self.window_name).status
+                if fetcher is not None
+                else backend.get_native_status(self.session_name, self.window_name)
+            )
+            resolution = self.resolve_native_status(native)
         logger.debug(
             "[get_status] terminal=%s native=%s",
             self.terminal_id,
             native.value if native is not None else None,
         )
-        if native is None:
-            # Unresolvable at the backend level (tmux always; herdr "unknown").
-            # Fall through to buffer analysis unchanged — no guessing here.
-            return None
+        return resolution.status
+
+    def resolve_native_status(self, native: TerminalStatus | None) -> NativeResolution:
+        """Reduce one mapped native status under the provider flush lock."""
+        now = time.monotonic()
         if native == TerminalStatus.PROCESSING:
-            # Reset flush-wait timers — herdr is actively working, so any
-            # previously stamped idle/done timestamp is from a pre-work gap
-            # and must not be counted toward the post-completion flush wait.
             self._done_first_detected = 0.0
             self._idle_first_detected = 0.0
-            logger.debug("[get_status] terminal=%s -> PROCESSING (native)", self.terminal_id)
-            return TerminalStatus.PROCESSING
+            return NativeResolution(native, None, None)
         if native == TerminalStatus.COMPLETED and self._task_dispatched:
-            # herdr "done": wait 10s from first detection for buffer to flush.
             if self._done_first_detected == 0.0:
-                self._done_first_detected = time.time()
-            waited = time.time() - self._done_first_detected
-            if waited >= 10.0:
-                logger.debug(
-                    "[get_status] terminal=%s -> COMPLETED (native done, %.1fs flush wait elapsed)",
-                    self.terminal_id,
-                    waited,
-                )
-                return TerminalStatus.COMPLETED
-            logger.debug(
-                "[get_status] terminal=%s -> PROCESSING (native done, flush wait %.1fs/10s)",
-                self.terminal_id,
-                waited,
+                self._done_first_detected = now
+            elapsed = (
+                (time.time() - self._done_first_detected)
+                if self._done_first_detected > 1e8
+                else (now - self._done_first_detected)
             )
-            return TerminalStatus.PROCESSING
+            if elapsed >= 10.0:
+                return NativeResolution(TerminalStatus.COMPLETED, None, None)
+            return NativeResolution(
+                TerminalStatus.PROCESSING,
+                self._done_first_detected + 10.0,
+                "done",
+            )
         if native == TerminalStatus.IDLE and self._task_dispatched:
-            # herdr "idle" post-dispatch: wait 10s from first detection for buffer to flush,
-            # then report COMPLETED (warn if still idle 5 min after dispatch).
             if self._idle_first_detected == 0.0:
-                self._idle_first_detected = time.time()
-            waited = time.time() - self._idle_first_detected
-            elapsed = time.time() - self._last_dispatch_time
-            if waited >= 10.0:
-                if elapsed >= 300.0:
-                    logger.warning(
-                        "[get_status] terminal=%s -> COMPLETED (native idle, %.0fs since dispatch, giving up)",
-                        self.terminal_id,
-                        elapsed,
-                    )
-                    return TerminalStatus.COMPLETED
-                logger.debug(
-                    "[get_status] terminal=%s -> COMPLETED (native idle, %.1fs flush wait elapsed)",
-                    self.terminal_id,
-                    waited,
-                )
-                return TerminalStatus.COMPLETED
-            logger.debug(
-                "[get_status] terminal=%s -> PROCESSING (native idle, flush wait %.1fs/10s)",
-                self.terminal_id,
-                waited,
+                self._idle_first_detected = now
+            elapsed = (
+                (time.time() - self._idle_first_detected)
+                if self._idle_first_detected > 1e8
+                else (now - self._idle_first_detected)
             )
-            return TerminalStatus.PROCESSING
-        if native == TerminalStatus.IDLE:
-            logger.debug(
-                "[get_status] terminal=%s -> IDLE (native idle, no task dispatched)",
-                self.terminal_id,
+            if elapsed >= 10.0:
+                return NativeResolution(TerminalStatus.COMPLETED, None, None)
+            return NativeResolution(
+                TerminalStatus.PROCESSING,
+                self._idle_first_detected + 10.0,
+                "idle",
             )
-            return TerminalStatus.IDLE
-        # COMPLETED (no task dispatched), WAITING_USER_ANSWER, ERROR -- return directly
-        logger.debug("[get_status] terminal=%s -> %s (native)", self.terminal_id, native.value)
-        return native
+        return NativeResolution(native, None, None)
 
     def _resolve_buffer(self, buffer: Optional[str]) -> str:
         """Resolve the buffer ``get_status()`` should parse when native status is None.

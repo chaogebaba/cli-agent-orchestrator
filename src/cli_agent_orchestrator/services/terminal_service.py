@@ -62,6 +62,7 @@ from cli_agent_orchestrator.constants import (
     TERMINAL_LOG_DIR,
 )
 from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.native_publish import DispatchTxn, NativePublishRequest
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.plugins import (
@@ -98,7 +99,7 @@ from cli_agent_orchestrator.services.session_env import (
     get_session_env,
     set_session_env,
 )
-from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.status_monitor import StatusMonitor, status_monitor
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
 from cli_agent_orchestrator.utils.provider_auth import ProviderAuthRefreshFailed
@@ -2808,14 +2809,24 @@ def send_input(
         else:
             preserved_draft = preserve_draft_before_send(terminal_id, metadata, provider)
 
-        backend.send_keys(
-            metadata["tmux_session"],
-            metadata["tmux_window"],
-            message,
-            enter_count=enter_count,
-            force_bracketed_paste=True,
-            submit_delay=provider.paste_submit_delay if provider else 0.3,
-        )
+        status_monitor.bind_dispatch_provider(terminal_id, provider)
+        dispatch_txn: DispatchTxn = status_monitor.begin_dispatch(terminal_id)
+        try:
+            backend.send_keys(
+                metadata["tmux_session"],
+                metadata["tmux_window"],
+                message,
+                enter_count=enter_count,
+                force_bracketed_paste=True,
+                submit_delay=provider.paste_submit_delay if provider else 0.3,
+            )
+        except BaseException:
+            status_monitor.abort_dispatch(dispatch_txn)
+            raise
+        else:
+            status_monitor.commit_dispatch(dispatch_txn)
+            if not isinstance(status_monitor, StatusMonitor) and provider is not None:
+                provider.mark_input_received()
         if preserved_draft is not None:
             preserved_draft.restore(backend)
 
@@ -2823,9 +2834,6 @@ def send_input(
         # This allows providers to adjust status
         # detection — specifically to stop reporting IDLE for the post-init
         # state and resume normal COMPLETED detection after a real task.
-        if provider:
-            provider.mark_input_received()
-
         update_last_active(terminal_id)
         if (
             expect_callback
@@ -2980,21 +2988,29 @@ def send_prepared_input(
         preserved = preserve_draft_before_send(terminal_id, metadata, provider)
     with _memory_injected_lock:
         _memory_injected_terminals.add(terminal_id)
-    backend.send_keys(
-        metadata["tmux_session"],
-        metadata["tmux_window"],
-        message,
-        enter_count=enter_count,
-        force_bracketed_paste=True,
-        submit_delay=provider.paste_submit_delay if provider else 0.3,
-    )
+    status_monitor.bind_dispatch_provider(terminal_id, provider)
+    dispatch_txn: DispatchTxn = status_monitor.begin_dispatch(terminal_id)
+    try:
+        backend.send_keys(
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            message,
+            enter_count=enter_count,
+            force_bracketed_paste=True,
+            submit_delay=provider.paste_submit_delay if provider else 0.3,
+        )
+    except BaseException:
+        status_monitor.abort_dispatch(dispatch_txn)
+        raise
+    else:
+        status_monitor.commit_dispatch(dispatch_txn)
+        if not isinstance(status_monitor, StatusMonitor) and provider is not None:
+            provider.mark_input_received()
     injection_observation = status_monitor.mark_injection_completed(terminal_id)
     if on_submitted is not None:
         on_submitted(injection_observation)
     if preserved is not None:
         preserved.restore(backend)
-    if provider:
-        provider.mark_input_received()
     update_last_active(terminal_id)
     if registry is not None and sender_id is not None and orchestration_type is not None:
         dispatch_plugin_event(

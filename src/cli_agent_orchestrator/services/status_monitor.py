@@ -28,9 +28,16 @@ from cli_agent_orchestrator.kernel.receiver_state import (
     ProbeEvidence,
     ReceiverState,
     ReceiverStateStore,
+    NativeEvidence,
     pass_outcome_for_source,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.native_publish import (
+    DispatchTxn,
+    NativePublishRequest,
+    SettlementFence,
+)
+from cli_agent_orchestrator.backends.herdr_backend import map_native_status
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
@@ -103,6 +110,14 @@ class ProbeResult:
     status: TerminalStatus
     meta: ScreenProbeMeta
     fresh_token: FreshToken
+
+
+@dataclass(frozen=True)
+class SettlementEntry:
+    handle: asyncio.TimerHandle
+    fenced_request: NativePublishRequest
+    native_event_gen: int
+    dispatch_gen: int
 
 
 PROOF_MAX_AGE_S = 2.0
@@ -229,6 +244,18 @@ class StatusMonitor:
         self._screen_size_deferred_warned: set[str] = set()
         self._receiver_state_store = ReceiverStateStore()
         self._receiver_publish_last_logged: Dict[str, float] = {}
+        self._dispatch_mutexes: Dict[str, threading.Lock] = {}
+        self._dispatch_next_gen: Dict[str, int] = {}
+        self._active_dispatch_epoch: Dict[str, int] = {}
+        self._dispatch_states: Dict[tuple[str, int], tuple[dict, int | None]] = {}
+        self._dispatch_provider_overrides: Dict[str, object] = {}
+        self._dispatch_providers: Dict[tuple[str, int], object] = {}
+        self._dispatch_consumed: set[tuple[str, int]] = set()
+        self._native_event_gen_accessor = None
+        self._settlements: Dict[tuple[str, str], object] = {}
+        self._settlement_tasks: set[asyncio.Task] = set()
+        self._latest_native_request: Dict[str, NativePublishRequest] = {}
+        self._dispatch_had_native: set[tuple[str, int]] = set()
 
     @property
     def receiver_state_store(self) -> ReceiverStateStore:
@@ -236,20 +263,392 @@ class StatusMonitor:
 
         return self._receiver_state_store
 
+    def set_native_event_gen_accessor(self, accessor) -> None:
+        self._native_event_gen_accessor = accessor
+
+    def bind_dispatch_provider(self, terminal_id: str, provider: object | None) -> None:
+        """Bind the provider already resolved by the guarded send seam."""
+        if provider is not None:
+            with self._lock:
+                self._dispatch_provider_overrides[terminal_id] = provider
+
+    def begin_dispatch(self, terminal_id: str) -> DispatchTxn:
+        mutex = self._dispatch_mutexes.setdefault(terminal_id, threading.Lock())
+        mutex.acquire()
+        try:
+            begun = time.monotonic()
+            with self._lock:
+                provider = self._dispatch_provider_overrides.pop(terminal_id, None)
+                if provider is None:
+                    try:
+                        provider = provider_manager.get_provider(terminal_id)
+                    except Exception:
+                        provider = None
+                next_gen = self._dispatch_next_gen.get(terminal_id, 0) + 1
+                self._dispatch_next_gen[terminal_id] = next_gen
+                prior = self._active_dispatch_epoch.get(terminal_id, 0)
+                snapshot = {}
+                if provider is not None:
+                    # Some source-compatible provider fixtures bypass
+                    # BaseProvider.__init__; give them the shared flush state
+                    # before invoking the inherited transaction helpers.
+                    if not hasattr(provider, "_flush_lock"):
+                        provider._flush_lock = threading.RLock()
+                    for field, default in (
+                        ("_task_dispatched", False),
+                        ("_last_dispatch_time", 0.0),
+                        ("_done_first_detected", 0.0),
+                        ("_idle_first_detected", 0.0),
+                    ):
+                        if not hasattr(provider, field):
+                            setattr(provider, field, default)
+                    with provider._flush_lock:
+                        snapshot = provider._arm_dispatch_locked(begun)
+                self._active_dispatch_epoch[terminal_id] = next_gen
+                self._dispatch_states[(terminal_id, next_gen)] = (snapshot, prior)
+                if provider is not None:
+                    self._dispatch_providers[(terminal_id, next_gen)] = provider
+            return DispatchTxn(terminal_id, next_gen, begun)
+        except BaseException:
+            mutex.release()
+            raise
+
+    def _finish_dispatch(self, txn: DispatchTxn) -> bool:
+        key = (txn.terminal_id, txn.dispatch_gen)
+        with self._lock:
+            if (
+                key in self._dispatch_consumed
+                or self._active_dispatch_epoch.get(txn.terminal_id) != txn.dispatch_gen
+            ):
+                return False
+            self._dispatch_consumed.add(key)
+            self._dispatch_states.pop(key, None)
+            return True
+
+    def commit_dispatch(self, txn: DispatchTxn) -> None:
+        consumed = False
+        try:
+            provider = self._dispatch_providers.get((txn.terminal_id, txn.dispatch_gen))
+            if not self._finish_dispatch(txn):
+                return
+            consumed = True
+            with self._lock:
+                if provider is not None:
+                    with provider._flush_lock:
+                        provider._commit_dispatch_locked(time.monotonic())
+                self._active_dispatch_epoch[txn.terminal_id] = txn.dispatch_gen
+                if (txn.terminal_id, txn.dispatch_gen) in self._dispatch_had_native:
+                    self._repair_dispatch_locked(txn.terminal_id, txn.dispatch_gen)
+        finally:
+            if consumed:
+                self._dispatch_providers.pop((txn.terminal_id, txn.dispatch_gen), None)
+                self._dispatch_mutexes[txn.terminal_id].release()
+
+    def abort_dispatch(self, txn: DispatchTxn) -> None:
+        consumed = False
+        try:
+            key = (txn.terminal_id, txn.dispatch_gen)
+            with self._lock:
+                if (
+                    key in self._dispatch_consumed
+                    or self._active_dispatch_epoch.get(txn.terminal_id) != txn.dispatch_gen
+                ):
+                    return
+                snapshot, prior = self._dispatch_states.pop(key, ({}, None))
+                self._dispatch_consumed.add(key)
+                consumed = True
+                provider = self._dispatch_providers.pop(key, None)
+                if provider is not None:
+                    with provider._flush_lock:
+                        provider._restore_dispatch_locked(snapshot)
+                self._active_dispatch_epoch[txn.terminal_id] = int(prior or 0)
+                if key in self._dispatch_had_native:
+                    self._repair_dispatch_locked(txn.terminal_id, int(prior or 0))
+        finally:
+            if consumed:
+                self._dispatch_mutexes[txn.terminal_id].release()
+
+    def active_dispatch_epoch(self, terminal_id: str) -> int | None:
+        with self._lock:
+            return self._active_dispatch_epoch.get(terminal_id)
+
+    def _receiver_key_locked(self, terminal_id: str):
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+        metadata = get_terminal_metadata(terminal_id)
+        if metadata is None:
+            return None
+        return (terminal_id, int(metadata["lifecycle_generation"]), str(metadata["tmux_window"]))
+
+    def _cancel_settlements_locked(self, terminal_id: str) -> None:
+        for key in [key for key in self._settlements if key[0] == terminal_id]:
+            entry = self._settlements.pop(key)
+            entry.handle.cancel()
+
+    def _repair_dispatch_locked(self, terminal_id: str, dispatch_gen: int) -> None:
+        request = self._latest_native_request.get(terminal_id)
+        if request is None:
+            return
+        self._cancel_settlements_locked(terminal_id)
+        key = self._receiver_key_locked(terminal_id)
+        if key is not None:
+            self._receiver_state_store.invalidate(key)
+        anchor = time.monotonic()
+        proof = self.prove_terminal_identity(terminal_id, depth="marker")
+        self.publish_native_observation(
+            request,
+            proof,
+            anchor,
+            SettlementFence(request.generation, dispatch_gen),
+        )
+
+    def _arm_settlement_locked(self, request: NativePublishRequest, deadline_mono: float) -> None:
+        loop = self._loop or self._running_loop()
+        if loop is None:
+            return
+        key = (request.terminal_id, request.pane_id)
+        dispatch_gen = self._active_dispatch_epoch.get(request.terminal_id, 0)
+
+        def install() -> None:
+            with self._lock:
+                old = self._settlements.pop(key, None)
+                if old is not None:
+                    old.handle.cancel()
+                delay = max(0.0, deadline_mono + 0.25 - time.monotonic())
+                handle = loop.call_later(
+                    delay,
+                    self._settlement_timer_fired,
+                    key,
+                    request,
+                    request.generation,
+                    dispatch_gen,
+                )
+                self._settlements[key] = SettlementEntry(
+                    handle, request, request.generation, dispatch_gen
+                )
+
+        if self._running_loop() is loop:
+            install()
+        else:
+            loop.call_soon_threadsafe(install)
+
+    def _settlement_timer_fired(
+        self,
+        key: tuple[str, str],
+        request: NativePublishRequest,
+        native_event_gen: int,
+        dispatch_gen: int,
+    ) -> None:
+        loop = self._loop or self._running_loop()
+        if loop is None:
+            return
+
+        async def settle() -> None:
+            try:
+                await asyncio.to_thread(
+                    self._run_settlement,
+                    request,
+                    native_event_gen,
+                    dispatch_gen,
+                )
+            finally:
+                with self._lock:
+                    entry = self._settlements.get(key)
+                    if (
+                        entry is not None
+                        and entry.native_event_gen == native_event_gen
+                        and entry.dispatch_gen == dispatch_gen
+                    ):
+                        self._settlements.pop(key, None)
+
+        task = loop.create_task(settle())
+        self._settlement_tasks.add(task)
+        task.add_done_callback(self._settlement_tasks.discard)
+
+    def _run_settlement(
+        self, request: NativePublishRequest, native_event_gen: int, dispatch_gen: int
+    ) -> None:
+        current_gen = (
+            self._native_event_gen_accessor(request.terminal_id, request.pane_id)
+            if self._native_event_gen_accessor is not None
+            else request.generation
+        )
+        with self._lock:
+            if (
+                current_gen != native_event_gen
+                or self._active_dispatch_epoch.get(request.terminal_id, 0) != dispatch_gen
+            ):
+                return
+        anchor = time.monotonic()
+        proof = self.prove_terminal_identity(request.terminal_id, depth="marker")
+        self.publish_native_observation(
+            request,
+            proof,
+            anchor,
+            SettlementFence(native_event_gen, dispatch_gen),
+        )
+
+    def publish_native_observation(
+        self,
+        request: NativePublishRequest,
+        proof: IdentityProof,
+        anchor_mono: float,
+        settlement_fence: SettlementFence | None = None,
+    ) -> None:
+        if proof.terminal_id != request.terminal_id:
+            raise ValueError("identity proof terminal mismatch")
+        proof_age = proof.proven_at_mono - anchor_mono
+        if proof_age < 0 or proof_age > PROOF_MAX_AGE_S:
+            raise ValueError("native identity proof outside event age bound")
+        with self._lock:
+            if settlement_fence is not None:
+                current_gen = (
+                    self._native_event_gen_accessor(request.terminal_id, request.pane_id)
+                    if self._native_event_gen_accessor is not None
+                    else request.generation
+                )
+                if (
+                    current_gen != settlement_fence.native_event_gen
+                    or self._active_dispatch_epoch.get(request.terminal_id, 0)
+                    != settlement_fence.dispatch_gen
+                ):
+                    return
+            provider = provider_manager.get_provider(request.terminal_id)
+            if provider is None:
+                return
+            with provider._flush_lock:
+                mapped = map_native_status(request.agent_status)
+                resolution = provider.resolve_native_status(mapped)
+                status = resolution.status or TerminalStatus.UNKNOWN
+                self._latest_native_request[request.terminal_id] = request
+                dispatch_epoch = self._active_dispatch_epoch.get(request.terminal_id, 0)
+                if dispatch_epoch:
+                    self._dispatch_had_native.add((request.terminal_id, dispatch_epoch))
+                try:
+                    from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+                    metadata = get_terminal_metadata(request.terminal_id)
+                    if metadata is None:
+                        return
+                    self._publish_observation(
+                        request.terminal_id,
+                        latched_status=status,
+                        pass_outcome="native",
+                        frame_source="native",
+                        metadata=metadata,
+                        freshness_proof=FreshnessProof(
+                            "identity_ok" if proof.failure is None else "identity_failed",
+                            proof.failure,
+                        ),
+                        captured_at_mono=request.received_at_mono,
+                        origin="native",
+                        native_evidence=NativeEvidence(
+                            request.agent_status,
+                            status,
+                            request.generation,
+                            request.received_at_mono,
+                        ),
+                        slot="incremental",
+                    )
+                    if resolution.settlement_deadline_mono is not None:
+                        self._arm_settlement_locked(request, resolution.settlement_deadline_mono)
+                except Exception:
+                    self._log_receiver_publish_failure(request.terminal_id)
+
+    def publish_native_poll(
+        self, terminal_id: str, pane_id: str, fetch, fetched_at_mono: float, proof: IdentityProof
+    ) -> FreshToken:
+        if proof.terminal_id != terminal_id:
+            raise ValueError("identity proof terminal mismatch")
+        if (
+            fetched_at_mono - proof.proven_at_mono < 0
+            or fetched_at_mono - proof.proven_at_mono > PROOF_MAX_AGE_S
+        ):
+            raise ValueError("native poll identity proof outside capture age bound")
+        with self._lock:
+            token = self._receiver_state_store.mint_token(
+                terminal_id, self._epoch_locked(terminal_id)
+            )
+            if fetch.failure_cause is not None or fetch.status is None:
+                return token
+            provider = provider_manager.get_provider(terminal_id)
+            if provider is None:
+                return token
+            with provider._flush_lock:
+                resolution = provider.resolve_native_status(fetch.status)
+            status = resolution.status or TerminalStatus.UNKNOWN
+            try:
+                from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+                metadata = get_terminal_metadata(terminal_id)
+                if metadata is None:
+                    return token
+                epoch = self._epoch_locked(terminal_id)
+                seq = self._observation_seq.get(terminal_id, 0)
+                evidence = NativeEvidence(
+                    fetch.agent_status or "",
+                    status,
+                    int(
+                        self._native_event_gen_accessor(terminal_id, pane_id)
+                        if self._native_event_gen_accessor
+                        else 0
+                    ),
+                    fetched_at_mono,
+                )
+                request = NativePublishRequest(
+                    terminal_id,
+                    pane_id,
+                    evidence.native_event_gen,
+                    fetch.agent_status or "",
+                    fetched_at_mono,
+                )
+                self._latest_native_request[terminal_id] = request
+                dispatch_epoch = self._active_dispatch_epoch.get(terminal_id, 0)
+                if dispatch_epoch:
+                    self._dispatch_had_native.add((terminal_id, dispatch_epoch))
+                kwargs = dict(
+                    terminal_id=terminal_id,
+                    lifecycle_generation=int(metadata["lifecycle_generation"]),
+                    window_identity=str(metadata["tmux_window"]),
+                    observation_epoch=epoch,
+                    observation_sequence=seq,
+                    provider=str(metadata["provider"]),
+                    frame_source="native",
+                    captured_at_mono=fetched_at_mono,
+                    frame_hash=None,
+                    latched_status=status,
+                    pass_outcome="native",
+                    freshness_proof=FreshnessProof(
+                        "identity_ok" if proof.failure is None else "identity_failed", proof.failure
+                    ),
+                    origin="native_poll",
+                    native_evidence=evidence,
+                )
+                fresh = ReceiverState(**kwargs)
+                incremental = ReceiverState(**kwargs)
+                self._receiver_state_store.publish_native_pair(fresh, incremental, token)
+                if resolution.settlement_deadline_mono is not None:
+                    self._arm_settlement_locked(request, resolution.settlement_deadline_mono)
+            except Exception:
+                self._log_receiver_publish_failure(terminal_id)
+            return token
+
     def _publish_observation(
         self,
         terminal_id: str,
         *,
         latched_status: TerminalStatus,
         pass_outcome: PassOutcome,
-        frame_source: Literal["incremental", "fresh_capture"],
+        frame_source: Literal["incremental", "fresh_capture", "native"],
         metadata: dict[str, Any] | None = None,
         freshness_proof: FreshnessProof | None = None,
         captured_at_mono: float | None = None,
         raw_classification: object | None = None,
         probe_evidence: ProbeEvidence | None = None,
-        origin: Literal["incremental", "probe", "forced"] | None = None,
+        origin: Literal["incremental", "probe", "forced", "native", "native_poll"] | None = None,
         fresh_token: FreshToken | None = None,
+        native_evidence: NativeEvidence | None = None,
+        slot: Literal["incremental", "fresh"] | None = None,
     ) -> None:
         """Build and publish one receiver observation. Caller holds ``_lock``."""
 
@@ -278,8 +677,10 @@ class StatusMonitor:
                 ),
                 raw_classification=raw_classification,
                 probe_evidence=probe_evidence,
+                native_evidence=native_evidence,
             ),
             fresh_token=fresh_token,
+            slot=slot,
         )
 
     @staticmethod
@@ -335,7 +736,9 @@ class StatusMonitor:
         )
         return status, None, hook_result
 
-    def prove_terminal_identity(self, terminal_id: str) -> IdentityProof:
+    def prove_terminal_identity(
+        self, terminal_id: str, depth: Literal["marker", "live"] = "live"
+    ) -> IdentityProof:
         """Return a closed identity proof for the terminal's current route."""
 
         from cli_agent_orchestrator.backends.registry import get_backend
@@ -349,6 +752,19 @@ class StatusMonitor:
                 )
             backend = get_backend()
             if getattr(backend, "supports_identity_readback", False) is not True:
+                if depth == "marker":
+                    from cli_agent_orchestrator.services.herdr_inbox_registry import (
+                        get_herdr_inbox_service,
+                    )
+
+                    service = get_herdr_inbox_service()
+                    marker = (
+                        service.read_identity_marker(terminal_id) if service is not None else None
+                    )
+                    failure = (
+                        None if marker is not None else "native_identity_failure:marker_unavailable"
+                    )
+                    return IdentityProof(terminal_id, "native", time.monotonic(), failure)
                 result = backend.read_native_identity(
                     terminal_id,
                     metadata["tmux_session"],
@@ -1195,6 +1611,8 @@ class StatusMonitor:
     def clear_terminal(self, terminal_id: str) -> None:
         """Free buffer and status for a deleted terminal."""
         with self._lock:
+            self._cancel_settlements_locked(terminal_id)
+            self._latest_native_request.pop(terminal_id, None)
             self._buffers.pop(terminal_id, None)
             self._last_status.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
@@ -1239,6 +1657,8 @@ class StatusMonitor:
         except Exception:
             receiver_key = None
         with self._lock:
+            self._cancel_settlements_locked(terminal_id)
+            self._latest_native_request.pop(terminal_id, None)
             if receiver_key is not None:
                 self._receiver_state_store.invalidate(receiver_key)
             self._buffers[terminal_id] = ""

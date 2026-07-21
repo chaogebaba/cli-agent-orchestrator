@@ -1323,7 +1323,7 @@ class ClaudeCodeProvider(BaseProvider):
         """
         return self._initialized
 
-    def mark_input_received(self) -> None:
+    def _after_dispatch_commit_locked(self) -> None:
         """Capture content-based snapshots for the staleness guard (issue #407).
 
         Uses tail-hash instead of raw length because the tmux sliding window
@@ -1340,7 +1340,6 @@ class ClaudeCodeProvider(BaseProvider):
         clean = self._strip_effort_footer_lines(re.sub(ANSI_CODE_PATTERN, "", output))
         self._snapshot_response_count = len(list(re.finditer(r"[⏺●]\s+", clean)))
         self._input_generation += 1
-        super().mark_input_received()
 
     def get_idle_pattern_for_log(self) -> str:
         """Return Claude Code IDLE prompt pattern for log files."""

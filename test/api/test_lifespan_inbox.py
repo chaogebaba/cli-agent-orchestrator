@@ -160,6 +160,8 @@ class TestLifespanInboxWiring:
                 mocks.herdr_cls.assert_called_once_with(
                     herdr_session="cao",
                     delivery_callback=ANY,
+                    native_publish_callback=ANY,
+                    native_activation_callback=ANY,
                 )
                 # The delivery callback must be a callable closure.
                 callback = mocks.herdr_cls.call_args.kwargs["delivery_callback"]

@@ -1180,15 +1180,25 @@ class InboxService:
                 if legacy_parked:
                     if provider is None:
                         provider = provider_manager.get_provider(terminal_id)
-                    probe_result = status_monitor.probe_screen_status(terminal_id)
-                    probe_meta = (
-                        probe_result.meta if hasattr(probe_result, "meta") else probe_result[1]
-                    )
                     from cli_agent_orchestrator.backends.registry import get_backend
+                    from cli_agent_orchestrator.services.receiver_state_view import native_probe
                     from cli_agent_orchestrator.services.seam_activation import (
                         receiver_state_active,
                     )
 
+                    if (
+                        receiver_state_active("delivery.park_identity_probe")
+                        and get_backend().supports_event_inbox()
+                    ):
+                        native_result = native_probe(terminal_id, status_monitor)
+                        if native_result is None:
+                            return
+                        probe_meta = native_result.meta
+                    else:
+                        probe_result = status_monitor.probe_screen_status(terminal_id)
+                        probe_meta = (
+                            probe_result.meta if hasattr(probe_result, "meta") else probe_result[1]
+                        )
                     if (
                         receiver_state_active("delivery.park_identity_probe")
                         and not get_backend().supports_event_inbox()
@@ -1659,16 +1669,26 @@ class InboxService:
                     if not legacy_test_seam:
                         if provider is None:
                             provider = provider_manager.get_provider(terminal_id)
-                        probe_result = status_monitor.probe_screen_status(terminal_id)
-                        if hasattr(probe_result, "status"):
-                            probe_status, probe_meta = probe_result.status, probe_result.meta
-                        else:
-                            probe_status, probe_meta = probe_result[0], probe_result[1]
                         from cli_agent_orchestrator.backends.registry import get_backend
+                        from cli_agent_orchestrator.services.receiver_state_view import native_probe
                         from cli_agent_orchestrator.services.seam_activation import (
                             receiver_state_active,
                         )
 
+                        if (
+                            receiver_state_active("delivery.fresh_probe")
+                            and get_backend().supports_event_inbox()
+                        ):
+                            native_result = native_probe(terminal_id, status_monitor)
+                            if native_result is None:
+                                return
+                            probe_status, probe_meta = native_result.status, native_result.meta
+                        else:
+                            probe_result = status_monitor.probe_screen_status(terminal_id)
+                            if hasattr(probe_result, "status"):
+                                probe_status, probe_meta = probe_result.status, probe_result.meta
+                            else:
+                                probe_status, probe_meta = probe_result[0], probe_result[1]
                         if (
                             receiver_state_active("delivery.fresh_probe")
                             and not get_backend().supports_event_inbox()

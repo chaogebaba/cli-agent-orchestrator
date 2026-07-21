@@ -21,6 +21,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Literal, Optional, Set
 
+from cli_agent_orchestrator.models.native_publish import NativePublishRequest
+
 logger = logging.getLogger(__name__)
 
 # Exponential backoff parameters
@@ -33,6 +35,7 @@ _KIRO_WORKING_THRESHOLD = 30.0  # seconds
 INTENT_ACK_WAIT_S = 5.0
 TEARDOWN_INTENT_TTL_S = 60.0
 RECONNECT_GRACE_S = 30.0
+SELF_TEST_TIMEOUT_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -67,6 +70,8 @@ class HerdrInboxService:
         self,
         socket_path: Optional[str] = None,
         delivery_callback: Optional[Callable[[str], None]] = None,
+        native_publish_callback: Callable[[NativePublishRequest], None] | None = None,
+        native_activation_callback: Callable[[], None] | None = None,
         herdr_session: str = "cao",
     ) -> None:
         """Initialize the inbox service.
@@ -81,6 +86,10 @@ class HerdrInboxService:
         self._herdr_session = herdr_session
         self._socket_path = socket_path or self._default_socket_path(herdr_session)
         self._delivery_callback = delivery_callback
+        self._native_publish_callback = native_publish_callback
+        self._native_activation_callback = native_activation_callback
+        self._publisher_enabled = False
+        self._publisher_self_test_attempted = False
 
         # Managed pane tracking
         self._pane_to_terminal: Dict[str, str] = {}  # pane_id → terminal_id
@@ -416,6 +425,20 @@ class HerdrInboxService:
                 # must be a single combined call.
                 await self._subscribe_all_events()
 
+                if (
+                    not self._publisher_self_test_attempted
+                    and self._native_publish_callback is not None
+                ):
+                    self._publisher_self_test_attempted = True
+                    if await self._native_publisher_self_test():
+                        self._publisher_enabled = True
+                        if self._native_activation_callback is not None:
+                            self._native_activation_callback()
+                    else:
+                        logger.warning(
+                            "native publisher startup self-test failed; legacy authority retained"
+                        )
+
                 self._backoff = _BACKOFF_BASE  # Reset backoff after successful setup
 
                 # Listen for events
@@ -645,6 +668,24 @@ class HerdrInboxService:
         self._reader, self._writer = await asyncio.open_unix_connection(self._socket_path)
         logger.info(f"Connected to herdr socket: {self._socket_path}")
 
+    async def _native_publisher_self_test(self) -> bool:
+        """Prove the subscribed server is queryable without consuming socket data."""
+
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    subprocess.run,
+                    ["herdr", "--session", self._herdr_session, "pane", "list"],
+                    capture_output=True,
+                    text=True,
+                    timeout=SELF_TEST_TIMEOUT_S,
+                ),
+                timeout=SELF_TEST_TIMEOUT_S,
+            )
+            return result.returncode == 0
+        except (asyncio.TimeoutError, subprocess.SubprocessError, OSError):
+            return False
+
     async def _subscribe_all_events(self) -> None:
         """Subscribe to all events in a SINGLE events.subscribe call.
 
@@ -741,6 +782,26 @@ class HerdrInboxService:
                     self._identity_records[(terminal_id, pane_id, generation)] = _IdentityRecord(
                         marker, time.monotonic()
                     )
+
+            if (
+                self._publisher_enabled
+                and raw_event in {"pane_agent_status_changed", "pane.agent_status_changed"}
+                and isinstance(status, str)
+                and status
+                and self._native_publish_callback is not None
+            ):
+                try:
+                    self._native_publish_callback(
+                        NativePublishRequest(
+                            terminal_id,
+                            pane_id,
+                            generation,
+                            status,
+                            time.monotonic(),
+                        )
+                    )
+                except Exception:
+                    logger.exception("native status publication failed for %s", terminal_id)
 
             if status in ("idle", "done"):
                 # Clear working timestamp

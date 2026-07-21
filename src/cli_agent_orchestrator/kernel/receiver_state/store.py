@@ -11,7 +11,7 @@ from cli_agent_orchestrator.models.terminal import RecoveryState, TerminalStatus
 
 from .classification import ScreenClassificationResult
 
-FrameSource: TypeAlias = Literal["incremental", "fresh_capture"]
+FrameSource: TypeAlias = Literal["incremental", "fresh_capture", "native"]
 PassSource: TypeAlias = Literal["inline", "forced"]
 PassOutcome: TypeAlias = Literal[
     "accepted",
@@ -22,11 +22,13 @@ PassOutcome: TypeAlias = Literal[
     "forced",
     "probe",
     "aborted",
+    "native",
 ]
 FreshnessKind: TypeAlias = Literal["not_probed", "identity_ok", "identity_failed", "probe_failed"]
 ReceiverStateKey: TypeAlias = tuple[str, int, str]
 FreshToken: TypeAlias = tuple[str, float]
-ObservationOrigin: TypeAlias = Literal["incremental", "probe", "forced"]
+ObservationOrigin: TypeAlias = Literal["incremental", "probe", "forced", "native", "native_poll"]
+ReceiverSlot: TypeAlias = Literal["incremental", "fresh"]
 
 
 @dataclass(frozen=True)
@@ -120,6 +122,14 @@ class ProbeEvidence:
         return result
 
 
+@dataclass(frozen=True)
+class NativeEvidence:
+    agent_status: str
+    resolved_status: TerminalStatus
+    native_event_gen: int
+    received_at_mono: float
+
+
 _INELIGIBLE_OUTCOMES = frozenset({"stale_seq", "aborted"})
 _FRESHNESS_KINDS = frozenset({"not_probed", "identity_ok", "identity_failed", "probe_failed"})
 _PASS_OUTCOMES = frozenset(
@@ -132,6 +142,7 @@ _PASS_OUTCOMES = frozenset(
         "forced",
         "probe",
         "aborted",
+        "native",
     }
 )
 
@@ -175,6 +186,7 @@ class ReceiverState:
     origin: ObservationOrigin = "incremental"
     raw_classification: ScreenClassificationResult | None = None
     probe_evidence: ProbeEvidence | None = None
+    native_evidence: NativeEvidence | None = None
     freshness_eligible: bool = field(init=False)
 
     def __post_init__(self) -> None:
@@ -187,8 +199,22 @@ class ReceiverState:
         )
         if self.frame_source == "fresh_capture" and self.pass_outcome != "probe":
             raise ValueError("fresh_capture observations require pass_outcome='probe'")
-        if self.frame_source == "incremental" and self.pass_outcome == "probe":
-            raise ValueError("incremental observations cannot use pass_outcome='probe'")
+        if self.frame_source == "native" and self.pass_outcome != "native":
+            raise ValueError("native observations require pass_outcome='native'")
+        if self.frame_source == "incremental" and self.pass_outcome in {"probe", "native"}:
+            raise ValueError("incremental observations cannot use probe/native outcomes")
+        if self.frame_source != "native" and self.pass_outcome == "native":
+            raise ValueError("pass_outcome='native' requires a native frame source")
+        native_origin = self.origin in {"native", "native_poll"}
+        if native_origin != (self.native_evidence is not None):
+            raise ValueError("native origins require exactly one native evidence projection")
+        if native_origin:
+            if self.raw_classification is not None or self.probe_evidence is not None:
+                raise ValueError("native observations cannot carry frame/probe evidence")
+            if self.frame_hash is not None:
+                raise ValueError("native observations cannot carry a frame hash")
+        elif self.native_evidence is not None:
+            raise ValueError("non-native observations cannot carry native evidence")
         if self.origin == "forced" and self.raw_classification is not None:
             raise ValueError("forced observations cannot carry raw classification")
         if self.frame_source == "incremental" and self.probe_evidence is not None:
@@ -221,6 +247,7 @@ class ObservationView:
     origin: ObservationOrigin
     raw_classification: ScreenClassificationResult | None
     probe_evidence: ProbeEvidence | None
+    native_evidence: NativeEvidence | None
 
     @property
     def key(self) -> ReceiverStateKey:
@@ -284,16 +311,68 @@ class ReceiverStateStore:
             return (observation_epoch, stamp)
 
     def publish_observation(
-        self, observation: ReceiverState, *, fresh_token: FreshToken | None = None
+        self,
+        observation: ReceiverState,
+        *,
+        fresh_token: FreshToken | None = None,
+        slot: ReceiverSlot | None = None,
     ) -> None:
         """Publish to exactly one slot, preserving the other slot."""
 
         with self._lock:
             slots = self._entries.setdefault(observation.key, _Slots())
-            if observation.frame_source == "incremental":
+            destination = (
+                slot
+                if slot is not None
+                else "incremental" if observation.frame_source == "incremental" else "fresh"
+            )
+            if destination == "incremental":
+                if fresh_token is not None:
+                    raise ValueError("incremental publications cannot carry a fresh token")
                 slots.latest_incremental.publish(observation)
             else:
                 slots.latest_fresh.publish(observation, fresh_token)
+
+    def publish_native_pair(
+        self,
+        fresh_observation: ReceiverState,
+        incremental_observation: ReceiverState,
+        token: FreshToken,
+    ) -> None:
+        """Atomically validate and publish the two copies of one native poll."""
+
+        if (
+            fresh_observation.frame_source != "native"
+            or incremental_observation.frame_source != "native"
+        ):
+            raise ValueError("native pairs require native observations")
+        if (
+            fresh_observation.origin != "native_poll"
+            or incremental_observation.origin != "native_poll"
+        ):
+            raise ValueError("native pairs require native_poll provenance")
+        coherent_fields = (
+            "key",
+            "observation_epoch",
+            "observation_sequence",
+            "provider",
+            "captured_at_mono",
+            "latched_status",
+            "origin",
+            "native_evidence",
+            "freshness_proof",
+        )
+        if any(
+            getattr(fresh_observation, field) != getattr(incremental_observation, field)
+            for field in coherent_fields
+        ):
+            raise ValueError("native pair observations are not coherent")
+        if token[0] != fresh_observation.observation_epoch:
+            raise ValueError("native pair token epoch mismatch")
+        with self._lock:
+            slots = self._entries.setdefault(fresh_observation.key, _Slots())
+            slots.latest_fresh.publish(fresh_observation, token)
+            slots.latest_incremental.publish(incremental_observation)
 
     def prior_classification(
         self, key: ReceiverStateKey, *, prefer_fresh: bool = False
@@ -368,6 +447,7 @@ class ReceiverStateStore:
             origin=observation.origin,
             raw_classification=observation.raw_classification,
             probe_evidence=observation.probe_evidence,
+            native_evidence=observation.native_evidence,
         )
 
     def invalidate(self, key: ReceiverStateKey) -> bool:
@@ -391,6 +471,7 @@ __all__ = [
     "FreshnessKind",
     "FreshnessProof",
     "FreshToken",
+    "NativeEvidence",
     "ObservationOrigin",
     "ObservationView",
     "PassOutcome",
@@ -402,6 +483,7 @@ __all__ = [
     "ReceiverState",
     "ReceiverStateKey",
     "ReceiverStateStore",
+    "ReceiverSlot",
     "apply_recovery_overlay",
     "pass_outcome_for_source",
 ]

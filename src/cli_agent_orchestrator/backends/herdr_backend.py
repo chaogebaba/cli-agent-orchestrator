@@ -17,6 +17,7 @@ import re
 import shlex
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, cast
 
@@ -29,6 +30,23 @@ from cli_agent_orchestrator.backends.base import (
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class NativeFetch:
+    agent_status: str | None
+    status: TerminalStatus | None
+    failure_cause: Literal["pane_unresolved", "command_error", "parse_error"] | None
+
+
+def map_native_status(agent_status: str | None) -> TerminalStatus | None:
+    return {
+        "working": TerminalStatus.PROCESSING,
+        "blocked": TerminalStatus.WAITING_USER_ANSWER,
+        "done": TerminalStatus.COMPLETED,
+        "idle": TerminalStatus.IDLE,
+    }.get(agent_status)
+
 
 # Herdr CLI subcommands that _run_herdr is allowed to invoke.
 _HERDR_ALLOWED_SUBCOMMANDS = frozenset(
@@ -671,7 +689,7 @@ class HerdrBackend(TerminalBackend):
         """Herdr uses socket events for inbox delivery."""
         return True
 
-    def get_native_status(self, session_name: str, window_name: str) -> Optional[TerminalStatus]:
+    def fetch_native_status(self, session_name: str, window_name: str) -> NativeFetch:
         """Query herdr's native agent_status for a pane.
 
         Uses herdr pane get to read the agent_status field directly, avoiding
@@ -697,29 +715,25 @@ class HerdrBackend(TerminalBackend):
         try:
             pane_id = self._resolve_pane_id_from_window(session_name, window_name)
         except TerminalBackendError:
-            return None
+            return NativeFetch(None, None, "pane_unresolved")
 
         result = self._run_herdr(["pane", "get", pane_id], check=False)
         if result.returncode != 0:
-            return None
+            return NativeFetch(None, None, "command_error")
 
         try:
             data = self._parse_herdr_json(result.stdout)
             pane_info = data.get("pane", data) if isinstance(data, dict) else data
             agent_status = pane_info.get("agent_status", "unknown")
-        except (json.JSONDecodeError, AttributeError):
-            return None
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            return NativeFetch(None, None, "parse_error")
+        if not isinstance(agent_status, str):
+            return NativeFetch(None, None, "parse_error")
+        return NativeFetch(agent_status, map_native_status(agent_status), None)
 
-        if agent_status == "working":
-            return TerminalStatus.PROCESSING
-        if agent_status == "blocked":
-            return TerminalStatus.WAITING_USER_ANSWER
-        if agent_status == "done":
-            return TerminalStatus.COMPLETED
-        if agent_status == "idle":
-            return TerminalStatus.IDLE
-        # "unknown" and any unrecognized value: unresolvable at backend level.
-        return None
+    def get_native_status(self, session_name: str, window_name: str) -> Optional[TerminalStatus]:
+        """Compatibility projection of :meth:`fetch_native_status`."""
+        return self.fetch_native_status(session_name, window_name).status
 
     def get_pane_id(self, terminal_id: str, session_name: str = "", window_name: str = "") -> str:
         """Resolve CAO terminal_id to herdr pane_id.
