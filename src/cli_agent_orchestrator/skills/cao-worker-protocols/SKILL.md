@@ -108,6 +108,20 @@ When your charter has you spawn helper or reviewer lanes with `assign`:
   (`developer-sonnet` is the standing fallback for dead grok lanes) or report
   the outage to your caller. `delete_terminal` the parked lane either way.
 
+### Lane lifecycle and ownership (delegating workers: maker, architect)
+
+- **Kill only what you summoned.** Delete your own reviewer/helper lanes when
+  your loop closes (charter already says so). You may NEVER delete a terminal
+  you did not create — not the supervisor's lanes, not another worker's, not
+  shared infrastructure. The supervisor owns fleet-wide lifecycle and sweeps
+  up anything you leave behind, but leaving cleanup to the sweep is a
+  deviation to cite, not the default.
+- **Reuse shared warm infrastructure before summoning.** If the supervisor's
+  dispatch names a warm shared lane (the session `grok_oracle` above all),
+  ask IT your questions (ask-then-idle w2w) instead of spawning your own
+  duplicate — one warm oracle serves every agent in the fleet. Never delete
+  a shared lane; it is not yours even while you use it.
+
 ### Lane health is the SUPERVISOR'S job (delegating workers: maker, architect)
 
 As a delegating worker you DISPATCH lanes and RECEIVE their reports — nothing
