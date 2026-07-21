@@ -19,7 +19,12 @@ from cli_agent_orchestrator.models.native_publish import NativePublishRequest
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import NativeResolution
 from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
-from cli_agent_orchestrator.services.status_monitor import IdentityProof, StatusMonitor
+from cli_agent_orchestrator.services import receiver_state_view, terminal_service
+from cli_agent_orchestrator.services.status_monitor import (
+    IdentityProof,
+    SettlementEntry,
+    StatusMonitor,
+)
 
 
 def _native_state(**overrides):
@@ -131,6 +136,10 @@ class _Provider:
         self._last_dispatch_time = 0.0
         self._done_first_detected = 0.0
         self._idle_first_detected = 0.0
+        self.blocks_orchestrated_input_while_waiting_user_answer = False
+        self.composer_stash_keys = None
+        self.paste_enter_count = 1
+        self.paste_submit_delay = 0.0
 
     def resolve_native_status(self, native):
         return NativeResolution(native, None, None)
@@ -237,3 +246,146 @@ def test_dispatch_abort_restores_provider_flush_state(native_monitor):
     monitor.abort_dispatch(txn)
     assert provider._task_dispatched is False
     assert provider._last_dispatch_time == 7.0
+
+
+@pytest.mark.parametrize("send_seam", ["send_input", "send_prepared_input"])
+def test_send_failure_aborts_dispatch_and_restores_all_provider_flush_fields(
+    native_monitor, monkeypatch, send_seam
+):
+    monitor, provider = native_monitor
+    provider._task_dispatched = False
+    provider._last_dispatch_time = 7.0
+    provider._done_first_detected = 8.0
+    provider._idle_first_detected = 9.0
+    before = (
+        provider._task_dispatched,
+        provider._last_dispatch_time,
+        provider._done_first_detected,
+        provider._idle_first_detected,
+    )
+    metadata = {
+        "tmux_session": "session",
+        "tmux_window": "window",
+        "provider": "kiro_cli",
+        "caller_id": None,
+    }
+    backend = MagicMock(supports_identity_readback=False)
+    backend.read_native_identity.return_value = SimpleNamespace(verdict="match")
+    backend.send_keys.side_effect = RuntimeError("backend send failed")
+    monkeypatch.setattr(terminal_service, "status_monitor", monitor)
+    monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda _terminal: metadata)
+    monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+    monkeypatch.setattr(
+        terminal_service.provider_manager, "get_provider", lambda _terminal: provider
+    )
+    monkeypatch.setattr(terminal_service, "preserve_draft_before_send", lambda *_args: None)
+    monkeypatch.setattr(terminal_service, "inject_memory_context", lambda message, *_a, **_k: message)
+    monkeypatch.setattr(terminal_service, "update_last_active", lambda _terminal: None)
+    monkeypatch.setattr(monitor, "get_status", lambda _terminal: TerminalStatus.IDLE)
+    monkeypatch.setattr(monitor, "notify_input_sent", lambda _terminal: None)
+    monkeypatch.setattr(monitor, "clear_rolling_buffer", lambda _terminal: None)
+
+    try:
+        with pytest.raises(RuntimeError, match="backend send failed"):
+            if send_seam == "send_input":
+                terminal_service.send_input("t1", "payload")
+            else:
+                terminal_service.send_prepared_input("t1", "payload")
+    finally:
+        terminal_service._memory_injected_terminals.discard("t1")
+
+    assert backend.send_keys.call_count == 1
+    assert (
+        provider._task_dispatched,
+        provider._last_dispatch_time,
+        provider._done_first_detected,
+        provider._idle_first_detected,
+    ) == before
+    dispatch_key = ("t1", 1)
+    assert dispatch_key in monitor._dispatch_consumed
+    assert dispatch_key not in monitor._dispatch_states
+    assert dispatch_key not in monitor._dispatch_providers
+    assert monitor.active_dispatch_epoch("t1") == 0
+    assert monitor._dispatch_mutexes["t1"].acquire(blocking=False)
+    monitor._dispatch_mutexes["t1"].release()
+
+
+@pytest.mark.asyncio
+async def test_settlement_timer_removes_matching_entry_and_preserves_replacement(
+    native_monitor, monkeypatch
+):
+    monitor, _provider = native_monitor
+    monitor._loop = asyncio.get_running_loop()
+    key = ("t1", "p1")
+    request = NativePublishRequest("t1", "p1", 4, "working", time.monotonic())
+    monkeypatch.setattr(monitor, "_run_settlement", lambda *_args: None)
+
+    monitor._arm_settlement_locked(request, time.monotonic() + 60.0)
+    matching = monitor._settlements[key]
+    matching.handle._run()
+    matching.handle.cancel()
+    await asyncio.gather(*tuple(monitor._settlement_tasks))
+    assert key not in monitor._settlements
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_settlement(*_args):
+        started.set()
+        assert release.wait(2.0)
+
+    monkeypatch.setattr(monitor, "_run_settlement", blocked_settlement)
+    monitor._arm_settlement_locked(request, time.monotonic() + 60.0)
+    superseded = monitor._settlements[key]
+    superseded.handle._run()
+    superseded.handle.cancel()
+    for _ in range(100):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.001)
+    assert started.is_set()
+
+    replacement_request = NativePublishRequest(
+        "t1", "p1", request.generation + 1, "working", time.monotonic()
+    )
+    replacement = SettlementEntry(MagicMock(), replacement_request, request.generation + 1, 0)
+    with monitor._lock:
+        monitor._settlements[key] = replacement
+    release.set()
+    await asyncio.gather(*tuple(monitor._settlement_tasks))
+
+    assert monitor._settlements[key] is replacement
+    replacement.handle.cancel.assert_not_called()
+
+
+def test_native_poll_cooldown_suppresses_second_poll(monkeypatch):
+    receiver_state_view._native_poll_last.clear()
+    backend = MagicMock()
+    backend.get_pane_id.return_value = "p1"
+    backend.fetch_native_status.return_value = NativeFetch(
+        "working", TerminalStatus.PROCESSING, None
+    )
+    provider = SimpleNamespace(
+        capabilities=SimpleNamespace(native_status_source="herdr")
+    )
+    monitor = MagicMock()
+    monitor.prove_terminal_identity.return_value = IdentityProof("t1", "native", 10.0, None)
+    monitor.publish_native_poll.return_value = ("epoch", 10.1)
+    monkeypatch.setattr(receiver_state_view, "get_backend", lambda: backend)
+    monkeypatch.setattr(
+        receiver_state_view,
+        "get_terminal_metadata",
+        lambda _terminal: {"tmux_session": "session", "tmux_window": "window"},
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
+        lambda _terminal: provider,
+    )
+    monkeypatch.setattr(
+        receiver_state_view.time, "monotonic", MagicMock(side_effect=[10.0, 10.1, 11.0])
+    )
+
+    assert receiver_state_view._poll_native_once("t1", monitor) is not None
+    assert receiver_state_view._poll_native_once("t1", monitor) is None
+    backend.fetch_native_status.assert_called_once_with("session", "window")
+    monitor.publish_native_poll.assert_called_once()
