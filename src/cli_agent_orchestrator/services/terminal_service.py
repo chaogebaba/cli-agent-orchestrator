@@ -620,6 +620,7 @@ async def create_terminal(
     fallback_source_terminal_id: str | None = None,
     fallback_source_lease_token=None,
     dispatch_barrier: dict[str, object] | None = None,
+    park_warm: bool = False,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -1084,6 +1085,7 @@ async def create_terminal(
                 caller_snapshot=published_snapshot,
                 fork_context=fork_context,
                 refresh_base_name=refresh_base_name,
+                park_warm=park_warm,
             )
         else:
             try:
@@ -2268,6 +2270,7 @@ async def _confirm_worker_started_or_resubmit(
     orchestration_type: OrchestrationType | None,
     *,
     generation: str | None = None,
+    park_warm: bool = False,
 ) -> bool:
     """Confirm deferred input started, retrying only through guarded send seams."""
 
@@ -2366,6 +2369,7 @@ def _schedule_deferred_init(
     caller_snapshot: dict | None = None,
     fork_context=None,
     refresh_base_name: str | None = None,
+    park_warm: bool = False,
 ) -> None:
     """Kick off provider.initialize() in the background and, on success,
     deliver the initial message via send_input.
@@ -2450,6 +2454,13 @@ def _schedule_deferred_init(
                 terminal_id,
                 settlement_form=settlement_form,
             )
+            send_kwargs = {
+                "registry": registry,
+                "sender_id": snapshot.get("caller_id"),
+                "orchestration_type": orchestration_type,
+            }
+            if park_warm:
+                send_kwargs["expect_callback"] = False
             if prepared is not None:
                 await _validate_deferred_artifact(
                     provider_instance,
@@ -2493,9 +2504,7 @@ def _schedule_deferred_init(
                     send_input,
                     terminal_id,
                     prepared_message,
-                    registry=registry,
-                    sender_id=snapshot.get("caller_id"),
-                    orchestration_type=orchestration_type,
+                    **send_kwargs,
                 )
                 started = await _confirm_worker_started_or_resubmit(
                     terminal_id,
@@ -2504,6 +2513,7 @@ def _schedule_deferred_init(
                     snapshot.get("caller_id"),
                     orchestration_type,
                     generation=generation,
+                    park_warm=park_warm,
                 )
                 if not started:
                     logger.error(

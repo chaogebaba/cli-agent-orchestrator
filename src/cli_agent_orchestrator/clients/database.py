@@ -277,6 +277,7 @@ class InboxModel(Base):
         server_default=OrchestrationType.SEND_MESSAGE.value,
     )
     status = Column(String, nullable=False)  # MessageStatus enum value
+    park_warm = Column(Boolean, nullable=True, default=False)
     failure_reason = Column(Text, nullable=True)
     digested_into = deferred(Column(Integer, nullable=True))
     enqueue_generation = deferred(Column(Integer, nullable=True))
@@ -838,6 +839,8 @@ def _migrate_mailbox_columns() -> None:
             connection.execute(text("ALTER TABLE inbox ADD COLUMN owner_receiver_id TEXT"))
         if inbox_columns and "owner_generation" not in inbox_column_names:
             connection.execute(text("ALTER TABLE inbox ADD COLUMN owner_generation INTEGER"))
+        if inbox_columns and "park_warm" not in inbox_column_names:
+            connection.execute(text("ALTER TABLE inbox ADD COLUMN park_warm BOOLEAN"))
         if inbox_columns:
             connection.execute(
                 text(
@@ -3017,6 +3020,7 @@ def _inbox_message_from_row(row: Any) -> InboxMessage:
         message=row.message,
         orchestration_type=OrchestrationType(row.orchestration_type),
         status=MessageStatus(row.status),
+        park_warm=bool(getattr(row, "park_warm", False)),
         failure_reason=row.failure_reason,
         digested_into=row.digested_into,
         enqueue_generation=row.enqueue_generation,
@@ -3371,6 +3375,7 @@ def _insert_routed_inbox_row(
     logical_receiver_id: str | None,
     message: str,
     orchestration_type: OrchestrationType,
+    park_warm: bool = False,
     dispatch_barrier: dict[str, Any] | None = None,
     profile_name: str | None = None,
     created_at: datetime | None = None,
@@ -3421,6 +3426,7 @@ def _insert_routed_inbox_row(
             "message": routed_message,
             "orchestration_type": orchestration_type.value,
             "status": status.value,
+            "park_warm": bool(park_warm),
             "barrier_id": barrier_id,
             "barrier_member_key": barrier_member_key,
             **({"created_at": created_at} if created_at is not None else {}),
@@ -3711,6 +3717,7 @@ def create_inbox_message(
     message: str,
     orchestration_type: OrchestrationType = OrchestrationType.SEND_MESSAGE,
     dispatch_barrier: dict[str, Any] | None = None,
+    park_warm: bool = False,
 ) -> InboxMessage:
     from cli_agent_orchestrator.services.stalled_callback_watchdog import (
         stalled_callback_watchdog,
@@ -3723,6 +3730,7 @@ def create_inbox_message(
             message,
             orchestration_type,
             dispatch_barrier=dispatch_barrier,
+            park_warm=park_warm,
         )
 
 
@@ -3733,6 +3741,7 @@ def _create_inbox_message_unfenced(
     orchestration_type: OrchestrationType = OrchestrationType.SEND_MESSAGE,
     *,
     dispatch_barrier: dict[str, Any] | None = None,
+    park_warm: bool = False,
 ) -> InboxMessage:
     """Create inbox message with status=MessageStatus.PENDING.
 
@@ -3757,6 +3766,7 @@ def _create_inbox_message_unfenced(
             message=message,
             orchestration_type=orchestration_type,
             dispatch_barrier=dispatch_barrier,
+            park_warm=park_warm,
         )
         db.commit()
         db.refresh(inbox_msg)
@@ -3942,6 +3952,7 @@ def get_pending_messages(
                 message=row.message,
                 orchestration_type=OrchestrationType(row.orchestration_type),
                 status=MessageStatus(row.status),
+                park_warm=bool(getattr(row, "park_warm", False)),
                 created_at=row.created_at,
             )
             for row in rows
@@ -3975,10 +3986,26 @@ def get_pending_messages_by_ids(receiver_id: str, message_ids: list[int]) -> Lis
                 message=row.message,
                 orchestration_type=OrchestrationType(row.orchestration_type),
                 status=MessageStatus(row.status),
+                park_warm=bool(getattr(row, "park_warm", False)),
                 created_at=row.created_at,
             )
             for row in rows
         ]
+
+
+def get_park_warm_for_message_ids(message_ids: list[int]) -> bool:
+    """Re-read per-dispatch intent for a recovered delivery batch."""
+    ids = sorted(set(message_ids))
+    if not ids:
+        return False
+    with SessionLocal() as db:
+        value = (
+            db.query(InboxModel.park_warm)
+            .filter(InboxModel.id.in_(ids))
+            .order_by(InboxModel.id)
+            .first()
+        )
+        return bool(value[0]) if value is not None else False
 
 
 def get_owned_legacy_parked_messages(receiver_id: str, limit: int = 100) -> List[InboxMessage]:
@@ -4082,6 +4109,7 @@ def get_inbox_messages(
                     message=msg.message,
                     orchestration_type=OrchestrationType(msg.orchestration_type),
                     status=MessageStatus(msg.status),
+                    park_warm=bool(getattr(msg, "park_warm", False)),
                     created_at=msg.created_at,
                 )
             )
@@ -5905,6 +5933,7 @@ def list_stale_delivering_messages() -> List[InboxMessage]:
                 message=x.message,
                 orchestration_type=OrchestrationType(x.orchestration_type),
                 status=MessageStatus(x.status),
+                park_warm=bool(getattr(x, "park_warm", False)),
                 created_at=x.created_at,
             )
             for x in rows

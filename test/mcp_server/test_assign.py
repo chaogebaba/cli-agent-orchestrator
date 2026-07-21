@@ -501,3 +501,29 @@ class TestBuildAssignDescription:
         args_pos = desc.index("Args:")
         returns_pos = desc.index("Returns:")
         assert args_pos < returns_pos
+
+
+def test_assign_threads_park_warm_to_deferred_create_path():
+    from cli_agent_orchestrator.mcp_server.server import _assign_impl
+
+    with (
+        patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor"}),
+        patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False),
+        patch(
+            "cli_agent_orchestrator.mcp_server.server._configured_default_fork_base",
+            return_value=None,
+        ),
+        patch(
+            "cli_agent_orchestrator.mcp_server.server.strict_supervisor_cwd",
+            return_value="/repo",
+        ),
+        patch(
+            "cli_agent_orchestrator.mcp_server.server._create_terminal",
+            return_value=("worker", "codex"),
+        ) as create,
+    ):
+        result = _assign_impl("developer", "park", park_warm=True)
+
+    assert result["success"] is True
+    assert create.call_args.kwargs["defer_init"] is True
+    assert create.call_args.kwargs["park_warm"] is True

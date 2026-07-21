@@ -901,6 +901,60 @@ class TestCreateInboxMessageEndpoint:
             )
             mock_inbox.deliver_pending.assert_called_once_with("abcd1234", registry=ANY)
 
+    def test_create_inbox_message_threads_park_warm_to_raw_producer(self, client):
+        mock_msg = MagicMock(
+            id=2,
+            sender_id="sender1",
+            receiver_id="abcd1234",
+        )
+        mock_msg.created_at.isoformat.return_value = "2026-07-20T12:00:00"
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value={"tmux_session": "cao-test", "tmux_window": "worker"},
+            ),
+            patch("cli_agent_orchestrator.api.main.get_backend") as backend,
+            patch("cli_agent_orchestrator.api.main.create_inbox_message") as create,
+            patch("cli_agent_orchestrator.api.main.inbox_service"),
+        ):
+            backend.return_value.session_exists.return_value = True
+            backend.return_value.get_history.return_value = ""
+            create.return_value = mock_msg
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={"sender_id": "sender1", "message": "park", "park_warm": True},
+            )
+
+        assert response.status_code == 200
+        create.assert_called_once_with(
+            "sender1", "abcd1234", "park", park_warm=True
+        )
+
+    def test_logical_inbox_threads_park_warm_through_delivery_entry(self, client):
+        row = MagicMock(id=3, sender_id="sender1", receiver_id="abcd1234")
+        row.created_at.isoformat.return_value = "2026-07-20T12:00:00"
+        with (
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.create_logical_inbox_message",
+                return_value=row,
+            ) as create,
+            patch("cli_agent_orchestrator.api.main.inbox_service") as inbox,
+        ):
+            response = client.post(
+                "/terminals/mb_aaaaaaaa/inbox/messages",
+                params={"sender_id": "sender1", "message": "park", "park_warm": True},
+            )
+
+        assert response.status_code == 200
+        create.assert_called_once_with(
+            sender_id="sender1",
+            mailbox_id="mb_aaaaaaaa",
+            message="park",
+            refresh_ingest=False,
+            park_warm=True,
+        )
+        inbox.deliver_pending.assert_called_once()
+
     @pytest.mark.parametrize(
         ("barrier_field", "value"),
         (

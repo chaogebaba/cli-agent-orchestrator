@@ -38,6 +38,7 @@ from cli_agent_orchestrator.clients.database import (
     get_owned_legacy_parked_messages,
     get_pending_messages,
     get_pending_messages_by_ids,
+    get_park_warm_for_message_ids,
     get_terminal_metadata,
     insert_identity_authority_notice,
     list_attempt_member_ids,
@@ -739,6 +740,7 @@ class InboxService:
         sender_id: str,
         orchestration_type: OrchestrationType,
         metadata: dict,
+        park_warm: bool = False,
     ) -> None:
         from cli_agent_orchestrator.services.stalled_callback_watchdog import (
             stalled_callback_watchdog,
@@ -747,7 +749,7 @@ class InboxService:
         if sender_id.startswith("watchdog:"):
             return
         stalled_callback_watchdog.record_callback_if_to_caller(sender_id, terminal_id)
-        if metadata.get("caller_id") and (
+        if metadata.get("caller_id") and not park_warm and (
             orchestration_type == OrchestrationType.ASSIGN
             or (
                 orchestration_type == OrchestrationType.SEND_MESSAGE
@@ -782,6 +784,7 @@ class InboxService:
         sender_id: str,
         orchestration_type: OrchestrationType,
         *,
+        park_warm: bool = False,
         observe_binding_staleness: bool = True,
     ) -> tuple[str, object | None]:
         """Return normal, stop, or inject for a frozen-law gated batch."""
@@ -852,7 +855,11 @@ class InboxService:
                         terminal_id,
                         confirmation_evidence=(prior["attempt_uuid"], lookup_evidence),
                         on_confirmed=lambda: self._commit_watchdog_ops(
-                            terminal_id, sender_id, orchestration_type, metadata
+                            terminal_id,
+                            sender_id,
+                            orchestration_type,
+                            metadata,
+                            park_warm,
                         ),
                     )
                 )
@@ -891,7 +898,11 @@ class InboxService:
                         terminal_id,
                         confirmation_evidence=(stale_prior["attempt_uuid"], stale_evidence),
                         on_confirmed=lambda: self._commit_watchdog_ops(
-                            terminal_id, sender_id, orchestration_type, metadata
+                            terminal_id,
+                            sender_id,
+                            orchestration_type,
+                            metadata,
+                            park_warm,
                         ),
                     )
                 )
@@ -980,7 +991,11 @@ class InboxService:
                         terminal_id,
                         confirmation_evidence=(newest["attempt_uuid"], fresh_evidence),
                         on_confirmed=lambda: self._commit_watchdog_ops(
-                            terminal_id, sender_id, orchestration_type, metadata
+                            terminal_id,
+                            sender_id,
+                            orchestration_type,
+                            metadata,
+                            park_warm,
                         ),
                     )
                 )
@@ -1043,7 +1058,11 @@ class InboxService:
                                 MessageStatus.DELIVERED,
                                 terminal_id,
                                 on_confirmed=lambda: self._commit_watchdog_ops(
-                                    terminal_id, sender_id, orchestration_type, metadata
+                                    terminal_id,
+                                    sender_id,
+                                    orchestration_type,
+                                    metadata,
+                                    park_warm,
                                 ),
                             )
                         )
@@ -1266,7 +1285,14 @@ class InboxService:
                     group = get_pending_messages_by_ids(terminal_id, durable_ids)
                 else:
                     _, first_group = next(
-                        groupby(page, key=lambda item: (item.sender_id, item.orchestration_type))
+                        groupby(
+                            page,
+                            key=lambda item: (
+                                item.sender_id,
+                                item.orchestration_type,
+                                bool(getattr(item, "park_warm", False)),
+                            ),
+                        )
                     )
                     group = list(first_group)
                 if not group:
@@ -1279,6 +1305,7 @@ class InboxService:
                     provider,
                     first.sender_id,
                     first.orchestration_type,
+                    park_warm=bool(getattr(first, "park_warm", False)),
                 )
                 ids = {item.id for item in group}
                 if state == "skip_d2_only":
@@ -1304,8 +1331,13 @@ class InboxService:
             # all pending messages (num_messages=0) a batch can span multiple groups,
             # so each run is sent separately to keep attribution and shaping correct.
             sent_count = 0
-            for (sender_id, orchestration_type), group in groupby(
-                messages, key=lambda m: (m.sender_id, m.orchestration_type)
+            for (sender_id, orchestration_type, park_warm), group in groupby(
+                messages,
+                key=lambda m: (
+                    m.sender_id,
+                    m.orchestration_type,
+                    bool(getattr(m, "park_warm", False)),
+                ),
             ):
                 batch = list(group)
                 combined = "\n".join(m.message for m in batch)
@@ -1322,6 +1354,7 @@ class InboxService:
                         provider,
                         sender_id,
                         orchestration_type,
+                        park_warm=park_warm,
                         observe_binding_staleness=False,
                     )
                     if gate_state == "stop":
@@ -1466,7 +1499,11 @@ class InboxService:
                                     message_ids,
                                     prior["attempt_uuid"],
                                     on_confirmed=lambda: self._commit_watchdog_ops(
-                                        terminal_id, sender_id, orchestration_type, metadata
+                                        terminal_id,
+                                        sender_id,
+                                        orchestration_type,
+                                        metadata,
+                                        park_warm,
                                     ),
                                 )
                             )
@@ -1495,6 +1532,7 @@ class InboxService:
                                         sender_id,
                                         orchestration_type,
                                         metadata,
+                                        park_warm,
                                     ),
                                 ),
                             )
@@ -1562,6 +1600,7 @@ class InboxService:
                                                 sender_id,
                                                 orchestration_type,
                                                 metadata,
+                                                park_warm,
                                             ),
                                         )
                                     )
@@ -1781,6 +1820,7 @@ class InboxService:
                                             sender_id,
                                             orchestration_type,
                                             metadata,
+                                            park_warm,
                                         ),
                                     )
                                 else:
@@ -1792,6 +1832,7 @@ class InboxService:
                                             sender_id,
                                             orchestration_type,
                                             metadata,
+                                            park_warm,
                                         ),
                                     )
                             return
@@ -2018,7 +2059,11 @@ class InboxService:
                                 attempt_uuid,
                                 inferred,
                                 on_confirmed=lambda: self._commit_watchdog_ops(
-                                    terminal_id, sender_id, orchestration_type, metadata
+                                    terminal_id,
+                                    sender_id,
+                                    orchestration_type,
+                                    metadata,
+                                    park_warm,
                                 ),
                             )
                         )
@@ -2039,7 +2084,11 @@ class InboxService:
                                 evidence=json.dumps(evidence),
                                 settled_status_gen=status_monitor.get_status_gen(terminal_id),
                                 on_confirmed=lambda: self._commit_watchdog_ops(
-                                    terminal_id, sender_id, orchestration_type, metadata
+                                    terminal_id,
+                                    sender_id,
+                                    orchestration_type,
+                                    metadata,
+                                    park_warm,
                                 ),
                             ),
                         )
@@ -2328,6 +2377,7 @@ class InboxService:
                         attempt["sender_id"],
                         OrchestrationType(attempt["orchestration_type"]),
                         metadata,
+                        get_park_warm_for_message_ids(message_ids),
                     )
                 return
             recovered_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -2422,6 +2472,7 @@ class InboxService:
                             attempt["sender_id"],
                             OrchestrationType(attempt["orchestration_type"]),
                             metadata,
+                            get_park_warm_for_message_ids(message_ids),
                         ),
                     ),
                 )

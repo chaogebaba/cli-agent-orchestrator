@@ -29,7 +29,7 @@ from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 
 
 def _watchdog_notice(message: str, idle_reason: str | None = None) -> WatchdogNotice:
-    return WatchdogNotice("worker", "caller", message, idle_reason)
+    return WatchdogNotice("worker", "caller", message, idle_reason, source_generation=1)
 
 
 def _plan(*, evidence=None, first_ref=("/tmp/transcript", 7, 10), attempt="a"):

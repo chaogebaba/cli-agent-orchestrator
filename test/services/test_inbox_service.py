@@ -28,6 +28,7 @@ def _make_message(
     status=MessageStatus.PENDING,
     sender_id="sender-1",
     orchestration_type=OrchestrationType.SEND_MESSAGE,
+    park_warm=False,
 ):
     return InboxMessage(
         id=id,
@@ -36,6 +37,7 @@ def _make_message(
         message=message,
         orchestration_type=orchestration_type,
         status=status,
+        park_warm=park_warm,
         created_at=datetime.now(),
     )
 
@@ -362,6 +364,53 @@ class TestDeliverPending:
             defer_on_dialog=True,
         )
         mock_update.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_mixed_park_warm_batches_are_homogeneous_and_only_normal_arms(
+        self, mock_get, mock_metadata, mock_monitor, mock_term_svc, _mock_update
+    ):
+        mock_get.return_value = [
+            _make_message(id=1, message="normal", park_warm=False),
+            _make_message(id=2, message="parked-a", park_warm=True),
+            _make_message(id=3, message="parked-b", park_warm=True),
+        ]
+        mock_metadata.return_value = {
+            "provider": "event",
+            "caller_id": "sender-1",
+            "agent_profile": "developer",
+        }
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        def settle(*_args, **kwargs):
+            if callback := kwargs.get("on_confirmed"):
+                callback()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.settle_delivery_attempt",
+                side_effect=settle,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog."
+                "stalled_callback_watchdog"
+            ) as watchdog,
+        ):
+            InboxService().deliver_pending("term-1", num_messages=0)
+
+        assert [call.args[1] for call in mock_term_svc.send_prepared_input.call_args_list] == [
+            "normal",
+            "parked-a\nparked-b",
+        ]
+        watchdog.record_inbound_task.assert_called_once_with(
+            "term-1", "sender-1", "developer"
+        )
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service", new_callable=_terminal_service_mock)

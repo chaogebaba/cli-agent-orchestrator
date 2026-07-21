@@ -178,6 +178,7 @@ def _create_terminal(
     barrier: Optional[str] = None,
     barrier_timeout_seconds: Optional[int] = None,
     barrier_member_key: Optional[str] = None,
+    park_warm: bool = False,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -246,6 +247,8 @@ def _create_terminal(
                     if isinstance(initial_message_orchestration_type, OrchestrationType)
                     else str(initial_message_orchestration_type)
                 )
+            if park_warm:
+                json_body["park_warm"] = True
             if fork_context is not None:
                 json_body["fork_context"] = fork_context.model_dump()
             if refresh_base_name is not None:
@@ -693,6 +696,7 @@ def _send_to_inbox(
     receiver_id: str,
     message: str,
     refresh_ingest: bool = False,
+    park_warm: bool = False,
 ) -> Dict[str, Any]:
     """Send message to another terminal's inbox (queued delivery when IDLE).
 
@@ -716,6 +720,8 @@ def _send_to_inbox(
         "message": message,
         "refresh_ingest": refresh_ingest,
     }
+    if park_warm:
+        params["park_warm"] = True
     response = cao_http.post(
         f"/terminals/{receiver_id}/inbox/messages",
         params=params,
@@ -1097,6 +1103,7 @@ def _assign_impl(
     barrier: Optional[str] = None,
     barrier_timeout_seconds: Optional[int] = None,
     barrier_member_key: Optional[str] = None,
+    park_warm: bool = False,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1246,6 +1253,13 @@ def _assign_impl(
         # provider.initialize() and initial-message delivery run as a
         # background task on the server. The tool-call typically returns
         # in under 2 seconds regardless of how long init takes.
+        create_kwargs = {
+            "barrier": barrier,
+            "barrier_timeout_seconds": barrier_timeout_seconds,
+            "barrier_member_key": barrier_member_key,
+        }
+        if park_warm:
+            create_kwargs["park_warm"] = True
         terminal_id, _ = _create_terminal(
             agent_profile,
             working_directory,
@@ -1254,9 +1268,7 @@ def _assign_impl(
             initial_message_orchestration_type=OrchestrationType.ASSIGN,
             fork_context=fork_context,
             refresh_base_name=refresh_base_name,
-            barrier=barrier,
-            barrier_timeout_seconds=barrier_timeout_seconds,
-            barrier_member_key=barrier_member_key,
+            **create_kwargs,
         )
 
         return {
@@ -1369,6 +1381,10 @@ async def assign(
     barrier_member_key: Optional[str] = Field(
         default=None, description="Stable member key for duplicate profiles or re-arm"
     ),
+    park_warm: bool = Field(
+        default=False,
+        description="Deliver the task without expecting a callback",
+    ),
 ) -> Dict[str, Any]:
     return _assign_impl(
         agent_profile,
@@ -1379,6 +1395,7 @@ async def assign(
         barrier,
         barrier_timeout_seconds,
         barrier_member_key,
+        park_warm,
     )
 
 
@@ -1444,6 +1461,7 @@ def _send_message_impl(
     barrier: str | None = None,
     barrier_timeout_seconds: int | None = None,
     barrier_member_key: str | None = None,
+    park_warm: bool = False,
 ) -> Dict[str, Any]:
     """Implementation of send_message logic."""
     try:
@@ -1535,7 +1553,10 @@ def _send_message_impl(
                 barrier_timeout_seconds=barrier_timeout_seconds,
                 barrier_member_key=barrier_member_key,
             )
-        return _send_to_inbox(receiver_id, message, refresh_ingest=refresh_ingest)
+        send_kwargs = {"refresh_ingest": refresh_ingest}
+        if park_warm:
+            send_kwargs["park_warm"] = True
+        return _send_to_inbox(receiver_id, message, **send_kwargs)
     except requests.HTTPError as exc:
         # e.g. the receiver terminal (a recorded caller included) was deleted
         # before this reply — surface the API detail instead of a raw
@@ -1756,6 +1777,10 @@ async def send_message(
     barrier_member_key: Optional[str] = Field(
         default=None, description="Stable member key for duplicate profiles or re-arm"
     ),
+    park_warm: bool = Field(
+        default=False,
+        description="Deliver without arming a receiver callback watchdog episode",
+    ),
 ) -> Dict[str, Any]:
     """Send a message to another terminal's inbox.
 
@@ -1780,6 +1805,7 @@ async def send_message(
         barrier,
         barrier_timeout_seconds,
         barrier_member_key,
+        park_warm,
     )
 
 

@@ -39,6 +39,8 @@ from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
 WATCHDOG_SCREEN_TAIL_LINES = 45
+WATCHDOG_WAITING_ESCALATE_S = 2 * STALLED_CALLBACK_GRACE_SECONDS
+WATCHDOG_WAITING_REPEAT_FLOOR_S = 600
 AUTO_RESUME_PROVIDERS = frozenset({"codex"})
 AUTO_RESUME_BODY = (
     "[watchdog auto-resume] your previous turn ended on a transient API error. "
@@ -78,6 +80,7 @@ class _Episode:
     auto_resumed: bool = False
     resume_reserved_at: float | None = None
     auto_resume_attempted_at: str | None = None
+    waiting_last_push_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +95,7 @@ class PreflightCandidate:
     idle_seconds: int
     idle_since: float
     last_screen_fp: str
+    phase_p_waiting: bool
 
 
 @dataclass(frozen=True)
@@ -114,6 +118,14 @@ class WatchdogNotice:
     caller_id: str
     message: str
     idle_reason: str | None
+    source_generation: int = 0
+    kind: str = "stall"
+
+
+@dataclass(frozen=True)
+class ReservedChainNotice:
+    notice: WatchdogNotice
+    key: tuple[str, int, str, int]
 
 
 @dataclass
@@ -140,6 +152,7 @@ class StalledCallbackWatchdog:
         self._paused: set[str] = set()
         self._generation_by_terminal: dict[str, int] = {}
         self._callback_fences: dict[str, int] = {}
+        self._chain_notified: set[tuple[str, int, str, int]] = set()
 
     @contextmanager
     def callback_insert_guard(self, sender_id: str):
@@ -233,6 +246,21 @@ class StalledCallbackWatchdog:
             self._ready_backlog_episodes.pop(terminal_id, None)
             self._generation_by_terminal.pop(terminal_id, None)
             self._callback_fences.pop(terminal_id, None)
+            self._chain_notified = {
+                key
+                for key in self._chain_notified
+                if key[0] != terminal_id and key[2] != terminal_id
+            }
+
+    def _blockers_locked(self, worker_id: str) -> list[tuple[str, _Episode]]:
+        return [
+            (terminal_id, episode)
+            for terminal_id, episode in self._episodes.items()
+            if episode.caller_id == worker_id
+            and not episode.callback_seen
+            and terminal_id not in self._paused
+            and terminal_exists(terminal_id)
+        ]
 
     def record_callback_if_to_caller(self, sender_id: str, receiver_id: str) -> None:
         meta = get_terminal_metadata(sender_id)
@@ -498,17 +526,14 @@ class StalledCallbackWatchdog:
                         idle_seconds=idle_seconds,
                         idle_since=episode.idle_since,
                         last_screen_fp=episode.last_screen_fp,
+                        phase_p_waiting=bool(self._blockers_locked(terminal_id)),
                     )
                 )
 
         due: list[WatchdogNotice] = []
         for candidate in candidates:
             metadata = get_terminal_metadata(candidate.terminal_id)
-            callback_status = get_callback_status_since(
-                candidate.terminal_id,
-                candidate.caller_id,
-                candidate.episode_started_wall_at,
-            )
+            callback_status = None
             provider = metadata.get("provider") if metadata is not None else None
             auto_resume_applicable = (
                 self._auto_resume_enabled() and provider in AUTO_RESUME_PROVIDERS
@@ -516,20 +541,26 @@ class StalledCallbackWatchdog:
             suppress = False
             fallback_idle_reason = None
             second_callback_status = None
-            if (
-                metadata is not None
-                and callback_status is None
-                and (not auto_resume_applicable or candidate.episode.auto_resumed)
-            ):
-                frame_decides_running, fallback_idle_reason = self._fresh_frame_decides_running(
-                    candidate.terminal_id
-                )
-                suppress = frame_decides_running and not auto_resume_applicable
-                second_callback_status = get_callback_status_since(
+            if not candidate.phase_p_waiting:
+                callback_status = get_callback_status_since(
                     candidate.terminal_id,
                     candidate.caller_id,
                     candidate.episode_started_wall_at,
                 )
+                if (
+                    metadata is not None
+                    and callback_status is None
+                    and (not auto_resume_applicable or candidate.episode.auto_resumed)
+                ):
+                    frame_decides_running, fallback_idle_reason = self._fresh_frame_decides_running(
+                        candidate.terminal_id
+                    )
+                    suppress = frame_decides_running and not auto_resume_applicable
+                    second_callback_status = get_callback_status_since(
+                        candidate.terminal_id,
+                        candidate.caller_id,
+                        candidate.episode_started_wall_at,
+                    )
             action: AutoResumeAction | None = None
             with self._lock:
                 current_episode = self._episodes.get(candidate.terminal_id)
@@ -541,6 +572,38 @@ class StalledCallbackWatchdog:
                 assert current_episode is not None
                 assert current_episode.idle_since is not None
                 if int(now - current_episode.idle_since) < self.grace_seconds:
+                    continue
+                blockers = self._blockers_locked(candidate.terminal_id)
+                if candidate.phase_p_waiting and not blockers:
+                    continue
+                if blockers:
+                    oldest_inbound_at = min(episode.inbound_at for _, episode in blockers)
+                    last_push = current_episode.waiting_last_push_at
+                    if (
+                        now - oldest_inbound_at >= WATCHDOG_WAITING_ESCALATE_S
+                        and (
+                            last_push is None
+                            or now - last_push >= WATCHDOG_WAITING_REPEAT_FLOOR_S
+                        )
+                    ):
+                        current_episode.waiting_last_push_at = now
+                        blocker_ids = ", ".join(sorted(terminal_id for terminal_id, _ in blockers))
+                        due.append(
+                            WatchdogNotice(
+                                terminal_id=candidate.terminal_id,
+                                caller_id=candidate.caller_id,
+                                message=(
+                                    f"[watchdog] worker {candidate.terminal_id} "
+                                    f"({current_episode.profile}) lawfully waiting on delegated "
+                                    f"sub-workers [{blocker_ids}], oldest outstanding "
+                                    f"{int(now - oldest_inbound_at)}s — not stalled; chain may need "
+                                    "a peek if this repeats."
+                                ),
+                                idle_reason=None,
+                                source_generation=current_episode.generation,
+                                kind="waiting",
+                            )
+                        )
                     continue
                 if callback_status in {
                     MessageStatus.PENDING,
@@ -651,6 +714,7 @@ class StalledCallbackWatchdog:
             f"idle {idle_seconds}s without callback"
             f"{f' [reason: {idle_reason}]' if idle_reason is not None else ''}{suffix}",
             idle_reason=idle_reason,
+            source_generation=episode.generation,
         )
 
     def _execute_auto_resume(
@@ -761,26 +825,123 @@ class StalledCallbackWatchdog:
                 logger.exception("Failed to deliver auto-resume for %s", action.terminal_id)
         return None
 
+    def _reserve_chain_notice(
+        self, notice: WatchdogNotice, now: float
+    ) -> ReservedChainNotice | None:
+        if notice.kind != "stall":
+            return None
+        with self._lock:
+            target_episode = self._episodes.get(notice.terminal_id)
+            if (
+                target_episode is None
+                or target_episode.generation != notice.source_generation
+            ):
+                return None
+            worker_id = target_episode.caller_id
+            worker_episode = self._episodes.get(worker_id)
+            if (
+                worker_episode is None
+                or worker_episode.callback_seen
+                or worker_episode.fired
+                or worker_episode.idle_since is None
+            ):
+                return None
+            blockers = dict(self._blockers_locked(worker_id))
+            if blockers.get(notice.terminal_id) is not target_episode:
+                return None
+            key = (
+                worker_id,
+                worker_episode.generation,
+                notice.terminal_id,
+                notice.source_generation,
+            )
+            if key in self._chain_notified:
+                return None
+            self._chain_notified.add(key)
+            chain_notice = WatchdogNotice(
+                terminal_id=worker_id,
+                caller_id=worker_episode.caller_id,
+                message=(
+                    f"[watchdog] chain stalled: worker {worker_id} "
+                    f"({worker_episode.profile}) has been waiting "
+                    f"{int(now - worker_episode.inbound_at)}s on its sub-worker "
+                    f"{notice.terminal_id} ({target_episode.profile}), which is now idle "
+                    f"{int(now - target_episode.inbound_at)}s without callback — "
+                    f"{worker_id} cannot return until this is resolved."
+                ),
+                idle_reason=None,
+                source_generation=worker_episode.generation,
+                kind="chain",
+            )
+            return ReservedChainNotice(chain_notice, key)
+
+    def _release_chain_reservation(self, key: tuple[str, int, str, int]) -> None:
+        with self._lock:
+            self._chain_notified.discard(key)
+
+    @staticmethod
+    def _persist_notice(notice: WatchdogNotice) -> None:
+        handled = insert_barrier_escalation_message(
+            notice.terminal_id,
+            notice.caller_id,
+            notice.message,
+            notice.idle_reason,
+        )
+        if handled is None:
+            create_inbox_message(
+                f"watchdog:{notice.terminal_id}",
+                notice.caller_id,
+                notice.message,
+            )
+
     def notify_due(self, registry: PluginRegistry | None = None) -> None:
         from cli_agent_orchestrator.services.inbox_service import inbox_service
 
-        for notice in self.collect_due_notifications():
+        now = time.monotonic()
+        notices = self.collect_due_notifications(now=now)
+        jobs = [(notice, self._reserve_chain_notice(notice, now)) for notice in notices]
+        chain_pairs = {
+            (reservation.notice.terminal_id, reservation.notice.caller_id)
+            for _, reservation in jobs
+            if reservation is not None
+        }
+        jobs = [
+            (notice, reservation)
+            for notice, reservation in jobs
+            if notice.kind != "waiting"
+            or (notice.terminal_id, notice.caller_id) not in chain_pairs
+        ]
+
+        for notice, reservation in jobs:
             try:
-                handled = insert_barrier_escalation_message(
-                    notice.terminal_id,
-                    notice.caller_id,
-                    notice.message,
-                    notice.idle_reason,
-                )
-                if handled is None:
-                    create_inbox_message(
-                        f"watchdog:{notice.terminal_id}",
-                        notice.caller_id,
-                        notice.message,
-                    )
-                inbox_service.deliver_pending(notice.caller_id, registry=registry)
+                self._persist_notice(notice)
             except Exception:
                 logger.exception("Failed to push stalled-callback watchdog notification")
+                if reservation is not None:
+                    self._release_chain_reservation(reservation.key)
+                continue
+
+            chain_persisted = False
+            if reservation is not None:
+                try:
+                    self._persist_notice(reservation.notice)
+                    chain_persisted = True
+                except Exception:
+                    self._release_chain_reservation(reservation.key)
+                    logger.exception("Failed to persist watchdog chain notification")
+
+            try:
+                inbox_service.deliver_pending(notice.caller_id, registry=registry)
+            except Exception:
+                logger.exception("Failed to deliver stalled-callback watchdog notification")
+            if chain_persisted and reservation is not None:
+                try:
+                    inbox_service.deliver_pending(
+                        reservation.notice.caller_id,
+                        registry=registry,
+                    )
+                except Exception:
+                    logger.exception("Failed to deliver watchdog chain notification")
 
     def tick_waiting_inbox(
         self,

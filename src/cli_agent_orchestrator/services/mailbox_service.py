@@ -465,6 +465,7 @@ def create_logical_inbox_message(
     refresh_ingest: bool = False,
     orchestration_type: OrchestrationType = OrchestrationType.SEND_MESSAGE,
     dispatch_barrier: dict[str, Any] | None = None,
+    park_warm: bool = False,
 ) -> InboxMessage:
     """Holder (d): resolve, guard, and insert one logical row under one authority."""
     with SessionLocal() as db:
@@ -499,6 +500,7 @@ def create_logical_inbox_message(
                     message=message,
                     orchestration_type=orchestration_type,
                     dispatch_barrier=dispatch_barrier,
+                    park_warm=park_warm,
                 )
                 db.commit()
                 db.refresh(row)

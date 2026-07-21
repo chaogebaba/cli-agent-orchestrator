@@ -411,6 +411,54 @@ def test_startup_sweep_metadata_gone_is_failed(monkeypatch):
     assert settle.call_args.args[1:3] == (MessageStatus.FAILED, "failed")
 
 
+@pytest.mark.parametrize("park_warm", [False, True])
+def test_startup_recovery_requeries_member_park_warm(monkeypatch, park_warm):
+    message = _message(MessageStatus.DELIVERING)
+    monkeypatch.setattr(module, "list_stale_delivering_messages", lambda: [message])
+    monkeypatch.setattr(
+        module,
+        "get_message_trace",
+        lambda _id: {
+            "attempts": [
+                {
+                    "attempt_uuid": "attempt",
+                    "payload_hash": "hash",
+                    "started_at": datetime.now(),
+                    "evidence": {},
+                    "sender_id": "sender",
+                    "orchestration_type": "send_message",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(module, "list_attempt_member_ids", lambda _id: [1, 2])
+    monkeypatch.setattr(module, "get_park_warm_for_message_ids", lambda ids: park_warm)
+    monkeypatch.setattr(
+        module,
+        "get_terminal_metadata",
+        lambda _id: {
+            "id": "receiver",
+            "tmux_session": "s",
+            "tmux_window": "w",
+            "caller_id": "sender",
+        },
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", MagicMock())
+    monkeypatch.setattr(module, "resolve_session_transcript", lambda _meta: Path("/trace"))
+    monkeypatch.setattr(module, "transcript_lookup", lambda *_a, **_k: ("hit", {}))
+
+    def settle(*_args, **kwargs):
+        kwargs["on_confirmed"]()
+        return True
+
+    monkeypatch.setattr(module, "settle_delivery_attempt", settle)
+    commit = MagicMock()
+    monkeypatch.setattr(InboxService, "_commit_watchdog_ops", commit)
+    InboxService().recover_stale_deliveries()
+
+    assert commit.call_args.args[-1] is park_warm
+
+
 def test_startup_sweep_pane_gap_requeues_without_transcript_reader(monkeypatch):
     message = _message(MessageStatus.DELIVERING)
     monkeypatch.setattr(module, "list_stale_delivering_messages", lambda: [message])

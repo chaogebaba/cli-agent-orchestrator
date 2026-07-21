@@ -43,6 +43,10 @@ class InboxMessage(BaseModel):
         default=OrchestrationType.SEND_MESSAGE, description="Orchestration mode"
     )
     status: MessageStatus = Field(..., description="Message status")
+    park_warm: bool = Field(
+        default=False,
+        description="Deliver without arming a receiver watchdog episode",
+    )
     failure_reason: str | None = Field(
         default=None, description="Terminal settlement reason, when available"
     )

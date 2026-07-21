@@ -6,6 +6,20 @@ from unittest.mock import MagicMock, patch
 import requests
 
 
+def test_send_message_threads_park_warm_to_inbox_producer():
+    from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+
+    with (
+        patch.dict(os.environ, {"CAO_TERMINAL_ID": "sender"}),
+        patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox") as send,
+    ):
+        send.return_value = {"success": True}
+        result = _send_message_impl("receiver", "park", park_warm=True)
+
+    assert result["success"] is True
+    assert send.call_args.kwargs == {"refresh_ingest": False, "park_warm": True}
+
+
 class TestReadyBaseGuard:
     @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
     def test_rejects_ready_base_owner(self, mock_inbox):

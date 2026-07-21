@@ -265,6 +265,7 @@ class CreateTerminalBody(BaseModel):
     barrier: Optional[str] = None
     barrier_timeout_seconds: Optional[StrictInt] = None
     barrier_member_key: Optional[str] = None
+    park_warm: bool = False
 
     @field_validator("barrier")
     @classmethod
@@ -2179,6 +2180,7 @@ async def create_terminal_in_session(
             defer_init=defer_init,
             initial_message=initial_message,
             initial_message_orchestration_type=orch_type,
+            park_warm=body.park_warm if body else False,
             fork_context=fork_context,
             refresh_base_name=body.refresh_base_name if body else None,
             dispatch_barrier=(
@@ -3198,6 +3200,7 @@ async def create_inbox_message_endpoint(
     sender_id: str,
     message: str,
     refresh_ingest: bool = False,
+    park_warm: bool = False,
     barrier: Optional[str] = None,
     barrier_timeout_seconds: Optional[int] = None,
     barrier_member_key: Optional[str] = None,
@@ -3217,6 +3220,8 @@ async def create_inbox_message_endpoint(
 
         try:
             logical_kwargs: dict[str, Any] = {}
+            if park_warm:
+                logical_kwargs["park_warm"] = True
             if barrier is not None:
                 logical_kwargs["dispatch_barrier"] = {
                     "label": barrier,
@@ -3286,6 +3291,8 @@ async def create_inbox_message_endpoint(
 
     try:
         raw_kwargs: dict[str, Any] = {}
+        if park_warm:
+            raw_kwargs["park_warm"] = True
         if barrier is not None:
             raw_kwargs["dispatch_barrier"] = {
                 "label": barrier,

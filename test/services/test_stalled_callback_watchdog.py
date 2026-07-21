@@ -1,5 +1,6 @@
 import threading
 from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -38,8 +39,12 @@ def _mark_screen_sampled(svc, terminal_id="worker1"):
     svc._episodes[terminal_id].last_screen_fp = "sample"
 
 
-def _notice(message: str, idle_reason: str | None = None) -> WatchdogNotice:
-    return WatchdogNotice("worker1", "caller1", message, idle_reason)
+def _notice(
+    message: str, idle_reason: str | None = None, source_generation: int = 1
+) -> WatchdogNotice:
+    return WatchdogNotice(
+        "worker1", "caller1", message, idle_reason, source_generation=source_generation
+    )
 
 
 def _armed_due_watchdog():
@@ -317,6 +322,49 @@ def test_msgtrace_confirmed_commit_performs_watchdog_operations_exactly_once():
         watchdog.record_inbound_task.assert_called_once_with("worker1", "caller1", "developer")
 
 
+def test_parked_commit_still_settles_sender_and_never_clears_existing_episode():
+    from cli_agent_orchestrator.services.inbox_service import InboxService
+
+    with patch(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.stalled_callback_watchdog"
+    ) as watchdog:
+        InboxService()._commit_watchdog_ops(
+            "worker1",
+            "caller1",
+            OrchestrationType.SEND_MESSAGE,
+            {"caller_id": "caller1", "agent_profile": "developer"},
+            park_warm=True,
+        )
+    watchdog.record_callback_if_to_caller.assert_called_once_with("caller1", "worker1")
+    watchdog.record_inbound_task.assert_not_called()
+    watchdog.clear_terminal.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("sender_id", "orchestration_type"),
+    [
+        ("watchdog:T", OrchestrationType.SEND_MESSAGE),
+        ("barrier-alert:7", OrchestrationType.SEND_MESSAGE),
+        ("mailbox-digest", OrchestrationType.MAILBOX_DIGEST),
+    ],
+)
+def test_existing_nonarming_producer_classes_remain_nonarming(
+    sender_id, orchestration_type
+):
+    from cli_agent_orchestrator.services.inbox_service import InboxService
+
+    with patch(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.stalled_callback_watchdog"
+    ) as watchdog:
+        InboxService()._commit_watchdog_ops(
+            "worker1",
+            sender_id,
+            orchestration_type,
+            {"caller_id": "caller1", "agent_profile": "developer"},
+        )
+    watchdog.record_inbound_task.assert_not_called()
+
+
 def test_watchdog_resets_on_new_task_after_firing():
     svc = StalledCallbackWatchdog(grace_seconds=3)
     svc.record_inbound_task("worker1", "caller1", "developer")
@@ -339,7 +387,10 @@ def test_watchdog_resets_on_new_task_after_firing():
         _mark_screen_sampled(svc)
 
         assert svc.collect_due_notifications(now=23.0) == [
-            _notice("[watchdog] worker worker1 (developer) idle 3s without callback")
+            _notice(
+                "[watchdog] worker worker1 (developer) idle 3s without callback",
+                source_generation=2,
+            )
         ]
 
 
@@ -913,3 +964,272 @@ class TestWaitingInboxAlert:
 
         assert "worker1" not in svc._waiting_inbox_episodes
         assert "worker1" not in svc._waiting_inbox_last_push
+
+
+def _arm_watchdog_episode(
+    svc: StalledCallbackWatchdog,
+    terminal_id: str,
+    caller_id: str,
+    *,
+    inbound_at: float,
+    idle_since: float | None = None,
+    sampled: bool = False,
+    profile: str = "developer",
+) -> None:
+    svc.record_inbound_task(terminal_id, caller_id, profile)
+    episode = svc._episodes[terminal_id]
+    episode.inbound_at = inbound_at
+    episode.idle_since = idle_since
+    episode.last_screen_fp = "sample" if sampled else None
+
+
+@contextmanager
+def _relational_watchdog_fakes(live_ids: set[str], providers: dict[str, str] | None = None):
+    providers = providers or {}
+
+    def metadata(terminal_id: str):
+        if terminal_id not in live_ids:
+            return None
+        return {
+            "id": terminal_id,
+            "provider": providers.get(terminal_id, "grok_cli"),
+            "tmux_session": "cao-test",
+            "tmux_window": terminal_id,
+        }
+
+    with (
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.terminal_exists",
+            side_effect=lambda terminal_id: terminal_id in live_ids,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+            side_effect=metadata,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+            return_value=None,
+        ) as callback_status,
+        patch.object(
+            StalledCallbackWatchdog,
+            "_fresh_frame_decides_running",
+            return_value=(False, None),
+        ) as fresh_frame,
+    ):
+        yield callback_status, fresh_frame
+
+
+def test_waiting_blocker_suppression_resolution_preserves_original_clock():
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
+    _arm_watchdog_episode(svc, "T", "W", inbound_at=10)
+    with _relational_watchdog_fakes({"W", "T", "C"}):
+        assert svc.collect_due_notifications(now=20) == []
+        assert svc._episodes["W"].idle_since == 0
+        with patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+            return_value={"caller_id": "W"},
+        ):
+            svc.record_callback_if_to_caller("T", "W")
+        assert svc.collect_due_notifications(now=21)[0].terminal_id == "W"
+
+
+def test_fired_and_order_independent_blockers_and_membership_exits():
+    def run(order):
+        svc = StalledCallbackWatchdog(grace_seconds=3)
+        _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
+        for terminal_id in order:
+            _arm_watchdog_episode(svc, terminal_id, "W", inbound_at=10)
+        svc._episodes["T"].fired = True
+        with _relational_watchdog_fakes({"W", "T", "U", "C"}):
+            return [n.message for n in svc.collect_due_notifications(now=20)]
+
+    assert run(("T", "U")) == run(("U", "T")) == []
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
+    _arm_watchdog_episode(svc, "T", "W", inbound_at=10)
+    with _relational_watchdog_fakes({"W", "T", "C"}):
+        svc._paused.add("T")
+        assert svc.collect_due_notifications(now=20)[0].terminal_id == "W"
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
+    _arm_watchdog_episode(svc, "T", "W", inbound_at=10)
+    with _relational_watchdog_fakes({"W", "C"}):
+        assert svc.collect_due_notifications(now=20)[0].terminal_id == "W"
+
+
+def test_waiting_safety_net_repeats_on_oldest_inbound_clock():
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=100, sampled=True)
+    _arm_watchdog_episode(svc, "T", "W", inbound_at=700)
+    with _relational_watchdog_fakes({"W", "T", "C"}):
+        assert svc.collect_due_notifications(now=1000)[0].kind == "waiting"
+        assert svc.collect_due_notifications(now=1599) == []
+        assert svc.collect_due_notifications(now=1600)[0].kind == "waiting"
+
+
+def test_phase_p_waiting_skips_frame_and_defers_when_phase_a_clears():
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
+    _arm_watchdog_episode(svc, "T", "W", inbound_at=1)
+    live = {"W", "T", "C"}
+    flipped = False
+
+    def metadata(terminal_id):
+        nonlocal flipped
+        if terminal_id == "W" and not flipped:
+            flipped = True
+            svc._episodes["T"].callback_seen = True
+        return {"id": terminal_id, "provider": "grok_cli"}
+
+    with (
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.terminal_exists",
+            side_effect=lambda terminal_id: terminal_id in live,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+            side_effect=metadata,
+        ),
+        patch.object(
+            StalledCallbackWatchdog,
+            "_fresh_frame_decides_running",
+            return_value=(False, None),
+        ) as fresh,
+    ):
+        assert svc.collect_due_notifications(now=20) == []
+        fresh.assert_not_called()
+        assert svc.collect_due_notifications(now=20)[0].terminal_id == "W"
+
+
+def test_phase_a_waiting_suppresses_and_blocks_auto_resume():
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
+    _arm_watchdog_episode(svc, "T", "W", inbound_at=1)
+    with (
+        _relational_watchdog_fakes({"W", "T", "C"}, {"W": "codex"}) as fakes,
+        patch.object(svc, "_auto_resume_enabled", return_value=True),
+        patch.object(svc, "_execute_auto_resume") as resume,
+    ):
+        assert svc.collect_due_notifications(now=20) == []
+        resume.assert_not_called()
+        fakes[1].assert_not_called()
+
+
+def test_phase_p_empty_phase_a_waiting_suppresses_after_probes():
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
+    added = False
+
+    def metadata(terminal_id):
+        nonlocal added
+        if terminal_id == "W" and not added:
+            added = True
+            _arm_watchdog_episode(svc, "T", "W", inbound_at=1)
+        return {"id": terminal_id, "provider": "grok_cli"}
+
+    with (
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.terminal_exists",
+            return_value=True,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+            side_effect=metadata,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+            return_value=None,
+        ) as callback_status,
+        patch.object(
+            StalledCallbackWatchdog,
+            "_fresh_frame_decides_running",
+            return_value=(False, None),
+        ) as fresh,
+    ):
+        assert svc.collect_due_notifications(now=20) == []
+    assert callback_status.call_count == 2
+    fresh.assert_called_once_with("W")
+
+
+def test_positive_grok_sample_keeps_existing_alarm_class():
+    sample = Path(__file__).parents[3] / "probes/error-pane-samples/2026-07-20-grok-roster-flap-d86a724d.txt"
+    assert "model" in sample.read_text(encoding="utf-8").lower()
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    _arm_watchdog_episode(svc, "worker1", "caller1", inbound_at=0, idle_since=10, sampled=True)
+    with _relational_watchdog_fakes({"worker1", "caller1"}):
+        notices = svc.collect_due_notifications(now=13)
+    assert notices[0].message == "[watchdog] worker worker1 (developer) idle 3s without callback"
+
+
+def test_fresh_watchdog_with_live_terminals_emits_nothing_until_armed():
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    with _relational_watchdog_fakes({"W", "T", "C"}):
+        assert svc.collect_due_notifications(now=10_000) == []
+
+
+def test_notify_due_trigger_a_is_deduped_and_coalesces_trigger_b():
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
+    _arm_watchdog_episode(svc, "T", "W", inbound_at=0, idle_since=0, sampled=True)
+    rows = []
+
+    with (
+        _relational_watchdog_fakes({"W", "T", "C"}),
+        patch.object(svc, "_persist_notice", side_effect=rows.append),
+        patch("cli_agent_orchestrator.services.inbox_service.inbox_service") as inbox,
+    ):
+        svc.notify_due()
+        svc.notify_due()
+    assert [notice.kind for notice in rows] == ["stall", "chain"]
+    assert rows[1].terminal_id == "W" and "sub-worker T" in rows[1].message
+    assert inbox.deliver_pending.call_count == 2
+
+
+def test_trigger_a_rollover_is_stale_and_insert_failure_rolls_back_reservation():
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
+    _arm_watchdog_episode(svc, "T", "W", inbound_at=0, idle_since=0, sampled=True)
+    with _relational_watchdog_fakes({"W", "T", "C"}):
+        original_collect = svc.collect_due_notifications
+
+        def collect_and_rearm(*, now=None):
+            result = original_collect(now=now)
+            svc._episodes["T"].generation += 1
+            return result
+
+        with (
+            patch.object(svc, "collect_due_notifications", side_effect=collect_and_rearm),
+            patch.object(svc, "_persist_notice") as persist,
+            patch("cli_agent_orchestrator.services.inbox_service.inbox_service"),
+        ):
+            svc.notify_due()
+        assert [call.args[0].kind for call in persist.call_args_list] == ["waiting", "stall"]
+        assert not svc._chain_notified
+
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
+    _arm_watchdog_episode(svc, "T", "W", inbound_at=0, idle_since=0, sampled=True)
+    with (
+        _relational_watchdog_fakes({"W", "T", "C"}),
+        patch.object(svc, "_persist_notice", side_effect=[None, RuntimeError("db")]),
+        patch("cli_agent_orchestrator.services.inbox_service.inbox_service"),
+    ):
+        svc.notify_due()
+    assert not svc._chain_notified
+
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
+    _arm_watchdog_episode(svc, "T", "W", inbound_at=0, idle_since=0, sampled=True)
+    persisted = []
+    with (
+        _relational_watchdog_fakes({"W", "T", "C"}),
+        patch.object(svc, "_persist_notice", side_effect=persisted.append),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",
+            side_effect=RuntimeError("delivery"),
+        ),
+    ):
+        svc.notify_due()
+        svc.notify_due()
+    assert [notice.kind for notice in persisted] == ["stall", "chain"]
