@@ -2179,7 +2179,18 @@ async def _prepare_fork_refresh(
         captured = snapshot_result
         if captured.acquisition_error or not captured.git_sha:
             return stale_preamble
-        if not base_digest_service.covers(decision.artifact, captured):
+        post_dispatch, _ = await _tracked_blocking(
+            terminal_id,
+            generation,
+            "abandonable",
+            "fork_refresh_compare",
+            fork_staleness,
+            row,
+            deadline=deadline,
+        )
+        if post_dispatch.delta.acquisition_error or not post_dispatch.delta.git_sha:
+            return stale_preamble
+        if not base_digest_service.covers(decision.artifact, post_dispatch.delta):
             return stale_preamble
         current, _ = await _tracked_blocking(
             terminal_id,
