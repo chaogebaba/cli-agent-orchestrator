@@ -68,6 +68,18 @@ If the task asks you to create files, write them before reporting completion. Wh
 - Never `cd` into a directory you may later delete; run cleanup from outside the disposable directory.
 - If every command fails with `getcwd`/`ENOENT`, stop issuing commands and report the cwd brick to your supervisor via `send_message` immediately; do not retry.
 
+### Fixture law for builders (3 consecutive diff-gate SHIP-NOs: 0b, 0b.1, WPWD — 2026-07-20/21)
+
+- **Fixtures drive the PRODUCTION entry path, never the helper directly.** A
+  test that calls `abort_dispatch()` by hand, mocks the function under test,
+  or injects synthetic rows past the real persistence/dispatch layer proves
+  nothing about the law — 12+ mutants survived green suites this way. Drive
+  the real API/MCP/send path end to end and assert the final observable state.
+- **Mutation evidence must be REPLAYABLE at the build commit**: for every
+  claimed mutant — exact patch, selector (which must COLLECT, cite output),
+  observed red result, restore step, restored file hash. A prose mapping or
+  selector list is not evidence; the reviewer replays your rows.
+
 After resolving Python merge conflicts, run `python scripts/verify_resolved_python.py --all-changed` before reporting success. The helper compiles every changed Python file and performs pytest collection for changed test files.
 
 ## Forbidden Operations (absolute, regardless of task wording)
