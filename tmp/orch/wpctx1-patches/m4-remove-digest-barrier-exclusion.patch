@@ -1,0 +1,16 @@
+diff --git a/src/cli_agent_orchestrator/clients/database.py b/src/cli_agent_orchestrator/clients/database.py
+--- a/src/cli_agent_orchestrator/clients/database.py
++++ b/src/cli_agent_orchestrator/clients/database.py
+@@ -2998,7 +2998,6 @@ _BARRIER_INTERNAL_PREFIXES = (
+     "message-trace:",
+     "mailbox-digest",
+     "compact-digest",
+-    "cao-digest:",
+     "barrier:",
+     "barrier-alert:",
+ )
+diff --git a/test/clients/test_database.py b/test/clients/test_database.py
+--- a/test/clients/test_database.py
++++ b/test/clients/test_database.py
+@@ -99,0 +100 @@ class TestTerminalOperations:
++        assert "cao-digest:" in create_digest_pending_notice.__globals__["_BARRIER_INTERNAL_PREFIXES"]

@@ -1,0 +1,21 @@
+commit: 8ce8826f6cf9e70cc541839db98f9c01e6eac169
+patch: m3-line-split-git-paths.patch
+command: uv run pytest -q test/services/test_fork_context_service.py
+exit: 1
+
+FF...FFFFF                                                               [100%]
+=================================== FAILURES ===================================
+__________________ test_tracked_modified_after_mark_is_stale ___________________
+E       ValueError: lstat: embedded null character in path
+=========================== short test summary info ============================
+FAILED test/services/test_fork_context_service.py::test_tracked_modified_after_mark_is_stale
+FAILED test/services/test_fork_context_service.py::test_dirty_at_snapshot_untouched_is_fresh
+FAILED test/services/test_fork_context_service.py::test_deleted_at_snapshot_still_deleted_is_fresh
+FAILED test/services/test_fork_context_service.py::test_deleted_at_snapshot_then_recreated_is_stale
+FAILED test/services/test_fork_context_service.py::test_deleted_at_snapshot_then_directory_is_stale
+FAILED test/services/test_fork_context_service.py::test_deleted_at_snapshot_then_symlink_is_stale
+FAILED test/services/test_fork_context_service.py::test_present_but_unreadable_hash_is_stale
+7 failed, 3 passed in 0.46s
+
+post-restore:
+c260289f089724b658902c9a2663371800099329c1c01d9d7f727ecc6e8dd8df  src/cli_agent_orchestrator/services/fork_context_service.py

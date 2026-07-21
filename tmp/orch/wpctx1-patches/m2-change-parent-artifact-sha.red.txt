@@ -1,0 +1,16 @@
+commit: 8ce8826f6cf9e70cc541839db98f9c01e6eac169
+patch: m2-change-parent-artifact-sha.patch
+command: uv run pytest -q test/services/test_base_digest_service.py::test_lineage_mismatch_and_acquisition_failure_are_invalid
+exit: 1
+
+F                                                                        [100%]
+=================================== FAILURES ===================================
+__________ test_lineage_mismatch_and_acquisition_failure_are_invalid ___________
+E       AssertionError: assert False
+E        +  where False = isinstance(DigestCovered(...), DigestInvalid)
+=========================== short test summary info ============================
+FAILED test/services/test_base_digest_service.py::test_lineage_mismatch_and_acquisition_failure_are_invalid
+1 failed in 0.13s
+
+post-restore:
+d589b11a12c76f7ea9fc645dcd7da3de8f8854c1b4cae4c0afdd37c236522466  src/cli_agent_orchestrator/services/base_digest_service.py

@@ -1,0 +1,16 @@
+commit: 8ce8826f6cf9e70cc541839db98f9c01e6eac169
+patch: m4-remove-digest-barrier-exclusion.patch
+command: uv run pytest -q test/clients/test_database.py::TestTerminalOperations::test_digest_pending_notice_deduplicates_and_is_parked
+exit: 1
+
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_ TestTerminalOperations.test_digest_pending_notice_deduplicates_and_is_parked _
+E       AssertionError: assert 'cao-digest:' in ('watchdog:', 'message-trace:', 'mailbox-digest', 'compact-digest', 'barrier:', 'barrier-alert:')
+=========================== short test summary info ============================
+FAILED test/clients/test_database.py::TestTerminalOperations::test_digest_pending_notice_deduplicates_and_is_parked
+1 failed in 0.16s
+
+post-restore:
+f7d1e9e35a8ee6a379da5428ec05e7a601d288f1de8353b19898b02b0c9c9441  src/cli_agent_orchestrator/clients/database.py
+e70ace59bf0459241a8fe36c6f0199ad7bb03d158498526d97c905f1a2ec9d98  test/clients/test_database.py

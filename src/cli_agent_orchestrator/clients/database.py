@@ -3772,11 +3772,16 @@ def create_digest_pending_notice(
                 and not db.query(TerminalModel).filter(TerminalModel.id == receiver_cache).first()
             ):
                 raise ValueError(f"Terminal '{receiver_id}' not found")
+            receiver_filter = (
+                InboxModel.logical_receiver_id == logical_receiver_id
+                if logical_receiver_id is not None
+                else InboxModel.receiver_id == receiver_cache
+            )
             existing = (
                 db.query(InboxModel)
                 .filter(
                     InboxModel.sender_id == sender_id,
-                    InboxModel.receiver_id == receiver_cache,
+                    receiver_filter,
                     text("substr(message, 1, :n) = :header").bindparams(
                         n=len(header), header=header
                     ),

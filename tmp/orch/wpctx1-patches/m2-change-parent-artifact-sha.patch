@@ -1,0 +1,12 @@
+diff --git a/src/cli_agent_orchestrator/services/base_digest_service.py b/src/cli_agent_orchestrator/services/base_digest_service.py
+--- a/src/cli_agent_orchestrator/services/base_digest_service.py
++++ b/src/cli_agent_orchestrator/services/base_digest_service.py
+@@ -224,7 +224,7 @@ def publish(
+     directory = Path(cwd) / "tmp" / "orch" / "digests"
+     directory.mkdir(parents=True, exist_ok=True)
+     path = directory / f"{base}-{datetime.now(timezone.utc).date().isoformat()}-r{round_number}.md"
+-    parent = parent_artifact_sha or "genesis"
++    parent = parent_artifact_sha or "c" * 64  # mutant: publish the wrong parent
+     entries = canonical_entries(delta.entries)
+     manifest = (
+         "<!-- digest-manifest\n"

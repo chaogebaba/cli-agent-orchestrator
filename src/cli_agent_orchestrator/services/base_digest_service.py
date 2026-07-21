@@ -185,6 +185,13 @@ def _same_entries(left: tuple[SnapshotEntry, ...], right: tuple[SnapshotEntry, .
     return sorted(left, key=key) == sorted(right, key=key)
 
 
+def covers(artifact: BaseDigestArtifact, delta: SnapshotDelta) -> bool:
+    """Return whether an artifact exactly covers an acquired snapshot delta."""
+    if delta.acquisition_error or any(entry.state == "unhashable" for entry in delta.entries):
+        return False
+    return _same_entries(artifact.entries, delta.entries)
+
+
 def evaluate(row: dict, delta: SnapshotDelta) -> DigestDecision:
     """Return the closed refresh decision for one base and acquired delta."""
     if delta.acquisition_error:
@@ -203,9 +210,7 @@ def evaluate(row: dict, delta: SnapshotDelta) -> DigestDecision:
     expected_parent = row.get("digest_head") or "genesis"
     if artifact.parent_artifact_sha != expected_parent:
         return DigestInvalid("lineage")
-    if any(entry.state == "unhashable" for entry in delta.entries):
-        return DigestPending(delta)
-    if not _same_entries(artifact.entries, delta.entries):
+    if not covers(artifact, delta):
         return DigestPending(delta)
     return DigestCovered(artifact)
 

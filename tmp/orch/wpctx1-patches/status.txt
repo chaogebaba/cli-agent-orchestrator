@@ -1,0 +1,6 @@
+Replay base: 8ce8826f6cf9e70cc541839db98f9c01e6eac169
+m1-remove-digest-artifact.patch: RED (exit 1), restored clean
+m2-change-parent-artifact-sha.patch: RED (exit 1), restored clean
+m3-line-split-git-paths.patch: RED (exit 1), restored clean
+m4-remove-digest-barrier-exclusion.patch: RED (exit 1), restored clean
+m5-drop-digest-head-cas.patch: RED (exit 1), restored clean

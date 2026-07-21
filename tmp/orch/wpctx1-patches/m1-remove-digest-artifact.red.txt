@@ -1,0 +1,17 @@
+commit: 8ce8826f6cf9e70cc541839db98f9c01e6eac169
+patch: m1-remove-digest-artifact.patch
+command: uv run pytest -q test/services/test_wpm4e_fork_refresh.py::test_e1_real_git_planted_token_refresh_resets_row_fresh
+exit: 1
+
+F                                                                        [100%]
+=================================== FAILURES ===================================
+___________ test_e1_real_git_planted_token_refresh_resets_row_fresh ____________
+E       AssertionError: assert 'pending' == 'covered'
+E         - covered
+E         + pending
+=========================== short test summary info ============================
+FAILED test/services/test_wpm4e_fork_refresh.py::test_e1_real_git_planted_token_refresh_resets_row_fresh
+1 failed in 0.73s
+
+post-restore:
+d589b11a12c76f7ea9fc645dcd7da3de8f8854c1b4cae4c0afdd37c236522466  src/cli_agent_orchestrator/services/base_digest_service.py

@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker
 
+from cli_agent_orchestrator.clients import database as database_client
 from cli_agent_orchestrator.clients.database import (
     Base,
     CallbackBarrierMemberModel,
@@ -16,6 +17,8 @@ from cli_agent_orchestrator.clients.database import (
     FlowModel,
     InboxMessageTraceEventModel,
     InboxModel,
+    MailboxIncarnationModel,
+    MailboxModel,
     TerminalModel,
     TranscriptBindingModel,
     begin_delivery_attempt,
@@ -97,11 +100,50 @@ class TestTerminalOperations:
         second = create_digest_pending_notice("receiver", "base", "k1", "body")
         assert first is not None
         assert second is None
+        assert "cao-digest:" in database_client._BARRIER_INTERNAL_PREFIXES
         with test_db() as db:
             row = db.query(InboxModel).one()
             assert row.sender_id == "cao-digest:base"
             assert row.park_warm is True
             assert row.message.startswith("[CAO DIGEST-PENDING] base=base key=k1\n")
+
+    def test_digest_pending_notice_deduplicates_across_mailbox_rollover(
+        self, test_db, monkeypatch,
+    ):
+        monkeypatch.setattr("cli_agent_orchestrator.clients.database.SessionLocal", test_db)
+        create_terminal("old", "cao-session", "window-old", "codex")
+        create_terminal("new", "cao-session", "window-new", "codex")
+        with test_db.begin() as db:
+            db.add(
+                MailboxModel(
+                    id="mb_digest", session_name="cao-session", role="supervisor",
+                    current_terminal_id="old", generation=1, consumed_through_id=0,
+                )
+            )
+            db.add(
+                MailboxIncarnationModel(
+                    mailbox_id="mb_digest", generation=1, terminal_id="old",
+                )
+            )
+
+        first = create_digest_pending_notice("mb_digest", "base", "k1", "body")
+        with test_db.begin() as db:
+            mailbox = db.get(MailboxModel, "mb_digest")
+            mailbox.current_terminal_id = "new"
+            mailbox.generation = 2
+            db.add(
+                MailboxIncarnationModel(
+                    mailbox_id="mb_digest", generation=2, terminal_id="new",
+                )
+            )
+        second = create_digest_pending_notice("mb_digest", "base", "k1", "body")
+
+        assert first is not None
+        assert second is None
+        with test_db() as db:
+            row = db.query(InboxModel).one()
+            assert row.receiver_id == "old"
+            assert row.logical_receiver_id == "mb_digest"
 
     def test_cancel_watchdog_message_persists_cancelled_without_notice(self, test_db, monkeypatch):
         monkeypatch.setattr("cli_agent_orchestrator.clients.database.SessionLocal", test_db)

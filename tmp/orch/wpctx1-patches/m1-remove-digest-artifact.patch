@@ -1,0 +1,6 @@
+diff --git a/src/cli_agent_orchestrator/services/base_digest_service.py b/src/cli_agent_orchestrator/services/base_digest_service.py
+--- a/src/cli_agent_orchestrator/services/base_digest_service.py
++++ b/src/cli_agent_orchestrator/services/base_digest_service.py
+@@ -180 +180 @@ def _newest_candidate(base: str, directory: Path) -> Path | None:
+-    return max(candidates, key=lambda item: (item[0], item[1]))[2]
++    return None  # mutant: behave as though the published digest disappeared

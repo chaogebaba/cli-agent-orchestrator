@@ -1,0 +1,16 @@
+commit: 8ce8826f6cf9e70cc541839db98f9c01e6eac169
+patch: m5-drop-digest-head-cas.patch
+command: uv run pytest -q test/services/test_wpm4e_fork_refresh.py::test_e1_real_git_planted_token_refresh_resets_row_fresh
+exit: 1
+
+F                                                                        [100%]
+=================================== FAILURES ===================================
+___________ test_e1_real_git_planted_token_refresh_resets_row_fresh ____________
+E       AssertionError: assert None == 'c928f4a425aa23303ff11056a0c1fc2a0d1a58643a61bb7df7b426e60fe79ec1'
+=========================== short test summary info ============================
+FAILED test/services/test_wpm4e_fork_refresh.py::test_e1_real_git_planted_token_refresh_resets_row_fresh
+1 failed in 0.24s
+
+post-restore:
+af29f1a023a41cc328231892d0e67a5cab57faaa204215a36738e6bcab3e1730  src/cli_agent_orchestrator/services/terminal_service.py
+997d5600f04d449047584f953398d6cb68f9d0c06d9d8fa4417914be50b46c55  test/services/test_wpm4e_fork_refresh.py

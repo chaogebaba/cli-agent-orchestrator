@@ -29,12 +29,12 @@ def _fresh(preamble="[FRESH]"):
     return StalenessResult(SnapshotDelta("new"), preamble, 0)
 
 
-def _covered():
+def _covered(entries=()):
     return base_digest_service.DigestCovered(
         base_digest_service.BaseDigestArtifact(
             path=Path("tmp/orch/digest.md"),
             base="base", parent_artifact_sha="genesis", artifact_sha="a" * 64,
-            entries=(), body="context",
+            entries=entries, body="context",
         )
     )
 
@@ -142,6 +142,7 @@ async def test_e1_real_git_planted_token_refresh_resets_row_fresh(
     assert refreshed_answer == "NEW-TOKEN"
     assert preamble.startswith("[FRESH]")
     assert terminals.fork_staleness(row).changed_count == 0
+    assert row["digest_head"] == artifact.artifact_sha
 
 
 @pytest.mark.asyncio
@@ -238,6 +239,62 @@ async def test_e1_false_refresh_dispatch_preserves_baseline_and_falls_back_stale
         "old", '{"old.py":"hash"}',
     )
     assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_e1_post_dispatch_delta_mismatch_preserves_snapshot_and_lineage(monkeypatch):
+    terminals._fork_refresh_locks.clear()
+    old_entry = SnapshotEntry("old.py", "sha256", "a" * 64)
+    new_entry = SnapshotEntry("new.py", "sha256", "b" * 64)
+    row = {
+        "id": 7, "name": "base", "kind": "base", "source_terminal_id": "base-term",
+        "session_uuid": "uuid", "cwd": "/repo", "git_sha": "old",
+        "dirty_hashes": '{"old.py":"baseline"}', "digest_head": "c" * 64,
+    }
+    writes = []
+    dispatches = []
+
+    async def inline(_terminal, _generation, _kind, _operation, function, *args,
+                     deadline=None, **kwargs):
+        return function(*args, **kwargs), time.monotonic()
+
+    async def ready(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(terminals, "_tracked_blocking", inline)
+    monkeypatch.setattr(terminals, "get_ready_provider_session", lambda _name: dict(row))
+    monkeypatch.setattr(
+        terminals, "fork_staleness", lambda _row: _stale(("old.py",))
+    )
+    monkeypatch.setattr(
+        terminals.base_digest_service, "evaluate", lambda *_a: _covered((old_entry,))
+    )
+    monkeypatch.setattr(terminals, "_wait_for_base_ready", ready)
+    monkeypatch.setattr(
+        terminals,
+        "_dispatch_base_refresh",
+        lambda *_a, **_k: dispatches.append(True) or True,
+    )
+    monkeypatch.setattr(
+        terminals, "fork_snapshot", lambda _cwd: SnapshotDelta("new", (new_entry,))
+    )
+    monkeypatch.setattr(
+        terminals,
+        "update_provider_session_snapshot",
+        lambda *_a, **_k: writes.append(_k),
+    )
+    monkeypatch.setattr(terminals.status_monitor, "get_input_gen", lambda _id: 1)
+
+    preamble = await terminals._prepare_fork_refresh(
+        "worker", "g", "base", "[STALE]", None, {}
+    )
+
+    assert preamble == "[STALE]"
+    assert dispatches == [True]
+    assert writes == []
+    assert (row["git_sha"], row["dirty_hashes"], row["digest_head"]) == (
+        "old", '{"old.py":"baseline"}', "c" * 64,
+    )
 
 
 @pytest.mark.asyncio

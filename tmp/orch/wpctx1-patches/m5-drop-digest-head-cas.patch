@@ -1,0 +1,16 @@
+diff --git a/src/cli_agent_orchestrator/services/terminal_service.py b/src/cli_agent_orchestrator/services/terminal_service.py
+--- a/src/cli_agent_orchestrator/services/terminal_service.py
++++ b/src/cli_agent_orchestrator/services/terminal_service.py
+@@ -2204,7 +2204,6 @@ async def _prepare_fork_refresh(
+             current["id"],
+             git_sha=captured.git_sha,
+             dirty_hashes=captured.dirty_hashes(),
+-            digest_head=decision.artifact.artifact_sha,
+             deadline=deadline,
+         )
+         if updated is None:
+diff --git a/test/services/test_wpm4e_fork_refresh.py b/test/services/test_wpm4e_fork_refresh.py
+--- a/test/services/test_wpm4e_fork_refresh.py
++++ b/test/services/test_wpm4e_fork_refresh.py
+@@ -144,0 +145 @@ async def test_e1_real_git_planted_token_refresh_resets_row_fresh(
++    assert row["digest_head"] == artifact.artifact_sha

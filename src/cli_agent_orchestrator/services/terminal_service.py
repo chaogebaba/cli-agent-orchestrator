@@ -2179,6 +2179,8 @@ async def _prepare_fork_refresh(
         captured = snapshot_result
         if captured.acquisition_error or not captured.git_sha:
             return stale_preamble
+        if not base_digest_service.covers(decision.artifact, captured):
+            return stale_preamble
         current, _ = await _tracked_blocking(
             terminal_id,
             generation,

@@ -1,0 +1,11 @@
+diff --git a/src/cli_agent_orchestrator/services/fork_context_service.py b/src/cli_agent_orchestrator/services/fork_context_service.py
+--- a/src/cli_agent_orchestrator/services/fork_context_service.py
++++ b/src/cli_agent_orchestrator/services/fork_context_service.py
+@@ -125,6 +125,6 @@ def _decode_git_paths(payload: bytes) -> list[str]:
+ def _decode_git_paths(payload: bytes) -> list[str]:
+     paths: list[str] = []
+-    for raw in payload.split(b"\0"):
++    for raw in payload.splitlines():  # mutant: discard NUL framing
+         if not raw:
+             continue
+         try:
