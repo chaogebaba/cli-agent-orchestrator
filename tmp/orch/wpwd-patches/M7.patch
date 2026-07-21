@@ -1,0 +1,13 @@
+diff --git a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+index 9bbccb1..2a3e17c 100644
+--- a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
++++ b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+@@ -855,8 +855,6 @@ class StalledCallbackWatchdog:
+                 notice.terminal_id,
+                 notice.source_generation,
+             )
+-            if key in self._chain_notified:
+-                return None
+             self._chain_notified.add(key)
+             chain_notice = WatchdogNotice(
+                 terminal_id=worker_id,

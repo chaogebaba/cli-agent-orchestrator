@@ -1,0 +1,45 @@
+$ uv run pytest -q test/services/test_stalled_callback_watchdog.py
+EXIT_CODE=1
+...................................................F......               [100%]
+=================================== FAILURES ===================================
+_______ test_phase_p_waiting_skips_frame_and_defers_when_phase_a_clears ________
+
+    def test_phase_p_waiting_skips_frame_and_defers_when_phase_a_clears():
+        svc = StalledCallbackWatchdog(grace_seconds=3)
+        _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
+        _arm_watchdog_episode(svc, "T", "W", inbound_at=1)
+        live = {"W", "T", "C"}
+        flipped = False
+    
+        def metadata(terminal_id):
+            nonlocal flipped
+            if terminal_id == "W" and not flipped:
+                flipped = True
+                svc._episodes["T"].callback_seen = True
+            return {"id": terminal_id, "provider": "grok_cli"}
+    
+        with (
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.terminal_exists",
+                side_effect=lambda terminal_id: terminal_id in live,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+                side_effect=metadata,
+            ),
+            patch.object(
+                StalledCallbackWatchdog,
+                "_fresh_frame_decides_running",
+                return_value=(False, None),
+            ) as fresh,
+        ):
+>           assert svc.collect_due_notifications(now=20) == []
+E           AssertionError: assert [WatchdogNoti...kind='stall')] == []
+E             
+E             Left contains one more item: WatchdogNotice(terminal_id='W', caller_id='C', message='[watchdog] worker W (developer) idle 20s without callback', idle_reason=None, source_generation=1, kind='stall')
+E             Use -v to get more diff
+
+test/services/test_stalled_callback_watchdog.py:1104: AssertionError
+=========================== short test summary info ============================
+FAILED test/services/test_stalled_callback_watchdog.py::test_phase_p_waiting_skips_frame_and_defers_when_phase_a_clears
+1 failed, 57 passed in 0.38s

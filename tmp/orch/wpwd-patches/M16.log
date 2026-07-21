@@ -1,0 +1,30 @@
+$ uv run pytest -q test/services/test_stalled_callback_watchdog.py::test_notify_due_trigger_a_is_deduped_and_coalesces_trigger_b
+EXIT_CODE=1
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_________ test_notify_due_trigger_a_is_deduped_and_coalesces_trigger_b _________
+
+    def test_notify_due_trigger_a_is_deduped_and_coalesces_trigger_b():
+        svc = StalledCallbackWatchdog(grace_seconds=3)
+        _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
+        _arm_watchdog_episode(svc, "T", "W", inbound_at=0, idle_since=0, sampled=True)
+        rows = []
+    
+        with (
+            _relational_watchdog_fakes({"W", "T", "C"}),
+            patch.object(svc, "_persist_notice", side_effect=rows.append),
+            patch("cli_agent_orchestrator.services.inbox_service.inbox_service") as inbox,
+        ):
+            svc.notify_due()
+            svc.notify_due()
+>       assert [notice.kind for notice in rows] == ["stall", "chain"]
+E       AssertionError: assert ['waiting', 'stall', 'chain'] == ['stall', 'chain']
+E         
+E         At index 0 diff: 'waiting' != 'stall'
+E         Left contains one more item: 'chain'
+E         Use -v to get more diff
+
+test/services/test_stalled_callback_watchdog.py:1219: AssertionError
+=========================== short test summary info ============================
+FAILED test/services/test_stalled_callback_watchdog.py::test_notify_due_trigger_a_is_deduped_and_coalesces_trigger_b
+1 failed in 0.22s

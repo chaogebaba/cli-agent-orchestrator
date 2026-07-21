@@ -1,0 +1,46 @@
+diff --git a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+index 9bbccb1..3b99ed1 100644
+--- a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
++++ b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+@@ -541,26 +541,25 @@ class StalledCallbackWatchdog:
+             suppress = False
+             fallback_idle_reason = None
+             second_callback_status = None
+-            if not candidate.phase_p_waiting:
+-                callback_status = get_callback_status_since(
++            callback_status = get_callback_status_since(
++                candidate.terminal_id,
++                candidate.caller_id,
++                candidate.episode_started_wall_at,
++            )
++            if (
++                metadata is not None
++                and callback_status is None
++                and (not auto_resume_applicable or candidate.episode.auto_resumed)
++            ):
++                frame_decides_running, fallback_idle_reason = self._fresh_frame_decides_running(
++                    candidate.terminal_id
++                )
++                suppress = frame_decides_running and not auto_resume_applicable
++                second_callback_status = get_callback_status_since(
+                     candidate.terminal_id,
+                     candidate.caller_id,
+                     candidate.episode_started_wall_at,
+                 )
+-                if (
+-                    metadata is not None
+-                    and callback_status is None
+-                    and (not auto_resume_applicable or candidate.episode.auto_resumed)
+-                ):
+-                    frame_decides_running, fallback_idle_reason = self._fresh_frame_decides_running(
+-                        candidate.terminal_id
+-                    )
+-                    suppress = frame_decides_running and not auto_resume_applicable
+-                    second_callback_status = get_callback_status_since(
+-                        candidate.terminal_id,
+-                        candidate.caller_id,
+-                        candidate.episode_started_wall_at,
+-                    )
+             action: AutoResumeAction | None = None
+             with self._lock:
+                 current_episode = self._episodes.get(candidate.terminal_id)

@@ -1,0 +1,12 @@
+diff --git a/src/cli_agent_orchestrator/services/mailbox_service.py b/src/cli_agent_orchestrator/services/mailbox_service.py
+index e637e39..d076183 100644
+--- a/src/cli_agent_orchestrator/services/mailbox_service.py
++++ b/src/cli_agent_orchestrator/services/mailbox_service.py
+@@ -500,7 +500,6 @@ def create_logical_inbox_message(
+                     message=message,
+                     orchestration_type=orchestration_type,
+                     dispatch_barrier=dispatch_barrier,
+-                    park_warm=park_warm,
+                 )
+                 db.commit()
+                 db.refresh(row)

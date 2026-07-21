@@ -1,0 +1,12 @@
+diff --git a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+index 9bbccb1..10bbd4d 100644
+--- a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
++++ b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+@@ -604,6 +604,7 @@ class StalledCallbackWatchdog:
+                                 kind="waiting",
+                             )
+                         )
++                    current_episode.idle_since = now
+                     continue
+                 if callback_status in {
+                     MessageStatus.PENDING,

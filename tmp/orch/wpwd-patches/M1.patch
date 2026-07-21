@@ -1,0 +1,20 @@
+diff --git a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+index 9bbccb1..3eb0a89 100644
+--- a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
++++ b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+@@ -253,14 +253,7 @@ class StalledCallbackWatchdog:
+             }
+ 
+     def _blockers_locked(self, worker_id: str) -> list[tuple[str, _Episode]]:
+-        return [
+-            (terminal_id, episode)
+-            for terminal_id, episode in self._episodes.items()
+-            if episode.caller_id == worker_id
+-            and not episode.callback_seen
+-            and terminal_id not in self._paused
+-            and terminal_exists(terminal_id)
+-        ]
++        return []
+ 
+     def record_callback_if_to_caller(self, sender_id: str, receiver_id: str) -> None:
+         meta = get_terminal_metadata(sender_id)

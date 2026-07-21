@@ -1,0 +1,12 @@
+diff --git a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+index 9bbccb1..41a13f2 100644
+--- a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
++++ b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+@@ -391,6 +391,7 @@ class StalledCallbackWatchdog:
+                     episode.last_screen_fp = fingerprint
+ 
+     def _fresh_frame_decides_running(self, terminal_id: str) -> tuple[bool, str | None]:
++        return True, None
+         from cli_agent_orchestrator.backends.registry import get_backend
+         from cli_agent_orchestrator.providers.manager import provider_manager
+         from cli_agent_orchestrator.services.seam_activation import receiver_state_active

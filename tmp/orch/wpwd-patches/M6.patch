@@ -1,0 +1,12 @@
+diff --git a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+index 9bbccb1..caca7ed 100644
+--- a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
++++ b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+@@ -258,6 +258,7 @@ class StalledCallbackWatchdog:
+             for terminal_id, episode in self._episodes.items()
+             if episode.caller_id == worker_id
+             and not episode.callback_seen
++            and not episode.fired
+             and terminal_id not in self._paused
+             and terminal_exists(terminal_id)
+         ]

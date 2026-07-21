@@ -1,0 +1,22 @@
+diff --git a/src/cli_agent_orchestrator/services/inbox_service.py b/src/cli_agent_orchestrator/services/inbox_service.py
+index f310a4a..418b1ab 100644
+--- a/src/cli_agent_orchestrator/services/inbox_service.py
++++ b/src/cli_agent_orchestrator/services/inbox_service.py
+@@ -2377,7 +2377,7 @@ class InboxService:
+                         attempt["sender_id"],
+                         OrchestrationType(attempt["orchestration_type"]),
+                         metadata,
+-                        get_park_warm_for_message_ids(message_ids),
++                        False,
+                     )
+                 return
+             recovered_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+@@ -2472,7 +2472,7 @@ class InboxService:
+                             attempt["sender_id"],
+                             OrchestrationType(attempt["orchestration_type"]),
+                             metadata,
+-                            get_park_warm_for_message_ids(message_ids),
++                            False,
+                         ),
+                     ),
+                 )

@@ -1,0 +1,18 @@
+diff --git a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+index 9bbccb1..1920d8d 100644
+--- a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
++++ b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+@@ -905,13 +905,6 @@ class StalledCallbackWatchdog:
+             for _, reservation in jobs
+             if reservation is not None
+         }
+-        jobs = [
+-            (notice, reservation)
+-            for notice, reservation in jobs
+-            if notice.kind != "waiting"
+-            or (notice.terminal_id, notice.caller_id) not in chain_pairs
+-        ]
+-
+         for notice, reservation in jobs:
+             try:
+                 self._persist_notice(notice)

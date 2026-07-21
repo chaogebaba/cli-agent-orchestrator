@@ -1,0 +1,21 @@
+diff --git a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+index 9bbccb1..b658f7d 100644
+--- a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
++++ b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+@@ -899,7 +899,7 @@ class StalledCallbackWatchdog:
+ 
+         now = time.monotonic()
+         notices = self.collect_due_notifications(now=now)
+-        jobs = [(notice, self._reserve_chain_notice(notice, now)) for notice in notices]
++        jobs = [(notice, None) for notice in notices]
+         chain_pairs = {
+             (reservation.notice.terminal_id, reservation.notice.caller_id)
+             for _, reservation in jobs
+@@ -915,6 +915,7 @@ class StalledCallbackWatchdog:
+         for notice, reservation in jobs:
+             try:
+                 self._persist_notice(notice)
++                reservation = self._reserve_chain_notice(notice, now)
+             except Exception:
+                 logger.exception("Failed to push stalled-callback watchdog notification")
+                 if reservation is not None:

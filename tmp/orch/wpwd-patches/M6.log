@@ -1,0 +1,188 @@
+$ uv run pytest -q test/services/test_stalled_callback_watchdog.py test/services/test_wp_watchdog_production_paths.py
+EXIT_CODE=1
+........................................................FF........       [100%]
+=================================== FAILURES ===================================
+_________ test_notify_due_trigger_a_is_deduped_and_coalesces_trigger_b _________
+
+    def test_notify_due_trigger_a_is_deduped_and_coalesces_trigger_b():
+        svc = StalledCallbackWatchdog(grace_seconds=3)
+        _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
+        _arm_watchdog_episode(svc, "T", "W", inbound_at=0, idle_since=0, sampled=True)
+        rows = []
+    
+        with (
+            _relational_watchdog_fakes({"W", "T", "C"}),
+            patch.object(svc, "_persist_notice", side_effect=rows.append),
+            patch("cli_agent_orchestrator.services.inbox_service.inbox_service") as inbox,
+        ):
+            svc.notify_due()
+            svc.notify_due()
+>       assert [notice.kind for notice in rows] == ["stall", "chain"]
+E       AssertionError: assert ['waiting', 'stall', 'stall'] == ['stall', 'chain']
+E         
+E         At index 0 diff: 'waiting' != 'stall'
+E         Left contains one more item: 'stall'
+E         Use -v to get more diff
+
+test/services/test_stalled_callback_watchdog.py:1219: AssertionError
+__ test_trigger_a_rollover_is_stale_and_insert_failure_rolls_back_reservation __
+
+    def test_trigger_a_rollover_is_stale_and_insert_failure_rolls_back_reservation():
+        svc = StalledCallbackWatchdog(grace_seconds=3)
+        _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
+        _arm_watchdog_episode(svc, "T", "W", inbound_at=0, idle_since=0, sampled=True)
+        with _relational_watchdog_fakes({"W", "T", "C"}):
+            original_collect = svc.collect_due_notifications
+    
+            def collect_and_rearm(*, now=None):
+                result = original_collect(now=now)
+                svc._episodes["T"].generation += 1
+                return result
+    
+            with (
+                patch.object(svc, "collect_due_notifications", side_effect=collect_and_rearm),
+                patch.object(svc, "_persist_notice") as persist,
+                patch("cli_agent_orchestrator.services.inbox_service.inbox_service"),
+            ):
+                svc.notify_due()
+            assert [call.args[0].kind for call in persist.call_args_list] == ["waiting", "stall"]
+            assert not svc._chain_notified
+    
+        svc = StalledCallbackWatchdog(grace_seconds=3)
+        _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
+        _arm_watchdog_episode(svc, "T", "W", inbound_at=0, idle_since=0, sampled=True)
+        with (
+            _relational_watchdog_fakes({"W", "T", "C"}),
+            patch.object(svc, "_persist_notice", side_effect=[None, RuntimeError("db")]),
+            patch("cli_agent_orchestrator.services.inbox_service.inbox_service"),
+        ):
+            svc.notify_due()
+        assert not svc._chain_notified
+    
+        svc = StalledCallbackWatchdog(grace_seconds=3)
+        _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
+        _arm_watchdog_episode(svc, "T", "W", inbound_at=0, idle_since=0, sampled=True)
+        persisted = []
+        with (
+            _relational_watchdog_fakes({"W", "T", "C"}),
+            patch.object(svc, "_persist_notice", side_effect=persisted.append),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",
+                side_effect=RuntimeError("delivery"),
+            ),
+        ):
+            svc.notify_due()
+            svc.notify_due()
+>       assert [notice.kind for notice in persisted] == ["stall", "chain"]
+E       AssertionError: assert ['waiting', 'stall', 'stall'] == ['stall', 'chain']
+E         
+E         At index 0 diff: 'waiting' != 'stall'
+E         Left contains one more item: 'stall'
+E         Use -v to get more diff
+
+test/services/test_stalled_callback_watchdog.py:1270: AssertionError
+------------------------------ Captured log call -------------------------------
+ERROR    cli_agent_orchestrator.services.stalled_callback_watchdog:stalled_callback_watchdog.py:920 Failed to push stalled-callback watchdog notification
+Traceback (most recent call last):
+  File "/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py", line 918, in notify_due
+    self._persist_notice(notice)
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1169, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1173, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1238, in _execute_mock_call
+    raise result
+RuntimeError: db
+ERROR    cli_agent_orchestrator.services.stalled_callback_watchdog:stalled_callback_watchdog.py:937 Failed to deliver stalled-callback watchdog notification
+Traceback (most recent call last):
+  File "/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py", line 935, in notify_due
+    inbox_service.deliver_pending(notice.caller_id, registry=registry)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1169, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1173, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1234, in _execute_mock_call
+    raise effect
+RuntimeError: delivery
+ERROR    cli_agent_orchestrator.services.stalled_callback_watchdog:stalled_callback_watchdog.py:937 Failed to deliver stalled-callback watchdog notification
+Traceback (most recent call last):
+  File "/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py", line 935, in notify_due
+    inbox_service.deliver_pending(notice.caller_id, registry=registry)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1169, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1173, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1234, in _execute_mock_call
+    raise effect
+  File "/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py", line 935, in notify_due
+    inbox_service.deliver_pending(notice.caller_id, registry=registry)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1169, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1173, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1234, in _execute_mock_call
+    raise effect
+RuntimeError: delivery
+ERROR    cli_agent_orchestrator.services.stalled_callback_watchdog:stalled_callback_watchdog.py:937 Failed to deliver stalled-callback watchdog notification
+Traceback (most recent call last):
+  File "/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py", line 935, in notify_due
+    inbox_service.deliver_pending(notice.caller_id, registry=registry)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1169, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1173, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1234, in _execute_mock_call
+    raise effect
+  File "/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py", line 935, in notify_due
+    inbox_service.deliver_pending(notice.caller_id, registry=registry)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1169, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1173, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1234, in _execute_mock_call
+    raise effect
+  File "/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py", line 935, in notify_due
+    inbox_service.deliver_pending(notice.caller_id, registry=registry)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1169, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1173, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/chao/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py", line 1234, in _execute_mock_call
+    raise effect
+RuntimeError: delivery
+=============================== warnings summary ===============================
+.venv/lib/python3.13/site-packages/fastapi/testclient.py:1
+  /home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.venv/lib/python3.13/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+.venv/lib/python3.13/site-packages/pydantic/_internal/_config.py:323
+.venv/lib/python3.13/site-packages/pydantic/_internal/_config.py:323
+  /home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.venv/lib/python3.13/site-packages/pydantic/_internal/_config.py:323: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.11/migration/
+    warnings.warn(DEPRECATION_MESSAGE, DeprecationWarning)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED test/services/test_stalled_callback_watchdog.py::test_notify_due_trigger_a_is_deduped_and_coalesces_trigger_b
+FAILED test/services/test_stalled_callback_watchdog.py::test_trigger_a_rollover_is_stale_and_insert_failure_rolls_back_reservation
+2 failed, 64 passed, 3 warnings in 0.89s

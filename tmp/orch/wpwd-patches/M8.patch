@@ -1,0 +1,13 @@
+diff --git a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+index 9bbccb1..9e5e1b2 100644
+--- a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
++++ b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+@@ -860,7 +860,7 @@ class StalledCallbackWatchdog:
+             self._chain_notified.add(key)
+             chain_notice = WatchdogNotice(
+                 terminal_id=worker_id,
+-                caller_id=worker_episode.caller_id,
++                caller_id=notice.caller_id,
+                 message=(
+                     f"[watchdog] chain stalled: worker {worker_id} "
+                     f"({worker_episode.profile}) has been waiting "

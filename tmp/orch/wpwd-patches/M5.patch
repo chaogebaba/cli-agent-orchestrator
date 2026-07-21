@@ -1,0 +1,13 @@
+diff --git a/src/cli_agent_orchestrator/services/inbox_service.py b/src/cli_agent_orchestrator/services/inbox_service.py
+index f310a4a..40b4aad 100644
+--- a/src/cli_agent_orchestrator/services/inbox_service.py
++++ b/src/cli_agent_orchestrator/services/inbox_service.py
+@@ -749,7 +749,7 @@ class InboxService:
+         if sender_id.startswith("watchdog:"):
+             return
+         stalled_callback_watchdog.record_callback_if_to_caller(sender_id, terminal_id)
+-        if metadata.get("caller_id") and not park_warm and (
++        if metadata.get("caller_id") and (
+             orchestration_type == OrchestrationType.ASSIGN
+             or (
+                 orchestration_type == OrchestrationType.SEND_MESSAGE

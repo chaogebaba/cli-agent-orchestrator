@@ -1,0 +1,34 @@
+$ uv run pytest -q test/services/test_stalled_callback_watchdog.py::test_trigger_a_rollover_is_stale_and_insert_failure_rolls_back_reservation
+EXIT_CODE=1
+F                                                                        [100%]
+=================================== FAILURES ===================================
+__ test_trigger_a_rollover_is_stale_and_insert_failure_rolls_back_reservation __
+
+    def test_trigger_a_rollover_is_stale_and_insert_failure_rolls_back_reservation():
+        svc = StalledCallbackWatchdog(grace_seconds=3)
+        _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
+        _arm_watchdog_episode(svc, "T", "W", inbound_at=0, idle_since=0, sampled=True)
+        with _relational_watchdog_fakes({"W", "T", "C"}):
+            original_collect = svc.collect_due_notifications
+    
+            def collect_and_rearm(*, now=None):
+                result = original_collect(now=now)
+                svc._episodes["T"].generation += 1
+                return result
+    
+            with (
+                patch.object(svc, "collect_due_notifications", side_effect=collect_and_rearm),
+                patch.object(svc, "_persist_notice") as persist,
+                patch("cli_agent_orchestrator.services.inbox_service.inbox_service"),
+            ):
+                svc.notify_due()
+>           assert [call.args[0].kind for call in persist.call_args_list] == ["waiting", "stall"]
+E           AssertionError: assert ['stall', 'chain'] == ['waiting', 'stall']
+E             
+E             At index 0 diff: 'stall' != 'waiting'
+E             Use -v to get more diff
+
+test/services/test_stalled_callback_watchdog.py:1242: AssertionError
+=========================== short test summary info ============================
+FAILED test/services/test_stalled_callback_watchdog.py::test_trigger_a_rollover_is_stale_and_insert_failure_rolls_back_reservation
+1 failed in 0.27s

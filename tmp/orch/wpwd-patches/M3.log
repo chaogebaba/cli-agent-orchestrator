@@ -1,0 +1,20 @@
+$ uv run pytest -q test/services/test_stalled_callback_watchdog.py::test_waiting_blocker_suppression_resolution_preserves_original_clock
+EXIT_CODE=1
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_____ test_waiting_blocker_suppression_resolution_preserves_original_clock _____
+
+    def test_waiting_blocker_suppression_resolution_preserves_original_clock():
+        svc = StalledCallbackWatchdog(grace_seconds=3)
+        _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
+        _arm_watchdog_episode(svc, "T", "W", inbound_at=10)
+        with _relational_watchdog_fakes({"W", "T", "C"}):
+            assert svc.collect_due_notifications(now=20) == []
+>           assert svc._episodes["W"].idle_since == 0
+E           AssertionError: assert 20 == 0
+E            +  where 20 = _Episode(caller_id='C', profile='developer', inbound_at=0, episode_started_wall_at=datetime.datetime(2026, 7, 21, 1, 2...n=1, revision=0, auto_resumed=False, resume_reserved_at=None, auto_resume_attempted_at=None, waiting_last_push_at=None).idle_since
+
+test/services/test_stalled_callback_watchdog.py:1028: AssertionError
+=========================== short test summary info ============================
+FAILED test/services/test_stalled_callback_watchdog.py::test_waiting_blocker_suppression_resolution_preserves_original_clock
+1 failed in 0.24s

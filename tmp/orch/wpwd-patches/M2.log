@@ -1,0 +1,21 @@
+$ uv run pytest -q test/services/test_stalled_callback_watchdog.py::test_waiting_safety_net_repeats_on_oldest_inbound_clock
+EXIT_CODE=1
+F                                                                        [100%]
+=================================== FAILURES ===================================
+___________ test_waiting_safety_net_repeats_on_oldest_inbound_clock ____________
+
+    def test_waiting_safety_net_repeats_on_oldest_inbound_clock():
+        svc = StalledCallbackWatchdog(grace_seconds=3)
+        # The waiter became idle recently, but its blocker has been outstanding
+        # since epoch zero.  The escalation age must use the blocker clock.
+        _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=900, sampled=True)
+        _arm_watchdog_episode(svc, "T", "W", inbound_at=0)
+        with _relational_watchdog_fakes({"W", "T", "C"}):
+>           notice = svc.collect_due_notifications(now=1000)[0]
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           IndexError: list index out of range
+
+test/services/test_stalled_callback_watchdog.py:1068: IndexError
+=========================== short test summary info ============================
+FAILED test/services/test_stalled_callback_watchdog.py::test_waiting_safety_net_repeats_on_oldest_inbound_clock
+1 failed in 0.21s

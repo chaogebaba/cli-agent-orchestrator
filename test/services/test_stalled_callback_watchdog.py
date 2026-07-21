@@ -1171,19 +1171,30 @@ def test_positive_grok_sample_keeps_existing_alarm_class():
     backend = MagicMock()
     backend.capture_viewport.return_value = captured.decode("utf-8")
     with (
-        _relational_watchdog_fakes({"worker1", "caller1"}),
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.terminal_exists",
+            side_effect=lambda terminal_id: terminal_id in {"worker1", "caller1"},
+        ),
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+            return_value=None,
+        ),
         patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
-        patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata", return_value={
-            "id": "worker1", "tmux_session": "cao-test", "tmux_window": "worker1",
-        }),
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+            return_value={
+                "id": "worker1",
+                "provider": "grok_cli",
+                "tmux_session": "cao-test",
+                "tmux_window": "worker1",
+            },
+        ),
         patch("cli_agent_orchestrator.services.seam_activation.receiver_state_active", return_value=False),
         patch("cli_agent_orchestrator.providers.manager.provider_manager.get_provider", return_value=provider),
     ):
-        running, _ = svc._fresh_frame_decides_running("worker1")
-        assert running is False
-    with _relational_watchdog_fakes({"worker1", "caller1"}):
         notices = svc.collect_due_notifications(now=13)
     assert notices[0].message == "[watchdog] worker worker1 (developer) idle 3s without callback"
+    backend.capture_viewport.assert_called_once_with("cao-test", "worker1")
 
 
 def test_fresh_watchdog_with_live_terminals_emits_nothing_until_armed():

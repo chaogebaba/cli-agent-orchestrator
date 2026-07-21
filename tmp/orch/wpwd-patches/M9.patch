@@ -1,0 +1,30 @@
+diff --git a/src/cli_agent_orchestrator/services/inbox_service.py b/src/cli_agent_orchestrator/services/inbox_service.py
+index f310a4a..8761cf5 100644
+--- a/src/cli_agent_orchestrator/services/inbox_service.py
++++ b/src/cli_agent_orchestrator/services/inbox_service.py
+@@ -1290,7 +1290,6 @@ class InboxService:
+                             key=lambda item: (
+                                 item.sender_id,
+                                 item.orchestration_type,
+-                                bool(getattr(item, "park_warm", False)),
+                             ),
+                         )
+                     )
+@@ -1331,15 +1330,15 @@ class InboxService:
+             # all pending messages (num_messages=0) a batch can span multiple groups,
+             # so each run is sent separately to keep attribution and shaping correct.
+             sent_count = 0
+-            for (sender_id, orchestration_type, park_warm), group in groupby(
++            for (sender_id, orchestration_type), group in groupby(
+                 messages,
+                 key=lambda m: (
+                     m.sender_id,
+                     m.orchestration_type,
+-                    bool(getattr(m, "park_warm", False)),
+                 ),
+             ):
+                 batch = list(group)
++                park_warm = bool(getattr(batch[0], "park_warm", False))
+                 combined = "\n".join(m.message for m in batch)
+                 attempt_uuid = None
+                 submit_observation = None

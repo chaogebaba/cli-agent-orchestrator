@@ -1,0 +1,54 @@
+$ uv run pytest -q test/services/test_stalled_callback_watchdog.py::test_parked_commit_still_settles_sender_and_never_clears_existing_episode
+EXIT_CODE=1
+F                                                                        [100%]
+=================================== FAILURES ===================================
+__ test_parked_commit_still_settles_sender_and_never_clears_existing_episode ___
+
+self = <MagicMock name='stalled_callback_watchdog.record_inbound_task' id='140511998154064'>
+
+    def assert_not_called(self):
+        """assert that the mock was never called.
+        """
+        if self.call_count != 0:
+            msg = ("Expected '%s' to not have been called. Called %s times.%s"
+                   % (self._mock_name or 'mock',
+                      self.call_count,
+                      self._calls_repr()))
+>           raise AssertionError(msg)
+E           AssertionError: Expected 'record_inbound_task' to not have been called. Called 1 times.
+E           Calls: [call('worker1', 'caller1', 'developer')].
+
+../../../.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu/lib/python3.13/unittest/mock.py:940: AssertionError
+
+During handling of the above exception, another exception occurred:
+
+    def test_parked_commit_still_settles_sender_and_never_clears_existing_episode():
+        from cli_agent_orchestrator.services.inbox_service import InboxService
+    
+        with patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.stalled_callback_watchdog"
+        ) as watchdog:
+            InboxService()._commit_watchdog_ops(
+                "worker1",
+                "caller1",
+                OrchestrationType.SEND_MESSAGE,
+                {"caller_id": "caller1", "agent_profile": "developer"},
+                park_warm=True,
+            )
+        watchdog.record_callback_if_to_caller.assert_called_once_with("caller1", "worker1")
+>       watchdog.record_inbound_task.assert_not_called()
+E       AssertionError: Expected 'record_inbound_task' to not have been called. Called 1 times.
+E       Calls: [call('worker1', 'caller1', 'developer')].
+E       
+E       pytest introspection follows:
+E       
+E       Args:
+E       assert ('worker1', '..., 'developer') == ()
+E         
+E         Left contains 3 more items, first extra item: 'worker1'
+E         Use -v to get more diff
+
+test/services/test_stalled_callback_watchdog.py:339: AssertionError
+=========================== short test summary info ============================
+FAILED test/services/test_stalled_callback_watchdog.py::test_parked_commit_still_settles_sender_and_never_clears_existing_episode
+1 failed in 0.30s

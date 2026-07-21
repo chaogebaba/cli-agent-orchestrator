@@ -1,0 +1,16 @@
+diff --git a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+index 9bbccb1..fd09f76 100644
+--- a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
++++ b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+@@ -832,10 +832,7 @@ class StalledCallbackWatchdog:
+             return None
+         with self._lock:
+             target_episode = self._episodes.get(notice.terminal_id)
+-            if (
+-                target_episode is None
+-                or target_episode.generation != notice.source_generation
+-            ):
++            if target_episode is None:
+                 return None
+             worker_id = target_episode.caller_id
+             worker_episode = self._episodes.get(worker_id)

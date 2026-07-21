@@ -1,0 +1,13 @@
+diff --git a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+index 9bbccb1..b8b56d9 100644
+--- a/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
++++ b/src/cli_agent_orchestrator/services/stalled_callback_watchdog.py
+@@ -574,8 +574,6 @@ class StalledCallbackWatchdog:
+                 if int(now - current_episode.idle_since) < self.grace_seconds:
+                     continue
+                 blockers = self._blockers_locked(candidate.terminal_id)
+-                if candidate.phase_p_waiting and not blockers:
+-                    continue
+                 if blockers:
+                     oldest_inbound_at = min(episode.inbound_at for _, episode in blockers)
+                     last_push = current_episode.waiting_last_push_at

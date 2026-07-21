@@ -1,0 +1,68 @@
+$ uv run pytest -q test/services/test_inbox_service.py::TestDeliverPending::test_mixed_park_warm_batches_are_homogeneous_and_only_normal_arms
+EXIT_CODE=1
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_ TestDeliverPending.test_mixed_park_warm_batches_are_homogeneous_and_only_normal_arms _
+
+self = <test.services.test_inbox_service.TestDeliverPending object at 0x7fc4d871ed50>
+mock_get = <MagicMock name='get_pending_messages' id='140483421310992'>
+mock_metadata = <MagicMock name='get_terminal_metadata' id='140483421311664'>
+mock_monitor = <MagicMock name='status_monitor' id='140483421312000'>
+mock_term_svc = <MagicMock id='140483421312336'>
+_mock_update = <MagicMock name='update_message_status' id='140483421313344'>
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.terminal_service",
+        new_callable=_terminal_service_mock,
+    )
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_mixed_park_warm_batches_are_homogeneous_and_only_normal_arms(
+        self, mock_get, mock_metadata, mock_monitor, mock_term_svc, _mock_update
+    ):
+        mock_get.return_value = [
+            _make_message(id=1, message="normal", park_warm=False),
+            _make_message(id=2, message="parked-a", park_warm=True),
+            _make_message(id=3, message="parked-b", park_warm=True),
+        ]
+        mock_metadata.return_value = {
+            "provider": "event",
+            "caller_id": "sender-1",
+            "agent_profile": "developer",
+        }
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+    
+        def settle(*_args, **kwargs):
+            if callback := kwargs.get("on_confirmed"):
+                callback()
+    
+        with (
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.settle_delivery_attempt",
+                side_effect=settle,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog."
+                "stalled_callback_watchdog"
+            ) as watchdog,
+        ):
+            InboxService().deliver_pending("term-1", num_messages=0)
+    
+>       assert [call.args[1] for call in mock_term_svc.send_prepared_input.call_args_list] == [
+            "normal",
+            "parked-a\nparked-b",
+        ]
+E       AssertionError: assert ['normal\nparked-a\nparked-b'] == ['normal', 'p...-a\nparked-b']
+E         
+E         At index 0 diff: 'normal\nparked-a\nparked-b' != 'normal'
+E         Right contains one more item: 'parked-a\nparked-b'
+E         Use -v to get more diff
+
+test/services/test_inbox_service.py:407: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  cli_agent_orchestrator.services.message_trace_service:message_trace_service.py:406 No authoritative session transcript is resolvable for terminal unknown; deliveries will be recorded as send_returned_unverified
+=========================== short test summary info ============================
+FAILED test/services/test_inbox_service.py::TestDeliverPending::test_mixed_park_warm_batches_are_homogeneous_and_only_normal_arms
+1 failed in 0.29s
