@@ -24,6 +24,7 @@ from cli_agent_orchestrator.clients.database import (
     count_ambiguous_attempts,
     create_flow,
     create_inbox_message,
+    create_digest_pending_notice,
     create_terminal,
     create_transcript_binding,
     delete_flow,
@@ -88,6 +89,19 @@ class TestTerminalOperations:
         assert terminal_exists("present") is True
         assert terminal_exists("missing") is False
         assert not any("Terminal metadata not found" in record.message for record in caplog.records)
+
+    def test_digest_pending_notice_deduplicates_and_is_parked(self, test_db, monkeypatch):
+        monkeypatch.setattr("cli_agent_orchestrator.clients.database.SessionLocal", test_db)
+        create_terminal("receiver", "cao-session", "window-0", "codex")
+        first = create_digest_pending_notice("receiver", "base", "k1", "body")
+        second = create_digest_pending_notice("receiver", "base", "k1", "body")
+        assert first is not None
+        assert second is None
+        with test_db() as db:
+            row = db.query(InboxModel).one()
+            assert row.sender_id == "cao-digest:base"
+            assert row.park_warm is True
+            assert row.message.startswith("[CAO DIGEST-PENDING] base=base key=k1\n")
 
     def test_cancel_watchdog_message_persists_cancelled_without_notice(self, test_db, monkeypatch):
         monkeypatch.setattr("cli_agent_orchestrator.clients.database.SessionLocal", test_db)

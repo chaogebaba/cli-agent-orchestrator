@@ -6,6 +6,8 @@ import pytest
 
 from cli_agent_orchestrator.services.fork_context_service import (
     ForkContextError,
+    SnapshotDelta,
+    StalenessResult,
     list_bases,
     resolve_base,
     retire,
@@ -52,6 +54,6 @@ def test_e3_anchor_is_typed_unforkable_and_absent_from_forkable_listing():
         return_value=[anchor, base],
     ), patch(
         "cli_agent_orchestrator.services.fork_context_service.staleness",
-        return_value=([], "fresh"),
+        return_value=StalenessResult(SnapshotDelta("head"), "fresh", 0),
     ):
         assert [row["name"] for row in list_bases()] == ["forkable"]

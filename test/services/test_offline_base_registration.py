@@ -286,12 +286,12 @@ def test_fresh_then_mutate_then_stale_assign_succeeds_quietly(
     )
     row = database.get_ready_provider_session("offline")
     assert row["source_terminal_id"] is None and row["session_name"] is None
-    assert svc.staleness(row)[0] == []
+    assert svc.staleness(row).changed_count == 0
 
     (repo / "tracked.txt").write_text("mutated\n", encoding="utf-8")
-    changed, preamble = svc.staleness(row)
-    assert changed == ["tracked.txt"]
-    assert preamble.startswith("[STALE]")
+    stale = svc.staleness(row)
+    assert stale.delta.paths == ("tracked.txt",)
+    assert stale.preamble.startswith("[STALE]")
 
     monkeypatch.setenv("CAO_TERMINAL_ID", "super001")
     with (

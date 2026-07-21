@@ -40,80 +40,83 @@ def assert_fork_role_notice(preamble: str) -> None:
 
 
 def test_tracked_modified_after_mark_is_stale(repo: Path):
-    sha, hashes = snapshot(str(repo))
+    captured = snapshot(str(repo))
     (repo / "tracked.txt").write_text("changed")
-    changed, preamble = staleness(row(repo, sha, hashes))
-    assert changed == ["tracked.txt"]
-    assert preamble.startswith("[STALE] 1 files")
-    assert_fork_role_notice(preamble)
+    stale = staleness(row(repo, captured.git_sha, captured.dirty_hashes()))
+    assert stale.changed_count == 1
+    assert stale.delta.paths == ("tracked.txt",)
+    assert stale.preamble.startswith("[STALE] 1 files")
+    assert_fork_role_notice(stale.preamble)
 
 
 def test_dirty_at_snapshot_untouched_is_fresh(repo: Path):
     (repo / "tracked.txt").write_text("dirty-at-mark")
-    sha, hashes = snapshot(str(repo))
-    assert json.loads(hashes)["tracked.txt"]
-    changed, preamble = staleness(row(repo, sha, hashes))
-    assert changed == []
-    assert preamble.startswith("[FRESH] base 'base' snapshot current.")
-    assert_fork_role_notice(preamble)
+    captured = snapshot(str(repo))
+    assert json.loads(captured.dirty_hashes())["tracked.txt"]
+    stale = staleness(row(repo, captured.git_sha, captured.dirty_hashes()))
+    assert stale.changed_count == 0
+    assert stale.delta.entries == ()
+    assert stale.preamble.startswith("[FRESH] base 'base' snapshot current.")
+    assert_fork_role_notice(stale.preamble)
 
 
 @pytest.mark.parametrize("sha, hashes", [(None, "{}"), ("invalid-sha", "{}")])
 def test_stale_unknown_includes_fork_role_notice(repo: Path, sha, hashes):
-    changed, preamble = staleness(row(repo, sha, hashes))
-    assert changed is None
-    assert preamble.startswith("[STALE-UNKNOWN]")
-    assert_fork_role_notice(preamble)
+    stale = staleness(row(repo, sha, hashes))
+    assert stale.changed_count is None
+    assert stale.preamble.startswith("[STALE-UNKNOWN]")
+    assert_fork_role_notice(stale.preamble)
 
 
 def test_clean_tree_is_fresh(repo: Path):
-    sha, hashes = snapshot(str(repo))
-    changed, preamble = staleness(row(repo, sha, hashes))
-    assert changed == []
-    assert preamble.startswith("[FRESH]")
+    captured = snapshot(str(repo))
+    stale = staleness(row(repo, captured.git_sha, captured.dirty_hashes()))
+    assert stale.changed_count == 0
+    assert stale.preamble.startswith("[FRESH]")
 
 
 def test_deleted_at_snapshot_still_deleted_is_fresh(repo: Path):
     (repo / "tracked.txt").unlink()
-    sha, hashes = snapshot(str(repo))
-    assert json.loads(hashes)["tracked.txt"] is None
-    changed, preamble = staleness(row(repo, sha, hashes))
-    assert changed == []
-    assert preamble.startswith("[FRESH]")
+    captured = snapshot(str(repo))
+    assert json.loads(captured.dirty_hashes())["tracked.txt"] is None
+    stale = staleness(row(repo, captured.git_sha, captured.dirty_hashes()))
+    assert stale.changed_count == 0
+    assert stale.preamble.startswith("[FRESH]")
 
 
 def test_deleted_at_snapshot_then_recreated_is_stale(repo: Path):
     (repo / "tracked.txt").unlink()
-    sha, hashes = snapshot(str(repo))
+    captured = snapshot(str(repo))
     (repo / "tracked.txt").write_text("recreated")
-    changed, preamble = staleness(row(repo, sha, hashes))
-    assert changed == ["tracked.txt"]
-    assert preamble.startswith("[STALE] 1 files")
+    stale = staleness(row(repo, captured.git_sha, captured.dirty_hashes()))
+    assert stale.changed_count == 1
+    assert stale.delta.paths == ("tracked.txt",)
+    assert stale.preamble.startswith("[STALE] 1 files")
 
 
 def test_deleted_at_snapshot_then_directory_is_stale(repo: Path):
     (repo / "tracked.txt").unlink()
-    sha, hashes = snapshot(str(repo))
+    captured = snapshot(str(repo))
     (repo / "tracked.txt").mkdir()
-    changed, preamble = staleness(row(repo, sha, hashes))
-    assert changed == ["tracked.txt"]
-    assert preamble.startswith("[STALE]")
+    stale = staleness(row(repo, captured.git_sha, captured.dirty_hashes()))
+    assert stale.delta.paths == ("tracked.txt",)
+    assert stale.preamble.startswith("[STALE]")
 
 
 def test_deleted_at_snapshot_then_symlink_is_stale(repo: Path):
     (repo / "tracked.txt").unlink()
-    sha, hashes = snapshot(str(repo))
+    captured = snapshot(str(repo))
     (repo / "tracked.txt").symlink_to("missing-target")
-    changed, preamble = staleness(row(repo, sha, hashes))
-    assert changed == ["tracked.txt"]
-    assert preamble.startswith("[STALE]")
+    stale = staleness(row(repo, captured.git_sha, captured.dirty_hashes()))
+    assert stale.delta.paths == ("tracked.txt",)
+    assert stale.preamble.startswith("[STALE]")
 
 
 def test_present_but_unreadable_hash_is_stale(repo: Path):
     (repo / "tracked.txt").write_text("dirty-at-mark")
-    sha, hashes = snapshot(str(repo))
+    captured = snapshot(str(repo))
     with patch("cli_agent_orchestrator.services.fork_context_service._hash",
                side_effect=PermissionError("unreadable")):
-        changed, preamble = staleness(row(repo, sha, hashes))
-    assert changed == ["tracked.txt"]
-    assert preamble.startswith("[STALE]")
+        stale = staleness(row(repo, captured.git_sha, captured.dirty_hashes()))
+    assert stale.delta.paths == ("tracked.txt",)
+    assert stale.preamble.startswith("[STALE]")

@@ -81,6 +81,7 @@ def test_e3_kind_migration_backfills_existing_rows_as_base(tmp_path, monkeypatch
 
     database._migrate_provider_sessions_kind()
     database._migrate_provider_sessions_kind()
+    database._migrate_provider_sessions_digest_head()
 
     with engine.connect() as connection:
         assert connection.execute(

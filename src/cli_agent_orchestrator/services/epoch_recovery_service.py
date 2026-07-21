@@ -166,10 +166,10 @@ async def _recover_row(row, session_name):
             )
         except Exception:
             remark_error = "remark_failed"
-        changed, _ = staleness(row)
+        stale = staleness(row)
         source = {"base": row["name"], "terminal_id": terminal.id,
                   "status": "resumed", "error_code": remark_error,
-                  "staleness": None if changed is None else len(changed),
+                  "staleness": stale.changed_count,
                   "stale_registration": remark_error == "remark_failed"}
         return _result(row["name"], "resumed", terminal.id, remark_error,
                        row.get("session_name") is None), source
@@ -229,8 +229,7 @@ async def recover_epoch(session_name: str, base_names: list[str] | None = None) 
         base = get_ready_provider_session(intent["parent_base_name"])
         stale = None
         if base:
-            changed, _ = staleness(base)
-            stale = None if changed is None else len(changed)
+            stale = staleness(base).changed_count
         candidates.append({
             "intent_id": intent["intent_id"],
             "worker_terminal_id": intent["worker_terminal_id"],

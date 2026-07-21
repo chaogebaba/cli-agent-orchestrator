@@ -33,6 +33,7 @@ from typing import Any, Dict, Optional, Protocol, cast
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     claim_deferred_init_failure,
+    create_digest_pending_notice,
     create_inbox_message,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
@@ -91,6 +92,7 @@ from cli_agent_orchestrator.services.draft_guard import (
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.fork_context_service import snapshot as fork_snapshot
 from cli_agent_orchestrator.services.fork_context_service import staleness as fork_staleness
+from cli_agent_orchestrator.services import base_digest_service
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
@@ -2015,15 +2017,6 @@ def _fork_refresh_lock(base_name: str) -> asyncio.Lock:
     return lock
 
 
-def _fork_refresh_prompt(base_name: str, changed: list[str]) -> str:
-    paths = "\n".join(f"- {path}" for path in changed)
-    return (
-        f"[CAO AUTO-REFRESH] Refresh registered base '{base_name}'. Re-read and "
-        "ingest the current contents of every changed file below. Do no unrelated "
-        f"work; reply only after the refresh is complete.\n\n{paths}"
-    )
-
-
 def _dispatch_base_refresh(
     base_terminal_id: str,
     message: str,
@@ -2093,7 +2086,7 @@ async def _prepare_fork_refresh(
         )
         if row is None or row.get("kind", "base") != "base":
             return stale_preamble
-        changed_and_preamble, _ = await _tracked_blocking(
+        stale, _ = await _tracked_blocking(
             terminal_id,
             generation,
             "abandonable",
@@ -2102,9 +2095,8 @@ async def _prepare_fork_refresh(
             row,
             deadline=deadline,
         )
-        changed, current_preamble = changed_and_preamble
-        if not changed:
-            return cast(str, current_preamble)
+        if not stale:
+            return stale.preamble
         base_terminal_id = row.get("source_terminal_id")
         if not base_terminal_id:
             return stale_preamble
@@ -2118,6 +2110,38 @@ async def _prepare_fork_refresh(
                     base_terminal_id,
                 )
             return stale_preamble
+        decision, _ = await _tracked_blocking(
+            terminal_id,
+            generation,
+            "abandonable",
+            "fork_refresh_digest",
+            base_digest_service.evaluate,
+            row,
+            stale.delta,
+            deadline=deadline,
+        )
+        if isinstance(decision, base_digest_service.DigestPending):
+            caller_id = caller_snapshot.get("caller_id")
+            if caller_id:
+                try:
+                    await _tracked_blocking(
+                        terminal_id,
+                        generation,
+                        "abandonable",
+                        "fork_refresh_digest_notice",
+                        create_digest_pending_notice,
+                        caller_id,
+                        base_name,
+                        base_digest_service.state_key(decision.delta),
+                        "A covered digest artifact is required before refresh.",
+                        deadline=deadline,
+                    )
+                except Exception:
+                    logger.exception("digest_pending_notice_failed base=%s", base_name)
+            return stale_preamble
+        if isinstance(decision, base_digest_service.DigestInvalid):
+            logger.warning("digest_refresh_invalid base=%s reason=%s", base_name, decision.reason)
+            return stale_preamble
         dispatched, _ = await _tracked_blocking(
             terminal_id,
             generation,
@@ -2125,7 +2149,7 @@ async def _prepare_fork_refresh(
             "fork_refresh_send",
             _dispatch_base_refresh,
             base_terminal_id,
-            _fork_refresh_prompt(base_name, changed),
+            base_digest_service.refresh_prompt(decision.artifact),
             sender_id=caller_snapshot.get("caller_id"),
             registry=registry,
             deadline=deadline,
@@ -2152,7 +2176,9 @@ async def _prepare_fork_refresh(
             row["cwd"],
             deadline=deadline,
         )
-        sha, hashes = snapshot_result
+        captured = snapshot_result
+        if captured.acquisition_error or not captured.git_sha:
+            return stale_preamble
         current, _ = await _tracked_blocking(
             terminal_id,
             generation,
@@ -2176,8 +2202,9 @@ async def _prepare_fork_refresh(
             "fork_refresh_snapshot_write",
             update_provider_session_snapshot,
             current["id"],
-            git_sha=sha,
-            dirty_hashes=hashes,
+            git_sha=captured.git_sha,
+            dirty_hashes=captured.dirty_hashes(),
+            digest_head=decision.artifact.artifact_sha,
             deadline=deadline,
         )
         if updated is None:
@@ -2191,7 +2218,7 @@ async def _prepare_fork_refresh(
             updated,
             deadline=deadline,
         )
-        return cast(str, refreshed[1])
+        return cast(str, refreshed.preamble)
     except asyncio.CancelledError:
         raise
     except Exception:

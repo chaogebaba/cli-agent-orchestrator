@@ -155,6 +155,7 @@ class ProviderSessionModel(Base):
     agent_profile = Column(Text, nullable=False)
     git_sha = Column(Text, nullable=True)
     dirty_hashes = Column(Text, nullable=False, default="{}", server_default="{}")
+    digest_head = Column(Text, nullable=True)
     summary = Column(Text, nullable=True)
     status = Column(Text, nullable=False)
     kind = Column(Text, nullable=False, default="base", server_default="base")
@@ -651,6 +652,7 @@ def init_db() -> None:
     _migrate_provider_sessions_status()
     _migrate_provider_sessions_session_name()
     _migrate_provider_sessions_kind()
+    _migrate_provider_sessions_digest_head()
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
     _migrate_inbox_orchestration_type()
@@ -708,7 +710,7 @@ def _migrate_provider_sessions_status() -> None:
                 "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
                 "name TEXT NOT NULL, provider TEXT NOT NULL, session_uuid TEXT NOT NULL, "
                 "cwd TEXT NOT NULL, agent_profile TEXT NOT NULL, git_sha TEXT, "
-                "dirty_hashes TEXT DEFAULT '{}' NOT NULL, summary TEXT, status TEXT NOT NULL, "
+                "dirty_hashes TEXT DEFAULT '{}' NOT NULL, digest_head TEXT, summary TEXT, status TEXT NOT NULL, "
                 "kind TEXT DEFAULT 'base' NOT NULL, "
                 "source_terminal_id TEXT, session_name TEXT, created_at DATETIME, updated_at DATETIME, "
                 "CONSTRAINT ck_provider_sessions_status "
@@ -720,9 +722,9 @@ def _migrate_provider_sessions_status() -> None:
             text(
                 "INSERT INTO provider_sessions "
                 "(id, name, provider, session_uuid, cwd, agent_profile, git_sha, dirty_hashes, "
-                "summary, status, kind, source_terminal_id, session_name, created_at, updated_at) "
+                "digest_head, summary, status, kind, source_terminal_id, session_name, created_at, updated_at) "
                 "SELECT id, name, provider, session_uuid, cwd, agent_profile, git_sha, "
-                "dirty_hashes, summary, status, 'base', source_terminal_id, NULL, created_at, updated_at "
+                "dirty_hashes, NULL, summary, status, 'base', source_terminal_id, NULL, created_at, updated_at "
                 "FROM provider_sessions_legacy"
             )
         )
@@ -757,6 +759,16 @@ def _migrate_provider_sessions_kind() -> None:
                     "ALTER TABLE provider_sessions ADD COLUMN kind TEXT NOT NULL " "DEFAULT 'base'"
                 )
             )
+
+
+def _migrate_provider_sessions_digest_head() -> None:
+    """Add the nullable digest lineage head idempotently."""
+    from sqlalchemy import text
+
+    with engine.begin() as connection:
+        columns = connection.execute(text("PRAGMA table_info(provider_sessions)")).mappings().all()
+        if columns and not any(column["name"] == "digest_head" for column in columns):
+            connection.execute(text("ALTER TABLE provider_sessions ADD COLUMN digest_head TEXT"))
 
 
 def _migrate_transcript_bindings_inode_nullable() -> None:
@@ -2343,6 +2355,7 @@ def update_provider_session_snapshot(
     *,
     git_sha: Optional[str],
     dirty_hashes: str,
+    digest_head: str | None = None,
 ) -> Optional[Dict[str, Any]]:
     """CAS-refresh the snapshot for the same still-ready registry row."""
     with SessionLocal() as db:
@@ -2351,6 +2364,7 @@ def update_provider_session_snapshot(
             return None
         row.git_sha = git_sha
         row.dirty_hashes = dirty_hashes
+        row.digest_head = digest_head
         row.updated_at = _utcnow()
         db.commit()
         db.refresh(row)
@@ -2984,6 +2998,7 @@ _BARRIER_INTERNAL_PREFIXES = (
     "message-trace:",
     "mailbox-digest",
     "compact-digest",
+    "cao-digest:",
     "barrier:",
     "barrier-alert:",
 )
@@ -3732,6 +3747,61 @@ def create_inbox_message(
             dispatch_barrier=dispatch_barrier,
             park_warm=park_warm,
         )
+
+
+def create_digest_pending_notice(
+    receiver_id: str,
+    base: str,
+    state_key: str,
+    body: str,
+) -> InboxMessage | None:
+    """Insert one parked digest-pending notice, deduplicated by its first line.
+
+    The immediate transaction makes the dedup observation and insert one atomic
+    operation.  Digest notices use an internal sender so they never become
+    callback-barrier members.
+    """
+    sender_id = f"cao-digest:{base}"
+    header = f"[CAO DIGEST-PENDING] base={base} key={state_key}\n"
+    with SessionLocal() as db:
+        db.execute(text("BEGIN IMMEDIATE"))
+        try:
+            receiver_cache, logical_receiver_id, _ = resolve_inbox_receiver(db, receiver_id)
+            if (
+                logical_receiver_id is None
+                and not db.query(TerminalModel).filter(TerminalModel.id == receiver_cache).first()
+            ):
+                raise ValueError(f"Terminal '{receiver_id}' not found")
+            existing = (
+                db.query(InboxModel)
+                .filter(
+                    InboxModel.sender_id == sender_id,
+                    InboxModel.receiver_id == receiver_cache,
+                    text("substr(message, 1, :n) = :header").bindparams(
+                        n=len(header), header=header
+                    ),
+                )
+                .order_by(InboxModel.id)
+                .first()
+            )
+            if existing is not None:
+                db.commit()
+                return None
+            row = _insert_routed_inbox_row(
+                db,
+                sender_id=sender_id,
+                receiver_id=receiver_cache,
+                logical_receiver_id=logical_receiver_id,
+                message=header + body,
+                orchestration_type=OrchestrationType.SEND_MESSAGE,
+                park_warm=True,
+            )
+            db.commit()
+            db.refresh(row)
+            return _inbox_message_from_row(row)
+        except Exception:
+            db.rollback()
+            raise
 
 
 def _create_inbox_message_unfenced(

@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.mcp_server import server
+from cli_agent_orchestrator.services.fork_context_service import SnapshotDelta, StalenessResult
 
 
 def _git(*args):
@@ -34,7 +35,7 @@ def _fork_assign(row, requested=None):
         return_value=[SimpleNamespace(name=f"rollout-{row['session_uuid']}.jsonl")],
     ), patch(
         "cli_agent_orchestrator.services.fork_context_service.staleness",
-        return_value=([], "[FRESH]"),
+        return_value=StalenessResult(SnapshotDelta("head"), "[FRESH]", 0),
     ) as stale, patch.object(server, "_create_terminal") as create:
         create.return_value = ("feed1234", row["provider"])
         result = server._assign_impl(

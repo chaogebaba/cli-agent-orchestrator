@@ -5,7 +5,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from cli_agent_orchestrator.mcp_server import server
-from cli_agent_orchestrator.services.fork_context_service import ForkContextError, mark_ready
+from cli_agent_orchestrator.services.fork_context_service import (
+    ForkContextError, SnapshotDelta, SnapshotEntry, StalenessResult, mark_ready,
+)
 
 
 ROW = {
@@ -45,7 +47,14 @@ def _assign_with_default(
         stack.enter_context(
             patch(
                 "cli_agent_orchestrator.services.fork_context_service.staleness",
-                return_value=(list(changed), "[STALE]" if changed else "[FRESH]"),
+                return_value=StalenessResult(
+                    SnapshotDelta(
+                        "head",
+                        tuple(SnapshotEntry(path, "absent") for path in changed),
+                    ),
+                    "[STALE]" if changed else "[FRESH]",
+                    len(changed),
+                ),
             )
         )
         stack.enter_context(patch.object(server, "strict_supervisor_cwd", return_value="/cold"))

@@ -3,6 +3,7 @@
 import asyncio
 import subprocess
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -11,6 +12,31 @@ import pytest
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import ForkContext
 from cli_agent_orchestrator.services import terminal_service as terminals
+from cli_agent_orchestrator.services import base_digest_service
+from cli_agent_orchestrator.services.fork_context_service import (
+    SnapshotDelta,
+    SnapshotEntry,
+    StalenessResult,
+)
+
+
+def _stale(paths=("changed.py",), preamble="[STALE]"):
+    delta = SnapshotDelta("old", tuple(SnapshotEntry(path, "sha256", "a" * 64) for path in paths))
+    return StalenessResult(delta, preamble, len(paths))
+
+
+def _fresh(preamble="[FRESH]"):
+    return StalenessResult(SnapshotDelta("new"), preamble, 0)
+
+
+def _covered():
+    return base_digest_service.DigestCovered(
+        base_digest_service.BaseDigestArtifact(
+            path=Path("tmp/orch/digest.md"),
+            base="base", parent_artifact_sha="genesis", artifact_sha="a" * 64,
+            entries=(), body="context",
+        )
+    )
 
 
 def _git(path, *args):
@@ -65,7 +91,8 @@ async def test_e1_real_git_planted_token_refresh_resets_row_fresh(
     token_file.write_text("OLD-TOKEN\n", encoding="utf-8")
     _git(repo, "add", "token.txt")
     _git(repo, "commit", "-qm", "base")
-    sha, hashes = terminals.fork_snapshot(str(repo))
+    captured = terminals.fork_snapshot(str(repo))
+    sha, hashes = captured.git_sha, captured.dirty_hashes()
     row = {
         "id": 9, "name": "base", "kind": "base", "source_terminal_id": "base-term",
         "session_uuid": "uuid", "cwd": str(repo), "git_sha": sha,
@@ -74,6 +101,13 @@ async def test_e1_real_git_planted_token_refresh_resets_row_fresh(
     inherited = {"token": token_file.read_text(encoding="utf-8").strip()}
     cold_answer = inherited["token"]
     token_file.write_text("NEW-TOKEN\n", encoding="utf-8")
+    stale = terminals.fork_staleness(row)
+    artifact = base_digest_service.publish(
+        base="base", cwd=str(repo), parent_artifact_sha=None,
+        delta=stale.delta, body="general context", round_number=1,
+    )
+    assert artifact.entries == stale.delta.entries
+    assert base_digest_service.evaluate(row, stale.delta).kind == "covered"
 
     async def inline(_terminal, _generation, _kind, _operation, function, *args,
                      deadline=None, **kwargs):
@@ -83,12 +117,12 @@ async def test_e1_real_git_planted_token_refresh_resets_row_fresh(
         return True
 
     def dispatch(_terminal_id, prompt, **_kwargs):
-        assert "token.txt" in prompt
+        assert "digest artifact" in prompt
         inherited["token"] = token_file.read_text(encoding="utf-8").strip()
         return True
 
-    def update(_row_id, *, git_sha, dirty_hashes):
-        row.update(git_sha=git_sha, dirty_hashes=dirty_hashes)
+    def update(_row_id, *, git_sha, dirty_hashes, digest_head=None):
+        row.update(git_sha=git_sha, dirty_hashes=dirty_hashes, digest_head=digest_head)
         return dict(row)
 
     terminals._fork_refresh_locks.clear()
@@ -107,7 +141,7 @@ async def test_e1_real_git_planted_token_refresh_resets_row_fresh(
     assert cold_answer == "OLD-TOKEN"
     assert refreshed_answer == "NEW-TOKEN"
     assert preamble.startswith("[FRESH]")
-    assert terminals.fork_staleness(row)[0] == []
+    assert terminals.fork_staleness(row).changed_count == 0
 
 
 @pytest.mark.asyncio
@@ -127,7 +161,7 @@ async def test_e1_two_concurrent_stale_forks_dispatch_once_and_reset_baseline(mo
         return function(*args, **kwargs), time.monotonic()
 
     def compare(_row):
-        return ([], "[FRESH]") if state["fresh"] else (["token.txt"], "[STALE]")
+        return _fresh() if state["fresh"] else _stale(("token.txt",))
 
     def dispatch(*_args, **_kwargs):
         state["dispatches"] += 1
@@ -144,7 +178,8 @@ async def test_e1_two_concurrent_stale_forks_dispatch_once_and_reset_baseline(mo
     monkeypatch.setattr(terminals, "_tracked_blocking", inline)
     monkeypatch.setattr(terminals, "get_ready_provider_session", lambda _name: dict(row))
     monkeypatch.setattr(terminals, "fork_staleness", compare)
-    monkeypatch.setattr(terminals, "fork_snapshot", lambda _cwd: ("new", "{}"))
+    monkeypatch.setattr(terminals, "fork_snapshot", lambda _cwd: SnapshotDelta("new"))
+    monkeypatch.setattr(terminals.base_digest_service, "evaluate", lambda *_a: _covered())
     monkeypatch.setattr(terminals, "update_provider_session_snapshot", update)
     monkeypatch.setattr(terminals, "_dispatch_base_refresh", dispatch)
     monkeypatch.setattr(terminals, "_wait_for_base_ready", ready)
@@ -183,10 +218,11 @@ async def test_e1_false_refresh_dispatch_preserves_baseline_and_falls_back_stale
 
     monkeypatch.setattr(terminals, "_tracked_blocking", inline)
     monkeypatch.setattr(terminals, "get_ready_provider_session", lambda _name: dict(row))
-    monkeypatch.setattr(terminals, "fork_staleness", lambda _row: (["new.py"], "[STALE]"))
+    monkeypatch.setattr(terminals, "fork_staleness", lambda _row: _stale(("new.py",)))
+    monkeypatch.setattr(terminals.base_digest_service, "evaluate", lambda *_a: _covered())
     monkeypatch.setattr(terminals, "_wait_for_base_ready", ready)
     monkeypatch.setattr(terminals, "_dispatch_base_refresh", lambda *_a, **_k: False)
-    monkeypatch.setattr(terminals, "fork_snapshot", lambda _cwd: ("new", "{}"))
+    monkeypatch.setattr(terminals, "fork_snapshot", lambda _cwd: SnapshotDelta("new"))
     monkeypatch.setattr(
         terminals,
         "update_provider_session_snapshot",
@@ -224,7 +260,7 @@ async def test_e1_busy_refresh_timeout_falls_back_stale_within_budget(monkeypatc
     monkeypatch.setattr(terminals, "FORK_REFRESH_WAIT_BUDGET", 0.02)
     monkeypatch.setattr(terminals, "_tracked_blocking", inline)
     monkeypatch.setattr(terminals, "get_ready_provider_session", lambda _name: row)
-    monkeypatch.setattr(terminals, "fork_staleness", lambda _row: (["x"], "[STALE]"))
+    monkeypatch.setattr(terminals, "fork_staleness", lambda _row: _stale(("x",)))
     monkeypatch.setattr(terminals, "_wait_for_base_ready", busy)
     monkeypatch.setattr(
         terminals, "_dispatch_base_refresh", lambda *_a, **_k: dispatches.append(True)
@@ -261,7 +297,8 @@ async def test_e1_hung_refresh_dispatch_completes_with_stale_preamble(monkeypatc
     monkeypatch.setattr(terminals, "FORK_REFRESH_WAIT_BUDGET", 0.02)
     monkeypatch.setattr(terminals, "_tracked_blocking", inline)
     monkeypatch.setattr(terminals, "get_ready_provider_session", lambda _name: row)
-    monkeypatch.setattr(terminals, "fork_staleness", lambda _row: (["x"], "[STALE]"))
+    monkeypatch.setattr(terminals, "fork_staleness", lambda _row: _stale(("x",)))
+    monkeypatch.setattr(terminals.base_digest_service, "evaluate", lambda *_a: _covered())
     monkeypatch.setattr(terminals, "_wait_for_base_ready", ready)
 
     started = time.monotonic()

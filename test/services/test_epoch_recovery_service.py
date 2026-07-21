@@ -13,6 +13,7 @@ from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.services import epoch_recovery_service as service
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services import fork_context_service
+from cli_agent_orchestrator.services.fork_context_service import SnapshotDelta
 
 
 @pytest.fixture
@@ -95,7 +96,7 @@ def test_d2_unscoped_default_exclusion_and_mark_ready_rescope(epoch_db, monkeypa
     database.create_terminal(
         "joined", "cao-s", "w", "grok_cli", "dev", provider_session_id="u",
     )
-    monkeypatch.setattr(fork_context_service, "snapshot", lambda _: (None, "{}"))
+    monkeypatch.setattr(fork_context_service, "snapshot", lambda _: SnapshotDelta("sha"))
     monkeypatch.setattr(
         "cli_agent_orchestrator.backends.registry.get_backend",
         lambda: SimpleNamespace(get_pane_working_directory=lambda *_: "/tmp"),
@@ -212,7 +213,7 @@ async def test_d2b_real_creation_seam_is_synchronous_leased_and_strict(monkeypat
         return SimpleNamespace(id="new")
     monkeypatch.setattr(service, "create_terminal", create)
     monkeypatch.setattr(service, "mark_ready", lambda *_: None)
-    monkeypatch.setattr(service, "staleness", lambda _: ([], ""))
+    monkeypatch.setattr(service, "staleness", lambda _: SimpleNamespace(changed_count=0))
     monkeypatch.setattr(service, "increment_session_epoch", lambda _: {"count": 1})
     monkeypatch.setattr(service, "list_warm_intents", lambda _: [])
     monkeypatch.setattr(service, "build_session_manifest", lambda _: {}, raising=False)
@@ -266,7 +267,7 @@ async def test_e3_epoch_recovery_preserves_anchor_kind_and_unforkable(
 
     monkeypatch.setattr(service, "create_terminal", create)
     monkeypatch.setattr(service, "mark_ready", remark)
-    monkeypatch.setattr(service, "staleness", lambda _: ([], ""))
+    monkeypatch.setattr(service, "staleness", lambda _: SimpleNamespace(changed_count=0))
 
     result, _source = await service._recover_row(anchor, "cao-s")
     recovered = database.get_ready_provider_session("root-anchor")
@@ -361,7 +362,7 @@ async def test_lease_conflict_and_remark_failure_matrix(monkeypatch):
     monkeypatch.setattr(service, "release_rebind_lease", lambda _: None)
     monkeypatch.setattr(service, "create_terminal", lambda **_: asyncio.sleep(0, result=SimpleNamespace(id="new")))
     monkeypatch.setattr(service, "mark_ready", lambda *_: (_ for _ in ()).throw(RuntimeError()))
-    monkeypatch.setattr(service, "staleness", lambda _: ([], ""))
+    monkeypatch.setattr(service, "staleness", lambda _: SimpleNamespace(changed_count=0))
     monkeypatch.setattr(service, "increment_session_epoch", lambda _: {"count": 1})
     resumed = await service.recover_epoch("cao-s")
     assert resumed["results"][0]["status"] == "resumed"
@@ -390,7 +391,7 @@ async def test_concurrent_duplicate_recovery_creates_exactly_one_terminal(monkey
         return SimpleNamespace(id="new-race")
     monkeypatch.setattr(service, "create_terminal", create)
     monkeypatch.setattr(service, "mark_ready", lambda *_: None)
-    monkeypatch.setattr(service, "staleness", lambda _: ([], ""))
+    monkeypatch.setattr(service, "staleness", lambda _: SimpleNamespace(changed_count=0))
     monkeypatch.setattr(service, "increment_session_epoch", lambda _: {"count": 1})
     monkeypatch.setattr(service, "list_warm_intents", lambda _: [])
     first = asyncio.create_task(service.recover_epoch("cao-race"))

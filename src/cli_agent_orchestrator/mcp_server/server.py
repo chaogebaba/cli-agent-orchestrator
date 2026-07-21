@@ -1192,8 +1192,9 @@ def _assign_impl(
             working_directory, workdir_preamble = _resolve_fork_working_directory(
                 row, working_directory
             )
-            changed, preamble = staleness(row)
-            if changed and not resume:
+            stale = staleness(row)
+            preamble = stale.preamble
+            if stale and not resume:
                 refresh_base_name = row["name"]
             if workdir_preamble:
                 preamble = f"{preamble}\n{workdir_preamble}"

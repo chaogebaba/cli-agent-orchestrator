@@ -6,6 +6,7 @@ import os
 import subprocess
 import time
 import uuid as uuidlib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, NoReturn, Optional
 from urllib.parse import quote
@@ -39,6 +40,61 @@ class OfflineBaseRegistrationError(ValueError):
         super().__init__(f"{code}: {message}")
 
 
+class NonUtf8PathError(ValueError):
+    """Git returned a path that cannot be represented in the CAO text domain."""
+
+    def __init__(self) -> None:
+        super().__init__("non-utf8-path")
+
+
+@dataclass(frozen=True)
+class SnapshotEntry:
+    path: str
+    state: Literal["sha256", "absent", "unhashable"]
+    value: str | None = None
+
+
+@dataclass(frozen=True)
+class SnapshotDelta:
+    """Typed, byte-domain-safe changed-set acquired from a worktree."""
+
+    git_sha: str | None
+    entries: tuple[SnapshotEntry, ...] = ()
+    acquisition_error: Literal["git-failure", "non-utf8-path"] | None = None
+
+    def __bool__(self) -> bool:
+        return bool(self.entries) or self.acquisition_error is not None
+
+    @property
+    def paths(self) -> tuple[str, ...]:
+        return tuple(entry.path for entry in self.entries)
+
+    @property
+    def is_acquisition_failure(self) -> bool:
+        return self.acquisition_error is not None
+
+    def dirty_hashes(self) -> str:
+        values = {
+            entry.path: (
+                entry.value
+                if entry.state == "sha256"
+                else None
+            )
+            for entry in self.entries
+        }
+        return json.dumps(values, sort_keys=True, separators=(",", ":"))
+
+
+@dataclass(frozen=True)
+class StalenessResult:
+    delta: SnapshotDelta
+    preamble: str
+    changed_count: int | None
+
+    def __bool__(self) -> bool:
+        return self.delta.is_acquisition_failure or self.changed_count not in (0, None)
+
+
 _FORK_ROLE_NOTICE = (
     "ROLE NOTICE: You are a newly forked worker, distinct from the base session whose "
     "transcript you inherit. Any role framing, read-only/do-not-edit constraints, or "
@@ -58,6 +114,31 @@ def _run_git(cwd: str, *args: str) -> str:
     ).stdout
 
 
+def _run_git_bytes(cwd: str, *args: str) -> bytes:
+    return subprocess.run(
+        ["git", "-C", cwd, *args],
+        check=True,
+        capture_output=True,
+    ).stdout
+
+
+def _decode_git_paths(payload: bytes) -> list[str]:
+    paths: list[str] = []
+    for raw in payload.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            paths.append(raw.decode("utf-8", errors="strict"))
+        except UnicodeDecodeError as exc:
+            raise NonUtf8PathError() from exc
+    return paths
+
+
+def _source_path(path: str) -> bool:
+    """Exclude CAO's generated digest artifacts from source-worktree drift."""
+    return not (path == "tmp/orch/digests" or path.startswith("tmp/orch/digests/"))
+
+
 def _hash(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -66,39 +147,90 @@ def _hash(path: Path) -> str:
     return h.hexdigest()
 
 
-def snapshot(cwd: str) -> tuple[Optional[str], str]:
+def _entry_for_path(cwd: str, path_name: str) -> SnapshotEntry:
+    path = Path(cwd) / path_name
     try:
-        sha = _run_git(cwd, "rev-parse", "HEAD").strip()
-        dirty = set(_run_git(cwd, "diff", "--name-only", "HEAD", "--").splitlines())
-        dirty.update(_run_git(cwd, "ls-files", "--others", "--exclude-standard").splitlines())
-        hashes: dict[str, Optional[str]] = {}
-        for p in sorted(dirty):
-            path = Path(cwd) / p
-            try:
-                path.lstat()
-            except FileNotFoundError:
-                hashes[p] = None
-            else:
-                hashes[p] = _hash(path)
-        return sha, json.dumps(hashes, sort_keys=True, separators=(",", ":"))
-    except (OSError, subprocess.CalledProcessError):
-        return None, "{}"
+        path.lstat()
+    except FileNotFoundError:
+        return SnapshotEntry(path_name, "absent")
+    except OSError:
+        return SnapshotEntry(path_name, "unhashable")
+    try:
+        return SnapshotEntry(path_name, "sha256", _hash(path))
+    except OSError:
+        return SnapshotEntry(path_name, "unhashable")
 
 
-def staleness(row: dict[str, Any]) -> tuple[Optional[list[str]], str]:
+def snapshot(cwd: str) -> SnapshotDelta:
+    try:
+        sha = _run_git_bytes(cwd, "rev-parse", "HEAD").decode("utf-8", "strict").strip()
+        dirty = {
+            path
+            for path in _decode_git_paths(
+                _run_git_bytes(cwd, "diff", "--name-only", "-z", "HEAD", "--")
+            )
+            if _source_path(path)
+        }
+        dirty.update(
+            path
+            for path in _decode_git_paths(
+                _run_git_bytes(cwd, "ls-files", "--others", "--exclude-standard", "-z")
+            )
+            if _source_path(path)
+        )
+        return SnapshotDelta(
+            sha,
+            tuple(_entry_for_path(cwd, path) for path in sorted(dirty)),
+        )
+    except NonUtf8PathError:
+        return SnapshotDelta(None, acquisition_error="non-utf8-path")
+    except (OSError, UnicodeError, subprocess.CalledProcessError):
+        return SnapshotDelta(None, acquisition_error="git-failure")
+
+
+def _staleness_unknown(row: dict[str, Any], message: str, cause: str) -> StalenessResult:
+    return StalenessResult(
+        SnapshotDelta(None, acquisition_error=cause), _with_role_notice(message), None
+    )
+
+
+def staleness(row: dict[str, Any]) -> StalenessResult:
     cwd, sha = row["cwd"], row.get("git_sha")
     if not sha:
-        return None, _with_role_notice(
-            "[STALE-UNKNOWN] base snapshot is not a git worktree. Revalidate inherited context."
+        return _staleness_unknown(
+            row,
+            "[STALE-UNKNOWN] base snapshot is not a git worktree. Revalidate inherited context.",
+            "git-failure",
         )
-    manifest = json.loads(row.get("dirty_hashes") or "{}")
     try:
-        candidates = set(_run_git(cwd, "diff", "--name-only", sha, "--").splitlines())
-        candidates.update(_run_git(cwd, "ls-files", "--others", "--exclude-standard").splitlines())
+        manifest = json.loads(row.get("dirty_hashes") or "{}")
+        if not isinstance(manifest, dict):
+            raise ValueError("dirty_hashes must be an object")
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return _staleness_unknown(
+            row,
+            "[STALE-UNKNOWN] base snapshot could not be compared. Revalidate inherited context.",
+            "git-failure",
+        )
+    try:
+        candidates = {
+            path
+            for path in _decode_git_paths(
+                _run_git_bytes(cwd, "diff", "--name-only", "-z", sha, "--")
+            )
+            if _source_path(path)
+        }
+        candidates.update(
+            path
+            for path in _decode_git_paths(
+                _run_git_bytes(cwd, "ls-files", "--others", "--exclude-standard", "-z")
+            )
+            if _source_path(path)
+        )
         for p in manifest:
-            if not (Path(cwd) / p).is_file():
+            if _source_path(p) and not (Path(cwd) / p).exists():
                 candidates.add(p)
-        changed = []
+        changed: list[SnapshotEntry] = []
         for p in sorted(candidates):
             path = Path(cwd) / p
             expected = manifest.get(p)
@@ -112,28 +244,45 @@ def staleness(row: dict[str, Any]) -> tuple[Optional[list[str]], str]:
                 absent = False
             if expected is None:
                 if not absent:
-                    changed.append(p)
+                    changed.append(_entry_for_path(cwd, p))
                 continue
             if absent:
-                changed.append(p)
+                changed.append(SnapshotEntry(p, "absent"))
                 continue
             try:
                 current = _hash(path)
             except OSError:
-                changed.append(p)
+                changed.append(SnapshotEntry(p, "unhashable"))
                 continue
             if current != expected:
-                changed.append(p)
+                changed.append(SnapshotEntry(p, "sha256", current))
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
-        return None, _with_role_notice(
-            "[STALE-UNKNOWN] base snapshot could not be compared. Revalidate inherited context."
+        return _staleness_unknown(
+            row,
+            "[STALE-UNKNOWN] base snapshot could not be compared. Revalidate inherited context.",
+            "git-failure",
+        )
+    except NonUtf8PathError:
+        return _staleness_unknown(
+            row,
+            "[STALE-UNKNOWN] base snapshot contains a non-UTF-8 path. Revalidate inherited context.",
+            "non-utf8-path",
         )
     if not changed:
-        return [], _with_role_notice(f"[FRESH] base '{row['name']}' snapshot current.")
-    shown = ", ".join(changed[:50])
-    return changed, _with_role_notice(
-        f"[STALE] {len(changed)} files changed since base '{row['name']}' "
-        f"({sha[:8]}): {shown}. Re-read these before relying on inherited context."
+        return StalenessResult(
+            SnapshotDelta(sha),
+            _with_role_notice(f"[FRESH] base '{row['name']}' snapshot current."),
+            0,
+        )
+    delta = SnapshotDelta(sha, tuple(changed))
+    shown = ", ".join(delta.paths[:50])
+    return StalenessResult(
+        delta,
+        _with_role_notice(
+            f"[STALE] {len(changed)} files changed since base '{row['name']}' "
+            f"({sha[:8]}): {shown}. Re-read these before relying on inherited context."
+        ),
+        len(changed),
     )
 
 
@@ -404,8 +553,9 @@ def validate_base_source(
         )
     except (OSError, subprocess.CalledProcessError):
         pass
-    git_sha, dirty_hashes = snapshot(canonical_cwd)
-    if not inside_worktree or not git_sha:
+    captured = snapshot(canonical_cwd)
+    git_sha, dirty_hashes = captured.git_sha, captured.dirty_hashes()
+    if captured.acquisition_error or not inside_worktree or not git_sha:
         _registration_error(
             "cwd_not_git_worktree", "cwd must be a git worktree with a resolvable HEAD"
         )
@@ -493,7 +643,10 @@ def mark_ready(
             raise ForkContextError("base_session_unset")
     else:
         raise ForkContextError("provider_lacks_fork_capability")
-    sha, hashes = snapshot(cwd)
+    captured = snapshot(cwd)
+    sha, hashes = captured.git_sha, captured.dirty_hashes()
+    if captured.acquisition_error or not sha:
+        raise ForkContextError(f"snapshot_{captured.acquisition_error or 'git-failure'}")
     row = register_provider_session(
         name=name,
         provider=provider,
@@ -516,8 +669,8 @@ def list_bases() -> list[dict[str, Any]]:
     for row in list_ready_provider_sessions():
         if row.get("kind", "base") != "base":
             continue
-        changed, _ = staleness(row)
-        row["staleness_count"] = None if changed is None else len(changed)
+        stale = staleness(row)
+        row["staleness_count"] = stale.changed_count
         result.append(row)
     return result
 

@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -12,6 +13,8 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import stalled_callback_watchdog as watchdog_module
 from cli_agent_orchestrator.services import terminal_guard_service
 from cli_agent_orchestrator.services import terminal_service as terminals
+from cli_agent_orchestrator.services import base_digest_service
+from cli_agent_orchestrator.services.fork_context_service import SnapshotDelta, SnapshotEntry, StalenessResult
 
 
 def _row(source_terminal_id="base-source"):
@@ -47,7 +50,20 @@ def _prepare_stale_refresh(monkeypatch, row):
         terminals, "get_ready_provider_session", lambda _name: dict(row)
     )
     monkeypatch.setattr(
-        terminals, "fork_staleness", lambda _row: (["changed.py"], "[STALE]")
+        terminals, "fork_staleness", lambda _row: StalenessResult(
+            SnapshotDelta("old", (SnapshotEntry("changed.py", "sha256", "a" * 64),)),
+            "[STALE]", 1,
+        )
+    )
+    monkeypatch.setattr(
+        terminals.base_digest_service, "evaluate",
+        lambda *_args: base_digest_service.DigestCovered(
+            base_digest_service.BaseDigestArtifact(
+                path=Path("tmp/orch/digest.md"),
+                base="base", parent_artifact_sha="genesis", artifact_sha="a" * 64,
+                entries=(), body="context",
+            )
+        ),
     )
 
 
