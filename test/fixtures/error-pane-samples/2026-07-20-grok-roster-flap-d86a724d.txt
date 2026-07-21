@@ -1,0 +1,6 @@
+== 2026-07-20 ~02:50 grok relay roster flap RECURRENCE (first outage same morning; user tested grok-4.5 recovered ~02:20, announced available; flapped again by 02:47)
+== fresh grok_dev lane d86a724d — assign WAS CORRECT (agent_profile=grok_dev, no model param). Supervisor's 'you spawned it wrong' correction was WRONG; maker pushed back correctly.
+== pane verbatim:
+Claude Code v2.1.215 / grok-4.5 with high effort · Claude Pro
+● There's an issue with the selected model (grok-4.5). It may not exist or you may not have access to it. Run /model to pick a different model.
+== note: grok_cli lanes ARE Claude Code binaries pointed at relay grok models — the banner is NORMAL; the model-select park is the roster flap signature (memory grok-relay-roster-outage).

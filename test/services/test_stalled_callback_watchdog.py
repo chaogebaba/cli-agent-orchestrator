@@ -1060,10 +1060,14 @@ def test_fired_and_order_independent_blockers_and_membership_exits():
 
 def test_waiting_safety_net_repeats_on_oldest_inbound_clock():
     svc = StalledCallbackWatchdog(grace_seconds=3)
-    _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=100, sampled=True)
-    _arm_watchdog_episode(svc, "T", "W", inbound_at=700)
+    # The waiter became idle recently, but its blocker has been outstanding
+    # since epoch zero.  The escalation age must use the blocker clock.
+    _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=900, sampled=True)
+    _arm_watchdog_episode(svc, "T", "W", inbound_at=0)
     with _relational_watchdog_fakes({"W", "T", "C"}):
-        assert svc.collect_due_notifications(now=1000)[0].kind == "waiting"
+        notice = svc.collect_due_notifications(now=1000)[0]
+        assert notice.kind == "waiting"
+        assert "oldest outstanding 1000s" in notice.message
         assert svc.collect_due_notifications(now=1599) == []
         assert svc.collect_due_notifications(now=1600)[0].kind == "waiting"
 
@@ -1153,10 +1157,30 @@ def test_phase_p_empty_phase_a_waiting_suppresses_after_probes():
 
 
 def test_positive_grok_sample_keeps_existing_alarm_class():
-    sample = Path(__file__).parents[3] / "probes/error-pane-samples/2026-07-20-grok-roster-flap-d86a724d.txt"
-    assert "model" in sample.read_text(encoding="utf-8").lower()
+    sample = (
+        Path(__file__).parents[1]
+        / "fixtures/error-pane-samples/2026-07-20-grok-roster-flap-d86a724d.txt"
+    )
+    captured = sample.read_bytes()
+    rows = captured.decode("utf-8").splitlines()
+    provider = _watchdog_grok_provider()
+    classification = provider.classify_screen(rows)
+    assert classification.status == TerminalStatus.UNKNOWN
     svc = StalledCallbackWatchdog(grace_seconds=3)
     _arm_watchdog_episode(svc, "worker1", "caller1", inbound_at=0, idle_since=10, sampled=True)
+    backend = MagicMock()
+    backend.capture_viewport.return_value = captured.decode("utf-8")
+    with (
+        _relational_watchdog_fakes({"worker1", "caller1"}),
+        patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+        patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata", return_value={
+            "id": "worker1", "tmux_session": "cao-test", "tmux_window": "worker1",
+        }),
+        patch("cli_agent_orchestrator.services.seam_activation.receiver_state_active", return_value=False),
+        patch("cli_agent_orchestrator.providers.manager.provider_manager.get_provider", return_value=provider),
+    ):
+        running, _ = svc._fresh_frame_decides_running("worker1")
+        assert running is False
     with _relational_watchdog_fakes({"worker1", "caller1"}):
         notices = svc.collect_due_notifications(now=13)
     assert notices[0].message == "[watchdog] worker worker1 (developer) idle 3s without callback"
