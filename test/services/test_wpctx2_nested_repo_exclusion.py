@@ -288,6 +288,59 @@ def test_t2g_lexical_intermediate_symlink_follows_marker_and_loop_fails_open(
     assert service._entry_for_path(str(repo), "loopdir/file.txt").state == "unhashable"
 
 
+def test_fix_r1_oserror_result_is_memoized_once_per_component(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocked = repo / "blocked"
+    blocked.mkdir()
+    original_stat = Path.stat
+    blocked_marker_calls = 0
+
+    def marker_stat(path: Path, *args, **kwargs):
+        nonlocal blocked_marker_calls
+        if path == blocked / ".git":
+            blocked_marker_calls += 1
+            raise OSError("marker unreadable")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", marker_stat)
+    memo: dict[Path, bool] = {}
+
+    assert not service._nested_repo(str(repo), "blocked/one.txt", memo)
+    assert not service._nested_repo(str(repo), "blocked/two.txt", memo)
+    assert blocked_marker_calls == 1
+    assert memo[blocked] is False
+
+
+def test_fix_r1_invalid_lexical_components_never_probe_markers(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_stat = Path.stat
+    stat_paths: list[Path] = []
+
+    def counting_stat(path: Path, *args, **kwargs):
+        stat_paths.append(path)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", counting_stat)
+    candidates = (
+        "sub/../file",
+        "./file",
+        str(repo / "file"),
+        "a//b",
+        "",
+    )
+
+    assert all(not service._nested_repo(str(repo), candidate, {}) for candidate in candidates)
+    assert stat_paths == []
+    assert repo / ".git" not in stat_paths
+
+
+def test_fix_r1_reviewer_probe_keeps_dot_segment_unexcluded(repo: Path) -> None:
+    assert not service._nested_repo(str(repo), "file", {})
+    assert not service._nested_repo(str(repo), "sub/../file", {})
+
+
 def test_t3_hash_failure_stays_unhashable_and_blocks_coverage(repo: Path) -> None:
     (repo / "unreadable.txt").write_text("content", encoding="utf-8")
     with patch.object(service, "_hash", side_effect=OSError("unreadable")):

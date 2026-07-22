@@ -139,8 +139,14 @@ def _source_path(path: str) -> bool:
 
 def _nested_repo(cwd: str, path: str, memo: dict[Path, bool]) -> bool:
     """Return whether a lexical path component below cwd carries a .git marker."""
+    if not path or Path(path).is_absolute():
+        return False
+    lexical_path = path[:-1] if path.endswith("/") else path
+    raw_components = lexical_path.split("/")
+    if any(component in {"", ".", ".."} for component in raw_components):
+        return False
     current = Path(cwd)
-    for component in Path(path).parts:
+    for component in raw_components:
         current = current / component
         if current in memo:
             if memo[current]:
@@ -151,6 +157,7 @@ def _nested_repo(cwd: str, path: str, memo: dict[Path, bool]) -> bool:
         except (FileNotFoundError, NotADirectoryError):
             memo[current] = False
         except OSError:
+            memo[current] = False
             return False
         else:
             memo[current] = True
