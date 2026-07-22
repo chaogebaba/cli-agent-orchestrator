@@ -196,9 +196,12 @@ def _persisted_persona_manifest(terminal_id: str) -> Path | None:
         return None
     candidate = Path(raw) / "cao-personas" / terminal_id / "current" / "persona-manifest.json"
     try:
-        return candidate if candidate.is_file() else None
-    except OSError:
+        candidate.stat()
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise PersonaContextError("persona_manifest_probe_inaccessible") from exc
+    return candidate
 
 
 def _next_generation(terminal_root: Path) -> tuple[str, Path]:

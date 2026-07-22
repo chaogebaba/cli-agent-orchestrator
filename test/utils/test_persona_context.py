@@ -186,6 +186,46 @@ def test_manifest_rehydration_fails_loud_on_invalid_runtime_root(
         persona_env["runtime"].chmod(0o700)
 
 
+def test_manifest_rehydration_fails_loud_on_inaccessible_persona_root(
+    persona_env: dict[str, Path],
+) -> None:
+    persona_env["cwd"].mkdir()
+    plan = compose_persona_plan(
+        "terminal-inaccessible-load",
+        "claude_code",
+        "maker",
+        ContextPolicy(scope="persona"),
+        persona_env["cwd"],
+    )
+    terminal_root = plan.generation_dir.parent
+    terminal_root.chmod(0o000)
+    try:
+        with pytest.raises(PersonaContextError, match="manifest_probe_inaccessible"):
+            load_persona_plan("terminal-inaccessible-load")
+    finally:
+        terminal_root.chmod(0o700)
+
+
+def test_generation_reaper_fails_loud_on_inaccessible_persona_root(
+    persona_env: dict[str, Path],
+) -> None:
+    persona_env["cwd"].mkdir()
+    plan = compose_persona_plan(
+        "terminal-inaccessible-reap",
+        "claude_code",
+        "maker",
+        ContextPolicy(scope="persona"),
+        persona_env["cwd"],
+    )
+    terminal_root = plan.generation_dir.parent
+    terminal_root.chmod(0o000)
+    try:
+        with pytest.raises(PersonaContextError, match="manifest_probe_inaccessible"):
+            reap_persona_generations("terminal-inaccessible-reap")
+    finally:
+        terminal_root.chmod(0o700)
+
+
 @pytest.mark.parametrize(
     "leaf",
     [
