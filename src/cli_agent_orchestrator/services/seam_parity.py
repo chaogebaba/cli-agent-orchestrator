@@ -437,8 +437,17 @@ def record_comparison(
             _write_poison(record)
             marker_written = True
         except Exception:
-            _promotion_inhibited.add(consumer_op)
             logger.error("Failed to write parity poison marker for %s", consumer_op, exc_info=True)
+            try:
+                _write_durable_inhibit(consumer_op)
+                _promotion_inhibited.discard(consumer_op)
+            except Exception:
+                _promotion_inhibited.add(consumer_op)
+                logger.error(
+                    "Failed to write durable parity inhibit marker for %s",
+                    consumer_op,
+                    exc_info=True,
+                )
 
         discard_buffer(consumer_op)
         persisted = False
@@ -472,8 +481,6 @@ def record_comparison(
         if persisted:
             if marker_written:
                 _remove_poison(consumer_op)
-        elif not marker_written:
-            _promotion_inhibited.add(consumer_op)
         return "mismatch"
 
 

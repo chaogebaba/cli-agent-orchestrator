@@ -136,20 +136,28 @@ def _set_phase(sessions, op: str, authority: str, phase: str, build_id: str = "b
         db.commit()
 
 
+@pytest.mark.parametrize(
+    ("none_behavior", "fallback_answer"),
+    [
+        ("none", None),
+        ("legacy", TerminalStatus.COMPLETED),
+        ("watchdog", TerminalStatus.COMPLETED),
+    ],
+)
 def test_t1_collecting_match_mismatch_unavailable_and_resolver_provenance(
-    parity_db, monkeypatch
+    parity_db, monkeypatch, none_behavior, fallback_answer
 ) -> None:
     _receiver_patches(monkeypatch)
     op = "agent_step.status_reads"
     monitor = _monitor(TerminalStatus.COMPLETED, TerminalStatus.COMPLETED)
 
     resolved = receiver_state_view.resolve_rs_answer(
-        "t1", max_age_s=10.0, none_behavior="legacy", monitor=monitor
+        "t1", max_age_s=10.0, none_behavior=none_behavior, monitor=monitor
     )
     assert resolved == receiver_state_view.ResolvedRSAnswer(TerminalStatus.COMPLETED, True)
     assert (
         receiver_state_view.snapshot_view(
-            op, "t1", max_age_s=10.0, none_behavior="legacy", monitor=monitor
+            op, "t1", max_age_s=10.0, none_behavior=none_behavior, monitor=monitor
         )
         is TerminalStatus.COMPLETED
     )
@@ -159,12 +167,12 @@ def test_t1_collecting_match_mismatch_unavailable_and_resolver_provenance(
 
     monitor.receiver_state_store.snapshot_view.return_value = None
     unavailable = receiver_state_view.resolve_rs_answer(
-        "t1", max_age_s=10.0, none_behavior="legacy", monitor=monitor
+        "t1", max_age_s=10.0, none_behavior=none_behavior, monitor=monitor
     )
-    assert unavailable == receiver_state_view.ResolvedRSAnswer(TerminalStatus.COMPLETED, False)
+    assert unavailable == receiver_state_view.ResolvedRSAnswer(fallback_answer, False)
     assert (
         receiver_state_view.snapshot_view(
-            op, "t1", max_age_s=10.0, none_behavior="legacy", monitor=monitor
+            op, "t1", max_age_s=10.0, none_behavior=none_behavior, monitor=monitor
         )
         is TerminalStatus.COMPLETED
     )
@@ -179,7 +187,7 @@ def test_t1_collecting_match_mismatch_unavailable_and_resolver_provenance(
     old_nonce = seam_parity.parity_state(op).window_nonce
     assert (
         receiver_state_view.snapshot_view(
-            op, "t1", max_age_s=10.0, none_behavior="legacy", monitor=monitor
+            op, "t1", max_age_s=10.0, none_behavior=none_behavior, monitor=monitor
         )
         is TerminalStatus.COMPLETED
     )
@@ -627,9 +635,16 @@ def test_t5b_db_failure_leaves_marker_and_durable_inhibition(parity_db, monkeypa
     assert next(row for row in seam_parity.status_rows() if row.consumer_op == op).inhibited
 
 
-def test_t5b_marker_failure_latches_but_still_persists(parity_db, monkeypatch, caplog) -> None:
+def test_t5b_marker_and_inhibit_failure_latches_but_still_persists(
+    parity_db, monkeypatch, caplog
+) -> None:
     op = "watchdog.cached_status"
     monkeypatch.setattr(seam_parity, "_write_poison", MagicMock(side_effect=OSError("disk")))
+    monkeypatch.setattr(
+        seam_parity,
+        "_write_durable_inhibit",
+        MagicMock(side_effect=OSError("inhibit disk")),
+    )
     seam_parity.record_comparison(
         op,
         "collecting",
@@ -758,7 +773,9 @@ def test_t5b_confirmation_wrapper_crash_rolls_back_and_leaves_poison(
     assert seam_parity._poison_path(op).exists()
 
 
-def test_t5b_subprocess_reset_clears_durable_server_inhibition(tmp_path, monkeypatch) -> None:
+def test_t5b_subprocess_reset_clears_marker_failure_server_inhibition(
+    tmp_path, monkeypatch
+) -> None:
     home = tmp_path / "cao-home"
     initial = _run_seam_subprocess(home, "status", "--json")
     assert initial.returncode == 0, initial.stderr
@@ -770,26 +787,27 @@ def test_t5b_subprocess_reset_clears_durable_server_inhibition(tmp_path, monkeyp
     monkeypatch.setattr(seam_activation, "SessionLocal", sessions)
     monkeypatch.setattr(seam_parity, "SessionLocal", sessions)
     monkeypatch.setattr(seam_parity, "SEAM_PARITY_POISON_DIR", home / "seam_parity_poison")
-    seam_parity._promotion_inhibited.clear()
     op = "watchdog.cached_status"
     with sessions() as db:
         row = db.get(database.SeamParityModel, op)
         build_id = str(row.build_id)
-        nonce = str(row.window_nonce)
     monkeypatch.setattr(seam_parity, "_build_id_cache", build_id)
-    seam_parity._write_poison(
-        seam_parity.MismatchRecord(
-            consumer_op=op,
-            build_id=build_id,
-            window_nonce=nonce,
-            phase="collecting",
-            acted_answer="idle",
-            shadow_answer="processing",
-            detail="acted=idle shadow=processing",
-            created_at="2026-07-22T00:00:00+00:00",
-        )
+    monkeypatch.setattr(
+        seam_parity,
+        "_write_poison",
+        MagicMock(side_effect=OSError("poison marker write failed")),
     )
-    seam_parity.startup_repair()
+    assert (
+        seam_parity.record_comparison(
+            op,
+            "collecting",
+            TerminalStatus.IDLE,
+            TerminalStatus.PROCESSING,
+            rs_sourced=True,
+        )
+        == "mismatch"
+    )
+    assert seam_parity._inhibit_path(op).exists()
     assert op not in seam_parity._promotion_inhibited
     assert next(row for row in seam_parity.status_rows() if row.consumer_op == op).inhibited
 
