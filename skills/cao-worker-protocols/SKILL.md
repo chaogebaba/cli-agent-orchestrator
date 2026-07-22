@@ -103,6 +103,16 @@ worker — and are reserved for the human operator alone:
 
 When your charter has you spawn helper or reviewer lanes with `assign`:
 
+- **Probe-safety floor (any brief that touches credentials, sandboxes, or a
+  real agent binary; incident 2026-07-22):** secret-bearing probe trees go
+  under `$HOME` or `$XDG_RUNTIME_DIR` with `chmod 700`/umask 077 — NEVER
+  default-permission `/tmp` (a bwrap probe left 17 world-readable copies of
+  the real `.credentials.json` there). Credential copies: minimum count,
+  0600, shredded in cleanup. bwrap namespaces bind the root READ-ONLY
+  (`--ro-bind / /`) with narrow rw binds for the probe tree only — never
+  `--dev-bind / /` rw. Any `--dangerously-skip-permissions` launch must be
+  fenced so the driven turn cannot write outside the probe tree.
+
 - **Never hand-write your own terminal id into lane briefs.** Your lanes'
   `send_message` with NO `receiver_id` routes to YOU automatically (you are
   their recorded caller) — tell lanes to "call back via send_message,
