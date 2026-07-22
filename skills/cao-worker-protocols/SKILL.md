@@ -103,6 +103,14 @@ worker — and are reserved for the human operator alone:
 
 When your charter has you spawn helper or reviewer lanes with `assign`:
 
+- **Never hand-write your own terminal id into lane briefs.** Your lanes'
+  `send_message` with NO `receiver_id` routes to YOU automatically (you are
+  their recorded caller) — tell lanes to "call back via send_message,
+  omitting receiver_id", not "send to terminal <id>". If you must name an
+  id anyway, take it from `assign`'s RESULT fields or `$CAO_TERMINAL_ID`,
+  never from memory (incident 2026-07-22: a maker misremembered its own id
+  and pointed three lanes at a nonexistent callback).
+
 - **The provider comes from the agent PROFILE, never from a model setting.**
   `assign(agent_profile="grok_dev")` gives a Grok CLI lane; `codex_dev` /
   `codex_reviewer` give Codex lanes; `developer-sonnet` gives a cheap
