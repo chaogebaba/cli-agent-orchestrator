@@ -5240,6 +5240,71 @@ def settle_open_attempt_inferred_delivered(
         return True
 
 
+def settle_attempt_inferred_delivered_batch(
+    attempt_uuid: str,
+    message_ids: list[int],
+    evidence: dict[str, Any],
+    on_confirmed: Callable[[], None] | None = None,
+) -> bool:
+    """Atomically settle one open attempt and its exact DELIVERING member set."""
+
+    class _StaleBatchSettlement(Exception):
+        pass
+
+    expected_ids = set(message_ids)
+    if not expected_ids or len(expected_ids) != len(message_ids):
+        return False
+    try:
+        with SessionLocal.begin() as db:
+            row = (
+                db.query(InboxDeliveryAttemptModel)
+                .filter_by(attempt_uuid=attempt_uuid, settled_at=None)
+                .one_or_none()
+            )
+            if row is None:
+                raise _StaleBatchSettlement
+            member_ids = [
+                member.message_id
+                for member in db.query(InboxDeliveryAttemptMemberModel)
+                .filter_by(attempt_uuid=attempt_uuid)
+                .all()
+            ]
+            if len(member_ids) != len(expected_ids) or set(member_ids) != expected_ids:
+                raise _StaleBatchSettlement
+            changed = (
+                db.query(InboxModel)
+                .filter(
+                    InboxModel.id.in_(expected_ids),
+                    InboxModel.status == MessageStatus.DELIVERING.value,
+                )
+                .update(
+                    {InboxModel.status: MessageStatus.DELIVERED.value},
+                    synchronize_session=False,
+                )
+            )
+            if changed != len(expected_ids):
+                raise _StaleBatchSettlement
+            now = _utcnow()
+            row.outcome = "confirmed"
+            row.reason = "inferred_by_execution"
+            row.evidence = _canonical_json(dict(evidence))
+            row.settled_at = row.last_at = now
+            for message_id in sorted(expected_ids):
+                db.add(
+                    InboxMessageTraceEventModel(
+                        message_id=message_id,
+                        kind="inferred_delivered",
+                        payload=dict(evidence),
+                        created_at=now,
+                    )
+                )
+    except _StaleBatchSettlement:
+        return False
+    if on_confirmed is not None:
+        on_confirmed()
+    return True
+
+
 def transition_pending_to_inferred_delivered(
     message_id: int,
     evidence: dict[str, Any],

@@ -307,7 +307,7 @@ def test_real_deliver_pending_replay_tags_exact_wire_and_trace(scratch_db):
             callback(submitted)
         return submitted
 
-    def confirm(_metadata, digest, _started_at, _evidence=None):
+    def confirm(_metadata, digest, _started_at, _evidence=None, **_kwargs):
         confirmed_digests.append(digest)
         if len(confirmed_digests) == 1:
             return (

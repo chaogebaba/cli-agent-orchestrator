@@ -8,12 +8,14 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import secrets
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import groupby
+from pathlib import Path
 from typing import Any, Callable, Literal, Sequence
 
 from sqlalchemy.exc import OperationalError
@@ -55,6 +57,7 @@ from cli_agent_orchestrator.clients.database import (
     record_wpm1_stalled_notice,
     recover_transcript_binding_if_current,
     recover_wpm2_stale_attempt,
+    settle_attempt_inferred_delivered_batch,
     settle_delivery_attempt,
     settle_delivery_attempt_proof_safe,
     settle_open_attempt_inferred_delivered,
@@ -76,7 +79,7 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
-from cli_agent_orchestrator.services import receiver_state_view, terminal_service
+from cli_agent_orchestrator.services import receiver_state_view, settings_service, terminal_service
 from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.message_trace_service import (
@@ -292,6 +295,90 @@ def classify_permanently_d2_only(attempt: dict, current_observation_epoch: str |
     if current_observation_epoch is None:
         return "transient_snapshot_unavailable"
     return "epoch_mismatch" if epoch != current_observation_epoch else "normal"
+
+
+def is_probable_delivered(evidence: dict) -> bool:
+    """Classify execution evidence without filesystem or service dependencies."""
+    if not isinstance(evidence, dict):
+        return False
+    if evidence.get("receiver_status_at_settle") != TerminalStatus.PROCESSING.value:
+        return False
+    growth = evidence.get("transcript_growth")
+    if not isinstance(growth, dict) or growth.get("inode_stable") is not True:
+        return False
+    size_at_open = growth.get("size_at_open")
+    size_at_settle = growth.get("size_at_settle")
+    if type(size_at_open) is not int or type(size_at_settle) is not int:
+        return False
+    if size_at_settle <= size_at_open:
+        return False
+    if "busy_initial_submit" not in evidence:
+        return True
+    busy = evidence.get("busy_initial_submit")
+    return (
+        isinstance(busy, dict) and busy.get("status_at_submit") == TerminalStatus.PROCESSING.value
+    )
+
+
+def _opener_transcript_ref(evidence: dict[str, Any]) -> dict[str, Any] | None:
+    reference = _lookup_ref(evidence)
+    if reference is None:
+        return None
+    path, inode, size = reference
+    return {"path": path, "inode": inode, "size": size}
+
+
+def _classify_probable_delivery(
+    evidence: dict[str, Any],
+    terminal_id: str,
+    opener_ref: dict[str, Any] | None,
+) -> dict[str, Any]:
+    classified = dict(evidence) if isinstance(evidence, dict) else {}
+    try:
+        receiver_status = status_monitor.get_status(terminal_id)
+    except Exception:
+        receiver_status = None
+    classified["receiver_status_at_settle"] = (
+        receiver_status.value if isinstance(receiver_status, TerminalStatus) else "unknown"
+    )
+    growth = None
+    if opener_ref is not None:
+        path = opener_ref.get("path")
+        inode = opener_ref.get("inode")
+        size = opener_ref.get("size")
+        if isinstance(path, str) and path and type(size) is int:
+            try:
+                settled = Path(path).stat()
+            except (OSError, ValueError):
+                pass
+            else:
+                growth = {
+                    "size_at_open": size,
+                    "size_at_settle": settled.st_size,
+                    "inode_stable": type(inode) is int and settled.st_ino == inode,
+                }
+    classified["transcript_growth"] = growth
+    return classified
+
+
+def _confirmation_timeout_seconds() -> float:
+    defaults = settings_service.get_provider_defaults("inbox")
+    if "confirmation_timeout_seconds" not in defaults:
+        return 10.0
+    raw = defaults["confirmation_timeout_seconds"]
+    try:
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ValueError
+        timeout = float(raw)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError
+    except (OverflowError, TypeError, ValueError):
+        logger.warning(
+            "Invalid [inbox] confirmation_timeout_seconds=%r; using default 10.0",
+            raw,
+        )
+        return 10.0
+    return timeout
 
 
 _delivery_locks: dict[str, threading.Lock] = {}
@@ -764,6 +851,52 @@ class InboxService:
             stalled_callback_watchdog.record_inbound_task(
                 terminal_id, metadata["caller_id"], metadata.get("agent_profile") or ""
             )
+
+    def _settle_probable_delivered(
+        self,
+        attempt_uuid: str,
+        message_ids: list[int],
+        batch: Sequence[InboxMessage],
+        evidence: dict[str, Any],
+        opener_ref: dict[str, Any] | None,
+        terminal_id: str,
+        sender_id: str,
+        orchestration_type: OrchestrationType,
+        metadata: dict[str, Any],
+        park_warm: bool,
+    ) -> tuple[bool, dict[str, Any]]:
+        classified = _classify_probable_delivery(evidence, terminal_id, opener_ref)
+        if not is_probable_delivered(classified):
+            return False, classified
+        settlement_evidence = {**classified, "kind": "execution_evidence"}
+        ordered_ids = sorted(message_ids)
+        won = _confirmed_settlement(
+            lambda: settle_attempt_inferred_delivered_batch(
+                attempt_uuid,
+                ordered_ids,
+                settlement_evidence,
+                on_confirmed=lambda: self._commit_watchdog_ops(
+                    terminal_id,
+                    sender_id,
+                    orchestration_type,
+                    metadata,
+                    park_warm,
+                ),
+            )
+        )
+        if not won:
+            return False, classified
+        growth = settlement_evidence["transcript_growth"]
+        assert isinstance(growth, dict)
+        growth_bytes = growth["size_at_settle"] - growth["size_at_open"]
+        logger.info(
+            "probable_delivered mids=%s receiver=%s growth=%s",
+            ordered_ids,
+            terminal_id,
+            growth_bytes,
+        )
+        self._evict_defer_state(batch)
+        return True, settlement_evidence
 
     @staticmethod
     def _exact_batch_attempts(message_ids: list[int]) -> list[dict]:
@@ -1466,6 +1599,7 @@ class InboxService:
                         if gate_state == "inject" and isinstance(gate_evidence, dict)
                         else transcript_ref(resolution)
                     )
+                    opener_ref = _opener_transcript_ref(persisted_evidence)
                     successor_plans: list[SuccessorLookupPlan] = []
                     carried_plans = persisted_evidence.pop("_successor_lookup_plans", ())
                     if isinstance(carried_plans, tuple) and all(
@@ -1908,6 +2042,23 @@ class InboxService:
                         return
                     attempt_uuid = opened.attempt_uuid
                     assert attempt_uuid is not None
+
+                    def settle_probable_delivery(
+                        candidate_evidence: dict[str, Any],
+                    ) -> tuple[bool, dict[str, Any]]:
+                        return self._settle_probable_delivered(
+                            attempt_uuid,
+                            message_ids,
+                            batch,
+                            candidate_evidence,
+                            opener_ref,
+                            terminal_id,
+                            sender_id,
+                            orchestration_type,
+                            metadata,
+                            park_warm,
+                        )
+
                     authority_lock = None
                     candidate_logical_id = getattr(batch[0], "logical_receiver_id", None)
                     logical_receiver_id = (
@@ -2008,9 +2159,14 @@ class InboxService:
                         if submit_observation is None:
                             raise
                         self._reset_identity_authority(terminal_id)
+                        probable, classified_evidence = settle_probable_delivery(
+                            submit_evidence or {}
+                        )
+                        if probable:
+                            return
                         settle_delivery_attempt_proof_safe(
                             attempt_uuid,
-                            submit_evidence or {},
+                            classified_evidence,
                             status_monitor.get_status_gen(terminal_id),
                         )
                         return
@@ -2039,9 +2195,14 @@ class InboxService:
                         if submit_observation is None and legacy_test_seam:
                             raise
                         self._reset_identity_authority(terminal_id)
+                        probable, classified_evidence = settle_probable_delivery(
+                            submit_evidence or dict(persisted_evidence)
+                        )
+                        if probable:
+                            return
                         settle_delivery_attempt_proof_safe(
                             attempt_uuid,
-                            submit_evidence or dict(persisted_evidence),
+                            classified_evidence,
                             status_monitor.get_status_gen(terminal_id),
                         )
                         return
@@ -2054,6 +2215,7 @@ class InboxService:
                         digest,
                         current_attempt["started_at"],
                         current_attempt.get("evidence"),
+                        timeout=_confirmation_timeout_seconds(),
                     )
                     if successor_source is not None:
                         evidence = {**current_attempt.get("evidence", {}), **evidence}
@@ -2104,15 +2266,9 @@ class InboxService:
                             ),
                         )
                     else:
-                        try:
-                            receiver_status = status_monitor.get_status(terminal_id)
-                        except Exception:
-                            receiver_status = None
-                        evidence["receiver_status_at_settle"] = (
-                            receiver_status.value
-                            if isinstance(receiver_status, TerminalStatus)
-                            else "unknown"
-                        )
+                        probable, evidence = settle_probable_delivery(evidence)
+                        if probable:
+                            return
                         settle_delivery_attempt(
                             attempt_uuid,
                             MessageStatus.PENDING,
@@ -2133,9 +2289,14 @@ class InboxService:
                     if attempt_uuid:
                         self._reset_identity_authority(terminal_id)
                         if submit_evidence is not None:
+                            probable, classified_evidence = settle_probable_delivery(
+                                submit_evidence
+                            )
+                            if probable:
+                                return
                             settle_delivery_attempt_proof_safe(
                                 attempt_uuid,
-                                submit_evidence,
+                                classified_evidence,
                                 status_monitor.get_status_gen(terminal_id),
                             )
                             return
@@ -2155,9 +2316,14 @@ class InboxService:
                     if attempt_uuid:
                         self._reset_identity_authority(terminal_id)
                         if submit_evidence is not None:
+                            probable, classified_evidence = settle_probable_delivery(
+                                submit_evidence
+                            )
+                            if probable:
+                                return
                             settle_delivery_attempt_proof_safe(
                                 attempt_uuid,
-                                submit_evidence,
+                                classified_evidence,
                                 status_monitor.get_status_gen(terminal_id),
                             )
                             return
@@ -2181,9 +2347,14 @@ class InboxService:
                     # optimistically set to DELIVERED above. (#271 semantic.)
                     if attempt_uuid:
                         if submit_evidence is not None:
+                            probable, classified_evidence = settle_probable_delivery(
+                                submit_evidence
+                            )
+                            if probable:
+                                return
                             settle_delivery_attempt_proof_safe(
                                 attempt_uuid,
-                                submit_evidence,
+                                classified_evidence,
                                 status_monitor.get_status_gen(terminal_id),
                             )
                             return
@@ -2212,9 +2383,14 @@ class InboxService:
                                 attempt_uuid, MessageStatus.FAILED, "failed", error=str(e)
                             )
                         else:
+                            probable, classified_evidence = settle_probable_delivery(
+                                submit_evidence or {}
+                            )
+                            if probable:
+                                return
                             result = settle_delivery_attempt_proof_safe(
                                 attempt_uuid,
-                                submit_evidence or {},
+                                classified_evidence,
                                 status_monitor.get_status_gen(terminal_id),
                             )
                             return
