@@ -1759,6 +1759,55 @@ class TestCodexStatuslineCorpus:
         assert provider.extract_last_message_from_script(output) == "• Clean answer."
 
 
+class TestCodexFooterFalsePositiveGuards:
+    @pytest.mark.parametrize(
+        ("output", "expected"),
+        [
+            (
+                "› Where is it?\n• It is here:\n/tmp/project/output.txt",
+                "• It is here:\n/tmp/project/output.txt",
+            ),
+            (
+                "› Where is it?\n• It is here:\n~/project/output.txt",
+                "• It is here:\n~/project/output.txt",
+            ),
+            (
+                "› How long?\n• You have 3h 12m left",
+                "• You have 3h 12m left",
+            ),
+            (
+                "› What remains?\n• Context 58% left",
+                "• Context 58% left",
+            ),
+            (
+                "› Which model?\n• gpt-5.6-sol high",
+                "• gpt-5.6-sol high",
+            ),
+        ],
+    )
+    def test_content_shaped_footer_tokens_are_not_cutoffs(self, output, expected):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script(output) == expected
+
+    def test_stacked_chrome_fits_the_five_line_tail_bound(self):
+        output = (
+            "› Fix the parser.\n"
+            "• Parser fixed.\n"
+            "\n"
+            "› Run /review on my current changes\n"
+            "\n"
+            "  ? for shortcuts\n"
+            "\n"
+            "  ~/project · main · gpt-5.6-sol high · Context 100% left\n"
+        )
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script(output) == "• Parser fixed."
+
+
 class TestCodexBulletFormatStatusDetection:
     """Tests for Codex's real interactive output format using › prompt and • bullets."""
 

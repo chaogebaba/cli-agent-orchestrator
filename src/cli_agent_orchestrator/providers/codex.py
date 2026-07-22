@@ -136,7 +136,11 @@ _TUI_LIMIT_RE = (
 )
 _TUI_MODEL_EFFORT_RE = r"[^·\n]+?\s+(?:minimal|low|medium|high|xhigh|max|ultra)"
 TUI_FOOTER_PATTERN = (
-    r"(?i)(?:\?\s+for shortcuts|" + _TUI_CONTEXT_RE + r"|" + _TUI_LIMIT_RE + r"|·\s+[~/])"
+    r"(?i)^\s*(?:\?\s+for shortcuts(?:\s+.*)?|"
+    + _TUI_CONTEXT_RE
+    + r"|"
+    + _TUI_LIMIT_RE
+    + r"|[^›\n]+·\s+[~/][^\n]*)\s*$"
 )
 _TUI_PATH_WITH_KNOWN_TAIL_RE = re.compile(
     rf"^[~/][^\n›]*\s+·\s+{_TUI_MODEL_EFFORT_RE}"
@@ -300,24 +304,13 @@ def _compute_tui_footer_cutoff(all_lines: list[str]) -> int:
     footer is found.
     """
     n = len(all_lines)
-    footer_start_idx = n
-
     last_nonempty = next(
         (i for i in range(n - 1, -1, -1) if all_lines[i].strip()),
         -1,
     )
+    footer_start_idx = _find_tui_footer_index(all_lines)
 
-    # Find the status bar line (last footer match in the bottom area).
-    for i in range(
-        last_nonempty,
-        max(last_nonempty - IDLE_PROMPT_TAIL_LINES, -1),
-        -1,
-    ):
-        if _is_tui_footer_line(all_lines[i], bottom=i == last_nonempty):
-            footer_start_idx = i
-            break
-
-    if footer_start_idx == n:
+    if footer_start_idx is None:
         # A five-hour-only config can render no status row at all. In that
         # case, recognize Codex's dim suggestion text as chrome so it cannot
         # become a false user message in status or extraction parsing.
@@ -343,29 +336,73 @@ def _compute_tui_footer_cutoff(all_lines: list[str]) -> int:
     return len("\n".join(all_lines[:footer_start_idx]))
 
 
-def _is_tui_footer_line(line: str, *, bottom: bool = False) -> bool:
-    """Return whether a rendered row is Codex footer chrome.
-
-    Token matches are safe anywhere in the pane tail. The generic middle-dot
-    shape is only accepted for the bottom-most non-empty row, where status_line
-    renders its compact path/model segments.
-    """
+def _tui_footer_candidate_strength(line: str) -> str | None:
+    """Return ``strong``/``weak`` for a whole-row footer candidate."""
     clean = strip_terminal_escapes(line).strip()
-    if not clean or "›" in clean:
-        return False
-    if re.search(TUI_FOOTER_PATTERN, clean):
-        return True
-    if not bottom or len(clean) > 240:
-        return False
+    if (
+        not clean
+        or len(clean) > 240
+        or "›" in clean
+        or re.match(ASSISTANT_PREFIX_PATTERN, clean, re.IGNORECASE)
+        or re.match(USER_PREFIX_PATTERN, clean, re.IGNORECASE)
+    ):
+        return None
+    if re.fullmatch(r"\?\s+for shortcuts(?:\s+.*)?", clean, re.IGNORECASE):
+        return "strong"
+    if re.fullmatch(TUI_FOOTER_PATTERN, clean):
+        legacy_path_last = bool(re.search(r"·\s+[~/]", clean))
+        return "strong" if legacy_path_last else "weak"
     # Anchor multi-segment status rows from the known right-hand grammar. Do
     # not split on middle dots: paths and branch names may contain them.
     if _TUI_PATH_WITH_KNOWN_TAIL_RE.fullmatch(clean):
-        return True
+        return "strong"
+    if _TUI_PATH_BRANCH_ONLY_RE.fullmatch(clean):
+        return "strong"
     if _TUI_PATH_TRUNCATED_RE.fullmatch(clean):
-        return True
-    # Configs with only current-dir, or current-dir + git-branch, legitimately
-    # collapse to a path (with or without a branch) and no trailing separator.
-    return bool(_TUI_PATH_ONLY_RE.fullmatch(clean) or _TUI_PATH_BRANCH_ONLY_RE.fullmatch(clean))
+        return "weak"
+    if _TUI_PATH_ONLY_RE.fullmatch(clean):
+        return "weak"
+    return None
+
+
+def _has_composer_anchor(all_lines: list[str], footer_idx: int, *, strong: bool) -> bool:
+    """Tie a footer candidate to nearby composer chrome above it."""
+    saw_separator = False
+    lower_bound = max(0, footer_idx - IDLE_PROMPT_TAIL_LINES)
+    for index in range(footer_idx - 1, lower_bound - 1, -1):
+        clean = strip_terminal_escapes(all_lines[index]).strip()
+        if not clean:
+            saw_separator = True
+            continue
+        if re.fullmatch(r"\?\s+for shortcuts(?:\s+.*)?", clean, re.IGNORECASE):
+            saw_separator = True
+            continue
+        if re.match(rf"{IDLE_PROMPT_SCREEN_PATTERN}", clean, re.IGNORECASE):
+            return (
+                strong
+                or saw_separator
+                or _is_known_composer_placeholder(clean)
+                or re.fullmatch(IDLE_PROMPT_STRICT_PATTERN, clean, re.IGNORECASE) is not None
+            )
+        if not strong:
+            return False
+    return False
+
+
+def _find_tui_footer_index(all_lines: list[str]) -> int | None:
+    """Return the structurally anchored bottom footer row, if present."""
+    last_nonempty = next(
+        (i for i in range(len(all_lines) - 1, -1, -1) if all_lines[i].strip()),
+        -1,
+    )
+    if last_nonempty < 0:
+        return None
+    strength = _tui_footer_candidate_strength(all_lines[last_nonempty])
+    if strength is None:
+        return None
+    if not _has_composer_anchor(all_lines, last_nonempty, strong=strength == "strong"):
+        return None
+    return last_nonempty
 
 
 def _is_known_composer_placeholder(line: str) -> bool:
@@ -400,11 +437,7 @@ def _has_tui_footer_in_tail(all_lines: list[str]) -> bool:
         # Preserve the historical full-screen capture behavior: old path-last
         # fixtures with a large blank viewport tail did not activate cutoff.
         return False
-    tail_start = max(0, last_nonempty - IDLE_PROMPT_TAIL_LINES + 1)
-    return any(
-        _is_tui_footer_line(line, bottom=tail_start + offset == last_nonempty)
-        for offset, line in enumerate(all_lines[tail_start : last_nonempty + 1])
-    )
+    return _find_tui_footer_index(all_lines) is not None
 
 
 def _toml_scalar(value: Any) -> str:
@@ -1264,18 +1297,27 @@ class CodexProvider(BaseProvider):
         self, rows: list[str], classification: ScreenClassificationResult
     ) -> str | None:
         clean_rows = [strip_terminal_escapes(row) for row in rows]
+        footer_index = _find_tui_footer_index(clean_rows)
+        strong_footer_indices = {
+            index
+            for index, row in enumerate(clean_rows)
+            if _tui_footer_candidate_strength(row) == "strong"
+            and bool(re.search(r"·\s+[~/]|\?\s+for shortcuts", row, re.IGNORECASE))
+        }
         state = "neutral"
         banner_rows: list[str] = []
 
-        for row in clean_rows:
+        for index, row in enumerate(clean_rows):
             if re.search(USER_PREFIX_PATTERN, row):
                 state = "user"
                 continue
             if re.search(ASSISTANT_PREFIX_PATTERN, row):
                 state = "assistant"
                 continue
-            if re.search(TUI_FOOTER_PATTERN, row) or re.search(
-                IDLE_PROMPT_STRICT_PATTERN, row, re.IGNORECASE
+            if (
+                index == footer_index
+                or index in strong_footer_indices
+                or re.search(IDLE_PROMPT_STRICT_PATTERN, row, re.IGNORECASE)
             ):
                 state = "neutral"
                 continue
@@ -1345,11 +1387,9 @@ class CodexProvider(BaseProvider):
             (i for i in range(len(plain_lines) - 1, -1, -1) if plain_lines[i].strip()),
             -1,
         )
-        footer_idx = len(plain_lines)
-        for i in range(len(plain_lines) - 1, -1, -1):
-            if _is_tui_footer_line(plain_lines[i], bottom=i == last_nonempty):
-                footer_idx = i
-                break
+        footer_idx = _find_tui_footer_index(plain_lines)
+        if footer_idx is None:
+            footer_idx = len(plain_lines)
 
         search_end = footer_idx
         while search_end > 0 and not plain_lines[search_end - 1].strip():
@@ -1391,7 +1431,12 @@ class CodexProvider(BaseProvider):
             text = line.strip()
             # Defense in depth: a status_line row must never become draft text,
             # even if a future footer variant misses the primary detector.
-            if _is_tui_footer_line(line, bottom=offset == last_nonempty):
+            candidate = _tui_footer_candidate_strength(line)
+            if (
+                offset == last_nonempty
+                and candidate is not None
+                and _has_composer_anchor(plain_lines, offset, strong=candidate == "strong")
+            ):
                 continue
             if not text:
                 segments.append("")

@@ -36,7 +36,6 @@ Run:
     uv run pytest -m e2e test/e2e/test_assign.py -v -k copilot
 """
 
-import re
 import time
 import uuid
 from test.e2e.conftest import (
@@ -46,6 +45,7 @@ from test.e2e.conftest import (
     get_terminal_status,
     wait_for_status,
 )
+from test.e2e.statusline_leak import assert_no_codex_statusline_leak
 
 import pytest
 import requests
@@ -169,15 +169,7 @@ def _run_assign_test(provider: str, agent_profile: str, task_message: str, conte
         # No TUI chrome leaking
         assert "? for shortcuts" not in output, "TUI footer leaked into output"
         assert "context left" not in output, "TUI status bar leaked into output"
-        assert (
-            re.search(r"(?i)context\s+\d+%\s+left", output) is None
-        ), "TUI context status leaked into output"
-        assert (
-            re.search(r"(?i)\d+%\s+(?:context\s+)?left", output) is None
-        ), "TUI percentage status leaked into output"
-        assert (
-            re.search(r"(?m)^\s*[~/][^·\n]*·(?:[^·\n]+·?)+\s*$", output) is None
-        ), "TUI path-first status leaked into output"
+        assert_no_codex_statusline_leak(output)
 
         output_lower = output.lower()
         matched = [kw for kw in content_keywords if kw.lower() in output_lower]
