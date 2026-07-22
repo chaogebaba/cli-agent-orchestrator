@@ -672,6 +672,9 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("sandbox startup lost its manifest binding")
         assert_sandbox_db_fence(active_manifest)
     init_db()
+    from cli_agent_orchestrator.utils.persona_context import reconcile_retained_persona_homes
+
+    reconcile_retained_persona_homes()
     # Parity repair is a fail-stop startup gate: no consumer may observe stale
     # build/phase state or a known-poisoned receiver-state authority.
     seam_parity.startup_repair()

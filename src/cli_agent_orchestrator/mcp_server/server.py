@@ -1173,6 +1173,7 @@ def _assign_impl(
                 provider=provider,
                 session_uuid=row["session_uuid"],
                 cwd=row["cwd"],
+                source_terminal_id=row.get("source_terminal_id"),
             )
             if resume:
                 try:

@@ -20,6 +20,7 @@ from cli_agent_orchestrator.clients.database import (
     get_current_transcript_binding,
     update_terminal_provider_session_id_if_null,
 )
+from cli_agent_orchestrator.utils import provider_plane
 from cli_agent_orchestrator.utils.provider_plane import provider_home
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,15 @@ _unresolved_warned_lock = threading.Lock()
 _binding_staleness_lock = threading.Lock()
 
 FileTriple = tuple[int, int, int]
+
+
+def _resolved_codex_home(terminal_id: str | None) -> Path:
+    from cli_agent_orchestrator.utils.persona_context import resolve_codex_home
+
+    resolved = resolve_codex_home(terminal_id)
+    if resolved == provider_plane.provider_home("codex").home:
+        return provider_home("codex").home
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -259,7 +269,7 @@ def _fd_codex_session(metadata: dict) -> str | None:
         from cli_agent_orchestrator.services.fork_context_service import _descendants, pane_pid
 
         candidates = set()
-        sessions_root = provider_home("codex").sessions.resolve()
+        sessions_root = (_resolved_codex_home(metadata.get("id")) / "sessions").resolve()
         for pid in _descendants(pane_pid(metadata["tmux_session"], metadata["tmux_window"])):
             for fd in Path(f"/proc/{pid}/fd").iterdir():
                 try:
@@ -410,7 +420,9 @@ def resolve_session_transcript(metadata: dict) -> TranscriptResolution | None:
             )
         return None
     if provider == "codex":
-        matches = list(provider_home("codex").sessions.glob(f"**/*{session_id}*.jsonl"))
+        matches = list(
+            (_resolved_codex_home(metadata.get("id")) / "sessions").glob(f"**/*{session_id}*.jsonl")
+        )
         return candidate(matches[0], "uuid_glob") if len(matches) == 1 else None
     cwd = metadata.get("working_directory") or metadata.get("cwd")
     if not cwd:

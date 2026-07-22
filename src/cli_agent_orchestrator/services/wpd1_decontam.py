@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -40,9 +41,7 @@ RECOVERY_NUDGE_MESSAGE = (
 SCREEN_TO_ARTIFACT_RULE = {
     CONTENT_POLICY_SCREEN_RULE_ID: CONTENT_POLICY_ARTIFACT_RULE_ID,
 }
-FINAL_STAGES = frozenset(
-    {"backup", "scrub", "validate", "install", "resume", "settle", "complete"}
-)
+FINAL_STAGES = frozenset({"backup", "scrub", "validate", "install", "resume", "settle", "complete"})
 NUDGE_STATUSES = frozenset({"sent", "skipped", "failed", "not_attempted"})
 NUDGE_SKIP_REASONS = frozenset({"no-nudge-flag", "caller-unresolvable"})
 _RULE_ID_RE = re.compile(r"^[a-z0-9.\-]+$")
@@ -153,9 +152,7 @@ SCHEMA_0144: dict[str, dict[str | None, dict[str, dict[str, frozenset[str]]]]] =
             }
         ),
         "thread_rolled_back": _spec({"num_turns": ["integer"], "type": ["string"]}),
-        "thread_settings_applied": _spec(
-            {"thread_settings": ["object"], "type": ["string"]}
-        ),
+        "thread_settings_applied": _spec({"thread_settings": ["object"], "type": ["string"]}),
         "token_count": _spec(
             {
                 "info": ["null", "object"],
@@ -185,9 +182,7 @@ SCHEMA_0144: dict[str, dict[str | None, dict[str, dict[str, frozenset[str]]]]] =
             }
         ),
     },
-    "inter_agent_communication_metadata": {
-        None: _spec({"trigger_turn": ["bool"]})
-    },
+    "inter_agent_communication_metadata": {None: _spec({"trigger_turn": ["bool"]})},
     "response_item": {
         "agent_message": _spec(
             {
@@ -466,8 +461,17 @@ def validate_artifact(path: Path, session_uuid: str) -> list[dict]:
     return validate_artifact_bytes(_read_regular(path), session_uuid, path.name)
 
 
-def find_artifact(session_uuid: str) -> Path:
-    matches = list(provider_home("codex").sessions.glob(f"**/rollout-*{session_uuid}*.jsonl"))
+def find_artifact(session_uuid: str, terminal_id: str | None = None) -> Path:
+    from cli_agent_orchestrator.utils import provider_plane
+    from cli_agent_orchestrator.utils.persona_context import resolve_codex_home
+
+    pattern = f"**/rollout-*{session_uuid}*.jsonl"
+    sessions_dir = provider_home("codex").sessions
+    if terminal_id is not None:
+        resolved_home = resolve_codex_home(terminal_id)
+        if resolved_home != provider_plane.provider_home("codex").home:
+            sessions_dir = resolved_home / "sessions"
+    matches = list(sessions_dir.glob(pattern))
     if not matches:
         raise DecontaminationError("session_artifact_missing", "backup")
     if len(matches) != 1:
@@ -623,9 +627,7 @@ def discover_artifact_spans(records: Sequence[dict]) -> tuple[Span, ...]:
                     start=match.start(),
                     end=match.end(),
                     replacement_policy=NEUTRAL_REPLACEMENT_POLICY,
-                    expected_preimage_sha256=hashlib.sha256(
-                        preimage.encode("utf-8")
-                    ).hexdigest(),
+                    expected_preimage_sha256=hashlib.sha256(preimage.encode("utf-8")).hexdigest(),
                     rule_id=CONTENT_POLICY_ARTIFACT_RULE_ID,
                 )
             )
@@ -927,9 +929,7 @@ def _validate_attempt(attempt: Any) -> None:
         raise DecontaminationError("incident_attempt_fields_invalid", "validate")
     if not _is_iso8601_utc(attempt["started_at"]):
         raise DecontaminationError("incident_attempt_started_invalid", "validate")
-    if attempt["finished_at"] is not None and not _is_iso8601_utc(
-        attempt["finished_at"]
-    ):
+    if attempt["finished_at"] is not None and not _is_iso8601_utc(attempt["finished_at"]):
         raise DecontaminationError("incident_attempt_finished_invalid", "validate")
     if attempt["final_stage"] not in FINAL_STAGES:
         raise DecontaminationError("incident_attempt_stage_invalid", "validate")
@@ -985,9 +985,7 @@ def mutate_incident(
         validate_incident_record(updated)
         _atomic_private_write(
             path,
-            (json.dumps(updated, sort_keys=True, separators=(",", ":")) + "\n").encode(
-                "utf-8"
-            ),
+            (json.dumps(updated, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"),
         )
         return updated
     finally:
@@ -1114,12 +1112,7 @@ def update_incident_nudge(
 
 
 def _create_private_file(path: Path, content: bytes) -> None:
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags, 0o600)
         with os.fdopen(fd, "wb") as stream:
@@ -1228,9 +1221,7 @@ def prepare_content_recovery(
     original: bytes | None = None
     scrub_result: ScrubResult | None = None
     installed = False
-    incident_dir = incident_directory(
-        terminal_id, lifecycle_generation, log_dir=log_dir
-    )
+    incident_dir = incident_directory(terminal_id, lifecycle_generation, log_dir=log_dir)
     try:
         initial = _initial_incident(
             terminal_id=terminal_id,
@@ -1244,7 +1235,14 @@ def prepare_content_recovery(
             prior_incident=None,
         )
         attempt_index, _record = _append_attempt(incident_dir, initial=initial, force=force)
-        artifact_path = find_artifact(session_uuid)
+        finder = find_artifact
+        parameters = inspect.signature(finder).parameters
+        if "terminal_id" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters.values()
+        ):
+            artifact_path = finder(session_uuid, terminal_id)
+        else:
+            artifact_path = finder(session_uuid)
         original_identity = artifact_identity(artifact_path)
         original = _read_regular(artifact_path)
         backup_path = incident_dir / f"backup-{attempt_index + 1:04d}.jsonl"
@@ -1252,7 +1250,9 @@ def prepare_content_recovery(
         records = validate_artifact_bytes(original, session_uuid, artifact_path.name)
         spans = list(discover_artifact_spans(records))
         spans.extend(ad_hoc_spans)
-        cpa_result = discover_cpa_spans(records) if use_cpa else CpaDiscoveryResult((), 0, False, True)
+        cpa_result = (
+            discover_cpa_spans(records) if use_cpa else CpaDiscoveryResult((), 0, False, True)
+        )
         if cpa_result.human_gate_required:
             raise DecontaminationError("cpa_truncated_human_gate_required", "scrub")
         spans.extend(cpa_result.spans)
@@ -1267,9 +1267,7 @@ def prepare_content_recovery(
         detail_path = incident_dir / f"span-detail-{attempt_index + 1:04d}.json"
         _create_private_file(
             detail_path,
-            (json.dumps(detail, sort_keys=True, separators=(",", ":")) + "\n").encode(
-                "utf-8"
-            ),
+            (json.dumps(detail, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"),
         )
         _validate_artifact_lease(lease)
         if artifact_identity(artifact_path) != original_identity:
@@ -1317,9 +1315,7 @@ def prepare_content_recovery(
                         attempt = attempts[attempt_index]
                         attempt["final_stage"] = stage if stage in FINAL_STAGES else "backup"
                         attempt["finished_at"] = _utcnow()
-                        attempt["result"] = (
-                            "failed" if restored or not installed else "aborted"
-                        )
+                        attempt["result"] = "failed" if restored or not installed else "aborted"
                         if scrub_result is not None:
                             attempt["scrub_summary"] = {
                                 "span_count": scrub_result.span_count,

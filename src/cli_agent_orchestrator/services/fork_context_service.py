@@ -22,10 +22,19 @@ from cli_agent_orchestrator.clients.database import (
     retire_provider_session,
     update_terminal_provider_session_id,
 )
+from cli_agent_orchestrator.utils import provider_plane
+from cli_agent_orchestrator.utils.persona_context import resolve_codex_home
 from cli_agent_orchestrator.utils.provider_plane import provider_home
 from cli_agent_orchestrator.utils.tmux_command import tmux_argv
 
 logger = logging.getLogger(__name__)
+
+
+def _resolved_codex_home(terminal_id: str | None) -> Path:
+    resolved = resolve_codex_home(terminal_id)
+    if resolved == provider_plane.provider_home("codex").home:
+        return provider_home("codex").home
+    return resolved
 
 
 class ForkContextError(ValueError):
@@ -411,8 +420,10 @@ def pane_launch_epoch(pid: int) -> float:
     return btime + start_ticks / os.sysconf("SC_CLK_TCK")
 
 
-def capture_codex_uuid(root_pid: int, launch_time: float, cwd: str) -> str:
-    sessions_root = provider_home("codex").sessions.resolve()
+def capture_codex_uuid(
+    root_pid: int, launch_time: float, cwd: str, terminal_id: str | None = None
+) -> str:
+    sessions_root = (_resolved_codex_home(terminal_id) / "sessions").resolve()
     for attempt in range(3):
         candidates: set[Path] = set()
         try:
@@ -432,20 +443,25 @@ def capture_codex_uuid(root_pid: int, launch_time: float, cwd: str) -> str:
                 p = candidates.pop()
                 first = json.loads(p.open().readline())
                 sid = first["payload"]["id"]
-                if first["type"] == "session_meta" and sid in p.name:
+                if first["type"] == "session_meta" and isinstance(sid, str) and sid in p.name:
                     return sid
                 raise ForkContextError("session_capture_mismatch")
         except OSError:
             pass
         if attempt < 2:
             time.sleep(1)
-    matches = []
+    matches: list[tuple[Path, str]] = []
     now = time.time()
-    for p in provider_home("codex").sessions.glob("**/rollout-*.jsonl"):
+    for p in (_resolved_codex_home(terminal_id) / "sessions").glob("**/rollout-*.jsonl"):
         try:
             meta = json.loads(p.open().readline())["payload"]
-            if meta.get("cwd") == cwd and launch_time <= p.stat().st_mtime <= now:
-                matches.append((p, meta["id"]))
+            session_id = meta.get("id")
+            if (
+                meta.get("cwd") == cwd
+                and isinstance(session_id, str)
+                and launch_time <= p.stat().st_mtime <= now
+            ):
+                matches.append((p, session_id))
         except (OSError, KeyError, json.JSONDecodeError):
             pass
     if len(matches) != 1:
@@ -486,6 +502,7 @@ def validate_base_source(
     cwd: str,
     name: str | None = None,
     agent_profile: str | None = None,
+    source_terminal_id: str | None = None,
 ) -> dict[str, str]:
     """Validate stored provider history under an explicit strict or legacy mode.
 
@@ -497,7 +514,9 @@ def validate_base_source(
         if provider == "codex":
             found = any(
                 session_uuid in path.name
-                for path in provider_home("codex").sessions.glob("**/rollout-*.jsonl")
+                for path in (_resolved_codex_home(source_terminal_id) / "sessions").glob(
+                    "**/rollout-*.jsonl"
+                )
             )
         else:
             found = (
@@ -553,7 +572,7 @@ def validate_base_source(
 
     validator = provider_manager.construct_provider(
         provider,
-        "offline-base",
+        source_terminal_id or "offline-base",
         "offline-base",
         "offline-base",
         agent_profile=agent_profile,
@@ -584,7 +603,11 @@ def validate_base_source(
         )
 
     if provider == "codex":
-        matches = list(provider_home("codex").sessions.glob(f"**/rollout-*{session_uuid}*.jsonl"))
+        matches = list(
+            (_resolved_codex_home(source_terminal_id) / "sessions").glob(
+                f"**/rollout-*{session_uuid}*.jsonl"
+            )
+        )
         try:
             with matches[0].open(encoding="utf-8") as stream:
                 payload_cwd = json.loads(stream.readline()).get("payload", {}).get("cwd")
@@ -684,14 +707,18 @@ def mark_ready(
         cwd = get_backend().get_pane_working_directory(
             terminal["tmux_session"], terminal["tmux_window"]
         )
+    if not isinstance(cwd, str) or not cwd:
+        raise ForkContextError("terminal_cwd_unavailable")
+    session_uuid: str
     provider = terminal["provider"]
     if provider == "codex":
         pid = pane_pid(terminal["tmux_session"], terminal["tmux_window"])
-        session_uuid = capture_codex_uuid(pid, pane_launch_epoch(pid), cwd)
+        session_uuid = capture_codex_uuid(pid, pane_launch_epoch(pid), cwd, terminal_id=terminal_id)
     elif provider == "grok_cli":
-        session_uuid = terminal.get("provider_session_id")
-        if not session_uuid:
+        candidate_uuid = terminal.get("provider_session_id")
+        if not isinstance(candidate_uuid, str) or not candidate_uuid:
             raise ForkContextError("base_session_unset")
+        session_uuid = candidate_uuid
     else:
         raise ForkContextError("provider_lacks_fork_capability")
     captured = snapshot(cwd)
