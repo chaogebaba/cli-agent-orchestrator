@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import time
@@ -23,6 +24,8 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.utils.provider_plane import provider_home
 from cli_agent_orchestrator.utils.tmux_command import tmux_argv
+
+logger = logging.getLogger(__name__)
 
 
 class ForkContextError(ValueError):
@@ -75,12 +78,7 @@ class SnapshotDelta:
 
     def dirty_hashes(self) -> str:
         values = {
-            entry.path: (
-                entry.value
-                if entry.state == "sha256"
-                else None
-            )
-            for entry in self.entries
+            entry.path: (entry.value if entry.state == "sha256" else None) for entry in self.entries
         }
         return json.dumps(values, sort_keys=True, separators=(",", ":"))
 
@@ -139,6 +137,27 @@ def _source_path(path: str) -> bool:
     return not (path == "tmp/orch/digests" or path.startswith("tmp/orch/digests/"))
 
 
+def _nested_repo(cwd: str, path: str, memo: dict[Path, bool]) -> bool:
+    """Return whether a lexical path component below cwd carries a .git marker."""
+    current = Path(cwd)
+    for component in Path(path).parts:
+        current = current / component
+        if current in memo:
+            if memo[current]:
+                return True
+            continue
+        try:
+            (current / ".git").stat()
+        except (FileNotFoundError, NotADirectoryError):
+            memo[current] = False
+        except OSError:
+            return False
+        else:
+            memo[current] = True
+            return True
+    return False
+
+
 def _hash(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -178,6 +197,15 @@ def snapshot(cwd: str) -> SnapshotDelta:
             )
             if _source_path(path)
         )
+        nested_memo: dict[Path, bool] = {}
+        excluded = {path for path in dirty if _nested_repo(cwd, path, nested_memo)}
+        dirty.difference_update(excluded)
+        if excluded:
+            logger.info(
+                "nested_repo_excluded count=%d paths=%s",
+                len(excluded),
+                ", ".join(sorted(excluded)[:10]),
+            )
         return SnapshotDelta(
             sha,
             tuple(_entry_for_path(cwd, path) for path in sorted(dirty)),
@@ -213,6 +241,8 @@ def staleness(row: dict[str, Any]) -> StalenessResult:
             "git-failure",
         )
     try:
+        nested_memo: dict[Path, bool] = {}
+        excluded: set[str] = set()
         candidates = {
             path
             for path in _decode_git_paths(
@@ -227,9 +257,23 @@ def staleness(row: dict[str, Any]) -> StalenessResult:
             )
             if _source_path(path)
         )
+        git_excluded = {path for path in candidates if _nested_repo(cwd, path, nested_memo)}
+        excluded.update(git_excluded)
+        candidates.difference_update(git_excluded)
         for p in manifest:
-            if _source_path(p) and not (Path(cwd) / p).exists():
+            if not _source_path(p):
+                continue
+            if _nested_repo(cwd, p, nested_memo):
+                excluded.add(p)
+                candidates.discard(p)
+            elif not (Path(cwd) / p).exists():
                 candidates.add(p)
+        if excluded:
+            logger.info(
+                "nested_repo_excluded count=%d paths=%s",
+                len(excluded),
+                ", ".join(sorted(excluded)[:10]),
+            )
         changed: list[SnapshotEntry] = []
         for p in sorted(candidates):
             path = Path(cwd) / p

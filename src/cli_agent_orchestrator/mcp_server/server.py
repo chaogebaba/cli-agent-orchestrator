@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import time
+from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import requests
@@ -1356,9 +1357,21 @@ _assign_message_field_desc = (
 
 def _serialize_provider_session(row: Dict[str, Any]) -> Dict[str, Any]:
     """Serialize a provider-session row without echoing its hash manifest."""
+    from cli_agent_orchestrator.services.fork_context_service import _nested_repo
+
     serialized = dict(row)
     manifest = json.loads(serialized.pop("dirty_hashes", None) or "{}")
-    serialized["dirty_file_count"] = len(manifest)
+    cwd = serialized.get("cwd")
+    memo: dict[Path, bool] = {}
+    dirty_file_count = 0
+    for path in manifest:
+        try:
+            excluded = isinstance(cwd, str) and _nested_repo(cwd, path, memo)
+        except OSError:
+            excluded = False
+        if not excluded:
+            dirty_file_count += 1
+    serialized["dirty_file_count"] = dirty_file_count
     return serialized
 
 
