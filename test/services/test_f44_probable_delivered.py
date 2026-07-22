@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -30,10 +32,51 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import inbox_service as inbox_module
+from cli_agent_orchestrator.services import stalled_callback_watchdog as watchdog_module
 from cli_agent_orchestrator.services.inbox_service import InboxService
 from cli_agent_orchestrator.services.message_trace_service import TranscriptResolution
-from cli_agent_orchestrator.services.stalled_callback_watchdog import stalled_callback_watchdog
+from cli_agent_orchestrator.services.stalled_callback_watchdog import (
+    StalledCallbackWatchdog,
+    stalled_callback_watchdog,
+)
 from cli_agent_orchestrator.services.status_monitor import BoundaryObservation
+
+_FIXTURE_3529_PATH = (
+    "/home/chao/.grok/sessions/%2Fhome%2Fchao%2FVScode_projects%2Fcli-subagents/"
+    "b7eb0509-ab66-4c56-9f5d-4913acf38c7d/chat_history.jsonl"
+)
+_FIXTURE_3529_EVIDENCE = {
+    "busy_initial_submit": {
+        "observation_epoch": "efd9715d-2326-4a97-a739-1b95167b82fc",
+        "seq": 707,
+        "status_at_admission": "idle",
+        "status_at_submit": "processing",
+    },
+    "injection_completed_seq": {
+        "observation_epoch": "efd9715d-2326-4a97-a739-1b95167b82fc",
+        "seq": 707,
+    },
+    "inode": 2820556,
+    "kind": "transcript_absent",
+    "normalized_payload_hash": ("3506baddf6e9d3b9e229b83ee5b3d16490a44e55b6ba6d0de6dcbbdfbfa9535f"),
+    "normalized_payload_length": 2126,
+    "path": _FIXTURE_3529_PATH,
+    "receiver_status_at_settle": "processing",
+    "resolution_kind": "exact_id",
+    "screen_probe": {
+        "frame_rows_hash": ("475d8da3e427dd9f7d0fc7037804e16a6bac2cd4492ea3e48af20707c633551a"),
+        "frame_source": "fresh_capture",
+        "geometry": {"columns": 137, "rows": 49},
+        "law_signal": {
+            "class": "chrome",
+            "provider_signal": "IDLE_FOOTER_PATTERN",
+            "row_index": 48,
+        },
+        "probed_at": "2026-07-21T22:33:13.763111Z",
+        "result_status": "idle",
+    },
+    "size": 668174,
+}
 
 
 @pytest.fixture
@@ -74,7 +117,16 @@ def _attempt_rows(sessions, message_ids: list[int], *, text: str = "payload"):
     return messages, attempt
 
 
-def _delivery_fakes(monkeypatch, transcript, *, send_error=None, settle_status=None):
+def _delivery_fakes(
+    monkeypatch,
+    transcript,
+    *,
+    send_error=None,
+    settle_status=None,
+    capture_wires: list[tuple[str, str]] | None = None,
+    record_submission: bool = True,
+    write_growth: bool = True,
+):
     admission = BoundaryObservation("epoch", TerminalStatus.IDLE, 1, 1, 1, 1, 1)
     submitted = BoundaryObservation("epoch", TerminalStatus.PROCESSING, 2, 2, 2, 2, 2)
     monitor = MagicMock()
@@ -96,13 +148,17 @@ def _delivery_fakes(monkeypatch, transcript, *, send_error=None, settle_status=N
     monkeypatch.setattr(inbox_module.terminal_service, "prepare_input", lambda _t, value, _s: value)
 
     def send(_terminal, _wire, **kwargs):
-        kwargs["on_submitted"](submitted)
-        with transcript.open("ab") as stream:
-            stream.write(b"y" * 68174)
+        if capture_wires is not None:
+            capture_wires.append((_terminal, _wire))
+        if record_submission:
+            kwargs["on_submitted"](submitted)
+        if write_growth:
+            with transcript.open("ab") as stream:
+                stream.write(b"y" * 68174)
         monitor.get_status.return_value = settle_status or TerminalStatus.PROCESSING
         if send_error is not None:
             raise send_error
-        return submitted
+        return submitted if record_submission else None
 
     monkeypatch.setattr(inbox_module.terminal_service, "send_prepared_input", send)
     return monitor
@@ -162,23 +218,48 @@ def test_t1_probable_delivered_truth_table(evidence, expected):
     assert inbox_module.is_probable_delivered(evidence) is expected
 
 
-def test_t2_main_path_execution_evidence_settles_once_without_redelivery(
-    f44_db, tmp_path, monkeypatch
-):
-    transcript = tmp_path / "fixture.jsonl"
-    transcript.write_bytes(b"x" * 600000)
-    message = create_inbox_message("sender", "receiver", "fixture-3529-attempt-1")
-    monitor = _delivery_fakes(monkeypatch, transcript)
+def test_t2_main_path_replays_fixture_and_late_ack_is_ordinary(f44_db, monkeypatch):
+    transcript = Path(_FIXTURE_3529_PATH)
+    stat_calls = 0
+    real_stat = Path.stat
+
+    def fixture_stat(path, *args, **kwargs):
+        nonlocal stat_calls
+        if path != transcript:
+            return real_stat(path, *args, **kwargs)
+        stat_calls += 1
+        return SimpleNamespace(
+            st_ino=2820556,
+            st_size=600000 if stat_calls == 1 else 668174,
+        )
+
+    monkeypatch.setattr(Path, "stat", fixture_stat)
+    raw_challenge = "7" * 32
+    monkeypatch.setattr(inbox_module.secrets, "token_hex", lambda _size: raw_challenge)
+    message = create_inbox_message(
+        "sender",
+        "receiver",
+        (
+            "fixture-3529-attempt-1\n\n"
+            "[Message from terminal sender. Use the cao-mcp-server send_message MCP tool "
+            "for any follow-up work — never a built-in collaboration.send_message.]"
+        ),
+    )
+    wires: list[tuple[str, str]] = []
+    monitor = _delivery_fakes(
+        monkeypatch,
+        transcript,
+        capture_wires=wires,
+        record_submission=False,
+        write_growth=False,
+    )
     timeouts: list[float] = []
 
     def confirm(*_args, **kwargs):
         timeouts.append(kwargs["timeout"])
-        return "ambiguous", {
-            "kind": "transcript_absent",
-            "path": str(transcript),
-            "inode": transcript.stat().st_ino,
-            "size": 668174,
-        }
+        if len(timeouts) == 1:
+            return "ambiguous", json.loads(json.dumps(_FIXTURE_3529_EVIDENCE))
+        return "hit", {"kind": "transcript_user_turn"}
 
     monkeypatch.setattr(inbox_module, "confirm_delivery", confirm)
     service = InboxService()
@@ -192,30 +273,103 @@ def test_t2_main_path_execution_evidence_settles_once_without_redelivery(
         "confirmed",
         "inferred_by_execution",
     )
-    assert attempt["evidence"]["kind"] == "execution_evidence"
-    assert attempt["evidence"]["path"] == str(transcript)
-    assert attempt["evidence"]["inode"] == transcript.stat().st_ino
-    assert attempt["evidence"]["receiver_status_at_settle"] == "processing"
-    assert attempt["evidence"]["busy_initial_submit"]["status_at_submit"] == "processing"
-    assert attempt["evidence"]["transcript_growth"] == {
+    expected_evidence = json.loads(json.dumps(_FIXTURE_3529_EVIDENCE))
+    expected_evidence["kind"] = "execution_evidence"
+    expected_evidence["transcript_growth"] = {
         "size_at_open": 600000,
         "size_at_settle": 668174,
         "inode_stable": True,
     }
-    assert [event["kind"] for event in trace["events"]] == ["inferred_delivered"]
+    assert attempt["evidence"] == expected_evidence
+    assert [event["kind"] for event in trace["events"]] == [
+        "attempt_challenge",
+        "inferred_delivered",
+    ]
+    assert (
+        trace["events"][0]["payload"]["challenge_sha256"]
+        == hashlib.sha256(raw_challenge.encode()).hexdigest()
+    )
     service._commit_watchdog_ops.assert_called_once()
     assert timeouts == [10.0]
     service.deliver_pending("receiver")
     assert len(get_message_trace(message.id)["attempts"]) == 1
     assert monitor.get_status.call_count > 0
 
-    late = create_inbox_message("receiver", "caller", "late challenge reply")
-    late_attempt = begin_delivery_attempt([late], "caller", "codex", "late", 4)
-    assert settle_delivery_attempt(late_attempt, MessageStatus.DELIVERED, "confirmed")
+    original_before_late_ack = get_message_trace(message.id)
+    late_body = f"ACK mid {message.id}:{raw_challenge}"
+    late = create_inbox_message("receiver", "sender", late_body)
+    monitor.get_status.return_value = TerminalStatus.IDLE
+    service.deliver_pending("sender")
     assert get_message_trace(late.id)["message"]["status"] == MessageStatus.DELIVERED.value
-    unchanged = get_message_trace(message.id)
-    assert unchanged["message"]["status"] == MessageStatus.DELIVERED.value
-    assert len(unchanged["attempts"]) == 1
+    assert wires[-1] == ("sender", late_body)
+    assert get_message_trace(message.id) == original_before_late_ack
+    assert timeouts == [10.0, 10.0]
+    assert service._commit_watchdog_ops.call_count == 2
+
+
+@pytest.mark.parametrize("park_warm", [False, True])
+def test_t2_probable_settlement_preserves_watchdog_park_warm_gating(f44_db, monkeypatch, park_warm):
+    watcher = StalledCallbackWatchdog()
+    callback_calls: list[tuple[str, str]] = []
+    commit_calls: list[tuple] = []
+    inbound_calls: list[tuple[str, str, str]] = []
+    real_callback = watcher.record_callback_if_to_caller
+    real_inbound = watcher.record_inbound_task
+
+    def record_callback(sender_id, receiver_id):
+        callback_calls.append((sender_id, receiver_id))
+        real_callback(sender_id, receiver_id)
+
+    def record_inbound(terminal_id, caller_id, profile):
+        inbound_calls.append((terminal_id, caller_id, profile))
+        real_inbound(terminal_id, caller_id, profile)
+
+    monkeypatch.setattr(watcher, "record_callback_if_to_caller", record_callback)
+    monkeypatch.setattr(watcher, "record_inbound_task", record_inbound)
+    monkeypatch.setattr(watchdog_module, "stalled_callback_watchdog", watcher)
+    monkeypatch.setattr(
+        inbox_module,
+        "_classify_probable_delivery",
+        lambda *_args, **_kwargs: _qualifying_evidence(),
+    )
+    message = create_inbox_message(
+        "sender",
+        "receiver",
+        "park gating",
+        orchestration_type=OrchestrationType.ASSIGN,
+        park_warm=park_warm,
+    )
+    attempt = begin_delivery_attempt([message], "receiver", "grok_cli", "hash", 10)
+    metadata = {"caller_id": "caller", "agent_profile": "worker"}
+    service = InboxService()
+    real_commit = service._commit_watchdog_ops
+
+    def commit_watchdog_ops(*args):
+        commit_calls.append(args)
+        real_commit(*args)
+
+    monkeypatch.setattr(service, "_commit_watchdog_ops", commit_watchdog_ops)
+
+    won, _ = service._settle_probable_delivered(
+        attempt,
+        [message.id],
+        [message],
+        {},
+        None,
+        "receiver",
+        "sender",
+        OrchestrationType.ASSIGN,
+        metadata,
+        park_warm,
+    )
+
+    assert won
+    assert commit_calls == [("receiver", "sender", OrchestrationType.ASSIGN, metadata, park_warm)]
+    assert callback_calls == [("sender", "receiver")]
+    expected_inbound = [] if park_warm else [("receiver", "caller", "worker")]
+    assert inbound_calls == expected_inbound
+    assert watcher.has_episode("receiver") is (not park_warm)
+    assert get_message_trace(message.id)["message"]["status"] == MessageStatus.DELIVERED.value
 
 
 def test_t2_false_main_path_retains_legacy_pending_flow(f44_db, tmp_path, monkeypatch):
@@ -389,8 +543,13 @@ def test_t3_stat_failure_is_null_and_never_blocks_legacy(f44_db, monkeypatch):
 
 def test_t4_delivery_failed_is_not_selected_for_delivery_or_recovery(f44_db, monkeypatch):
     message = create_inbox_message("sender", "receiver", "terminal")
-    attempt = begin_delivery_attempt([message], "receiver", "grok_cli", "hash", 3)
+    attempt = begin_delivery_attempt([message], "receiver", "claude_code", "hash", 3)
     assert settle_delivery_attempt(attempt, MessageStatus.DELIVERY_FAILED, "failed")
+    with f44_db.begin() as db:
+        db.get(InboxDeliveryAttemptModel, attempt).started_at = datetime.now() - timedelta(
+            minutes=5
+        )
+    assert database.list_stale_open_claude_attempts(60) == []
     send = MagicMock()
     recover = MagicMock()
     monkeypatch.setattr(inbox_module.terminal_service, "send_prepared_input", send)
