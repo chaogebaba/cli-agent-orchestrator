@@ -42,6 +42,23 @@ async def test_ignores_non_claude_code_providers(
 
 
 @pytest.mark.asyncio
+async def test_persona_plan_suppresses_cwd_memory_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    called: list[str] = []
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.utils.persona_context.has_persona_plan", lambda terminal_id: True
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.get_terminal_metadata",
+        lambda terminal_id: called.append(terminal_id) or None,
+    )
+    await ClaudeCodeMemoryPlugin().on_post_create_terminal(_event(terminal_id="persona"))
+    assert called == []
+    assert not (tmp_path / ".claude" / "CLAUDE.md").exists()
+
+
+@pytest.mark.asyncio
 async def test_writes_memory_block_on_post_create_terminal(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

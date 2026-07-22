@@ -31,9 +31,60 @@
       "type": "string",
       "description": "Agent role. Built-in values: supervisor, developer, reviewer. Custom roles are also supported via settings.json."
     },
+    "protected": {
+      "type": "boolean"
+    },
     "provider": {
       "type": "string",
       "description": "Provider override (e.g. claude_code, kiro_cli, codex)."
+    },
+    "provider_init_timeout": {
+      "type": "integer"
+    },
+    "container": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path_maps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["host", "guest"],
+            "properties": {
+              "host": {"type": "string"},
+              "guest": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
+    "contextPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope"],
+      "properties": {
+        "scope": {"const": "persona"},
+        "memoryTypes": {
+          "type": "array",
+          "items": {"enum": ["user", "feedback", "project", "reference"]},
+          "default": []
+        },
+        "memoryNames": {
+          "type": "array",
+          "items": {"type": "string"},
+          "default": []
+        },
+        "globalClaudeMd": {"type": "boolean", "default": false},
+        "extraLeaves": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^(?!(?:CLAUDE\\.md|\\.credentials\\.json|settings\\.json|persona-manifest\\.json)$)(?!\\.{1,2}$)[^/\\\\\\u0000]+$"
+          },
+          "default": []
+        }
+      }
     },
     "allowedTools": {
       "type": "array",

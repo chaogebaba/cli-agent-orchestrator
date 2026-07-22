@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
+    from cli_agent_orchestrator.utils.persona_context import PersonaPlan
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
@@ -282,9 +283,7 @@ def _is_ink_selection_waiting(rendered: str) -> bool:
         if len(nearby_options) >= 2 and nearby_focus:
             return True
 
-    plan_rows = [
-        index for index, line in enumerate(lines) if _INK_PLAN_HEAD_PATTERN.search(line)
-    ]
+    plan_rows = [index for index, line in enumerate(lines) if _INK_PLAN_HEAD_PATTERN.search(line)]
     if plan_rows:
         for focus_row in focus_rows:
             preceding_plans = [row for row in plan_rows if row <= focus_row]
@@ -324,11 +323,13 @@ class ClaudeCodeProvider(BaseProvider):
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
+        persona_plan: Optional["PersonaPlan"] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        self._persona_plan = persona_plan
         self.allocated_session_uuid = str(uuid.uuid4())
         self._render_uncertain_active = False
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
@@ -542,7 +543,11 @@ class ClaudeCodeProvider(BaseProvider):
         # sandbox, only the Claude provider command is pane-scoped through
         # bubblewrap; the leading environment cleanup remains outside it.
         plane = provider_home("claude_code")
-        if plane.classification == "shared-auth-read-only":
+        if self._persona_plan is not None:
+            from cli_agent_orchestrator.utils.persona_context import wrap_claude_persona
+
+            claude_cmd = shlex.join(wrap_claude_persona(self._persona_plan, command_parts))
+        elif plane.classification == "shared-auth-read-only":
             claude_cmd = shlex.join(wrap_claude_command(plane, command_parts))
         else:
             claude_cmd = shlex.join(command_parts)
@@ -825,7 +830,8 @@ class ClaudeCodeProvider(BaseProvider):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
         # Prevent bypass permissions dialog from appearing (settings-based fix).
-        self._ensure_skip_bypass_prompt_setting()
+        if self._persona_plan is None:
+            self._ensure_skip_bypass_prompt_setting()
         self._ensure_sandbox_onboarding_state()
 
         # Build properly escaped command string

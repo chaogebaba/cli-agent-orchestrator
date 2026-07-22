@@ -53,6 +53,10 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
 
         if event.provider != "claude_code":
             return
+        from cli_agent_orchestrator.utils.persona_context import has_persona_plan
+
+        if has_persona_plan(event.terminal_id):
+            return
         inject_memory_file(
             event,
             "claude_code_memory",

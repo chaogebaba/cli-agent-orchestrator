@@ -2,13 +2,16 @@
 
 import logging
 import threading
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, cast
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.utils.persona_context import PersonaPlan
 
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
 from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.models.terminal import ForkContext
 from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
 from cli_agent_orchestrator.providers.base import BaseProvider
-from cli_agent_orchestrator.models.terminal import ForkContext
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
@@ -21,6 +24,7 @@ from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
 
 logger = logging.getLogger(__name__)
+_NO_PERSONA_PLAN = object()
 
 PROVIDER_CLASSES = {
     ProviderType.KIRO_CLI.value: KiroCliProvider,
@@ -39,7 +43,7 @@ PROVIDER_CLASSES = {
 def get_provider_class(provider_type: str) -> type[BaseProvider]:
     """Resolve provider capability metadata without constructing a terminal provider."""
     try:
-        return PROVIDER_CLASSES[provider_type]
+        return cast(type[BaseProvider], PROVIDER_CLASSES[provider_type])
     except KeyError as exc:
         raise ValueError(f"Unknown provider type: {provider_type}") from exc
 
@@ -62,11 +66,20 @@ class ProviderManager:
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
         fork_context: Optional[ForkContext] = None,
+        persona_plan: "PersonaPlan | None | object" = _NO_PERSONA_PLAN,
     ) -> BaseProvider:
         """Construct and commit a provider for ordinary terminal creation."""
         provider = self.construct_provider(
-            provider_type, terminal_id, tmux_session, tmux_window, agent_profile,
-            allowed_tools, skill_prompt, model, fork_context,
+            provider_type,
+            terminal_id,
+            tmux_session,
+            tmux_window,
+            agent_profile,
+            allowed_tools,
+            skill_prompt,
+            model,
+            fork_context,
+            persona_plan,
         )
         self.commit_provider(terminal_id, provider)
         return provider
@@ -82,9 +95,17 @@ class ProviderManager:
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
         fork_context: Optional[ForkContext] = None,
+        persona_plan: "PersonaPlan | None | object" = _NO_PERSONA_PLAN,
     ) -> BaseProvider:
         """Construct without mutating the live terminal mapping."""
         try:
+            if persona_plan is _NO_PERSONA_PLAN:
+                from cli_agent_orchestrator.utils.persona_context import load_persona_plan
+
+                persona_plan = load_persona_plan(terminal_id)
+            persona_plan = cast(Optional["PersonaPlan"], persona_plan)
+            if persona_plan is not None and persona_plan.provider != provider_type:
+                raise ValueError("persona manifest provider mismatch")
             provider: BaseProvider
             if provider_type == ProviderType.KIRO_CLI.value:
                 if not agent_profile:
@@ -114,6 +135,7 @@ class ProviderManager:
                     agent_profile,
                     allowed_tools,
                     skill_prompt=skill_prompt,
+                    persona_plan=persona_plan,
                 )
             elif provider_type == ProviderType.CODEX.value:
                 provider = CodexProvider(
@@ -124,6 +146,7 @@ class ProviderManager:
                     allowed_tools,
                     skill_prompt=skill_prompt,
                     fork_context=fork_context,
+                    persona_plan=persona_plan,
                 )
             elif provider_type == ProviderType.COPILOT_CLI.value:
                 provider = CopilotCliProvider(
@@ -212,7 +235,9 @@ class ProviderManager:
             if expected_current is not None and current is not expected_current:
                 raise RuntimeError("provider_mapping_changed")
             self._providers[terminal_id] = provider
-        logger.info("Committed %s provider for terminal: %s", provider.__class__.__name__, terminal_id)
+        logger.info(
+            "Committed %s provider for terminal: %s", provider.__class__.__name__, terminal_id
+        )
         return current
 
     def get_provider(self, terminal_id: str) -> Optional[BaseProvider]:

@@ -156,6 +156,7 @@ class ProviderSessionModel(Base):
     git_sha = Column(Text, nullable=True)
     dirty_hashes = Column(Text, nullable=False, default="{}", server_default="{}")
     digest_head = Column(Text, nullable=True)
+    retained_persona_home = Column(Text, nullable=True)
     summary = Column(Text, nullable=True)
     status = Column(Text, nullable=False)
     kind = Column(Text, nullable=False, default="base", server_default="base")
@@ -705,6 +706,7 @@ def init_db() -> None:
     _migrate_provider_sessions_session_name()
     _migrate_provider_sessions_kind()
     _migrate_provider_sessions_digest_head()
+    _migrate_provider_sessions_retained_persona_home()
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
     _migrate_inbox_orchestration_type()
@@ -762,7 +764,8 @@ def _migrate_provider_sessions_status() -> None:
                 "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
                 "name TEXT NOT NULL, provider TEXT NOT NULL, session_uuid TEXT NOT NULL, "
                 "cwd TEXT NOT NULL, agent_profile TEXT NOT NULL, git_sha TEXT, "
-                "dirty_hashes TEXT DEFAULT '{}' NOT NULL, digest_head TEXT, summary TEXT, status TEXT NOT NULL, "
+                "dirty_hashes TEXT DEFAULT '{}' NOT NULL, digest_head TEXT, "
+                "retained_persona_home TEXT, summary TEXT, status TEXT NOT NULL, "
                 "kind TEXT DEFAULT 'base' NOT NULL, "
                 "source_terminal_id TEXT, session_name TEXT, created_at DATETIME, updated_at DATETIME, "
                 "CONSTRAINT ck_provider_sessions_status "
@@ -774,9 +777,11 @@ def _migrate_provider_sessions_status() -> None:
             text(
                 "INSERT INTO provider_sessions "
                 "(id, name, provider, session_uuid, cwd, agent_profile, git_sha, dirty_hashes, "
-                "digest_head, summary, status, kind, source_terminal_id, session_name, created_at, updated_at) "
+                "digest_head, retained_persona_home, summary, status, kind, "
+                "source_terminal_id, session_name, created_at, updated_at) "
                 "SELECT id, name, provider, session_uuid, cwd, agent_profile, git_sha, "
-                "dirty_hashes, NULL, summary, status, 'base', source_terminal_id, NULL, created_at, updated_at "
+                "dirty_hashes, NULL, NULL, summary, status, 'base', source_terminal_id, NULL, "
+                "created_at, updated_at "
                 "FROM provider_sessions_legacy"
             )
         )
@@ -821,6 +826,19 @@ def _migrate_provider_sessions_digest_head() -> None:
         columns = connection.execute(text("PRAGMA table_info(provider_sessions)")).mappings().all()
         if columns and not any(column["name"] == "digest_head" for column in columns):
             connection.execute(text("ALTER TABLE provider_sessions ADD COLUMN digest_head TEXT"))
+    _migrate_provider_sessions_retained_persona_home()
+
+
+def _migrate_provider_sessions_retained_persona_home() -> None:
+    """Add the nullable retained Codex persona-home claim idempotently."""
+    from sqlalchemy import text
+
+    with engine.begin() as connection:
+        columns = connection.execute(text("PRAGMA table_info(provider_sessions)")).mappings().all()
+        if columns and not any(column["name"] == "retained_persona_home" for column in columns):
+            connection.execute(
+                text("ALTER TABLE provider_sessions ADD COLUMN retained_persona_home TEXT")
+            )
 
 
 def _migrate_transcript_bindings_inode_nullable() -> None:
@@ -2263,24 +2281,58 @@ def register_provider_session(*, include_superseded: bool = False, **values: Any
         raise ValueError("base_name_reserved:cold")
     if values.get("kind", "base") not in {"base", "anchor"}:
         raise ValueError("invalid_provider_session_kind")
+    old_uuid: str | None = None
+    cleanup_uuid: str | None = None
+    cleanup_path: str | None = None
     with SessionLocal() as db:
+        db.execute(text("BEGIN IMMEDIATE"))
         now = _utcnow()
-        superseded_count = (
+        previous = (
             db.query(ProviderSessionModel)
-            .filter(
-                ProviderSessionModel.name == values["name"],
-                ProviderSessionModel.status == "ready",
-            )
-            .update({"status": "superseded", "updated_at": now})
+            .filter_by(name=values["name"], status="ready")
+            .with_for_update()
+            .first()
         )
-        row = ProviderSessionModel(**values, status="ready", created_at=now, updated_at=now)
+        old_uuid = previous.session_uuid if previous is not None else None
+        inherited_claim = None
+        if previous is not None and previous.session_uuid == values.get("session_uuid"):
+            inherited_claim = previous.retained_persona_home
+        if inherited_claim is None and values.get("session_uuid"):
+            source = (
+                db.query(ProviderSessionModel)
+                .filter(
+                    ProviderSessionModel.session_uuid == values["session_uuid"],
+                    ProviderSessionModel.status == "ready",
+                    ProviderSessionModel.retained_persona_home.isnot(None),
+                )
+                .order_by(ProviderSessionModel.id)
+                .first()
+            )
+            inherited_claim = source.retained_persona_home if source is not None else None
+        superseded_count = 0
+        if previous is not None:
+            previous_claim = previous.retained_persona_home
+            previous.status = "superseded"
+            previous.updated_at = now
+            previous.retained_persona_home = None
+            superseded_count = 1
+            if old_uuid != values.get("session_uuid"):
+                cleanup_uuid = old_uuid
+                cleanup_path = previous_claim
+        row_values = dict(values)
+        row_values["retained_persona_home"] = inherited_claim
+        row = ProviderSessionModel(**row_values, status="ready", created_at=now, updated_at=now)
         db.add(row)
         db.commit()
         db.refresh(row)
         result = provider_session_to_dict(row)
         if include_superseded:
             result["superseded"] = superseded_count > 0
-        return result
+    if cleanup_uuid is not None:
+        from cli_agent_orchestrator.utils.persona_context import persona_cleanup
+
+        persona_cleanup(cleanup_uuid, candidate_path=cleanup_path)
+    return result
 
 
 def get_provider_session_history(name: str) -> Optional[Dict[str, Any]]:
@@ -2381,15 +2433,26 @@ def delete_session_epoch(session_name: str) -> bool:
 
 def retire_provider_session(name: str) -> Optional[Dict[str, Any]]:
     """Atomically retire the current ready registration for ``name``."""
+    cleanup_uuid: str | None = None
+    cleanup_path: str | None = None
     with SessionLocal() as db:
+        db.execute(text("BEGIN IMMEDIATE"))
         row = db.query(ProviderSessionModel).filter_by(name=name, status="ready").first()
         if row is None:
             return None
+        cleanup_uuid = row.session_uuid
+        cleanup_path = row.retained_persona_home
         row.status = "retired"
+        row.retained_persona_home = None
         row.updated_at = _utcnow()
         db.commit()
         db.refresh(row)
-        return provider_session_to_dict(row)
+        result = provider_session_to_dict(row)
+    if cleanup_uuid is not None:
+        from cli_agent_orchestrator.utils.persona_context import persona_cleanup
+
+        persona_cleanup(cleanup_uuid, candidate_path=cleanup_path)
+    return result
 
 
 def provider_session_to_dict(row: ProviderSessionModel) -> Dict[str, Any]:
@@ -2434,6 +2497,130 @@ def get_ready_provider_session_by_source_terminal(
             .first()
         )
         return provider_session_to_dict(row) if row else None
+
+
+def get_retained_persona_home_for_terminal(terminal_id: str) -> Optional[str]:
+    """Return a claimed retained home for any provider row owned by a terminal."""
+    with SessionLocal() as db:
+        row = (
+            db.query(ProviderSessionModel)
+            .filter(
+                ProviderSessionModel.source_terminal_id == terminal_id,
+                ProviderSessionModel.retained_persona_home.isnot(None),
+            )
+            .order_by(
+                (ProviderSessionModel.status == "ready").desc(), ProviderSessionModel.id.desc()
+            )
+            .first()
+        )
+        return cast(Optional[str], row.retained_persona_home) if row is not None else None
+
+
+def claim_retained_persona_home(session_uuid: str, destination: str) -> int:
+    """Claim all currently-ready rows for a UUID with a guarded CAS update."""
+    with SessionLocal() as db:
+        db.execute(text("BEGIN IMMEDIATE"))
+        count = (
+            db.query(ProviderSessionModel)
+            .filter(
+                ProviderSessionModel.session_uuid == session_uuid,
+                ProviderSessionModel.status == "ready",
+                ProviderSessionModel.retained_persona_home.is_(None),
+            )
+            .update(
+                {"retained_persona_home": destination, "updated_at": _utcnow()},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return int(count)
+
+
+def verify_retained_persona_claim(session_uuid: str, destination: str) -> int:
+    with SessionLocal() as db:
+        return int(
+            db.query(ProviderSessionModel)
+            .filter_by(
+                session_uuid=session_uuid,
+                status="ready",
+                retained_persona_home=destination,
+            )
+            .count()
+        )
+
+
+def unclaim_retained_persona_home(session_uuid: str, destination: str) -> int:
+    with SessionLocal() as db:
+        db.execute(text("BEGIN IMMEDIATE"))
+        count = (
+            db.query(ProviderSessionModel)
+            .filter_by(
+                session_uuid=session_uuid,
+                retained_persona_home=destination,
+            )
+            .update(
+                {"retained_persona_home": None, "updated_at": _utcnow()}, synchronize_session=False
+            )
+        )
+        db.commit()
+        return int(count)
+
+
+def persona_cleanup_claim(session_uuid: str) -> tuple[bool, Optional[str]]:
+    """Clear a UUID's claim when no ready row remains; return its old path."""
+    with SessionLocal() as db:
+        db.execute(text("BEGIN IMMEDIATE"))
+        ready = (
+            db.query(ProviderSessionModel)
+            .filter_by(session_uuid=session_uuid, status="ready")
+            .count()
+        )
+        if ready:
+            return False, None
+        rows = (
+            db.query(ProviderSessionModel)
+            .filter(
+                ProviderSessionModel.session_uuid == session_uuid,
+                ProviderSessionModel.retained_persona_home.isnot(None),
+            )
+            .all()
+        )
+        path = next(
+            (cast(str, row.retained_persona_home) for row in rows if row.retained_persona_home),
+            None,
+        )
+        for row in rows:
+            row.retained_persona_home = None
+            row.updated_at = _utcnow()
+        db.commit()
+        return True, path
+
+
+def list_retained_persona_claims() -> List[Dict[str, Any]]:
+    with SessionLocal() as db:
+        rows = (
+            db.query(ProviderSessionModel)
+            .filter(
+                ProviderSessionModel.status == "ready",
+                ProviderSessionModel.retained_persona_home.isnot(None),
+            )
+            .all()
+        )
+        return [provider_session_to_dict(row) for row in rows]
+
+
+def clear_missing_retained_persona_claim(session_uuid: str, destination: str) -> int:
+    with SessionLocal() as db:
+        db.execute(text("BEGIN IMMEDIATE"))
+        count = (
+            db.query(ProviderSessionModel)
+            .filter_by(session_uuid=session_uuid, retained_persona_home=destination)
+            .update(
+                {"retained_persona_home": None, "updated_at": _utcnow()}, synchronize_session=False
+            )
+        )
+        db.commit()
+        return int(count)
 
 
 def get_provider_session_by_uuid(session_uuid: str) -> Optional[Dict[str, Any]]:

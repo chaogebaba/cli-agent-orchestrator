@@ -9,7 +9,10 @@ import shlex
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.utils.persona_context import PersonaPlan
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import BLOCKED_WAIT_CAP_S
@@ -30,6 +33,7 @@ from cli_agent_orchestrator.services.settings_service import (
     get_server_settings,
     resolve_provider_string_option,
 )
+from cli_agent_orchestrator.utils import provider_plane
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.provider_plane import provider_home
@@ -42,6 +46,16 @@ from cli_agent_orchestrator.utils.terminal import (
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
+
+
+def _resolved_codex_home(terminal_id: str | None) -> Path:
+    from cli_agent_orchestrator.utils.persona_context import resolve_codex_home
+
+    resolved = resolve_codex_home(terminal_id)
+    if resolved == provider_plane.provider_home("codex").home:
+        return provider_home("codex").home
+    return resolved
+
 
 # Regex patterns for Codex output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
@@ -439,6 +453,7 @@ class CodexProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
         fork_context: Optional[ForkContext] = None,
+        persona_plan: Optional["PersonaPlan"] = None,
     ):
         """Initialize provider state."""
         super().__init__(
@@ -446,6 +461,7 @@ class CodexProvider(BaseProvider):
         )
         self._initialized = False
         self._agent_profile = agent_profile
+        self._persona_plan = persona_plan
 
     @classmethod
     def seed_resume_identity(cls, cwd: str, agent_profile: str) -> str:
@@ -524,6 +540,13 @@ class CodexProvider(BaseProvider):
         if profile is not None:
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
             system_prompt = self._apply_skill_prompt(system_prompt)
+            if self._persona_plan is not None and self._persona_plan.memory_instructions:
+                persona_memory = self._persona_plan.memory_instructions.rstrip()
+                system_prompt = (
+                    f"{system_prompt.rstrip()}\n\n{persona_memory}"
+                    if system_prompt
+                    else persona_memory
+                )
 
             # Prepend security constraints for soft enforcement (Codex has no
             # native tool restriction mechanism). Only applied when tool
@@ -651,7 +674,7 @@ class CodexProvider(BaseProvider):
     def capture_session_uuid(self, pane_pid: int, launch_time: float, cwd: str) -> str:
         from cli_agent_orchestrator.services.fork_context_service import capture_codex_uuid
 
-        return capture_codex_uuid(pane_pid, launch_time, cwd)
+        return capture_codex_uuid(pane_pid, launch_time, cwd, terminal_id=self.terminal_id)
 
     def resume_session_uuid(self) -> str | None:
         if self._fork_context is not None and self._fork_context.mode == "resume":
@@ -659,7 +682,11 @@ class CodexProvider(BaseProvider):
         return None
 
     def validate_session_artifact(self, session_uuid: str, cwd: str) -> None:
-        matches = list(provider_home("codex").sessions.glob(f"**/rollout-*{session_uuid}*.jsonl"))
+        matches = list(
+            (_resolved_codex_home(getattr(self, "terminal_id", None)) / "sessions").glob(
+                f"**/rollout-*{session_uuid}*.jsonl"
+            )
+        )
         if not matches:
             raise RetryableArtifactValidation("session_artifact_missing")
         if len(matches) > 1:
@@ -673,7 +700,7 @@ class CodexProvider(BaseProvider):
             raise TerminalArtifactValidation("session_artifact_identity_invalid")
 
     def auth_state_path(self) -> Path | None:
-        return provider_home("codex").home / "auth.json"
+        return _resolved_codex_home(getattr(self, "terminal_id", None)) / "auth.json"
 
     def provider_process_started_at(self, pane_pid: int) -> float | None:
         from cli_agent_orchestrator.services.fork_context_service import _descendants

@@ -77,6 +77,7 @@ from cli_agent_orchestrator.providers.base import (
     TerminalArtifactValidation,
 )
 from cli_agent_orchestrator.providers.manager import get_provider_class, provider_manager
+from cli_agent_orchestrator.services import base_digest_service
 from cli_agent_orchestrator.services.deferred_dispatcher import (
     DeferredCall,
     DeferredExecutorSaturated,
@@ -92,7 +93,6 @@ from cli_agent_orchestrator.services.draft_guard import (
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.fork_context_service import snapshot as fork_snapshot
 from cli_agent_orchestrator.services.fork_context_service import staleness as fork_staleness
-from cli_agent_orchestrator.services import base_digest_service
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
@@ -106,7 +106,11 @@ from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
 from cli_agent_orchestrator.utils.provider_auth import ProviderAuthRefreshFailed
 from cli_agent_orchestrator.utils.provider_plane import NativeHomeIsolationUnavailable
-from cli_agent_orchestrator.utils.sandbox_guard import bind_pane_identity, require_provider_admitted
+from cli_agent_orchestrator.utils.sandbox_guard import (
+    bind_pane_identity,
+    is_sandbox,
+    require_provider_admitted,
+)
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
@@ -673,6 +677,8 @@ async def create_terminal(
             )
         except ValueError as exc:
             raise ValueError(f"invalid_working_directory: {exc}") from exc
+    else:
+        working_directory = resolve_and_validate_path(os.getcwd(), description="Working directory")
     provider_class = get_provider_class(provider)
     if provider_class.supports_seed_resume_identity is True and fork_context is None:
         raise RuntimeError("seed_required")
@@ -730,6 +736,7 @@ async def create_terminal(
             release_session_lifecycle_lease(session_lifecycle_lease_token)
         raise
 
+    persona_plan = None
     session_created = False  # tracks whether THIS call created the tmux session
     window_created = False
     fifo_attached = False
@@ -737,11 +744,34 @@ async def create_terminal(
     try:
         # Step 1: Generate unique identifiers
         terminal_id = terminal_id or generate_terminal_id()
-        env_vars = bind_pane_identity(env_vars, terminal_id)
+        assert terminal_id is not None
         if lease_token is not None:
             from cli_agent_orchestrator.services.rebind_lease import validate_rebind_lease
 
             validate_rebind_lease(terminal_id, lease_token)
+
+        from cli_agent_orchestrator.models.agent_profile import ContextPolicy
+
+        context_policy = getattr(early_profile, "contextPolicy", None)
+        if isinstance(context_policy, ContextPolicy):
+            if is_sandbox():
+                logger.warning(
+                    "Terminal %s profile %s requested contextPolicy in a sandbox; "
+                    "shared-auth provider isolation takes precedence",
+                    terminal_id,
+                    agent_profile,
+                )
+            else:
+                from cli_agent_orchestrator.utils.persona_context import compose_persona_plan
+
+                persona_plan = compose_persona_plan(
+                    terminal_id,
+                    provider,
+                    agent_profile,
+                    context_policy,
+                    working_directory,
+                )
+        env_vars = bind_pane_identity(env_vars, terminal_id, plan=persona_plan)
 
         window_name = generate_window_name(agent_profile)
 
@@ -1046,6 +1076,7 @@ async def create_terminal(
                 skill_prompt=skill_prompt,
                 model=profile.model if profile else None,
                 fork_context=fork_context,
+                persona_plan=persona_plan,
             )
         except Exception as exc:
             if lease_token is not None:
@@ -1242,6 +1273,17 @@ async def create_terminal(
                 status_monitor.clear_terminal(terminal_id)
             except Exception:
                 pass  # Ignore cleanup errors
+            if persona_plan is not None:
+                try:
+                    from cli_agent_orchestrator.utils.persona_context import cleanup_persona
+
+                    cleanup_persona(terminal_id)
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        "Failed to clean persona after terminal creation rollback %s: %s",
+                        terminal_id,
+                        cleanup_exc,
+                    )
         if not ((resume_uuid or lease_token is not None) and db_created):
             try:
                 provider_manager.cleanup_provider(terminal_id)
@@ -3376,6 +3418,7 @@ def _delete_terminal_under_lease(
     require_confirmed_death: bool = False,
     quarantine_session_uuid: str | None = None,
     uuid_lease_token=None,
+    persona_retention_intent=None,
 ) -> Dict:
     """Delete terminal and kill its tmux window."""
     from cli_agent_orchestrator.services.rebind_lease import validate_rebind_lease
@@ -3421,6 +3464,7 @@ def _delete_terminal_under_lease(
         except Exception as exc:
             logger.warning(f"Failed to clear state detector for {terminal_id}: {exc}")
 
+    persona_retention_error = None
     try:
         if not require_confirmed_death:
             svc = get_herdr_inbox_service()
@@ -3505,8 +3549,32 @@ def _delete_terminal_under_lease(
                     }
                 detach_observation(metadata)
 
+        if persona_retention_intent is not None:
+            if metadata is None:
+                persona_retention_error = "retained_persona_terminal_missing"
+            else:
+                try:
+                    death = get_backend().window_liveness(
+                        metadata["tmux_session"], metadata["tmux_window"]
+                    )
+                except Exception:
+                    death = "error"
+                if death != "gone":
+                    persona_retention_error = "retained_persona_process_not_dead"
+                else:
+                    from cli_agent_orchestrator.utils.persona_context import (
+                        retain_codex_persona_home,
+                    )
+
+                    persona_retention_error = retain_codex_persona_home(
+                        terminal_id, persona_retention_intent
+                    )
+
         # Cleanup provider state and database record
         provider_manager.cleanup_provider(terminal_id)
+        from cli_agent_orchestrator.utils.persona_context import cleanup_persona
+
+        cleanup_persona(terminal_id)
         with _memory_injected_lock:
             _memory_injected_terminals.discard(terminal_id)
         from cli_agent_orchestrator.services.inbox_service import (
@@ -3559,6 +3627,7 @@ def _delete_terminal_under_lease(
             "intent_error": intent_error,
             "intent_retain_reason": "keep_bases" if preserve_warm_intent else None,
             "rollback_kill_uncertain": False,
+            "persona_retention_error": persona_retention_error,
         }
 
     except Exception as e:

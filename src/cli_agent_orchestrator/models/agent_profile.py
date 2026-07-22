@@ -2,9 +2,44 @@
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 PermissionMode = Literal["default", "acceptEdits", "plan", "auto", "bypassPermissions"]
+MemoryType = Literal["user", "feedback", "project", "reference"]
+
+_RESERVED_PERSONA_LEAVES = {
+    "CLAUDE.md",
+    ".credentials.json",
+    "settings.json",
+    "persona-manifest.json",
+}
+
+
+class ContextPolicy(BaseModel):
+    """Profile-declared native context isolation policy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scope: Literal["persona"]
+    memoryTypes: List[MemoryType] = Field(default_factory=list)
+    memoryNames: List[str] = Field(default_factory=list)
+    globalClaudeMd: bool = False
+    extraLeaves: List[str] = Field(default_factory=list)
+
+    @field_validator("extraLeaves")
+    @classmethod
+    def validate_extra_leaves(cls, leaves: List[str]) -> List[str]:
+        for leaf in leaves:
+            if (
+                not leaf
+                or leaf in {".", ".."}
+                or leaf in _RESERVED_PERSONA_LEAVES
+                or "/" in leaf
+                or "\\" in leaf
+                or "\x00" in leaf
+            ):
+                raise ValueError(f"invalid persona extra leaf: {leaf!r}")
+        return leaves
 
 
 class McpServer(BaseModel):
@@ -63,6 +98,10 @@ class AgentProfile(BaseModel):
     # instead of the server default (60s from settings_service). Allows containerized
     # profiles to declare longer init times (e.g., 180s) without changing global config.
     provider_init_timeout: Optional[int] = None
+
+    # CAO-native. When present, launch the provider with a frozen, terminal-scoped
+    # view of native provider context instead of shared user/project instruction files.
+    contextPolicy: Optional[ContextPolicy] = None
 
     # Q CLI agent fields (all optional, will be passed through to JSON)
     prompt: Optional[str] = None

@@ -8,7 +8,76 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.models.agent_profile import AgentProfile, ContextPolicy
+
+
+class TestPersonaPlanningSeam:
+    @pytest.mark.asyncio
+    async def test_composition_failure_happens_before_any_pane(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ):
+        from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.utils.persona_context import PersonaContextError
+
+        profile = AgentProfile(
+            name="persona",
+            description="persona",
+            provider="claude_code",
+            contextPolicy=ContextPolicy(scope="persona"),
+        )
+        backend = MagicMock()
+        monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+        monkeypatch.setattr(terminal_service, "load_agent_profile", lambda name: profile)
+        monkeypatch.setattr(terminal_service, "generate_terminal_id", lambda: "persona-terminal")
+        monkeypatch.setattr(terminal_service, "is_sandbox", lambda: False)
+        with patch(
+            "cli_agent_orchestrator.utils.persona_context.compose_persona_plan",
+            side_effect=PersonaContextError("sabotaged persona root"),
+        ):
+            with pytest.raises(PersonaContextError, match="sabotaged"):
+                await terminal_service.create_terminal(
+                    "claude_code",
+                    "persona",
+                    session_name="cao-persona",
+                    new_session=True,
+                    working_directory=str(tmp_path),
+                )
+        backend.create_session.assert_not_called()
+        backend.create_window.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sandbox_precedence_skips_persona_with_one_warning(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, caplog
+    ):
+        from cli_agent_orchestrator.services import terminal_service
+
+        profile = AgentProfile(
+            name="persona",
+            description="persona",
+            provider="claude_code",
+            contextPolicy=ContextPolicy(scope="persona"),
+        )
+        backend = MagicMock()
+        backend.session_exists.return_value = True
+        bind = MagicMock(return_value={})
+        monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+        monkeypatch.setattr(terminal_service, "load_agent_profile", lambda name: profile)
+        monkeypatch.setattr(terminal_service, "generate_terminal_id", lambda: "persona-terminal")
+        monkeypatch.setattr(terminal_service, "is_sandbox", lambda: True)
+        monkeypatch.setattr(terminal_service, "bind_pane_identity", bind)
+        with patch("cli_agent_orchestrator.utils.persona_context.compose_persona_plan") as compose:
+            with pytest.raises(ValueError, match="already exists"):
+                await terminal_service.create_terminal(
+                    "claude_code",
+                    "persona",
+                    session_name="cao-persona",
+                    new_session=True,
+                    working_directory=str(tmp_path),
+                )
+        compose.assert_not_called()
+        bind.assert_called_once_with(None, "persona-terminal", plan=None)
+        warnings = [record for record in caplog.records if "shared-auth" in record.message]
+        assert len(warnings) == 1
 
 
 class TestCreateTerminalCleanup:
