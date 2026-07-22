@@ -263,6 +263,10 @@ def _poison_path(consumer_op: str) -> Path:
     return SEAM_PARITY_POISON_DIR / consumer_op
 
 
+def _inhibit_path(consumer_op: str) -> Path:
+    return SEAM_PARITY_POISON_DIR / ".inhibit" / consumer_op
+
+
 def _write_poison(record: MismatchRecord) -> None:
     SEAM_PARITY_POISON_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(SEAM_PARITY_POISON_DIR, 0o700)
@@ -289,6 +293,38 @@ def _write_poison(record: MismatchRecord) -> None:
         temp.unlink(missing_ok=True)
 
 
+def _write_durable_inhibit(consumer_op: str) -> None:
+    inhibit_dir = SEAM_PARITY_POISON_DIR / ".inhibit"
+    inhibit_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(inhibit_dir, 0o700)
+    final = _inhibit_path(consumer_op)
+    temp = inhibit_dir / f".{consumer_op}.{uuid.uuid4().hex}.tmp"
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        payload = b"inhibited\n"
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(fd, payload[offset:])
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        os.replace(temp, final)
+        dir_fd = os.open(inhibit_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+        parent_fd = os.open(SEAM_PARITY_POISON_DIR, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
 def _remove_poison(consumer_op: str) -> None:
     path = _poison_path(consumer_op)
     path.unlink(missing_ok=True)
@@ -298,6 +334,25 @@ def _remove_poison(consumer_op: str) -> None:
             os.fsync(dir_fd)
         finally:
             os.close(dir_fd)
+
+
+def _remove_durable_inhibit(consumer_op: str) -> None:
+    path = _inhibit_path(consumer_op)
+    path.unlink(missing_ok=True)
+    inhibit_dir = path.parent
+    if inhibit_dir.exists():
+        dir_fd = os.open(inhibit_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+
+def _inhibition_state(consumer_op: str) -> tuple[bool, bool, bool]:
+    poisoned = _poison_path(consumer_op).exists()
+    durable = _inhibit_path(consumer_op).exists()
+    memory_only = consumer_op in _promotion_inhibited
+    return poisoned, durable, memory_only
 
 
 def _persist_collecting_mismatch(record: MismatchRecord) -> bool:
@@ -417,7 +472,7 @@ def record_comparison(
         if persisted:
             if marker_written:
                 _remove_poison(consumer_op)
-        else:
+        elif not marker_written:
             _promotion_inhibited.add(consumer_op)
         return "mismatch"
 
@@ -518,7 +573,7 @@ def _recover_poison(path: Path) -> None:
             setattr(parity, key, value)
         db.commit()
     discard_buffer(consumer_op)
-    _promotion_inhibited.add(consumer_op)
+    _write_durable_inhibit(consumer_op)
     _remove_poison(consumer_op)
 
 
@@ -573,12 +628,14 @@ def sweep() -> None:
             if entry is None:
                 continue
             state, activation = entry
-            poisoned = _poison_path(consumer_op).exists()
-            if consumer_op in _promotion_inhibited or poisoned:
+            poisoned, durable_inhibit, memory_only = _inhibition_state(consumer_op)
+            if poisoned or durable_inhibit or memory_only:
                 logger.error(
-                    "seam parity promotion inhibited op=%s poisoned=%s",
+                    "seam parity promotion inhibited op=%s poisoned=%s durable=%s memory_only=%s",
                     consumer_op,
                     poisoned,
+                    durable_inhibit,
+                    memory_only,
                 )
                 continue
             if state is None or activation is None or state.phase == "done":
@@ -672,6 +729,7 @@ def reset(consumer_op: str) -> None:
             )
         _open_fresh_window(consumer_op, phase)
         _remove_poison(consumer_op)
+        _remove_durable_inhibit(consumer_op)
         _promotion_inhibited.discard(consumer_op)
 
 
@@ -683,6 +741,7 @@ def status_rows() -> tuple[SeamStatus, ...]:
             parity = db.get(SeamParityModel, consumer_op)
             if activation is None or parity is None:
                 continue
+            poisoned, durable_inhibit, memory_only = _inhibition_state(consumer_op)
             mismatches = tuple(
                 {
                     "id": row.id,
@@ -716,8 +775,8 @@ def status_rows() -> tuple[SeamStatus, ...]:
                     mismatch_count=int(parity.mismatch_count),
                     last_sample_at=cast(str | None, parity.last_sample_at),
                     last_mismatch_detail=cast(str | None, parity.last_mismatch_detail),
-                    poisoned=_poison_path(consumer_op).exists(),
-                    inhibited=consumer_op in _promotion_inhibited,
+                    poisoned=poisoned,
+                    inhibited=poisoned or durable_inhibit or memory_only,
                     mismatches=mismatches,
                 )
             )

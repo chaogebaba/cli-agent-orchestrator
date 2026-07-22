@@ -5,6 +5,9 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import os
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -94,6 +97,24 @@ def _receiver_patches(monkeypatch: pytest.MonkeyPatch) -> None:
             "lifecycle_generation": 1,
             "recovery_state": None,
         },
+    )
+
+
+def _run_seam_subprocess(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    root = Path(__file__).parents[2]
+    env = os.environ.copy()
+    env["CAO_HOME"] = str(home)
+    source = str(root / "src")
+    env["PYTHONPATH"] = (
+        source if not env.get("PYTHONPATH") else source + os.pathsep + env["PYTHONPATH"]
+    )
+    return subprocess.run(
+        [sys.executable, "-m", "cli_agent_orchestrator.cli.main", "seam", *args],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
     )
 
 
@@ -303,6 +324,16 @@ def test_t2_epoch_fence_drops_buffered_clean_after_mismatch(parity_db) -> None:
 def test_t3_sweep_atomically_promotes_and_records_unique_evidence(parity_db, monkeypatch) -> None:
     op = "watchdog.cached_status"
     monkeypatch.setattr(seam_parity, "_thresholds", lambda: seam_parity.ParityThresholds(1, 0))
+    monkeypatch.setattr(
+        seam_activation,
+        "accept",
+        MagicMock(side_effect=AssertionError("sweep must not call two-step accept")),
+    )
+    monkeypatch.setattr(
+        seam_activation,
+        "promote",
+        MagicMock(side_effect=AssertionError("sweep must not call two-step promote")),
+    )
     with parity_db() as db:
         row = db.get(database.SeamParityModel, op)
         row.clean_samples = 1
@@ -320,29 +351,126 @@ def test_t3_sweep_atomically_promotes_and_records_unique_evidence(parity_db, mon
 
 
 def test_t3_composite_normalizes_orphan_and_rolls_back_on_injected_transaction(
-    parity_db,
+    parity_db, monkeypatch
 ) -> None:
     op = "agent_step.status_reads"
     with parity_db() as db:
         activation = db.get(database.SeamActivationModel, op)
         activation.accepted_version = 1
         activation.acceptance_token = "orphan"
+        nonce = db.get(database.SeamParityModel, op).window_nonce
         db.commit()
     assert isinstance(
-        seam_activation.promote_with_evidence(op, "orphan-evidence"), seam_activation.Promoted
+        seam_activation.promote_with_evidence(op, f"parity:build-a:1:{nonce}"),
+        seam_activation.Promoted,
     )
 
     other = "watchdog.ready_backlog_gate"
     with parity_db() as db:
-        result = seam_activation._promote_with_evidence_in(db, other, "rolled-back")
+        other_nonce = db.get(database.SeamParityModel, other).window_nonce
+    evidence_ref = f"parity:build-a:1:{other_nonce}"
+    original = seam_activation._promote_with_evidence_in
+
+    def crash_after_transition(db, consumer_op, evidence):
+        result = original(db, consumer_op, evidence)
         assert isinstance(result, seam_activation.Promoted)
-        db.rollback()
+        assert db.get(database.SeamActivationModel, other).active_authority == "receiver_state"
+        assert db.get(database.SeamParityModel, other).phase == "confirming"
+        assert db.query(database.SeamActivationEvidenceModel).filter_by(consumer_op=other).one()
+        raise RuntimeError("crash before composite commit")
+
+    monkeypatch.setattr(seam_activation, "_promote_with_evidence_in", crash_after_transition)
+    assert isinstance(
+        seam_activation.promote_with_evidence(other, evidence_ref),
+        seam_activation.PromotionConflict,
+    )
     with parity_db() as db:
         activation = db.get(database.SeamActivationModel, other)
         parity = db.get(database.SeamParityModel, other)
+        evidence_count = (
+            db.query(database.SeamActivationEvidenceModel).filter_by(consumer_op=other).count()
+        )
     assert activation.active_authority == "legacy"
     assert activation.accepted_version == 0
+    assert activation.acceptance_token is None
     assert parity.phase == "collecting"
+    assert parity.window_nonce == other_nonce
+    assert evidence_count == 0
+
+
+def test_t3_stale_evidence_epoch_rolls_back_entire_composite(parity_db) -> None:
+    op = "watchdog.cached_status"
+    stale_nonce = seam_parity.parity_state(op).window_nonce
+    evidence_ref = f"parity:build-a:1:{stale_nonce}"
+    seam_parity.reset(op)
+    assert seam_parity.parity_state(op).window_nonce != stale_nonce
+
+    assert isinstance(
+        seam_activation.promote_with_evidence(op, evidence_ref),
+        seam_activation.PromotionConflict,
+    )
+    with parity_db() as db:
+        activation = db.get(database.SeamActivationModel, op)
+        parity = db.get(database.SeamParityModel, op)
+        evidence_count = db.query(database.SeamActivationEvidenceModel).count()
+    assert activation.active_authority == "legacy"
+    assert activation.accepted_version == activation.active_version == 0
+    assert activation.acceptance_token is None
+    assert parity.phase == "collecting"
+    assert evidence_count == 0
+
+
+def test_t3_evidence_epoch_parser_preserves_colon_build_id(parity_db) -> None:
+    op = "watchdog.cached_status"
+    build_id = "1.2.3:0123456789abcdef"
+    with parity_db() as db:
+        parity = db.get(database.SeamParityModel, op)
+        parity.build_id = build_id
+        nonce = str(parity.window_nonce)
+        db.commit()
+    assert isinstance(
+        seam_activation.promote_with_evidence(op, f"parity:{build_id}:1:{nonce}"),
+        seam_activation.Promoted,
+    )
+
+
+@pytest.mark.parametrize(
+    ("authority", "orphaned", "promotes"),
+    [
+        ("legacy", False, True),
+        ("legacy", True, True),
+        ("receiver_state", False, False),
+        ("receiver_state", True, False),
+    ],
+)
+def test_t3_composite_entry_state_truth_table(
+    parity_db, authority: str, orphaned: bool, promotes: bool
+) -> None:
+    op = "watchdog.waiting_inbox_gate"
+    with parity_db() as db:
+        activation = db.get(database.SeamActivationModel, op)
+        active_version = 0 if authority == "legacy" else 1
+        activation.active_authority = authority
+        activation.active_version = active_version
+        activation.accepted_version = active_version + int(orphaned)
+        activation.acceptance_token = "orphan" if orphaned else None
+        nonce = db.get(database.SeamParityModel, op).window_nonce
+        db.commit()
+    result = seam_activation.promote_with_evidence(
+        op,
+        f"parity:build-a:{active_version + 1}:{nonce}",
+    )
+    with parity_db() as db:
+        activation = db.get(database.SeamActivationModel, op)
+        parity = db.get(database.SeamParityModel, op)
+    if promotes:
+        assert isinstance(result, seam_activation.Promoted)
+        assert activation.active_authority == "receiver_state"
+        assert parity.phase == "confirming"
+    else:
+        assert isinstance(result, seam_activation.PromotionConflict)
+        assert activation.active_authority == "receiver_state"
+        assert parity.phase == "collecting"
 
 
 def test_t4_clean_confirmation_stops_dual_read(parity_db, monkeypatch) -> None:
@@ -375,6 +503,16 @@ def test_t5_event_inbox_and_out_of_scope_bypass_comparator(parity_db, monkeypatc
         "get_backend",
         lambda: SimpleNamespace(supports_event_inbox=lambda: True),
     )
+    monkeypatch.setattr(
+        receiver_state_view,
+        "get_terminal_metadata",
+        lambda _terminal_id: {
+            "tmux_window": "w",
+            "lifecycle_generation": 1,
+            "recovery_state": None,
+        },
+    )
+    monkeypatch.setattr(receiver_state_view, "native_publisher_active", lambda: True)
     sample = MagicMock()
     monkeypatch.setattr(seam_parity, "record_comparison", sample)
     assert (
@@ -386,6 +524,17 @@ def test_t5_event_inbox_and_out_of_scope_bypass_comparator(parity_db, monkeypatc
             monitor=monitor,
         )
         is TerminalStatus.COMPLETED
+    )
+    _set_phase(parity_db, "watchdog.cached_status", "receiver_state", "confirming")
+    assert (
+        receiver_state_view.snapshot_view(
+            "watchdog.cached_status",
+            "t1",
+            max_age_s=30.0,
+            none_behavior="watchdog",
+            monitor=monitor,
+        )
+        is TerminalStatus.IDLE
     )
     assert (
         receiver_state_view.snapshot_view(
@@ -400,20 +549,22 @@ def test_t5_event_inbox_and_out_of_scope_bypass_comparator(parity_db, monkeypatc
     sample.assert_not_called()
 
 
-def test_t5_direct_production_admission_site_uses_phase_answer(parity_db, monkeypatch) -> None:
+def test_t5_direct_production_admission_site_uses_promoted_rs_answer(
+    parity_db, monkeypatch
+) -> None:
+    op = "delivery.admission_status"
+    _set_phase(parity_db, op, "receiver_state", "done")
+    _receiver_patches(monkeypatch)
     database.create_terminal("sender", "session", "sender", "codex")
     database.create_terminal("receiver", "session", "receiver", "grok_cli")
     database.create_inbox_message("sender", "receiver", "work")
     observation = BoundaryObservation("epoch", TerminalStatus.IDLE, 1, 1, 1, None, 1)
-    monitor = MagicMock()
-    monitor.get_boundary_observation.return_value = observation
-    monitor.get_status.return_value = TerminalStatus.IDLE
-    phase_view = MagicMock(return_value=TerminalStatus.PROCESSING)
+    monitor = _monitor(TerminalStatus.PROCESSING, TerminalStatus.IDLE)
+    monitor.get_boundary_observation = MagicMock(return_value=observation)
     provider = MagicMock()
     provider.capabilities.accepts_input_while_processing = False
     with (
         patch("cli_agent_orchestrator.services.inbox_service.status_monitor", monitor),
-        patch.object(receiver_state_view, "view_from_legacy", phase_view),
         patch(
             "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
             return_value=provider,
@@ -423,15 +574,11 @@ def test_t5_direct_production_admission_site_uses_phase_answer(parity_db, monkey
         ) as paste,
     ):
         InboxService().deliver_pending("receiver")
-    phase_view.assert_called_once_with(
-        "delivery.admission_status",
-        "receiver",
-        TerminalStatus.IDLE,
-        max_age_s=5.0,
-        none_behavior="none",
-        monitor=monitor,
-    )
+    monitor.get_boundary_observation.assert_called_once_with("receiver")
+    monitor.receiver_state_store.snapshot_view.assert_called()
     paste.assert_not_called()
+    with parity_db() as db:
+        assert db.get(database.SeamActivationModel, op).active_authority == "receiver_state"
 
 
 def test_t5b_poison_recovery_is_idempotent_and_inhibits(parity_db) -> None:
@@ -456,11 +603,13 @@ def test_t5b_poison_recovery_is_idempotent_and_inhibits(parity_db) -> None:
     assert len(rows) == 1
     assert rows[0].source == "poison_recovery"
     assert parity.phase == "collecting"
-    assert op in seam_parity._promotion_inhibited
+    assert op not in seam_parity._promotion_inhibited
+    assert seam_parity._inhibit_path(op).exists()
+    assert next(row for row in seam_parity.status_rows() if row.consumer_op == op).inhibited
     assert not (seam_parity.SEAM_PARITY_POISON_DIR / op).exists()
 
 
-def test_t5b_db_failure_leaves_marker_and_latch(parity_db, monkeypatch) -> None:
+def test_t5b_db_failure_leaves_marker_and_durable_inhibition(parity_db, monkeypatch) -> None:
     op = "watchdog.cached_status"
     monkeypatch.setattr(seam_parity, "_persist_collecting_mismatch", lambda _record: False)
     assert (
@@ -474,10 +623,11 @@ def test_t5b_db_failure_leaves_marker_and_latch(parity_db, monkeypatch) -> None:
         == "mismatch"
     )
     assert (seam_parity.SEAM_PARITY_POISON_DIR / op).exists()
-    assert op in seam_parity._promotion_inhibited
+    assert op not in seam_parity._promotion_inhibited
+    assert next(row for row in seam_parity.status_rows() if row.consumer_op == op).inhibited
 
 
-def test_t5b_marker_failure_latches_but_still_persists(parity_db, monkeypatch) -> None:
+def test_t5b_marker_failure_latches_but_still_persists(parity_db, monkeypatch, caplog) -> None:
     op = "watchdog.cached_status"
     monkeypatch.setattr(seam_parity, "_write_poison", MagicMock(side_effect=OSError("disk")))
     seam_parity.record_comparison(
@@ -489,7 +639,170 @@ def test_t5b_marker_failure_latches_but_still_persists(parity_db, monkeypatch) -
     )
     with parity_db() as db:
         assert db.query(database.SeamParityMismatchModel).count() == 1
+        parity = db.get(database.SeamParityModel, op)
+        parity.clean_samples = 1
+        parity.window_started_at = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        db.commit()
     assert op in seam_parity._promotion_inhibited
+    monkeypatch.setattr(seam_parity, "_thresholds", lambda: seam_parity.ParityThresholds(1, 0))
+    caplog.set_level("ERROR", logger=seam_parity.__name__)
+    seam_parity.sweep()
+    assert "memory_only=True" in caplog.text
+    with parity_db() as db:
+        assert db.get(database.SeamActivationModel, op).active_authority == "legacy"
+
+
+def test_t5b_crash_after_poison_fsync_recovers_mismatch_on_restart(parity_db, monkeypatch) -> None:
+    op = "watchdog.cached_status"
+    old_nonce = seam_parity.parity_state(op).window_nonce
+    persist = seam_parity._persist_collecting_mismatch
+
+    def crash_before_db(record):
+        marker = seam_parity._poison_path(op)
+        assert marker.exists()
+        assert json.loads(marker.read_text(encoding="utf-8"))["window_nonce"] == old_nonce
+        raise RuntimeError("crash before DB persist")
+
+    monkeypatch.setattr(seam_parity, "_persist_collecting_mismatch", crash_before_db)
+    assert (
+        seam_parity.record_comparison(
+            op,
+            "collecting",
+            TerminalStatus.IDLE,
+            TerminalStatus.PROCESSING,
+            rs_sourced=True,
+        )
+        == "mismatch"
+    )
+    with parity_db() as db:
+        assert db.query(database.SeamParityMismatchModel).count() == 0
+        assert db.get(database.SeamParityModel, op).window_nonce == old_nonce
+    assert seam_parity._poison_path(op).exists()
+
+    monkeypatch.setattr(seam_parity, "_persist_collecting_mismatch", persist)
+    seam_parity._promotion_inhibited.clear()
+    seam_parity.startup_repair()
+    with parity_db() as db:
+        mismatch = db.query(database.SeamParityMismatchModel).one()
+        parity = db.get(database.SeamParityModel, op)
+    assert mismatch.source == "poison_recovery"
+    assert mismatch.window_nonce == old_nonce
+    assert parity.window_nonce != old_nonce
+    assert seam_parity._inhibit_path(op).exists()
+    assert not seam_parity._poison_path(op).exists()
+
+
+def test_t5b_crash_after_db_commit_before_poison_unlink_keeps_both_facts(
+    parity_db, monkeypatch
+) -> None:
+    op = "watchdog.cached_status"
+
+    def crash_before_unlink(consumer_op):
+        assert consumer_op == op
+        assert seam_parity._poison_path(op).exists()
+        with parity_db() as db:
+            assert db.query(database.SeamParityMismatchModel).count() == 1
+            assert db.get(database.SeamParityModel, op).window_nonce != f"nonce-{op}"
+        raise RuntimeError("crash before poison unlink")
+
+    monkeypatch.setattr(seam_parity, "_remove_poison", crash_before_unlink)
+    with pytest.raises(RuntimeError, match="poison unlink"):
+        seam_parity.record_comparison(
+            op,
+            "collecting",
+            TerminalStatus.IDLE,
+            TerminalStatus.PROCESSING,
+            rs_sourced=True,
+        )
+    with parity_db() as db:
+        mismatch = db.query(database.SeamParityMismatchModel).one()
+    assert mismatch.source == "live"
+    assert seam_parity._poison_path(op).exists()
+
+
+def test_t5b_confirmation_wrapper_crash_rolls_back_and_leaves_poison(
+    parity_db, monkeypatch
+) -> None:
+    op = "watchdog.cached_status"
+    _set_phase(parity_db, op, "receiver_state", "confirming")
+    original_nonce = seam_parity.parity_state(op).window_nonce
+    original = seam_activation._rollback_with_mismatch_in
+
+    def crash_after_transition(db, consumer_op, version, detail):
+        result = original(db, consumer_op, version, detail)
+        assert isinstance(result, seam_activation.RolledBack)
+        assert db.get(database.SeamActivationModel, op).active_authority == "legacy"
+        assert db.get(database.SeamParityModel, op).phase == "collecting"
+        assert db.query(database.SeamParityMismatchModel).one()
+        raise RuntimeError("crash before rollback commit")
+
+    monkeypatch.setattr(seam_activation, "_rollback_with_mismatch_in", crash_after_transition)
+    assert (
+        seam_parity.record_comparison(
+            op,
+            "confirming",
+            TerminalStatus.IDLE,
+            TerminalStatus.PROCESSING,
+            rs_sourced=True,
+        )
+        == "mismatch"
+    )
+    with parity_db() as db:
+        activation = db.get(database.SeamActivationModel, op)
+        parity = db.get(database.SeamParityModel, op)
+        mismatch_count = db.query(database.SeamParityMismatchModel).count()
+    assert activation.active_authority == "receiver_state"
+    assert parity.phase == "confirming"
+    assert parity.window_nonce == original_nonce
+    assert mismatch_count == 0
+    assert seam_parity._poison_path(op).exists()
+
+
+def test_t5b_subprocess_reset_clears_durable_server_inhibition(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "cao-home"
+    initial = _run_seam_subprocess(home, "status", "--json")
+    assert initial.returncode == 0, initial.stderr
+    assert len(json.loads(initial.stdout)) == 5
+
+    db_file = home / "db" / "cli-agent-orchestrator.db"
+    engine = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False})
+    sessions = sessionmaker(bind=engine)
+    monkeypatch.setattr(seam_activation, "SessionLocal", sessions)
+    monkeypatch.setattr(seam_parity, "SessionLocal", sessions)
+    monkeypatch.setattr(seam_parity, "SEAM_PARITY_POISON_DIR", home / "seam_parity_poison")
+    seam_parity._promotion_inhibited.clear()
+    op = "watchdog.cached_status"
+    with sessions() as db:
+        row = db.get(database.SeamParityModel, op)
+        build_id = str(row.build_id)
+        nonce = str(row.window_nonce)
+    monkeypatch.setattr(seam_parity, "_build_id_cache", build_id)
+    seam_parity._write_poison(
+        seam_parity.MismatchRecord(
+            consumer_op=op,
+            build_id=build_id,
+            window_nonce=nonce,
+            phase="collecting",
+            acted_answer="idle",
+            shadow_answer="processing",
+            detail="acted=idle shadow=processing",
+            created_at="2026-07-22T00:00:00+00:00",
+        )
+    )
+    seam_parity.startup_repair()
+    assert op not in seam_parity._promotion_inhibited
+    assert next(row for row in seam_parity.status_rows() if row.consumer_op == op).inhibited
+
+    child_status = _run_seam_subprocess(home, "status", "--json")
+    assert child_status.returncode == 0, child_status.stderr
+    child_row = next(row for row in json.loads(child_status.stdout) if row["consumer_op"] == op)
+    assert child_row["inhibited"] is True
+    reset = _run_seam_subprocess(home, "reset", op)
+    assert reset.returncode == 0, reset.stderr
+    assert (
+        next(row for row in seam_parity.status_rows() if row.consumer_op == op).inhibited is False
+    )
+    engine.dispose()
 
 
 def test_t5c_unknown_build_confirming_clean_holds_but_mismatch_demotes(
@@ -570,6 +883,34 @@ async def test_t5d_watchdog_sweep_first_deferred_and_event_storm_capped(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_t5d_throwing_sweep_does_not_hot_retry_under_event_storm(monkeypatch) -> None:
+    watchdog = StalledCallbackWatchdog()
+    watchdog._parity_clock = MagicMock(side_effect=[0.0, 60.0, 60.1, 60.2])
+    event = {"topic": "terminal.t.status", "data": {"status": "idle"}}
+    queue = SimpleNamespace(
+        get=AsyncMock(side_effect=[event, event, event, asyncio.CancelledError()])
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.bus.subscribe",
+        lambda _topic: queue,
+    )
+    for name in (
+        "record_status",
+        "poll_unarmed_statuses",
+        "refresh_screen_fingerprints",
+        "notify_due",
+        "tick_waiting_inbox",
+        "tick_ready_backlog",
+    ):
+        monkeypatch.setattr(watchdog, name, MagicMock())
+    sweep = MagicMock(side_effect=RuntimeError("sweep failed"))
+    monkeypatch.setattr(seam_parity, "sweep", sweep)
+    with pytest.raises(asyncio.CancelledError):
+        await watchdog.run()
+    assert sweep.call_count == 1
+
+
+@pytest.mark.asyncio
 async def test_t5e_startup_repair_failure_aborts_before_consumer_tasks(monkeypatch) -> None:
     from cli_agent_orchestrator.api import main
 
@@ -599,6 +940,14 @@ def test_t6_cli_status_rollback_reset_and_no_promote(parity_db) -> None:
     assert reset.exit_code == 0
     conflict = runner.invoke(cli, ["seam", "rollback", "watchdog.cached_status"])
     assert conflict.exit_code == 1
+
+
+def test_t6_cli_status_initializes_fresh_home(tmp_path) -> None:
+    result = _run_seam_subprocess(tmp_path / "fresh-home", "status", "--json")
+    assert result.returncode == 0, result.stderr
+    rows = json.loads(result.stdout)
+    assert len(rows) == 5
+    assert {row["phase"] for row in rows} == {"collecting"}
 
 
 def test_t5_source_wiring_calls_direct_comparator_and_startup_before_tasks() -> None:

@@ -1130,9 +1130,10 @@ class StalledCallbackWatchdog:
                 await asyncio.to_thread(self.notify_due, registry)
                 await asyncio.to_thread(self.tick_waiting_inbox, registry)
                 await asyncio.to_thread(self.tick_ready_backlog, registry)
-                if self._parity_clock() >= next_parity_sweep:
+                parity_now = self._parity_clock()
+                if parity_now >= next_parity_sweep:
+                    next_parity_sweep = parity_now + 60.0
                     await asyncio.to_thread(seam_parity.sweep)
-                    next_parity_sweep = self._parity_clock() + 60.0
             except Exception:
                 logger.exception("StalledCallbackWatchdog error")
 

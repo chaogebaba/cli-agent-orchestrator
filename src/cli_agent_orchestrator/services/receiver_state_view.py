@@ -258,6 +258,21 @@ def _event_inbox_bypass(terminal_id: str) -> bool:
         return True
 
 
+def _event_inbox_comparator_bypass(terminal_id: str) -> bool:
+    try:
+        return bool(get_backend().supports_event_inbox())
+    except Exception:
+        now_mono = time.monotonic()
+        last_logged = _backend_failure_last_logged.get(terminal_id)
+        if last_logged is None or now_mono - last_logged >= 60.0:
+            _backend_failure_last_logged[terminal_id] = now_mono
+            logger.warning(
+                "Receiver-state backend check failed; bypassing parity comparison",
+                exc_info=True,
+            )
+        return True
+
+
 def view_from_legacy(
     consumer_op: ConsumerOp,
     terminal_id: str,
@@ -280,6 +295,17 @@ def view_from_legacy(
     state = seam_parity.parity_state(consumer_op)
     if state is None:
         if not receiver_state_active(consumer_op):
+            return legacy_answer
+        return resolve_rs_answer(
+            terminal_id,
+            max_age_s=max_age_s,
+            none_behavior=none_behavior,
+            monitor=monitor,
+            require_fresh=require_fresh,
+            token=token,
+        ).answer
+    if _event_inbox_comparator_bypass(terminal_id):
+        if state.phase == "collecting":
             return legacy_answer
         return resolve_rs_answer(
             terminal_id,

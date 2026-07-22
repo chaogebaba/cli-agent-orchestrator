@@ -78,6 +78,22 @@ PromoteWithEvidenceResult: TypeAlias = Promoted | PromotionConflict | DuplicateE
 RollbackResult: TypeAlias = RolledBack | RollbackConflict
 
 _outage_last_logged: dict[str, float] = {}
+
+
+def _parse_parity_evidence_ref(evidence_ref: str) -> tuple[str, int, str] | None:
+    prefix = "parity:"
+    if not evidence_ref.startswith(prefix):
+        return None
+    try:
+        build_id, target_text, window_nonce = evidence_ref[len(prefix) :].rsplit(":", 2)
+        target_version = int(target_text)
+    except (TypeError, ValueError):
+        return None
+    if not build_id or not window_nonce or target_version < 1:
+        return None
+    return build_id, target_version, window_nonce
+
+
 _EVENT_FRAME_OPS = frozenset({"watchdog.pane_classify", "auto_responder.frame_classify"})
 
 
@@ -178,11 +194,17 @@ def _promote_with_evidence_in(
 ) -> PromoteResult:
     """Compose orphan normalization, accept, evidence, promote, and window reset."""
 
+    expected = _parse_parity_evidence_ref(evidence_ref)
+    if expected is None:
+        return PromotionConflict()
+    expected_build_id, target_version, expected_window_nonce = expected
+
     db.execute(
         update(SeamActivationModel)
         .where(
             SeamActivationModel.consumer_op == consumer_op,
             SeamActivationModel.active_authority == "legacy",
+            SeamActivationModel.active_version == target_version - 1,
             SeamActivationModel.accepted_version == SeamActivationModel.active_version + 1,
         )
         .values(
@@ -197,6 +219,7 @@ def _promote_with_evidence_in(
         .where(
             SeamActivationModel.consumer_op == consumer_op,
             SeamActivationModel.active_authority == "legacy",
+            SeamActivationModel.active_version == target_version - 1,
             SeamActivationModel.accepted_version == SeamActivationModel.active_version,
         )
         .values(
@@ -238,7 +261,9 @@ def _promote_with_evidence_in(
         update(SeamParityModel)
         .where(
             SeamParityModel.consumer_op == consumer_op,
+            SeamParityModel.build_id == expected_build_id,
             SeamParityModel.phase == "collecting",
+            SeamParityModel.window_nonce == expected_window_nonce,
         )
         .values(
             phase="confirming",

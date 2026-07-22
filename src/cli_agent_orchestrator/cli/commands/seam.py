@@ -6,12 +6,16 @@ import json
 
 import click
 
+from cli_agent_orchestrator.clients.database import init_db
 from cli_agent_orchestrator.services import seam_activation, seam_parity
 
 
 @click.group()
 def seam() -> None:
     """Inspect parity state or apply rollback/reset overrides."""
+
+    init_db()
+    seam_parity.startup_repair()
 
 
 @seam.command("status")
