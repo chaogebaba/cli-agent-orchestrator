@@ -112,6 +112,7 @@ from cli_agent_orchestrator.security.auth import (
 from cli_agent_orchestrator.services import (
     codex_review_service,
     flow_service,
+    seam_parity,
     secret_gate,
     session_service,
     terminal_service,
@@ -133,9 +134,9 @@ from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.mailbox_service import MailboxDomainError
+from cli_agent_orchestrator.services.receiver_state_view import activate_native_publisher
 from cli_agent_orchestrator.services.stalled_callback_watchdog import stalled_callback_watchdog
 from cli_agent_orchestrator.services.status_monitor import status_monitor
-from cli_agent_orchestrator.services.receiver_state_view import activate_native_publisher
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_guard_service import (
     TerminalProtectionError,
@@ -671,6 +672,9 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("sandbox startup lost its manifest binding")
         assert_sandbox_db_fence(active_manifest)
     init_db()
+    # Parity repair is a fail-stop startup gate: no consumer may observe stale
+    # build/phase state or a known-poisoned receiver-state authority.
+    seam_parity.startup_repair()
     _reconcile_memory_at_startup()
     inbox_service.recover_stale_deliveries()
     adopt_mailbox_rows_at_startup()

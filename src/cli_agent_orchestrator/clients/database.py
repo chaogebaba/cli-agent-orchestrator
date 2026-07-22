@@ -609,6 +609,58 @@ class SeamActivationEvidenceModel(Base):
     )
 
 
+class SeamParityModel(Base):
+    """Current parity window for one status-read consumer seam."""
+
+    __tablename__ = "seam_parity"
+
+    consumer_op = Column(Text, primary_key=True)
+    build_id = Column(Text, nullable=False)
+    phase = Column(Text, nullable=False)
+    window_started_at = Column(Text, nullable=False)
+    window_nonce = Column(Text, nullable=False)
+    clean_samples = Column(Integer, nullable=False, default=0, server_default="0")
+    mismatch_count = Column(Integer, nullable=False, default=0, server_default="0")
+    last_sample_at = Column(Text, nullable=True)
+    last_mismatch_detail = Column(Text, nullable=True)
+    __table_args__ = (
+        CheckConstraint(
+            "phase IN ('collecting','confirming','done')",
+            name="ck_seam_parity_phase",
+        ),
+    )
+
+
+class SeamParityMismatchModel(Base):
+    """Append-only status parity mismatch history."""
+
+    __tablename__ = "seam_parity_mismatch"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    consumer_op = Column(Text, nullable=False)
+    build_id = Column(Text, nullable=False)
+    window_nonce = Column(Text, nullable=False)
+    phase = Column(Text, nullable=False)
+    acted_answer = Column(Text, nullable=False)
+    shadow_answer = Column(Text, nullable=False)
+    detail = Column(Text, nullable=True)
+    source = Column(Text, nullable=False)
+    created_at = Column(Text, nullable=False)
+    __table_args__ = (
+        CheckConstraint(
+            "source IN ('live','poison_recovery')",
+            name="ck_seam_parity_mismatch_source",
+        ),
+        UniqueConstraint(
+            "consumer_op",
+            "window_nonce",
+            "created_at",
+            "source",
+            name="uq_seam_parity_mismatch_replay",
+        ),
+    )
+
+
 def _ensure_db_dir() -> None:
     """Create the DB dir owner-only (0o700).
 

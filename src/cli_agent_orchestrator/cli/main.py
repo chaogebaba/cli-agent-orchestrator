@@ -21,6 +21,7 @@ from cli_agent_orchestrator.cli.commands.profile import profile
 from cli_agent_orchestrator.cli.commands.redeploy import redeploy
 from cli_agent_orchestrator.cli.commands.sandbox import sandbox
 from cli_agent_orchestrator.cli.commands.schedule import flow, schedule
+from cli_agent_orchestrator.cli.commands.seam import seam
 from cli_agent_orchestrator.cli.commands.session import session
 from cli_agent_orchestrator.cli.commands.shutdown import shutdown
 from cli_agent_orchestrator.cli.commands.skills import skills
@@ -54,6 +55,7 @@ cli.add_command(redeploy)
 cli.add_command(sandbox)
 cli.add_command(shutdown)
 cli.add_command(schedule)
+cli.add_command(seam)
 cli.add_command(flow)  # deprecated alias for 'schedule' (issue #378)
 cli.add_command(env)
 cli.add_command(mcp_server)

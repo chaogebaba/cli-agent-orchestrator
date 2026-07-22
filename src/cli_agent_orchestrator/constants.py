@@ -78,6 +78,7 @@ CAO_HOME_DIR = Path(
     os.environ.get("CAO_HOME", str(Path.home() / ".aws" / "cli-agent-orchestrator"))
 )
 DEFERRED_DEADLETTER_DIR = CAO_HOME_DIR / "deadletters"
+SEAM_PARITY_POISON_DIR = CAO_HOME_DIR / "seam_parity_poison"
 BLOCKED_WAIT_CAP_S = 1800.0
 
 # Managed environment variable file

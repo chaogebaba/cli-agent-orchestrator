@@ -15,14 +15,12 @@ that need to exercise the Auth0 paths.
 
 import os
 import pathlib
-import time
-from typing import Any, Dict
-from unittest.mock import patch
-
-import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
+from typing import Any, Dict
+from unittest.mock import patch
 
 import pytest
 
@@ -41,6 +39,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """Release the isolated suite database and remove its namespace."""
     engine.dispose()
     shutil.rmtree(_TEST_CAO_HOME, ignore_errors=True)
+
+
 # Make the `mock_cli` test-fixture binary discoverable for the pytest
 # session so MockCliProvider can `shlex.join(["mock_cli", ...])` without
 # an absolute path. Not on PATH outside the test session — production
@@ -159,6 +159,24 @@ def _no_llm_compile_in_tests(monkeypatch):
     var themselves or stub the ``wiki_compiler`` seams.
     """
     monkeypatch.setenv("CAO_MEMORY_COMPILE_MODE", "append")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_seam_parity_state():
+    """Keep durable parity windows from leaking across unrelated tests."""
+
+    yield
+
+    from cli_agent_orchestrator.clients.database import (
+        SeamParityMismatchModel,
+        SeamParityModel,
+        SessionLocal,
+    )
+
+    with SessionLocal() as db:
+        db.query(SeamParityMismatchModel).delete()
+        db.query(SeamParityModel).delete()
+        db.commit()
 
 
 @pytest.fixture

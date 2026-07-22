@@ -7,15 +7,18 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Literal, TypeAlias
+from typing import Literal, Mapping, TypeAlias
 
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.orm import Session
 
 from cli_agent_orchestrator.clients.database import (
     SEAM_ACTIVATION_CONSUMER_OPS,
     SeamActivationEvidenceModel,
     SeamActivationModel,
+    SeamParityMismatchModel,
+    SeamParityModel,
     SessionLocal,
 )
 
@@ -71,6 +74,7 @@ class RollbackConflict:
 
 AcceptResult: TypeAlias = Accepted | AcceptConflict | DuplicateEvidence
 PromoteResult: TypeAlias = Promoted | PromotionConflict
+PromoteWithEvidenceResult: TypeAlias = Promoted | PromotionConflict | DuplicateEvidence
 RollbackResult: TypeAlias = RolledBack | RollbackConflict
 
 _outage_last_logged: dict[str, float] = {}
@@ -167,6 +171,113 @@ def promote(consumer_op: ConsumerOp, acceptance_token: str) -> PromoteResult:
             return PromotionConflict()
 
 
+def _promote_with_evidence_in(
+    db: Session,
+    consumer_op: ConsumerOp,
+    evidence_ref: str,
+) -> PromoteResult:
+    """Compose orphan normalization, accept, evidence, promote, and window reset."""
+
+    db.execute(
+        update(SeamActivationModel)
+        .where(
+            SeamActivationModel.consumer_op == consumer_op,
+            SeamActivationModel.active_authority == "legacy",
+            SeamActivationModel.accepted_version == SeamActivationModel.active_version + 1,
+        )
+        .values(
+            accepted_version=SeamActivationModel.active_version,
+            acceptance_token=None,
+            updated_at=_now(),
+        )
+    )
+    acceptance_token = str(uuid.uuid4())
+    accepted = db.execute(
+        update(SeamActivationModel)
+        .where(
+            SeamActivationModel.consumer_op == consumer_op,
+            SeamActivationModel.active_authority == "legacy",
+            SeamActivationModel.accepted_version == SeamActivationModel.active_version,
+        )
+        .values(
+            accepted_version=SeamActivationModel.active_version + 1,
+            acceptance_token=acceptance_token,
+            evidence_ref=evidence_ref,
+            updated_at=_now(),
+        )
+    )
+    if accepted.rowcount != 1:
+        return PromotionConflict()
+    db.add(
+        SeamActivationEvidenceModel(
+            consumer_op=consumer_op,
+            evidence_ref=evidence_ref,
+            acceptance_token=acceptance_token,
+            created_at=_now(),
+        )
+    )
+    db.flush()
+    promoted = db.execute(
+        update(SeamActivationModel)
+        .where(
+            SeamActivationModel.consumer_op == consumer_op,
+            SeamActivationModel.active_authority == "legacy",
+            SeamActivationModel.acceptance_token == acceptance_token,
+            SeamActivationModel.accepted_version == SeamActivationModel.active_version + 1,
+        )
+        .values(
+            active_authority="receiver_state",
+            active_version=SeamActivationModel.accepted_version,
+            tombstoned_legacy=1,
+            updated_at=_now(),
+        )
+    )
+    if promoted.rowcount != 1:
+        return PromotionConflict()
+    parity = db.execute(
+        update(SeamParityModel)
+        .where(
+            SeamParityModel.consumer_op == consumer_op,
+            SeamParityModel.phase == "collecting",
+        )
+        .values(
+            phase="confirming",
+            window_started_at=_now(),
+            window_nonce=str(uuid.uuid4()),
+            clean_samples=0,
+            mismatch_count=0,
+            last_sample_at=None,
+            last_mismatch_detail=None,
+        )
+    )
+    return Promoted() if parity.rowcount == 1 else PromotionConflict()
+
+
+def promote_with_evidence(consumer_op: ConsumerOp, evidence_ref: str) -> PromoteWithEvidenceResult:
+    """Atomically accept evidence, promote authority, and open confirmation."""
+
+    if _event_frame_refused(consumer_op):
+        return PromotionConflict()
+    with SessionLocal() as db:
+        try:
+            result = _promote_with_evidence_in(db, consumer_op, evidence_ref)
+            if not isinstance(result, Promoted):
+                db.rollback()
+                return result
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            return DuplicateEvidence()
+        except Exception:
+            db.rollback()
+            logger.exception("Atomic seam promotion failed for %s", consumer_op)
+            return PromotionConflict()
+    from cli_agent_orchestrator.services.seam_parity import discard_buffer
+
+    discard_buffer(consumer_op)
+    return Promoted()
+
+
 def rollback(consumer_op: ConsumerOp, expected_active_version: int) -> RollbackResult:
     """Restore legacy authority only for the expected active version."""
 
@@ -194,6 +305,99 @@ def rollback(consumer_op: ConsumerOp, expected_active_version: int) -> RollbackR
         except OperationalError:
             db.rollback()
             return RollbackConflict()
+
+
+def _rollback_with_mismatch_in(
+    db: Session,
+    consumer_op: ConsumerOp,
+    expected_active_version: int,
+    mismatch_detail: Mapping[str, str],
+) -> RollbackResult:
+    """Compose mismatch history, rollback, and a fresh collecting window."""
+
+    required = {
+        "consumer_op",
+        "build_id",
+        "window_nonce",
+        "phase",
+        "acted_answer",
+        "shadow_answer",
+        "detail",
+        "created_at",
+    }
+    if set(mismatch_detail) != required or mismatch_detail["consumer_op"] != consumer_op:
+        return RollbackConflict()
+    db.add(
+        SeamParityMismatchModel(
+            **dict(mismatch_detail),
+            source="live",
+        )
+    )
+    db.flush()
+    rolled_back = db.execute(
+        update(SeamActivationModel)
+        .where(
+            SeamActivationModel.consumer_op == consumer_op,
+            SeamActivationModel.active_authority == "receiver_state",
+            SeamActivationModel.active_version == expected_active_version,
+        )
+        .values(
+            active_authority="legacy",
+            rollback_version=SeamActivationModel.active_version,
+            accepted_version=SeamActivationModel.active_version,
+            updated_at=_now(),
+        )
+    )
+    if rolled_back.rowcount != 1:
+        return RollbackConflict()
+    parity = db.execute(
+        update(SeamParityModel)
+        .where(
+            SeamParityModel.consumer_op == consumer_op,
+            SeamParityModel.phase == "confirming",
+            SeamParityModel.window_nonce == mismatch_detail["window_nonce"],
+        )
+        .values(
+            build_id=mismatch_detail["build_id"],
+            phase="collecting",
+            window_started_at=_now(),
+            window_nonce=str(uuid.uuid4()),
+            clean_samples=0,
+            mismatch_count=0,
+            last_sample_at=mismatch_detail["created_at"],
+            last_mismatch_detail=mismatch_detail["detail"],
+        )
+    )
+    return RolledBack() if parity.rowcount == 1 else RollbackConflict()
+
+
+def rollback_with_mismatch(
+    consumer_op: ConsumerOp,
+    expected_active_version: int,
+    mismatch_detail: Mapping[str, str],
+) -> RollbackResult:
+    """Atomically persist a confirmation mismatch and restore legacy authority."""
+
+    with SessionLocal() as db:
+        try:
+            result = _rollback_with_mismatch_in(
+                db,
+                consumer_op,
+                expected_active_version,
+                mismatch_detail,
+            )
+            if not isinstance(result, RolledBack):
+                db.rollback()
+                return result
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Atomic seam rollback failed for %s", consumer_op)
+            return RollbackConflict()
+    from cli_agent_orchestrator.services.seam_parity import discard_buffer
+
+    discard_buffer(consumer_op)
+    return RolledBack()
 
 
 def receiver_state_active(consumer_op: ConsumerOp) -> bool:
@@ -227,6 +431,7 @@ __all__ = [
     "ConsumerOp",
     "DuplicateEvidence",
     "PromoteResult",
+    "PromoteWithEvidenceResult",
     "Promoted",
     "PromotionConflict",
     "RollbackConflict",
@@ -235,6 +440,8 @@ __all__ = [
     "accept",
     "consumer_ops",
     "promote",
+    "promote_with_evidence",
     "receiver_state_active",
     "rollback",
+    "rollback_with_mismatch",
 ]

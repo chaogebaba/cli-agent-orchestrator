@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass
 import time
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
@@ -37,11 +37,11 @@ class _StatusMonitor(Protocol):
 
     def probe_screen_status(self, terminal_id: str) -> "ProbeResult": ...
 
-    def prove_terminal_identity(self, terminal_id: str, depth: str = "live"): ...
+    def prove_terminal_identity(self, terminal_id: str, depth: str = "live") -> Any: ...
 
     def publish_native_poll(
-        self, terminal_id: str, pane_id: str, fetch, fetched_at_mono: float, proof
-    ): ...
+        self, terminal_id: str, pane_id: str, fetch: Any, fetched_at_mono: float, proof: Any
+    ) -> FreshToken: ...
 
 
 @dataclass(frozen=True)
@@ -49,6 +49,12 @@ class NativeProbeResult:
     status: TerminalStatus
     meta: dict[str, Any]
     fresh_token: FreshToken
+
+
+@dataclass(frozen=True)
+class ResolvedRSAnswer:
+    answer: TerminalStatus | None
+    rs_sourced: bool
 
 
 def activate_native_publisher() -> None:
@@ -62,7 +68,9 @@ def native_publisher_active() -> bool:
         return _native_publisher_enabled
 
 
-def _poll_native_once(terminal_id: str, monitor: _StatusMonitor):
+def _poll_native_once(
+    terminal_id: str, monitor: _StatusMonitor
+) -> tuple[FreshToken, Any, Any, float] | None:
     now = time.monotonic()
     last = _native_poll_last.get(terminal_id)
     if last is not None and now - last < NATIVE_POLL_COOLDOWN_S:
@@ -71,7 +79,7 @@ def _poll_native_once(terminal_id: str, monitor: _StatusMonitor):
     try:
         from cli_agent_orchestrator.providers.manager import provider_manager
 
-        backend = get_backend()
+        backend = cast(Any, get_backend())
         provider = provider_manager.get_provider(terminal_id)
         metadata = get_terminal_metadata(terminal_id)
         if (
@@ -132,11 +140,10 @@ def native_probe(
 def _monitor() -> _StatusMonitor:
     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-    return status_monitor
+    return cast(_StatusMonitor, status_monitor)
 
 
-def snapshot_view(
-    consumer_op: ConsumerOp,
+def resolve_rs_answer(
     terminal_id: str,
     *,
     max_age_s: float,
@@ -144,32 +151,17 @@ def snapshot_view(
     monitor: _StatusMonitor | None = None,
     require_fresh: bool = False,
     token: FreshToken | None = None,
-) -> TerminalStatus | None:
-    """Read one activated receiver view or preserve the row's legacy behavior."""
+) -> ResolvedRSAnswer:
+    """Resolve the complete receiver-state answer independently of activation."""
 
     monitor = _monitor() if monitor is None else monitor
     try:
-        if get_backend().supports_event_inbox() and not native_publisher_active():
-            return monitor.get_status(terminal_id)
-    except Exception:
-        now_mono = time.monotonic()
-        last_logged = _backend_failure_last_logged.get(terminal_id)
-        if last_logged is None or now_mono - last_logged >= 60.0:
-            _backend_failure_last_logged[terminal_id] = now_mono
-            logger.warning(
-                "Receiver-state backend check failed; using legacy status", exc_info=True
-            )
-        return monitor.get_status(terminal_id)
-
-    if not receiver_state_active(consumer_op):
-        return monitor.get_status(terminal_id)
-
-    try:
         metadata = get_terminal_metadata(terminal_id)
     except Exception:
-        return monitor.get_raw_status(terminal_id)
+        return ResolvedRSAnswer(monitor.get_raw_status(terminal_id), False)
     if metadata is None:
         status = None
+        rs_sourced = False
     else:
         view = monitor.receiver_state_store.snapshot_view(
             (
@@ -183,6 +175,7 @@ def snapshot_view(
             token=token,
         )
         status = None if view is None else view.latched_status
+        rs_sourced = view is not None
         if (
             view is not None
             and view.origin in {"native", "native_poll"}
@@ -212,8 +205,9 @@ def snapshot_view(
                 )
                 if refreshed is not None and refreshed.latched_status != TerminalStatus.UNKNOWN:
                     status = refreshed.latched_status
+                    rs_sourced = True
 
-    if status == TerminalStatus.PROCESSING:
+    if status == TerminalStatus.PROCESSING and metadata is not None:
         # Legacy get_raw_status re-checks the live buffer and may advance a
         # stuck PROCESSING latch. Preserve that side effect for flipped reads,
         # then prefer the newly published receiver observation.
@@ -238,22 +232,165 @@ def snapshot_view(
             status = refreshed.latched_status
 
     if status is not None:
-        return status
+        return ResolvedRSAnswer(status, rs_sourced)
     if none_behavior == "watchdog":
         try:
             monitor.probe_screen_status(terminal_id)
         except Exception:
             logger.debug("Receiver-state watchdog probe failed for %s", terminal_id, exc_info=True)
-        return monitor.get_status(terminal_id)
+        return ResolvedRSAnswer(monitor.get_status(terminal_id), False)
     if none_behavior == "legacy":
+        return ResolvedRSAnswer(monitor.get_status(terminal_id), False)
+    return ResolvedRSAnswer(None, False)
+
+
+def _event_inbox_bypass(terminal_id: str) -> bool:
+    try:
+        return bool(get_backend().supports_event_inbox() and not native_publisher_active())
+    except Exception:
+        now_mono = time.monotonic()
+        last_logged = _backend_failure_last_logged.get(terminal_id)
+        if last_logged is None or now_mono - last_logged >= 60.0:
+            _backend_failure_last_logged[terminal_id] = now_mono
+            logger.warning(
+                "Receiver-state backend check failed; using legacy status", exc_info=True
+            )
+        return True
+
+
+def view_from_legacy(
+    consumer_op: ConsumerOp,
+    terminal_id: str,
+    legacy_answer: TerminalStatus | None,
+    *,
+    max_age_s: float,
+    none_behavior: NoneBehavior,
+    monitor: _StatusMonitor | None = None,
+    require_fresh: bool = False,
+    token: FreshToken | None = None,
+) -> TerminalStatus | None:
+    """Apply phase-based authority and shadow comparison to one legacy answer."""
+
+    monitor = _monitor() if monitor is None else monitor
+    if _event_inbox_bypass(terminal_id):
+        return legacy_answer
+
+    from cli_agent_orchestrator.services import seam_parity
+
+    state = seam_parity.parity_state(consumer_op)
+    if state is None:
+        if not receiver_state_active(consumer_op):
+            return legacy_answer
+        return resolve_rs_answer(
+            terminal_id,
+            max_age_s=max_age_s,
+            none_behavior=none_behavior,
+            monitor=monitor,
+            require_fresh=require_fresh,
+            token=token,
+        ).answer
+
+    try:
+        rs = resolve_rs_answer(
+            terminal_id,
+            max_age_s=max_age_s,
+            none_behavior=none_behavior,
+            monitor=monitor,
+            require_fresh=require_fresh,
+            token=token,
+        )
+    except Exception:
+        logger.debug("Receiver-state parity resolver failed for %s", terminal_id, exc_info=True)
+        rs = ResolvedRSAnswer(None, False)
+
+    if state.phase == "collecting":
+        try:
+            seam_parity.record_comparison(
+                consumer_op,
+                "collecting",
+                legacy_answer,
+                rs.answer,
+                rs_sourced=rs.rs_sourced,
+            )
+        except Exception:
+            logger.debug("Receiver-state parity sample failed for %s", consumer_op, exc_info=True)
+        return legacy_answer
+    if state.phase == "confirming":
+        try:
+            seam_parity.record_comparison(
+                consumer_op,
+                "confirming",
+                rs.answer,
+                legacy_answer,
+                rs_sourced=rs.rs_sourced,
+            )
+        except Exception:
+            logger.debug(
+                "Receiver-state confirmation sample failed for %s", consumer_op, exc_info=True
+            )
+        return rs.answer
+    return rs.answer
+
+
+def snapshot_view(
+    consumer_op: ConsumerOp,
+    terminal_id: str,
+    *,
+    max_age_s: float,
+    none_behavior: NoneBehavior,
+    monitor: _StatusMonitor | None = None,
+    require_fresh: bool = False,
+    token: FreshToken | None = None,
+) -> TerminalStatus | None:
+    """Read the phase-authoritative answer and collect shadow parity when active."""
+
+    monitor = _monitor() if monitor is None else monitor
+    if _event_inbox_bypass(terminal_id):
         return monitor.get_status(terminal_id)
-    return None
+
+    from cli_agent_orchestrator.services import seam_parity
+
+    state = seam_parity.parity_state(consumer_op)
+    if state is None:
+        if not receiver_state_active(consumer_op):
+            return monitor.get_status(terminal_id)
+        return resolve_rs_answer(
+            terminal_id,
+            max_age_s=max_age_s,
+            none_behavior=none_behavior,
+            monitor=monitor,
+            require_fresh=require_fresh,
+            token=token,
+        ).answer
+    if state.phase == "done":
+        return resolve_rs_answer(
+            terminal_id,
+            max_age_s=max_age_s,
+            none_behavior=none_behavior,
+            monitor=monitor,
+            require_fresh=require_fresh,
+            token=token,
+        ).answer
+    legacy_answer = monitor.get_status(terminal_id)
+    return view_from_legacy(
+        consumer_op,
+        terminal_id,
+        legacy_answer,
+        max_age_s=max_age_s,
+        none_behavior=none_behavior,
+        monitor=monitor,
+        require_fresh=require_fresh,
+        token=token,
+    )
 
 
 __all__ = [
     "NoneBehavior",
+    "ResolvedRSAnswer",
     "activate_native_publisher",
     "native_publisher_active",
     "native_probe",
+    "resolve_rs_answer",
     "snapshot_view",
+    "view_from_legacy",
 ]

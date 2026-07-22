@@ -153,6 +153,7 @@ class StalledCallbackWatchdog:
         self._generation_by_terminal: dict[str, int] = {}
         self._callback_fences: dict[str, int] = {}
         self._chain_notified: set[tuple[str, int, str, int]] = set()
+        self._parity_clock = time.monotonic
 
     @contextmanager
     def callback_insert_guard(self, sender_id: str):
@@ -579,12 +580,8 @@ class StalledCallbackWatchdog:
                 if blockers:
                     oldest_inbound_at = min(episode.inbound_at for _, episode in blockers)
                     last_push = current_episode.waiting_last_push_at
-                    if (
-                        now - oldest_inbound_at >= WATCHDOG_WAITING_ESCALATE_S
-                        and (
-                            last_push is None
-                            or now - last_push >= WATCHDOG_WAITING_REPEAT_FLOOR_S
-                        )
+                    if now - oldest_inbound_at >= WATCHDOG_WAITING_ESCALATE_S and (
+                        last_push is None or now - last_push >= WATCHDOG_WAITING_REPEAT_FLOOR_S
                     ):
                         current_episode.waiting_last_push_at = now
                         blocker_ids = ", ".join(sorted(terminal_id for terminal_id, _ in blockers))
@@ -832,10 +829,7 @@ class StalledCallbackWatchdog:
             return None
         with self._lock:
             target_episode = self._episodes.get(notice.terminal_id)
-            if (
-                target_episode is None
-                or target_episode.generation != notice.source_generation
-            ):
+            if target_episode is None or target_episode.generation != notice.source_generation:
                 return None
             worker_id = target_episode.caller_id
             worker_episode = self._episodes.get(worker_id)
@@ -908,8 +902,7 @@ class StalledCallbackWatchdog:
         jobs = [
             (notice, reservation)
             for notice, reservation in jobs
-            if notice.kind != "waiting"
-            or (notice.terminal_id, notice.caller_id) not in chain_pairs
+            if notice.kind != "waiting" or (notice.terminal_id, notice.caller_id) not in chain_pairs
         ]
 
         for notice, reservation in jobs:
@@ -1114,9 +1107,12 @@ class StalledCallbackWatchdog:
                 )
 
     async def run(self, registry: PluginRegistry | None = None) -> None:
+        from cli_agent_orchestrator.services import seam_parity
+
         queue = bus.subscribe("terminal.*.status")
         logger.info("StalledCallbackWatchdog started")
         interval = max(1.0, min(5.0, float(self.grace_seconds)))
+        next_parity_sweep = self._parity_clock() + 60.0
         while True:
             try:
                 try:
@@ -1134,6 +1130,9 @@ class StalledCallbackWatchdog:
                 await asyncio.to_thread(self.notify_due, registry)
                 await asyncio.to_thread(self.tick_waiting_inbox, registry)
                 await asyncio.to_thread(self.tick_ready_backlog, registry)
+                if self._parity_clock() >= next_parity_sweep:
+                    await asyncio.to_thread(seam_parity.sweep)
+                    next_parity_sweep = self._parity_clock() + 60.0
             except Exception:
                 logger.exception("StalledCallbackWatchdog error")
 

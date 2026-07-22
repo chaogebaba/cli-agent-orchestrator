@@ -36,9 +36,9 @@ from cli_agent_orchestrator.clients.database import (
     get_current_mailbox_terminal,
     get_message_trace,
     get_owned_legacy_parked_messages,
+    get_park_warm_for_message_ids,
     get_pending_messages,
     get_pending_messages_by_ids,
-    get_park_warm_for_message_ids,
     get_terminal_metadata,
     insert_identity_authority_notice,
     list_attempt_member_ids,
@@ -749,12 +749,16 @@ class InboxService:
         if sender_id.startswith("watchdog:"):
             return
         stalled_callback_watchdog.record_callback_if_to_caller(sender_id, terminal_id)
-        if metadata.get("caller_id") and not park_warm and (
-            orchestration_type == OrchestrationType.ASSIGN
-            or (
-                orchestration_type == OrchestrationType.SEND_MESSAGE
-                and sender_id == metadata["caller_id"]
-                and stalled_callback_watchdog.has_episode(terminal_id)
+        if (
+            metadata.get("caller_id")
+            and not park_warm
+            and (
+                orchestration_type == OrchestrationType.ASSIGN
+                or (
+                    orchestration_type == OrchestrationType.SEND_MESSAGE
+                    and sender_id == metadata["caller_id"]
+                    and stalled_callback_watchdog.has_episode(terminal_id)
+                )
             )
         ):
             stalled_callback_watchdog.record_inbound_task(
@@ -1386,9 +1390,18 @@ class InboxService:
                                 )
                             except Exception:
                                 return
-                        if not isinstance(
-                            getattr(admission_snapshot, "status", None), TerminalStatus
-                        ):
+                        if isinstance(getattr(admission_snapshot, "status", None), TerminalStatus):
+                            status = receiver_state_view.view_from_legacy(
+                                "delivery.admission_status",
+                                terminal_id,
+                                admission_snapshot.status,
+                                max_age_s=5.0,
+                                none_behavior="none",
+                                monitor=status_monitor,
+                            )
+                            if status is None:
+                                return
+                        else:
                             admission_snapshot = None
                             status = receiver_state_view.snapshot_view(
                                 "delivery.admission_status",
@@ -1404,8 +1417,6 @@ class InboxService:
                                 TerminalStatus.COMPLETED,
                             }:
                                 return
-                        else:
-                            status = admission_snapshot.status
                         if metadata.get("provider") == "claude_code" and status not in {
                             TerminalStatus.IDLE,
                             TerminalStatus.COMPLETED,
