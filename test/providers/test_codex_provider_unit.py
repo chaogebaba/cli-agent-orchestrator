@@ -1644,6 +1644,37 @@ class TestCodexComposerDraftParsing:
         ]
         assert self._p().read_composer_draft(screen) == ""
 
+    @pytest.mark.parametrize(
+        "fixture_name",
+        ["live-statusline-enabled-plain.txt", "live-statusline-enabled-ansi.txt"],
+    )
+    def test_live_statusline_fixture_is_idle_and_has_no_draft(self, fixture_name):
+        screen = load_fixture(fixture_name).splitlines()
+        provider = self._p()
+
+        assert provider.get_status("\n".join(screen)) == TerminalStatus.IDLE
+        assert provider.read_composer_draft(screen) == ""
+
+    @pytest.mark.parametrize(
+        "fixture_name",
+        ["live-statusline-enabled-plain.txt", "live-statusline-enabled-ansi.txt"],
+    )
+    def test_live_statusline_fixture_footer_does_not_hide_completed_response(self, fixture_name):
+        status_line = next(
+            line for line in reversed(load_fixture(fixture_name).splitlines()) if line.strip()
+        )
+        output = f"› fix the bug\n• The bug is fixed.\n\n› Explain this codebase\n\n{status_line}"
+
+        assert self._p().get_status(output) == TerminalStatus.COMPLETED
+        assert self._p().read_composer_draft(output.splitlines()) == ""
+
+    def test_five_hour_only_statusline_is_footer_and_has_no_draft(self):
+        screen = load_fixture("codex-five-hour-statusline.txt").splitlines()
+        provider = self._p()
+
+        assert provider.get_status("\n".join(screen)) == TerminalStatus.IDLE
+        assert provider.read_composer_draft(screen) == ""
+
 
 class TestCodexBulletFormatStatusDetection:
     """Tests for Codex's real interactive output format using › prompt and • bullets."""
@@ -2027,6 +2058,19 @@ class TestCodexV0136FooterFormat:
         assert "def greet(name):" in message
         assert "Hello, {name}!" in message
         assert "Run /review" not in message
+
+    def test_dual_chrome_rows_do_not_promote_ghost_prompt_to_user(self):
+        output = (
+            "› Fix the parser.\n"
+            "• Parser fixed.\n"
+            "› Run /review on my current changes\n"
+            "  ? for shortcuts\n"
+            "  ~/project · main · gpt-5.6-sol high\n"
+        )
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script(output) == "• Parser fixed."
 
 
 class TestCodexProviderMessageExtraction:
@@ -2690,9 +2734,7 @@ class TestCodexProviderExitDetection:
         provider._initialized = True
         provider.shell_baseline = "zsh"
 
-        assert provider.get_status("OpenAI Codex (v0.98.0)\n› \n% \n") == (
-            TerminalStatus.ERROR
-        )
+        assert provider.get_status("OpenAI Codex (v0.98.0)\n› \n% \n") == (TerminalStatus.ERROR)
 
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_get_status_normal_when_codex_running(self, mock_backend):
@@ -2794,16 +2836,12 @@ class TestWPQ8ContentPolicyRefusal:
         rows = load_fixture("codex_content_policy_refusal_2026-07-17.txt").splitlines()
         provider = CodexProvider("test1234", "test-session", "window-0")
         original = provider.classify_idle_reason(rows, provider.classify_screen(rows))
-        redrawn = provider.classify_idle_reason(
-            [*rows, ""], provider.classify_screen([*rows, ""])
-        )
+        redrawn = provider.classify_idle_reason([*rows, ""], provider.classify_screen([*rows, ""]))
         assert original == redrawn == "content_policy_refusal"
         original_rule = screen_rule_id_for_reason(original)
         redrawn_rule = screen_rule_id_for_reason(redrawn)
         assert original_rule == redrawn_rule
-        assert incident_directory(
-            "term", 7, original_rule, log_dir=tmp_path
-        ) == incident_directory(
+        assert incident_directory("term", 7, original_rule, log_dir=tmp_path) == incident_directory(
             "term", 7, redrawn_rule, log_dir=tmp_path
         )
 

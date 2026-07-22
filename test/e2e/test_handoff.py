@@ -20,6 +20,7 @@ Run:
     uv run pytest -m e2e test/e2e/test_handoff.py -v -k copilot
 """
 
+import re
 import time
 import uuid
 from test.e2e.conftest import (
@@ -102,6 +103,15 @@ def _run_handoff_test(provider: str, agent_profile: str, task_message: str, cont
         # No TUI chrome leaking into output
         assert "? for shortcuts" not in output, "TUI footer leaked into output"
         assert "context left" not in output, "TUI status bar leaked into output"
+        assert (
+            re.search(r"(?i)context\s+\d+%\s+left", output) is None
+        ), "TUI context status leaked into output"
+        assert (
+            re.search(r"(?i)\d+%\s+(?:context\s+)?left", output) is None
+        ), "TUI percentage status leaked into output"
+        assert (
+            re.search(r"(?m)^\s*[~/][^·\n]*·(?:[^·\n]+·?)+\s*$", output) is None
+        ), "TUI path-first status leaked into output"
         assert "esc to interrupt" not in output, "TUI spinner leaked into output"
 
         # Handoff prefix should not appear in extracted output

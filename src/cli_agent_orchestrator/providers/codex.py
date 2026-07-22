@@ -129,13 +129,18 @@ TRANSIENT_ERROR_EXCLUSIONS = (
 )
 
 # Codex TUI footer indicators (status bar below the idle prompt).
-# Used to detect when the bottom lines contain TUI chrome rather than user input.
-# v0.110 and earlier: "? for shortcuts" and "N% context left"
-# v0.111+: "model · N% left · path" (PR #13202 restored draft footer hints)
-# v0.136+: "model · path" (the "N% left" segment was removed)
-# The "·\s+[~/]" alternative anchors on the path component of the footer,
-# which is shared across v0.111 and v0.136 status bars.
-TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])"
+# Keep this case-insensitive: status_line labels and model names vary by version.
+# The path-first alternative covers the current status_line rendering; the
+# path-last alternative preserves the older Codex footer shape.
+TUI_FOOTER_PATTERN = (
+    r"(?i)(?:\?\s+for shortcuts|"
+    r"context\s+\d+%\s+left|"
+    r"\d+%\s+(?:context\s+)?left|"
+    r"(?:\d+\s*h(?:\s+\d+\s*m)?(?:\s+\d+\s*s)?|"
+    r"\d+\s*m(?:\s+\d+\s*s)?)\s+left|"
+    r"·\s+[~/]|"
+    r"^\s*[~/][^·\n]*·(?:[^·\n]+(?:·[^·\n]+)*)\s*$)"
+)
 # Codex TUI progress spinner: "• Working (0s • esc to interrupt)",
 # "• Thinking (3m 39s ...)",
 # "• Starting script creation (1h 2m 3s • esc to interrupt)".
@@ -270,7 +275,7 @@ def _composer_body_is_dim_ghost(raw_body: str) -> bool:
     return saw_text and not saw_undimmed
 
 
-def _compute_tui_footer_cutoff(all_lines: list) -> int:
+def _compute_tui_footer_cutoff(all_lines: list[str]) -> int:
     """Compute the character position where the TUI footer area starts.
 
     Scans backward from the last line to find the TUI footer status bar
@@ -285,28 +290,66 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
     n = len(all_lines)
     footer_start_idx = n
 
-    # Find the status bar line (last TUI_FOOTER_PATTERN match in the bottom area)
+    last_nonempty = next(
+        (i for i in range(n - 1, -1, -1) if all_lines[i].strip()),
+        -1,
+    )
+
+    # Find the status bar line (last footer match in the bottom area).
     for i in range(n - 1, max(n - IDLE_PROMPT_TAIL_LINES - 1, -1), -1):
-        if re.search(TUI_FOOTER_PATTERN, all_lines[i]):
+        if _is_tui_footer_line(all_lines[i], bottom=i == last_nonempty):
             footer_start_idx = i
             break
 
     if footer_start_idx == n:
         return len("\n".join(all_lines))
 
-    # Scan upward from the status bar to include blank lines and the
-    # suggestion hint (› with text) that are part of the TUI footer chrome.
-    for j in range(footer_start_idx - 1, max(footer_start_idx - 4, -1), -1):
+    # Scan upward from the status bar to include both chrome rows when present:
+    # the shortcuts hint and the suggestion prompt. The old walk stopped at
+    # the shortcuts row, leaving a ghost prompt above the cutoff.
+    for j in range(footer_start_idx - 1, max(footer_start_idx - 7, -1), -1):
         line = all_lines[j]
         if not line.strip():
             footer_start_idx = j
         elif re.match(rf"\s*{IDLE_PROMPT_PATTERN}", line):
             footer_start_idx = j
-            break
+        elif re.search(r"\?\s+for shortcuts", line, re.IGNORECASE):
+            footer_start_idx = j
         else:
             break
 
     return len("\n".join(all_lines[:footer_start_idx]))
+
+
+def _is_tui_footer_line(line: str, *, bottom: bool = False) -> bool:
+    """Return whether a rendered row is Codex footer chrome.
+
+    Token matches are safe anywhere in the pane tail. The generic middle-dot
+    shape is only accepted for the bottom-most non-empty row, where status_line
+    renders its compact path/model segments.
+    """
+    clean = strip_terminal_escapes(line).strip()
+    if not clean or "›" in clean:
+        return False
+    if re.search(TUI_FOOTER_PATTERN, clean):
+        return True
+    if not bottom or len(clean) > 240:
+        return False
+    segments = [segment.strip() for segment in clean.split("·")]
+    return len(segments) >= 2 and all(0 < len(segment) <= 96 for segment in segments)
+
+
+def _has_tui_footer_in_tail(all_lines: list[str]) -> bool:
+    """Detect footer chrome only within the configured pane-tail window."""
+    tail_start = max(0, len(all_lines) - IDLE_PROMPT_TAIL_LINES)
+    last_nonempty = next(
+        (i for i in range(len(all_lines) - 1, -1, -1) if all_lines[i].strip()),
+        -1,
+    )
+    return any(
+        _is_tui_footer_line(line, bottom=tail_start + offset == last_nonempty)
+        for offset, line in enumerate(all_lines[tail_start:])
+    )
 
 
 def _toml_scalar(value: Any) -> str:
@@ -392,7 +435,7 @@ def _toml_override(key: str, value: Any) -> str:
 
 
 def _resolved_codex_profile_config(
-    profile, profile_name: str | None = None
+    profile: Any, profile_name: str | None = None
 ) -> tuple[str | None, dict[str, Any]]:
     """Single model/config resolver shared by interactive and seed launches."""
     defaults = get_provider_defaults("codex")
@@ -475,7 +518,7 @@ class CodexProvider(BaseProvider):
         session_name: str,
         window_name: str,
         agent_profile: Optional[str] = None,
-        allowed_tools: Optional[list] = None,
+        allowed_tools: Optional[list[str]] = None,
         skill_prompt: Optional[str] = None,
         fork_context: Optional[ForkContext] = None,
         persona_plan: Optional["PersonaPlan"] = None,
@@ -528,7 +571,7 @@ class CodexProvider(BaseProvider):
             validator.validate_session_artifact(session_uuid, cwd)
         except Exception as exc:
             raise RuntimeError("seed_artifact_invalid") from exc
-        return session_uuid
+        return str(session_uuid)
 
     def _build_codex_command(self) -> str:
         """Build Codex command with agent profile if provided.
@@ -553,7 +596,7 @@ class CodexProvider(BaseProvider):
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
         if profile and profile.codexProfile and not yolo:
-            command_parts = ["codex", "--profile", profile.codexProfile]
+            command_parts: list[str] = ["codex", "--profile", profile.codexProfile]
         else:
             command_parts = ["codex", "--yolo"]
         command_parts.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
@@ -670,7 +713,6 @@ class CodexProvider(BaseProvider):
                 for x in command_rest
             ]
             command_parts = command_prefix + command_rest + [self._fork_context.session_uuid]
-
         return shlex.join(command_parts)
 
     def build_fork_command(
@@ -813,7 +855,7 @@ class CodexProvider(BaseProvider):
         self,
         *,
         coordinates: tuple[str, str] | None = None,
-        provider_override=None,
+        provider_override: Any = None,
         raw_status: bool = False,
     ) -> bool:
         """Initialize Codex provider by starting codex command."""
@@ -930,9 +972,7 @@ class CodexProvider(BaseProvider):
         # Only apply the cutoff when TUI footer indicators are actually present
         # to avoid over-excluding in short outputs or test fixtures.
         all_lines = clean_output.splitlines()
-        tui_footer_detected = any(
-            re.search(TUI_FOOTER_PATTERN, line) for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]
-        )
+        tui_footer_detected = _has_tui_footer_in_tail(all_lines)
         if tui_footer_detected:
             cutoff_pos = _compute_tui_footer_cutoff(all_lines)
         else:
@@ -1245,9 +1285,13 @@ class CodexProvider(BaseProvider):
         # widths where useful, then we strip SGR from the final draft.
         plain_lines = [strip_terminal_escapes(line).rstrip() for line in raw_lines]
 
+        last_nonempty = next(
+            (i for i in range(len(plain_lines) - 1, -1, -1) if plain_lines[i].strip()),
+            -1,
+        )
         footer_idx = len(plain_lines)
         for i in range(len(plain_lines) - 1, -1, -1):
-            if re.search(TUI_FOOTER_PATTERN, plain_lines[i]):
+            if _is_tui_footer_line(plain_lines[i], bottom=i == last_nonempty):
                 footer_idx = i
                 break
 
@@ -1285,8 +1329,14 @@ class CodexProvider(BaseProvider):
             return ""
 
         segments = [first_plain]
-        for line in plain_lines[prompt_idx + 1 : search_end]:
+        for offset, line in enumerate(
+            plain_lines[prompt_idx + 1 : search_end], start=prompt_idx + 1
+        ):
             text = line.strip()
+            # Defense in depth: a status_line row must never become draft text,
+            # even if a future footer variant misses the primary detector.
+            if _is_tui_footer_line(line, bottom=offset == last_nonempty):
+                continue
             if not text:
                 segments.append("")
                 continue
@@ -1384,9 +1434,7 @@ class CodexProvider(BaseProvider):
         # Primary: find last user message, extract response between it and idle prompt.
         # Exclude the Codex TUI footer from user-message matching when detected.
         all_lines = clean_output.splitlines()
-        tui_footer_detected = any(
-            re.search(TUI_FOOTER_PATTERN, line) for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]
-        )
+        tui_footer_detected = _has_tui_footer_in_tail(all_lines)
         if tui_footer_detected:
             cutoff_pos = _compute_tui_footer_cutoff(all_lines)
         else:
