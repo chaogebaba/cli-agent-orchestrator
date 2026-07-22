@@ -185,6 +185,22 @@ def _persona_root(*, create: bool = True) -> Path:
     return root
 
 
+def _persisted_persona_manifest(terminal_id: str) -> Path | None:
+    """Return a terminal manifest path without validating the runtime root.
+
+    This probe is only used to distinguish an ordinary terminal from a
+    persisted persona before applying the fail-loud runtime-root contract.
+    """
+    raw = os.environ.get("XDG_RUNTIME_DIR")
+    if not raw:
+        return None
+    candidate = Path(raw) / "cao-personas" / terminal_id / "current" / "persona-manifest.json"
+    try:
+        return candidate if candidate.is_file() else None
+    except OSError:
+        return None
+
+
 def _next_generation(terminal_root: Path) -> tuple[str, Path]:
     numbers = []
     for candidate in terminal_root.glob("gen-*"):
@@ -523,9 +539,10 @@ def load_persona_plan(terminal_id: str) -> PersonaPlan | None:
     """Validate and rehydrate a frozen plan from its current manifest."""
     if not re.fullmatch(r"[A-Za-z0-9_-]+", terminal_id):
         raise PersonaContextError("persona_terminal_id_invalid")
-    manifest_path = _persona_root(create=False) / terminal_id / "current" / "persona-manifest.json"
-    if not manifest_path.is_file():
+    persisted_manifest = _persisted_persona_manifest(terminal_id)
+    if persisted_manifest is None:
         return None
+    manifest_path = _persona_root(create=False) / terminal_id / "current" / "persona-manifest.json"
     try:
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -804,6 +821,8 @@ def reap_persona_generations(terminal_id: str) -> None:
     """Remove generations no longer referenced by the current provider."""
     if not re.fullmatch(r"[A-Za-z0-9_-]+", terminal_id):
         raise PersonaContextError("persona_terminal_id_invalid")
+    if _persisted_persona_manifest(terminal_id) is None:
+        return
     terminal_root = _persona_root(create=False) / terminal_id
     if not terminal_root.exists():
         return

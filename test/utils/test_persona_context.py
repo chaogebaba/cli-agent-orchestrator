@@ -290,7 +290,7 @@ def test_provider_manager_rehydrates_manifest_plan(persona_env: dict[str, Path])
     provider = ProviderManager().construct_provider(
         "claude_code", "claude-rehydrate", "session", "window", "maker"
     )
-    assert provider._persona_plan == expected
+    assert getattr(provider, "_persona_plan", None) == expected
 
 
 def test_no_manifest_lookup_does_not_create_persona_tree(
@@ -302,6 +302,34 @@ def test_no_manifest_lookup_does_not_create_persona_tree(
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
     assert load_persona_plan("ordinary-terminal") is None
     assert not (runtime / "cao-personas").exists()
+
+
+def test_ordinary_rehydration_without_runtime_dir_uses_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+
+    assert load_persona_plan("ordinary-terminal") is None
+    provider = ProviderManager().construct_provider(
+        "claude_code", "ordinary-terminal", "session", "window", "maker"
+    )
+    assert getattr(provider, "_persona_plan", None) is None
+    reap_persona_generations("ordinary-terminal")
+
+
+def test_unknown_codex_resolution_without_runtime_dir_uses_production(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    production = tmp_path / "production-codex"
+    production.mkdir()
+    monkeypatch.setattr(
+        persona_context,
+        "provider_home",
+        lambda provider: ProviderHome(provider, "production", production),
+    )
+
+    assert resolve_codex_home("unknown-terminal") == production
 
 
 def test_context_policy_schema_accepts_contract_and_rejects_unknown_key() -> None:
