@@ -1,0 +1,16 @@
+name=03-deep-path-full
+cwd=/tmp/deep/path/that/is/quite/long/and/maybe/truncates/status/line/segment/abcdefghijklmnopqrstuvwxyz
+config=["current-dir","git-branch","model-with-reasoning","context-remaining","five-hour-limit"]
+cols=120
+busy=0
+git_state=non-git
+CODEX_HOME=/tmp/fx-codex-minhome
+launch_extra=--disable apps
+codex=0.145.0
+observed_tail:
+| │ model:     gpt-5.6-sol high   /model to change       │
+| │ directory: /tmp/…/segment/abcdefghijklmnopqrstuvwxyz │
+| ╰──────────────────────────────────────────────────────╯
+|   Tip: Press Tab to queue a message when a task is running; otherwise it sends immediately (except !).
+| › Improve documentation in @filename
+|   /tmp/deep/path/that/is/quite/long/and/maybe/truncates/status/line/segment/abcdefghijklmnopqrstuvwxyz · gpt-5.6-sol hi…

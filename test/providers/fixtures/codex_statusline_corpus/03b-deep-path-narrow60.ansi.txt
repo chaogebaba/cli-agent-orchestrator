@@ -1,0 +1,33 @@
+export CODEX_HOME=/tmp/fx-codex-minhome; cd /tmp/deep/path/that/is/quite/long/and/maybe/truncates/status/line/segment/abcdefghijklmnopqrstuvwxyz && codex --disable apps -c tui.status_line=\[\"current-dir\"\,\"git-branch\"\,\"model-with-reasoning\"\,\"context-remaining\"\,\"five-hour-limit\"\]
+
+[1m[36mcli-subagents[0m on [1m[35m master[0m [1m[31m[!?][0m on [1m[34m☁️  user@example.com[0m 
+[1m[32m❯[0m export CODEX_HOME=/tmp/fx-codex-minhome; cd /tmp/deep/path
+/that/is/quite/long/and/maybe/truncates/status/line/segment/
+abcdefghijklmnopqrstuvwxyz && codex --disable apps -c tui.st
+atus_line=\[\"current-dir\"\,\"git-branch\"\,\"model-with-re
+asoning\"\,\"context-remaining\"\,\"five-hour-limit\"\]
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/fx-codex-minhome"))
+[2m╭──────────────────────────────────────────────────────╮
+│ >_ [0;1mOpenAI Codex[0;2m (v0.145.0)                           │
+│                                                      │
+│ model:     [0mgpt-5.6-sol high[2m   [0m[38;5;6m/model[2m[39m to change       │
+│ directory: [0m/tmp/…/segment/abcdefghijklmnopqrstuvwxyz[2m │
+╰──────────────────────────────────────────────────────╯
+
+[0m  [1mTip:[0m Visit the Codex community forum:
+  https://community.openai.com/c/codex/37
+
+
+[1m›[0m [2mImplement {feature}
+
+[0m  [38;2;171;223;167m/tmp/deep/path/that/is/quite/long/and/maybe/truncates/sta…
+
+
+
+
+
+
+
+
+
+

@@ -130,17 +130,22 @@ TRANSIENT_ERROR_EXCLUSIONS = (
 
 # Codex TUI footer indicators (status bar below the idle prompt).
 # Keep this case-insensitive: status_line labels and model names vary by version.
-# The path-first alternative covers the current status_line rendering; the
-# path-last alternative preserves the older Codex footer shape.
-TUI_FOOTER_PATTERN = (
-    r"(?i)(?:\?\s+for shortcuts|"
-    r"context\s+\d+%\s+left|"
-    r"\d+%\s+(?:context\s+)?left|"
-    r"(?:\d+\s*h(?:\s+\d+\s*m)?(?:\s+\d+\s*s)?|"
-    r"\d+\s*m(?:\s+\d+\s*s)?)\s+left|"
-    r"·\s+[~/]|"
-    r"^\s*[~/][^·\n]*·(?:[^·\n]+(?:·[^·\n]+)*)\s*$)"
+_TUI_CONTEXT_RE = r"(?:context\s+\d+%\s+left|\d+%\s+(?:context\s+)?left)"
+_TUI_LIMIT_RE = (
+    r"(?:(?:\d+\s*h(?:\s+\d+\s*m)?(?:\s+\d+\s*s)?)|" r"(?:\d+\s*m(?:\s+\d+\s*s)?))\s+left"
 )
+_TUI_MODEL_EFFORT_RE = r"[^·\n]+?\s+(?:minimal|low|medium|high|xhigh|max|ultra)"
+TUI_FOOTER_PATTERN = (
+    r"(?i)(?:\?\s+for shortcuts|" + _TUI_CONTEXT_RE + r"|" + _TUI_LIMIT_RE + r"|·\s+[~/])"
+)
+_TUI_PATH_WITH_KNOWN_TAIL_RE = re.compile(
+    rf"^[~/][^\n›]*\s+·\s+{_TUI_MODEL_EFFORT_RE}"
+    rf"(?:\s+·\s+(?:{_TUI_CONTEXT_RE}|{_TUI_LIMIT_RE}))?$",
+    re.IGNORECASE,
+)
+_TUI_PATH_BRANCH_ONLY_RE = re.compile(r"^[~/][^\n›]*\s+·\s+\S[^\n]*$")
+_TUI_PATH_ONLY_RE = re.compile(r"^[~/][^\n›]*$")
+_TUI_PATH_TRUNCATED_RE = re.compile(r"^[~/][^\n›]*…$")
 # Codex TUI progress spinner: "• Working (0s • esc to interrupt)",
 # "• Thinking (3m 39s ...)",
 # "• Starting script creation (1h 2m 3s • esc to interrupt)".
@@ -185,6 +190,13 @@ CODEX_WELCOME_PATTERN = r"OpenAI Codex"
 CODEX_EMPTY_COMPOSER_PLACEHOLDERS = {
     "Explain this codebase",
     "Ask Codex to do anything",
+    "Find and fix a bug in @filename",
+    "Implement {feature}",
+    "Improve documentation in @filename",
+    "Run /review on my current changes",
+    "Summarize recent commits",
+    "Use /skills to list available skills",
+    "Write tests for @filename",
 }
 # CSI SGR sequences only (colour/intensity). Used to walk dim state on
 # escape-preserving capture-pane (-e) lines without treating cursor CSI as text.
@@ -296,13 +308,23 @@ def _compute_tui_footer_cutoff(all_lines: list[str]) -> int:
     )
 
     # Find the status bar line (last footer match in the bottom area).
-    for i in range(n - 1, max(n - IDLE_PROMPT_TAIL_LINES - 1, -1), -1):
+    for i in range(
+        last_nonempty,
+        max(last_nonempty - IDLE_PROMPT_TAIL_LINES, -1),
+        -1,
+    ):
         if _is_tui_footer_line(all_lines[i], bottom=i == last_nonempty):
             footer_start_idx = i
             break
 
     if footer_start_idx == n:
-        return len("\n".join(all_lines))
+        # A five-hour-only config can render no status row at all. In that
+        # case, recognize Codex's dim suggestion text as chrome so it cannot
+        # become a false user message in status or extraction parsing.
+        if last_nonempty >= 0 and _is_known_composer_placeholder(all_lines[last_nonempty]):
+            footer_start_idx = last_nonempty
+        else:
+            return len("\n".join(all_lines))
 
     # Scan upward from the status bar to include both chrome rows when present:
     # the shortcuts hint and the suggestion prompt. The old walk stopped at
@@ -335,20 +357,53 @@ def _is_tui_footer_line(line: str, *, bottom: bool = False) -> bool:
         return True
     if not bottom or len(clean) > 240:
         return False
-    segments = [segment.strip() for segment in clean.split("·")]
-    return len(segments) >= 2 and all(0 < len(segment) <= 96 for segment in segments)
+    # Anchor multi-segment status rows from the known right-hand grammar. Do
+    # not split on middle dots: paths and branch names may contain them.
+    if _TUI_PATH_WITH_KNOWN_TAIL_RE.fullmatch(clean):
+        return True
+    if _TUI_PATH_TRUNCATED_RE.fullmatch(clean):
+        return True
+    # Configs with only current-dir, or current-dir + git-branch, legitimately
+    # collapse to a path (with or without a branch) and no trailing separator.
+    return bool(_TUI_PATH_ONLY_RE.fullmatch(clean) or _TUI_PATH_BRANCH_ONLY_RE.fullmatch(clean))
 
 
-def _has_tui_footer_in_tail(all_lines: list[str]) -> bool:
-    """Detect footer chrome only within the configured pane-tail window."""
-    tail_start = max(0, len(all_lines) - IDLE_PROMPT_TAIL_LINES)
+def _is_known_composer_placeholder(line: str) -> bool:
+    """Recognize a Codex suggestion row after ANSI escapes are removed."""
+    clean = strip_terminal_escapes(line).strip()
+    match = re.fullmatch(r"(?:›|❯|codex>)\s*(.*)", clean)
+    return match is not None and match.group(1) in CODEX_EMPTY_COMPOSER_PLACEHOLDERS
+
+
+def _has_known_composer_placeholder_at_bottom(all_lines: list[str]) -> bool:
     last_nonempty = next(
         (i for i in range(len(all_lines) - 1, -1, -1) if all_lines[i].strip()),
         -1,
     )
+    return last_nonempty >= 0 and _is_known_composer_placeholder(all_lines[last_nonempty])
+
+
+def _has_tui_footer_in_tail(all_lines: list[str]) -> bool:
+    """Detect footer chrome only within the configured pane-tail window."""
+    last_nonempty = next(
+        (i for i in range(len(all_lines) - 1, -1, -1) if all_lines[i].strip()),
+        -1,
+    )
+    if last_nonempty < 0:
+        return False
+    trailing_rows = len(all_lines) - last_nonempty - 1
+    last_clean = strip_terminal_escapes(all_lines[last_nonempty]).strip()
+    legacy_path_last = bool(re.search(r"·\s+[~/]", last_clean)) and not last_clean.startswith(
+        ("/", "~")
+    )
+    if trailing_rows >= IDLE_PROMPT_TAIL_LINES and legacy_path_last:
+        # Preserve the historical full-screen capture behavior: old path-last
+        # fixtures with a large blank viewport tail did not activate cutoff.
+        return False
+    tail_start = max(0, last_nonempty - IDLE_PROMPT_TAIL_LINES + 1)
     return any(
         _is_tui_footer_line(line, bottom=tail_start + offset == last_nonempty)
-        for offset, line in enumerate(all_lines[tail_start:])
+        for offset, line in enumerate(all_lines[tail_start : last_nonempty + 1])
     )
 
 
@@ -972,8 +1027,9 @@ class CodexProvider(BaseProvider):
         # Only apply the cutoff when TUI footer indicators are actually present
         # to avoid over-excluding in short outputs or test fixtures.
         all_lines = clean_output.splitlines()
-        tui_footer_detected = _has_tui_footer_in_tail(all_lines)
-        if tui_footer_detected:
+        if _has_tui_footer_in_tail(all_lines) or _has_known_composer_placeholder_at_bottom(
+            all_lines
+        ):
             cutoff_pos = _compute_tui_footer_cutoff(all_lines)
         else:
             cutoff_pos = len(clean_output)
@@ -1434,11 +1490,13 @@ class CodexProvider(BaseProvider):
         # Primary: find last user message, extract response between it and idle prompt.
         # Exclude the Codex TUI footer from user-message matching when detected.
         all_lines = clean_output.splitlines()
-        tui_footer_detected = _has_tui_footer_in_tail(all_lines)
-        if tui_footer_detected:
+        if _has_tui_footer_in_tail(all_lines) or _has_known_composer_placeholder_at_bottom(
+            all_lines
+        ):
             cutoff_pos = _compute_tui_footer_cutoff(all_lines)
         else:
             cutoff_pos = len(clean_output)
+        tui_chrome_detected = cutoff_pos < len(clean_output)
 
         user_matches = [
             m
@@ -1475,7 +1533,7 @@ class CodexProvider(BaseProvider):
             )
             if idle_after:
                 end_pos = response_start + idle_after.start()
-            elif tui_footer_detected:
+            elif tui_chrome_detected:
                 end_pos = cutoff_pos
             else:
                 end_pos = len(clean_output)

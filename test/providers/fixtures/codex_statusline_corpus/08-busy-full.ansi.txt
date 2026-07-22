@@ -1,0 +1,39 @@
+cd /home/chao/VScode_projects/cli-subagents && codex --disable apps -c 'tui.status_line=["current-dir","git-branch","model-with-reasoning","context-remaining","five-hour-limit"]'
+
+[1m[36mcli-subagents[0m on [1m[35m master[0m [1m[31m[!?][0m on [1m[34m☁️  user@example.com[0m 
+[1m[32m❯[0m cd /home/chao/VScode_projects/cli-subagents && codex --disable apps -c 'tui.status_line=["current-dir","git-branch","m
+odel-with-reasoning","context-remaining","five-hour-limit"]'
+[2m╭────────────────────────────────────────────────╮
+│ >_ [0;1mOpenAI Codex[0;2m (v0.145.0)                     │
+│                                                │
+│ model:     [0mgpt-5.6-sol high[2m   [0m[38;5;6m/model[2m[39m to change │
+│ directory: [0m~/VScode_projects/cli-subagents[2m     │
+╰────────────────────────────────────────────────╯
+
+[0m  [1mTip:[0m [3mNew[0m Build faster with Codex.
+
+
+[1;2m› [0mSay only: ok
+
+
+[1m[38;2;167;167;167m•[0m [1m[38;2;128;128;128mWor[38;2;138;138;138mk[38;2;167;167;167mi[38;2;202;202;202mn[38;2;231;231;231mg[0m [2m(1s • esc to interrupt)[0m                            
+
+
+[1m›[0m [2mRun /review on my current changes
+
+[0m  [38;2;171;223;167m~/VScode_projects/cli-subagents[2m[39m · [0m[38;2;143;179;239mmaster[2m[39m · [0m[38;2;246;226;183mgpt-5.6-sol high[2m[39m · [0m[38;2;242;181;144mContext 100% left[39m                                     
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

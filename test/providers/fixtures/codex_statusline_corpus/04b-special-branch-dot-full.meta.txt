@@ -1,0 +1,16 @@
+name=04b-special-branch-dot-full
+cwd=/tmp/fx-statusline-repo
+config=["current-dir","git-branch","model-with-reasoning","context-remaining","five-hour-limit"]
+cols=120
+busy=0
+git_state=branch=feat/x·y; head=1e99f52
+CODEX_HOME=/tmp/fx-codex-minhome
+launch_extra=--disable apps
+codex=0.145.0
+observed_tail:
+| │ model:     gpt-5.6-sol high   /model to change │
+| │ directory: /tmp/fx-statusline-repo             │
+| ╰────────────────────────────────────────────────╯
+|   Tip: New Use /fast to enable our fastest inference with increased plan usage.
+| › Find and fix a bug in @filename
+|   /tmp/fx-statusline-repo · feat/x·y · gpt-5.6-sol high · Context 100% left

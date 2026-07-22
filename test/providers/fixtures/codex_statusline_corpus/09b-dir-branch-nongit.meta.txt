@@ -1,0 +1,16 @@
+name=09b-dir-branch-nongit
+cwd=/tmp/x
+config=["current-dir","git-branch"]
+cols=120
+busy=0
+git_state=non-git
+CODEX_HOME=/tmp/fx-codex-minhome
+launch_extra=--disable apps
+codex=0.145.0
+observed_tail:
+| │ model:     gpt-5.6-sol high   /model to change │
+| │ directory: /tmp/x                              │
+| ╰────────────────────────────────────────────────╯
+|   Tip: Join the OpenAI community Discord: http://discord.gg/openai
+| › Write tests for @filename
+|   /tmp/x

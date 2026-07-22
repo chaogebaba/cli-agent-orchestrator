@@ -1,0 +1,16 @@
+name=09-dir-branch-only
+cwd=/home/chao/VScode_projects/cli-subagents
+config=["current-dir","git-branch"]
+cols=120
+busy=0
+git_state=branch=master; head=82f8c4f
+CODEX_HOME=/tmp/fx-codex-minhome
+launch_extra=--disable apps
+codex=0.145.0
+observed_tail:
+| │ model:     gpt-5.6-sol high   /model to change │
+| │ directory: ~/VScode_projects/cli-subagents     │
+| ╰────────────────────────────────────────────────╯
+|   Tip: New Use /fast to enable our fastest inference with increased plan usage.
+| › Improve documentation in @filename
+|   ~/VScode_projects/cli-subagents · master

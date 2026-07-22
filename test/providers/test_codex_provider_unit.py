@@ -14,12 +14,38 @@ from cli_agent_orchestrator.providers.codex import (
     CONTENT_POLICY_SCREEN_RULE_ID,
     CodexProvider,
     ProviderError,
+    _has_tui_footer_in_tail,
     _toml_override,
     _toml_scalar,
+    strip_terminal_escapes,
 )
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+STATUSLINE_CORPUS_DIR = FIXTURES_DIR / "codex_statusline_corpus"
+STATUSLINE_VARIANTS = {
+    "01-git-master-full": TerminalStatus.IDLE,
+    "02-nongit-tmpx-full": TerminalStatus.IDLE,
+    "02b-nongit-home-full": TerminalStatus.IDLE,
+    "03-deep-path-full": TerminalStatus.IDLE,
+    "03b-deep-path-narrow60": TerminalStatus.IDLE,
+    "04-special-path-dot-full": TerminalStatus.IDLE,
+    "04b-special-branch-dot-full": TerminalStatus.IDLE,
+    "05-five-hour-limit-pair": TerminalStatus.IDLE,
+    "05b-five-hour-only": TerminalStatus.IDLE,
+    "06-context-remaining-only": TerminalStatus.IDLE,
+    "06b-current-dir-only": TerminalStatus.IDLE,
+    "07-baseline-empty-statusline": TerminalStatus.IDLE,
+    "07b-baseline-empty-nongit": TerminalStatus.IDLE,
+    "08-busy-full": TerminalStatus.PROCESSING,
+    "09-dir-branch-only": TerminalStatus.IDLE,
+    "09b-dir-branch-nongit": TerminalStatus.IDLE,
+}
+STATUSLINE_CAPTURE_CASES = [
+    (name, capture_format, status)
+    for name, status in STATUSLINE_VARIANTS.items()
+    for capture_format in ("plain", "ansi")
+]
 
 
 @pytest.fixture(autouse=True)
@@ -1674,6 +1700,63 @@ class TestCodexComposerDraftParsing:
 
         assert provider.get_status("\n".join(screen)) == TerminalStatus.IDLE
         assert provider.read_composer_draft(screen) == ""
+
+
+class TestCodexStatuslineCorpus:
+    def _provider(self):
+        return CodexProvider("test1234", "test-session", "window-0")
+
+    def test_corpus_inventory_is_complete(self):
+        expected = {"INDEX.md"}
+        expected.update(
+            f"{variant}.{suffix}.txt"
+            for variant in STATUSLINE_VARIANTS
+            for suffix in ("plain", "ansi", "meta")
+        )
+
+        assert {path.name for path in STATUSLINE_CORPUS_DIR.iterdir()} == expected
+
+    @pytest.mark.parametrize(
+        ("variant", "capture_format", "expected"),
+        STATUSLINE_CAPTURE_CASES,
+        ids=[f"{name}-{capture_format}" for name, capture_format, _ in STATUSLINE_CAPTURE_CASES],
+    )
+    def test_real_capture_classification_and_draft(self, variant, capture_format, expected):
+        screen = (
+            (STATUSLINE_CORPUS_DIR / f"{variant}.{capture_format}.txt")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        provider = self._provider()
+
+        assert provider.get_status("\n".join(screen)) == expected
+        assert provider.read_composer_draft(screen) == ""
+        assert _has_tui_footer_in_tail(screen) is (variant != "05b-five-hour-only")
+
+    @pytest.mark.parametrize(
+        ("variant", "capture_format", "_expected"),
+        STATUSLINE_CAPTURE_CASES,
+        ids=[f"{name}-{capture_format}" for name, capture_format, _ in STATUSLINE_CAPTURE_CASES],
+    )
+    def test_real_capture_tail_does_not_hide_clean_completed_extract(
+        self, variant, capture_format, _expected
+    ):
+        rows = (
+            (STATUSLINE_CORPUS_DIR / f"{variant}.{capture_format}.txt")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        nonempty = [index for index, row in enumerate(rows) if strip_terminal_escapes(row).strip()]
+        last_nonempty = nonempty[-1]
+        prompt_index = max(
+            index for index in nonempty if "›" in strip_terminal_escapes(rows[index])
+        )
+        chrome_tail = rows[prompt_index : last_nonempty + 1]
+        output = "\n".join(["› Actual request", "• Clean answer.", "", *chrome_tail])
+        provider = self._provider()
+
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script(output) == "• Clean answer."
 
 
 class TestCodexBulletFormatStatusDetection:

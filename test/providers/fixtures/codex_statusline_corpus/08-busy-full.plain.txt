@@ -1,0 +1,39 @@
+cd /home/chao/VScode_projects/cli-subagents && codex --disable apps -c 'tui.status_line=["current-dir","git-branch","model-with-reasoning","context-remaining","five-hour-limit"]'
+
+cli-subagents on  master [!?] on ☁️  user@example.com 
+❯ cd /home/chao/VScode_projects/cli-subagents && codex --disable apps -c 'tui.status_line=["current-dir","git-branch","m
+odel-with-reasoning","context-remaining","five-hour-limit"]'
+╭────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.145.0)                     │
+│                                                │
+│ model:     gpt-5.6-sol high   /model to change │
+│ directory: ~/VScode_projects/cli-subagents     │
+╰────────────────────────────────────────────────╯
+
+  Tip: New Build faster with Codex.
+
+
+› Say only: ok
+
+
+• Working (1s • esc to interrupt)                            
+
+
+› Run /review on my current changes
+
+  ~/VScode_projects/cli-subagents · master · gpt-5.6-sol high · Context 100% left                                     
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
