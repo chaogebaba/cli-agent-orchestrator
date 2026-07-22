@@ -22,6 +22,7 @@ from cli_agent_orchestrator.utils.persona_context import (
     filter_native_memory,
     load_persona_plan,
     persona_wrapper_prefix,
+    reap_persona_generations,
     resolve_codex_home,
     wrap_claude_persona,
 )
@@ -150,6 +151,39 @@ def test_filter_and_compose_claude_manifest_rehydration(persona_env: dict[str, P
     assert not second.generation_dir.parent.exists()
     assert persona_env["cwd"].joinpath(".claude").is_dir()
     assert persona_env["cwd"].joinpath("CLAUDE.md").is_file()
+
+
+def test_reap_persona_generations_keeps_current_only(persona_env: dict[str, Path]) -> None:
+    persona_env["cwd"].mkdir()
+    policy = ContextPolicy(scope="persona")
+    first = compose_persona_plan(
+        "terminal-reap", "claude_code", "maker", policy, persona_env["cwd"]
+    )
+    second = compose_persona_plan(
+        "terminal-reap", "claude_code", "maker", policy, persona_env["cwd"]
+    )
+
+    reap_persona_generations("terminal-reap")
+
+    assert not first.generation_dir.exists()
+    assert second.generation_dir.is_dir()
+    cleanup_persona("terminal-reap")
+
+
+def test_manifest_rehydration_fails_loud_on_invalid_runtime_root(
+    persona_env: dict[str, Path],
+) -> None:
+    persona_env["cwd"].mkdir()
+    policy = ContextPolicy(scope="persona")
+    compose_persona_plan(
+        "terminal-invalid-runtime", "claude_code", "maker", policy, persona_env["cwd"]
+    )
+    persona_env["runtime"].chmod(0o755)
+    try:
+        with pytest.raises(PersonaContextError, match="ownership_or_mode"):
+            load_persona_plan("terminal-invalid-runtime")
+    finally:
+        persona_env["runtime"].chmod(0o700)
 
 
 @pytest.mark.parametrize(

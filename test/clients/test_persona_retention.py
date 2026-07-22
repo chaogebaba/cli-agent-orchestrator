@@ -225,6 +225,53 @@ def test_zero_owner_fence_prevents_alias_reclaim(retention_env: Path) -> None:
     assert alias["retained_persona_home"] is None
 
 
+def test_t2c_n_alias_after_zero_owner_check_is_born_unclaimed(
+    retention_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database.register_provider_session(**_values("base"))
+    source = retention_env / "source-codex-home"
+    source.mkdir()
+    destination = retention_env / "cao-personas" / "retained" / UUID_ONE
+    destination.parent.mkdir(parents=True)
+    destination.parent.chmod(0o700)
+    monkeypatch.setattr(
+        persona_context,
+        "load_persona_plan",
+        lambda terminal_id: SimpleNamespace(provider="codex", codex_home=source),
+    )
+    real_verify = database.verify_retained_persona_claim
+    real_rmtree = persona_context.shutil.rmtree
+    alias_claims: list[str | None] = []
+
+    def zero_ready_owner(session_uuid: str, path: str) -> int:
+        with database.SessionLocal() as db:
+            row = db.query(database.ProviderSessionModel).filter_by(name="base").one()
+            row.status = "superseded"
+            db.commit()
+        assert real_verify(session_uuid, path) == 0
+        return 0
+
+    def register_alias_before_compensation(path: Path, *args: object, **kwargs: object) -> None:
+        alias = database.register_provider_session(
+            **_values("alias-during-compensation", terminal_id="terminal-alias")
+        )
+        alias_claims.append(alias["retained_persona_home"])
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(database, "verify_retained_persona_claim", zero_ready_owner)
+    monkeypatch.setattr(persona_context.shutil, "rmtree", register_alias_before_compensation)
+
+    assert (
+        persona_context.retain_codex_persona_home(
+            "terminal-one", persona_context.PersonaRetentionIntent(UUID_ONE, destination, (1,))
+        )
+        is None
+    )
+    assert alias_claims == [None]
+    assert not destination.exists()
+    assert database.list_retained_persona_claims() == []
+
+
 def test_startup_sweep_clears_dangling_claim_and_orphan_directory(
     retention_env: Path,
 ) -> None:

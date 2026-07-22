@@ -523,12 +523,7 @@ def load_persona_plan(terminal_id: str) -> PersonaPlan | None:
     """Validate and rehydrate a frozen plan from its current manifest."""
     if not re.fullmatch(r"[A-Za-z0-9_-]+", terminal_id):
         raise PersonaContextError("persona_terminal_id_invalid")
-    try:
-        manifest_path = (
-            _persona_root(create=False) / terminal_id / "current" / "persona-manifest.json"
-        )
-    except PersonaContextError:
-        return None
+    manifest_path = _persona_root(create=False) / terminal_id / "current" / "persona-manifest.json"
     if not manifest_path.is_file():
         return None
     try:
@@ -730,11 +725,23 @@ def retain_codex_persona_home(terminal_id: str, intent: PersonaRetentionIntent) 
         logger.warning("Retained persona move failed for %s: %s", intent.session_uuid, exc)
         return "retained_persona_move_failed"
     if verify_retained_persona_claim(intent.session_uuid, str(destination)) == 0:
-        shutil.rmtree(destination, ignore_errors=True)
+        _remove_persona_tree(destination, missing_ok=True)
         logger.warning(
             "Compensated retained persona home after ownership disappeared: %s", destination
         )
     return None
+
+
+def _remove_persona_tree(path: Path, *, missing_ok: bool = False) -> None:
+    """Remove a persona-owned tree only after checking credential invariants."""
+    if not path.exists():
+        if missing_ok:
+            return
+        raise FileNotFoundError(path)
+    for candidate in path.rglob(".credentials.json"):
+        if candidate.is_file() and not candidate.is_symlink():
+            raise PersonaContextError("persona_regular_credentials_file_detected")
+    shutil.rmtree(path)
 
 
 def persona_cleanup(session_uuid: str, *, candidate_path: str | None = None) -> None:
@@ -752,7 +759,7 @@ def persona_cleanup(session_uuid: str, *, candidate_path: str | None = None) -> 
         candidate = Path(path).resolve()
         if candidate != root and root not in candidate.parents:
             raise PersonaContextError("retained_persona_path_escape")
-        shutil.rmtree(candidate, ignore_errors=False)
+        _remove_persona_tree(candidate)
     except FileNotFoundError:
         return
     except (OSError, PersonaContextError) as exc:
@@ -790,7 +797,27 @@ def reconcile_retained_persona_homes() -> None:
             claimed_paths[str(path)] = row["session_uuid"]
     for candidate in retained_root.iterdir():
         if candidate.is_dir() and str(candidate) not in claimed_paths:
-            shutil.rmtree(candidate, ignore_errors=True)
+            _remove_persona_tree(candidate, missing_ok=True)
+
+
+def reap_persona_generations(terminal_id: str) -> None:
+    """Remove generations no longer referenced by the current provider."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", terminal_id):
+        raise PersonaContextError("persona_terminal_id_invalid")
+    terminal_root = _persona_root(create=False) / terminal_id
+    if not terminal_root.exists():
+        return
+    current_link = terminal_root / "current"
+    try:
+        current = current_link.resolve(strict=True)
+    except OSError as exc:
+        raise PersonaContextError("persona_current_generation_invalid") from exc
+    if current.parent != terminal_root.resolve() or not re.fullmatch(r"gen-\d+", current.name):
+        raise PersonaContextError("persona_current_generation_invalid")
+    for candidate in terminal_root.iterdir():
+        if candidate.is_dir() and re.fullmatch(r"gen-\d+", candidate.name):
+            if candidate.resolve() != current:
+                _remove_persona_tree(candidate)
 
 
 def cleanup_persona(terminal_id: str) -> None:
@@ -803,7 +830,4 @@ def cleanup_persona(terminal_id: str) -> None:
         return
     if not terminal_root.exists():
         return
-    for candidate in terminal_root.rglob(".credentials.json"):
-        if candidate.is_file() and not candidate.is_symlink():
-            raise PersonaContextError("persona_regular_credentials_file_detected")
-    shutil.rmtree(terminal_root)
+    _remove_persona_tree(terminal_root)

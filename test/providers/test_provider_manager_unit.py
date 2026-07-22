@@ -129,6 +129,24 @@ def test_cleanup_provider_calls_cleanup_and_removes():
     assert manager._providers.get("t1") is None
 
 
+def test_cleanup_provider_reaps_persona_generations(monkeypatch):
+    from cli_agent_orchestrator.utils.persona_context import PersonaPlan
+
+    manager = ProviderManager()
+    provider = MagicMock()
+    provider._persona_plan = object.__new__(PersonaPlan)
+    manager._providers["t1"] = provider
+    reap = MagicMock()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.utils.persona_context.reap_persona_generations", reap
+    )
+
+    manager.cleanup_provider("t1")
+
+    provider.cleanup.assert_called_once()
+    reap.assert_called_once_with("t1")
+
+
 def test_create_provider_kiro_cli_without_agent_profile_raises():
     """Test Kiro CLI provider requires agent_profile."""
     manager = ProviderManager()

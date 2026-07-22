@@ -27,8 +27,8 @@ from cli_agent_orchestrator.services.rebind_lease import (
     rebind_lease_held,
     release_rebind_lease,
 )
-from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.stalled_callback_watchdog import stalled_callback_watchdog
+from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 
@@ -199,7 +199,8 @@ def _launch_context(metadata: dict) -> str | None:
     prompt = build_skill_catalog(profile.skills)
     if profile.sessionBrief:
         from cli_agent_orchestrator.services.session_manifest_service import (
-            build_session_manifest, render_session_brief,
+            build_session_manifest,
+            render_session_brief,
         )
         brief = render_session_brief(build_session_manifest(metadata["tmux_session"], metadata["id"]))
         prompt = f"{prompt}\n\n{brief}" if prompt else brief
@@ -242,7 +243,8 @@ async def rebind_terminal(
     if not initial_metadata:
         return _result(terminal_id, "unresumable", error_code="terminal_missing", interrupt=interrupt)
     from cli_agent_orchestrator.services.session_lifecycle_lease import (
-        acquire_session_lifecycle_shared, release_session_lifecycle_lease,
+        acquire_session_lifecycle_shared,
+        release_session_lifecycle_lease,
     )
     lifecycle_lease = acquire_session_lifecycle_shared(initial_metadata["tmux_session"])
     if lifecycle_lease is None:
@@ -493,6 +495,13 @@ async def rebind_terminal(
                 return result
         if old_provider is not candidate:
             old_provider.cleanup()
+            from cli_agent_orchestrator.utils.persona_context import (
+                PersonaPlan,
+                reap_persona_generations,
+            )
+
+            if isinstance(getattr(candidate, "_persona_plan", None), PersonaPlan):
+                reap_persona_generations(terminal_id)
         result = _result(terminal_id, "rebound", interrupt=interrupt)
         if prepared_recovery is not None:
             from cli_agent_orchestrator.services.wpd1_decontam import public_scrub_summary

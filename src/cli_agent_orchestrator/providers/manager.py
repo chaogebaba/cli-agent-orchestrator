@@ -295,6 +295,13 @@ class ProviderManager:
                 provider = self._providers.pop(terminal_id, None)
             if provider:
                 provider.cleanup()
+                from cli_agent_orchestrator.utils.persona_context import (
+                    PersonaPlan,
+                    reap_persona_generations,
+                )
+
+                if isinstance(getattr(provider, "_persona_plan", None), PersonaPlan):
+                    reap_persona_generations(terminal_id)
                 logger.info(f"Cleaned up provider for terminal: {terminal_id}")
         except Exception as e:
             logger.error(f"Failed to cleanup provider for terminal {terminal_id}: {e}")

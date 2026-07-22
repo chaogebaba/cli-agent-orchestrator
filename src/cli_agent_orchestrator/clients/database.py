@@ -2506,11 +2506,10 @@ def get_retained_persona_home_for_terminal(terminal_id: str) -> Optional[str]:
             db.query(ProviderSessionModel)
             .filter(
                 ProviderSessionModel.source_terminal_id == terminal_id,
+                ProviderSessionModel.status == "ready",
                 ProviderSessionModel.retained_persona_home.isnot(None),
             )
-            .order_by(
-                (ProviderSessionModel.status == "ready").desc(), ProviderSessionModel.id.desc()
-            )
+            .order_by(ProviderSessionModel.id.desc())
             .first()
         )
         return cast(Optional[str], row.retained_persona_home) if row is not None else None

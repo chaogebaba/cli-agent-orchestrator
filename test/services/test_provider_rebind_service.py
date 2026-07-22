@@ -465,6 +465,13 @@ def test_real_monitor_projected_error_diverges_from_candidate_raw(monkeypatch):
 @pytest.mark.asyncio
 async def test_transaction_p12_uses_real_raw_monitor_under_error_overlay(monkeypatch):
     old, candidate, _states = _install_transaction_harness(monkeypatch)
+    from cli_agent_orchestrator.utils.persona_context import PersonaPlan
+
+    candidate._persona_plan = object.__new__(PersonaPlan)
+    reap = MagicMock()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.utils.persona_context.reap_persona_generations", reap
+    )
     monitor = StatusMonitor()
     state = {"value": None}
     backend = MagicMock()
@@ -508,6 +515,7 @@ async def test_transaction_p12_uses_real_raw_monitor_under_error_overlay(monkeyp
     result = await service.rebind_terminal("txn")
     assert result["status"] == "rebound", result
     assert state["value"] == "rebound"
+    reap.assert_called_once_with("txn")
 
 
 @pytest.mark.asyncio
