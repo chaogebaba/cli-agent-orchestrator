@@ -160,6 +160,21 @@ DIALOG_ACTION_FOOTER_PATTERN = re.compile(
     r"left/right\s+group\s+.*enter\s+edit shortcut.*esc\s+close)",
     re.IGNORECASE,
 )
+# Startup "Update available!" dialog. Codex shows this at startup when a newer
+# release exists, with a numbered menu whose cursor default is option 1:
+#   ✨ Update available! 0.142.5 -> 0.144.5
+#   1. Update now (runs npm install -g @openai/codex)
+#   2. Skip
+#   3. Skip until next version
+#   Press enter to continue
+# A blind Enter would run a GLOBAL npm install that swaps the codex binary under
+# every other running CAO worker. We suppress with
+# -c check_for_update_on_startup=false at launch AND detect+dismiss with
+# '3'+Enter as defense-in-depth.
+UPDATE_DIALOG_PATTERN = r"Update available!\s+\S+\s+->\s+\S+"
+UPDATE_DIALOG_MENU_PATTERN = r"Skip until next version"
+UPDATE_DIALOG_FOOTER = r"Press enter to continue"
+STARTUP_PROMPT_BOTTOM_LINES = 15
 # Codex welcome banner indicating normal startup (no trust prompt)
 CODEX_WELCOME_PATTERN = r"OpenAI Codex"
 CODEX_EMPTY_COMPOSER_PLACEHOLDERS = {
@@ -404,6 +419,16 @@ def _resolved_codex_profile_config(
     return model, config
 
 
+def _has_update_dialog_in_bottom(clean_output: str) -> bool:
+    """Return True when Codex's update-available dialog is active in the bottom region."""
+    bottom = "\n".join(clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+    return (
+        re.search(UPDATE_DIALOG_PATTERN, bottom) is not None
+        and re.search(UPDATE_DIALOG_MENU_PATTERN, bottom) is not None
+        and re.search(UPDATE_DIALOG_FOOTER, bottom) is not None
+    )
+
+
 def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
     """Find the first ASSISTANT_PREFIX_PATTERN match in ``text`` whose line
     is not an MCP tool-call marker.
@@ -631,14 +656,21 @@ class CodexProvider(BaseProvider):
 
         command_parts.extend(["-c", "features.multi_agent=false"])
 
+        # Suppress the startup update dialog at the source. This follows all
+        # profile overrides so it wins, but stays before a fork/resume UUID,
+        # which Codex requires as the final positional argument.
+        command_parts.extend(["-c", "check_for_update_on_startup=false"])
+
         if self._fork_context:
             mode = self._fork_context.mode
-            prefix = ["codex", mode]
-            rest = command_parts[1:]
-            rest = [
-                "--dangerously-bypass-approvals-and-sandbox" if x == "--yolo" else x for x in rest
+            command_prefix = ["codex", mode]
+            command_rest = command_parts[1:]
+            command_rest = [
+                "--dangerously-bypass-approvals-and-sandbox" if x == "--yolo" else x
+                for x in command_rest
             ]
-            command_parts = prefix + rest + [self._fork_context.session_uuid]
+            command_parts = command_prefix + command_rest + [self._fork_context.session_uuid]
+
         return shlex.join(command_parts)
 
     def build_fork_command(
@@ -724,12 +756,10 @@ class CodexProvider(BaseProvider):
         return btime + float(stat[21]) / os.sysconf(os.sysconf_names["SC_CLK_TCK"])
 
     async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
-        """Auto-accept the workspace trust prompt if it appears.
+        """Dismiss a workspace-trust or update dialog that blocks readiness.
 
-        Codex shows a folder approval dialog when opening a new directory.
-        This sends Enter to accept the default option (allow Codex to work).
-        CAO assumes the user trusts the working directory since they confirmed
-        workspace access during the launch command.
+        Workspace trust is accepted with Enter. An update dialog is dismissed
+        with '3'+Enter so CAO never selects the default global-install action.
         """
         start_time = time.time()
         while time.time() - start_time < timeout:
@@ -738,8 +768,7 @@ class CodexProvider(BaseProvider):
                 await asyncio.sleep(1.0)
                 continue
 
-            # Clean ANSI codes for reliable text matching
-            clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+            clean_output = strip_terminal_escapes(re.sub(ANSI_CODE_PATTERN, "", output))
 
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -749,9 +778,21 @@ class CodexProvider(BaseProvider):
                 get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 return
 
-            # Check if Codex has fully started (welcome banner visible)
+            if _has_update_dialog_in_bottom(clean_output):
+                from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                logger.info(
+                    "Codex update-available dialog detected, selecting " "'Skip until next version'"
+                )
+                status_monitor.notify_input_sent(self.terminal_id)
+                get_backend().send_keys(self.session_name, self.window_name, "3", enter_count=0)
+                # TUI rendering latency: '3' highlights the menu item, Enter confirms.
+                await asyncio.sleep(0.3)
+                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                return
+
             if re.search(CODEX_WELCOME_PATTERN, clean_output):
-                logger.info("Codex started without trust prompt")
+                logger.info("Codex started without a blocking startup prompt")
                 return
 
             await asyncio.sleep(1.0)
@@ -763,8 +804,8 @@ class CodexProvider(BaseProvider):
         except Exception:
             pass
         logger.error(
-            "Codex trust prompt handler timed out; no trust dialog or welcome "
-            "banner detected. Pane tail:\n%s",
+            "Codex startup prompt handler timed out; no prompt or welcome banner detected. "
+            "Pane tail:\n%s",
             pane_tail,
         )
 
@@ -919,6 +960,13 @@ class CodexProvider(BaseProvider):
                 and clean_output[trust.end() : selector.start()].count("\n") <= 4
             ):
                 return TerminalStatus.WAITING_USER_ANSWER
+
+        # Update-available dialog. Bottom-anchored like trust-v2 to avoid false
+        # positives from scrollback. Never let this fall through to IDLE/COMPLETED
+        # where a queued message or blind Enter could select "Update now".
+        # Eager inbox delivery is not a vector: accepts_input_while_processing=False.
+        if _has_update_dialog_in_bottom(clean_output):
+            return TerminalStatus.WAITING_USER_ANSWER
 
         # Check bottom of captured output for idle prompt.
         # With --no-alt-screen, scrollback contains history so we can't anchor

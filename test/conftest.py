@@ -172,11 +172,41 @@ def _isolate_seam_parity_state():
         SeamParityModel,
         SessionLocal,
     )
+    from sqlalchemy import inspect
+    from sqlalchemy.exc import SQLAlchemyError
 
-    with SessionLocal() as db:
-        db.query(SeamParityMismatchModel).delete()
-        db.query(SeamParityModel).delete()
-        db.commit()
+    try:
+        with SessionLocal() as db:
+            tables = set(inspect(db.get_bind()).get_table_names())
+            for model in (SeamParityMismatchModel, SeamParityModel):
+                if model.__tablename__ in tables:
+                    db.query(model).delete()
+            db.commit()
+    except (AttributeError, SQLAlchemyError):
+        # Migration and fault-injection tests intentionally replace SessionLocal
+        # with incomplete schemas, fake queries, or commit failures.
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_cao_env(monkeypatch):
+    """Strip CAO runtime env vars that leak when the suite runs inside a CAO terminal.
+
+    Without this, tests that assert default values (e.g. sender_id=="supervisor")
+    fail because the real terminal's CAO_TERMINAL_ID overrides the default.
+    monkeypatch.delenv runs BEFORE the test body, so tests that explicitly
+    monkeypatch.setenv one of these after fixture setup still work correctly.
+    """
+    # server.py defaults sender_id to "supervisor" when unset
+    monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
+    # server.py reads these for workflow_return context detection
+    monkeypatch.delenv("CAO_WORKFLOW_RUN_ID", raising=False)
+    monkeypatch.delenv("CAO_WORKFLOW_STEP_ID", raising=False)
+    # cli/commands/info.py uses this for session detection
+    monkeypatch.delenv("CAO_SESSION_NAME", raising=False)
+    # HTTP clients must not inherit the enclosing CAO sandbox binding.
+    monkeypatch.delenv("CAO_ENDPOINT", raising=False)
+    monkeypatch.delenv("CAO_INSTANCE_ID", raising=False)
 
 
 @pytest.fixture

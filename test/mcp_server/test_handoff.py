@@ -286,7 +286,10 @@ class TestHandoffOutcomes:
                 "terminal_id": "a1b2c3d4",
             }
         }
-        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+        with (
+            patch.dict(os.environ, {"CAO_TERMINAL_ID": "sup-409"}),
+            patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests,
+        ):
             mock_requests.post.return_value = blocked
             mock_requests.Timeout = Exception
             result = asyncio.run(_handoff_impl("developer", "Do task"))
@@ -308,7 +311,10 @@ class TestHandoffOutcomes:
                 "terminal_id": "a1b2c3d4",
             }
         }
-        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+        with (
+            patch.dict(os.environ, {"CAO_TERMINAL_ID": "sup-409"}),
+            patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests,
+        ):
             mock_requests.post.return_value = blocked
             mock_requests.Timeout = Exception
             result = asyncio.run(_handoff_impl("developer", "Do task"))
