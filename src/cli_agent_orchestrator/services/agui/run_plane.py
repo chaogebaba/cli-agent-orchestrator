@@ -21,7 +21,7 @@ import json
 import logging
 import os
 import uuid
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, cast
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,11 @@ _AGUI_RAW = "RAW"
 _AGUI_RUN_STARTED = "RUN_STARTED"
 _AGUI_RUN_FINISHED = "RUN_FINISHED"
 _AGUI_RUN_ERROR = "RUN_ERROR"
+
+
+def _sdk_construct(constructor: Any, **kwargs: Any) -> Any:
+    """Call an AG-UI SDK constructor whose installed stubs lag the runtime."""
+    return constructor(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +146,7 @@ def get_run_plane_content_type(accept: Optional[str] = None) -> str:
     """
     if not AG_UI_AVAILABLE:
         return "text/event-stream"
-    encoder = EventEncoder(accept=accept)
+    encoder = _sdk_construct(EventEncoder, accept=accept)
     return encoder.get_content_type() or "text/event-stream"
 
 
@@ -179,7 +184,7 @@ async def run_plane_stream(
     thread_id = run_input.thread_id
     run_id = run_input.run_id
 
-    encoder = EventEncoder(accept=accept)
+    encoder = _sdk_construct(EventEncoder, accept=accept)
 
     # Guard: heartbeat comment frames are SSE-specific. If content negotiation
     # ever yields a non-SSE type, fall back to text/event-stream to avoid
@@ -189,13 +194,14 @@ async def run_plane_stream(
 
     # Helper to emit one event.
     def _emit(event: Any) -> str:
-        return encoder.encode(event)
+        return cast(str, encoder.encode(event))
 
     # Track lifecycle state for legality.
     finished = False
 
     # ── 1. RUN_STARTED ──────────────────────────────────────────────────
-    run_started = RunStartedEvent(
+    run_started = _sdk_construct(
+        RunStartedEvent,
         type="RUN_STARTED",
         thread_id=thread_id,
         run_id=run_id,
@@ -214,7 +220,8 @@ async def run_plane_stream(
             interrupt = approval_construct.get_interrupt(interrupt_id)
             if interrupt is None:
                 # Unknown interrupt -> RUN_ERROR
-                err = RunErrorEvent(
+                err = _sdk_construct(
+                    RunErrorEvent,
                     type="RUN_ERROR",
                     thread_id=thread_id,
                     run_id=run_id,
@@ -234,7 +241,8 @@ async def run_plane_stream(
                 decision_str = "deny"
 
             if decision_str is None:
-                err = RunErrorEvent(
+                err = _sdk_construct(
+                    RunErrorEvent,
                     type="RUN_ERROR",
                     thread_id=thread_id,
                     run_id=run_id,
@@ -257,7 +265,8 @@ async def run_plane_stream(
                     edited_text=edited_text,
                 )
             except (KeyError, ValueError) as e:
-                err = RunErrorEvent(
+                err = _sdk_construct(
+                    RunErrorEvent,
                     type="RUN_ERROR",
                     thread_id=thread_id,
                     run_id=run_id,
@@ -270,7 +279,8 @@ async def run_plane_stream(
                 # Delivery to the terminal failed; the interrupt is left
                 # unresolved (retryable). Surface an explicit error rather than
                 # finishing the run as a success (P1).
-                err = RunErrorEvent(
+                err = _sdk_construct(
+                    RunErrorEvent,
                     type="RUN_ERROR",
                     thread_id=thread_id,
                     run_id=run_id,
@@ -288,7 +298,8 @@ async def run_plane_stream(
             if snapshot_fn is not None:
                 try:
                     snapshot = snapshot_fn()
-                    snap_evt = StateSnapshotEvent(
+                    snap_evt = _sdk_construct(
+                        StateSnapshotEvent,
                         type="STATE_SNAPSHOT",
                         thread_id=thread_id,
                         run_id=run_id,
@@ -333,11 +344,13 @@ async def run_plane_stream(
                 ag_interrupts.append(ag_intr)
 
             # Emit RUN_FINISHED with interrupt outcome
-            outcome = RunFinishedInterruptOutcome(
+            outcome = _sdk_construct(
+                RunFinishedInterruptOutcome,
                 type="interrupt",
                 interrupts=ag_interrupts,
             )
-            run_finished = RunFinishedEvent(
+            run_finished = _sdk_construct(
+                RunFinishedEvent,
                 type="RUN_FINISHED",
                 thread_id=thread_id,
                 run_id=run_id,
@@ -351,7 +364,8 @@ async def run_plane_stream(
     if snapshot_fn is not None:
         try:
             snapshot = snapshot_fn()
-            snap_evt = StateSnapshotEvent(
+            snap_evt = _sdk_construct(
+                StateSnapshotEvent,
                 type="STATE_SNAPSHOT",
                 thread_id=thread_id,
                 run_id=run_id,
@@ -409,8 +423,9 @@ async def run_plane_stream(
 
     # ── 6. RUN_FINISHED (success) ───────────────────────────────────────
     if not finished:
-        outcome = RunFinishedSuccessOutcome(type="success")
-        run_finished = RunFinishedEvent(
+        outcome = _sdk_construct(RunFinishedSuccessOutcome, type="success")
+        run_finished = _sdk_construct(
+            RunFinishedEvent,
             type="RUN_FINISHED",
             thread_id=thread_id,
             run_id=run_id,
@@ -437,7 +452,8 @@ def _translate_live_frame(
         if agui_type == _AGUI_STATE_SNAPSHOT:
             # data should contain a snapshot payload (from state_snapshot_frame)
             snapshot_value = data.get("snapshot") or data
-            evt = StateSnapshotEvent(
+            evt = _sdk_construct(
+                StateSnapshotEvent,
                 type="STATE_SNAPSHOT",
                 thread_id=thread_id,
                 run_id=run_id,
@@ -447,7 +463,8 @@ def _translate_live_frame(
 
         elif agui_type == _AGUI_STATE_DELTA:
             delta = data.get("delta") or data.get("ops") or []
-            evt = StateDeltaEvent(
+            evt = _sdk_construct(
+                StateDeltaEvent,
                 type="STATE_DELTA",
                 thread_id=thread_id,
                 run_id=run_id,
@@ -458,7 +475,8 @@ def _translate_live_frame(
         elif agui_type == _AGUI_STEP_STARTED:
             step_id = data.get("step_id") or data.get("terminal_id") or str(uuid.uuid4())
             step_name = data.get("step_name") or data.get("provider") or "step"
-            evt = StepStartedEvent(
+            evt = _sdk_construct(
+                StepStartedEvent,
                 type="STEP_STARTED",
                 thread_id=thread_id,
                 run_id=run_id,
@@ -470,7 +488,8 @@ def _translate_live_frame(
         elif agui_type == _AGUI_STEP_FINISHED:
             step_id = data.get("step_id") or data.get("terminal_id") or "unknown"
             step_name = data.get("step_name") or "step"
-            evt = StepFinishedEvent(
+            evt = _sdk_construct(
+                StepFinishedEvent,
                 type="STEP_FINISHED",
                 thread_id=thread_id,
                 run_id=run_id,
@@ -482,7 +501,8 @@ def _translate_live_frame(
         elif agui_type == _AGUI_TOOL_CALL_START:
             tool_call_id = data.get("tool_call_id") or str(uuid.uuid4())
             tool_call_name = data.get("tool_call_name") or "unknown"
-            evt = ToolCallStartEvent(
+            evt = _sdk_construct(
+                ToolCallStartEvent,
                 type="TOOL_CALL_START",
                 thread_id=thread_id,
                 run_id=run_id,
@@ -493,7 +513,8 @@ def _translate_live_frame(
 
         elif agui_type == _AGUI_TOOL_CALL_END:
             tool_call_id = data.get("tool_call_id") or "unknown"
-            evt = ToolCallEndEvent(
+            evt = _sdk_construct(
+                ToolCallEndEvent,
                 type="TOOL_CALL_END",
                 thread_id=thread_id,
                 run_id=run_id,
@@ -502,7 +523,8 @@ def _translate_live_frame(
             return encoder.encode(evt)
 
         elif agui_type == _AGUI_GENERATIVE_UI:
-            evt = CustomEvent(
+            evt = _sdk_construct(
+                CustomEvent,
                 type="CUSTOM",
                 thread_id=thread_id,
                 run_id=run_id,
@@ -512,7 +534,8 @@ def _translate_live_frame(
             return encoder.encode(evt)
 
         elif agui_type == _AGUI_TEXT_MESSAGE_CONTENT:
-            evt = CustomEvent(
+            evt = _sdk_construct(
+                CustomEvent,
                 type="CUSTOM",
                 thread_id=thread_id,
                 run_id=run_id,
@@ -522,7 +545,8 @@ def _translate_live_frame(
             return encoder.encode(evt)
 
         elif agui_type == _AGUI_RAW:
-            evt = CustomEvent(
+            evt = _sdk_construct(
+                CustomEvent,
                 type="CUSTOM",
                 thread_id=thread_id,
                 run_id=run_id,
@@ -533,7 +557,8 @@ def _translate_live_frame(
 
         elif agui_type == _AGUI_RUN_ERROR:
             message = data.get("message") or "unknown error"
-            evt = RunErrorEvent(
+            evt = _sdk_construct(
+                RunErrorEvent,
                 type="RUN_ERROR",
                 thread_id=thread_id,
                 run_id=run_id,
@@ -543,7 +568,8 @@ def _translate_live_frame(
 
         else:
             # Unmapped type -> custom event with the raw data
-            evt = CustomEvent(
+            evt = _sdk_construct(
+                CustomEvent,
                 type="CUSTOM",
                 thread_id=thread_id,
                 run_id=run_id,

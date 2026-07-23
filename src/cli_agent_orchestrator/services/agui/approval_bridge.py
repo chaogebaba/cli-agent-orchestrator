@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.agui.handoff_approval import (
@@ -38,9 +38,9 @@ class ApprovalBridge:
     def __init__(
         self,
         construct: AgentHandoffWithApproval,
-        get_output_fn: Optional[object] = None,
-        get_provider_fn: Optional[object] = None,
-        get_session_fn: Optional[object] = None,
+        get_output_fn: Optional[Callable[[str], str]] = None,
+        get_provider_fn: Optional[Callable[[str], Optional[str]]] = None,
+        get_session_fn: Optional[Callable[[str], Optional[str]]] = None,
     ) -> None:
         """Initialize the bridge.
 

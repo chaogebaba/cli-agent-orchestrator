@@ -514,7 +514,7 @@ class CodexProvider(BaseProvider):
             raise RuntimeError("seed_exec_failed") from exc
         if completed.returncode != 0:
             raise RuntimeError("seed_exec_failed")
-        matches = set(
+        matches: set[str] = set(
             re.findall(
                 r"(?im)^\s*session id:\s*([0-9a-f]{8}-[0-9a-f-]{27,})\s*$",
                 completed.stdout or "",
@@ -522,7 +522,7 @@ class CodexProvider(BaseProvider):
         )
         if len(matches) != 1:
             raise RuntimeError("seed_uuid_unparseable")
-        session_uuid = next(iter(matches))
+        session_uuid: str = next(iter(matches))
         validator = cls("seed", "seed", "seed", agent_profile)
         try:
             validator.validate_session_artifact(session_uuid, cwd)

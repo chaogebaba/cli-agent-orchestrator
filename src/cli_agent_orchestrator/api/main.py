@@ -1959,7 +1959,7 @@ async def create_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
-        create_kwargs = dict(
+        create_kwargs: Dict[str, Any] = dict(
             provider=resolved_provider,
             agent_profile=agent_profile,
             session_name=session_name,
@@ -2028,7 +2028,7 @@ async def start_session_endpoint(
     env_vars: Optional[Dict[str, str]] = Body(default=None, embed=True),
     allow_incomplete_brief: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
-) -> Dict:
+) -> Dict[str, Any]:
     """Canonical lifecycle start endpoint."""
     _validate_artifacts_dir_override(env_vars)
     try:
@@ -2061,20 +2061,23 @@ async def start_session_endpoint(
             "seed_uuid_unparseable",
             "seed_artifact_invalid",
         }:
-            return JSONResponse(
-                status_code=422,
-                content={
-                    "schema_version": "cao.session-start/v1",
-                    "session": None,
-                    "supervisor_terminal": None,
-                    "bootstrap": {
-                        "mode": "seed_resume",
-                        "status": "seed_failed",
-                        "error_code": code,
+            return cast(
+                Dict[str, Any],
+                JSONResponse(
+                    status_code=422,
+                    content={
+                        "schema_version": "cao.session-start/v1",
+                        "session": None,
+                        "supervisor_terminal": None,
+                        "bootstrap": {
+                            "mode": "seed_resume",
+                            "status": "seed_failed",
+                            "error_code": code,
+                        },
+                        "manifest": None,
+                        "manifest_error": None,
                     },
-                    "manifest": None,
-                    "manifest_error": None,
-                },
+                ),
             )
         raise
     if memory:
@@ -4333,7 +4336,7 @@ async def export_memories_endpoint(
 
     svc = _get_memory_service()
     try:
-        backend = get_backend(format)(svc)
+        backend = cast(Any, get_backend(format))(svc)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
