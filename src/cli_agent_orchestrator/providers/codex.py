@@ -406,7 +406,9 @@ def _has_composer_anchor(all_lines: list[str], footer_idx: int) -> bool:
     return _find_composer_anchor_index(all_lines, footer_idx) is not None
 
 
-def _find_ambiguous_footer_region(all_lines: list[str]) -> tuple[int, int] | None:
+def _find_ambiguous_footer_region(
+    all_lines: list[str], *, minimum_prompt_index: int = 0
+) -> tuple[int, int] | None:
     """Find content-shaped composer/footer rows below assistant output.
 
     Such rows are useful semantic chrome evidence, but rendered cells cannot
@@ -417,7 +419,7 @@ def _find_ambiguous_footer_region(all_lines: list[str]) -> tuple[int, int] | Non
         if _tui_footer_candidate_strength(line) is None:
             continue
         prompt_idx = _find_composer_anchor_index(all_lines, footer_idx)
-        if prompt_idx is None:
+        if prompt_idx is None or prompt_idx < minimum_prompt_index:
             continue
         prompt = strip_terminal_escapes(all_lines[prompt_idx]).strip()
         if re.fullmatch(IDLE_PROMPT_STRICT_PATTERN, prompt, re.IGNORECASE):
@@ -1624,21 +1626,35 @@ class CodexProvider(BaseProvider):
         # Primary: find last user message, extract response between it and idle prompt.
         # Exclude the Codex TUI footer from user-message matching when detected.
         all_lines = clean_output.splitlines()
-        ambiguous_footer = _find_ambiguous_footer_region(all_lines)
+        if _has_tui_footer_in_tail(all_lines) or _has_known_composer_placeholder_at_bottom(
+            all_lines
+        ):
+            cutoff_pos = _compute_tui_footer_cutoff(all_lines)
+        else:
+            cutoff_pos = len(clean_output)
+        tui_chrome_detected = cutoff_pos < len(clean_output)
+
+        user_matches = [
+            m
+            for m in re.finditer(USER_PREFIX_PATTERN, clean_output, re.IGNORECASE | re.MULTILINE)
+            if m.start() < cutoff_pos
+        ]
+
+        # Preserve ambiguous composer/footer-shaped content only when it belongs
+        # to the final turn. An older pair followed by a later user boundary must
+        # not preempt the normal last-user extraction path.
+        minimum_prompt_index = (
+            clean_output.count("\n", 0, user_matches[-1].start()) if user_matches else 0
+        )
+        ambiguous_footer = _find_ambiguous_footer_region(
+            all_lines, minimum_prompt_index=minimum_prompt_index
+        )
         if ambiguous_footer is not None:
             prompt_idx, _footer_idx = ambiguous_footer
             prompt_pos = len("\n".join(all_lines[:prompt_idx]))
             if prompt_idx:
                 prompt_pos += 1
-            prior_users = [
-                match
-                for match in re.finditer(
-                    USER_PREFIX_PATTERN,
-                    clean_output,
-                    re.IGNORECASE | re.MULTILINE,
-                )
-                if match.start() < prompt_pos
-            ]
+            prior_users = [match for match in user_matches if match.start() < prompt_pos]
             if prior_users:
                 last_user = prior_users[-1]
                 assistant = _find_assistant_marker(clean_output[last_user.start() : prompt_pos])
@@ -1653,20 +1669,6 @@ class CodexProvider(BaseProvider):
                         flags=re.IGNORECASE,
                     )
                     return response_text.strip()
-
-        if _has_tui_footer_in_tail(all_lines) or _has_known_composer_placeholder_at_bottom(
-            all_lines
-        ):
-            cutoff_pos = _compute_tui_footer_cutoff(all_lines)
-        else:
-            cutoff_pos = len(clean_output)
-        tui_chrome_detected = cutoff_pos < len(clean_output)
-
-        user_matches = [
-            m
-            for m in re.finditer(USER_PREFIX_PATTERN, clean_output, re.IGNORECASE | re.MULTILINE)
-            if m.start() < cutoff_pos
-        ]
 
         if user_matches:
             last_user = user_matches[-1]

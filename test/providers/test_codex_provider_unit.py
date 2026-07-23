@@ -1890,6 +1890,35 @@ class TestCodexFooterFalsePositiveGuards:
         )
         assert provider.read_composer_draft(output.splitlines()) is None
 
+    @pytest.mark.parametrize(
+        ("tail", "expected"),
+        [
+            ("›", "• Second answer."),
+            (
+                "› Summarize recent commits\n\n~/repo · main",
+                "• Second answer.\n\n› Summarize recent commits\n\n~/repo · main",
+            ),
+        ],
+        ids=("strict-final-prompt", "ambiguous-final-footer"),
+    )
+    def test_older_ambiguous_footer_cannot_override_final_turn(self, tail, expected):
+        output = (
+            "› first question\n"
+            "• First answer.\n"
+            "\n"
+            "› Run /review on my current changes\n"
+            "\n"
+            "/tmp/project\n"
+            "› second question\n"
+            "• Second answer.\n"
+            "\n"
+            f"{tail}"
+        )
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script(output) == expected
+
     def test_stacked_chrome_fits_the_five_line_tail_bound(self):
         output = (
             "› Fix the parser.\n"
