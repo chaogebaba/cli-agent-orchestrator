@@ -372,8 +372,8 @@ def _tui_footer_candidate_strength(line: str) -> str | None:
     return None
 
 
-def _has_composer_anchor(all_lines: list[str], footer_idx: int) -> bool:
-    """Tie a footer candidate to adjacent, corroborated composer chrome."""
+def _find_composer_anchor_index(all_lines: list[str], footer_idx: int) -> int | None:
+    """Return the composer row corroborating a footer candidate, if any."""
     saw_blank = False
     saw_shortcuts = False
     lower_bound = max(0, footer_idx - IDLE_PROMPT_TAIL_LINES)
@@ -387,18 +387,52 @@ def _has_composer_anchor(all_lines: list[str], footer_idx: int) -> bool:
             continue
         if re.match(rf"{IDLE_PROMPT_SCREEN_PATTERN}", clean, re.IGNORECASE):
             if re.fullmatch(IDLE_PROMPT_STRICT_PATTERN, clean, re.IGNORECASE) is not None:
-                return True
-            # Non-empty composer rows are content-shaped. Require chrome below
-            # plus a boundary above so a quoted ``› ...`` row inside an answer
-            # cannot corroborate a path-shaped bottom row as footer chrome.
+                return index
+            # Non-empty composer rows are content-shaped. This adjacency is
+            # sufficient for semantic status, while extraction and draft
+            # handling apply their own conservative ambiguity policies.
             previous_is_boundary = (
                 index == 0 or not strip_terminal_escapes(all_lines[index - 1]).strip()
             )
-            return saw_shortcuts or (saw_blank and previous_is_boundary)
+            return index if saw_shortcuts or (saw_blank and previous_is_boundary) else None
         # Every candidate strength uses the same adjacency rule: arbitrary
         # assistant/user content between the composer and footer rejects it.
-        return False
-    return False
+        return None
+    return None
+
+
+def _has_composer_anchor(all_lines: list[str], footer_idx: int) -> bool:
+    """Tie a footer candidate to adjacent, corroborated composer chrome."""
+    return _find_composer_anchor_index(all_lines, footer_idx) is not None
+
+
+def _find_ambiguous_footer_region(all_lines: list[str]) -> tuple[int, int] | None:
+    """Find content-shaped composer/footer rows below assistant output.
+
+    Such rows are useful semantic chrome evidence, but rendered cells cannot
+    prove whether Codex or the assistant owns them. Extraction therefore uses
+    this only to preserve the whole ambiguous region, never as a cutoff.
+    """
+    for footer_idx, line in enumerate(all_lines):
+        if _tui_footer_candidate_strength(line) is None:
+            continue
+        prompt_idx = _find_composer_anchor_index(all_lines, footer_idx)
+        if prompt_idx is None:
+            continue
+        prompt = strip_terminal_escapes(all_lines[prompt_idx]).strip()
+        if re.fullmatch(IDLE_PROMPT_STRICT_PATTERN, prompt, re.IGNORECASE):
+            # An empty prompt contributes no answer text and is safe to trim.
+            continue
+        if any(
+            re.match(
+                ASSISTANT_PREFIX_PATTERN,
+                strip_terminal_escapes(candidate).strip(),
+                re.IGNORECASE,
+            )
+            for candidate in all_lines[:prompt_idx]
+        ):
+            return prompt_idx, footer_idx
+    return None
 
 
 def _find_tui_footer_index(all_lines: list[str]) -> int | None:
@@ -1059,6 +1093,14 @@ class CodexProvider(BaseProvider):
         # herdr never pushes a buffer (pipe_pane is a no-op there); read live
         # pane content instead of falling through to "no output" on every call.
         output = self._resolve_buffer(output)
+        # Rendered cells do not carry widget ownership. Any assistant/tool frame
+        # whose bottom cells (including retained SGR) equal a valid dialog frame
+        # is snapshot-indistinguishable from that dialog. Codex owns the update
+        # prompt only during startup, so lifecycle state is the external signal:
+        # fail closed while INITIALIZING, preserve the same rows as content once
+        # RUNNING. The startup handler remains responsible for dismissal.
+        if not self._initialized and _has_update_dialog_in_bottom(strip_terminal_escapes(output)):
+            return TerminalStatus.WAITING_USER_ANSWER
         return self._get_screen_local_status(output)
 
     @staticmethod
@@ -1110,13 +1152,6 @@ class CodexProvider(BaseProvider):
                 and clean_output[trust.end() : selector.start()].count("\n") <= 4
             ):
                 return TerminalStatus.WAITING_USER_ANSWER
-
-        # Update-available dialog. Bottom-anchored like trust-v2 to avoid false
-        # positives from scrollback. Never let this fall through to IDLE/COMPLETED
-        # where a queued message or blind Enter could select "Update now".
-        # Eager inbox delivery is not a vector: accepts_input_while_processing=False.
-        if _has_update_dialog_in_bottom(clean_output):
-            return TerminalStatus.WAITING_USER_ANSWER
 
         # Check bottom of captured output for idle prompt.
         # With --no-alt-screen, scrollback contains history so we can't anchor
@@ -1218,6 +1253,7 @@ class CodexProvider(BaseProvider):
         clean = strip_terminal_escapes(joined)
         rows = clean.splitlines()
         legacy_status = self._get_screen_local_status(joined)
+        startup_update_dialog = not self._initialized and _has_update_dialog_in_bottom(clean)
         chrome_rows = [
             index
             for index, row in enumerate(rows)
@@ -1233,6 +1269,22 @@ class CodexProvider(BaseProvider):
             -1,
         )
         signals: list[ScreenSignal] = []
+        if startup_update_dialog:
+            dialog_footer_index = next(
+                (
+                    index
+                    for index in range(len(rows) - 1, -1, -1)
+                    if _UPDATE_DIALOG_ROW_PATTERNS[-1].fullmatch(rows[index].strip())
+                ),
+                max(len(rows) - 1, 0),
+            )
+            signals.append(
+                ScreenSignal(
+                    "waiting",
+                    "DIALOG_ACTION_FOOTER_PATTERN",
+                    dialog_footer_index,
+                )
+            )
         for index, row in enumerate(rows):
             progress = re.search(TUI_PROGRESS_PATTERN, row) is not None
             if progress:
@@ -1476,6 +1528,18 @@ class CodexProvider(BaseProvider):
         # Join using plain line widths (escape-stripped); matches previous
         # behavior for wrap detection on capture-pane plain or pyte screens.
         draft = self._join_composer_segments(plain_lines, prompt_idx, prompt_pos, segments)
+        if draft and any(
+            re.match(
+                ASSISTANT_PREFIX_PATTERN,
+                strip_terminal_escapes(candidate).strip(),
+                re.IGNORECASE,
+            )
+            for candidate in plain_lines[:prompt_idx]
+        ):
+            # A non-empty composer-shaped row below assistant output has no
+            # snapshot-only ownership proof. Returning None makes draft_guard
+            # defer injection instead of clearing/restoring uncertain text.
+            return None
         if draft.strip() in CODEX_EMPTY_COMPOSER_PLACEHOLDERS:
             return ""
         return draft
@@ -1560,6 +1624,36 @@ class CodexProvider(BaseProvider):
         # Primary: find last user message, extract response between it and idle prompt.
         # Exclude the Codex TUI footer from user-message matching when detected.
         all_lines = clean_output.splitlines()
+        ambiguous_footer = _find_ambiguous_footer_region(all_lines)
+        if ambiguous_footer is not None:
+            prompt_idx, _footer_idx = ambiguous_footer
+            prompt_pos = len("\n".join(all_lines[:prompt_idx]))
+            if prompt_idx:
+                prompt_pos += 1
+            prior_users = [
+                match
+                for match in re.finditer(
+                    USER_PREFIX_PATTERN,
+                    clean_output,
+                    re.IGNORECASE | re.MULTILINE,
+                )
+                if match.start() < prompt_pos
+            ]
+            if prior_users:
+                last_user = prior_users[-1]
+                assistant = _find_assistant_marker(clean_output[last_user.start() : prompt_pos])
+                if assistant is not None:
+                    response_start = last_user.start() + assistant.start()
+                    response_text = clean_output[response_start:].strip()
+                    response_text = re.sub(
+                        r"^(?:assistant|codex|agent)\s*:\s*",
+                        "",
+                        response_text,
+                        count=1,
+                        flags=re.IGNORECASE,
+                    )
+                    return response_text.strip()
+
         if _has_tui_footer_in_tail(all_lines) or _has_known_composer_placeholder_at_bottom(
             all_lines
         ):

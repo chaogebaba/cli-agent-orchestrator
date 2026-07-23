@@ -15,6 +15,7 @@ from cli_agent_orchestrator.providers.codex import (
     CodexProvider,
     ProviderError,
     _has_tui_footer_in_tail,
+    _has_update_dialog_in_bottom,
     _toml_override,
     _toml_scalar,
     strip_terminal_escapes,
@@ -46,6 +47,13 @@ STATUSLINE_CAPTURE_CASES = [
     for name, status in STATUSLINE_VARIANTS.items()
     for capture_format in ("plain", "ansi")
 ]
+UPDATE_DIALOG_ROWS = (
+    "✨ Update available! 0.142.5 -> 0.144.5",
+    "1. Update now (runs npm install -g @openai/codex)",
+    "2. Skip",
+    "3. Skip until next version",
+    "Press enter to continue",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -1692,7 +1700,7 @@ class TestCodexComposerDraftParsing:
         output = f"› fix the bug\n• The bug is fixed.\n\n› Explain this codebase\n\n{status_line}"
 
         assert self._p().get_status(output) == TerminalStatus.COMPLETED
-        assert self._p().read_composer_draft(output.splitlines()) == ""
+        assert self._p().read_composer_draft(output.splitlines()) is None
 
     def test_five_hour_only_statusline_is_footer_and_has_no_draft(self):
         screen = load_fixture("codex-five-hour-statusline.txt").splitlines()
@@ -1730,7 +1738,8 @@ class TestCodexStatuslineCorpus:
         provider = self._provider()
 
         assert provider.get_status("\n".join(screen)) == expected
-        assert provider.read_composer_draft(screen) == ""
+        expected_draft = None if (variant, capture_format) == ("08-busy-full", "plain") else ""
+        assert provider.read_composer_draft(screen) == expected_draft
         assert _has_tui_footer_in_tail(screen) is (variant != "05b-five-hour-only")
 
     @pytest.mark.parametrize(
@@ -1738,7 +1747,7 @@ class TestCodexStatuslineCorpus:
         STATUSLINE_CAPTURE_CASES,
         ids=[f"{name}-{capture_format}" for name, capture_format, _ in STATUSLINE_CAPTURE_CASES],
     )
-    def test_real_capture_tail_does_not_hide_clean_completed_extract(
+    def test_real_capture_tail_never_hides_completed_answer(
         self, variant, capture_format, _expected
     ):
         rows = (
@@ -1756,7 +1765,15 @@ class TestCodexStatuslineCorpus:
         provider = self._provider()
 
         assert provider.get_status(output) == TerminalStatus.COMPLETED
-        assert provider.extract_last_message_from_script(output) == "• Clean answer."
+        extracted = provider.extract_last_message_from_script(output)
+        assert extracted.startswith("• Clean answer.")
+        if variant == "05b-five-hour-only":
+            assert extracted == "• Clean answer."
+        else:
+            # Without widget ownership metadata, a non-empty composer/footer
+            # tail is content-shaped. Extraction preserves it rather than risk
+            # silently truncating an assistant quote with identical rows.
+            assert strip_terminal_escapes("\n".join(chrome_tail)).strip() in extracted
 
 
 class TestCodexFooterFalsePositiveGuards:
@@ -1839,7 +1856,39 @@ class TestCodexFooterFalsePositiveGuards:
             "• Final explanation remains here."
         )
 
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
         assert _has_tui_footer_in_tail(output.splitlines()) is False
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script(output) == (
+            "• Exact rows:\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "/tmp/project · main\n"
+            "• Final explanation remains here."
+        )
+
+    def test_blank_bounded_quoted_composer_preserves_full_answer(self):
+        output = (
+            "› Quote the display.\n"
+            "• It printed these exact rows:\n"
+            "\n"
+            "› Run /review on my current changes\n"
+            "\n"
+            "/tmp/project/output.txt"
+        )
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script(output) == (
+            "• It printed these exact rows:\n"
+            "\n"
+            "› Run /review on my current changes\n"
+            "\n"
+            "/tmp/project/output.txt"
+        )
+        assert provider.read_composer_draft(output.splitlines()) is None
 
     def test_stacked_chrome_fits_the_five_line_tail_bound(self):
         output = (
@@ -1855,7 +1904,7 @@ class TestCodexFooterFalsePositiveGuards:
         provider = CodexProvider("test1234", "test-session", "window-0")
 
         assert provider.get_status(output) == TerminalStatus.COMPLETED
-        assert provider.extract_last_message_from_script(output) == "• Parser fixed."
+        assert provider.extract_last_message_from_script(output) == output.strip().split("\n", 1)[1]
 
 
 class TestCodexBulletFormatStatusDetection:
@@ -2223,7 +2272,7 @@ class TestCodexV0136FooterFormat:
         assert status == TerminalStatus.PROCESSING
 
     def test_extract_last_message_v0136_footer(self):
-        """extract_last_message_from_script ignores v0.136 suggestion-hint footer."""
+        """Ambiguous v0.136 footer preserves the answer instead of truncating it."""
         script_output = (
             "› Create a Python function called 'greet'.\n"
             "• def greet(name):\n"
@@ -2239,7 +2288,8 @@ class TestCodexV0136FooterFormat:
 
         assert "def greet(name):" in message
         assert "Hello, {name}!" in message
-        assert "Run /review" not in message
+        assert "Run /review" in message
+        assert "openai.gpt-5.5 medium · ~/project" in message
 
     def test_dual_chrome_rows_do_not_promote_ghost_prompt_to_user(self):
         output = (
@@ -2252,7 +2302,7 @@ class TestCodexV0136FooterFormat:
         provider = CodexProvider("test1234", "test-session", "window-0")
 
         assert provider.get_status(output) == TerminalStatus.COMPLETED
-        assert provider.extract_last_message_from_script(output) == "• Parser fixed."
+        assert provider.extract_last_message_from_script(output) == output.split("\n", 1)[1].strip()
 
 
 class TestCodexProviderMessageExtraction:
@@ -2499,7 +2549,7 @@ class TestCodexV0111Extraction:
     """Extraction tests for Codex v0.111.0+ footer format."""
 
     def test_extract_bullet_with_v0111_footer(self):
-        """Extract response when v0.111.0 footer (suggestion hint) is present."""
+        """Preserve an ambiguous v0.111.0 footer without losing the answer."""
         output = (
             "› fix the bug\n"
             "• I've fixed the issue in main.py by correcting the import.\n"
@@ -2513,9 +2563,8 @@ class TestCodexV0111Extraction:
         message = provider.extract_last_message_from_script(output)
 
         assert "I've fixed the issue" in message
-        # Suggestion hint should not leak into extracted output
-        assert "Find and fix a bug" not in message
-        assert "gpt-5.3-codex" not in message
+        assert "Find and fix a bug" in message
+        assert "gpt-5.3-codex" in message
 
     def test_extract_multi_turn_with_v0111_footer(self):
         """Extract last response from multi-turn with v0.111.0 footer."""
@@ -2536,7 +2585,7 @@ class TestCodexV0111Extraction:
 
         assert "First answer" not in message
         assert "Second answer with details." in message
-        assert "Write tests" not in message
+        assert "Write tests" in message
 
     def test_extract_double_blank_between_hint_and_status(self):
         """Suggestion hint must not leak when 2 blank lines separate it from status bar."""
@@ -2554,7 +2603,8 @@ class TestCodexV0111Extraction:
         message = provider.extract_last_message_from_script(output)
 
         assert "I've fixed the issue" in message
-        assert "Find and fix a bug" not in message
+        assert "Find and fix a bug" in message
+        assert "gpt-5.3-codex" in message
 
 
 class TestCodexProviderMisc:
@@ -2708,6 +2758,53 @@ class TestCodexProviderTrustPrompt:
 class TestCodexProviderUpdateDialog:
     """Tests for Codex update-available dialog handling."""
 
+    def test_identical_complete_dialog_is_scoped_to_startup_lifecycle(self):
+        output = "\n".join(
+            (
+                "› Quote the complete startup dialog.",
+                "• Exact dialog follows:",
+                *UPDATE_DIALOG_ROWS,
+                "",
+                "›",
+                "  ? for shortcuts 95% context left",
+            )
+        )
+        initializing = CodexProvider("initializing", "test-session", "window-0")
+        running = CodexProvider("running", "test-session", "window-0")
+        running._initialized = True
+
+        assert initializing.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+        assert (
+            initializing.get_status_from_screen(output.splitlines())
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+        assert initializing.classify_injection_hazard(output.splitlines()) == "interactive_dialog"
+        assert running.get_status(output) == TerminalStatus.COMPLETED
+        assert running.get_status_from_screen(output.splitlines()) == TerminalStatus.COMPLETED
+        assert running.classify_injection_hazard(output.splitlines()) is None
+        assert running.extract_last_message_from_script(output) == "\n".join(
+            ("• Exact dialog follows:", *UPDATE_DIALOG_ROWS)
+        )
+
+    @pytest.mark.parametrize("missing_index", range(len(UPDATE_DIALOG_ROWS)))
+    def test_startup_update_grammar_requires_every_row(self, missing_index):
+        rows = [row for index, row in enumerate(UPDATE_DIALOG_ROWS) if index != missing_index]
+        output = "\n".join(rows)
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert _has_update_dialog_in_bottom(output) is False
+        assert provider.get_status(output) != TerminalStatus.WAITING_USER_ANSWER
+
+    @pytest.mark.parametrize("swap_index", range(len(UPDATE_DIALOG_ROWS) - 1))
+    def test_startup_update_grammar_requires_row_order(self, swap_index):
+        rows = list(UPDATE_DIALOG_ROWS)
+        rows[swap_index], rows[swap_index + 1] = rows[swap_index + 1], rows[swap_index]
+        output = "\n".join(rows)
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert _has_update_dialog_in_bottom(output) is False
+        assert provider.get_status(output) != TerminalStatus.WAITING_USER_ANSWER
+
     def test_get_status_update_dialog_waiting(self):
         """Active update dialog classifies as WAITING_USER_ANSWER."""
         output = load_fixture("codex_update_dialog.txt")
@@ -2785,6 +2882,16 @@ class TestCodexProviderUpdateDialog:
             + "\n\n› Ask Codex to do anything\n\n  ~/project · main"
         )
 
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_get_status_boxed_update_dialog_is_waiting_during_startup(self):
+        output = "\n".join(
+            ("╭────────────────────────────────────────────╮",)
+            + tuple(f"│ {row:<42} │" for row in UPDATE_DIALOG_ROWS)
+            + ("╰────────────────────────────────────────────╯",)
+        )
         provider = CodexProvider("test1234", "test-session", "window-0")
 
         assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
