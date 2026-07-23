@@ -188,6 +188,13 @@ DIALOG_ACTION_FOOTER_PATTERN = re.compile(
 UPDATE_DIALOG_PATTERN = r"Update available!\s+\S+\s+->\s+\S+"
 UPDATE_DIALOG_MENU_PATTERN = r"Skip until next version"
 UPDATE_DIALOG_FOOTER = r"Press enter to continue"
+_UPDATE_DIALOG_ROW_PATTERNS = (
+    re.compile(rf"^(?:✨\s*)?{UPDATE_DIALOG_PATTERN}$", re.IGNORECASE),
+    re.compile(r"^(?:›\s*)?1\.\s+Update now(?:\s+\(.*\))?$", re.IGNORECASE),
+    re.compile(r"^(?:›\s*)?2\.\s+Skip$", re.IGNORECASE),
+    re.compile(rf"^(?:›\s*)?3\.\s+{UPDATE_DIALOG_MENU_PATTERN}$", re.IGNORECASE),
+    re.compile(rf"^{UPDATE_DIALOG_FOOTER}$", re.IGNORECASE),
+)
 STARTUP_PROMPT_BOTTOM_LINES = 15
 # Codex welcome banner indicating normal startup (no trust prompt)
 CODEX_WELCOME_PATTERN = r"OpenAI Codex"
@@ -365,27 +372,32 @@ def _tui_footer_candidate_strength(line: str) -> str | None:
     return None
 
 
-def _has_composer_anchor(all_lines: list[str], footer_idx: int, *, strong: bool) -> bool:
-    """Tie a footer candidate to nearby composer chrome above it."""
-    saw_separator = False
+def _has_composer_anchor(all_lines: list[str], footer_idx: int) -> bool:
+    """Tie a footer candidate to adjacent, corroborated composer chrome."""
+    saw_blank = False
+    saw_shortcuts = False
     lower_bound = max(0, footer_idx - IDLE_PROMPT_TAIL_LINES)
     for index in range(footer_idx - 1, lower_bound - 1, -1):
         clean = strip_terminal_escapes(all_lines[index]).strip()
         if not clean:
-            saw_separator = True
+            saw_blank = True
             continue
         if re.fullmatch(r"\?\s+for shortcuts(?:\s+.*)?", clean, re.IGNORECASE):
-            saw_separator = True
+            saw_shortcuts = True
             continue
         if re.match(rf"{IDLE_PROMPT_SCREEN_PATTERN}", clean, re.IGNORECASE):
-            return (
-                strong
-                or saw_separator
-                or _is_known_composer_placeholder(clean)
-                or re.fullmatch(IDLE_PROMPT_STRICT_PATTERN, clean, re.IGNORECASE) is not None
+            if re.fullmatch(IDLE_PROMPT_STRICT_PATTERN, clean, re.IGNORECASE) is not None:
+                return True
+            # Non-empty composer rows are content-shaped. Require chrome below
+            # plus a boundary above so a quoted ``› ...`` row inside an answer
+            # cannot corroborate a path-shaped bottom row as footer chrome.
+            previous_is_boundary = (
+                index == 0 or not strip_terminal_escapes(all_lines[index - 1]).strip()
             )
-        if not strong:
-            return False
+            return saw_shortcuts or (saw_blank and previous_is_boundary)
+        # Every candidate strength uses the same adjacency rule: arbitrary
+        # assistant/user content between the composer and footer rejects it.
+        return False
     return False
 
 
@@ -400,7 +412,7 @@ def _find_tui_footer_index(all_lines: list[str]) -> int | None:
     strength = _tui_footer_candidate_strength(all_lines[last_nonempty])
     if strength is None:
         return None
-    if not _has_composer_anchor(all_lines, last_nonempty, strong=strength == "strong"):
+    if not _has_composer_anchor(all_lines, last_nonempty):
         return None
     return last_nonempty
 
@@ -551,13 +563,22 @@ def _resolved_codex_profile_config(
 
 
 def _has_update_dialog_in_bottom(clean_output: str) -> bool:
-    """Return True when Codex's update-available dialog is active in the bottom region."""
-    bottom = "\n".join(clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
-    return (
-        re.search(UPDATE_DIALOG_PATTERN, bottom) is not None
-        and re.search(UPDATE_DIALOG_MENU_PATTERN, bottom) is not None
-        and re.search(UPDATE_DIALOG_FOOTER, bottom) is not None
-    )
+    """Return True for an ordered update-menu block in the bottom region."""
+    expected = 0
+    border_chars = frozenset("╭╮╰╯│─┌┐└┘├┤┬┴┼")
+    for raw_row in clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:]:
+        row = raw_row.strip()
+        if len(row) >= 2 and row.startswith("│") and row.endswith("│"):
+            row = row[1:-1].strip()
+        if not row or set(row) <= border_chars:
+            continue
+        if _UPDATE_DIALOG_ROW_PATTERNS[expected].fullmatch(row):
+            expected += 1
+            if expected == len(_UPDATE_DIALOG_ROW_PATTERNS):
+                return True
+            continue
+        expected = 1 if _UPDATE_DIALOG_ROW_PATTERNS[0].fullmatch(row) else 0
+    return False
 
 
 def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
@@ -1425,6 +1446,14 @@ class CodexProvider(BaseProvider):
             return ""
 
         segments = [first_plain]
+        draft_region_has_assistant = any(
+            re.match(
+                ASSISTANT_PREFIX_PATTERN,
+                strip_terminal_escapes(candidate_line).strip(),
+                re.IGNORECASE,
+            )
+            for candidate_line in plain_lines[prompt_idx + 1 : last_nonempty]
+        )
         for offset, line in enumerate(
             plain_lines[prompt_idx + 1 : search_end], start=prompt_idx + 1
         ):
@@ -1432,11 +1461,7 @@ class CodexProvider(BaseProvider):
             # Defense in depth: a status_line row must never become draft text,
             # even if a future footer variant misses the primary detector.
             candidate = _tui_footer_candidate_strength(line)
-            if (
-                offset == last_nonempty
-                and candidate is not None
-                and _has_composer_anchor(plain_lines, offset, strong=candidate == "strong")
-            ):
+            if offset == last_nonempty and candidate is not None and not draft_region_has_assistant:
                 continue
             if not text:
                 segments.append("")

@@ -1783,6 +1783,18 @@ class TestCodexFooterFalsePositiveGuards:
                 "› Which model?\n• gpt-5.6-sol high",
                 "• gpt-5.6-sol high",
             ),
+            (
+                "› Where?\n• It is:\n/tmp/project · main",
+                "• It is:\n/tmp/project · main",
+            ),
+            (
+                "› What line?\n• Exact output:\n/tmp/project · gpt-5.6-sol high",
+                "• Exact output:\n/tmp/project · gpt-5.6-sol high",
+            ),
+            (
+                "› What row?\n• Literal output:\n? for shortcuts",
+                "• Literal output:\n? for shortcuts",
+            ),
         ],
     )
     def test_content_shaped_footer_tokens_are_not_cutoffs(self, output, expected):
@@ -1790,6 +1802,44 @@ class TestCodexFooterFalsePositiveGuards:
 
         assert provider.get_status(output) == TerminalStatus.COMPLETED
         assert provider.extract_last_message_from_script(output) == expected
+
+    @pytest.mark.parametrize(
+        "output",
+        [
+            "› Show the rows.\n• Exact rows:\n› Ask Codex to do anything\n/tmp/project",
+            "› Show the rows.\n• Exact rows:\n› arbitrary quoted prompt\n\n/tmp/project",
+        ],
+    )
+    def test_quoted_composer_rows_do_not_anchor_path_only_footer(self, output):
+        assert _has_tui_footer_in_tail(output.splitlines()) is False
+
+    def test_statusline_shaped_row_above_bottom_is_content(self):
+        output = (
+            "› What output?\n"
+            "• Exact rows:\n"
+            "/tmp/project · main\n"
+            "• Final explanation remains here."
+        )
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert _has_tui_footer_in_tail(output.splitlines()) is False
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script(output) == (
+            "• Exact rows:\n/tmp/project · main\n• Final explanation remains here."
+        )
+
+    def test_bottom_row_only_rejects_corroborated_interior_candidate(self):
+        output = (
+            "› What output?\n"
+            "• Exact rows:\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "/tmp/project · main\n"
+            "• Final explanation remains here."
+        )
+
+        assert _has_tui_footer_in_tail(output.splitlines()) is False
 
     def test_stacked_chrome_fits_the_five_line_tail_bound(self):
         output = (
@@ -2707,6 +2757,37 @@ class TestCodexProviderUpdateDialog:
         status = provider.get_status(output)
 
         assert status == TerminalStatus.COMPLETED
+
+    def test_get_status_update_dialog_phrases_in_diff_content_is_completed(self):
+        output = (
+            "› Show the patch.\n"
+            "• The diff adds these documentation lines:\n"
+            "+ ✨ Update available! 0.142.5 -> 0.144.5\n"
+            "+ 3. Skip until next version\n"
+            "+ Press enter to continue\n"
+            "\n"
+            "›\n"
+            "  ? for shortcuts 95% context left"
+        )
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script(output) == (
+            "• The diff adds these documentation lines:\n"
+            "+ ✨ Update available! 0.142.5 -> 0.144.5\n"
+            "+ 3. Skip until next version\n"
+            "+ Press enter to continue"
+        )
+
+    def test_get_status_update_dialog_with_statusline_stacked_is_waiting(self):
+        output = (
+            load_fixture("codex_update_dialog.txt").rstrip()
+            + "\n\n› Ask Codex to do anything\n\n  ~/project · main"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
