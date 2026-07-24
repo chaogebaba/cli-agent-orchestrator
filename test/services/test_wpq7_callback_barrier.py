@@ -313,6 +313,7 @@ def test_supervisor_only_dispatch_and_barrier_control_are_owner_scoped(barrier_d
 def test_mcp_supervisor_barrier_path_remains_functional_end_to_end(barrier_db, monkeypatch):
     _seed_raw(barrier_db, workers=("worker-a",))
     monkeypatch.setenv("CAO_TERMINAL_ID", "owner")
+    monkeypatch.setattr(mcp_server, "_current_terminal_id", lambda: "owner")
     post = MagicMock()
     deliver = MagicMock()
     monkeypatch.setattr(mcp_server.cao_http, "post", post)
@@ -326,7 +327,7 @@ def test_mcp_supervisor_barrier_path_remains_functional_end_to_end(barrier_db, m
         barrier_member_key="lane-a",
     )
 
-    assert result["success"] is True
+    assert result["success"] is True, result
     post.assert_not_called()
     deliver.assert_called_once_with("worker-a")
     with barrier_db() as db:
@@ -631,6 +632,11 @@ def test_quota_rearm_completion_delivers_two_groups_and_only_combined_is_challen
             return {"success": True}
 
         monkeypatch.setenv("CAO_TERMINAL_ID", combined.sender_id)
+        monkeypatch.setattr(
+            mcp_server,
+            "_current_terminal_id",
+            lambda: combined.sender_id,
+        )
         monkeypatch.setattr(mcp_server, "ENABLE_SENDER_ID_INJECTION", True)
         monkeypatch.setattr(mcp_server, "_send_to_inbox", capture)
         assert mcp_server._send_message_impl("owner", combined.message) == {"success": True}

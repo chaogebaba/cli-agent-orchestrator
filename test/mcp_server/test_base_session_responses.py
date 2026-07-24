@@ -15,7 +15,7 @@ from cli_agent_orchestrator.mcp_server.server import (
 @pytest.mark.asyncio
 async def test_mark_base_ready_replaces_dirty_hashes_with_count(monkeypatch):
     row = {"name": "base", "dirty_hashes": '{"one.py":"abc","two.py":null}'}
-    monkeypatch.setenv("CAO_TERMINAL_ID", "terminal-1")
+    monkeypatch.setenv("CAO_TERMINAL_ID", "a1b2c3d4")
     terminal_response = patch("cli_agent_orchestrator.mcp_server.server.requests.get")
     with (
         patch("cli_agent_orchestrator.services.fork_context_service.mark_ready", return_value=row),
@@ -32,7 +32,7 @@ async def test_mark_base_ready_replaces_dirty_hashes_with_count(monkeypatch):
 @pytest.mark.asyncio
 async def test_e3_mark_base_ready_threads_anchor_kind(monkeypatch):
     row = {"name": "root", "kind": "anchor", "dirty_hashes": "{}"}
-    monkeypatch.setenv("CAO_TERMINAL_ID", "terminal-1")
+    monkeypatch.setenv("CAO_TERMINAL_ID", "a1b2c3d4")
     with (
         patch(
             "cli_agent_orchestrator.services.fork_context_service.mark_ready",
@@ -44,13 +44,13 @@ async def test_e3_mark_base_ready_threads_anchor_kind(monkeypatch):
         response = await mark_base_ready("root", summary=None, kind="anchor")
 
     assert response["base"]["kind"] == "anchor"
-    mark.assert_called_once_with("terminal-1", "root", None, "anchor")
+    mark.assert_called_once_with("a1b2c3d4", "root", None, "anchor")
 
 
 @pytest.mark.asyncio
 async def test_mark_base_ready_notifies_recorded_caller(monkeypatch):
     row = {"name": "infra", "dirty_hashes": "{}"}
-    monkeypatch.setenv("CAO_TERMINAL_ID", "terminal-1")
+    monkeypatch.setenv("CAO_TERMINAL_ID", "a1b2c3d4")
     with (
         patch("cli_agent_orchestrator.services.fork_context_service.mark_ready", return_value=row),
         patch("cli_agent_orchestrator.mcp_server.server.requests.get") as mock_get,
@@ -67,7 +67,7 @@ async def test_mark_base_ready_notifies_recorded_caller(monkeypatch):
 @pytest.mark.asyncio
 async def test_mark_base_ready_reports_callback_failure_without_failing_mark(monkeypatch):
     row = {"name": "infra", "dirty_hashes": "{}"}
-    monkeypatch.setenv("CAO_TERMINAL_ID", "terminal-1")
+    monkeypatch.setenv("CAO_TERMINAL_ID", "a1b2c3d4")
     with (
         patch("cli_agent_orchestrator.services.fork_context_service.mark_ready", return_value=row),
         patch(
@@ -109,7 +109,7 @@ async def test_t2h_all_base_serializers_filter_nested_keys(
         "cwd": str(tmp_path),
         "dirty_hashes": '{"live.py":"abc","nested/missing.py":"def"}',
     }
-    monkeypatch.setenv("CAO_TERMINAL_ID", "terminal-1")
+    monkeypatch.setenv("CAO_TERMINAL_ID", "a1b2c3d4")
 
     with (
         patch(
@@ -147,7 +147,7 @@ async def test_t2h_serializer_marker_oserror_counts_key(
         "cwd": str(tmp_path),
         "dirty_hashes": '{"nested/missing.py":"def"}',
     }
-    monkeypatch.setenv("CAO_TERMINAL_ID", "terminal-1")
+    monkeypatch.setenv("CAO_TERMINAL_ID", "a1b2c3d4")
     original_stat = Path.stat
 
     def marker_stat(path: Path, *args, **kwargs):

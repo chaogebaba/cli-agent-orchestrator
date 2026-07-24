@@ -73,7 +73,7 @@ class TestCreateTerminalProviderResolution:
         mock_requests.get.return_value = metadata_response
         mock_requests.post.return_value = post_response
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-1"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             terminal_id, provider = _create_terminal("reviewer", "/repo")
 
         assert terminal_id == "worker-1"
@@ -84,7 +84,7 @@ class TestCreateTerminalProviderResolution:
             params={
                 "provider": "claude_code",
                 "agent_profile": "reviewer",
-                "caller_id": "supervisor-1",
+                "caller_id": "a1b2c3d4",
                 "working_directory": "/repo",
             },
             json=None,
@@ -117,7 +117,7 @@ class TestCreateTerminalProviderResolution:
         mock_requests.get.return_value = metadata_response
         mock_requests.post.return_value = post_response
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-1"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             terminal_id, provider = _create_terminal("reviewer", "/repo")
 
         assert terminal_id == "worker-2"
@@ -128,7 +128,7 @@ class TestCreateTerminalProviderResolution:
             params={
                 "provider": "kiro_cli",
                 "agent_profile": "reviewer",
-                "caller_id": "supervisor-1",
+                "caller_id": "a1b2c3d4",
                 "working_directory": "/repo",
             },
             json=None,
@@ -162,7 +162,7 @@ class TestCreateTerminalProviderResolution:
         mock_requests.get.return_value = metadata_response
         mock_requests.post.return_value = post_response
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-1"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             _create_terminal(
                 "reviewer",
                 working_directory=None,
@@ -219,7 +219,7 @@ class TestAssignSenderIdInjection:
 
         mock_create.return_value = ("worker-1", "claude_code")
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-abc123"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             result = _assign_impl("developer", "Analyze the logs")
 
         assert result["success"] is True
@@ -228,9 +228,9 @@ class TestAssignSenderIdInjection:
         assert kwargs["defer_init"] is True
         sent_message = kwargs["initial_message"]
         assert sent_message.startswith("Analyze the logs")
-        assert "[Assigned by terminal supervisor-abc123" in sent_message
+        assert "[Assigned by terminal a1b2c3d4" in sent_message
         assert (
-            "send results back to terminal supervisor-abc123 using the cao-mcp-server "
+            "send results back to terminal a1b2c3d4 using the cao-mcp-server "
             "send_message MCP tool — never a built-in collaboration.send_message]" in sent_message
         )
         assert "collaboration.send_message" in sent_message
@@ -248,7 +248,7 @@ class TestAssignSenderIdInjection:
 
         mock_create.return_value = ("worker-2", "claude_code")
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-abc123"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             result = _assign_impl("developer", "Analyze the logs")
 
         assert result["success"] is True
@@ -298,7 +298,7 @@ class TestAssignSenderIdInjection:
 
         mock_create.side_effect = Exception("connection refused")
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-abc123"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             result = _assign_impl("developer", "Analyze the logs")
 
         assert result["success"] is False
@@ -315,7 +315,7 @@ class TestAssignSenderIdInjection:
         mock_create.return_value = ("worker-4", "claude_code")
         original = "Do the task described in /path/to/task.md"
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "sup-111"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "deadbeef"}):
             _assign_impl("developer", original)
 
         _, kwargs = mock_create.call_args
@@ -333,7 +333,7 @@ class TestAssignSenderIdInjection:
 
         mock_create.return_value = ("worker-fast", "kiro_cli")
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-abc123"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             result = _assign_impl("developer", "Do work")
 
         assert result["success"] is True
@@ -507,7 +507,7 @@ def test_assign_threads_park_warm_to_deferred_create_path():
     from cli_agent_orchestrator.mcp_server.server import _assign_impl
 
     with (
-        patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor"}),
+        patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}),
         patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False),
         patch(
             "cli_agent_orchestrator.mcp_server.server._configured_default_fork_base",

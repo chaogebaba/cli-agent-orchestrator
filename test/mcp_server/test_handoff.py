@@ -59,10 +59,10 @@ class TestShapeHandoffMessage:
     """The codex prompt-shaping that stays caller-side (was _send_direct_input_handoff)."""
 
     def test_codex_prepends_banner_with_supervisor_id(self):
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-abc123"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             shaped = _shape_handoff_message("codex", "Implement hello world")
         assert shaped.startswith("[CAO Handoff]")
-        assert "supervisor-abc123" in shaped
+        assert "a1b2c3d4" in shaped
         assert "Implement hello world" in shaped
         assert "Do NOT use send_message" in shaped
         # Original message must appear in full AFTER the banner.
@@ -89,7 +89,7 @@ class TestHandoffMessageContext:
         """Codex handoff posts the [CAO Handoff] banner as the prompt."""
         mock_provider.return_value = _ctx("codex")
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-abc123"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
                 mock_requests.post.return_value = _ok_run_step_response()
                 mock_requests.Timeout = Exception
@@ -103,7 +103,7 @@ class TestHandoffMessageContext:
         assert url.endswith("/terminals/run-step")
         sent_prompt = mock_requests.post.call_args[1]["json"]["prompt"]
         assert sent_prompt.startswith("[CAO Handoff]")
-        assert "supervisor-abc123" in sent_prompt
+        assert "a1b2c3d4" in sent_prompt
         assert "Implement hello world" in sent_prompt
         assert "Do NOT use send_message" in sent_prompt
 
@@ -142,7 +142,7 @@ class TestHandoffMessageContext:
     def test_codex_banner_supervisor_id_from_env(self, mock_provider, _nudge):
         mock_provider.return_value = _ctx("codex")
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "sup-xyz789"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "c0ffee01"}):
             with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
                 mock_requests.post.return_value = _ok_run_step_response()
                 mock_requests.Timeout = Exception
@@ -150,7 +150,7 @@ class TestHandoffMessageContext:
                 asyncio.run(_handoff_impl("developer", "Build feature X"))
 
         sent_prompt = mock_requests.post.call_args[1]["json"]["prompt"]
-        assert "sup-xyz789" in sent_prompt
+        assert "c0ffee01" in sent_prompt
         assert "Build feature X" in sent_prompt
 
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
@@ -177,7 +177,7 @@ class TestHandoffMessageContext:
         mock_provider.return_value = _ctx("codex")
         original = "Implement the task described in /path/to/task.md. Write tests."
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "sup-111"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "deadbeef"}):
             with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
                 mock_requests.post.return_value = _ok_run_step_response()
                 mock_requests.Timeout = Exception
@@ -287,7 +287,7 @@ class TestHandoffOutcomes:
             }
         }
         with (
-            patch.dict(os.environ, {"CAO_TERMINAL_ID": "sup-409"}),
+            patch.dict(os.environ, {"CAO_TERMINAL_ID": "5a409abc"}),
             patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests,
         ):
             mock_requests.post.return_value = blocked
@@ -312,7 +312,7 @@ class TestHandoffOutcomes:
             }
         }
         with (
-            patch.dict(os.environ, {"CAO_TERMINAL_ID": "sup-409"}),
+            patch.dict(os.environ, {"CAO_TERMINAL_ID": "5a409abc"}),
             patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests,
         ):
             mock_requests.post.return_value = blocked
@@ -389,7 +389,7 @@ class TestHandoffContextPropagation:
     def test_supervisor_context_in_payload(self, mock_provider, _nudge):
         mock_provider.return_value = _ctx(
             "kiro_cli",
-            session_name="cao-supervisor-1",
+            session_name="cao-a1b2c3d4",
             caller_id="sup-abc",
             allowed_tools=["fs_read", "fs_write"],
         )
@@ -401,7 +401,7 @@ class TestHandoffContextPropagation:
 
         assert result.success is True
         payload = mock_requests.post.call_args[1]["json"]
-        assert payload["session_name"] == "cao-supervisor-1"
+        assert payload["session_name"] == "cao-a1b2c3d4"
         assert payload["caller_id"] == "sup-abc"
         assert payload["allowed_tools"] == ["fs_read", "fs_write"]
 
@@ -445,14 +445,14 @@ class TestResolveHandoffProvider:
         }
         meta.raise_for_status.return_value = None
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "sup-xyz"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "c0ffee01"}):
             with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
                 mock_requests.get.return_value = meta
                 ctx = _resolve_handoff_provider("developer")
 
         assert ctx.provider == "kiro_cli"
         assert ctx.session_name == "cao-sup"
-        assert ctx.caller_id == "sup-xyz"
+        assert ctx.caller_id == "c0ffee01"
         assert ctx.allowed_tools == ["fs_read", "fs_write"]
 
     @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider")

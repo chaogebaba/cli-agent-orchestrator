@@ -49,7 +49,7 @@ async def test_barrier_status_and_cancel_use_principal_bound_internal_seam(monke
 
 
 def test_worker_cannot_create_callback_barrier_via_send_message(monkeypatch):
-    monkeypatch.setenv("CAO_TERMINAL_ID", "worker-terminal")
+    monkeypatch.setenv("CAO_TERMINAL_ID", "11111111")
     with (
         patch.object(server, "_barrier_dispatch_is_supervisor_owned", return_value=False),
         patch.object(server, "_send_barrier_to_inbox") as send,
@@ -69,7 +69,7 @@ def test_worker_cannot_create_callback_barrier_via_send_message(monkeypatch):
 
 
 def test_supervisor_can_create_callback_barrier_for_owned_worker(monkeypatch):
-    monkeypatch.setenv("CAO_TERMINAL_ID", "supervisor-terminal")
+    monkeypatch.setenv("CAO_TERMINAL_ID", "22222222")
     with (
         patch.object(server, "_barrier_dispatch_is_supervisor_owned", return_value=True),
         patch.object(server, "_send_barrier_to_inbox", return_value={"success": True}) as send,

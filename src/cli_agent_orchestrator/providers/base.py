@@ -21,12 +21,12 @@ and output format to reliably detect status changes.
 
 import logging
 import re
-import time
 import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Literal
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional
 
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
 from cli_agent_orchestrator.providers.screen_classification import (
@@ -260,6 +260,13 @@ class BaseProvider(ABC):
     # if CAO_PYTE_STATUS is on — protecting providers (and kiro_cli, which
     # depends on raw \r) whose detectors are tuned for the raw stream.
     supports_screen_detection: bool = False
+
+    # Opt-in for the deferred-init direct status probe (capture-pane bypass).
+    # Set True on providers whose get_status() detector is line-oriented and
+    # works correctly on a rendered capture-pane snapshot. Providers whose
+    # get_status() relies on dispatch bookkeeping (e.g. kiro_cli) must leave
+    # this False — their COMPLETED/IDLE split is not screen-detectable.
+    supports_direct_status_probe: bool = False
 
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         """Detect status from a pyte-rendered screen (composited viewport).

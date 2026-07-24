@@ -2322,6 +2322,46 @@ def _normalized_composer_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.lower())
 
 
+def _worker_is_started_direct(terminal_id: str, provider: Any) -> bool:
+    """Direct visible-screen status check bypassing the event-driven status cache.
+
+    The deferred-init retry loop polls ``status_monitor.get_status()`` which
+    returns the **cached** status updated only by the event-driven pipeline
+    (pyte screener at rising-edge/quiescence edges). When that lags behind
+    reality the cached status stays IDLE even though the worker already
+    transitioned to PROCESSING.
+
+    This function does a live ``capture-pane`` to grab the visible screen
+    (not the 8 KB rolling buffer, which is too small to reliably hold the
+    footer) and calls ``provider.get_status()`` directly, catching the real
+    state so the retry loop doesn't re-deliver into a working terminal.
+
+    Only providers that set ``supports_direct_status_probe = True`` should
+    be passed to this function; the ``get_status()`` contract for other
+    providers (e.g. kiro_cli, antigravity_cli, cursor_cli) relies on
+    dispatch bookkeeping and cannot distinguish IDLE from COMPLETED on a
+    rendered capture-pane snapshot.
+    """
+    try:
+        metadata = get_terminal_metadata(terminal_id)
+        if not metadata:
+            return False
+        session_name = metadata.get("tmux_session")
+        window_name = metadata.get("tmux_window")
+        if not session_name or not window_name:
+            return False
+        output = get_backend().get_history(session_name, window_name, tail_lines=200)
+        status = provider.get_status(output)
+    except Exception:
+        logger.debug(
+            "Direct status probe for %s failed (falling through to cached path)",
+            terminal_id,
+            exc_info=True,
+        )
+        return False
+    return status in _DEFERRED_STARTED_STATUSES
+
+
 def _message_visible_in_box(terminal_id: str, message: str) -> bool:
     """Return whether the provider parser sees exactly the expected task draft."""
     expected = _normalized_composer_text(message)
@@ -2351,6 +2391,7 @@ async def _confirm_worker_started_or_resubmit(
     sender_id: str | None,
     orchestration_type: OrchestrationType | None,
     *,
+    provider: Any = None,
     generation: str | None = None,
     park_warm: bool = False,
 ) -> bool:
@@ -2386,6 +2427,19 @@ async def _confirm_worker_started_or_resubmit(
             )
         if current_status == TerminalStatus.ERROR:
             return False
+
+        # The cached status can lag behind the visible provider screen. Providers
+        # must opt in because only some get_status implementations are safe on a
+        # direct capture. This is a fast path inside the existing WPM4a guarded
+        # confirmation loop; Codex inherits the default False capability.
+        if provider is not None and getattr(provider, "supports_direct_status_probe", False):
+            if await run_blocking(
+                "deferred_submit_direct_status",
+                _worker_is_started_direct,
+                terminal_id,
+                provider,
+            ):
+                return True
 
         task_is_stable = await run_blocking(
             "deferred_submit_probe", _message_visible_in_box, terminal_id, message
@@ -2594,6 +2648,7 @@ def _schedule_deferred_init(
                     registry,
                     snapshot.get("caller_id"),
                     orchestration_type,
+                    provider=provider_instance,
                     generation=generation,
                     park_warm=park_warm,
                 )
