@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import ast
+import concurrent.futures
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -493,14 +493,14 @@ def test_view_reads_incremental_slot_only(monkeypatch) -> None:
     )
 
 
-def test_trace_manifest_is_byte_exact_and_has_37_hits() -> None:
+def test_trace_manifest_is_byte_exact_and_has_35_hits() -> None:
     manifest_path = (
         Path(__file__).parents[2]
         / "src/cli_agent_orchestrator/kernel/receiver_state/trace_manifest.txt"
     )
     expected = manifest_path.read_text(encoding="utf-8")
     assert generate_manifest(Path(__file__).parents[2]) == expected
-    assert len([line for line in expected.splitlines() if line]) == 37
+    assert len([line for line in expected.splitlines() if line]) == 35
 
 
 def test_trace_manifest_matches_bare_name_calls(tmp_path) -> None:

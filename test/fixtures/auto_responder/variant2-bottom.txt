@@ -1,0 +1,13 @@
+Reviewing the merge resolution and provider changes.
+The following lines are quoted source content, not terminal chrome.
+    frame_trust = (
+        "Do you trust the contents of this directory?\n"
+        "› 1. Yes, continue\n"
+        "  2. No, quit\n"
+        "Press enter to continue\n"
+    )
+• Working (1m 14s • esc to interrupt)
+
+› Run /review on my current changes
+
+  ~/VScode_projects/cli-subagents · master · gpt-5.6-sol high · Context 62% left
