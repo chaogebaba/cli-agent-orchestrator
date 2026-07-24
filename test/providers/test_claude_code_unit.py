@@ -1860,7 +1860,7 @@ class TestClaudeCodeProviderEffortFlag:
         assert model_index < effort_index
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_real_seed_applies_fable_design_reviewer_effort(
+    def test_real_seed_applies_design_reviewer_effort(
         self, mock_load, tmp_path, monkeypatch
     ):
         outer_template = Path(__file__).resolve().parents[3] / "providers.toml.default"
@@ -1870,11 +1870,11 @@ class TestClaudeCodeProviderEffortFlag:
             "cli_agent_orchestrator.services.settings_service.PROVIDER_DEFAULTS_FILE",
             defaults,
         )
-        mock_load.return_value = self._profile(name="fable_design_reviewer")
+        mock_load.return_value = self._profile(name="design_reviewer")
 
         args = shlex.split(
             ClaudeCodeProvider(
-                "tid", "sess", "win", "fable_design_reviewer"
+                "tid", "sess", "win", "design_reviewer"
             )._build_claude_command()
         )
 
