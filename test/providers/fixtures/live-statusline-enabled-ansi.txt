@@ -1,0 +1,40 @@
+codex -c 'tui.status_line=["current-dir","git-branch","model-with-reasoning","context-remaining","five-hour-limit"]'
+
+[1m[36mcli-agent-orchestrator[0m on [1m[35m quirks-merge-train[0m [1m[31m[$][0m is [1m[38;5;208m📦 v2.3.0[0m via [1m[33m🐍 v3.14.6 [0mon [1m[34m☁️  user@example.com[0m 
+[1m[32m❯[0m codex -c 'tui.status_line=["current-dir","git-branch","model-with-reasoning","context-remaining","five-hour-limit"]'
+[2m╭─────────────────────────────────────────────────────╮
+│ >_ [0;1mOpenAI Codex[0;2m (v0.145.0)                          │
+│                                                     │
+│ model:     [0mgpt-5.6-sol high[2m   [0m[38;5;6m/model[2m[39m to change      │
+│ directory: [0m~/…/cli-subagents/cli-agent-orchestrator[2m │
+╰─────────────────────────────────────────────────────╯
+
+[0m  [1mTip:[0m Use /permissions to control when Codex asks for confirmation.
+
+
+[1m›[0m [2mExplain this codebase
+
+[0m  [38;2;171;223;167m~/VScode_projects/cli-subagents/cli-agent-orchestrator[2m[39m · [0m[38;2;143;179;239mquirks-merge-train[2m[39m · [0m[38;2;246;226;183mgpt-5.6-sol high[2m[39m · [0m[38;2;242;181;144mContext 100% left
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

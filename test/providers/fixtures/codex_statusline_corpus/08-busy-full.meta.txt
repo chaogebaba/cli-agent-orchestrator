@@ -1,0 +1,20 @@
+name=08-busy-full
+cwd=/home/chao/VScode_projects/cli-subagents
+config=["current-dir","git-branch","model-with-reasoning","context-remaining","five-hour-limit"]
+cols=120
+busy=1
+git_state=branch=master; head=82f8c4f
+CODEX_HOME=default (~/.codex)
+codex=0.145.0
+note=real user config for model_provider; status_line override only
+observed_tail:
+| │ >_ OpenAI Codex (v0.145.0)                     │
+| │                                                │
+| │ model:     gpt-5.6-sol high   /model to change │
+| │ directory: ~/VScode_projects/cli-subagents     │
+| ╰────────────────────────────────────────────────╯
+|   Tip: New Build faster with Codex.
+| › Say only: ok
+| • Working (1s • esc to interrupt)                            
+| › Run /review on my current changes
+|   ~/VScode_projects/cli-subagents · master · gpt-5.6-sol high · Context 100% left                                     

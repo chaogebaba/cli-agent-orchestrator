@@ -1,0 +1,40 @@
+╭────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.145.0)                     │
+│                                                │
+│ model:     gpt-5.6-sol high   /model to change │
+│ directory: /tmp/x                              │
+╰────────────────────────────────────────────────╯
+
+  Tip: Visit the Codex community forum: https://community.openai.com/c/codex/37
+
+
+› Use /skills to list available skills
+
+  /tmp/x · gpt-5.6-sol high · Context 100% left
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

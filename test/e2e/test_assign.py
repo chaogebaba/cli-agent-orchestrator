@@ -45,6 +45,7 @@ from test.e2e.conftest import (
     get_terminal_status,
     wait_for_status,
 )
+from test.e2e.statusline_leak import assert_no_codex_statusline_leak
 
 import pytest
 import requests
@@ -168,6 +169,7 @@ def _run_assign_test(provider: str, agent_profile: str, task_message: str, conte
         # No TUI chrome leaking
         assert "? for shortcuts" not in output, "TUI footer leaked into output"
         assert "context left" not in output, "TUI status bar leaked into output"
+        assert_no_codex_statusline_leak(output)
 
         output_lower = output.lower()
         matched = [kw for kw in content_keywords if kw.lower() in output_lower]

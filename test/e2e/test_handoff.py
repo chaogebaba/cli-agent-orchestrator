@@ -30,6 +30,7 @@ from test.e2e.conftest import (
     send_handoff_message,
     wait_for_status,
 )
+from test.e2e.statusline_leak import assert_no_codex_statusline_leak
 
 import pytest
 
@@ -102,6 +103,7 @@ def _run_handoff_test(provider: str, agent_profile: str, task_message: str, cont
         # No TUI chrome leaking into output
         assert "? for shortcuts" not in output, "TUI footer leaked into output"
         assert "context left" not in output, "TUI status bar leaked into output"
+        assert_no_codex_statusline_leak(output)
         assert "esc to interrupt" not in output, "TUI spinner leaked into output"
 
         # Handoff prefix should not appear in extracted output

@@ -1,0 +1,16 @@
+name=02-nongit-tmpx-full
+cwd=/tmp/x
+config=["current-dir","git-branch","model-with-reasoning","context-remaining","five-hour-limit"]
+cols=120
+busy=0
+git_state=non-git
+CODEX_HOME=/tmp/fx-codex-minhome
+launch_extra=--disable apps
+codex=0.145.0
+observed_tail:
+| │ model:     gpt-5.6-sol high   /model to change │
+| │ directory: /tmp/x                              │
+| ╰────────────────────────────────────────────────╯
+|   Tip: Visit the Codex community forum: https://community.openai.com/c/codex/37
+| › Use /skills to list available skills
+|   /tmp/x · gpt-5.6-sol high · Context 100% left
