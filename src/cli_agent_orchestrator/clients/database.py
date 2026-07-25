@@ -3604,6 +3604,7 @@ def _fire_open_barrier_in_db(
 
 
 def _maybe_fire_completed_barrier(db: Any, barrier: Any) -> int | None:
+    db.flush()
     states = [
         state
         for state, in db.query(CallbackBarrierMemberModel.state)

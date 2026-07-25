@@ -47,18 +47,32 @@ from cli_agent_orchestrator.services.inbox_service import InboxService
 from cli_agent_orchestrator.services.status_monitor import BoundaryObservation
 
 
-@pytest.fixture
-def barrier_db(tmp_path, monkeypatch):
+def _barrier_sessions(tmp_path, monkeypatch, *, autoflush: bool, filename: str):
     engine = create_engine(
-        f"sqlite:///{tmp_path / 'wpq7.db'}",
+        f"sqlite:///{tmp_path / filename}",
         connect_args={"check_same_thread": False},
     )
     Base.metadata.create_all(engine)
-    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    sessions = sessionmaker(autocommit=False, autoflush=autoflush, bind=engine)
     monkeypatch.setattr(dbmod, "SessionLocal", sessions)
     monkeypatch.setattr("cli_agent_orchestrator.services.mailbox_service.SessionLocal", sessions)
     monkeypatch.setattr("cli_agent_orchestrator.services.cleanup_service.SessionLocal", sessions)
     return sessions
+
+
+@pytest.fixture
+def barrier_db(tmp_path, monkeypatch):
+    return _barrier_sessions(tmp_path, monkeypatch, autoflush=False, filename="wpq7.db")
+
+
+@pytest.fixture(params=[True, False], ids=["autoflush-true", "autoflush-false"])
+def completion_barrier_db(tmp_path, monkeypatch, request):
+    return _barrier_sessions(
+        tmp_path,
+        monkeypatch,
+        autoflush=request.param,
+        filename=f"wpq7-completion-{request.param}.db",
+    )
 
 
 def _terminal(db, terminal_id: str, *, caller: str | None = None, profile: str = "reviewer"):
@@ -86,6 +100,67 @@ def _dispatch_pair(label: str = "gate"):
     first = create_inbox_message("owner", "worker-a", "task a", dispatch_barrier={"label": label})
     second = create_inbox_message("owner", "worker-b", "task b", dispatch_barrier={"label": label})
     return first, second
+
+
+def _seed_mailbox_owner(sessions):
+    with sessions.begin() as db:
+        db.add(
+            MailboxModel(
+                id="mb_aaaaaaaa",
+                session_name="cao-wpq7",
+                role="supervisor",
+                current_terminal_id="owner",
+                generation=1,
+                consumed_through_id=0,
+            )
+        )
+        db.add(
+            MailboxIncarnationModel(
+                mailbox_id="mb_aaaaaaaa",
+                generation=1,
+                terminal_id="owner",
+                published_at=datetime.now(),
+            )
+        )
+
+
+@pytest.mark.parametrize("member_count", [1, 3])
+@pytest.mark.parametrize("mailbox_owner", [False, True])
+def test_last_arrival_fires_immediately_in_both_autoflush_modes(
+    completion_barrier_db, member_count, mailbox_owner
+):
+    workers = tuple(f"worker-{index}" for index in range(member_count))
+    _seed_raw(completion_barrier_db, workers=workers)
+    if mailbox_owner:
+        _seed_mailbox_owner(completion_barrier_db)
+
+    for worker in workers:
+        create_inbox_message(
+            "owner",
+            worker,
+            f"task for {worker}",
+            dispatch_barrier={"label": "live-shape"},
+        )
+    for worker in workers[:-1]:
+        create_inbox_message(worker, "owner", f"answer from {worker}")
+
+    with completion_barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "OPEN"
+        assert barrier.combined_message_id is None
+
+    final_worker = workers[-1]
+    create_inbox_message(final_worker, "owner", f"answer from {final_worker}")
+
+    with completion_barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "FIRED_COMPLETE"
+        combined_rows = db.query(InboxModel).filter_by(sender_id=f"barrier:{barrier.id}").all()
+        assert len(combined_rows) == 1
+        assert barrier.combined_message_id == combined_rows[0].id
+        assert combined_rows[0].message.startswith(
+            f"[callback barrier COMPLETE] live-shape — {member_count}/{member_count} in "
+        )
 
 
 def test_two_member_happy_path_holds_then_fires_one_combined(barrier_db):
