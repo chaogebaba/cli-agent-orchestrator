@@ -43,6 +43,7 @@ from cli_agent_orchestrator.api.routes_fork import router as fork_router
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     TRANSCRIPT_BINDING_SOURCES,
     adopt_mailbox_rows_at_startup,
@@ -78,7 +79,8 @@ from cli_agent_orchestrator.constants import (
     add_local_cors_origins,
 )
 from cli_agent_orchestrator.ext_apps import mount_widget_static
-from cli_agent_orchestrator.graph.providers import get_provider
+from cli_agent_orchestrator.graph.models import GraphView
+from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider
 
 # Import the sinks package for its import-time @register_sink side effects
 # ("okf", "obsidian", "graphml"); get_sink resolves by name from the registry.
@@ -167,6 +169,7 @@ logger = logging.getLogger(__name__)
 TMUX_KEY_PATTERN = re.compile(
     r"^(?:Up|Down|Left|Right|Enter|Tab|Escape|Space|[A-Za-z0-9]|[CMS]-[A-Za-z0-9])$"
 )
+GRAPH_PROJECTION_TIMEOUT_S = 90.0
 
 
 async def flow_daemon():
@@ -645,6 +648,19 @@ def _reconcile_memory_at_startup() -> None:
             )
 
 
+def _seed_default_skills_at_startup() -> None:
+    """Seed newly packaged skills without overwriting an existing installation."""
+    try:
+        seeded_count = seed_default_skills()
+        if seeded_count:
+            logger.info("Seeded %d new builtin skill(s).", seeded_count)
+    except Exception as exc:
+        logger.warning(
+            "automatic builtin skill seeding failed (%s); run `cao init` to retry",
+            type(exc).__name__,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -678,6 +694,9 @@ async def lifespan(app: FastAPI):
     # Parity repair is a fail-stop startup gate: no consumer may observe stale
     # build/phase state or a known-poisoned receiver-state authority.
     seam_parity.startup_repair()
+    # Upstream skill seed is best-effort (never raises); it must run AFTER the
+    # fail-stop gates above so a seeding hiccup can never mask a parity failure.
+    _seed_default_skills_at_startup()
     _reconcile_memory_at_startup()
     inbox_service.recover_stale_deliveries()
     adopt_mailbox_rows_at_startup()
@@ -3330,6 +3349,28 @@ async def resume_workflow_run_endpoint(
 # which raise KeyError for an unregistered name (mapped to 404 here).
 
 
+async def _project_graph_with_timeout(
+    inst: GraphProvider,
+    filters: Dict[str, Any],
+    *,
+    provider: str,
+    timeout_s: float = GRAPH_PROJECTION_TIMEOUT_S,
+) -> GraphView:
+    try:
+        return await asyncio.wait_for(inst.project(**filters), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail={
+                "message": f"graph projection timed out after {timeout_s:g} seconds",
+                "kind": "graph_projection_timeout",
+                "timeout_s": timeout_s,
+                "provider": provider,
+                "metadata": {"graph_projection_timeout": True},
+            },
+        )
+
+
 @app.get("/graph/{provider}")
 async def get_graph_endpoint(
     provider: str,
@@ -3380,7 +3421,7 @@ async def get_graph_endpoint(
             detail=f"unknown graph provider '{provider}'",
         )
     try:
-        view = await inst.project(**filters)
+        view = await _project_graph_with_timeout(inst, filters, provider=provider)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return view.to_dict()
@@ -3417,7 +3458,7 @@ async def export_graph_endpoint(
         )
 
     try:
-        view = await prov.project(**filters)
+        view = await _project_graph_with_timeout(prov, filters, provider=provider)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 

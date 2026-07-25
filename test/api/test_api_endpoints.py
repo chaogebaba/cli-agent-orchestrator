@@ -1222,7 +1222,11 @@ class TestLifespan:
     """Tests for the lifespan() context manager."""
 
     @pytest.mark.asyncio
-    async def test_lifespan_startup_and_shutdown(self, caplog):
+    # NOTE: _seed_default_skills_at_startup is patched via decorator rather than
+    # added to the with-list below -- CPython caps statically nested blocks at 20
+    # and that parenthesized context-manager list is already at the limit.
+    @patch("cli_agent_orchestrator.api.main._seed_default_skills_at_startup")
+    async def test_lifespan_startup_and_shutdown(self, mock_seed, caplog):
         """lifespan starts the event-bus consumers on entry, cleans up on exit.
 
         The watchdog PollingObserver inbox watcher was replaced by event-bus
@@ -1255,6 +1259,7 @@ class TestLifespan:
         mock_load = AsyncMock(side_effect=record_registry_load)
         mock_teardown = AsyncMock()
         startup_order = []
+        mock_seed.side_effect = lambda: startup_order.append("skill_seed")
 
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
@@ -1318,11 +1323,15 @@ class TestLifespan:
                     mock_bus.set_loop.assert_called_once()
                     loop_arg = mock_bus.set_loop.call_args.args[0]
                     assert loop_arg is asyncio.get_running_loop()
+                    mock_seed.assert_called_once_with()
                     mock_purge.assert_called_once_with()
                     mock_recover.assert_called_once_with()
                     mock_orphan_reconcile.assert_called_once_with()
                     assert startup_order == [
                         "init_db",
+                        # Upstream skill seed must land AFTER the fail-stop
+                        # startup gates and before delivery recovery.
+                        "skill_seed",
                         "recover",
                         "orphan_reconcile",
                         "registry_load",
