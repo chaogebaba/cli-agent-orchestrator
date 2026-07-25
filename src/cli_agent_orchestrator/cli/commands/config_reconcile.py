@@ -274,6 +274,7 @@ def _reconcile_config(
     audit_after_publish = False
     with _config_lock():
         target_exists = target.exists()
+        # Another seed may win between the unlocked existence check and lock acquisition.
         if target_exists and not force_providers:
             audit_after_publish = True
         elif target_exists:
