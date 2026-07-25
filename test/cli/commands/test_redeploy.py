@@ -215,3 +215,32 @@ def test_force_providers_is_forwarded_without_yes_implying_it():
 
     assert result.exit_code == 0
     install.assert_called_once_with("/repo", force_providers=True)
+
+
+def test_force_providers_with_yes_emits_diff_before_restart_and_skips_prompt():
+    events = []
+
+    def install_with_diff(_root, *, force_providers):
+        events.append(f"install:{force_providers}")
+        command.click.echo("drift: providers.toml differs at codex.model", err=True)
+
+    with (
+        patch.object(command, "_redeploy_source_root", return_value="/repo"),
+        patch.object(command, "_install_redeploy", side_effect=install_with_diff),
+        patch.object(command, "_restart_server", side_effect=lambda: events.append("restart")),
+        patch.object(
+            command,
+            "_verify_redeploy",
+            side_effect=lambda _root: events.append("verify") or _status(),
+        ),
+        patch.object(command.click, "confirm") as confirm,
+    ):
+        result = CliRunner().invoke(cli, ["redeploy", "--force-providers", "--yes"])
+
+    assert result.exit_code == 0
+    assert events == ["install:True", "restart", "verify"]
+    confirm.assert_not_called()
+    assert "providers.toml differs at codex.model" in result.stderr
+    assert result.output.index("providers.toml differs") < result.output.index(
+        "restarting cao-server"
+    )
