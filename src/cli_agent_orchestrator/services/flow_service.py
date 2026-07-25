@@ -1,5 +1,6 @@
 """Flow service for scheduled agent sessions."""
 
+import asyncio
 import json
 import logging
 import os
@@ -242,6 +243,7 @@ async def execute_flow(name: str) -> bool:
                 logger.info(f"Flow {name}: session {session_name} is busy, skipping")
                 return False
             from cli_agent_orchestrator.services import terminal_service
+
             await terminal_service.quiesce_deferred_terminals(terminals)
             for t in terminals:
                 provider_manager.cleanup_provider(t["id"])
@@ -261,6 +263,7 @@ async def execute_flow(name: str) -> bool:
                 terminal_service._delete_terminal_core(terminal["id"])
             get_backend().kill_session(session_name)
         from cli_agent_orchestrator.services.terminal_service import seed_resume_bootstrap
+
         fork_context = seed_resume_bootstrap(flow.agent_profile, flow.provider, os.getcwd())
         terminal = await create_terminal(
             session_name=session_name,
@@ -270,8 +273,14 @@ async def execute_flow(name: str) -> bool:
             fork_context=fork_context,
         )
 
-        # Send rendered prompt to terminal
-        send_input(terminal.id, rendered_prompt)
+        # Send rendered prompt to terminal. send_input is blocking tmux I/O
+        # (now additionally a pane-foreground-command probe on top of the
+        # existing bracketed-paste delivery, see clients/tmux.py's
+        # _pane_is_bracketed_paste_incompatible) -- run it off the event loop
+        # so a slow tmux call can't freeze every other request (same hazard
+        # class as issue #382, already fixed for POST /terminals/{id}/input
+        # in api/main.py's send_terminal_input; this call site was missed).
+        await asyncio.to_thread(send_input, terminal.id, rendered_prompt)
 
         logger.info(f"Flow {name}: launched session {session_name}")
         return True

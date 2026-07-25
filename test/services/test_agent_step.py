@@ -125,9 +125,7 @@ class TestHappyPath:
         ):
             with pytest.raises(StepExecutionError) as exc_info:
                 asyncio.run(
-                    run_agent_step(
-                        "kiro_cli", "dev", "x", teardown=False, cancel_signal=signal
-                    )
+                    run_agent_step("kiro_cli", "dev", "x", teardown=False, cancel_signal=signal)
                 )
         assert exc_info.value.kind == "cancelled"
         m_delete.assert_not_called()
@@ -181,9 +179,7 @@ class TestHappyPath:
         m_delete.assert_not_called()
         # A reused terminal is owned by the caller — no graceful exit either.
         m_exit.assert_not_called()
-        m_send.assert_called_once_with(
-            "reuse99", "x", orchestration_type=OrchestrationType.HANDOFF
-        )
+        m_send.assert_called_once_with("reuse99", "x", orchestration_type=OrchestrationType.HANDOFF)
 
     def test_dialog_block_surfaces_structured_non_retryable_error(self):
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
@@ -202,9 +198,7 @@ class TestHappyPath:
             m_send.side_effect = TerminalInputBlockedError("dialog")
             m_status.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
             with pytest.raises(StepExecutionError) as exc_info:
-                asyncio.run(
-                    run_agent_step("codex", "dev", "x", reuse_terminal_id="reuse99")
-                )
+                asyncio.run(run_agent_step("codex", "dev", "x", reuse_terminal_id="reuse99"))
 
         assert exc_info.value.kind == "input_blocked"
         assert exc_info.value.terminal_id == "reuse99"
@@ -218,9 +212,7 @@ class TestHappyPath:
         with create, send as m_send, delete, get_output, exit_cli, wait, status:
             m_send.side_effect = DeliveryDeferredError("composer unstable")
             with pytest.raises(StepExecutionError) as exc_info:
-                asyncio.run(
-                    run_agent_step("claude_code", "dev", "x", reuse_terminal_id="reuse99")
-                )
+                asyncio.run(run_agent_step("claude_code", "dev", "x", reuse_terminal_id="reuse99"))
         assert exc_info.value.kind == "delivery_deferred"
         assert exc_info.value.terminal_id == "reuse99"
 
@@ -258,6 +250,31 @@ class TestHappyPath:
             asyncio.run(run_agent_step("kiro_cli", "dev", "x", working_directory="/tmp/wd"))
         assert m_create.await_args.kwargs["working_directory"] == "/tmp/wd"
 
+    def test_model_forwarded_to_create(self):
+        """handoff's own `model` parameter reaches terminal_service.create_terminal
+        for a freshly created terminal."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with create as m_create, send, delete, get_output, exit_cli, wait, status:
+            asyncio.run(run_agent_step("kiro_cli", "dev", "x", model="fable-5"))
+        assert m_create.await_args.kwargs["model"] == "fable-5"
+
+    def test_omitted_model_forwards_none_to_create(self):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with create as m_create, send, delete, get_output, exit_cli, wait, status:
+            asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
+        assert m_create.await_args.kwargs["model"] is None
+
+    def test_reused_terminal_never_passes_model_to_create(self):
+        """Reusing a terminal skips create_terminal entirely -- model has
+        nothing to apply to and must not be silently expected to retarget an
+        already-running provider."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with create as m_create, send, delete, get_output, exit_cli, wait, status:
+            asyncio.run(
+                run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99", model="fable-5")
+            )
+        m_create.assert_not_awaited()
+
     def test_no_session_name_creates_new_session(self):
         """Regression: session_name=None must create a NEW tmux session
         (new_session=True). Otherwise create_terminal auto-generates a name and
@@ -277,9 +294,7 @@ class TestHappyPath:
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
         with create as m_create, send, delete, get_output, exit_cli, get_wd, wait, status:
             asyncio.run(
-                run_agent_step(
-                    "kiro_cli", "dev", "x", session_name="cao-sup", env_vars=env_vars
-                )
+                run_agent_step("kiro_cli", "dev", "x", session_name="cao-sup", env_vars=env_vars)
             )
         assert m_create.await_args.kwargs["new_session"] is False
         assert m_create.await_args.kwargs["session_name"] == "cao-sup"
@@ -530,9 +545,7 @@ class TestTypedCompletionWait:
             ),
             patch(f"{_MODULE}.status_monitor.get_status_gen", return_value=7),
         ):
-            outcome = await _wait_for_completion(
-                "t1", input_gen=7, timeout=1.0, polling_interval=0
-            )
+            outcome = await _wait_for_completion("t1", input_gen=7, timeout=1.0, polling_interval=0)
 
         assert outcome == _CompletionOutcome.COMPLETED
 
@@ -645,9 +658,7 @@ class TestTypedCompletionWait:
                 TerminalStatus.COMPLETED,
             ]
             result = asyncio.run(
-                run_agent_step(
-                    "kiro_cli", "dev", "x", reuse_terminal_id="reuse99", timeout=3600
-                )
+                run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99", timeout=3600)
             )
         assert result.status == TerminalStatus.COMPLETED
         m_sleep.assert_awaited_once()
@@ -708,9 +719,7 @@ class TestCancellationPhaseTable:
                 assert result.status == TerminalStatus.COMPLETED
             else:
                 expected = (
-                    RuntimeError
-                    if case in {"send_raw", "extraction_raw"}
-                    else StepExecutionError
+                    RuntimeError if case in {"send_raw", "extraction_raw"} else StepExecutionError
                 )
                 with pytest.raises(expected) as exc_info:
                     asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
@@ -771,9 +780,7 @@ class TestCancellationPhaseTable:
             ),
         ):
             (m_send if phase == "send" else m_output).side_effect = _block_then_raise
-            task = asyncio.create_task(
-                run_agent_step("kiro_cli", "dev", "x", cancel_signal=signal)
-            )
+            task = asyncio.create_task(run_agent_step("kiro_cli", "dev", "x", cancel_signal=signal))
             assert await asyncio.to_thread(started.wait, 5)
             signal.set()
             release.set()
@@ -809,9 +816,7 @@ class TestCancellationPhaseTable:
             status,
         ):
             m_send.side_effect = _block_then_raise
-            task = asyncio.create_task(
-                run_agent_step("kiro_cli", "dev", "x", cancel_signal=signal)
-            )
+            task = asyncio.create_task(run_agent_step("kiro_cli", "dev", "x", cancel_signal=signal))
             assert await asyncio.to_thread(started.wait, 5)
             signal.set()
             release.set()
@@ -850,9 +855,7 @@ class TestCancellationPhaseTable:
             ),
         ):
             m_output.side_effect = _block_then_succeed
-            task = asyncio.create_task(
-                run_agent_step("kiro_cli", "dev", "x", cancel_signal=signal)
-            )
+            task = asyncio.create_task(run_agent_step("kiro_cli", "dev", "x", cancel_signal=signal))
             assert await asyncio.to_thread(started.wait, 5)
             signal.set()
             release.set()
@@ -861,6 +864,7 @@ class TestCancellationPhaseTable:
         assert result.last_message == "finished"
         m_exit.assert_called_once()
         m_delete.assert_called_once()
+
 
 class TestTeardownIsBestEffort:
     def test_teardown_failure_does_not_fail_successful_step(self):

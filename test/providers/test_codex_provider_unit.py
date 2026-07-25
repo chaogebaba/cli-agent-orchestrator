@@ -635,6 +635,35 @@ class TestCodexProviderModelFlag:
 
         assert "--model" not in command
 
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_explicit_model_override_wins_over_toml_and_profile_model(
+        self, mock_load, provider_defaults_file
+    ):
+        provider_defaults_file.write_text(
+            '[codex]\nmodel = "provider"\n' '[codex.profiles.agent]\nmodel = "profile-toml"\n',
+            encoding="utf-8",
+        )
+        mock_profile = MagicMock()
+        mock_profile.model = "gpt-5"
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent", model="fable-5")
+        command = provider._build_codex_command()
+
+        assert "--model fable-5" in command
+        assert "--model gpt-5" not in command
+        assert "profile-toml" not in command
+        assert "provider" not in command
+
+    def test_explicit_model_override_applies_with_no_agent_profile(self):
+        provider = CodexProvider("tid", "sess", "win", None, model="fable-5")
+        command = provider._build_codex_command()
+
+        assert "--model fable-5" in command
+
 
 class TestCodexBuildCommandExtra:
     """Coverage for branches inside ``_build_codex_command`` that the

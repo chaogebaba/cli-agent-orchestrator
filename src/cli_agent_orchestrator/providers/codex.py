@@ -667,6 +667,7 @@ class CodexProvider(BaseProvider):
         skill_prompt: Optional[str] = None,
         fork_context: Optional[ForkContext] = None,
         persona_plan: Optional["PersonaPlan"] = None,
+        model: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(
@@ -675,6 +676,9 @@ class CodexProvider(BaseProvider):
         self._initialized = False
         self._agent_profile = agent_profile
         self._persona_plan = persona_plan
+        # Explicit per-call override for the existing profile/providers.toml
+        # model chain, see _build_codex_command.
+        self._model = model
 
     @classmethod
     def seed_resume_identity(cls, cwd: str, agent_profile: str) -> str:
@@ -747,8 +751,9 @@ class CodexProvider(BaseProvider):
         command_parts.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
 
         model, codex_config = _resolved_codex_profile_config(profile, self._agent_profile)
-        if isinstance(model, str) and model:
-            command_parts.extend(["--model", model])
+        resolved_model = self._model if self._model is not None else model
+        if resolved_model:
+            command_parts.extend(["--model", resolved_model])
 
         if profile is not None:
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""

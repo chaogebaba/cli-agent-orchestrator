@@ -627,6 +627,7 @@ async def create_terminal(
     fallback_source_lease_token=None,
     dispatch_barrier: dict[str, object] | None = None,
     park_warm: bool = False,
+    model: Optional[str] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -656,6 +657,12 @@ async def create_terminal(
             via handoff/assign. Recorded so send_message can route callbacks
             structurally instead of parsing IDs out of message text (issue #284).
             None for operator-launched terminals.
+        model: Explicit per-call model override, forwarded to the provider
+            (where supported -- see each provider's own __init__) ahead of
+            the provider's existing profile/providers.toml resolution. Lets a
+            caller (e.g. MCP handoff/assign's own `model` parameter) pin a
+            specific model for one worker without needing a dedicated agent profile.
+            None leaves that existing resolution chain unchanged.
 
     Returns:
         Terminal object with all metadata populated
@@ -1074,7 +1081,7 @@ async def create_terminal(
                 agent_profile,
                 allowed_tools,
                 skill_prompt=skill_prompt,
-                model=profile.model if profile else None,
+                model=model,
                 fork_context=fork_context,
                 persona_plan=persona_plan,
             )

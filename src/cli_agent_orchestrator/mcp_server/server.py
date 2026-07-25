@@ -193,6 +193,7 @@ def _create_terminal(
     barrier_timeout_seconds: Optional[int] = None,
     barrier_member_key: Optional[str] = None,
     park_warm: bool = False,
+    model: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -211,6 +212,16 @@ def _create_terminal(
             initializing. Ignored otherwise.
         initial_message_orchestration_type: Passed through to send_input for
             plugin event emission (assign/handoff).
+        model: Explicit per-call model override for the new terminal, applied
+            ahead of the provider's existing profile/providers.toml resolution (where the
+            resolved provider supports it). Only honored on the
+            existing-session branch below (``POST /sessions/{name}/
+            terminals``) -- the new-session branch (``POST /sessions``, used
+            only when this tool is called with no current CAO_TERMINAL_ID)
+            goes through a different server-side route that does not accept
+            it; handoff/assign both already require an existing terminal
+            (see their own CAO_TERMINAL_ID checks), so this branch is the one
+            that matters for both callers in practice.
 
     Returns:
         Tuple of (terminal_id, provider)
@@ -246,6 +257,8 @@ def _create_terminal(
             params["working_directory"] = working_directory
         if child_allowed_tools:
             params["allowed_tools"] = child_allowed_tools
+        if model:
+            params["model"] = model
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
@@ -878,7 +891,11 @@ def _peek_terminal_impl(terminal_id: str, lines: int = 40) -> Dict[str, Any]:
 
 # Implementation functions
 async def _handoff_impl(
-    agent_profile: str, message: str, timeout: int = 600, working_directory: Optional[str] = None
+    agent_profile: str,
+    message: str,
+    timeout: int = 600,
+    working_directory: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> HandoffResult:
     """Implementation of handoff logic.
 
@@ -952,6 +969,8 @@ async def _handoff_impl(
             payload["allowed_tools"] = ctx.allowed_tools
         if working_directory:
             payload["working_directory"] = working_directory
+        if model:
+            payload["model"] = model
 
         # Allow the full step time plus the server-side ready-wait (up to 120s)
         # plus headroom; the server enforces the per-step timeout internally.
@@ -1033,6 +1052,15 @@ async def _handoff_impl(
         )
 
 
+# Shared by both handoff and assign's tool signatures below.
+_model_field_desc = (
+    "Optional model override for the worker agent (e.g. a concrete model name/id "
+    "accepted by the resolved provider's own --model flag). Takes precedence over "
+    "the provider's existing profile/providers.toml model resolution for this one "
+    "call only. Not honored by every provider; omit to preserve normal resolution."
+)
+
+
 @mcp.tool()
 async def handoff(
     agent_profile: str = Field(
@@ -1049,12 +1077,12 @@ async def handoff(
         default=None,
         description="Optional working directory where the agent should execute",
     ),
+    model: Optional[str] = Field(default=None, description=_model_field_desc),
 ) -> HandoffResult:
     """Hand off a task to another agent via CAO terminal and wait for completion.
 
     This tool allows handing off tasks to other agents by creating a new terminal
     in the same session. It sends the message, waits for completion, and captures the output.
-
     ## Usage
 
     Use this tool to hand off tasks to another agent and wait for the results.
@@ -1072,6 +1100,11 @@ async def handoff(
     - You can specify a custom directory via working_directory parameter
     - Directory must exist and be accessible
 
+    ## Model
+
+    - By default, the provider uses its existing profile/providers.toml model resolution
+    - You can pin a specific model via the model parameter for this one worker
+
     ## Requirements
 
     - Must be called from within a CAO terminal (CAO_TERMINAL_ID environment variable)
@@ -1083,11 +1116,12 @@ async def handoff(
         message: The task/message to send
         timeout: Maximum wait time in seconds
         working_directory: Optional directory path where agent should execute
+        model: Optional model override (not honored by every provider)
 
     Returns:
         HandoffResult with success status, message, and agent output
     """
-    return await _handoff_impl(agent_profile, message, timeout, working_directory)
+    return await _handoff_impl(agent_profile, message, timeout, working_directory, model)
 
 
 # Implementation function for assign
@@ -1118,6 +1152,7 @@ def _assign_impl(
     barrier_timeout_seconds: Optional[int] = None,
     barrier_member_key: Optional[str] = None,
     park_warm: bool = False,
+    model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1280,6 +1315,7 @@ def _assign_impl(
             initial_message_orchestration_type=OrchestrationType.ASSIGN,
             fork_context=fork_context,
             refresh_base_name=refresh_base_name,
+            model=model,
             **create_kwargs,
         )
 
@@ -1336,6 +1372,12 @@ Example message: "Analyze the logs. When done, send results back to terminal ee3
 
     desc += """
 
+## Model
+
+- By default, the provider uses its existing profile/providers.toml model resolution
+- You can pin a specific model for this one worker via the model parameter, without
+  needing a dedicated agent profile -- not honored by every provider
+
 ## Cleanup
 
 When you are done with an assigned terminal (received results or no longer need it),
@@ -1350,6 +1392,7 @@ Args:
     working_directory: Optional working directory where the agent should execute"""
 
     desc += """
+    model: Optional model override for the worker (not honored by every provider)
 
 Returns:
     Dict with success status, worker terminal_id, and message"""
@@ -1409,6 +1452,7 @@ async def assign(
         default=False,
         description="Deliver the task without expecting a callback",
     ),
+    model: Optional[str] = Field(default=None, description=_model_field_desc),
 ) -> Dict[str, Any]:
     return _assign_impl(
         agent_profile,
@@ -1420,6 +1464,7 @@ async def assign(
         barrier_timeout_seconds,
         barrier_member_key,
         park_warm,
+        model,
     )
 
 

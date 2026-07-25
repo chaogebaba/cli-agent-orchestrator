@@ -67,6 +67,8 @@ from cli_agent_orchestrator.constants import (
     DEFAULT_PROVIDER,
     INBOX_POLLING_INTERVAL,
     INBOX_RECONCILE_INTERVAL,
+    MODEL_ID_MAX_LEN,
+    MODEL_ID_RE,
     OTEL_SERVICE_NAME,
     SERVER_HOST,
     SERVER_PORT,
@@ -301,6 +303,27 @@ class CreateTerminalBody(BaseModel):
         return self
 
 
+def _validate_model_id(value: str) -> None:
+    """Validate a ``model`` override at the request boundary (PR #501 review).
+
+    Shared by ``RunStepRequest.model`` (field_validator below) and the
+    ``/sessions/{session_name}/terminals`` ``model`` query param, so both
+    entry points into ``terminal_service.create_terminal`` apply the same
+    rule. Raises ``ValueError``; callers translate that into the transport
+    -appropriate error (FastAPI 422 for a Pydantic field_validator, an
+    explicit 400 for the query-param call site — see that endpoint).
+
+    Raises:
+        ValueError: ``value`` exceeds MODEL_ID_MAX_LEN or contains a
+            character outside MODEL_ID_RE (whitespace, control characters,
+            and shell/quoting metacharacters are all rejected).
+    """
+    if len(value) > MODEL_ID_MAX_LEN:
+        raise ValueError(f"model exceeds the {MODEL_ID_MAX_LEN}-char cap")
+    if not re.fullmatch(MODEL_ID_RE, value):
+        raise ValueError(f"model {value!r} is invalid (must match {MODEL_ID_RE!r})")
+
+
 class RunStepRequest(BaseModel):
     """Request body for the combined step-execution endpoint (N0, #312)."""
 
@@ -340,6 +363,15 @@ class RunStepRequest(BaseModel):
             "Workflow identity env vars injected into a freshly created terminal. "
             "Keys are restricted to the WORKFLOW_ENV_ALLOWLIST (NFR-SEC-4); "
             "values are validated but never echoed in error bodies."
+        ),
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description=(
+            "Explicit per-call model override for a freshly created terminal "
+            "(ignored when reusing a terminal), applied ahead of the provider's "
+            "existing profile/providers.toml resolution. Lets a caller pin a specific "
+            "model for one worker without a dedicated agent profile."
         ),
     )
 
@@ -385,6 +417,20 @@ class RunStepRequest(BaseModel):
                     f"value for '{key}' is invalid (must be a 1-64 char "
                     "[A-Za-z0-9_-] identifier)"
                 ) from None
+        return v
+
+    @field_validator("model")
+    @classmethod
+    def validate_model(cls, v: Optional[str]) -> Optional[str]:
+        """See ``_validate_model_id`` -- the boundary check the model
+        override needs (PR #501 review): the value reaches a provider's
+        launch-command builder, shlex-quoted before delivery (so classic
+        word-splitting is not reachable) but a control character or newline
+        surviving quoting into the command string is still a delivery
+        hazard this codebase already guards against elsewhere."""
+        if v is None:
+            return v
+        _validate_model_id(v)
         return v
 
     @model_validator(mode="after")
@@ -2406,6 +2452,7 @@ async def create_terminal_in_session(
     allowed_tools: Optional[str] = None,
     caller_id: Optional[TerminalId] = None,
     defer_init: bool = False,
+    model: Optional[str] = None,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -2424,9 +2471,17 @@ async def create_terminal_in_session(
     ``initial_message_orchestration_type``) rather than query params so prompt
     content isn't exposed in HTTP access logs and isn't subject to URL-length
     limits.
+
+    ``model``: optional explicit override, applied ahead of the provider's
+    existing profile/providers.toml model resolution (where the resolved provider
+    supports it -- see ``terminal_service.create_terminal``'s own docstring).
+    Lets a caller pin a specific model for one worker without needing a
+    dedicated agent profile.
     """
     try:
         validate_tmux_name(session_name, "session_name")
+        if model is not None:
+            _validate_model_id(model)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
@@ -2505,6 +2560,7 @@ async def create_terminal_in_session(
                 if body and body.barrier is not None
                 else None
             ),
+            model=model,
         )
         return result
     except HTTPException:
@@ -2904,6 +2960,7 @@ async def run_step(
             registry=get_plugin_registry(request),
             env_vars=body.env_vars,
             on_terminal_created=on_terminal_created,
+            model=body.model,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure

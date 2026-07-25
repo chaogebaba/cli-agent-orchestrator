@@ -324,6 +324,7 @@ class ClaudeCodeProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
         persona_plan: Optional["PersonaPlan"] = None,
+        model: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
@@ -332,6 +333,10 @@ class ClaudeCodeProvider(BaseProvider):
         self._persona_plan = persona_plan
         self.allocated_session_uuid = str(uuid.uuid4())
         self._render_uncertain_active = False
+        # Explicit per-call override for profile.model (see launch()'s own
+        # --model resolution below) -- e.g. a handoff/assign caller pinning a
+        # specific model for one worker without needing a dedicated profile.
+        self._model = model
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
         # lives on BaseProvider and is consumed by _resolve_native_status().
         self._input_generation: int = 0
@@ -445,7 +450,10 @@ class ClaudeCodeProvider(BaseProvider):
         native = getattr(profile, "native_agent", None) if profile else None
         if profile is not None and isinstance(native, str) and native:
             # Thin wrapper: CAO profile maps to a native Claude Code agent.
-            # Let Claude Code handle all config (MCP servers, hooks, tools, model).
+            # Let Claude Code handle all config (MCP servers, hooks, tools, model)
+            # -- the explicit per-call override is deliberately NOT applied here,
+            # matching the existing rule that CAO does not decompose model config
+            # for native-agent wrappers.
             # CAO_TERMINAL_ID propagates via tmux pane env inheritance.
             command_parts.extend(["--agent", native])
         elif self._agent_profile is not None and profile is None:
@@ -453,6 +461,8 @@ class ClaudeCodeProvider(BaseProvider):
             # native agent store (~/.claude/agents/). Same thin-orchestrator
             # pattern as the Kiro CLI provider.
             command_parts.extend(["--agent", self._agent_profile])
+            if self._model:
+                command_parts.extend(["--model", self._model])
         elif profile is not None:
             # Full CAO profile with config decomposition
             defaults = get_provider_defaults("claude_code")
@@ -466,8 +476,9 @@ class ClaudeCodeProvider(BaseProvider):
             model = resolve_provider_string_option(
                 profile_defaults, defaults, profile, "model", "model"
             )
-            if model:
-                command_parts.extend(["--model", model])
+            resolved_model = self._model if self._model is not None else model
+            if resolved_model:
+                command_parts.extend(["--model", resolved_model])
             effort = resolve_provider_string_option(
                 profile_defaults, defaults, profile, "reasoning_effort", "reasoningEffort"
             )

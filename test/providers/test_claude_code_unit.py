@@ -1554,6 +1554,7 @@ class TestClaudeCodeProviderMisc:
         with pytest.raises(ValueError, match="profile may not override CAO_TERMINAL_ID"):
             provider._build_claude_command()
 
+
 class TestClaudeCodeProviderContainerPathTranslation:
     """_build_claude_command must translate temp-file paths for container profiles.
 
@@ -1581,7 +1582,9 @@ class TestClaudeCodeProviderContainerPathTranslation:
         provider = ClaudeCodeProvider("test-container", "sess", "win", "test-agent")
         tmp_dir = tmp_path / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        with patch("cli_agent_orchestrator.providers.claude_code.cao_tmp_dir", return_value=tmp_dir):
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.cao_tmp_dir", return_value=tmp_dir
+        ):
             command = provider._build_claude_command()
 
         args = shlex.split(command)
@@ -1612,7 +1615,9 @@ class TestClaudeCodeProviderContainerPathTranslation:
         provider = ClaudeCodeProvider("test-host", "sess", "win", "test-agent")
         tmp_dir = tmp_path / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        with patch("cli_agent_orchestrator.providers.claude_code.cao_tmp_dir", return_value=tmp_dir):
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.cao_tmp_dir", return_value=tmp_dir
+        ):
             command = provider._build_claude_command()
 
         args = shlex.split(command)
@@ -1758,9 +1763,7 @@ class TestClaudeCodeProviderEffortFlag:
         assert args[args.index("--effort") + 1] == "medium"
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_per_profile_effort_wins_over_provider(
-        self, mock_load, tmp_path, monkeypatch
-    ):
+    def test_per_profile_effort_wins_over_provider(self, mock_load, tmp_path, monkeypatch):
         self._set_defaults(
             tmp_path,
             monkeypatch,
@@ -1776,9 +1779,7 @@ class TestClaudeCodeProviderEffortFlag:
         assert args[args.index("--effort") + 1] == "high"
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_frontmatter_effort_fallback_when_toml_absent(
-        self, mock_load, tmp_path, monkeypatch
-    ):
+    def test_frontmatter_effort_fallback_when_toml_absent(self, mock_load, tmp_path, monkeypatch):
         self._set_defaults(tmp_path, monkeypatch, "")
         mock_load.return_value = self._profile(reasoning_effort="xhigh")
 
@@ -1789,9 +1790,7 @@ class TestClaudeCodeProviderEffortFlag:
         assert args[args.index("--effort") + 1] == "xhigh"
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_empty_profile_effort_clears_lower_tiers(
-        self, mock_load, tmp_path, monkeypatch
-    ):
+    def test_empty_profile_effort_clears_lower_tiers(self, mock_load, tmp_path, monkeypatch):
         self._set_defaults(
             tmp_path,
             monkeypatch,
@@ -1818,9 +1817,7 @@ class TestClaudeCodeProviderEffortFlag:
         assert "--effort" not in args
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_native_agent_branch_ignores_effort(
-        self, mock_load, tmp_path, monkeypatch
-    ):
+    def test_native_agent_branch_ignores_effort(self, mock_load, tmp_path, monkeypatch):
         self._set_defaults(
             tmp_path,
             monkeypatch,
@@ -1839,9 +1836,7 @@ class TestClaudeCodeProviderEffortFlag:
         assert "--effort" not in args
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_model_and_effort_combine_in_stable_order(
-        self, mock_load, tmp_path, monkeypatch
-    ):
+    def test_model_and_effort_combine_in_stable_order(self, mock_load, tmp_path, monkeypatch):
         self._set_defaults(
             tmp_path,
             monkeypatch,
@@ -1860,9 +1855,7 @@ class TestClaudeCodeProviderEffortFlag:
         assert model_index < effort_index
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_real_seed_applies_design_reviewer_effort(
-        self, mock_load, tmp_path, monkeypatch
-    ):
+    def test_real_seed_applies_design_reviewer_effort(self, mock_load, tmp_path, monkeypatch):
         outer_template = Path(__file__).resolve().parents[3] / "providers.toml.default"
         defaults = tmp_path / "providers.toml"
         shutil.copyfile(outer_template, defaults)
@@ -1873,12 +1866,112 @@ class TestClaudeCodeProviderEffortFlag:
         mock_load.return_value = self._profile(name="design_reviewer")
 
         args = shlex.split(
-            ClaudeCodeProvider(
-                "tid", "sess", "win", "design_reviewer"
-            )._build_claude_command()
+            ClaudeCodeProvider("tid", "sess", "win", "design_reviewer")._build_claude_command()
         )
 
         assert args[args.index("--effort") + 1] == "high"
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_explicit_model_override_wins_over_toml_and_profile_model(
+        self, mock_load, tmp_path, monkeypatch
+    ):
+        """The one-call override sits above every existing model layer."""
+        defaults = tmp_path / "providers.toml"
+        defaults.write_text(
+            '[claude_code]\nmodel = "provider"\n'
+            '[claude_code.profiles.agent]\nmodel = "profile-toml"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.PROVIDER_DEFAULTS_FILE",
+            defaults,
+        )
+        mock_profile = MagicMock()
+        mock_profile.model = "sonnet"
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", model="fable-5")
+        command = provider._build_claude_command()
+
+        assert "--model fable-5" in command
+        assert "--model sonnet" not in command
+        assert "profile-toml" not in command
+        assert "provider" not in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_profile_model_with_brackets_is_not_override_validated(
+        self, mock_load, tmp_path, monkeypatch
+    ):
+        defaults = tmp_path / "providers.toml"
+        defaults.write_text("", encoding="utf-8")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.PROVIDER_DEFAULTS_FILE",
+            defaults,
+        )
+        mock_load.return_value = MagicMock(
+            name="design_reviewer",
+            model="claude-opus-5[1m]",
+            native_agent=None,
+            system_prompt=None,
+            mcpServers=None,
+            permissionMode=None,
+        )
+
+        command = ClaudeCodeProvider(
+            "tid", "sess", "win", "design_reviewer"
+        )._build_claude_command()
+        args = shlex.split(command)
+
+        assert args[args.index("--model") + 1] == "claude-opus-5[1m]"
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_explicit_model_override_applies_with_no_profile_model(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", model="fable-5")
+        command = provider._build_claude_command()
+
+        assert "--model fable-5" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_model_override_ignored_for_native_agent_profile(self, mock_load):
+        """A profile that maps to a native Claude Code agent handles its own
+        model config -- an explicit override is not applied there (by
+        design, see the provider's own comment), and does not appear in the
+        launch command at all."""
+        mock_profile = MagicMock()
+        mock_profile.native_agent = "my-claude-agent"
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", model="fable-5")
+        command = provider._build_claude_command()
+
+        assert "--agent my-claude-agent" in command
+        assert "--model" not in command
+
+    def test_no_agent_profile_still_honors_explicit_model(self):
+        """No CAO profile exists (agent_profile passed straight through to
+        Claude Code's own native agent store) -- an explicit model override
+        still applies since there's no profile.model to conflict with."""
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", model="fable-5")
+        # profile is None on this path (agent_profile has no CAO profile file).
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.load_agent_profile",
+            side_effect=FileNotFoundError,
+        ):
+            command = provider._build_claude_command()
+
+        assert "--agent agent" in command
+        assert "--model fable-5" in command
 
 
 class TestClaudeCodeProviderPermissionMode:
