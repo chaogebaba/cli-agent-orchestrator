@@ -4,6 +4,7 @@ import json
 
 import click
 
+from cli_agent_orchestrator.cli.commands.config_reconcile import reconcile
 from cli_agent_orchestrator.services.config_service import ConfigService
 from cli_agent_orchestrator.utils.sandbox_guard import require_not_sandbox_mutation
 
@@ -30,7 +31,7 @@ def _coerce(value: str):
 
 @click.group()
 def config():
-    """Inspect and edit unified CAO configuration (settings.json)."""
+    """Inspect and edit CAO configuration."""
 
 
 @config.command(name="get")
@@ -77,3 +78,6 @@ def list_cmd():
 def path_cmd():
     """Print the absolute path to the unified settings.json file."""
     click.echo(str(ConfigService.path()))
+
+
+config.add_command(reconcile)

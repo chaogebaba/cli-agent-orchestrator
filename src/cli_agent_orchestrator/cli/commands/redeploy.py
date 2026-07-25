@@ -11,7 +11,7 @@ from urllib.parse import quote
 import click
 import requests
 
-from cli_agent_orchestrator.constants import CAO_HOME_DIR, MCP_REQUEST_TIMEOUT
+from cli_agent_orchestrator.constants import MCP_REQUEST_TIMEOUT
 from cli_agent_orchestrator.services.verification_service import (
     DeploymentStatus,
     cli_deploy_root,
@@ -47,17 +47,17 @@ def _installable_profiles(workspace_root: Path) -> list[Path]:
     ]
 
 
-def _install_redeploy(source_root: Path) -> None:
+def _install_redeploy(source_root: Path, *, force_providers: bool = False) -> None:
     workspace_root = source_root.parent
     subprocess.run(
         ["uv", "tool", "install", "--force", "--python", "3.13", str(source_root)],
         check=True,
     )
-    providers_target = CAO_HOME_DIR / "providers.toml"
-    providers_target.parent.mkdir(parents=True, exist_ok=True)
-    if not providers_target.exists():
-        shutil.copyfile(workspace_root / "providers.toml.default", providers_target)
     cao = shutil.which("cao") or "cao"
+    reconcile_command = [cao, "config", "reconcile"]
+    if force_providers:
+        reconcile_command.append("--force-providers")
+    subprocess.run(reconcile_command, check=True)
     for profile in _installable_profiles(workspace_root):
         # cao install derives the provider from the profile's own frontmatter.
         subprocess.run([cao, "install", str(profile)], check=True)
@@ -139,12 +139,17 @@ def _print_deployment(
 
 @click.command()
 @click.option("--yes", is_flag=True, help="Restart without an interactive confirmation.")
-def redeploy(yes: bool) -> None:
+@click.option(
+    "--force-providers",
+    is_flag=True,
+    help="Back up and reset providers.toml from the workspace template.",
+)
+def redeploy(yes: bool, force_providers: bool) -> None:
     """Reinstall CAO, optionally restart its server, then verify deployment."""
     require_not_sandbox_mutation("redeploy")
     source_root = _redeploy_source_root()
     try:
-        _install_redeploy(source_root)
+        _install_redeploy(source_root, force_providers=force_providers)
     except (OSError, subprocess.CalledProcessError) as exc:
         raise click.ClickException(f"install failed: {exc}") from exc
 

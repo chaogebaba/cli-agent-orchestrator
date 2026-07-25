@@ -38,7 +38,6 @@ def _python_files() -> list[Path]:
     return sorted(SOURCE.rglob("*.py"))
 
 
-
 def _raw_tmux_argv_literal(argument: ast.AST) -> bool:
     return (
         isinstance(argument, (ast.List, ast.Tuple))
@@ -721,6 +720,9 @@ def test_each_local_mutation_command_is_fenced(
     redeploy_module = importlib.import_module("cli_agent_orchestrator.cli.commands.redeploy")
     install_module = importlib.import_module("cli_agent_orchestrator.cli.commands.install")
     config_module = importlib.import_module("cli_agent_orchestrator.cli.commands.config")
+    reconcile_module = importlib.import_module(
+        "cli_agent_orchestrator.cli.commands.config_reconcile"
+    )
     env_module = importlib.import_module("cli_agent_orchestrator.cli.commands.env")
     skills_module = importlib.import_module("cli_agent_orchestrator.cli.commands.skills")
 
@@ -732,6 +734,7 @@ def test_each_local_mutation_command_is_fenced(
     monkeypatch.setattr(install_module, "_copy_local_profile_to_store", bomb)
     monkeypatch.setattr(install_module, "install_agent", bomb)
     monkeypatch.setattr(config_module.ConfigService, "set", bomb)
+    monkeypatch.setattr(reconcile_module, "_reconcile_config", bomb)
     monkeypatch.setattr(env_module, "set_env_var", bomb)
     monkeypatch.setattr(env_module, "unset_env_var", bomb)
     monkeypatch.setattr(skills_module, "_install_skill_folder", bomb)
@@ -746,6 +749,7 @@ def test_each_local_mutation_command_is_fenced(
         ["redeploy", "--yes"],
         ["install", "developer"],
         ["config", "set", "memory.enabled", "true"],
+        ["config", "reconcile", "--force-providers"],
         ["env", "set", "SAFE_KEY", "value"],
         ["env", "unset", "SAFE_KEY"],
         ["profile", "create", "-t", "x", "-c", str(config), "-o", str(tmp_path)],
