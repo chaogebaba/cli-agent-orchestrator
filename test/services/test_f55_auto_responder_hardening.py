@@ -341,13 +341,28 @@ def test_delivery_lock_is_non_reentrant_but_clear_terminal_is_lock_free():
 
     engine = ar.AutoResponder()
     lock = get_delivery_lock("f55-lock-order")
+    clear_finished = threading.Event()
+
+    def clear_terminal():
+        engine.clear_terminal("f55-lock-order")
+        clear_finished.set()
+
     assert lock.acquire(blocking=False)
     try:
         assert not lock.acquire(blocking=False)
-        engine.clear_terminal("f55-lock-order")
-        assert engine._terminal_generation["f55-lock-order"] == 1
+        worker = REAL_THREAD(target=clear_terminal)
+        worker.start()
+        finished_without_delivery_lock = clear_finished.wait(0.5)
     finally:
         lock.release()
+    worker.join(1)
+
+    assert finished_without_delivery_lock, (
+        "clear_terminal blocked on the non-reentrant delivery lock; "
+        "the delete path would deadlock"
+    )
+    assert not worker.is_alive()
+    assert engine._terminal_generation["f55-lock-order"] == 1
 
 
 def test_incarnation_fence_rejects_rebound_and_coordinate_changes(monkeypatch):
@@ -364,7 +379,81 @@ def test_incarnation_fence_rejects_rebound_and_coordinate_changes(monkeypatch):
     current["lifecycle_generation"] -= 1
     current["tmux_window"] = "rebound-window"
     assert not engine._send_answer("term1", metadata, rule, incarnation)
+    current["tmux_window"] = metadata["tmux_window"]
+    current["tmux_session"] = "rebound-session"
+    assert not engine._send_answer("term1", metadata, rule, incarnation)
     backend.send_special_key.assert_not_called()
+
+
+def test_d4_a1_sequence_keeps_screen_barrier_at_sequence_start(monkeypatch):
+    class FrameStatusProvider:
+        def get_status_from_screen(self, lines):
+            return (
+                TerminalStatus.PROCESSING
+                if "processing" in ar.normalize_screen(lines)
+                else TerminalStatus.WAITING_USER_ANSWER
+            )
+
+    metadata = _metadata()
+    current = dict(metadata)
+    backend = _backend(["trust ok"])
+    sent_keys = []
+
+    def send_key(_session, _window, key):
+        sent_keys.append(key)
+        if key == "A":
+            backend.capture_viewport.return_value = "processing"
+
+    backend.send_special_key.side_effect = send_key
+    _wire(monkeypatch, current, backend)
+    monkeypatch.setattr(ar.threading, "Thread", MagicMock())
+    engine = ar.AutoResponder()
+    monkeypatch.setattr(engine, "_log", lambda *_args: None)
+    real_barrier = engine._effect_barrier
+    barrier_calls = 0
+
+    def counted_barrier(*args):
+        nonlocal barrier_calls
+        barrier_calls += 1
+        return real_barrier(*args)
+
+    monkeypatch.setattr(engine, "_effect_barrier", counted_barrier)
+    rule = ar.Rule("r", True, "contains", "trust", ["ok"], ["A", "B"])
+    incarnation = engine._snapshot_incarnation("term1", metadata)
+
+    assert engine._fire(
+        "term1",
+        metadata,
+        FrameStatusProvider(),
+        rule,
+        "trust ok",
+        ar._RuleState(),
+        incarnation,
+    )
+
+    assert sent_keys == ["A", "B"]
+    assert backend.capture_viewport.return_value == "processing"
+    assert barrier_calls == 1
+
+
+def test_d4_a1_sequence_rechecks_incarnation_before_each_key(monkeypatch):
+    metadata = _metadata()
+    current = dict(metadata)
+    backend = _backend(["trust ok"])
+
+    def rebind_after_first_key(_session, _window, key):
+        assert key == "A"
+        current["tmux_session"] = "rebound-session"
+
+    backend.send_special_key.side_effect = rebind_after_first_key
+    _wire(monkeypatch, current, backend)
+    monkeypatch.setattr(ar.time, "sleep", lambda _seconds: None)
+    engine = ar.AutoResponder()
+    rule = ar.Rule("r", True, "contains", "trust", ["ok"], ["A", "B"])
+    incarnation = engine._snapshot_incarnation("term1", metadata)
+
+    assert not engine._send_answer("term1", metadata, rule, incarnation)
+    backend.send_special_key.assert_called_once_with("cao-sess", "win", "A")
 
 
 def test_post_clear_push_and_retry_token_are_dropped(monkeypatch):
