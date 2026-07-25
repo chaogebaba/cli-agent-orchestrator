@@ -245,7 +245,32 @@ def test_root_installer_delegates_without_toml_or_stanza_parsing():
     assert "toml" not in contents.lower()
 
 
-def test_read_only_cao_home_aborts_before_live_mutation(reconcile_env):
+def test_backup_failure_aborts_before_atomic_publish(reconcile_env, monkeypatch):
+    target = reconcile_env["target"]
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b'[codex]\nmodel = "live"\n')
+    before = _digest(target)
+    publish_calls = []
+
+    def fail_backup(_target):
+        raise OSError("backup failed")
+
+    monkeypatch.setattr(command, "_write_backup", fail_backup)
+    monkeypatch.setattr(
+        command,
+        "_atomic_publish",
+        lambda *args, **kwargs: publish_calls.append((args, kwargs)),
+    )
+
+    result = CliRunner().invoke(cli, ["config", "reconcile", "--force-providers"])
+
+    assert result.exit_code != 0
+    assert "config reconcile failed: backup failed" in result.output
+    assert publish_calls == []
+    assert _digest(target) == before
+
+
+def test_read_only_cao_home_aborts_without_live_mutation(reconcile_env):
     target = reconcile_env["target"]
     target.parent.mkdir(parents=True)
     target.write_bytes(b'[codex]\nmodel = "live"\n')
@@ -258,7 +283,7 @@ def test_read_only_cao_home_aborts_before_live_mutation(reconcile_env):
     finally:
         target.parent.chmod(0o700)
 
-    assert result.exit_code != 0, "read-only CAO_HOME unexpectedly allowed a backup"
+    assert result.exit_code != 0
     assert _digest(target) == before
 
 
