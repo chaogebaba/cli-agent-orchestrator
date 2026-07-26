@@ -2364,6 +2364,7 @@ def delete_terminal_and_warm_intent(
 ) -> Dict[str, bool]:
     """Delete the terminal and, unless retained, its warm intent atomically."""
     with SessionLocal.begin() as db:
+        _close_owned_barriers_for_gone_terminal_in_db(db, terminal_id)
         _mark_barrier_member_gone_in_db(db, terminal_id)
         intent_deleted = False
         if not preserve_warm_intent:
@@ -3533,6 +3534,83 @@ def _render_callback_barrier(db: Any, barrier: Any, members: list[Any], fired_at
     return _truncate_barrier_message("\n".join(lines), message_ids)
 
 
+def _resolve_barrier_owner_or_none(db: Any, barrier: Any) -> tuple[str, str | None] | None:
+    """Address the barrier owner, or None when the owner no longer exists.
+
+    A barrier outlives the terminal that opened it, so the owner address is a
+    claim about a row that may already be gone. Returning None is the only
+    honest answer for a barrier whose combined callback has nowhere to land.
+    """
+    if barrier.owner_mailbox_id is not None:
+        mailbox = db.query(MailboxModel).filter_by(id=barrier.owner_mailbox_id).one_or_none()
+        if mailbox is None:
+            return None
+        return (str(mailbox.current_terminal_id or mailbox.id), str(mailbox.id))
+    owner_terminal_id = barrier.owner_terminal_id
+    exists = db.query(TerminalModel.id).filter(TerminalModel.id == owner_terminal_id).scalar()
+    if exists is None:
+        return None
+    return (str(owner_terminal_id), None)
+
+
+def _close_barrier_owner_gone_in_db(db: Any, barrier: Any, now: datetime) -> None:
+    """Close an OPEN barrier whose owner is gone, without minting a dead PENDING row.
+
+    Firing it would enqueue a combined callback addressed to a deleted receiver,
+    which `_stamp_enqueue_generation` refuses (correctly) by raising. The refusal
+    is not the bug; opening a barrier whose owner then vanished is.
+    """
+    changed = (
+        db.query(CallbackBarrierModel)
+        .filter(CallbackBarrierModel.id == barrier.id, CallbackBarrierModel.state == "OPEN")
+        .update(
+            {
+                CallbackBarrierModel.state: "CANCELLED",
+                CallbackBarrierModel.close_reason: "owner_gone",
+                CallbackBarrierModel.fired_at: now,
+            },
+            synchronize_session=False,
+        )
+    )
+    if changed != 1:
+        return
+    db.query(InboxModel).filter(
+        InboxModel.barrier_id == barrier.id,
+        InboxModel.status == MessageStatus.HELD.value,
+    ).update(
+        {
+            InboxModel.status: MessageStatus.CANCELLED.value,
+            InboxModel.failure_reason: "barrier_owner_gone",
+        },
+        synchronize_session=False,
+    )
+    logger.warning(
+        "callback_barrier_owner_gone barrier=%s label=%s owner_terminal=%s owner_mailbox=%s",
+        barrier.id,
+        barrier.label,
+        barrier.owner_terminal_id,
+        barrier.owner_mailbox_id,
+    )
+
+
+def _close_owned_barriers_for_gone_terminal_in_db(db: Any, terminal_id: str) -> list[int]:
+    """Close every OPEN barrier owned by a terminal that is being deleted."""
+    now = _barrier_now()
+    if now.tzinfo is not None:
+        now = now.astimezone(timezone.utc).replace(tzinfo=None)
+    barriers = (
+        db.query(CallbackBarrierModel)
+        .filter(
+            CallbackBarrierModel.state == "OPEN",
+            CallbackBarrierModel.owner_terminal_id == terminal_id,
+        )
+        .all()
+    )
+    for barrier in barriers:
+        _close_barrier_owner_gone_in_db(db, barrier, now)
+    return [int(barrier.id) for barrier in barriers]
+
+
 def _fire_open_barrier_in_db(
     db: Any,
     barrier: Any,
@@ -3545,6 +3623,10 @@ def _fire_open_barrier_in_db(
     now = now or _barrier_now()
     if now.tzinfo is not None:
         now = now.astimezone(timezone.utc).replace(tzinfo=None)
+    owner = _resolve_barrier_owner_or_none(db, barrier)
+    if owner is None:
+        _close_barrier_owner_gone_in_db(db, barrier, now)
+        return None
     changed = (
         db.query(CallbackBarrierModel)
         .filter(CallbackBarrierModel.id == barrier.id, CallbackBarrierModel.state == "OPEN")
@@ -3565,13 +3647,7 @@ def _fire_open_barrier_in_db(
         .order_by(CallbackBarrierMemberModel.position)
         .all()
     )
-    if barrier.owner_mailbox_id is not None:
-        mailbox = db.query(MailboxModel).filter_by(id=barrier.owner_mailbox_id).one()
-        receiver_id = mailbox.current_terminal_id or mailbox.id
-        logical_receiver_id = mailbox.id
-    else:
-        receiver_id = barrier.owner_terminal_id
-        logical_receiver_id = None
+    receiver_id, logical_receiver_id = owner
     row_fields = _stamp_enqueue_generation(
         db,
         {
@@ -3879,13 +3955,25 @@ def fire_due_barriers(now: datetime | None = None) -> list[int]:
             .all()
         )
         for barrier in due:
-            message_id = _fire_open_barrier_in_db(
-                db,
-                barrier,
-                state="FIRED_TIMEOUT",
-                close_reason="timeout",
-                now=now,
-            )
+            # One unfireable barrier must not wedge every other barrier forever.
+            # Without the savepoint a single raise aborts the whole sweep, and
+            # since the sweep is retried unchanged it would never fire again.
+            try:
+                with db.begin_nested():
+                    message_id = _fire_open_barrier_in_db(
+                        db,
+                        barrier,
+                        state="FIRED_TIMEOUT",
+                        close_reason="timeout",
+                        now=now,
+                    )
+            except Exception:
+                logger.exception(
+                    "callback_barrier_fire_failed barrier=%s label=%s",
+                    barrier.id,
+                    barrier.label,
+                )
+                continue
             if message_id is not None:
                 fired.append(message_id)
     return fired

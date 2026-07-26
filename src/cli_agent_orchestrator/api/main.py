@@ -747,7 +747,13 @@ async def lifespan(app: FastAPI):
     inbox_service.recover_stale_deliveries()
     adopt_mailbox_rows_at_startup()
     inbox_service.reconcile_pending_orphans()
-    await asyncio.to_thread(fire_due_barriers, datetime.now(timezone.utc))
+    # A barrier sweep is best-effort at startup: the daemon retries every poll,
+    # and no barrier is worth refusing to boot over. Fail-stop belongs to the
+    # parity gates above, which are about authority, not about one stale row.
+    try:
+        await asyncio.to_thread(fire_due_barriers, datetime.now(timezone.utc))
+    except Exception:
+        logger.exception("Startup callback barrier sweep failed; deferring to daemon")
     registry = PluginRegistry()
     await registry.load()
     app.state.plugin_registry = registry

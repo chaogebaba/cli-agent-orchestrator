@@ -225,3 +225,62 @@ class TestLifespanInboxWiring:
             # Assert (shutdown — after context exit): no herdr task was created.
             mocks.herdr_cls.assert_not_called()
             assert _find_task(tasks, mocks.herdr_cls.return_value.start.return_value) is None
+
+
+class TestLifespanBarrierSweepResilience:
+    """A stale callback barrier must never prevent the server from booting.
+
+    Live incident 2026-07-25: an OPEN barrier (`drill-r2-brainstorm`) outlived
+    its owner terminal `8494ddf1`. Every boot the startup sweep tried to enqueue
+    the combined callback to that deleted receiver, `_stamp_enqueue_generation`
+    raised `pending_receiver_generation_unavailable`, and the lifespan aborted:
+    `ERROR: Application startup failed. Exiting.` systemd restarted it 634 times
+    over two hours and `cao launch` failed with `Connection refused` on :9889 —
+    one orphaned DB row made the whole fleet unlaunchable.
+
+    Raw evidence:
+    probes/error-pane-samples/2026-07-25-cao-server-crashloop-barrier-owner-gone.txt
+
+    The barrier-side fix lives in `clients/database.py`; this pins the second
+    line of defence, which is what turns "server will not start" into "one
+    logged warning". Boot resilience is a SEPARATE property from barrier
+    correctness: any future raise in that sweep must also not brick startup.
+    """
+
+    @pytest.mark.asyncio
+    async def test_startup_barrier_sweep_failure_does_not_block_boot(self) -> None:
+        """Startup completes even when fire_due_barriers raises."""
+        # Arrange
+        tasks: list = []
+        backend = MagicMock()
+
+        # Act
+        with _patched_lifespan(backend, tasks) as mocks:
+            with patch(
+                "cli_agent_orchestrator.api.main.fire_due_barriers",
+                side_effect=ValueError("pending_receiver_generation_unavailable"),
+            ) as sweep:
+                async with lifespan(app):
+                    # Assert: the sweep was attempted and it did raise...
+                    sweep.assert_called_once()
+                    # ...and startup still got past it to the plugin registry.
+                    mocks.load.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_startup_barrier_sweep_still_runs_on_the_happy_path(self) -> None:
+        """The guard must not silently skip the sweep it is protecting.
+
+        Kills the mutant where boot resilience is 'achieved' by not sweeping.
+        """
+        # Arrange
+        tasks: list = []
+        backend = MagicMock()
+
+        # Act
+        with _patched_lifespan(backend, tasks):
+            with patch(
+                "cli_agent_orchestrator.api.main.fire_due_barriers", return_value=[]
+            ) as sweep:
+                async with lifespan(app):
+                    # Assert
+                    sweep.assert_called_once()

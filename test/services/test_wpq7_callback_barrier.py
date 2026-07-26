@@ -124,6 +124,55 @@ def _seed_mailbox_owner(sessions):
         )
 
 
+def _orphan_owner(sessions, owner_id: str = "owner"):
+    """Delete the owner terminal, leaving its OPEN barrier behind.
+
+    Reproduces the LIVE shape from the 2026-07-25 crash-loop rather than an
+    invented one: the barrier row, its members and its held callbacks all
+    survive; only the owner terminal row is gone. Nothing in the public API can
+    produce this state, which is precisely why no existing test reached it —
+    the orphan is made by the DELETE path, not by the barrier path.
+
+    Raw evidence:
+    probes/error-pane-samples/2026-07-25-cao-server-crashloop-barrier-owner-gone.txt
+    """
+    with sessions.begin() as db:
+        deleted = db.query(TerminalModel).filter_by(id=owner_id).delete()
+    assert deleted == 1, "fixture must actually orphan the barrier"
+
+
+@pytest.fixture
+def orphaned_barrier_db(barrier_db):
+    """A DB holding exactly the row shape that crash-looped cao-server 634 times.
+
+    OPEN barrier, overdue timeout, every member ARRIVED, callback still held,
+    owner terminal deleted. Any sweep-side change should be run against this.
+
+    Note the members are stamped ARRIVED *raw*. Arriving through the public API
+    would fire the barrier COMPLETE on the last arrival — yet the live barrier
+    had all three members ARRIVED and was still OPEN. That combination is the
+    separate never-fires defect (F71, GOLDEN-TIPS 2026-07-25); it is what left
+    an owner-gone barrier sitting in the sweep set for hours. The fixture
+    reproduces the state as found, not the state the API can reach.
+    """
+    _seed_raw(barrier_db)
+    _dispatch_pair("drill-r2-brainstorm")
+    create_inbox_message("worker-a", "owner", "answer a")
+    with barrier_db.begin() as db:
+        # Stamp the remaining member ARRIVED without firing, as F71 left it.
+        for member in db.query(CallbackBarrierMemberModel).all():
+            member.state = "ARRIVED"
+    with barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "OPEN", "precondition: barrier must still be open"
+        assert barrier.combined_message_id is None
+        members = db.query(CallbackBarrierMemberModel).all()
+        assert [m.state for m in members] == ["ARRIVED", "ARRIVED"]
+        assert db.query(InboxModel).filter_by(status=MessageStatus.HELD.value).count() == 1
+    _orphan_owner(barrier_db)
+    return barrier_db
+
+
 @pytest.mark.parametrize("member_count", [1, 3])
 @pytest.mark.parametrize("mailbox_owner", [False, True])
 def test_last_arrival_fires_immediately_in_both_autoflush_modes(
@@ -818,3 +867,123 @@ def test_concurrent_first_tag_creates_one_open_barrier_for_each_owner_form(
     with barrier_db() as db:
         assert db.query(CallbackBarrierModel).count() == 1
         assert db.query(CallbackBarrierMemberModel).count() == 2
+
+
+def test_owner_gone_barrier_closes_instead_of_bricking_the_sweep(orphaned_barrier_db):
+    """The exact live crash: sweeping an owner-gone barrier must close, not raise.
+
+    Incident 2026-07-25: barrier 5 (`drill-r2-brainstorm`) outlived owner
+    `8494ddf1`. The startup sweep tried to enqueue its combined callback to the
+    deleted receiver, `_stamp_enqueue_generation` raised
+    `pending_receiver_generation_unavailable`, and cao-server crash-looped 634
+    times over two hours — `cao launch` failed `Connection refused` on :9889 and
+    the fleet could not start at all.
+
+    Raw evidence:
+    probes/error-pane-samples/2026-07-25-cao-server-crashloop-barrier-owner-gone.txt
+    """
+    fired = fire_due_barriers(datetime.now(timezone.utc) + timedelta(hours=1))
+
+    assert fired == []
+    with orphaned_barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "CANCELLED"
+        assert barrier.close_reason == "owner_gone"
+        assert barrier.combined_message_id is None
+        # No PENDING row may be minted for the receiver that does not exist.
+        assert (
+            db.query(InboxModel)
+            .filter_by(status=MessageStatus.PENDING.value, receiver_id="owner")
+            .count()
+            == 0
+        )
+        # Held callbacks are closed with a named reason, never left dangling.
+        held = db.query(InboxModel).filter_by(barrier_id=barrier.id).one()
+        assert held.status == MessageStatus.CANCELLED.value
+        assert held.failure_reason == "barrier_owner_gone"
+
+
+def test_owner_gone_sweep_is_idempotent_across_reboots(orphaned_barrier_db):
+    """Repeated sweeps must stay quiet — the crash-loop swept the same row 634x.
+
+    A fix that closes the barrier but re-raises (or re-fires) on the next boot
+    would still brick the server, just more slowly.
+    """
+    first = fire_due_barriers(datetime.now(timezone.utc) + timedelta(hours=1))
+    second = fire_due_barriers(datetime.now(timezone.utc) + timedelta(hours=2))
+    third = fire_due_barriers(datetime.now(timezone.utc) + timedelta(hours=3))
+
+    assert first == second == third == []
+    with orphaned_barrier_db() as db:
+        assert db.query(CallbackBarrierModel).one().state == "CANCELLED"
+
+
+def test_owner_gone_mailbox_barrier_also_closes(barrier_db):
+    """Same defect through the mailbox-owner branch, not just the terminal branch.
+
+    `_fire_open_barrier_in_db` resolved a mailbox owner with `.one()`, which
+    raises `NoResultFound` on a deleted mailbox — a different exception, the same
+    unbootable outcome. Bug-family sweep, not a second incident.
+    """
+    _seed_raw(barrier_db)
+    _seed_mailbox_owner(barrier_db)
+    _dispatch_pair("mailbox-orphan")
+    with barrier_db.begin() as db:
+        assert db.query(MailboxModel).filter_by(id="mb_aaaaaaaa").delete() == 1
+
+    fired = fire_due_barriers(datetime.now(timezone.utc) + timedelta(hours=1))
+
+    assert fired == []
+    with barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "CANCELLED"
+        assert barrier.close_reason == "owner_gone"
+
+
+def test_deleting_owner_closes_its_open_barriers(barrier_db):
+    """Delete-side sweep: an owner's OPEN barriers close when the owner is deleted.
+
+    `_mark_barrier_member_gone_in_db` only ever handled barriers the terminal was
+    a MEMBER of. A supervisor is an OWNER, never a member, so deleting it left an
+    orphaned OPEN barrier behind — the state that bricked the server.
+    """
+    _seed_raw(barrier_db)
+    _dispatch_pair("owned")
+    with barrier_db() as db:
+        assert db.query(CallbackBarrierModel).one().state == "OPEN"
+
+    delete_terminal_and_warm_intent("owner")
+
+    with barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "CANCELLED"
+        assert barrier.close_reason == "owner_gone"
+    # And the sweep over the now-clean table is a no-op rather than a raise.
+    assert fire_due_barriers(datetime.now(timezone.utc) + timedelta(hours=1)) == []
+
+
+def test_one_unfireable_barrier_does_not_wedge_the_others(barrier_db, monkeypatch):
+    """Per-barrier savepoint: a raise on one barrier must not abort the sweep.
+
+    Without isolation a single bad row aborts the whole transaction, and since
+    the sweep is retried unchanged every poll, NO barrier would ever fire again.
+    """
+    _seed_raw(barrier_db)
+    _dispatch_pair("poison")
+    _dispatch_pair("healthy")
+
+    real = dbmod._fire_open_barrier_in_db
+
+    def explode(db, barrier, **kwargs):
+        if barrier.label == "poison":
+            raise ValueError("pending_receiver_generation_unavailable")
+        return real(db, barrier, **kwargs)
+
+    monkeypatch.setattr(dbmod, "_fire_open_barrier_in_db", explode)
+    fired = fire_due_barriers(datetime.now(timezone.utc) + timedelta(hours=1))
+
+    assert len(fired) == 1
+    with barrier_db() as db:
+        states = {row.label: row.state for row in db.query(CallbackBarrierModel).all()}
+    assert states["healthy"] == "FIRED_TIMEOUT"
+    assert states["poison"] == "OPEN"
