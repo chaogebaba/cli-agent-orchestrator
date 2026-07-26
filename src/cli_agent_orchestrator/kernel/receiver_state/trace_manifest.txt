@@ -1,6 +1,6 @@
-src/cli_agent_orchestrator/services/agent_step.py:373:snapshot_view
-src/cli_agent_orchestrator/services/agent_step.py:438:snapshot_view
-src/cli_agent_orchestrator/services/agent_step.py:457:snapshot_view
+src/cli_agent_orchestrator/services/agent_step.py:381:snapshot_view
+src/cli_agent_orchestrator/services/agent_step.py:446:snapshot_view
+src/cli_agent_orchestrator/services/agent_step.py:465:snapshot_view
 src/cli_agent_orchestrator/services/agent_step.py:76:snapshot_view
 src/cli_agent_orchestrator/services/auto_responder.py:526:force_status
 src/cli_agent_orchestrator/services/auto_responder.py:669:prove_terminal_identity
