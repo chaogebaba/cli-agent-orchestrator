@@ -851,3 +851,44 @@ def test_ac9e_a_rewritten_seal_is_tamper_evident() -> None:
             Proven(MemberAnswer(), by=Planted.LIVE)
     finally:
         observation._SEALED_PROOF_CLASS[(Planted, "LIVE")] = ProofClass.LIVENESS
+
+
+def test_ac9f_two_consistent_writes_defeat_admission_and_that_is_ACCEPTED() -> None:
+    """The boundary, pinned as a test so it cannot be quietly forgotten.
+
+    Tamper-evidence detects a SINGLE rewrite: the seal and the member's own
+    declaration disagree. It cannot detect a consistent PAIR of writes -- they
+    agree on a lie and there is nothing left to compare.
+
+    This asserts the limit rather than a defence, because the alternative was
+    measured and does not exist: splitting arrival and liveness into separate
+    enum classes removes the tag field but trades this attack for `__class__`
+    reassignment plus a `_member_map_` fix-up. Two writes beat both shapes.
+    Evidence: `probes/f84-typebound-2026-07-27/SUPERVISOR-agreeing-lie.md`.
+
+    **The threat model is ACCIDENT, not ADVERSARY.** Code that can write
+    `_SEALED_PROOF_CLASS` can also rebind `Proven`. If this test ever starts
+    FAILING, someone has found a cheaper defence than we could -- read the probe
+    memo before assuming the new check is sound.
+    """
+
+    class Agreeing(TaggedProof):
+        LIVE = ("agreeing-lie", ProofClass.LIVENESS)
+
+    observation._SEALED_PROOF_CLASS[(Agreeing, "LIVE")] = ProofClass.ARRIVAL
+    object.__setattr__(Agreeing.LIVE, "_proof_class", ProofClass.ARRIVAL)
+    try:
+        admitted = Proven(MemberAnswer(), by=Agreeing.LIVE)
+        assert admitted.by is Agreeing.LIVE  # ADMITTED -- the accepted limit
+    finally:
+        observation._SEALED_PROOF_CLASS[(Agreeing, "LIVE")] = ProofClass.LIVENESS
+        object.__setattr__(Agreeing.LIVE, "_proof_class", ProofClass.LIVENESS)
+
+    # And the single-sided write it DOES catch, asserted alongside so the
+    # difference between the two is the thing under test.
+    observation._SEALED_PROOF_CLASS[(Agreeing, "LIVE")] = ProofClass.ARRIVAL
+    try:
+        with pytest.raises(ValueError, match="disagrees with its declaration"):
+            Proven(MemberAnswer(), by=Agreeing.LIVE)
+    finally:
+        observation._SEALED_PROOF_CLASS[(Agreeing, "LIVE")] = ProofClass.LIVENESS

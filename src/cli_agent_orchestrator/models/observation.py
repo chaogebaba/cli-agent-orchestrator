@@ -185,7 +185,26 @@ _SEALED_PROOF_CLASS: dict[tuple[type, str], ProofClass] = {}
 
 
 def _sealed_proof_class(member: ProofMember) -> ProofClass:
-    """Return the tag recorded when `member` was created, never a live read.
+    """Return the tag sealed at DECLARATION, never a live read.
+
+    **THE THREAT MODEL IS ACCIDENT, NOT ADVERSARY** (supervisor, after r3;
+    measured in `probes/f84-typebound-2026-07-27/SUPERVISOR-agreeing-lie.md`).
+    What these checks stop is an adopter that declares a liveness proof and uses
+    it where arrival is required -- a mistake made by code trying to be correct,
+    which is the F84 defect at this seat.
+
+    They do NOT stop a caller that writes `_SEALED_PROOF_CLASS` and the member's
+    `_proof_class` TOGETHER: two consistent writes agree on a lie and admission
+    has nothing left to compare. Verified, along with the alternative shape
+    (splitting arrival and liveness into separate enum classes), which trades
+    this two-write attack for `__class__` reassignment plus a `_member_map_`
+    fix-up -- differently shaped, not stronger.
+
+    Code that can write module-private state can also rebind `Proven` itself, so
+    no check here could survive it. **The honest claim is that a liveness proof
+    cannot reach `Proven` by ACCIDENT or by ORDINARY EXTENSION -- not that it
+    cannot reach `Proven`.** Stating the boundary is the point; a guard that
+    implies more than it defends is the overclaim R14-E89 already cost us.
 
     Two things are checked before the tag is read, because a tag read from the
     wrong object is worse than no tag:
