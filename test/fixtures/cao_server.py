@@ -50,6 +50,7 @@ import importlib
 import json
 import os
 import pkgutil
+import shutil
 import signal
 import socket
 import socketserver
@@ -183,6 +184,17 @@ def _subprocess_env(
     env = os.environ.copy()
     for leaked in ("AUTH0_DOMAIN", "AUTH0_AUDIENCE", "CAO_AUTH_JWKS_URI"):
         env.pop(leaked, None)
+
+    # CAO_HOME_DIR OUTRANKS the HOME redirect below: constants.py reads it
+    # first and only falls back to $HOME/.aws/... when it is unset. test/
+    # conftest.py exports it (pointing at a cao-pytest-* tmp dir) to keep the
+    # suite off the production DB, and subprocess env is inherited -- so the
+    # child ignored home_dir entirely and wrote its logs under conftest's dir.
+    # That is what made test_home_isolated fail. CAO_HOME is the pre-2026-07-27
+    # spelling of the same var; strip both so stale exporters cannot resurrect
+    # the bug. Pre-existing, found while absorbing upstream ccbb8160.
+    for home_override in ("CAO_HOME_DIR", "CAO_HOME"):
+        env.pop(home_override, None)
 
     env.update(
         {
@@ -332,6 +344,11 @@ class _JWKSServer:
         if self.port == 0:
             raise RuntimeError("JWKS server has not been started")
         return f"http://{self._host}:{self.port}{self._JWKS_PATH}"
+
+
+# Provider name -> the executable that must exist on PATH before we are
+# willing to boot it. Only needed where the two differ.
+_PROVIDER_BINARIES = {"kiro_cli": "kiro-cli", "claude_code": "claude", "codex": "codex"}
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +564,24 @@ def cao_terminal(
     provider = params.get("provider", "kiro_cli")
     profile = params.get("agent_profile", "developer")
     session_name = f"caotest-{uuid.uuid4().hex[:12]}"
+
+    # PRE-FLIGHT, before POST /sessions. Booting a real provider CLI that is
+    # installed but unauthenticated makes it start its OWN login flow -- kiro
+    # opens a browser at the developer's real account (observed 2026-07-27:
+    # an `-m "e2e or slow"` run popped Firefox asking the user to log in to
+    # kiro). The 5xx skip below is too late: by the time the API answers, the
+    # browser is already open. A consuming test's own shutil.which() guard is
+    # also too late -- fixtures resolve before the test body runs.
+    #
+    # Same gate every other live-provider test uses (see
+    # test/providers/test_kiro_cli_integration.py).
+    if os.environ.get("CAO_RUN_LIVE_PROVIDER_TESTS", "") != "1":
+        pytest.skip(
+            f"cao_terminal boots the real {provider!r} CLI, which may start an "
+            "interactive login. Set CAO_RUN_LIVE_PROVIDER_TESTS=1 to enable."
+        )
+    if shutil.which(_PROVIDER_BINARIES.get(provider, provider)) is None:
+        pytest.skip(f"provider CLI for {provider!r} is not on PATH")
 
     resp = requests.post(
         f"{cao_server.url}/sessions",

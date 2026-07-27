@@ -13,6 +13,7 @@ module top.
 Run with: uv run pytest -m e2e test/e2e/ -v
 """
 
+import os
 import shutil
 import time
 from test.fixtures.cao_server import CaoServer, _patch_api_base_url_for_e2e
@@ -29,6 +30,32 @@ def pytest_collection_modifyitems(items):
         path = str(item.path)
         if "/test/e2e/" in path and "/test/e2e/script_runner/" not in path:
             item.add_marker(pytest.mark.live)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def require_live_provider_opt_in():
+    """Refuse to boot real provider CLIs unless the developer opted in.
+
+    Every test under test/e2e/ drives REAL provider binaries through a real
+    cao-server (see _create_terminal_with_tools -> POST {API_BASE_URL}/sessions
+    in test_allowed_tools.py:112 and its siblings). The per-provider
+    ``require_*`` fixtures below only check the binary is ON PATH -- an
+    installed-but-UNAUTHENTICATED CLI passes that check and then starts its own
+    interactive login. Observed twice on 2026-07-27: an `-m "e2e or slow"` run
+    opened Firefox asking the developer to log in to their real kiro account.
+
+    Being on PATH is not consent to use someone's credentials. This is the same
+    gate the live provider tests already use
+    (test/providers/test_kiro_cli_integration.py:45-48); test/e2e/ simply never
+    adopted it. Autouse + session scope so it fires before any provider starts,
+    for every file in this tree at once.
+    """
+    if os.environ.get("CAO_RUN_LIVE_PROVIDER_TESTS", "") != "1":
+        pytest.skip(
+            "Live provider E2E disabled: these tests launch real provider CLIs "
+            "and an unauthenticated one will open an interactive login. "
+            "Set CAO_RUN_LIVE_PROVIDER_TESTS=1 to enable."
+        )
 
 
 @pytest.fixture(scope="session", autouse=True)
