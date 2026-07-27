@@ -113,6 +113,12 @@ BARRIER_AGGREGATE: AggregateSpec[Complete, BarrierProof, BarrierReason] = Aggreg
     empty=Unobservable("roster_unobservable", retry_after=BARRIER_RETRY),
 )
 
+# ⚠ EMPIRICAL r2: the digest ADOPTER no longer folds -- it selects over an
+# ordered cause list, because one `unobserved_reason` cannot carry both
+# `apparatus_unavailable` and `unhashable_entry`. This spec stays because it is
+# a SECOND spec for grading `fold()` itself: it proves the `empty` disposition
+# is per-adopter and not a property of the function. Do not read it as the
+# digest seat's contract.
 COVERAGE_AGGREGATE: AggregateSpec[Covered, CoverageProof, CoverageReason] = AggregateSpec(
     value=Covered(),
     proven_by=CoverageProof.ENTRIES_MATCH,
