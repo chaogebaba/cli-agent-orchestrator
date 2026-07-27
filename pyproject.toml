@@ -3,7 +3,7 @@ name = "cli-agent-orchestrator"
 version = "2.3.0"
 description = "CLI Agent Orchestrator"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 license = "Apache-2.0"
 authors = [
     { name = "AWS Labs" },
@@ -14,10 +14,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries",
 ]
@@ -51,11 +47,7 @@ dependencies = [
     "pyyaml>=6.0",
     # Markdown parser used by the repository-local link validator.
     "markdown-it-py>=4.0.0",
-    # `cao update` reads uv's install receipt (TOML). tomllib is stdlib on 3.11+;
-    # on 3.10 the fallback `import tomli` runs. cli/main.py imports the update
-    # command unconditionally, so tomli must be a RUNTIME dependency on 3.10 —
     # not just a dev dependency — or every `cao` command would fail to import.
-    "tomli>=2.0.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
@@ -123,7 +115,6 @@ dev = [
     "pytest-xdist>=3.8.0",
     "hypothesis>=6.0",
     "networkx>=3.0",
-    "tomli>=2.0.0; python_version < '3.11'",
     # JWT/JWKS test fixtures (test/fixtures/jwt_factory.py) mint RS256 tokens
     # with authlib; runtime verification needs only pyjwt[crypto].
     "authlib>=1.7.1",
@@ -131,6 +122,12 @@ dev = [
 
 [tool.black]
 line-length = 100
+# Deliberately BELOW the >=3.14 floor: at py314 black rewrites `except (A, B):`
+# into PEP 758's unparenthesized `except A, B:` across 42 upstream-tracked
+# files. That is a formatting preference, not a capability -- every 3.14
+# runtime feature is available regardless -- and the churn would multiply
+# merge conflicts with awslabs upstream for no functional gain.
+# (User ruling 2026-07-27, during the 3.14 upgrade.)
 target-version = ['py310']
 
 [tool.isort]
@@ -138,7 +135,7 @@ profile = "black"
 line_length = 100
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.14"
 strict = true
 warn_return_any = true
 warn_unused_configs = true

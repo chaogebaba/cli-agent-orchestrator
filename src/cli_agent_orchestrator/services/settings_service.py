@@ -4,13 +4,9 @@ import json
 import logging
 import math
 import os
+import tomllib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
-
-try:
-    import tomllib
-except ImportError:  # pragma: no cover - exercised on Python 3.10
-    import tomli as tomllib  # type: ignore[import-not-found]
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.utils.paths import normalized_path
@@ -310,7 +306,7 @@ def get_server_settings() -> Dict[str, Any]:
                 if not math.isfinite(parsed) or not 1.0 <= parsed <= 600.0:
                     raise ValueError
                 result[key] = parsed
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 logger.warning("Invalid %s=%r; using default 60.0", env_name, raw)
                 result[key] = 60.0
         elif raw is not None and raw.strip() != "":

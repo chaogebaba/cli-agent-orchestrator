@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import os
-import sys
+import tomllib as toml
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from importlib import resources
@@ -12,11 +12,6 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import click
-
-if sys.version_info >= (3, 11):
-    import tomllib as toml
-else:  # pragma: no cover - exercised on Python 3.10
-    import tomli as toml  # type: ignore[import-not-found]
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.services.settings_service import (
@@ -51,7 +46,7 @@ def _load_live(target: Path) -> tuple[dict[str, Any] | None, str | None]:
         return None, "missing"
     try:
         return toml.loads(target.read_text(encoding="utf-8")), None
-    except (OSError, UnicodeDecodeError, toml.TOMLDecodeError):
+    except OSError, UnicodeDecodeError, toml.TOMLDecodeError:
         return None, "invalid"
 
 

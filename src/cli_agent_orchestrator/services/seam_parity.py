@@ -9,16 +9,12 @@ import logging
 import os
 import threading
 import time
+import tomllib
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Mapping, TypeAlias, cast
-
-try:
-    import tomllib
-except ImportError:  # pragma: no cover - exercised on Python 3.10
-    import tomli as tomllib  # type: ignore[no-redef]
 
 from sqlalchemy import select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert

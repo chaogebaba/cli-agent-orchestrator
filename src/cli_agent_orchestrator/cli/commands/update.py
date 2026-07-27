@@ -3,15 +3,11 @@
 import shlex
 import shutil
 import subprocess
+import tomllib
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import click
-
-try:  # Python 3.11+
-    import tomllib
-except ModuleNotFoundError:  # Python 3.10 — tomli is a declared dependency there
-    import tomli as tomllib  # type: ignore[no-redef]
 
 # The uv tool package name CAO is installed under.
 _PACKAGE = "cli-agent-orchestrator"
@@ -39,7 +35,7 @@ def _receipt_path() -> Optional[Path]:
         return None
     try:
         out = subprocess.run(["uv", "tool", "dir"], capture_output=True, text=True, check=True)
-    except (OSError, subprocess.CalledProcessError):
+    except OSError, subprocess.CalledProcessError:
         return None
     tools_dir = out.stdout.strip()
     if not tools_dir:
@@ -58,7 +54,7 @@ def _cao_requirement(receipt: Path) -> Optional[dict]:
     """
     try:
         data = tomllib.loads(receipt.read_text())
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return None
     # tomllib always returns a dict at the root, so `data` is a mapping here.
     tool = data.get("tool")
