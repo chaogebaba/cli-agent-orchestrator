@@ -297,11 +297,33 @@ def classify_permanently_d2_only(attempt: dict, current_observation_epoch: str |
     return "epoch_mismatch" if epoch != current_observation_epoch else "normal"
 
 
+# WP-F44 required `receiver_status_at_settle == "processing"`. That came from
+# the fixture the WP was built on -- a BUSY grok_tester, still mid-turn at settle
+# -- and encodes the fixture's shape rather than a safety requirement.
+#
+# Measured 2026-07-27: of five ambiguous attempts in 24h, THREE had a stable
+# inode and real transcript growth (+813, +1058, +8969 bytes) and were refused
+# on status alone, because the receiver had reached COMPLETED. One of them also
+# carried queue corroboration. They were redelivered; the worker saw each brief
+# twice.
+#
+# `COMPLETED` means the receiver FINISHED a turn. For "did the payload land",
+# a turn that started and finished while the transcript grew is not weaker
+# evidence than one still running -- the growth is the same evidence, observed
+# slightly later. The original gate excluded its own best case.
+#
+# What is deliberately NOT admitted: IDLE and UNKNOWN. Growth on an idle
+# receiver is not attributable to this payload, and UNKNOWN is the sampler's
+# own failure -- WP-F44's ruling that "unknown -> False" stands, and is the
+# reason this is a closed set rather than a `!= IDLE` negation.
+_EXECUTING_AT_SETTLE = frozenset({TerminalStatus.PROCESSING.value, TerminalStatus.COMPLETED.value})
+
+
 def is_probable_delivered(evidence: dict) -> bool:
     """Classify execution evidence without filesystem or service dependencies."""
     if not isinstance(evidence, dict):
         return False
-    if evidence.get("receiver_status_at_settle") != TerminalStatus.PROCESSING.value:
+    if evidence.get("receiver_status_at_settle") not in _EXECUTING_AT_SETTLE:
         return False
     growth = evidence.get("transcript_growth")
     if not isinstance(growth, dict) or growth.get("inode_stable") is not True:

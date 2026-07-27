@@ -634,3 +634,66 @@ def test_t5a_outer_template_documents_commented_inbox_default():
     content = template.read_text(encoding="utf-8")
     assert "# [inbox]" in content
     assert "# confirmation_timeout_seconds = 10.0" in content
+
+
+@pytest.mark.parametrize(
+    "status_at_settle,expected",
+    [
+        ("processing", True),
+        # 2026-07-27: the case WP-F44 excluded and should not have. A turn that
+        # started AND FINISHED while the transcript grew is not weaker evidence
+        # that the payload landed -- it is the same growth, observed later.
+        ("completed", True),
+        # Still refused, and these are why the gate is a closed SET rather than
+        # `!= idle`: growth on an idle receiver is not attributable to this
+        # payload, and "unknown" is the sampler's own failure, which WP-F44
+        # ruled must never be read as evidence.
+        ("idle", False),
+        ("unknown", False),
+        ("error", False),
+        ("waiting_user_answer", False),
+        ("render_uncertain", False),
+    ],
+)
+def test_f44b_execution_gate_admits_only_executing_statuses(status_at_settle, expected):
+    """The status gate, pinned in BOTH directions.
+
+    Nothing pinned the `completed` exclusion, which is why widening the gate was
+    silent -- the whole F44 suite stayed green either way. A restriction nothing
+    asserts is a restriction nobody can safely change, in either direction.
+    """
+    evidence = {**_qualifying_evidence(), "receiver_status_at_settle": status_at_settle}
+    assert inbox_module.is_probable_delivered(evidence) is expected
+
+
+def test_f44b_growth_is_still_required_at_every_admitted_status():
+    """Widening the STATUS gate must not weaken the GROWTH requirement.
+
+    The risk in admitting `completed` is that it is the commonest terminal
+    status, so it is the one most likely to co-occur with an unrelated attempt.
+    Growth and inode stability carry the actual evidence; status only says the
+    receiver was executing. Both admitted statuses are asserted so a later edit
+    cannot drop the growth check for just one of them.
+    """
+    for status in ("processing", "completed"):
+        no_growth = {
+            **_qualifying_evidence(),
+            "receiver_status_at_settle": status,
+            "transcript_growth": {
+                "size_at_open": 500000,
+                "size_at_settle": 500000,
+                "inode_stable": True,
+            },
+        }
+        assert inbox_module.is_probable_delivered(no_growth) is False
+
+        rotated = {
+            **_qualifying_evidence(),
+            "receiver_status_at_settle": status,
+            "transcript_growth": {
+                "size_at_open": 500000,
+                "size_at_settle": 500001,
+                "inode_stable": False,
+            },
+        }
+        assert inbox_module.is_probable_delivered(rotated) is False
