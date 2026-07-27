@@ -198,8 +198,22 @@ def _sealed_proof_class(member: ProofMember) -> ProofClass:
     A member failing either did not come from a `TaggedProof` declaration and
     has no admission record, so it cannot establish `Proven`.
     """
+    owner = type(member)
+    # EMPIRICAL r3 B1: the owner's metaclass must be EXACTLY `TaggedProofMeta`.
+    # A metaclass SUBCLASS can call `super().__new__` -- letting the seal be
+    # written -- and then rewrite it, which r3 demonstrated. It can also shadow
+    # `__members__` so the canonical-membership check below reads a map the
+    # attacker supplies. Neither is reachable without declaring a metaclass, so
+    # requiring the exact one closes both, and closes every future variation on
+    # "extend the metaclass" without needing to enumerate them.
+    if type(owner) is not TaggedProofMeta:  # type: ignore[comparison-overlap]
+        raise ValueError(
+            f"{member!r} belongs to {owner.__name__}, whose metaclass is "
+            f"{type(owner).__name__} and not TaggedProofMeta; only enums declared "
+            "by TaggedProofMeta itself can establish Proven"
+        )
     try:
-        canonical = type(member).__members__[member.name]  # type: ignore[attr-defined]
+        canonical = owner.__members__[member.name]
     except (AttributeError, KeyError, TypeError):
         raise ValueError(
             f"{member!r} is not a member of a proof enum; only members declared "
@@ -207,11 +221,26 @@ def _sealed_proof_class(member: ProofMember) -> ProofClass:
         ) from None
     if canonical is not member:
         raise ValueError(
-            f"{member!r} is not the canonical member of {type(member).__name__} "
+            f"{member!r} is not the canonical member of {owner.__name__} "
             "under its own name; an alias cannot establish Proven"
         )
+    # EMPIRICAL r3 B1: the seal must still AGREE with the declaration it was
+    # taken from. A direct write to the module-private dict is the one route
+    # that needs no metaclass -- but it can only change the RECORD, not the
+    # member's own declared tag, so comparing the two makes the write
+    # tamper-EVIDENT. This is deliberately not a claim that in-process memory is
+    # a security boundary; it is the F84 claim, that a guard must not authorize
+    # on a single mutable reading of the thing it is guarding.
+    declared = getattr(member, "_proof_class", None)
+    sealed_now = _SEALED_PROOF_CLASS.get((owner, member.name))
+    if sealed_now is not None and declared is not None and sealed_now is not declared:
+        raise ValueError(
+            f"{member!r} has a sealed proof class ({sealed_now}) that disagrees "
+            f"with its declaration ({declared}); the admission record was "
+            "rewritten after the class was created"
+        )
     try:
-        sealed = _SEALED_PROOF_CLASS[(type(member), member.name)]  # type: ignore[attr-defined]
+        sealed = _SEALED_PROOF_CLASS[(type(member), member.name)]
     except KeyError:
         raise ValueError(
             f"{member!r} carries no sealed proof class; only members declared by "

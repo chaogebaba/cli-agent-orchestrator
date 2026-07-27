@@ -28,6 +28,7 @@ from cli_agent_orchestrator.models.observation import (
     Proven,
     SettlementOutcome,
     TaggedProof,
+    TaggedProofMeta,
     Unobservable,
     fold,
 )
@@ -274,7 +275,10 @@ def test_ac9b_mutating_the_stored_tag_cannot_forge_admission() -> None:
         MEMBER = ("mutable", ProofClass.LIVENESS)
 
     MutableProof.MEMBER._proof_class = ProofClass.ARRIVAL
-    with pytest.raises(ValueError, match="only ARRIVAL-class"):
+    # r3 B1: the seal still reads LIVENESS, so the DISAGREEMENT is now the
+    # finding -- a better message than "wrong class", because it names the
+    # tampering rather than only its effect.
+    with pytest.raises(ValueError, match="disagrees with its declaration"):
         Proven(MemberAnswer(), by=MutableProof.MEMBER)
 
 
@@ -292,7 +296,9 @@ def test_ac9b_a_member_with_no_sealed_tag_is_refused() -> None:
     # EMPIRICAL r2: refused one check EARLIER than it used to be. It is not a
     # member of any proof enum, so admission stops before any tag is read --
     # reading a tag off an object of unknown provenance is the mistake.
-    with pytest.raises(ValueError, match="not a member of a proof enum"):
+    # r3 B1: refused a step earlier still -- its metaclass is `type`, so it was
+    # never declared by TaggedProofMeta at all.
+    with pytest.raises(ValueError, match="metaclass is type"):
         Proven(MemberAnswer(), by=Impostor())
 
 
@@ -355,7 +361,9 @@ def test_ac9c_mutating_proof_class_cannot_reach_the_sealed_tag() -> None:
 
     MutableProof.LIVE._proof_class = ProofClass.ARRIVAL  # type: ignore[misc]
     assert MutableProof.LIVE.proof_class is ProofClass.ARRIVAL  # the LIE
-    with pytest.raises(ValueError, match="only ARRIVAL-class"):
+    # r3 B1: now refused as TAMPER-EVIDENT rather than merely out-classed --
+    # the seal still says LIVENESS, so the disagreement itself is the finding.
+    with pytest.raises(ValueError, match="disagrees with its declaration"):
         Proven(MemberAnswer(), by=MutableProof.LIVE)
 
 
@@ -372,7 +380,10 @@ def test_ac9c_a_planted_sealed_value_is_refused() -> None:
     class PlantedProof(TaggedProof):
         LIVE = ("planted", ProofClass.LIVENESS)
 
+    # Declaration rewritten to match, so the isinstance branch decides rather
+    # than tamper-evidence (r3 B1).
     observation._SEALED_PROOF_CLASS[(PlantedProof, "LIVE")] = "forged"  # type: ignore[index]
+    object.__setattr__(PlantedProof.LIVE, "_proof_class", "forged")
     try:
         with pytest.raises(ValueError, match="not a ProofClass"):
             Proven(MemberAnswer(), by=PlantedProof.LIVE)
@@ -415,7 +426,12 @@ def test_ac9c_admission_admits_only_arrival_it_does_not_refuse_liveness() -> Non
     # And the real enum is untouched -- this constructs, it does not mutate.
     assert [m.name for m in ProofClass] == ["ARRIVAL", "LIVENESS"]
 
+    # Both the seal AND the declaration are set, so the tamper-evidence check
+    # (r3 B1) agrees and the ADMISSION branch is what decides -- otherwise this
+    # test passes on tamper-evidence and R09 goes unreachable for the third
+    # time. Models a member whose declared class is genuinely the third one.
     observation._SEALED_PROOF_CLASS[(R09Proof, "LIVE")] = third
+    object.__setattr__(R09Proof.LIVE, "_proof_class", third)
     try:
         with pytest.raises(ValueError, match="only ARRIVAL-class"):
             Proven(MemberAnswer(), by=R09Proof.LIVE)
@@ -746,8 +762,7 @@ def test_ac9d_the_type_checker_rejects_a_liveness_member() -> None:
     import sys
     import tempfile
 
-    source = textwrap.dedent(
-        """
+    source = textwrap.dedent("""
         from typing import Literal
         from cli_agent_orchestrator.models.observation import (
             ProofClass, Proven, TaggedProof,
@@ -763,8 +778,7 @@ def test_ac9d_the_type_checker_rejects_a_liveness_member() -> None:
 
         ok: Proven[Subject, ArrivalOnly, str] = Proven(Subject(), by=Kind.ARRIVED)
         bad: Proven[Subject, ArrivalOnly, str] = Proven(Subject(), by=Kind.LIVE)
-        """
-    )
+        """)
     with tempfile.TemporaryDirectory() as tmp:
         probe = pathlib.Path(tmp) / "probe.py"
         probe.write_text(source, encoding="utf-8")
@@ -783,3 +797,57 @@ def test_ac9d_the_type_checker_rejects_a_liveness_member() -> None:
     assert "Literal[Kind.LIVE]" in out, f"the LIVENESS member was not rejected:\n{out}"
     assert "Literal[Kind.ARRIVED]" in out, f"expected the arrival type as expected:\n{out}"
     assert "Found 1 error" in out, f"exactly one error expected; got:\n{out}"
+
+
+def test_ac9e_a_metaclass_subclass_cannot_declare_a_proof_enum() -> None:
+    """EMPIRICAL r3 B1, route 2: `super().__new__` then rewrite the seal.
+
+    A `TaggedProofMeta` SUBCLASS gets the base metaclass to seal the correct
+    tags and then overwrites them -- and, separately, can shadow `__members__`
+    so the canonical-membership check reads a map it supplies. Both are ordinary
+    Python, not exotic. Requiring the EXACT metaclass closes them together, and
+    closes future variations without enumerating them.
+    """
+
+    class Extended(TaggedProofMeta):
+        def __new__(
+            mcls, name: str, bases: tuple[type, ...], namespace: object, **kwargs: object
+        ) -> "Extended":
+            cls = super().__new__(mcls, name, bases, namespace, **kwargs)  # type: ignore[arg-type]
+            for key in list(observation._SEALED_PROOF_CLASS):
+                if key[0] is cls:
+                    observation._SEALED_PROOF_CLASS[key] = ProofClass.ARRIVAL
+            return cls  # type: ignore[return-value]
+
+    class Subverted(TaggedProof, metaclass=Extended):
+        LIVE = ("subverted-live", ProofClass.LIVENESS)
+
+    # The seal itself was successfully rewritten -- the defence is not that the
+    # write failed, but that the declaring metaclass is no longer the trusted one.
+    assert observation._SEALED_PROOF_CLASS[(Subverted, "LIVE")] is ProofClass.ARRIVAL
+    with pytest.raises(ValueError, match="not TaggedProofMeta"):
+        Proven(MemberAnswer(), by=Subverted.LIVE)
+
+
+def test_ac9e_a_rewritten_seal_is_tamper_evident() -> None:
+    """EMPIRICAL r3 B1, route 1: a direct write to the module-private registry.
+
+    This is the one route needing no metaclass. It cannot be PREVENTED -- a
+    module-private dict is private by convention -- but it can be made
+    detectable, because the write changes the RECORD while the member's own
+    declaration still says what it was declared to say. Admission compares them.
+
+    This is deliberately not a claim that in-process memory is a security
+    boundary. It is F84's claim: a guard must not authorize on a single mutable
+    reading of the thing it is guarding.
+    """
+
+    class Planted(TaggedProof):
+        LIVE = ("planted-live", ProofClass.LIVENESS)
+
+    observation._SEALED_PROOF_CLASS[(Planted, "LIVE")] = ProofClass.ARRIVAL
+    try:
+        with pytest.raises(ValueError, match="disagrees with its declaration"):
+            Proven(MemberAnswer(), by=Planted.LIVE)
+    finally:
+        observation._SEALED_PROOF_CLASS[(Planted, "LIVE")] = ProofClass.LIVENESS
