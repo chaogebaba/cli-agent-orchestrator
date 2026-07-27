@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import time
+import tomllib
 from pathlib import Path
 from urllib.parse import quote
 
@@ -47,10 +49,40 @@ def _installable_profiles(workspace_root: Path) -> list[Path]:
     ]
 
 
+def _install_python_version(source_root: Path) -> str:
+    """Derive the interpreter to install under from the package's own floor.
+
+    This used to be the literal "3.13" while `install.sh` said 3.14, so raising
+    the floor to >=3.14 made `cao redeploy` resolve an interpreter its own
+    package rejects:
+
+        Because the current Python version (3.13.14) does not satisfy
+        Python>=3.14 ... your requirements are unsatisfiable
+
+    A hardcoded version in the installer is a SECOND copy of the floor that
+    nothing keeps in step with the first. Reading `requires-python` means the
+    two cannot disagree: there is only one floor now, and this asks it.
+    """
+    pyproject = (source_root / "pyproject.toml").read_text(encoding="utf-8")
+    requires = tomllib.loads(pyproject)["project"]["requires-python"]
+    match = re.search(r"(\d+)\.(\d+)", requires)
+    if match is None:
+        raise ValueError(f"cannot derive an interpreter from requires-python = {requires!r}")
+    return f"{match.group(1)}.{match.group(2)}"
+
+
 def _install_redeploy(source_root: Path, *, force_providers: bool = False) -> None:
     workspace_root = source_root.parent
     subprocess.run(
-        ["uv", "tool", "install", "--force", "--python", "3.13", str(source_root)],
+        [
+            "uv",
+            "tool",
+            "install",
+            "--force",
+            "--python",
+            _install_python_version(source_root),
+            str(source_root),
+        ],
         check=True,
     )
     cao = shutil.which("cao") or "cao"

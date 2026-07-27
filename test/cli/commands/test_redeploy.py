@@ -1,5 +1,8 @@
 """Mock-only acceptance tests for the human-operated redeploy command."""
 
+import re
+import tomllib
+from pathlib import Path
 from unittest.mock import patch
 
 from click.testing import CliRunner
@@ -188,6 +191,9 @@ def test_e4_install_mechanics_match_workspace_script(tmp_path):
     }
     for profile, content in profile_contents.items():
         (profiles / profile).write_text(content, encoding="utf-8")
+    (source / "pyproject.toml").write_text(
+        '[project]\nname = "x"\nrequires-python = ">=4.7"\n', encoding="utf-8"
+    )
     calls = []
 
     with (
@@ -196,7 +202,21 @@ def test_e4_install_mechanics_match_workspace_script(tmp_path):
     ):
         command._install_redeploy(source)
 
-    assert calls[0] == ["uv", "tool", "install", "--force", "--python", "3.13", str(source)]
+    # The version is DERIVED from the package floor, never a literal here: a
+    # literal is a second copy of the floor, and this assertion is exactly
+    # where the first copy's drift would have been caught and was not.
+    # 4.7 is deliberately not a real interpreter: a version that cannot be
+    # confused with whatever this suite happens to run under proves the value
+    # was READ, not merely coincident with the environment.
+    assert calls[0] == [
+        "uv",
+        "tool",
+        "install",
+        "--force",
+        "--python",
+        "4.7",
+        str(source),
+    ]
     assert calls[1:] == [
         ["/bin/cao", "config", "reconcile"],
         ["/bin/cao", "install", str(profiles / "chao_supervisor.md")],
@@ -244,3 +264,27 @@ def test_force_providers_with_yes_emits_diff_before_restart_and_skips_prompt():
     assert result.output.index("providers.toml differs") < result.output.index(
         "restarting cao-server"
     )
+
+
+def test_e4b_installer_and_workspace_script_agree_on_the_floor():
+    """The real repo's `install.sh` must name the real package floor.
+
+    2026-07-27: `install.sh` said 3.14 while `redeploy.py` said 3.13, so
+    `cao redeploy` resolved an interpreter the package rejected. Two copies of
+    one fact drifted because nothing compared them. This compares them.
+    """
+    source_root = Path(__file__).resolve().parents[3]
+    floor = tomllib.loads((source_root / "pyproject.toml").read_text(encoding="utf-8"))["project"][
+        "requires-python"
+    ]
+    expected = re.search(r"(\d+\.\d+)", floor).group(1)
+
+    assert command._install_python_version(source_root) == expected
+
+    install_sh = source_root.parent / "install.sh"
+    if install_sh.exists():
+        named = re.findall(r"--python\s+(\d+\.\d+)", install_sh.read_text(encoding="utf-8"))
+        assert named, "install.sh no longer passes --python; the parity check went blind"
+        assert set(named) == {
+            expected
+        }, f"install.sh names {set(named)}, package floor is {expected}"
