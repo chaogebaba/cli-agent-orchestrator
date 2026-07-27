@@ -187,12 +187,13 @@ def test_ac9a_string_values_are_preserved() -> None:
     """Members ARE their strings, so no durable migration is needed.
 
     EMPIRICAL r1-code: this asserted `f"{CoverageProof.ENTRIES_MATCH}"`, which
-    is NOT version-stable under the `(str, Enum)` mixin the 3.10 floor requires
-    -- interpolation yields the value on 3.10 and `"CoverageProof.ENTRIES_MATCH"`
-    on 3.11+. The assertion would have passed on the floor and failed on the two
-    versions above it. `==` and `.value` are stable on every supported version,
-    so durable comparisons use those; the interpolation form is asserted NOT to
-    be relied on.
+    is NOT stable across the two spellings of a str-enum -- interpolation
+    yields the value under `StrEnum` and `"CoverageProof.ENTRIES_MATCH"` under
+    the `(str, Enum)` mixin this module uses. (It was found as a version skew:
+    the same split runs along 3.10 vs 3.11+ for the mixin, which is how the
+    assertion passed on the then-floor and failed above it.) `==` and `.value`
+    are stable under both spellings, so durable comparisons use those; the
+    interpolation form is asserted NOT to be relied on.
     """
     assert ProofKind.TRANSCRIPT_USER_TURN == "transcript_user_turn"
     assert BarrierProof.MEMBER_ARRIVED == "member_arrived"

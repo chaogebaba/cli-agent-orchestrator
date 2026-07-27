@@ -78,19 +78,26 @@ class TaggedProof(str, Enum):
     R14-E88: declared ONCE here; every adopter enum inherits it rather than
     re-spelling the implementation.
 
-    **Why `(str, Enum)` and not `StrEnum`** (EMPIRICAL r1-code): `StrEnum` is
-    3.11+, and this package's floor is `requires-python = ">=3.10"` with CI
-    testing 3.10/3.11/3.12. The first draft used `StrEnum` and was the ONLY
-    such use in `src/`; the other ten str-enums here all use this mixin form.
-    Local mypy did not catch it because `mypy.ini:2` pins `python_version =
-    3.11` (overriding `pyproject.toml:141`'s 3.10) and the dev interpreter is
-    3.13 -- so every check ran above the floor it was supposed to defend.
+    **Why `(str, Enum)` and not `StrEnum`** (EMPIRICAL r1-code, re-ruled r1
+    follow-up): `StrEnum` is legal on the current `>=3.14` floor, so the
+    original version reason is gone. The mixin stays for two live reasons --
+    every other str-enum in `src/` uses this form, and M6 pins the durable
+    contract to `==`/`.value`, which this form already satisfies. A revert
+    would buy no correctness and would change `str()`/format behaviour at
+    every call site. Adopting `StrEnum` is a deliberate repo-wide migration
+    with persistence review, not an F84-local edit.
 
     **Note the mixin is not a drop-in for `StrEnum` under interpolation:**
-    `f"{member}"` yields the VALUE on 3.10 but `"Class.MEMBER"` on 3.11+, while
-    `StrEnum` yields the value on all of them. `==` against the string and
-    `.value` are stable everywhere, so durable comparisons use those and never
-    interpolation.
+    `f"{member}"` yields `"Class.MEMBER"` here, where `StrEnum` yields the
+    value. `==` against the string and `.value` are stable under both, so
+    durable comparisons use those and never interpolation.
+
+    Historical note, kept because it is the reason the floor moved at all: the
+    first draft used `StrEnum` under a `>=3.10` floor and was the ONLY such use
+    in `src/`. Local mypy missed it because `mypy.ini` pinned 3.11 over
+    `pyproject.toml`'s 3.10 while the dev interpreter was 3.13 -- every check
+    ran ABOVE the floor it was meant to defend. A tool configured above the
+    floor cannot see the floor.
     """
 
     _proof_class: ProofClass
