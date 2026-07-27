@@ -261,7 +261,9 @@ def test_ac1b_meet_takes_the_weakest_verdict_present() -> None:
     proven: Observation[MemberAnswer, BarrierProof, MemberReason] = Proven(
         MemberAnswer(), by=BarrierProof.MEMBER_ARRIVED
     )
-    disproven: Observation[MemberAnswer, BarrierProof, MemberReason] = Disproven("member_terminal_gone")
+    disproven: Observation[MemberAnswer, BarrierProof, MemberReason] = Disproven(
+        "member_terminal_gone"
+    )
 
     won = fold([proven, proven], BARRIER_AGGREGATE)
     assert isinstance(won, Proven)
@@ -388,9 +390,7 @@ def test_stale_and_recovery_are_distinct_answers() -> None:
 def test_observations_are_frozen() -> None:
     # Annotated at the VARIANT, not the union: the assignment target has to be
     # a real attribute for the frozen-ness to be what fails.
-    obs: Disproven[MemberAnswer, BarrierProof, MemberReason] = Disproven(
-        "member_terminal_gone"
-    )
+    obs: Disproven[MemberAnswer, BarrierProof, MemberReason] = Disproven("member_terminal_gone")
     with pytest.raises(Exception):
         obs.reason = "member_unobservable"  # type: ignore[misc]
 
@@ -398,8 +398,6 @@ def test_observations_are_frozen() -> None:
 def test_observations_survive_copy_and_pickle() -> None:
     """PV3 dropped the nominal carrier, so an Observation is an ordinary frozen
     dataclass -- copy and pickle are sound and nothing needs to police them."""
-    obs: Observation[MemberAnswer, BarrierProof, MemberReason] = Disproven(
-        "member_terminal_gone"
-    )
+    obs: Observation[MemberAnswer, BarrierProof, MemberReason] = Disproven("member_terminal_gone")
     assert copy.copy(obs) == obs
     assert pickle.loads(pickle.dumps(obs)) == obs
