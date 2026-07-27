@@ -21,11 +21,12 @@ Placement is fork decision **D8**: this module lives under ``models/`` so that
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
-from typing import Generic, Iterable, NoReturn, Protocol, TypeVar, runtime_checkable
+from enum import Enum, EnumType
+from typing import Any, Generic, Iterable, NoReturn, Protocol, TypeVar, runtime_checkable
 
 __all__ = [
     "ProofClass",
+    "TaggedProofMeta",
     "ProofMember",
     "TaggedProof",
     "Deadline",
@@ -65,7 +66,57 @@ class ProofMember(Protocol):
     def proof_class(self) -> ProofClass: ...
 
 
-class TaggedProof(str, Enum):
+class TaggedProofMeta(EnumType):
+    """Validate proof declarations BEFORE the members exist, and seal the tags.
+
+    EMPIRICAL r2 killed the previous scheme, which keyed the sealed tags on
+    ``id(member)``. Five routes admitted a LIVENESS member, and the worst
+    needed no adversary at all: a duplicate-value alias leaves a STALE ``id()``
+    in the registry, CPython recycles that address, and the reviewer's probe hit
+    it with an ordinary string in ONE allocation -- an object that never passed
+    through ``__new__`` inheriting a sealed ARRIVAL tag. **An integer that the
+    allocator may reuse cannot be an authorization key.**
+
+    Two of those five routes are not admission bugs at all -- they are
+    DECLARATIONS that should never have compiled, so they are refused here,
+    where the class is being built:
+
+    - a tag that is not a ``ProofClass`` (the R09 mutant's opening: a guard
+      written as "refuse LIVENESS" admits a malformed tag, whereas one written
+      as "admit only ARRIVAL" refuses it -- but neither should have to, because
+      the declaration itself is wrong)
+    - a duplicate value, which makes one member an ALIAS of another and hides
+      its declared tag behind the first member's
+
+    What remains is sealed into ``_SEALED_PROOF_CLASS`` keyed by ``(class,
+    member name)``: a name is not recycled while its class is alive, and it
+    cannot be reached by overriding a property or assigning to ``_proof_class``.
+    """
+
+    def __new__(
+        mcls, name: str, bases: tuple[type, ...], namespace: Any, **kwargs: Any
+    ) -> "TaggedProofMeta":
+        declared = {
+            key: value
+            for key, value in list(namespace.items())
+            if not key.startswith("_") and isinstance(value, tuple) and len(value) == 2
+        }
+        cls = super().__new__(mcls, name, bases, namespace, **kwargs)
+        seen: dict[str, str] = {}
+        for member_name, (value, tag) in declared.items():
+            if not isinstance(tag, ProofClass):
+                raise TypeError(f"{name}.{member_name}: proof class {tag!r} is not a ProofClass")
+            if value in seen:
+                raise ValueError(
+                    f"{name}.{member_name}: duplicate value {value!r} aliases "
+                    f"{name}.{seen[value]}; an alias hides its own proof class"
+                )
+            seen[value] = member_name
+            _SEALED_PROOF_CLASS[(cls, member_name)] = tag
+        return cls
+
+
+class TaggedProof(str, Enum, metaclass=TaggedProofMeta):
     """Base for every adopter's proof enum: a str-enum whose members carry a tag.
 
     R13v28-E79: the first attempt wrote ``proof_class = ProofClass.ARRIVAL`` in
@@ -106,11 +157,11 @@ class TaggedProof(str, Enum):
         obj = str.__new__(cls, value)
         obj._value_ = value
         obj._proof_class = proof_class
-        # EMPIRICAL r1-code B2: the ADMISSION tag is recorded here, in
-        # module-private storage keyed by member identity, at the moment the
-        # member is created. `_proof_class` and the property below remain the
-        # READABLE tag; this is the AUTHORITATIVE one.
-        _SEALED_PROOF_CLASS[id(obj)] = proof_class
+        # The ADMISSION tag is NOT recorded here. `__new__` runs per member and
+        # can be reached by a subclass through the `_new_member_` hook EnumType
+        # retains (EMPIRICAL r2 route 2), so anything sealed here is sealed by
+        # the caller. `TaggedProofMeta` seals from the DECLARATION instead.
+        # `_proof_class` and the property below are the READABLE tag only.
         return obj
 
     @property
@@ -118,32 +169,65 @@ class TaggedProof(str, Enum):
         return self._proof_class
 
 
-# The sealed admission tags, keyed by member identity. Enum members are
-# created once at class definition and live for the process, so identity is
-# stable and this never needs eviction.
+# The sealed admission tags, keyed by ``(owning class, member name)``.
 #
-# EMPIRICAL r1-code B2: `Proven.__post_init__` used to authorize on the
-# `proof_class` PROPERTY, which a subclass can override, and on `_proof_class`,
-# which ordinary assignment can rewrite. Both routes produced a `Proven` from a
-# LIVENESS member -- verified at the interpreter. A guard that authorizes on
-# forgeable state is not a guard. `_sealed_proof_class()` reads what was
-# recorded at member creation and cannot be reached through either route.
-_SEALED_PROOF_CLASS: dict[int, ProofClass] = {}
+# EMPIRICAL r1-code B2 established WHY a separate record is needed:
+# `Proven.__post_init__` used to authorize on the `proof_class` PROPERTY, which
+# a subclass can override, and on `_proof_class`, which ordinary assignment can
+# rewrite. Both produced a `Proven` from a LIVENESS member.
+#
+# EMPIRICAL r2 established what the record may be KEYED ON. `id()` was wrong:
+# it is recycled, so a stale entry from an aliased member transferred a sealed
+# ARRIVAL tag to an unrelated object in one allocation, with no attacker. The
+# key is now the member's NAME under its class, which the allocator never
+# reuses.
+_SEALED_PROOF_CLASS: dict[tuple[type, str], ProofClass] = {}
 
 
 def _sealed_proof_class(member: ProofMember) -> ProofClass:
     """Return the tag recorded when `member` was created, never a live read.
 
-    A member with no sealed tag did not come from `TaggedProof.__new__`, so it
-    has no admission record and cannot establish `Proven`.
+    Two things are checked before the tag is read, because a tag read from the
+    wrong object is worse than no tag:
+
+    1. the member must BE the canonical member its own class publishes under
+       that name -- this refuses an impostor object that merely has a `name`,
+       and refuses an alias, which is a different name for someone else's member
+    2. a tag must have been sealed for that (class, name) at declaration time
+
+    A member failing either did not come from a `TaggedProof` declaration and
+    has no admission record, so it cannot establish `Proven`.
     """
     try:
-        return _SEALED_PROOF_CLASS[id(member)]
+        canonical = type(member).__members__[member.name]  # type: ignore[attr-defined]
+    except (AttributeError, KeyError, TypeError):
+        raise ValueError(
+            f"{member!r} is not a member of a proof enum; only members declared "
+            "by a TaggedProof subclass can establish Proven"
+        ) from None
+    if canonical is not member:
+        raise ValueError(
+            f"{member!r} is not the canonical member of {type(member).__name__} "
+            "under its own name; an alias cannot establish Proven"
+        )
+    try:
+        sealed = _SEALED_PROOF_CLASS[(type(member), member.name)]  # type: ignore[attr-defined]
     except KeyError:
         raise ValueError(
-            f"{member!r} carries no sealed proof class; only members created by "
+            f"{member!r} carries no sealed proof class; only members declared by "
             "TaggedProof can establish Proven"
         ) from None
+    if not isinstance(sealed, ProofClass):
+        # The metaclass refuses a malformed tag at declaration, so reaching
+        # this means the dict itself was written to -- the one route left once
+        # the key is no longer forgeable. Checked rather than trusted because
+        # the alternative is the R09 shape: a value that is NEITHER class
+        # slipping through a guard that only asks whether it is the wrong one.
+        raise ValueError(
+            f"{member!r} has a sealed value that is not a ProofClass; the "
+            "admission record was written outside TaggedProof"
+        )
+    return sealed
 
 
 @dataclass(frozen=True)

@@ -8,11 +8,16 @@ are the assertions that would have died on the defects the gates found.
 from __future__ import annotations
 
 import copy
+import os
+import pathlib
 import pickle
+import textwrap
+from enum import Enum
 from typing import Literal
 
 import pytest
 
+from cli_agent_orchestrator.models import observation
 from cli_agent_orchestrator.models.observation import (
     AggregateSpec,
     Deadline,
@@ -37,6 +42,20 @@ from cli_agent_orchestrator.models.observation import (
 class ProofKind(TaggedProof):
     TRANSCRIPT_USER_TURN = ("transcript_user_turn", ProofClass.ARRIVAL)
     STATUS_GEN = ("status_gen", ProofClass.LIVENESS)
+
+
+# EMPIRICAL r2 + user ruling 2026-07-27: the ARRIVAL-only TYPE for the one
+# adopter whose vocabulary is mixed. Measured (probes/f84-typebound-2026-07-27):
+# mypy types an enum member CONSTANT as `Literal[Enum.MEMBER]`, so a union of
+# the arrival members rejects `STATUS_GEN` as an `arg-type` error at every
+# ANNOTATED site -- including through the real `Proven[T, P, R]` generic.
+#
+# This is X2's ruling ("a bad value must fail to type-check, not fail review")
+# applied to PROOFS, where it had only ever been applied to reasons. It does
+# NOT replace the runtime seal: measured type-ONLY, since a member arriving
+# through `Any`, `cast`, or deserialization builds a liveness `Proven` with
+# mypy silent. Two layers, two different boundaries.
+ArrivalProofKind = Literal[ProofKind.TRANSCRIPT_USER_TURN]
 
 
 class BarrierProof(TaggedProof):
@@ -270,8 +289,181 @@ def test_ac9b_a_member_with_no_sealed_tag_is_refused() -> None:
             return ProofClass.ARRIVAL
 
     assert isinstance(Impostor(), ProofMember)  # satisfies the bound
-    with pytest.raises(ValueError, match="no sealed proof class"):
+    # EMPIRICAL r2: refused one check EARLIER than it used to be. It is not a
+    # member of any proof enum, so admission stops before any tag is read --
+    # reading a tag off an object of unknown provenance is the mistake.
+    with pytest.raises(ValueError, match="not a member of a proof enum"):
         Proven(MemberAnswer(), by=Impostor())
+
+
+def test_ac9c_an_alias_cannot_be_declared() -> None:
+    """EMPIRICAL r2 route 3, now refused where it belongs -- at DECLARATION.
+
+    A duplicate value makes the second name an ALIAS of the first member, so
+    the second name's declared proof class is silently discarded and reading
+    `AliasProof.LIVENESS_NAME.proof_class` returns the FIRST member's tag. The
+    r2 probe used exactly this to admit a liveness name. It also left a stale
+    `id()` in the old registry, which is what made accidental reuse possible.
+    """
+    with pytest.raises(ValueError, match="aliases"):
+
+        class AliasProof(TaggedProof):
+            LIVENESS_NAME = ("same-value", ProofClass.LIVENESS)
+            ARRIVAL_NAME = ("same-value", ProofClass.ARRIVAL)
+
+
+def test_ac9c_a_malformed_tag_cannot_be_declared() -> None:
+    """The R09 mutant's opening, closed at declaration.
+
+    R09 survived all 34 tests: the guard asked "is the tag LIVENESS?" and so
+    admitted a tag that was NEITHER class. Rewriting it as "is the tag
+    ARRIVAL?" closes it at admission -- but the declaration was already wrong,
+    and refusing it here means no admission-time spelling can matter.
+    """
+    with pytest.raises(TypeError, match="is not a ProofClass"):
+
+        class MalformedProof(TaggedProof):
+            BAD = ("bad", "not-a-proof-class")
+
+
+def test_ac9c_a_property_override_cannot_reach_the_sealed_tag() -> None:
+    """EMPIRICAL r2 route 1 against the NAME-keyed seal.
+
+    The tester's proposed backstop still admitted this, because it read the tag
+    back through the member's own class. The seal is keyed by (class, name) and
+    written from the DECLARATION, so an override changes what a reader sees and
+    not what admission consults.
+    """
+
+    class OverriddenProof(TaggedProof):
+        LIVE = ("overridden-live", ProofClass.LIVENESS)
+
+        @property
+        def proof_class(self) -> ProofClass:
+            return ProofClass.ARRIVAL
+
+    assert OverriddenProof.LIVE.proof_class is ProofClass.ARRIVAL  # the LIE
+    with pytest.raises(ValueError, match="only ARRIVAL-class"):
+        Proven(MemberAnswer(), by=OverriddenProof.LIVE)
+
+
+def test_ac9c_mutating_proof_class_cannot_reach_the_sealed_tag() -> None:
+    """EMPIRICAL r1-code B2's route, re-verified against the new key."""
+
+    class MutableProof(TaggedProof):
+        LIVE = ("mutable-live", ProofClass.LIVENESS)
+
+    MutableProof.LIVE._proof_class = ProofClass.ARRIVAL  # type: ignore[misc]
+    assert MutableProof.LIVE.proof_class is ProofClass.ARRIVAL  # the LIE
+    with pytest.raises(ValueError, match="only ARRIVAL-class"):
+        Proven(MemberAnswer(), by=MutableProof.LIVE)
+
+
+def test_ac9c_a_planted_sealed_value_is_refused() -> None:
+    """The one route left once the KEY cannot be forged: forge the VALUE.
+
+    The metaclass refuses a malformed tag at declaration, so the only way to
+    reach a non-ProofClass sealed value is to write the module-private dict
+    directly. Verified reachable at the interpreter, hence checked rather than
+    trusted. This is R09's shape one layer down: a value that is NEITHER class
+    passes any guard that merely asks whether it is the wrong one.
+    """
+
+    class PlantedProof(TaggedProof):
+        LIVE = ("planted", ProofClass.LIVENESS)
+
+    observation._SEALED_PROOF_CLASS[(PlantedProof, "LIVE")] = "forged"  # type: ignore[index]
+    try:
+        with pytest.raises(ValueError, match="not a ProofClass"):
+            Proven(MemberAnswer(), by=PlantedProof.LIVE)
+    finally:
+        observation._SEALED_PROOF_CLASS.pop((PlantedProof, "LIVE"), None)
+
+
+def test_ac9c_admission_admits_only_arrival_it_does_not_refuse_liveness() -> None:
+    """Mutant R09, which survived all 34 tests of the previous suite.
+
+    Writing the guard as `if sealed is ProofClass.LIVENESS: raise` is right for
+    every tag that IS one of the two classes, so no ordinary fixture separates
+    it from `if sealed is not ProofClass.ARRIVAL: raise`. They differ only on a
+    tag that is NEITHER -- and the previous suite had no way to produce one.
+
+    This drives `Proven` DIRECTLY (not `_sealed_proof_class`, which now raises
+    first and would mask the branch under test) with a sealed value that is a
+    valid `ProofClass`-typed object of neither class. Under the mutant the
+    admission passes and a `Proven` is BUILT; under the correct spelling it is
+    refused.
+
+    **A guard that enumerates what to REFUSE is open by default. Only one that
+    enumerates what to ADMIT is closed.**
+    """
+
+    class R09Proof(TaggedProof):
+        LIVE = ("r09-live", ProofClass.LIVENESS)
+
+    # A genuine ProofClass INSTANCE that is neither member: subclassing an enum
+    # with members is forbidden, but `__new__` on the mixin type produces an
+    # object `isinstance`-compatible with ProofClass and identical to neither
+    # member. `isinstance` therefore CANNOT be what refuses this -- only the
+    # admit-only-ARRIVAL comparison can. That is what makes this test separate
+    # the two spellings rather than pass for an unrelated reason.
+    third = str.__new__(ProofClass, "hearsay")
+    object.__setattr__(third, "_name_", "HEARSAY")
+    object.__setattr__(third, "_value_", "hearsay")
+    assert isinstance(third, ProofClass)
+    assert third is not ProofClass.ARRIVAL and third is not ProofClass.LIVENESS
+    # And the real enum is untouched -- this constructs, it does not mutate.
+    assert [m.name for m in ProofClass] == ["ARRIVAL", "LIVENESS"]
+
+    observation._SEALED_PROOF_CLASS[(R09Proof, "LIVE")] = third
+    try:
+        with pytest.raises(ValueError, match="only ARRIVAL-class"):
+            Proven(MemberAnswer(), by=R09Proof.LIVE)
+    finally:
+        observation._SEALED_PROOF_CLASS.pop((R09Proof, "LIVE"), None)
+
+
+def test_ac9c_a_non_canonical_member_is_refused() -> None:
+    """The canonical-membership check, exercised by something that reaches it.
+
+    The metaclass refuses a declared alias, so an alias cannot arrive by the
+    front door. It can still arrive by `_value2member_map_`, which is how the
+    Enum machinery resolves a lookup -- and an object bound there is NOT the
+    member its own name publishes. Admission must compare identity against
+    `__members__`, not merely find A tag.
+    """
+
+    class CanonProof(TaggedProof):
+        REAL = ("canon-real", ProofClass.ARRIVAL)
+
+    # The object must be of a type that HAS `__members__` and publishes this
+    # name -- otherwise the earlier "not a member of a proof enum" check
+    # refuses it and the identity comparison is never reached. A second
+    # instance of the member's own class satisfies the lookup and fails only
+    # the identity test, which is precisely the branch under test.
+    impostor = str.__new__(CanonProof, "canon-real")
+    object.__setattr__(impostor, "_name_", "REAL")
+    object.__setattr__(impostor, "_value_", "canon-real")
+
+    assert type(impostor).__members__["REAL"] is not impostor  # lookup succeeds
+    assert impostor == CanonProof.REAL  # equal by value, NOT the same object
+    with pytest.raises(ValueError, match="canonical"):
+        Proven(MemberAnswer(), by=impostor)  # type: ignore[arg-type]
+
+
+def test_ac9c_the_seal_is_not_keyed_on_a_recyclable_identity() -> None:
+    """The r2 finding that needed no adversary: `id()` is REUSED.
+
+    An aliased member left a stale `id()` key, and an ordinary allocation
+    landed on that freed address in ONE iteration -- inheriting a sealed
+    ARRIVAL tag without anything malicious happening. This asserts the property
+    that makes that impossible: every key names a live class and one of its
+    own member names, so nothing the allocator does can forge a key.
+    """
+    for owner, member_name in observation._SEALED_PROOF_CLASS:
+        assert isinstance(owner, type)
+        assert member_name in owner.__members__  # type: ignore[attr-defined]
+        assert owner.__members__[member_name].name == member_name  # type: ignore[attr-defined]
 
 
 def test_ac9b_inv_exact_member_to_class_map() -> None:
@@ -537,3 +729,57 @@ def test_observations_survive_copy_and_pickle() -> None:
     obs: Observation[MemberAnswer, BarrierProof, MemberReason] = Disproven("member_terminal_gone")
     assert copy.copy(obs) == obs
     assert pickle.loads(pickle.dumps(obs)) == obs
+
+
+def test_ac9d_the_type_checker_rejects_a_liveness_member() -> None:
+    """The STATIC half of admission (user ruling 2026-07-27).
+
+    The runtime seal refuses a liveness member when the code RUNS. This asserts
+    the other half: annotated against `ArrivalProofKind`, a liveness member is
+    an error mypy reports without executing anything.
+
+    Asserted by running mypy, because a type-prevention claim is empirical --
+    GOLDEN-TIPS, ed1c0c1. A comment saying "the type checker prevents this" is
+    a wish; this is the measurement.
+    """
+    import subprocess
+    import sys
+    import tempfile
+
+    source = textwrap.dedent(
+        """
+        from typing import Literal
+        from cli_agent_orchestrator.models.observation import (
+            ProofClass, Proven, TaggedProof,
+        )
+
+        class Kind(TaggedProof):
+            ARRIVED = ("arrived", ProofClass.ARRIVAL)
+            LIVE = ("live", ProofClass.LIVENESS)
+
+        ArrivalOnly = Literal[Kind.ARRIVED]
+
+        class Subject: ...
+
+        ok: Proven[Subject, ArrivalOnly, str] = Proven(Subject(), by=Kind.ARRIVED)
+        bad: Proven[Subject, ArrivalOnly, str] = Proven(Subject(), by=Kind.LIVE)
+        """
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        probe = pathlib.Path(tmp) / "probe.py"
+        probe.write_text(source, encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, "-m", "mypy", "--strict", "--no-site-packages", str(probe)],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "MYPYPATH": str(pathlib.Path(__file__).parents[2] / "src")},
+        )
+
+    out = result.stdout
+    # Asserted on CONTENT, not line numbers: the probe is a dedented literal and
+    # a line-number assertion breaks on any edit to it while still "passing" for
+    # the wrong reasons if the offsets happen to line up.
+    assert "arg-type" in out, f"expected an arg-type error, got:\n{out}"
+    assert "Literal[Kind.LIVE]" in out, f"the LIVENESS member was not rejected:\n{out}"
+    assert "Literal[Kind.ARRIVED]" in out, f"expected the arrival type as expected:\n{out}"
+    assert "Found 1 error" in out, f"exactly one error expected; got:\n{out}"
