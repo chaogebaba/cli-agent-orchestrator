@@ -19,7 +19,6 @@ from typing import Any, Dict, List, Literal, NotRequired, Optional, Tuple, Typed
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
     PYTE_QUIESCENCE_DELAY_S,
-    STATE_BUFFER_MAX,
 )
 from cli_agent_orchestrator.kernel.receiver_state import (
     FreshnessProof,
@@ -40,6 +39,7 @@ from cli_agent_orchestrator.models.native_publish import (
 from cli_agent_orchestrator.backends.herdr_backend import map_native_status
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.event_bus import bus
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
@@ -153,7 +153,7 @@ def _row_multiset_hash(rows: tuple[str, ...]) -> str:
 # StatusMonitor will not regress to PROCESSING until ``notify_input_sent``
 # is called (signalling that a new processing cycle is starting).
 #
-# Why: the event-driven pipeline derives status from a rolling 8KB buffer,
+# Why: the event-driven pipeline derives status from a rolling state buffer,
 # and TUI redraws (cursor positioning, status-bar refreshes) routinely
 # evict the idle/response markers that the per-provider get_status() relies
 # on. That makes status flap rapidly between IDLE/COMPLETED and PROCESSING
@@ -915,8 +915,9 @@ class StatusMonitor:
         """Append chunk to the rolling buffer and (re)detect status.
 
         Two detection paths share one latch/publish backend (_apply_detection):
-        - RAW (default, every provider): regex over the rolling 8KB byte
-          buffer, run on every chunk. Unchanged legacy behavior.
+        - RAW (default, every provider): regex over the rolling state buffer
+          (``state_buffer_max`` bytes, server setting), run on every chunk.
+          Unchanged legacy behavior.
         - SCREEN (pyte): when CAO_PYTE_STATUS is on AND the provider opts in
           via supports_screen_detection, the chunk is fed to a per-terminal
           pyte screen and detection runs only on the rising edge (output
@@ -929,6 +930,7 @@ class StatusMonitor:
             and provider is not None
             and getattr(provider, "supports_screen_detection", False)
         )
+        state_buffer_max = get_server_settings()["state_buffer_max"]
 
         # Resolve the pyte screen size BEFORE taking the lock: the lookup
         # shells out to tmux (fork/exec — see run()'s fork-storm note) and
@@ -942,8 +944,8 @@ class StatusMonitor:
 
         with self._lock:
             buffer = self._buffers.get(terminal_id, "") + chunk
-            if len(buffer) > STATE_BUFFER_MAX:
-                buffer = buffer[-STATE_BUFFER_MAX:]
+            if len(buffer) > state_buffer_max:
+                buffer = buffer[-state_buffer_max:]
             self._buffers[terminal_id] = buffer
             chunk_seq = self._bump_chunk_seq_locked(terminal_id)
             self._fifo_frame_seq[terminal_id] = self._fifo_frame_seq.get(terminal_id, 0) + 1

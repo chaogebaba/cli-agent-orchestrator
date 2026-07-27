@@ -28,7 +28,7 @@ import pytest
 # test module can import the global database engine. This prevents tests from
 # depending on (or migrating) the installed production database.
 _TEST_CAO_HOME = Path(tempfile.mkdtemp(prefix="cao-pytest-"))
-os.environ["CAO_HOME"] = str(_TEST_CAO_HOME)
+os.environ["CAO_HOME_DIR"] = str(_TEST_CAO_HOME)
 
 from cli_agent_orchestrator.clients.database import engine, init_db  # noqa: E402
 

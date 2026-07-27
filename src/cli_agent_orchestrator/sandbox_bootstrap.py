@@ -377,7 +377,7 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> dict[str
 
 def _manifest_env(manifest: dict[str, Any], manifest_path: Path) -> dict[str, str]:
     result = {
-        "CAO_HOME": str(manifest["root"]),
+        "CAO_HOME_DIR": str(manifest["root"]),
         "CAO_ENDPOINT": str(manifest["endpoint"]),
         "CAO_INSTANCE_ID": str(manifest["instance_id"]),
         "CAO_TMUX_SOCKET": str(manifest["tmux_socket"]),

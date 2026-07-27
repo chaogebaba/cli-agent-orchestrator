@@ -90,10 +90,49 @@ BRACKETED_PASTE_INCOMPATIBLE_SHELLS = frozenset(
 # =============================================================================
 # Application Directory Structure
 # =============================================================================
-# Base directory for all CAO data (~/.aws/cli-agent-orchestrator)
-CAO_HOME_DIR = Path(
-    os.environ.get("CAO_HOME", str(Path.home() / ".aws" / "cli-agent-orchestrator"))
+# Base directory for all CAO data. Defaults to ``~/.aws/cli-agent-orchestrator``,
+# overridable via the ``CAO_HOME_DIR`` env var (read at import, mirroring the
+# ``CAO_AGENTS_DIR`` / ``CAO_GRAPH_EXPORT_ROOT`` convention). Every path below
+# derives from it, so one override relocates the whole tree. Motivating case:
+# environments that restrict reads under ``~/.aws`` at the OS level (e.g.
+# AppArmor, mount namespaces, or similar path-based sandboxing) to protect
+# credentials; pointing this outside ``~/.aws`` keeps the sandbox enabled.
+# Must be set before this module is first imported. Empty or whitespace-only
+# values are treated as unset; tilde is expanded and the result is resolved to
+# an absolute path.
+_cao_home_raw = os.environ.get("CAO_HOME_DIR", "").strip()
+CAO_HOME_DIR = (
+    Path(_cao_home_raw).expanduser().resolve()
+    if _cao_home_raw
+    else Path.home() / ".aws" / "cli-agent-orchestrator"
 )
+
+# WPU1 (upstream absorb 2026-07-27): upstream renamed this override from our
+# ``CAO_HOME`` to ``CAO_HOME_DIR`` and we adopted their name (user ruling) so
+# the constants block stops re-conflicting. The rename is a SILENT failure if
+# any exporter is missed: ``test/conftest.py`` sets the override before
+# importing the database engine, and ``sandbox_bootstrap.py`` exports it into
+# the G7 manifest -- a stale ``CAO_HOME`` would not error, it would quietly
+# resolve to the PRODUCTION tree and let a suite run migrate the real DB.
+# Fail loudly instead: the old name set without the new one is always a
+# missed rename, never a legitimate configuration.
+if os.environ.get("CAO_HOME", "").strip() and not _cao_home_raw:
+    raise RuntimeError(
+        "CAO_HOME is set but CAO_HOME_DIR is not. CAO_HOME was renamed to "
+        "CAO_HOME_DIR when upstream's override landed; a stale CAO_HOME would "
+        "silently resolve to the production tree instead of your override. "
+        "Rename the variable at the site that exported it."
+    )
+
+# Ensure the base directory exists with owner-only permissions. When relocated
+# outside ~/.aws there is no parent permission umbrella protecting the DB,
+# memory, agent-store, and terminal logs from other local users.
+CAO_HOME_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+try:
+    os.chmod(CAO_HOME_DIR, 0o700)
+except OSError:
+    pass  # best-effort: may fail on read-only mounts or non-owned dirs
+
 DEFERRED_DEADLETTER_DIR = CAO_HOME_DIR / "deadletters"
 SEAM_PARITY_POISON_DIR = CAO_HOME_DIR / "seam_parity_poison"
 BLOCKED_WAIT_CAP_S = 1800.0
@@ -107,20 +146,21 @@ DB_DIR = CAO_HOME_DIR / "db"
 # Log file directory structure
 LOG_DIR = CAO_HOME_DIR / "logs"
 TERMINAL_LOG_DIR = LOG_DIR / "terminal"  # Per-terminal log files for pipe-pane output
-TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 DRAFT_LOG_DIR = LOG_DIR / "drafts"  # Stashed human composer drafts before CAO injection
-DRAFT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+DRAFT_LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 # FIFO directory for event-driven terminal output streaming
 FIFO_DIR = CAO_HOME_DIR / "fifos"  # Named pipes for tmux pipe-pane streaming
-FIFO_DIR.mkdir(parents=True, exist_ok=True)
+FIFO_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 # =============================================================================
 # Event-Driven State Detection Configuration
 # =============================================================================
-# Rolling buffer size for state detection (8KB)
-# Keeps trailing 8KB of terminal output for pattern matching
-STATE_BUFFER_MAX = 8192
+# The rolling per-terminal raw-output buffer StatusMonitor keeps for raw-path
+# status detection and GET /terminals/{id}/output (mode=full) is a server
+# tuning value, not a fixed constant -- see settings_service.py's
+# ``_SERVER_DEFAULTS["state_buffer_max"]`` / ``get_server_settings()``.
 
 # Max events buffered per subscriber queue before dropping. Claude's TUI startup
 # can emit thousands of small chunks in a short burst, so keep this comfortably

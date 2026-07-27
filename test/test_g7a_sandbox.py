@@ -492,7 +492,7 @@ def test_empty_cache_invalid_and_valid_lifecycle_audit(tmp_path: Path) -> None:
         for key, value in os.environ.items()
         if key
         not in {
-            "CAO_HOME",
+            "CAO_HOME_DIR",
             "CAO_ENDPOINT",
             "CAO_INSTANCE_ID",
             "CAO_TMUX_SOCKET",
@@ -648,7 +648,7 @@ def test_real_down_purge_rejects_symlink_swapped_root(tmp_path: Path) -> None:
 
 def test_production_home_default_is_byte_identical() -> None:
     env = dict(os.environ)
-    env.pop("CAO_HOME", None)
+    env.pop("CAO_HOME_DIR", None)
     result = subprocess.run(
         [
             str(PYTHON),
@@ -688,7 +688,7 @@ async def test_wrong_venv_same_base_identity_fails_health(
 
 def test_cao_home_namespaces_all_core_paths(tmp_path: Path) -> None:
     root = tmp_path / "namespace"
-    env = {**os.environ, "CAO_HOME": str(root), "CAO_GRAPH_EXPORT_ROOT": str(root / "graph")}
+    env = {**os.environ, "CAO_HOME_DIR": str(root), "CAO_GRAPH_EXPORT_ROOT": str(root / "graph")}
     code = """
 from cli_agent_orchestrator import constants as c
 paths = [c.CAO_ENV_FILE, c.DB_DIR, c.LOG_DIR, c.TERMINAL_LOG_DIR, c.DRAFT_LOG_DIR,
@@ -715,7 +715,7 @@ def test_each_local_mutation_command_is_fenced(
 ) -> None:
     monkeypatch.setenv("CAO_INSTANCE_ID", "deadbeef")
     monkeypatch.setenv("CAO_ENDPOINT", "http://127.0.0.1:19876")
-    monkeypatch.setenv("CAO_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CAO_HOME_DIR", str(tmp_path / "home"))
 
     redeploy_module = importlib.import_module("cli_agent_orchestrator.cli.commands.redeploy")
     install_module = importlib.import_module("cli_agent_orchestrator.cli.commands.install")

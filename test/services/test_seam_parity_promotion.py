@@ -103,7 +103,7 @@ def _receiver_patches(monkeypatch: pytest.MonkeyPatch) -> None:
 def _run_seam_subprocess(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
     root = Path(__file__).parents[2]
     env = os.environ.copy()
-    env["CAO_HOME"] = str(home)
+    env["CAO_HOME_DIR"] = str(home)
     source = str(root / "src")
     env["PYTHONPATH"] = (
         source if not env.get("PYTHONPATH") else source + os.pathsep + env["PYTHONPATH"]
