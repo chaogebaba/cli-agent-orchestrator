@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import pickle
+from typing import Literal
 
 import pytest
 
@@ -46,6 +47,25 @@ class CoverageProof(TaggedProof):
     ENTRIES_MATCH = ("entries_match", ProofClass.ARRIVAL)
 
 
+# B1 (DESIGN r20) -- X2 is the fork the USER ruled: `R` must be CLOSED, so that
+# "a reason outside the adopter's enum fails to TYPE-CHECK rather than failing
+# review". It was the one ruling that did not survive transcription: `R` was
+# instantiated at `str` in both fixtures, which is D10's free-string defect
+# demonstrated inside the type D10 exists to protect. `R` carries no TypeVar
+# bound BY DESIGN (a `Literal` union cannot be a bound); closure is enforced
+# HERE, at instantiation, which is the only place it can be.
+#
+# Component and aggregate reasons are DIFFERENT types because X3 says a fold
+# changes the SUBJECT: a member is not a roster, an entry is not a delta.
+# `fold()`'s CR/AR type parameters were already separate; these give that split
+# a representation. It also makes B2's "borrow the component's reason" mutant a
+# TYPE error as well as a test failure.
+MemberReason = Literal["member_terminal_gone", "member_unobservable"]
+BarrierReason = Literal["roster_member_gone", "roster_unobservable"]
+EntryReason = Literal["entry_mismatch", "entry_unobservable"]
+CoverageReason = Literal["delta_entry_mismatch", "delta_unobservable"]
+
+
 class Complete:
     def __eq__(self, other: object) -> bool:
         return isinstance(other, Complete)
@@ -60,12 +80,24 @@ class MemberAnswer:
     pass
 
 
-BARRIER_AGGREGATE: AggregateSpec[Complete, BarrierProof, str] = AggregateSpec(
+# S3 (DESIGN r20): the deadlines are DISTINCT and NON-ZERO. `Deadline(0.0)` is
+# the epoch -- "retry immediately" -- while §5.3 rules the freshness deadline IS
+# `now`. These fixtures are the worked example a PV2 builder copies, so a
+# semantically wrong value here propagates. Distinct values also let a test
+# prove `fold` forwards the SPEC's trigger rather than fabricating one.
+BARRIER_RETRY = Deadline(120.0)
+COVERAGE_RETRY = Deadline(300.0)
+
+BARRIER_AGGREGATE: AggregateSpec[Complete, BarrierProof, BarrierReason] = AggregateSpec(
     value=Complete(),
     proven_by=BarrierProof.MEMBER_ARRIVED,
-    disproven_reason="member_terminal_gone",
-    unobserved_reason="apparatus_unavailable",
-    retry_after=Deadline(0.0),
+    # B2 (DESIGN r20): these MUST differ from every component reason. They were
+    # byte-identical, so `fold`'s constructors were graded only on TYPE and a
+    # mutant returning `seen[0].reason` -- X3's exact prohibition -- survived all
+    # 23 tests. Verified: the mutant passed 23/23 before this change.
+    disproven_reason="roster_member_gone",
+    unobserved_reason="roster_unobservable",
+    retry_after=BARRIER_RETRY,
     # DESIGN r18 P1 + R16-E102 + R17-E106: an empty roster is UNREACHABLE on
     # every path in today's source (nothing deletes barrier members;
     # delete_mailbox refuses on an open barrier; the creating transaction
@@ -73,15 +105,15 @@ BARRIER_AGGREGATE: AggregateSpec[Complete, BarrierProof, str] = AggregateSpec(
     # state no writer produces -- and it preserves database.py:3690's
     # `if states and all(...)` guard, where Proven(Complete) would have
     # fired an empty barrier.
-    empty=Unobservable("apparatus_unavailable", retry_after=Deadline(0.0)),
+    empty=Unobservable("roster_unobservable", retry_after=BARRIER_RETRY),
 )
 
-COVERAGE_AGGREGATE: AggregateSpec[Covered, CoverageProof, str] = AggregateSpec(
+COVERAGE_AGGREGATE: AggregateSpec[Covered, CoverageProof, CoverageReason] = AggregateSpec(
     value=Covered(),
     proven_by=CoverageProof.ENTRIES_MATCH,
-    disproven_reason="entry_mismatch",
-    unobserved_reason="apparatus_unavailable",
-    retry_after=Deadline(0.0),
+    disproven_reason="delta_entry_mismatch",
+    unobserved_reason="delta_unobservable",
+    retry_after=COVERAGE_RETRY,
     # REACHABLE and different from the barrier's: _same_entries((), ()) is True
     # at source, so an empty delta really is covered. The two adopters do NOT
     # share a verdict -- ruling them separately is what surfaced that.
@@ -99,7 +131,7 @@ COVERAGE_AGGREGATE: AggregateSpec[Covered, CoverageProof, str] = AggregateSpec(
     [
         Proven(MemberAnswer(), by=BarrierProof.MEMBER_ARRIVED),
         Disproven("member_terminal_gone"),
-        Unobservable("apparatus_unavailable", retry_after=Deadline(0.0)),
+        Unobservable("member_unobservable", retry_after=Deadline(60.0)),
     ],
     ids=["proven", "disproven", "unobservable"],
 )
@@ -115,7 +147,9 @@ def test_ac0_observation_has_no_truth_value(observation: object) -> None:
 
 def test_ac0_covers_the_idiom_that_actually_bites() -> None:
     """`if not predicate(...)` is the real-world form of the trap."""
-    obs = Unobservable("apparatus_unavailable", retry_after=Deadline(0.0))
+    obs: Observation[MemberAnswer, BarrierProof, MemberReason] = Unobservable(
+        "member_unobservable", retry_after=Deadline(60.0)
+    )
     with pytest.raises(TypeError):
         if not obs:  # noqa: SIM103 - this IS the assertion
             pass
@@ -139,10 +173,22 @@ def test_ac9a_tag_is_real_state_not_a_fake_enum_member() -> None:
 
 
 def test_ac9a_string_values_are_preserved() -> None:
-    """StrEnum members ARE their strings, so no durable migration is needed."""
+    """Members ARE their strings, so no durable migration is needed.
+
+    EMPIRICAL r1-code: this asserted `f"{CoverageProof.ENTRIES_MATCH}"`, which
+    is NOT version-stable under the `(str, Enum)` mixin the 3.10 floor requires
+    -- interpolation yields the value on 3.10 and `"CoverageProof.ENTRIES_MATCH"`
+    on 3.11+. The assertion would have passed on the floor and failed on the two
+    versions above it. `==` and `.value` are stable on every supported version,
+    so durable comparisons use those; the interpolation form is asserted NOT to
+    be relied on.
+    """
     assert ProofKind.TRANSCRIPT_USER_TURN == "transcript_user_turn"
     assert BarrierProof.MEMBER_ARRIVED == "member_arrived"
-    assert f"{CoverageProof.ENTRIES_MATCH}" == "entries_match"
+    assert CoverageProof.ENTRIES_MATCH == "entries_match"
+    assert CoverageProof.ENTRIES_MATCH.value == "entries_match"
+    # What actually gets persisted/compared: the value, never the repr.
+    assert {m.value for m in ProofKind} == {"transcript_user_turn", "status_gen"}
 
 
 def test_ac9a_one_enum_can_carry_mixed_tags() -> None:
@@ -197,24 +243,34 @@ def test_ac1b_unobservable_component_never_yields_disproven() -> None:
     Unobservable -> this dies. That mutant is a real product change; the old
     'add a third FoldLaw member' mutant is unwritable now that the enum is gone.
     """
-    components: list[Observation[MemberAnswer, BarrierProof, str]] = [
+    components: list[Observation[MemberAnswer, BarrierProof, MemberReason]] = [
         Proven(MemberAnswer(), by=BarrierProof.MEMBER_ARRIVED),
-        Unobservable("apparatus_unavailable", retry_after=Deadline(0.0)),
+        Unobservable("member_unobservable", retry_after=Deadline(60.0)),
         Disproven("member_terminal_gone"),
     ]
     result = fold(components, BARRIER_AGGREGATE)
     assert isinstance(result, Unobservable)
-    assert result.reason == "apparatus_unavailable"
+    # The aggregate's OWN reason -- never a component's. Both component reasons
+    # present here ("member_terminal_gone", "member_unobservable") are distinct
+    # from it, so a `fold` that borrowed `seen[0].reason` dies on this line.
+    assert result.reason == "roster_unobservable"
+    assert result.retry_after == BARRIER_RETRY
 
 
 def test_ac1b_meet_takes_the_weakest_verdict_present() -> None:
-    proven: Observation[MemberAnswer, BarrierProof, str] = Proven(
+    proven: Observation[MemberAnswer, BarrierProof, MemberReason] = Proven(
         MemberAnswer(), by=BarrierProof.MEMBER_ARRIVED
     )
-    disproven: Observation[MemberAnswer, BarrierProof, str] = Disproven("member_terminal_gone")
+    disproven: Observation[MemberAnswer, BarrierProof, MemberReason] = Disproven("member_terminal_gone")
 
-    assert isinstance(fold([proven, proven], BARRIER_AGGREGATE), Proven)
-    assert isinstance(fold([proven, disproven], BARRIER_AGGREGATE), Disproven)
+    won = fold([proven, proven], BARRIER_AGGREGATE)
+    assert isinstance(won, Proven)
+    assert won.by is BarrierProof.MEMBER_ARRIVED
+
+    lost = fold([proven, disproven], BARRIER_AGGREGATE)
+    assert isinstance(lost, Disproven)
+    # Disproven borrows too, if allowed to: assert the aggregate's reason.
+    assert lost.reason == "roster_member_gone"
 
 
 def test_ac1b_fold_changes_the_subject() -> None:
@@ -223,15 +279,18 @@ def test_ac1b_fold_changes_the_subject() -> None:
     R15v32-E94: the signature used to share one type triple across both, which
     asserted the subjects are the same -- the exact claim X3 denies.
     """
-    components: list[Observation[MemberAnswer, BarrierProof, str]] = [
+    components: list[Observation[MemberAnswer, BarrierProof, MemberReason]] = [
         Proven(MemberAnswer(), by=BarrierProof.MEMBER_ARRIVED)
     ]
     result = fold(components, BARRIER_AGGREGATE)
     assert isinstance(result, Proven)
     assert result.value == Complete()  # not MemberAnswer
+    # The PROOF changes subject too: the aggregate is proven by the spec's
+    # member, not by whatever proved any single component.
+    assert result.by is BarrierProof.MEMBER_ARRIVED
 
 
-def test_ac7a_barrier_fires_with_a_failed_member_but_is_not_proven() -> None:
+def test_ac7a_failed_member_yields_unobservable_not_disproven() -> None:
     """R13v28-E80: FIRES is not PROVEN.
 
     A roster with no AWAITING closes, whatever mix it holds -- but a FAILED
@@ -239,9 +298,9 @@ def test_ac7a_barrier_fires_with_a_failed_member_but_is_not_proven() -> None:
     unproven. close_reason already records `complete_partial` for this case;
     the durable vocabulary was ahead of the law.
     """
-    roster: list[Observation[MemberAnswer, BarrierProof, str]] = [
+    roster: list[Observation[MemberAnswer, BarrierProof, MemberReason]] = [
         Proven(MemberAnswer(), by=BarrierProof.MEMBER_ARRIVED),
-        Unobservable("apparatus_unavailable", retry_after=Deadline(0.0)),
+        Unobservable("member_unobservable", retry_after=Deadline(60.0)),
     ]
     verdict = fold(roster, BARRIER_AGGREGATE)
     assert isinstance(verdict, Unobservable)
@@ -249,9 +308,9 @@ def test_ac7a_barrier_fires_with_a_failed_member_but_is_not_proven() -> None:
 
 def test_ac8b_coverage_precedence_both_directions() -> None:
     """An acquisition failure AND a genuine mismatch settles Unobservable."""
-    components: list[Observation[MemberAnswer, CoverageProof, str]] = [
+    components: list[Observation[MemberAnswer, CoverageProof, EntryReason]] = [
         Disproven("entry_mismatch"),
-        Unobservable("apparatus_unavailable", retry_after=Deadline(0.0)),
+        Unobservable("entry_unobservable", retry_after=Deadline(60.0)),
     ]
     assert isinstance(fold(components, COVERAGE_AGGREGATE), Unobservable)
     assert isinstance(fold(list(reversed(components)), COVERAGE_AGGREGATE), Unobservable)
@@ -272,7 +331,8 @@ def test_empty_barrier_is_unobservable_not_proven() -> None:
     """
     result = fold([], BARRIER_AGGREGATE)
     assert isinstance(result, Unobservable)
-    assert result.reason == "apparatus_unavailable"
+    assert result.reason == "roster_unobservable"
+    assert result.retry_after == BARRIER_RETRY
 
 
 def test_empty_coverage_is_proven() -> None:
@@ -326,14 +386,20 @@ def test_stale_and_recovery_are_distinct_answers() -> None:
 
 
 def test_observations_are_frozen() -> None:
-    obs = Disproven("member_terminal_gone")
+    # Annotated at the VARIANT, not the union: the assignment target has to be
+    # a real attribute for the frozen-ness to be what fails.
+    obs: Disproven[MemberAnswer, BarrierProof, MemberReason] = Disproven(
+        "member_terminal_gone"
+    )
     with pytest.raises(Exception):
-        obs.reason = "something_else"  # type: ignore[misc]
+        obs.reason = "member_unobservable"  # type: ignore[misc]
 
 
 def test_observations_survive_copy_and_pickle() -> None:
     """PV3 dropped the nominal carrier, so an Observation is an ordinary frozen
     dataclass -- copy and pickle are sound and nothing needs to police them."""
-    obs = Disproven("member_terminal_gone")
+    obs: Observation[MemberAnswer, BarrierProof, MemberReason] = Disproven(
+        "member_terminal_gone"
+    )
     assert copy.copy(obs) == obs
     assert pickle.loads(pickle.dumps(obs)) == obs

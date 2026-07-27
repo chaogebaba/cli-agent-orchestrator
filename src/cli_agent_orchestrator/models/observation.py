@@ -21,7 +21,7 @@ Placement is fork decision **D8**: this module lives under ``models/`` so that
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum
 from typing import Generic, Iterable, NoReturn, Protocol, TypeVar, runtime_checkable
 
 __all__ = [
@@ -40,7 +40,7 @@ __all__ = [
 ]
 
 
-class ProofClass(StrEnum):
+class ProofClass(str, Enum):
     """What a proof member actually witnesses.
 
     ARRIVAL proves the payload reached the receiver. LIVENESS proves only that
@@ -65,8 +65,8 @@ class ProofMember(Protocol):
     def proof_class(self) -> ProofClass: ...
 
 
-class TaggedProof(StrEnum):
-    """Base for every adopter's proof enum: a StrEnum whose members carry a tag.
+class TaggedProof(str, Enum):
+    """Base for every adopter's proof enum: a str-enum whose members carry a tag.
 
     R13v28-E79: the first attempt wrote ``proof_class = ProofClass.ARRIVAL`` in
     the class body, which creates a FAKE ENUM MEMBER -- ``list(ProofKind)``
@@ -77,6 +77,20 @@ class TaggedProof(StrEnum):
 
     R14-E88: declared ONCE here; every adopter enum inherits it rather than
     re-spelling the implementation.
+
+    **Why `(str, Enum)` and not `StrEnum`** (EMPIRICAL r1-code): `StrEnum` is
+    3.11+, and this package's floor is `requires-python = ">=3.10"` with CI
+    testing 3.10/3.11/3.12. The first draft used `StrEnum` and was the ONLY
+    such use in `src/`; the other ten str-enums here all use this mixin form.
+    Local mypy did not catch it because `mypy.ini:2` pins `python_version =
+    3.11` (overriding `pyproject.toml:141`'s 3.10) and the dev interpreter is
+    3.13 -- so every check ran above the floor it was supposed to defend.
+
+    **Note the mixin is not a drop-in for `StrEnum` under interpolation:**
+    `f"{member}"` yields the VALUE on 3.10 but `"Class.MEMBER"` on 3.11+, while
+    `StrEnum` yields the value on all of them. `==` against the string and
+    `.value` are stable everywhere, so durable comparisons use those and never
+    interpolation.
     """
 
     _proof_class: ProofClass
@@ -230,7 +244,7 @@ def fold(
     return Proven(aggregate.value, aggregate.proven_by)
 
 
-class SettlementOutcome(StrEnum):
+class SettlementOutcome(str, Enum):
     """The three-valued result of a conditional settlement CAS.
 
     R18-E110: these were declared as a ``Literal`` of three strings with a
