@@ -99,11 +99,44 @@ class TaggedProof(str, Enum):
         obj = str.__new__(cls, value)
         obj._value_ = value
         obj._proof_class = proof_class
+        # EMPIRICAL r1-code B2: the ADMISSION tag is recorded here, in
+        # module-private storage keyed by member identity, at the moment the
+        # member is created. `_proof_class` and the property below remain the
+        # READABLE tag; this is the AUTHORITATIVE one.
+        _SEALED_PROOF_CLASS[id(obj)] = proof_class
         return obj
 
     @property
     def proof_class(self) -> ProofClass:
         return self._proof_class
+
+
+# The sealed admission tags, keyed by member identity. Enum members are
+# created once at class definition and live for the process, so identity is
+# stable and this never needs eviction.
+#
+# EMPIRICAL r1-code B2: `Proven.__post_init__` used to authorize on the
+# `proof_class` PROPERTY, which a subclass can override, and on `_proof_class`,
+# which ordinary assignment can rewrite. Both routes produced a `Proven` from a
+# LIVENESS member -- verified at the interpreter. A guard that authorizes on
+# forgeable state is not a guard. `_sealed_proof_class()` reads what was
+# recorded at member creation and cannot be reached through either route.
+_SEALED_PROOF_CLASS: dict[int, ProofClass] = {}
+
+
+def _sealed_proof_class(member: ProofMember) -> ProofClass:
+    """Return the tag recorded when `member` was created, never a live read.
+
+    A member with no sealed tag did not come from `TaggedProof.__new__`, so it
+    has no admission record and cannot establish `Proven`.
+    """
+    try:
+        return _SEALED_PROOF_CLASS[id(member)]
+    except KeyError:
+        raise ValueError(
+            f"{member!r} carries no sealed proof class; only members created by "
+            "TaggedProof can establish Proven"
+        ) from None
 
 
 @dataclass(frozen=True)
@@ -158,10 +191,10 @@ class Proven(_ObservationBase, Generic[T, P, R]):
         # A liveness-class proof can never establish arrival. Refusing at
         # construction means the bad observation cannot be built, which is
         # stronger than a reader that has to remember to check.
-        if self.by.proof_class is not ProofClass.ARRIVAL:
+        sealed = _sealed_proof_class(self.by)
+        if sealed is not ProofClass.ARRIVAL:
             raise ValueError(
-                f"{self.by!r} is {self.by.proof_class}; only ARRIVAL-class "
-                "proof can establish Proven"
+                f"{self.by!r} is {sealed}; only ARRIVAL-class " "proof can establish Proven"
             )
 
 

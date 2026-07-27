@@ -41,6 +41,11 @@ class ProofKind(TaggedProof):
 
 class BarrierProof(TaggedProof):
     MEMBER_ARRIVED = ("member_arrived", ProofClass.ARRIVAL)
+    # A SECOND arrival-class member exists so a component's proof can DIFFER
+    # from the aggregate spec's. Without it the two are the same value and the
+    # "aggregate proof never escapes from a component" test cannot fail --
+    # B2's vacuity pattern, which I reproduced in the test written to fix it.
+    MEMBER_ARRIVED_LATE = ("member_arrived_late", ProofClass.ARRIVAL)
 
 
 class CoverageProof(TaggedProof):
@@ -216,6 +221,52 @@ def test_ac9b_liveness_proof_cannot_establish_proven() -> None:
         Proven(MemberAnswer(), by=ProofKind.STATUS_GEN)
 
 
+def test_ac9b_a_property_override_cannot_forge_admission() -> None:
+    """EMPIRICAL r1-code B2: the guard read the OVERRIDABLE property, so a
+    subclass returning ARRIVAL from `proof_class` produced a Proven from a
+    LIVENESS member. Admission now reads the tag SEALED at member creation.
+    """
+
+    class ForgedProof(TaggedProof):
+        MEMBER = ("forged", ProofClass.LIVENESS)
+
+        @property
+        def proof_class(self) -> ProofClass:
+            return ProofClass.ARRIVAL
+
+    assert ForgedProof.MEMBER.proof_class is ProofClass.ARRIVAL  # the lie reads true
+    with pytest.raises(ValueError, match="only ARRIVAL-class"):
+        Proven(MemberAnswer(), by=ForgedProof.MEMBER)
+
+
+def test_ac9b_mutating_the_stored_tag_cannot_forge_admission() -> None:
+    """EMPIRICAL r1-code B2, second route: `_proof_class` is ordinary instance
+    state, so plain assignment rewrote it before construction.
+    """
+
+    class MutableProof(TaggedProof):
+        MEMBER = ("mutable", ProofClass.LIVENESS)
+
+    MutableProof.MEMBER._proof_class = ProofClass.ARRIVAL
+    with pytest.raises(ValueError, match="only ARRIVAL-class"):
+        Proven(MemberAnswer(), by=MutableProof.MEMBER)
+
+
+def test_ac9b_a_member_with_no_sealed_tag_is_refused() -> None:
+    """A hand-rolled object that satisfies the PROTOCOL has no admission
+    record, so it cannot establish Proven -- structural typing is not
+    authorization."""
+
+    class Impostor:
+        @property
+        def proof_class(self) -> ProofClass:
+            return ProofClass.ARRIVAL
+
+    assert isinstance(Impostor(), ProofMember)  # satisfies the bound
+    with pytest.raises(ValueError, match="no sealed proof class"):
+        Proven(MemberAnswer(), by=Impostor())
+
+
 def test_ac9b_inv_exact_member_to_class_map() -> None:
     """R14-E89's amendment: assert the exact map AND member-set equality.
 
@@ -255,6 +306,41 @@ def test_ac1b_unobservable_component_never_yields_disproven() -> None:
     # from it, so a `fold` that borrowed `seen[0].reason` dies on this line.
     assert result.reason == "roster_unobservable"
     assert result.retry_after == BARRIER_RETRY
+
+
+def test_ac1b_fold_accepts_a_ONE_SHOT_iterable() -> None:
+    """EMPIRICAL r1-code B3: `seen = list(components)` -> `seen = components`
+    passed 23/23, but a GENERATOR is consumed by the first `any()`, so
+    [Proven, Disproven] returned Proven -- the meet silently inverted. The
+    signature says `Iterable`, so a one-shot iterator must be honoured.
+    """
+    components = (
+        c
+        for c in (
+            Proven(MemberAnswer(), by=BarrierProof.MEMBER_ARRIVED),
+            Disproven("member_terminal_gone"),
+        )
+    )
+    result = fold(components, BARRIER_AGGREGATE)
+    assert isinstance(result, Disproven)
+    assert result.reason == "roster_member_gone"
+
+
+def test_ac1b_aggregate_proof_never_escapes_from_a_component() -> None:
+    """EMPIRICAL r1-code B3: returning the COMPONENT's proof for the aggregate
+    passed 23/23. X3 says the aggregate is a different subject, so its proof
+    must come from the spec -- a component's proof is about a member.
+    """
+    other = BarrierProof.MEMBER_ARRIVED_LATE
+    assert other is not BARRIER_AGGREGATE.proven_by  # or this test is vacuous
+    components: list[Observation[MemberAnswer, BarrierProof, MemberReason]] = [
+        Proven(MemberAnswer(), by=other),
+        Proven(MemberAnswer(), by=other),
+    ]
+    result = fold(components, BARRIER_AGGREGATE)
+    assert isinstance(result, Proven)
+    assert result.by is BARRIER_AGGREGATE.proven_by
+    assert result.value is BARRIER_AGGREGATE.value
 
 
 def test_ac1b_meet_takes_the_weakest_verdict_present() -> None:
@@ -369,10 +455,33 @@ def test_settlement_outcome_falsiness_is_a_mechanism() -> None:
 
 
 def test_settlement_outcome_keeps_its_persisted_spellings() -> None:
-    """Falsy, and still a real str -- the durable values are unchanged."""
-    assert SettlementOutcome.STALE == "stale"
-    assert SettlementOutcome.RECOVERY == "settlement_pending_recovery"
+    """Falsy, and still a real str -- the durable values are unchanged.
+
+    EMPIRICAL r1-code B4: this asserted only STALE and RECOVERY, so changing
+    SETTLED's DURABLE value from "settled" to "done" passed 23/23. A persisted
+    token is a durable contract; assert the exact member->value map and the
+    member SET, so both a changed spelling and an added member die -- and for
+    different reasons, or one masks the other.
+    """
+    assert {m.name: m.value for m in SettlementOutcome} == {
+        "SETTLED": "settled",
+        "STALE": "stale",
+        "RECOVERY": "settlement_pending_recovery",
+    }
     assert isinstance(SettlementOutcome.SETTLED, str)
+
+
+def test_proof_class_is_a_closed_set() -> None:
+    """EMPIRICAL r1-code B4: adding `ProofClass.HEARSAY` passed all 23 tests.
+
+    ProofClass is an ADMISSION vocabulary -- `Proven.__post_init__` authorizes
+    on it -- so a new member silently widens what can establish proof. Closed
+    sets are pinned by their whole membership, never by sampling.
+    """
+    assert {m.name: m.value for m in ProofClass} == {
+        "ARRIVAL": "arrival",
+        "LIVENESS": "liveness",
+    }
 
 
 def test_stale_and_recovery_are_distinct_answers() -> None:
@@ -385,6 +494,26 @@ def test_stale_and_recovery_are_distinct_answers() -> None:
 # --------------------------------------------------------------------------
 # Structural properties the core relies on
 # --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("observation", "field"),
+    [
+        (Proven(MemberAnswer(), by=BarrierProof.MEMBER_ARRIVED), "value"),
+        (Disproven("member_terminal_gone"), "reason"),
+        (Unobservable("member_unobservable", retry_after=Deadline(60.0)), "reason"),
+        (BARRIER_AGGREGATE, "value"),
+        (Deadline(60.0), "at"),
+    ],
+    ids=["proven", "disproven", "unobservable", "aggregate_spec", "deadline"],
+)
+def test_every_carrier_is_frozen(observation: object, field: str) -> None:
+    """EMPIRICAL r1-code S1: only `Disproven` was checked, despite the plural
+    name -- so removing `frozen=True` from Proven, Unobservable, AggregateSpec
+    or Deadline INDEPENDENTLY left all 23 green and allowed runtime mutation.
+    """
+    with pytest.raises(Exception):
+        setattr(observation, field, "mutated")
 
 
 def test_observations_are_frozen() -> None:
