@@ -265,16 +265,22 @@ class StalledCallbackWatchdog:
 
     def record_callback_if_to_caller(self, sender_id: str, receiver_id: str) -> None:
         meta = get_terminal_metadata(sender_id)
-        if not meta or receiver_id not in {
-            meta.get("caller_id"),
-            meta.get("caller_mailbox_id"),
-        }:
+        if not meta:
+            return
+        caller_identities = {meta.get("caller_id"), meta.get("caller_mailbox_id")}
+        if receiver_id not in caller_identities:
             return
         with self._lock:
             if sender_id in self._paused:
                 return
             episode = self._episodes.get(sender_id)
-            if episode and episode.caller_id == receiver_id:
+            # The episode stores ONE caller identity, but a reply may legitimately
+            # arrive addressed to either the caller terminal or its mailbox -- a
+            # barrier-routed callback lands on the mailbox id. Comparing only
+            # against episode.caller_id silently dropped those, leaving
+            # callback_seen False and firing a false "idle ... without callback"
+            # push at the next episode. Accept any identity the outer gate did.
+            if episode and episode.caller_id in caller_identities:
                 episode.callback_seen = True
 
     def record_status(
@@ -608,7 +614,7 @@ class StalledCallbackWatchdog:
                     MessageStatus.DELIVERING,
                 }:
                     continue
-                if callback_status == MessageStatus.DELIVERED:
+                if callback_status in {MessageStatus.DELIVERED, MessageStatus.DIGESTED}:
                     current_episode.callback_seen = True
                     continue
                 if second_callback_status in {
@@ -617,7 +623,7 @@ class StalledCallbackWatchdog:
                     MessageStatus.DELIVERING,
                 }:
                     continue
-                if second_callback_status == MessageStatus.DELIVERED:
+                if second_callback_status in {MessageStatus.DELIVERED, MessageStatus.DIGESTED}:
                     current_episode.callback_seen = True
                     continue
                 if suppress:
@@ -779,7 +785,10 @@ class StalledCallbackWatchdog:
             with self._lock:
                 episode = self._episodes.get(action.terminal_id)
                 valid = self._candidate_valid(action, episode) and second_status is None
-                if second_status == MessageStatus.DELIVERED and episode is not None:
+                if (
+                    second_status in {MessageStatus.DELIVERED, MessageStatus.DIGESTED}
+                    and episode is not None
+                ):
                     episode.callback_seen = True
                     valid = False
                 if valid:

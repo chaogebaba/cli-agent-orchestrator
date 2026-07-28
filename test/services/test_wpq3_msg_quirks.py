@@ -596,7 +596,8 @@ def test_d5_auto_resume_is_one_shot_and_suffix_preserves_mark(monkeypatch):
     deliver.assert_called_once_with("worker")
 
 
-def test_d5_second_callback_read_cancels_pending_resume(monkeypatch):
+@pytest.mark.parametrize("status", [MessageStatus.PENDING, MessageStatus.DIGESTED])
+def test_d5_second_callback_read_cancels_pending_resume(monkeypatch, status):
     service, metadata = _armed()
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
@@ -604,7 +605,7 @@ def test_d5_second_callback_read_cancels_pending_resume(monkeypatch):
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        MagicMock(side_effect=[None, MessageStatus.PENDING]),
+        MagicMock(side_effect=[None, status]),
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
@@ -630,6 +631,7 @@ def test_d5_second_callback_read_cancels_pending_resume(monkeypatch):
     assert service.collect_due_notifications(now=13.0) == []
     cancel.assert_called_once_with(42, "worker")
     assert not service._episodes["worker"].auto_resumed
+    assert service._episodes["worker"].callback_seen is (status == MessageStatus.DIGESTED)
 
 
 def test_d5_failed_before_commit_pushes_without_marking_auto_resumed(monkeypatch):

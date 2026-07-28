@@ -43,7 +43,11 @@ from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import callback_barrier_service
 from cli_agent_orchestrator.services import inbox_service as inbox_module
+from cli_agent_orchestrator.services import mailbox_service as mailbox_module
+from cli_agent_orchestrator.services import stalled_callback_watchdog as watchdog_module
 from cli_agent_orchestrator.services.inbox_service import InboxService
+from cli_agent_orchestrator.services.mailbox_service import create_logical_inbox_message
+from cli_agent_orchestrator.services.stalled_callback_watchdog import StalledCallbackWatchdog
 from cli_agent_orchestrator.services.status_monitor import BoundaryObservation
 
 
@@ -122,6 +126,24 @@ def _seed_mailbox_owner(sessions):
                 published_at=datetime.now(),
             )
         )
+
+
+def _install_f92_watchdog(monkeypatch, *, caller_mailbox_id: str | None = None):
+    service = StalledCallbackWatchdog(grace_seconds=3)
+    monkeypatch.setattr(watchdog_module, "stalled_callback_watchdog", service)
+    monkeypatch.setattr(
+        watchdog_module,
+        "get_terminal_metadata",
+        lambda terminal_id: {
+            "id": terminal_id,
+            "caller_id": "owner",
+            "caller_mailbox_id": caller_mailbox_id,
+            "provider": "grok_cli",
+            "tmux_session": "cao-wpq7",
+            "tmux_window": terminal_id,
+        },
+    )
+    return service
 
 
 def _orphan_owner(sessions, owner_id: str = "owner"):
@@ -252,6 +274,203 @@ def test_held_is_durable_callback_proof_and_not_delivery_pending(barrier_db):
     assert held.status == MessageStatus.HELD
     assert get_callback_status_since("worker-a", "owner", before) == MessageStatus.HELD
     assert held.id not in {row.id for row in get_pending_messages("owner")}
+
+
+@pytest.mark.parametrize("wrapper", ["raw-terminal", "logical-mailbox"])
+def test_f92_one_member_barrier_records_callback_through_creation_wrapper(
+    barrier_db, monkeypatch, wrapper
+):
+    _seed_raw(barrier_db, workers=("worker-a",))
+    caller_mailbox_id = None
+    callback_receiver = "owner"
+    if wrapper == "logical-mailbox":
+        _seed_mailbox_owner(barrier_db)
+        caller_mailbox_id = "mb_aaaaaaaa"
+        callback_receiver = caller_mailbox_id
+
+    watchdog = _install_f92_watchdog(
+        monkeypatch,
+        caller_mailbox_id=caller_mailbox_id,
+    )
+    watchdog.record_inbound_task("worker-a", "owner", "developer")
+    first_episode = watchdog._episodes["worker-a"]
+    create_inbox_message(
+        "owner",
+        "worker-a",
+        "task",
+        dispatch_barrier={"label": f"f92-{wrapper}"},
+    )
+
+    if wrapper == "raw-terminal":
+        callback = create_inbox_message("worker-a", callback_receiver, "answer")
+    else:
+        callback = create_logical_inbox_message(
+            sender_id="worker-a",
+            mailbox_id=callback_receiver,
+            message="answer",
+        )
+
+    assert callback.status == MessageStatus.DIGESTED
+    assert callback.barrier_id is not None
+    assert callback.barrier_member_key is not None
+    assert first_episode.callback_seen
+    with barrier_db() as db:
+        assert db.query(CallbackBarrierModel).one().state == "FIRED_COMPLETE"
+        assert db.query(CallbackBarrierMemberModel).one().state == "ARRIVED"
+
+    watchdog.record_status("worker-a", TerminalStatus.IDLE, now=10.0)
+    first_episode.last_screen_fp = "sample"
+    assert watchdog.collect_due_notifications(now=13.0) == []
+
+
+@pytest.mark.parametrize("wrapper", ["raw-terminal", "logical-mailbox"])
+def test_f92_creation_wrapper_ignores_row_without_complete_barrier_membership(
+    barrier_db, monkeypatch, wrapper
+):
+    _seed_raw(barrier_db, workers=("worker-a",))
+    callback_receiver = "owner"
+    insert_module = dbmod
+    create_callback = lambda: create_inbox_message("worker-a", callback_receiver, "half-populated")
+    if wrapper == "logical-mailbox":
+        _seed_mailbox_owner(barrier_db)
+        callback_receiver = "mb_aaaaaaaa"
+        insert_module = mailbox_module
+        create_callback = lambda: create_logical_inbox_message(
+            sender_id="worker-a",
+            mailbox_id=callback_receiver,
+            message="half-populated",
+        )
+
+    watchdog = _install_f92_watchdog(monkeypatch)
+    recorder = MagicMock()
+    monkeypatch.setattr(watchdog, "record_callback_if_to_caller", recorder)
+    original_insert = insert_module._insert_routed_inbox_row
+
+    def insert_half_populated_membership(db, *args, **kwargs):
+        row = original_insert(db, *args, **kwargs)
+        row.barrier_id = 8675309
+        row.barrier_member_key = None
+        return row
+
+    monkeypatch.setattr(
+        insert_module,
+        "_insert_routed_inbox_row",
+        insert_half_populated_membership,
+    )
+
+    callback = create_callback()
+
+    assert callback.barrier_id == 8675309
+    assert callback.barrier_member_key is None
+    recorder.assert_not_called()
+    with barrier_db() as db:
+        committed = db.query(InboxModel).filter_by(id=callback.id).one()
+        assert committed.barrier_id == 8675309
+        assert committed.barrier_member_key is None
+
+
+def test_f92_intermediate_mailbox_callback_records_before_barrier_fires(barrier_db, monkeypatch):
+    _seed_raw(barrier_db)
+    _seed_mailbox_owner(barrier_db)
+    watchdog = _install_f92_watchdog(monkeypatch, caller_mailbox_id="mb_aaaaaaaa")
+    watchdog.record_inbound_task("worker-a", "owner", "developer")
+    episode = watchdog._episodes["worker-a"]
+    _dispatch_pair("f92-intermediate")
+
+    callback = create_logical_inbox_message(
+        sender_id="worker-a",
+        mailbox_id="mb_aaaaaaaa",
+        message="answer",
+    )
+
+    assert callback.status == MessageStatus.HELD
+    assert episode.callback_seen
+    with barrier_db() as db:
+        assert db.query(CallbackBarrierModel).one().state == "OPEN"
+        states = {
+            member.terminal_id: member.state
+            for member in db.query(CallbackBarrierMemberModel).all()
+        }
+    assert states == {"worker-a": "ARRIVED", "worker-b": "AWAITING"}
+
+
+def test_f92_new_task_after_one_member_callback_starts_new_generation(barrier_db, monkeypatch):
+    _seed_raw(barrier_db, workers=("worker-a",))
+    watchdog = _install_f92_watchdog(monkeypatch)
+    watchdog.record_inbound_task("worker-a", "owner", "developer")
+    first_episode = watchdog._episodes["worker-a"]
+    create_inbox_message(
+        "owner",
+        "worker-a",
+        "task one",
+        dispatch_barrier={"label": "f92-generation"},
+    )
+    callback = create_inbox_message("worker-a", "owner", "answer one")
+    assert callback.status == MessageStatus.DIGESTED
+
+    # This arrives before any watchdog poll. Without the post-commit recorder,
+    # record_inbound_task joins the unanswered prior episode instead.
+    watchdog.record_inbound_task("worker-a", "owner", "developer")
+
+    replacement = watchdog._episodes["worker-a"]
+    assert replacement is not first_episode
+    assert replacement.generation == first_episode.generation + 1
+
+
+def test_f92_digested_callback_durably_suppresses_when_recorder_missed(barrier_db, monkeypatch):
+    _seed_raw(barrier_db, workers=("worker-a",))
+    watchdog = _install_f92_watchdog(monkeypatch)
+    watchdog.record_inbound_task("worker-a", "owner", "developer")
+    recorder = MagicMock()
+    monkeypatch.setattr(watchdog, "record_callback_if_to_caller", recorder)
+    create_inbox_message(
+        "owner",
+        "worker-a",
+        "task",
+        dispatch_barrier={"label": "f92-durable"},
+    )
+
+    callback = create_inbox_message("worker-a", "owner", "answer")
+
+    assert callback.status == MessageStatus.DIGESTED
+    recorder.assert_called_once_with("worker-a", "owner")
+    episode = watchdog._episodes["worker-a"]
+    assert not episode.callback_seen
+    watchdog.record_status("worker-a", TerminalStatus.IDLE, now=10.0)
+    episode.last_screen_fp = "sample"
+    assert watchdog.collect_due_notifications(now=13.0) == []
+    assert episode.callback_seen
+    assert not episode.fired
+
+
+def test_f92_combined_partial_barrier_row_does_not_clear_missing_worker(barrier_db, monkeypatch):
+    _seed_raw(barrier_db)
+    watchdog = _install_f92_watchdog(monkeypatch)
+    watchdog.record_inbound_task("worker-b", "owner", "developer")
+    _dispatch_pair("f92-partial")
+    create_inbox_message("worker-a", "owner", "answer")
+    fired = fire_due_barriers(datetime.now(timezone.utc) + timedelta(hours=1))
+    assert len(fired) == 1
+    with barrier_db() as db:
+        combined = db.query(InboxModel).filter_by(id=fired[0]).one()
+        assert combined.sender_id.startswith("barrier:")
+        assert "1/2" in combined.message
+
+    episode = watchdog._episodes["worker-b"]
+    watchdog.record_status("worker-b", TerminalStatus.IDLE, now=10.0)
+    episode.last_screen_fp = "sample"
+    monkeypatch.setattr(
+        watchdog,
+        "_fresh_frame_decides_running",
+        lambda _terminal_id: (False, None),
+    )
+
+    notices = watchdog.collect_due_notifications(now=13.0)
+
+    assert len(notices) == 1
+    assert notices[0].terminal_id == "worker-b"
+    assert episode.fired
+    assert not episode.callback_seen
 
 
 def test_terminal_settlement_selector_never_admits_held(barrier_db):

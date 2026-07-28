@@ -505,7 +505,7 @@ def create_logical_inbox_message(
                 db.commit()
                 db.refresh(row)
                 result = _inbox_message_from_row(row)
-                if result.status == MessageStatus.HELD:
+                if result.barrier_id is not None and result.barrier_member_key is not None:
                     stalled_callback_watchdog.record_callback_if_to_caller(
                         sender_id, logical_receiver_id or receiver_cache
                     )

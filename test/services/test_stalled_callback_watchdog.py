@@ -303,6 +303,111 @@ def test_watchdog_suppresses_notification_after_callback_to_recorded_caller():
     assert svc.collect_due_notifications(now=20.0) == []
 
 
+def test_f92_barrier_routed_callback_to_mailbox_suppresses_notification():
+    """F92: a callback addressed to the caller's MAILBOX must clear the episode.
+
+    Barrier-routed replies land on ``caller_mailbox_id``, not ``caller_id``. The
+    outer gate accepted either identity while the inner comparison tested
+    ``caller_id`` only, so the clear was a silent no-op and the next episode fired
+    a false ``idle ... without callback`` push at a worker that had already
+    replied. Observed 10+ times in one session across 3 terminals / 2 providers.
+    """
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    svc.record_inbound_task("worker1", "caller1", "developer")
+
+    with patch(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        return_value={"caller_id": "caller1", "caller_mailbox_id": "mb_caller1"},
+    ):
+        svc.record_callback_if_to_caller("worker1", "mb_caller1")
+
+    svc.record_status("worker1", TerminalStatus.IDLE, now=10.0)
+    # Arm everything a firing needs, so the empty result below can ONLY be caused
+    # by the callback having cleared the episode. Without this the assertion is
+    # vacuous -- it passes on an unfixed build because nothing could fire anyway.
+    _mark_screen_sampled(svc)
+
+    with patch(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        return_value={"id": "worker1"},
+    ):
+        assert svc.collect_due_notifications(now=13.0) == []
+
+
+def test_f92_fix_does_not_silence_the_genuine_hang_push():
+    """F92 guard: a worker assigned work that NEVER replies must still push.
+
+    A fix that suppresses everything is worse than the bug it closes. Same setup
+    as the test above, minus the callback.
+    """
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    svc.record_inbound_task("worker1", "caller1", "developer")
+    svc.record_status("worker1", TerminalStatus.IDLE, now=10.0)
+    _mark_screen_sampled(svc)
+
+    with patch(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        return_value={"id": "worker1"},
+    ):
+        assert svc.collect_due_notifications(now=13.0) == [
+            _notice("[watchdog] worker worker1 (developer) idle 3s without callback")
+        ]
+
+
+def test_f92_callback_from_an_unrelated_third_party_still_does_not_clear():
+    """F92 scope guard: widening the comparison must not accept a stranger.
+
+    ``mb_other`` is a real mailbox id, just not this episode's caller -- the outer
+    gate rejects it, and the episode must remain armed.
+    """
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    svc.record_inbound_task("worker1", "caller1", "developer")
+
+    with patch(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        return_value={"caller_id": "caller1", "caller_mailbox_id": "mb_caller1"},
+    ):
+        svc.record_callback_if_to_caller("worker1", "mb_other")
+
+    svc.record_status("worker1", TerminalStatus.IDLE, now=10.0)
+    _mark_screen_sampled(svc)
+
+    with patch(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        return_value={"id": "worker1"},
+    ):
+        assert svc.collect_due_notifications(now=13.0) == [
+            _notice("[watchdog] worker worker1 (developer) idle 3s without callback")
+        ]
+
+
+def test_f92_callback_to_new_current_caller_does_not_clear_older_episode():
+    """A callback for the current caller cannot clear an older caller's episode."""
+    svc = StalledCallbackWatchdog(grace_seconds=3)
+    svc.record_inbound_task("worker1", "caller1", "developer")
+    episode = svc._episodes["worker1"]
+
+    with patch(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        return_value={"caller_id": "caller2", "caller_mailbox_id": "mb_caller2"},
+    ):
+        svc.record_callback_if_to_caller("worker1", "caller2")
+
+    assert episode.callback_seen is False, "old caller episode was cleared by new caller callback"
+
+    svc.record_status("worker1", TerminalStatus.IDLE, now=10.0)
+    _mark_screen_sampled(svc)
+
+    with patch(
+        "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+        return_value={"id": "worker1"},
+    ):
+        notices = svc.collect_due_notifications(now=13.0)
+
+    assert notices == [_notice("[watchdog] worker worker1 (developer) idle 3s without callback")]
+    assert notices[0].caller_id == "caller1"
+
+
 def test_msgtrace_confirmed_commit_performs_watchdog_operations_exactly_once():
     """FX7 operations are grouped at the confirmed-delivery commit boundary."""
     from cli_agent_orchestrator.services.inbox_service import InboxService
@@ -348,9 +453,7 @@ def test_parked_commit_still_settles_sender_and_never_clears_existing_episode():
         ("mailbox-digest", OrchestrationType.MAILBOX_DIGEST),
     ],
 )
-def test_existing_nonarming_producer_classes_remain_nonarming(
-    sender_id, orchestration_type
-):
+def test_existing_nonarming_producer_classes_remain_nonarming(sender_id, orchestration_type):
     from cli_agent_orchestrator.services.inbox_service import InboxService
 
     with patch(
@@ -467,7 +570,8 @@ def test_watchdog_provisional_callback_suppresses_and_requeries(status):
     assert not episode.fired
 
 
-def test_watchdog_delivered_callback_durably_suppresses_without_requery():
+@pytest.mark.parametrize("status", [MessageStatus.DELIVERED, MessageStatus.DIGESTED])
+def test_watchdog_durable_callback_suppresses_without_requery(status):
     svc = _armed_due_watchdog()
     episode = svc._episodes["worker1"]
 
@@ -479,13 +583,29 @@ def test_watchdog_delivered_callback_durably_suppresses_without_requery():
         patch(
             "cli_agent_orchestrator.services.stalled_callback_watchdog."
             "get_callback_status_since",
-            return_value=MessageStatus.DELIVERED,
+            return_value=status,
         ) as callback_status,
     ):
         assert svc.collect_due_notifications(now=13.0) == []
         assert svc.collect_due_notifications(now=14.0) == []
 
     callback_status.assert_called_once()
+    assert episode.callback_seen
+    assert not episode.fired
+
+
+def test_watchdog_second_digested_callback_read_clears_during_capture():
+    svc = _armed_due_watchdog()
+    episode = svc._episodes["worker1"]
+
+    with _watchdog_guard_fakes(
+        _WPQ4_T10_FRAME,
+        callback_side_effect=(None, MessageStatus.DIGESTED),
+    ) as (backend, callback_status):
+        assert svc.collect_due_notifications(now=13.0) == []
+
+    backend.capture_viewport.assert_called_once_with("cao-test", "worker1")
+    assert callback_status.call_count == 2
     assert episode.callback_seen
     assert not episode.fired
 
@@ -1189,8 +1309,14 @@ def test_positive_grok_sample_keeps_existing_alarm_class():
                 "tmux_window": "worker1",
             },
         ),
-        patch("cli_agent_orchestrator.services.seam_activation.receiver_state_active", return_value=False),
-        patch("cli_agent_orchestrator.providers.manager.provider_manager.get_provider", return_value=provider),
+        patch(
+            "cli_agent_orchestrator.services.seam_activation.receiver_state_active",
+            return_value=False,
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
+            return_value=provider,
+        ),
     ):
         notices = svc.collect_due_notifications(now=13)
     assert notices[0].message == "[watchdog] worker worker1 (developer) idle 3s without callback"

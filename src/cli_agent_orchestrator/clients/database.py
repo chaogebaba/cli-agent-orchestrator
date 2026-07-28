@@ -4304,7 +4304,7 @@ def _create_inbox_message_unfenced(
         db.commit()
         db.refresh(inbox_msg)
         result = _inbox_message_from_row(inbox_msg)
-        if result.status == MessageStatus.HELD:
+        if result.barrier_id is not None and result.barrier_member_key is not None:
             from cli_agent_orchestrator.services.stalled_callback_watchdog import (
                 stalled_callback_watchdog,
             )
@@ -6497,6 +6497,7 @@ def get_callback_status_since(
                         MessageStatus.HELD.value,
                         MessageStatus.DELIVERING.value,
                         MessageStatus.DELIVERED.value,
+                        MessageStatus.DIGESTED.value,
                     )
                 ),
             )
