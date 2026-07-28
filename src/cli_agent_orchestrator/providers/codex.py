@@ -196,6 +196,40 @@ _UPDATE_DIALOG_ROW_PATTERNS = (
     re.compile(rf"^{UPDATE_DIALOG_FOOTER}$", re.IGNORECASE),
 )
 STARTUP_PROMPT_BOTTOM_LINES = 15
+STARTUP_ACTIVITY_PATTERN = r"^\s*•[^\S\n]+\S"
+STARTUP_BLOCKING_INPUT_PATTERN = (
+    r"(?:Command Approval Required|\[[aA]\]\s+Accept\b|"
+    r"\[[dD]\]\s+Decline\b|Press enter to continue)"
+)
+# MERGE NOTE (upstream bfc4d71f). Upstream's `_has_startup_idle_composer` reuses
+# TUI_FOOTER_PATTERN, which upstream defines UNANCHORED
+# (r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])") so it matches
+# anywhere in a line. THIS FORK deliberately anchored TUI_FOOTER_PATTERN with
+# ^...$ to stop mid-line prose from latching a footer. Codex 0.145 renders the
+# status bar as "  gpt-5.6-sol medium · Context 100% left" — model name FIRST —
+# so our anchored pattern does not match it and upstream's helper returned False
+# for every placeholder (10 test failures on merge).
+#
+# Resolved by giving the STARTUP path its own footer predicate rather than
+# loosening TUI_FOOTER_PATTERN, whose anchoring guards the runtime status
+# classifier that F29/F31 hardened. Startup readiness and runtime status are
+# different questions and now have different predicates.
+STARTUP_FOOTER_PATTERN = (
+    r"(?i)(?:\?\s+for shortcuts|context\s+\d+%\s+left|\d+%\s+(?:context\s+)?left|·\s+[~/])"
+)
+STARTUP_IDLE_PLACEHOLDER_PATTERN = (
+    rf"^\s*{IDLE_PROMPT_PATTERN}[^\S\n]+(?:"
+    r"Explain this codebase|"
+    r"Summarize recent commits|"
+    r"Implement \{feature\}|"
+    r"Find and fix a bug in @filename|"
+    r"Write tests for @filename|"
+    r"Improve documentation in @filename|"
+    r"Run /review on my current changes|"
+    r"Use /skills to list available skills"
+    r")\s*$"
+)
+
 # Codex welcome banner indicating normal startup (no trust prompt)
 CODEX_WELCOME_PATTERN = r"OpenAI Codex"
 CODEX_EMPTY_COMPOSER_PLACEHOLDERS = {
@@ -617,6 +651,34 @@ def _has_update_dialog_in_bottom(clean_output: str) -> bool:
     return False
 
 
+def _has_startup_idle_composer(clean_output: str) -> bool:
+    """Return True when the bottom of the pane shows Codex's idle composer."""
+    all_lines = clean_output.splitlines()
+    tail_lines = all_lines[-STARTUP_PROMPT_BOTTOM_LINES:]
+    tail_output = "\n".join(tail_lines)
+
+    if re.search(STARTUP_ACTIVITY_PATTERN, tail_output, re.MULTILINE):
+        return False
+    if re.search(WAITING_PROMPT_PATTERN, tail_output, re.IGNORECASE | re.MULTILINE):
+        return False
+    if re.search(STARTUP_BLOCKING_INPUT_PATTERN, tail_output, re.IGNORECASE):
+        return False
+
+    legacy_tail = all_lines[-IDLE_PROMPT_TAIL_LINES:]
+    if any(re.match(IDLE_PROMPT_STRICT_PATTERN, line) for line in legacy_tail):
+        return True
+
+    # Codex 0.145 renders placeholder text inside the idle composer instead of
+    # an empty prompt. Match only known placeholder copy and require its status
+    # footer below it so typed drafts and ordinary output are not treated as ready.
+    for index in range(len(tail_lines) - 1, -1, -1):
+        if re.match(STARTUP_IDLE_PLACEHOLDER_PATTERN, tail_lines[index]):
+            return any(
+                re.search(STARTUP_FOOTER_PATTERN, line) for line in tail_lines[index + 1 :]
+            )
+    return False
+
+
 def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
     """Find the first ASSISTANT_PREFIX_PATTERN match in ``text`` whose line
     is not an MCP tool-call marker.
@@ -961,6 +1023,7 @@ class CodexProvider(BaseProvider):
                 continue
 
             clean_output = strip_terminal_escapes(re.sub(ANSI_CODE_PATTERN, "", output))
+            bottom_region = "\n".join(clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
 
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -983,8 +1046,22 @@ class CodexProvider(BaseProvider):
                 get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 return
 
-            if re.search(CODEX_WELCOME_PATTERN, clean_output):
-                logger.info("Codex started without a blocking startup prompt")
+            # Exit when the bottom region shows the idle composer prompt AND no
+            # dialog is active. The welcome banner alone is insufficient — it
+            # renders as normal startup chrome BEFORE a late update dialog appears.
+            has_idle = _has_startup_idle_composer(clean_output)
+            # MERGE NOTE (upstream bfc4d71f): upstream tests
+            # TRUST_PROMPT_PATTERN and a separate TRUST_PROMPT_PATTERN_V2 +
+            # TRUST_PROMPT_FOOTER pair. Neither V2 symbol exists in this fork —
+            # our TRUST_PROMPT_PATTERN (:164) already unions BOTH trust texts
+            # ("allow Codex to work in this folder" | "Do you trust the contents
+            # of this directory"), so the V2 clause is redundant here rather than
+            # dropped. Transcribing it verbatim raised NameError in 14 tests.
+            has_dialog = re.search(TRUST_PROMPT_PATTERN, bottom_region) or (
+                _has_update_dialog_in_bottom(clean_output)
+            )
+            if has_idle and not has_dialog:
+                logger.info("Codex started — idle prompt visible, no blocking dialog")
                 return
 
             await asyncio.sleep(1.0)
