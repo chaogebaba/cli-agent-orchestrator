@@ -15,7 +15,7 @@ import termios
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, AsyncIterator, Dict, List, Optional, Tuple, cast
+from typing import Annotated, Any, AsyncIterator, Dict, List, Literal, Optional, Tuple, cast
 
 from fastapi import (
     BackgroundTasks,
@@ -272,6 +272,7 @@ class CreateTerminalBody(BaseModel):
     barrier_timeout_seconds: Optional[StrictInt] = None
     barrier_member_key: Optional[str] = None
     park_warm: bool = False
+    lifecycle: Optional[Literal["ephemeral", "sticky"]] = None
 
     @field_validator("barrier")
     @classmethod
@@ -2088,6 +2089,7 @@ async def create_session(
             initial_message=initial_message,
             initial_message_orchestration_type=initial_message_orchestration_type,
             model=model,
+            lifecycle=body.lifecycle if body else None,
         )
         if allow_incomplete_brief:
             create_kwargs["allow_incomplete_brief"] = True
@@ -2262,6 +2264,18 @@ async def get_session_manifest(session_name: str) -> Dict:
 
     try:
         return build_session_manifest(session_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+
+@app.get("/sessions/{session_name}/fleet")
+async def get_session_fleet(session_name: str) -> Dict:
+    """Return the narrow live fleet projection in one request."""
+    from cli_agent_orchestrator.services.fleet_service import build_fleet
+
+    try:
+        validate_tmux_name(session_name, "session_name")
+        return await asyncio.to_thread(build_fleet, session_name)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
@@ -2605,6 +2619,7 @@ async def create_terminal_in_session(
             initial_message=initial_message,
             initial_message_orchestration_type=orch_type,
             park_warm=body.park_warm if body else False,
+            lifecycle=body.lifecycle if body else None,
             fork_context=fork_context,
             refresh_base_name=body.refresh_base_name if body else None,
             dispatch_barrier=(
@@ -3607,6 +3622,8 @@ async def delete_terminal(
     request: Request,
     terminal_id: TerminalId,
     force: bool = False,
+    orphan: bool = False,
+    caller_id: Optional[TerminalId] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
 ) -> Dict:
     """Delete a terminal."""
@@ -3617,12 +3634,19 @@ async def delete_terminal(
         # loop so a stalled tmux/FIFO op bounds its blast radius to this one
         # request instead of wedging the whole server (issue #382 fixed this
         # for DELETE /sessions; the per-terminal path had the same hazard).
-        success = await asyncio.to_thread(
+        delete_kwargs: Dict[str, Any] = {"registry": get_plugin_registry(request)}
+        if force:
+            delete_kwargs["force"] = True
+        if orphan:
+            delete_kwargs["orphan"] = True
+        if caller_id is not None:
+            delete_kwargs["caller_id"] = caller_id
+        result = await asyncio.to_thread(
             terminal_service.delete_terminal,
             terminal_id,
-            registry=get_plugin_registry(request),
+            **delete_kwargs,
         )
-        return {"success": success}
+        return {"success": True, **result}
     except TerminalProtectionError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:

@@ -6,10 +6,23 @@ import hashlib
 import os
 import re
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Callable, Literal, assert_never, cast
+
+from cli_agent_orchestrator.models.observation import (
+    CoverageProof,
+    CoverageReason,
+    CoverageUnobs,
+    Covered,
+    Deadline,
+    Disproven,
+    Observation,
+    Proven,
+    Unobservable,
+)
 
 from cli_agent_orchestrator.services.fork_context_service import (
     SnapshotDelta,
@@ -46,9 +59,13 @@ def decode_path(value: str) -> str:
 def canonical_entries(entries: tuple[SnapshotEntry, ...] | list[SnapshotEntry]) -> str:
     ordered = sorted(entries, key=lambda entry: encode_path(entry.path).encode("utf-8"))
     return "\n".join(
-        f"{entry.state} {entry.value or '-'} {encode_path(entry.path)}"
-        for entry in ordered
+        f"{entry.state} {entry.value or '-'} {encode_path(entry.path)}" for entry in ordered
     )
+
+
+def projected_manifest_bytes(entries: tuple[SnapshotEntry, ...] | list[SnapshotEntry]) -> int:
+    """Return the encoded entry-manifest bytes before snapshot state is discarded."""
+    return len(canonical_entries(entries).encode("utf-8"))
 
 
 def state_key(delta: SnapshotDelta) -> str:
@@ -79,11 +96,52 @@ class DigestPending:
 
 @dataclass(frozen=True)
 class DigestInvalid:
-    reason: str
+    reason: DigestInvalidReason
+    delta: SnapshotDelta
+    detail: str | BudgetBreakdown | None = None
     kind: Literal["invalid"] = "invalid"
 
 
-DigestDecision = DigestCovered | DigestPending | DigestInvalid
+@dataclass(frozen=True)
+class DigestUnobservable:
+    reason: CoverageUnobs
+    delta: SnapshotDelta
+    detail: str | None = None
+    kind: Literal["unobservable"] = "unobservable"
+
+
+DigestInvalidReason = Literal[
+    "over_budget_artifact",
+    "base_mismatch",
+    "lineage",
+    "malformed_manifest",
+    "unreadable",
+]
+
+
+@dataclass(frozen=True)
+class BudgetBreakdown:
+    cap: int
+    artifact_bytes: int | None = None
+    manifest_bytes: int | None = None
+    body_bytes: int | None = None
+    top_dirty: tuple[tuple[str, int], ...] = ()
+
+
+class OverBudgetError(ValueError):
+    """A rendered digest exceeded the cap before publication."""
+
+    def __init__(self, detail: BudgetBreakdown, *, kind: Literal["rendered"] = "rendered"):
+        self.kind = kind
+        self.detail = detail
+        super().__init__(
+            f"{kind} digest exceeds {detail.cap} bytes: "
+            f"manifest={detail.manifest_bytes}, body={detail.body_bytes}, "
+            f"top_dirty={detail.top_dirty}"
+        )
+
+
+DigestDecision = DigestCovered | DigestPending | DigestInvalid | DigestUnobservable
 
 
 def _artifact_hash(data: bytes) -> str:
@@ -155,7 +213,7 @@ def _parse_manifest(path: Path) -> BaseDigestArtifact:
     )
 
 
-def _digest_dir(row: dict) -> Path:
+def _digest_dir(row: dict[str, Any]) -> Path:
     return Path(row["cwd"]) / "tmp" / "orch" / "digests"
 
 
@@ -185,34 +243,58 @@ def _same_entries(left: tuple[SnapshotEntry, ...], right: tuple[SnapshotEntry, .
     return sorted(left, key=key) == sorted(right, key=key)
 
 
-def covers(artifact: BaseDigestArtifact, delta: SnapshotDelta) -> bool:
-    """Return whether an artifact exactly covers an acquired snapshot delta."""
-    if delta.acquisition_error or any(entry.state == "unhashable" for entry in delta.entries):
-        return False
-    return _same_entries(artifact.entries, delta.entries)
+def coverage(
+    artifact: BaseDigestArtifact,
+    delta: SnapshotDelta,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+) -> Observation[Covered, CoverageProof, CoverageReason]:
+    """Select the first applicable coverage disposition in the ruled order."""
+    if delta.acquisition_error:
+        return Unobservable("apparatus_unavailable", retry_after=Deadline(clock()))
+    if any(entry.state == "unhashable" for entry in delta.entries):
+        return Unobservable("unhashable_entry", retry_after=Deadline(clock()))
+    if not _same_entries(artifact.entries, delta.entries):
+        return Disproven("entry_mismatch")
+    return Proven(Covered(), by=CoverageProof.ENTRIES_MATCH)
 
 
-def evaluate(row: dict, delta: SnapshotDelta) -> DigestDecision:
+def evaluate(row: dict[str, Any], delta: SnapshotDelta) -> DigestDecision:
     """Return the closed refresh decision for one base and acquired delta."""
     if delta.acquisition_error:
-        return DigestInvalid(f"acquisition:{delta.acquisition_error}")
+        return DigestUnobservable("apparatus_unavailable", delta, detail=delta.acquisition_error)
     candidate = _newest_candidate(row["name"], _digest_dir(row))
     if candidate is None:
         return DigestPending(delta)
     try:
         if candidate.stat().st_size > MAX_DIGEST_BYTES:
-            return DigestInvalid("over-budget")
+            artifact_bytes = candidate.stat().st_size
+            return DigestInvalid(
+                "over_budget_artifact",
+                delta,
+                detail=BudgetBreakdown(
+                    artifact_bytes=artifact_bytes,
+                    cap=MAX_DIGEST_BYTES,
+                ),
+            )
         artifact = _parse_manifest(candidate)
-    except (OSError, UnicodeError, ValueError) as exc:
-        return DigestInvalid(str(exc))
+    except (OSError, UnicodeError) as exc:
+        return DigestInvalid("unreadable", delta, detail=str(exc))
+    except ValueError as exc:
+        return DigestInvalid("malformed_manifest", delta, detail=str(exc))
     if artifact.base != row["name"]:
-        return DigestInvalid("base-mismatch")
+        return DigestInvalid("base_mismatch", delta)
     expected_parent = row.get("digest_head") or "genesis"
     if artifact.parent_artifact_sha != expected_parent:
-        return DigestInvalid("lineage")
-    if not covers(artifact, delta):
+        return DigestInvalid("lineage", delta)
+    observation = coverage(artifact, delta)
+    if isinstance(observation, Disproven):
         return DigestPending(delta)
-    return DigestCovered(artifact)
+    if isinstance(observation, Unobservable):
+        return DigestUnobservable(cast(CoverageUnobs, observation.reason), delta)
+    if isinstance(observation, Proven):
+        return DigestCovered(artifact)
+    assert_never(observation)
 
 
 def publish(
@@ -239,7 +321,9 @@ def publish(
         f"{entries}\n"
         "-->\n"
     )
-    provisional = (manifest + body.rstrip("\n") + "\n").encode("utf-8")
+    manifest_data = manifest.encode("utf-8")
+    body_data = (body.rstrip("\n") + "\n").encode("utf-8")
+    provisional = manifest_data + body_data
     artifact_sha = _artifact_hash(provisional)
     final = provisional.replace(
         ("artifact_sha: " + "0" * 64 + "\n").encode("ascii"),
@@ -247,8 +331,33 @@ def publish(
         1,
     )
     if len(final) > MAX_DIGEST_BYTES:
-        raise ValueError("over-budget")
-    with tempfile.NamedTemporaryFile("wb", dir=directory, prefix=".digest-", delete=False) as stream:
+        contributors = tuple(
+            sorted(
+                (
+                    (
+                        entry.path,
+                        len(
+                            f"{entry.state} {entry.value or '-'} {encode_path(entry.path)}".encode(
+                                "utf-8"
+                            )
+                        ),
+                    )
+                    for entry in delta.entries
+                ),
+                key=lambda item: (-item[1], encode_path(item[0]).encode("utf-8")),
+            )[:5]
+        )
+        raise OverBudgetError(
+            BudgetBreakdown(
+                manifest_bytes=len(manifest_data),
+                body_bytes=len(body_data),
+                cap=MAX_DIGEST_BYTES,
+                top_dirty=contributors,
+            )
+        )
+    with tempfile.NamedTemporaryFile(
+        "wb", dir=directory, prefix=".digest-", delete=False
+    ) as stream:
         stream.write(final)
         stream.flush()
         os.fsync(stream.fileno())

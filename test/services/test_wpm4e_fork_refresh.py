@@ -381,6 +381,104 @@ async def test_e1_post_dispatch_delta_mismatch_preserves_snapshot_and_lineage(mo
 
 
 @pytest.mark.asyncio
+async def test_ac8c_evaluate_unobservable_sends_no_pending_notice(monkeypatch, caplog):
+    terminals._fork_refresh_locks.clear()
+    delta = SnapshotDelta(None, acquisition_error="git-failure")
+    row = {
+        "id": 7, "name": "base", "kind": "base", "source_terminal_id": "base-term",
+        "session_uuid": "uuid", "cwd": "/repo",
+    }
+    notices = []
+    dispatches = []
+
+    async def inline(_terminal, _generation, _kind, _operation, function, *args,
+                     deadline=None, **kwargs):
+        return function(*args, **kwargs), time.monotonic()
+
+    async def ready(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(terminals, "_tracked_blocking", inline)
+    monkeypatch.setattr(terminals, "get_ready_provider_session", lambda _name: row)
+    monkeypatch.setattr(
+        terminals, "fork_staleness", lambda _row: StalenessResult(delta, "[STALE]", 1)
+    )
+    monkeypatch.setattr(terminals, "_wait_for_base_ready", ready)
+    monkeypatch.setattr(
+        terminals, "create_digest_pending_notice",
+        lambda *_args, **_kwargs: notices.append(True),
+    )
+    monkeypatch.setattr(
+        terminals, "_dispatch_base_refresh",
+        lambda *_args, **_kwargs: dispatches.append(True),
+    )
+    caplog.set_level("WARNING")
+
+    preamble = await terminals._prepare_fork_refresh(
+        "worker", "g", "base", "[STALE]", None, {"caller_id": "caller"}
+    )
+
+    assert preamble == "[STALE]"
+    assert notices == []
+    assert dispatches == []
+    assert "digest_refresh_unobservable base=base reason=apparatus_unavailable" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ac8c_post_dispatch_acquisition_gap_uses_coverage_and_logs_reason(
+    monkeypatch, caplog
+):
+    terminals._fork_refresh_locks.clear()
+    entry = SnapshotEntry("old.py", "sha256", "a" * 64)
+    row = {
+        "id": 7, "name": "base", "kind": "base", "source_terminal_id": "base-term",
+        "session_uuid": "uuid", "cwd": "/repo", "git_sha": "old",
+        "dirty_hashes": "{}",
+    }
+    writes = []
+
+    async def inline(_terminal, _generation, _kind, _operation, function, *args,
+                     deadline=None, **kwargs):
+        return function(*args, **kwargs), time.monotonic()
+
+    async def ready(*_args, **_kwargs):
+        return True
+
+    comparisons = iter(
+        (
+            _stale(("old.py",)),
+            StalenessResult(
+                SnapshotDelta(None, (entry,), acquisition_error="git-failure"),
+                "[STALE]", 1,
+            ),
+        )
+    )
+    monkeypatch.setattr(terminals, "_tracked_blocking", inline)
+    monkeypatch.setattr(terminals, "get_ready_provider_session", lambda _name: row)
+    monkeypatch.setattr(terminals, "fork_staleness", lambda _row: next(comparisons))
+    monkeypatch.setattr(
+        terminals.base_digest_service, "evaluate", lambda *_args: _covered((entry,))
+    )
+    monkeypatch.setattr(terminals, "_wait_for_base_ready", ready)
+    monkeypatch.setattr(terminals, "_dispatch_base_refresh", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(terminals, "fork_snapshot", lambda _cwd: SnapshotDelta("new"))
+    monkeypatch.setattr(terminals.status_monitor, "get_input_gen", lambda _id: 1)
+    monkeypatch.setattr(
+        terminals, "update_provider_session_snapshot",
+        lambda *_args, **kwargs: writes.append(kwargs),
+    )
+    caplog.set_level("WARNING")
+
+    preamble = await terminals._prepare_fork_refresh(
+        "worker", "g", "base", "[STALE]", None, {}
+    )
+
+    assert preamble == "[STALE]"
+    assert writes == []
+    assert "digest_post_dispatch_unobservable base=base reason=apparatus_unavailable" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_e1_busy_refresh_timeout_falls_back_stale_within_budget(monkeypatch):
     terminals._fork_refresh_locks.clear()
     row = {

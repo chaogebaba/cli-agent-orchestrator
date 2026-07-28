@@ -104,6 +104,7 @@ async def create_session(
     initial_message: str | None = None,
     initial_message_orchestration_type: OrchestrationType | None = None,
     model: str | None = None,
+    lifecycle: str | None = None,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
@@ -166,6 +167,7 @@ async def create_session(
         initial_message=initial_message,
         initial_message_orchestration_type=initial_message_orchestration_type,
         model=model,
+        lifecycle=lifecycle,
     )
     if mailbox_claim is not None:
         from cli_agent_orchestrator.clients.database import get_terminal_metadata

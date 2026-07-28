@@ -74,6 +74,7 @@ class AgentProfile(BaseModel):
     system_prompt: Optional[str] = None  # The markdown content
     role: Optional[str] = None  # "supervisor", "developer", "reviewer"
     protected: Optional[bool] = None  # Refuse MCP deletion unless force=true
+    lifecycle: Optional[Literal["ephemeral", "sticky"]] = None
 
     # CAO-native. Per-agent skill-catalog scope: when set, only skills whose name
     # matches one of these patterns (exact name or fnmatch glob, e.g. "ads-*") are

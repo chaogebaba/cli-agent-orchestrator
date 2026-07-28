@@ -26,7 +26,9 @@ class TestSnapshotOnDelete:
         self, mock_log_dir, mock_db_delete, mock_pm, mock_meta, mock_tmux, tmp_path
     ):
         """Snapshot files are written before the window is killed."""
-        from cli_agent_orchestrator.services.terminal_service import delete_terminal
+        from cli_agent_orchestrator.services.terminal_service import (
+            _delete_terminal_core as delete_terminal,
+        )
 
         mock_log_dir.__truediv__ = lambda self, name: tmp_path / name
         mock_meta.return_value = {
@@ -64,7 +66,9 @@ class TestSnapshotOnDelete:
         self, mock_log_dir, mock_db_delete, mock_pm, mock_meta, mock_tmux, tmp_path
     ):
         """Snapshot failure does not prevent terminal deletion."""
-        from cli_agent_orchestrator.services.terminal_service import delete_terminal
+        from cli_agent_orchestrator.services.terminal_service import (
+            _delete_terminal_core as delete_terminal,
+        )
 
         mock_log_dir.__truediv__ = lambda self, name: tmp_path / name
         mock_meta.return_value = {

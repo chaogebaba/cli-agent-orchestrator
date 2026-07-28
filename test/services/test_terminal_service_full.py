@@ -14,9 +14,13 @@ from cli_agent_orchestrator.services.terminal_service import (
     OutputMode,
     TerminalInputBlockedError,
     _deferred_init_tasks,
+)
+from cli_agent_orchestrator.services.terminal_service import (
+    _delete_terminal_core as delete_terminal,
+)
+from cli_agent_orchestrator.services.terminal_service import (
     _schedule_deferred_init,
     create_terminal,
-    delete_terminal,
     get_output,
     get_terminal,
     get_working_directory,

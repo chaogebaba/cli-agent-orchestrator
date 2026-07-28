@@ -18,8 +18,10 @@ from cli_agent_orchestrator.plugins import (
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.session_service import create_session, delete_session
 from cli_agent_orchestrator.services.terminal_service import (
+    _delete_terminal_core as delete_terminal,
+)
+from cli_agent_orchestrator.services.terminal_service import (
     create_terminal,
-    delete_terminal,
     send_input,
 )
 
@@ -302,8 +304,7 @@ class TestTerminalPluginEvents:
         }
         mock_provider_manager.cleanup_provider.side_effect = lambda *_: call_order.append("cleanup")
         mock_db_delete_terminal.side_effect = lambda *_a, **_k: (
-            call_order.append("db_delete") or
-            {"terminal_deleted": True, "intent_deleted": False}
+            call_order.append("db_delete") or {"terminal_deleted": True, "intent_deleted": False}
         )
         registry.dispatch.side_effect = record_dispatch
 
@@ -422,12 +423,32 @@ class TestMessagePluginEvents:
 
         registry.dispatch.assert_not_awaited()
 
-    @patch("cli_agent_orchestrator.services.inbox_service.confirm_delivery", return_value=("unverified", {"kind": "send_returned_unverified"}))
-    @patch("cli_agent_orchestrator.services.inbox_service.get_message_trace", return_value={"attempts": [{"attempt_uuid": "attempt-1", "started_at": "2026-07-11T00:00:00+00:00", "evidence": {}}]})
-    @patch("cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt", return_value="attempt-1")
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.confirm_delivery",
+        return_value=("unverified", {"kind": "send_returned_unverified"}),
+    )
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.get_message_trace",
+        return_value={
+            "attempts": [
+                {
+                    "attempt_uuid": "attempt-1",
+                    "started_at": "2026-07-11T00:00:00+00:00",
+                    "evidence": {},
+                }
+            ]
+        },
+    )
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt",
+        return_value="attempt-1",
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.list_message_attempts", return_value=[])
     @patch("cli_agent_orchestrator.services.inbox_service.count_ambiguous_attempts", return_value=0)
-    @patch("cli_agent_orchestrator.services.inbox_service.get_terminal_metadata", return_value={"provider": "event"})
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.get_terminal_metadata",
+        return_value={"provider": "event"},
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.settle_delivery_attempt")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
@@ -471,6 +492,4 @@ class TestMessagePluginEvents:
             defer_on_dialog=True,
         )
         mock_settle.assert_called_once()
-        assert mock_settle.call_args.args[:3] == (
-            "attempt-1", MessageStatus.DELIVERED, "confirmed"
-        )
+        assert mock_settle.call_args.args[:3] == ("attempt-1", MessageStatus.DELIVERED, "confirmed")

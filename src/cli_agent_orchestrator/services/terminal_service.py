@@ -28,7 +28,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, Optional, Protocol, cast
+from typing import Any, Dict, Optional, Protocol, assert_never, cast
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
@@ -628,6 +628,7 @@ async def create_terminal(
     dispatch_barrier: dict[str, object] | None = None,
     park_warm: bool = False,
     model: Optional[str] = None,
+    lifecycle: str | None = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -728,6 +729,31 @@ async def create_terminal(
             raise ValueError(
                 f"sessionBrief requires a runtime-context provider; resolved provider={provider}"
             )
+        profile_lifecycle = getattr(early_profile, "lifecycle", None)
+        if profile_lifecycle not in {"ephemeral", "sticky"}:
+            profile_lifecycle = None
+        resolved_lifecycle = lifecycle or profile_lifecycle or "ephemeral"
+        if resolved_lifecycle not in {"ephemeral", "sticky"}:
+            raise ValueError("invalid_terminal_lifecycle")
+
+        # Existing-session managed creates take shared authority before any
+        # create_window call. The direct CLI restore path is intentionally
+        # unmanaged and does not pass through this function.
+        if not new_session and session_lifecycle_lease_token is None:
+            from cli_agent_orchestrator.services.session_lifecycle_lease import (
+                acquire_session_lifecycle_shared,
+            )
+
+            session_lifecycle_lease_token = acquire_session_lifecycle_shared(session_name)
+            if session_lifecycle_lease_token is None:
+                raise RuntimeError("resume_in_progress")
+            owned_lifecycle_lease = True
+        elif not new_session and not resume_uuid:
+            from cli_agent_orchestrator.services.session_lifecycle_lease import (
+                validate_session_lifecycle_shared,
+            )
+
+            validate_session_lifecycle_shared(session_name, session_lifecycle_lease_token)
     except Exception:
         if owned_uuid_lease:
             from cli_agent_orchestrator.services.provider_session_lease import (
@@ -831,6 +857,10 @@ async def create_terminal(
                     raise RuntimeError("window_create_failed") from exc
                 raise
             window_created = True
+
+        parent_writer = getattr(get_backend(), "set_window_parent", None)
+        if callable(parent_writer):
+            parent_writer(session_name, window_name, caller_id)
 
         # Step 3: Load the profile once for allowed tool resolution before
         # provider initialization. The skill catalog is computed only for
@@ -950,6 +980,11 @@ async def create_terminal(
                                 agent_profile=agent_profile,
                                 allowed_tools=allowed_tools,
                                 caller_id=caller_id,
+                                **(
+                                    {"lifecycle": resolved_lifecycle}
+                                    if resolved_lifecycle != "ephemeral"
+                                    else {}
+                                ),
                                 parent_base_name=fork_context.base_name,
                                 fork_mode=fork_context.mode,
                                 **init_fields,
@@ -963,6 +998,11 @@ async def create_terminal(
                                 agent_profile=agent_profile,
                                 allowed_tools=allowed_tools,
                                 caller_id=caller_id,
+                                **(
+                                    {"lifecycle": resolved_lifecycle}
+                                    if resolved_lifecycle != "ephemeral"
+                                    else {}
+                                ),
                                 parent_base_name=fork_context.base_name,
                                 fork_mode=fork_context.mode,
                                 dispatch_barrier=dispatch_barrier,
@@ -980,6 +1020,11 @@ async def create_terminal(
                                     agent_profile,
                                     allowed_tools,
                                     caller_id=caller_id,
+                                    **(
+                                        {"lifecycle": resolved_lifecycle}
+                                        if resolved_lifecycle != "ephemeral"
+                                        else {}
+                                    ),
                                     provider_session_id=attempted_resume_uuid,
                                     **init_fields,
                                 )
@@ -992,6 +1037,11 @@ async def create_terminal(
                                     agent_profile,
                                     allowed_tools,
                                     caller_id=caller_id,
+                                    **(
+                                        {"lifecycle": resolved_lifecycle}
+                                        if resolved_lifecycle != "ephemeral"
+                                        else {}
+                                    ),
                                     provider_session_id=attempted_resume_uuid,
                                     dispatch_barrier=dispatch_barrier,
                                     **init_fields,
@@ -1006,6 +1056,11 @@ async def create_terminal(
                                     agent_profile,
                                     allowed_tools,
                                     caller_id=caller_id,
+                                    **(
+                                        {"lifecycle": resolved_lifecycle}
+                                        if resolved_lifecycle != "ephemeral"
+                                        else {}
+                                    ),
                                     **init_fields,
                                 )
                             else:
@@ -1017,6 +1072,11 @@ async def create_terminal(
                                     agent_profile,
                                     allowed_tools,
                                     caller_id=caller_id,
+                                    **(
+                                        {"lifecycle": resolved_lifecycle}
+                                        if resolved_lifecycle != "ephemeral"
+                                        else {}
+                                    ),
                                     dispatch_barrier=dispatch_barrier,
                                     **init_fields,
                                 )
@@ -1024,6 +1084,14 @@ async def create_terminal(
             if lease_token is not None:
                 raise RuntimeError("db_publish_failed") from exc
             raise
+        if not resume_uuid and owned_lifecycle_lease:
+            from cli_agent_orchestrator.services.session_lifecycle_lease import (
+                release_session_lifecycle_lease,
+            )
+
+            release_session_lifecycle_lease(session_lifecycle_lease_token)
+            owned_lifecycle_lease = False
+            session_lifecycle_lease_token = None
         db_created = True
 
         # The live snapshot is transactional launch context. Build it only after
@@ -1179,6 +1247,7 @@ async def create_terminal(
             session_name=session_name,
             agent_profile=agent_profile,
             caller_id=caller_id,
+            lifecycle=resolved_lifecycle,
             allowed_tools=allowed_tools,
             shell_command=shell_command,
             status=initial_status,
@@ -1305,7 +1374,7 @@ async def create_terminal(
                 release_provider_session_lease(uuid_lease_token)
             except RuntimeError:
                 pass
-        if resume_uuid and session_lifecycle_lease_token is not None and owned_lifecycle_lease:
+        if session_lifecycle_lease_token is not None and owned_lifecycle_lease:
             from cli_agent_orchestrator.services.session_lifecycle_lease import (
                 release_session_lifecycle_lease,
             )
@@ -2191,6 +2260,13 @@ async def _prepare_fork_refresh(
         if isinstance(decision, base_digest_service.DigestInvalid):
             logger.warning("digest_refresh_invalid base=%s reason=%s", base_name, decision.reason)
             return stale_preamble
+        if isinstance(decision, base_digest_service.DigestUnobservable):
+            logger.warning(
+                "digest_refresh_unobservable base=%s reason=%s", base_name, decision.reason
+            )
+            return stale_preamble
+        if not isinstance(decision, base_digest_service.DigestCovered):
+            assert_never(decision)
         dispatched, _ = await _tracked_blocking(
             terminal_id,
             generation,
@@ -2237,10 +2313,19 @@ async def _prepare_fork_refresh(
             row,
             deadline=deadline,
         )
-        if post_dispatch.delta.acquisition_error or not post_dispatch.delta.git_sha:
+        coverage = base_digest_service.coverage(decision.artifact, post_dispatch.delta)
+        if isinstance(coverage, base_digest_service.Disproven):
+            logger.warning("digest_post_dispatch_mismatch base=%s", base_name)
             return stale_preamble
-        if not base_digest_service.covers(decision.artifact, post_dispatch.delta):
+        if isinstance(coverage, base_digest_service.Unobservable):
+            logger.warning(
+                "digest_post_dispatch_unobservable base=%s reason=%s",
+                base_name,
+                coverage.reason,
+            )
             return stale_preamble
+        if not isinstance(coverage, base_digest_service.Proven):
+            assert_never(coverage)
         current, _ = await _tracked_blocking(
             terminal_id,
             generation,
@@ -3433,9 +3518,174 @@ def provider_session_owner(session_uuid: str) -> dict:
     return {"state": "error" if saw_error else "gone", "terminal_id": None}
 
 
-def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
-    quiesce_deferred_terminal_sync(terminal_id)
-    return _delete_terminal_core(terminal_id, registry=registry)
+def _cascade_plan(
+    terminals: list[dict[str, Any]],
+    root_id: str,
+    *,
+    orphan: bool,
+    force: bool,
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Return children-before-parents reap order and named survivors."""
+    from cli_agent_orchestrator.services.terminal_guard_service import classify_deletion
+
+    children: dict[str, list[str]] = {}
+    by_id = {row["id"]: row for row in terminals}
+    for row in terminals:
+        parent = row.get("caller_id")
+        if parent:
+            children.setdefault(parent, []).append(row["id"])
+    for child_ids in children.values():
+        child_ids.sort()
+
+    reaped: list[str] = []
+    skipped: list[dict[str, str]] = []
+
+    def skip_subtree(node_id: str, reason: str) -> None:
+        skipped.append({"id": node_id, "reason": reason})
+        for child_id in children.get(node_id, []):
+            skip_subtree(child_id, f"ancestor_skipped:{node_id}")
+
+    def visit(node_id: str, depth: int) -> None:
+        if depth >= 32:
+            skip_subtree(node_id, "depth_cap")
+            return
+        classification = classify_deletion(node_id, force=force)
+        if not classification.allowed:
+            skip_subtree(node_id, classification.reason or "protected")
+            return
+        for child_id in children.get(node_id, []):
+            if child_id in by_id:
+                visit(child_id, depth + 1)
+        reaped.append(node_id)
+
+    if orphan:
+        for child_id in children.get(root_id, []):
+            skip_subtree(child_id, "orphan_requested")
+    else:
+        for child_id in children.get(root_id, []):
+            visit(child_id, 1)
+    reaped.append(root_id)
+    return reaped, skipped
+
+
+def _caller_owns_target(terminals: list[dict[str, Any]], caller_id: str, target_id: str) -> bool:
+    if caller_id == target_id:
+        return False
+    by_id = {row["id"]: row for row in terminals}
+    current = by_id.get(target_id)
+    seen: set[str] = set()
+    while current and current.get("caller_id"):
+        parent_id = current["caller_id"]
+        if parent_id == caller_id:
+            return True
+        if parent_id in seen:
+            return False
+        seen.add(parent_id)
+        current = by_id.get(parent_id)
+    return False
+
+
+def _surviving_ancestor(by_id: dict[str, dict[str, Any]], node_id: str, reap_set: set[str]) -> str:
+    current = by_id.get(node_id, {}).get("caller_id")
+    seen: set[str] = set()
+    while current:
+        if current in seen:
+            return ""
+        seen.add(current)
+        row = by_id.get(current)
+        if row is None:
+            return ""
+        if current not in reap_set and row.get("recovery_state") != "fallback_ready":
+            return current
+        current = row.get("caller_id")
+    return ""
+
+
+def delete_terminal(
+    terminal_id: str,
+    registry: PluginRegistry | None = None,
+    *,
+    force: bool = False,
+    orphan: bool = False,
+    caller_id: str | None = None,
+) -> dict[str, Any]:
+    """Cascade-delete a terminal's managed descendant tree."""
+    from cli_agent_orchestrator.services.rebind_lease import (
+        acquire_rebind_lease,
+        release_rebind_lease,
+    )
+    from cli_agent_orchestrator.services.session_lifecycle_lease import (
+        acquire_session_lifecycle_exclusive,
+        release_session_lifecycle_lease,
+    )
+    from cli_agent_orchestrator.services.terminal_guard_service import (
+        TerminalProtectionError,
+        require_delete_allowed,
+    )
+
+    root = get_terminal_metadata(terminal_id)
+    if root is None:
+        raise ValueError(f"Terminal '{terminal_id}' not found")
+    require_delete_allowed(terminal_id, force=force)
+    session_name = root["tmux_session"]
+
+    quiesce_deferred_session_sync(session_name)
+    lifecycle_lease = acquire_session_lifecycle_exclusive(session_name)
+    if lifecycle_lease is None:
+        raise RuntimeError("resume_in_progress")
+    try:
+        terminals = list_terminals_by_session(session_name)
+        if caller_id is not None and not _caller_owns_target(terminals, caller_id, terminal_id):
+            raise TerminalProtectionError("cascade_outside_caller_subtree")
+        order, skipped = _cascade_plan(
+            terminals,
+            terminal_id,
+            orphan=orphan,
+            force=force,
+        )
+        by_id = {row["id"]: row for row in terminals}
+        reap_set = set(order)
+        reaped: list[dict[str, str]] = []
+        for index, node_id in enumerate(order):
+            token = acquire_rebind_lease(node_id)
+            if token is None:
+                raise RuntimeError("rebind_in_progress")
+            try:
+                observation = status_monitor.get_boundary_observation(node_id)
+                busy = observation.status == TerminalStatus.PROCESSING
+                target_id = _surviving_ancestor(by_id, node_id, reap_set)
+                result = _delete_terminal_under_lease(
+                    node_id,
+                    token,
+                    registry=registry,
+                    require_confirmed_death=True,
+                    quarantine_session_uuid=by_id.get(node_id, {}).get("provider_session_id"),
+                    reparent_target_id=target_id,
+                )
+            finally:
+                release_rebind_lease(token)
+            if result.get("rollback_kill_uncertain"):
+                return {
+                    "reaped": reaped,
+                    "skipped": skipped,
+                    "uncertain": [{"id": node_id, "reason": "rollback_kill_uncertain"}],
+                    "unattempted": order[index + 1 :],
+                }
+            disposition = "killed_while_busy" if busy else "reaped"
+            reaped.append({"id": node_id, "status": disposition})
+            parent_writer = getattr(get_backend(), "set_window_parent", None)
+            if callable(parent_writer):
+                for child in terminals:
+                    if child.get("caller_id") == node_id and child["id"] not in reap_set:
+                        parent_writer(session_name, child["tmux_window"], target_id or None)
+        return {
+            "reaped": reaped,
+            "skipped": skipped,
+            "uncertain": [],
+            "unattempted": [],
+        }
+    finally:
+        release_session_lifecycle_lease(lifecycle_lease)
 
 
 def quiesce_deferred_terminals_sync(terminals: list[dict]) -> None:
@@ -3482,6 +3732,7 @@ def _delete_terminal_under_lease(
     quarantine_session_uuid: str | None = None,
     uuid_lease_token=None,
     persona_retention_intent=None,
+    reparent_target_id: str | None = None,
 ) -> Dict:
     """Delete terminal and kill its tmux window."""
     from cli_agent_orchestrator.services.rebind_lease import validate_rebind_lease
@@ -3664,10 +3915,12 @@ def _delete_terminal_under_lease(
             from cli_agent_orchestrator.services.memory_service import _curator_locks
 
             _curator_locks.pop(terminal_id, None)
-            deletion = delete_terminal_and_warm_intent(
-                terminal_id,
-                preserve_warm_intent=preserve_warm_intent,
-            )
+            deletion_kwargs: dict[str, Any] = {
+                "preserve_warm_intent": preserve_warm_intent,
+            }
+            if reparent_target_id is not None:
+                deletion_kwargs["reparent_target_id"] = reparent_target_id
+            deletion = delete_terminal_and_warm_intent(terminal_id, **deletion_kwargs)
         finally:
             delivery_lock.release()
         deleted = deletion["terminal_deleted"]

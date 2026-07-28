@@ -300,6 +300,7 @@ class TestCreateSession:
             initial_message=None,
             initial_message_orchestration_type=None,
             model=None,
+            lifecycle=None,
         )
 
     def test_create_session_passes_model_and_initial_message(self, client):
@@ -1151,13 +1152,19 @@ class TestDeleteTerminal:
     def test_delete_terminal_success(self, client):
         """DELETE /terminals/{id} deletes terminal successfully."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.delete_terminal.return_value = True
+            mock_svc.delete_terminal.return_value = {
+                "reaped": [{"id": "abcd1234", "status": "reaped"}],
+                "skipped": [],
+                "uncertain": [],
+                "unattempted": [],
+            }
 
             response = client.delete("/terminals/abcd1234")
 
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
+        assert data["reaped"] == [{"id": "abcd1234", "status": "reaped"}]
         mock_svc.delete_terminal.assert_called_once_with("abcd1234", registry=ANY)
 
     def test_delete_terminal_not_found(self, client):

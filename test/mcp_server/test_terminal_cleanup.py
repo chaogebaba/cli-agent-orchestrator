@@ -1,7 +1,8 @@
-"""Tests for delete_terminal MCP tool and _get_cleanup_nudge helper."""
+"""Tests for fleet/delete MCP tools and _get_cleanup_nudge helper."""
 
+import asyncio
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import requests
 
@@ -11,6 +12,7 @@ from cli_agent_orchestrator.mcp_server.server import (
     _get_terminal_context_from_env,
     _peek_terminal_impl,
     delete_terminal,
+    fleet,
 )
 
 
@@ -122,17 +124,47 @@ class TestDeleteTerminal:
     @patch("cli_agent_orchestrator.mcp_server.server.requests.delete")
     def test_force_overrides_protection(self, mock_delete):
         mock_delete.return_value.raise_for_status.return_value = None
+        mock_delete.return_value.json.return_value = {
+            "success": True,
+            "reaped": [{"id": "t1", "status": "reaped"}],
+            "skipped": [],
+            "uncertain": [],
+            "unattempted": [],
+        }
         result = delete_terminal("t1", force=True)
         assert result["success"] is True
         mock_delete.assert_called_once()
-        assert mock_delete.call_args.kwargs["params"] == {"force": True}
+        assert mock_delete.call_args.kwargs["params"] == {"force": True, "orphan": False}
 
     def test_success(self):
         with patch("cli_agent_orchestrator.mcp_server.server.requests.delete") as mock_delete:
             mock_delete.return_value.raise_for_status.return_value = None
+            mock_delete.return_value.json.return_value = {
+                "success": True,
+                "reaped": [{"id": "t1", "status": "reaped"}],
+                "skipped": [],
+                "uncertain": [],
+                "unattempted": [],
+            }
             result = delete_terminal("t1")
         assert result["success"] is True
-        assert "t1" in result["message"]
+        assert result["reaped"] == [{"id": "t1", "status": "reaped"}]
+
+    def test_orphan_true_is_forwarded(self):
+        with patch("cli_agent_orchestrator.mcp_server.server.requests.delete") as mock_delete:
+            mock_delete.return_value.raise_for_status.return_value = None
+            mock_delete.return_value.json.return_value = {
+                "success": True,
+                "reaped": [{"id": "t1", "status": "reaped"}],
+                "skipped": [{"id": "child", "reason": "orphan_requested"}],
+                "uncertain": [],
+                "unattempted": [],
+            }
+
+            result = delete_terminal("t1", orphan=True)
+
+        assert result["success"] is True
+        assert mock_delete.call_args.kwargs["params"] == {"force": False, "orphan": True}
 
     def test_not_found_returns_false(self):
         with patch("cli_agent_orchestrator.mcp_server.server.requests.delete") as mock_delete:
@@ -143,6 +175,41 @@ class TestDeleteTerminal:
             result = delete_terminal("t1")
         assert result["success"] is False
         assert "not found" in result["message"]
+
+
+class TestFleet:
+    def test_returns_one_serialized_fleet_envelope_with_orphan_and_depth(self):
+        payload = {
+            "session_name": "cao-test",
+            "terminals": [
+                {
+                    "id": "child",
+                    "profile": "developer",
+                    "provider": "codex",
+                    "window_index": "2",
+                    "window_name": "worker",
+                    "parent_id": "deadbeef",
+                    "depth": 2,
+                    "orphan": True,
+                    "status": "idle",
+                    "since_last_input": 1.0,
+                    "lifecycle": "ephemeral",
+                    "reparented_from": None,
+                }
+            ],
+        }
+        response = MagicMock()
+        response.json.return_value = payload
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server.cao_http.get",
+            return_value=response,
+        ) as get:
+            result = asyncio.run(fleet("cao-test"))
+
+        assert result["success"] is True
+        assert result["fleet"]["terminals"][0]["orphan"] is True
+        assert result["fleet"]["terminals"][0]["depth"] == 2
+        get.assert_called_once_with("/sessions/cao-test/fleet", timeout=ANY)
 
     def test_http_error_non_404(self):
         with patch("cli_agent_orchestrator.mcp_server.server.requests.delete") as mock_delete:

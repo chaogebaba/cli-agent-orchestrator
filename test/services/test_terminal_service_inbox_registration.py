@@ -26,12 +26,13 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import ForkContext, Terminal
+from cli_agent_orchestrator.services import epoch_recovery_service, terminal_service
+from cli_agent_orchestrator.services.terminal_service import (
+    _delete_terminal_core as delete_terminal,
+)
 from cli_agent_orchestrator.services.terminal_service import (
     create_terminal,
-    delete_terminal,
 )
-from cli_agent_orchestrator.services import epoch_recovery_service
-from cli_agent_orchestrator.services import terminal_service
 
 # Fixed identifiers used across the tests so assertions can be exact.
 TERMINAL_ID = "term-abc123"
@@ -180,42 +181,58 @@ class TestCreateTerminalHerdrRegistration:
         m.backend.kill_session.assert_not_called()
         m.provider_manager.cleanup_provider.assert_not_called()
 
-    @pytest.mark.parametrize("site,code,post_publish", [
-        ("window", "window_create_failed", False),
-        ("fifo_reader", "fifo_create_failed", False),
-        ("pipe_pane", "fifo_create_failed", False),
-        ("db", "db_publish_failed", False),
-        ("context", "context_build_failed", True),
-        ("provider", "provider_construct_failed", True),
-        ("init_timeout", "initialize_timeout", True),
-        ("init_failure", "initialize_failed", True),
-        ("capture_ambiguous", "session_capture_ambiguous", True),
-        ("capture_mismatch", "session_capture_mismatch", True),
-        ("artifact", "artifact_invalid", True),
-        ("identity", "identity_persist_failed", True),
-        ("herdr", "herdr_register_failed", True),
-    ])
+    @pytest.mark.parametrize(
+        "site,code,post_publish",
+        [
+            ("window", "window_create_failed", False),
+            ("fifo_reader", "fifo_create_failed", False),
+            ("pipe_pane", "fifo_create_failed", False),
+            ("db", "db_publish_failed", False),
+            ("context", "context_build_failed", True),
+            ("provider", "provider_construct_failed", True),
+            ("init_timeout", "initialize_timeout", True),
+            ("init_failure", "initialize_failed", True),
+            ("capture_ambiguous", "session_capture_ambiguous", True),
+            ("capture_mismatch", "session_capture_mismatch", True),
+            ("artifact", "artifact_invalid", True),
+            ("identity", "identity_persist_failed", True),
+            ("herdr", "herdr_register_failed", True),
+        ],
+    )
     @pytest.mark.asyncio
     async def test_d5_real_leased_creation_site_normalization(
-        self, create_mocks, site, code, post_publish,
+        self,
+        create_mocks,
+        site,
+        code,
+        post_publish,
     ):
         m = create_mocks
         token = SimpleNamespace(terminal_id=TERMINAL_ID)
         metadata = {
-            "id": TERMINAL_ID, "tmux_session": SESSION_NAME, "tmux_window": WINDOW_NAME,
-            "provider": "claude_code", "agent_profile": "developer",
-            "allowed_tools": None, "caller_id": None, "provider_session_id": "native-u",
+            "id": TERMINAL_ID,
+            "tmux_session": SESSION_NAME,
+            "tmux_window": WINDOW_NAME,
+            "provider": "claude_code",
+            "agent_profile": "developer",
+            "allowed_tools": None,
+            "caller_id": None,
+            "provider_session_id": "native-u",
         }
         m.backend.window_liveness.return_value = "gone"
         with contextlib.ExitStack() as stack:
-            stack.enter_context(patch(
-                "cli_agent_orchestrator.services.rebind_lease.validate_rebind_lease"
-            ))
-            get_metadata = stack.enter_context(patch(_TS + "get_terminal_metadata", return_value=metadata))
-            delete_row = stack.enter_context(patch(
-                _TS + "delete_terminal_and_warm_intent",
-                return_value={"terminal_deleted": True, "intent_deleted": False},
-            ))
+            stack.enter_context(
+                patch("cli_agent_orchestrator.services.rebind_lease.validate_rebind_lease")
+            )
+            get_metadata = stack.enter_context(
+                patch(_TS + "get_terminal_metadata", return_value=metadata)
+            )
+            delete_row = stack.enter_context(
+                patch(
+                    _TS + "delete_terminal_and_warm_intent",
+                    return_value={"terminal_deleted": True, "intent_deleted": False},
+                )
+            )
             fifo = stack.enter_context(patch(_TS + "fifo_manager"))
             persist = stack.enter_context(patch(_TS + "_persist_provider_runtime_identity"))
 
@@ -231,19 +248,29 @@ class TestCreateTerminalHerdrRegistration:
                 m.db_create_terminal.side_effect = RuntimeError("boom")
             elif site == "context":
                 m.load_agent_profile.return_value = SimpleNamespace(
-                    sessionBrief="required", skills=None, allowedTools=None,
-                    mcpServers=None, role=None, model=None,
+                    sessionBrief="required",
+                    skills=None,
+                    allowedTools=None,
+                    mcpServers=None,
+                    role=None,
+                    model=None,
                 )
-                stack.enter_context(patch(
-                    "cli_agent_orchestrator.services.session_manifest_service.build_session_manifest",
-                    side_effect=RuntimeError("boom"),
-                ))
+                stack.enter_context(
+                    patch(
+                        "cli_agent_orchestrator.services.session_manifest_service.build_session_manifest",
+                        side_effect=RuntimeError("boom"),
+                    )
+                )
             elif site == "provider":
                 m.provider_manager.create_provider.side_effect = RuntimeError("boom")
             elif site == "init_timeout":
-                m.provider_manager.create_provider.return_value.initialize.side_effect = TimeoutError("boom")
+                m.provider_manager.create_provider.return_value.initialize.side_effect = (
+                    TimeoutError("boom")
+                )
             elif site == "init_failure":
-                m.provider_manager.create_provider.return_value.initialize.side_effect = RuntimeError("boom")
+                m.provider_manager.create_provider.return_value.initialize.side_effect = (
+                    RuntimeError("boom")
+                )
             elif site == "capture_ambiguous":
                 persist.side_effect = RuntimeError("session_capture_ambiguous")
             elif site == "capture_mismatch":
@@ -257,9 +284,12 @@ class TestCreateTerminalHerdrRegistration:
 
             with pytest.raises(Exception) as caught:
                 await create_terminal(
-                    provider="claude_code", agent_profile="developer",
-                    session_name=SESSION_NAME, terminal_id=TERMINAL_ID,
-                    lease_token=token, strict_backend_registration=True,
+                    provider="claude_code",
+                    agent_profile="developer",
+                    session_name=SESSION_NAME,
+                    terminal_id=TERMINAL_ID,
+                    lease_token=token,
+                    strict_backend_registration=True,
                 )
 
         assert epoch_recovery_service._normalize_creation_error(caught.value) == code
@@ -274,37 +304,51 @@ class TestCreateTerminalHerdrRegistration:
         m = create_mocks
         token = SimpleNamespace(terminal_id=TERMINAL_ID)
         metadata = {
-            "id": TERMINAL_ID, "tmux_session": SESSION_NAME, "tmux_window": WINDOW_NAME,
-            "provider": "claude_code", "agent_profile": "developer",
-            "allowed_tools": None, "caller_id": None,
+            "id": TERMINAL_ID,
+            "tmux_session": SESSION_NAME,
+            "tmux_window": WINDOW_NAME,
+            "provider": "claude_code",
+            "agent_profile": "developer",
+            "allowed_tools": None,
+            "caller_id": None,
         }
         m.service.register_terminal.side_effect = RuntimeError("register failed")
         m.backend.window_liveness.return_value = "live"
-        m.provider_manager.get_provider.return_value = m.provider_manager.create_provider.return_value
-        with patch(_TS + "get_terminal_metadata", return_value=metadata) as get_metadata, \
-             patch(_TS + "status_monitor") as monitor, \
-             patch(_TS + "delete_terminal_and_warm_intent") as delete_row, \
-             patch(_TS + "list_terminals_by_provider_session_id",
-                   return_value=[metadata]), \
-             patch("cli_agent_orchestrator.services.rebind_lease.validate_rebind_lease"), \
-             patch("cli_agent_orchestrator.clients.database.quarantine_terminal_owner",
-                   return_value=True) as quarantine:
+        m.provider_manager.get_provider.return_value = (
+            m.provider_manager.create_provider.return_value
+        )
+        with (
+            patch(_TS + "get_terminal_metadata", return_value=metadata) as get_metadata,
+            patch(_TS + "status_monitor") as monitor,
+            patch(_TS + "delete_terminal_and_warm_intent") as delete_row,
+            patch(_TS + "list_terminals_by_provider_session_id", return_value=[metadata]),
+            patch("cli_agent_orchestrator.services.rebind_lease.validate_rebind_lease"),
+            patch(
+                "cli_agent_orchestrator.clients.database.quarantine_terminal_owner",
+                return_value=True,
+            ) as quarantine,
+        ):
             with pytest.raises(RuntimeError, match="rollback_kill_uncertain"):
                 await create_terminal(
-                    provider="claude_code", agent_profile="developer",
-                    session_name=SESSION_NAME, terminal_id=TERMINAL_ID,
-                    lease_token=token, strict_backend_registration=True,
+                    provider="claude_code",
+                    agent_profile="developer",
+                    session_name=SESSION_NAME,
+                    terminal_id=TERMINAL_ID,
+                    lease_token=token,
+                    strict_backend_registration=True,
                 )
             assert terminal_service.provider_session_owner("native-u") == {
-                "state": "live", "terminal_id": TERMINAL_ID,
+                "state": "live",
+                "terminal_id": TERMINAL_ID,
             }
 
         m.db_create_terminal.assert_called_once()
         get_metadata.assert_called_once_with(TERMINAL_ID)
-        quarantine.assert_called_once_with(
-            TERMINAL_ID, None, "rollback_kill_uncertain"
+        quarantine.assert_called_once_with(TERMINAL_ID, None, "rollback_kill_uncertain")
+        assert (
+            m.provider_manager.get_provider(TERMINAL_ID)
+            is m.provider_manager.create_provider.return_value
         )
-        assert m.provider_manager.get_provider(TERMINAL_ID) is m.provider_manager.create_provider.return_value
         monitor.clear_terminal.assert_not_called()
         m.service.unregister_terminal.assert_not_called()
         delete_row.assert_not_called()
@@ -312,29 +356,40 @@ class TestCreateTerminalHerdrRegistration:
 
     @pytest.mark.asyncio
     async def test_pre_identity_quarantine_blocks_second_epoch_owner(
-        self, create_mocks, quarantine_db, monkeypatch,
+        self,
+        create_mocks,
+        quarantine_db,
+        monkeypatch,
     ):
         m = create_mocks
         token = SimpleNamespace(terminal_id=TERMINAL_ID)
         source_uuid = "source-native-u"
         m.db_create_terminal.side_effect = database.create_terminal
         m.backend.window_liveness.return_value = "live"
-        with patch(_TS + "get_terminal_metadata", side_effect=database.get_terminal_metadata), \
+        with (
+            patch(_TS + "get_terminal_metadata", side_effect=database.get_terminal_metadata),
             patch(
                 _TS + "delete_terminal_and_warm_intent",
                 side_effect=database.delete_terminal_and_warm_intent,
-            ) as delete_row, \
-             patch(_TS + "_persist_provider_runtime_identity",
-                   side_effect=RuntimeError("session_capture_ambiguous")), \
-             patch("cli_agent_orchestrator.services.rebind_lease.validate_rebind_lease"):
+            ) as delete_row,
+            patch(
+                _TS + "_persist_provider_runtime_identity",
+                side_effect=RuntimeError("session_capture_ambiguous"),
+            ),
+            patch("cli_agent_orchestrator.services.rebind_lease.validate_rebind_lease"),
+        ):
             with pytest.raises(RuntimeError, match="rollback_kill_uncertain"):
                 await create_terminal(
-                    provider="claude_code", agent_profile="developer",
-                    session_name=SESSION_NAME, terminal_id=TERMINAL_ID,
+                    provider="claude_code",
+                    agent_profile="developer",
+                    session_name=SESSION_NAME,
+                    terminal_id=TERMINAL_ID,
                     lease_token=token,
                     fork_context=ForkContext(
-                        mode="resume", session_uuid=source_uuid,
-                        base_name="base", provider="claude_code",
+                        mode="resume",
+                        session_uuid=source_uuid,
+                        base_name="base",
+                        provider="claude_code",
                         initial_preamble="",
                     ),
                 )
@@ -346,13 +401,20 @@ class TestCreateTerminalHerdrRegistration:
         delete_row.assert_not_called()
 
         database.register_provider_session(
-            name="base", provider="claude_code", session_uuid=source_uuid,
-            cwd="/tmp", agent_profile="developer", dirty_hashes="{}",
-            source_terminal_id="old", session_name=SESSION_NAME,
+            name="base",
+            provider="claude_code",
+            session_uuid=source_uuid,
+            cwd="/tmp",
+            agent_profile="developer",
+            dirty_hashes="{}",
+            source_terminal_id="old",
+            session_name=SESSION_NAME,
         )
         monkeypatch.setattr(epoch_recovery_service, "get_backend", lambda: m.backend)
         monkeypatch.setattr(epoch_recovery_service, "_artifact_exists", lambda _: True)
-        monkeypatch.setattr(epoch_recovery_service, "load_agent_profile", lambda _: SimpleNamespace())
+        monkeypatch.setattr(
+            epoch_recovery_service, "load_agent_profile", lambda _: SimpleNamespace()
+        )
         create_again = AsyncMock()
         monkeypatch.setattr(epoch_recovery_service, "create_terminal", create_again)
         result = await epoch_recovery_service.recover_epoch(SESSION_NAME)
@@ -361,68 +423,98 @@ class TestCreateTerminalHerdrRegistration:
 
     @pytest.mark.asyncio
     async def test_leased_resume_uuid_is_published_before_provider_start(
-        self, create_mocks, quarantine_db,
+        self,
+        create_mocks,
+        quarantine_db,
     ):
         m = create_mocks
         source_uuid = "source-before-provider"
         m.db_create_terminal.side_effect = database.create_terminal
         observed = []
+
         def fail_provider(*_args, **_kwargs):
             observed.append(database.get_terminal_metadata(TERMINAL_ID)["provider_session_id"])
             raise RuntimeError("provider failed")
+
         m.provider_manager.create_provider.side_effect = fail_provider
         m.backend.window_liveness.return_value = "gone"
-        with patch(_TS + "get_terminal_metadata", side_effect=database.get_terminal_metadata), \
-             patch(
-                 _TS + "delete_terminal_and_warm_intent",
-                 side_effect=database.delete_terminal_and_warm_intent,
-             ), \
-             patch("cli_agent_orchestrator.services.rebind_lease.validate_rebind_lease"):
+        with (
+            patch(_TS + "get_terminal_metadata", side_effect=database.get_terminal_metadata),
+            patch(
+                _TS + "delete_terminal_and_warm_intent",
+                side_effect=database.delete_terminal_and_warm_intent,
+            ),
+            patch("cli_agent_orchestrator.services.rebind_lease.validate_rebind_lease"),
+        ):
             with pytest.raises(RuntimeError, match="provider_construct_failed"):
                 await create_terminal(
-                    provider="claude_code", agent_profile="developer",
-                    session_name=SESSION_NAME, terminal_id=TERMINAL_ID,
+                    provider="claude_code",
+                    agent_profile="developer",
+                    session_name=SESSION_NAME,
+                    terminal_id=TERMINAL_ID,
                     lease_token=SimpleNamespace(terminal_id=TERMINAL_ID),
                     fork_context=ForkContext(
-                        mode="resume", session_uuid=source_uuid, base_name="base",
-                        provider="claude_code", initial_preamble="",
+                        mode="resume",
+                        session_uuid=source_uuid,
+                        base_name="base",
+                        provider="claude_code",
+                        initial_preamble="",
                     ),
                 )
         assert observed == [source_uuid]
 
     @pytest.mark.asyncio
     async def test_quarantine_db_exception_is_closed_and_retains_authority(
-        self, create_mocks, quarantine_db,
+        self,
+        create_mocks,
+        quarantine_db,
     ):
         m = create_mocks
         source_uuid = "source-quarantine-error"
         m.db_create_terminal.side_effect = database.create_terminal
         m.backend.window_liveness.return_value = "live"
-        with patch(_TS + "get_terminal_metadata", side_effect=database.get_terminal_metadata), \
-             patch(
-                 _TS + "delete_terminal_and_warm_intent",
-                 side_effect=database.delete_terminal_and_warm_intent,
-             ) as delete_row, \
-             patch(_TS + "_persist_provider_runtime_identity",
-                   side_effect=RuntimeError("session_capture_ambiguous")), \
-             patch("cli_agent_orchestrator.services.rebind_lease.validate_rebind_lease"), \
-             patch("cli_agent_orchestrator.clients.database.quarantine_terminal_owner",
-                   side_effect=RuntimeError("database is locked")):
+        with (
+            patch(_TS + "get_terminal_metadata", side_effect=database.get_terminal_metadata),
+            patch(
+                _TS + "delete_terminal_and_warm_intent",
+                side_effect=database.delete_terminal_and_warm_intent,
+            ) as delete_row,
+            patch(
+                _TS + "_persist_provider_runtime_identity",
+                side_effect=RuntimeError("session_capture_ambiguous"),
+            ),
+            patch("cli_agent_orchestrator.services.rebind_lease.validate_rebind_lease"),
+            patch(
+                "cli_agent_orchestrator.clients.database.quarantine_terminal_owner",
+                side_effect=RuntimeError("database is locked"),
+            ),
+        ):
             with pytest.raises(RuntimeError) as caught:
                 await create_terminal(
-                    provider="claude_code", agent_profile="developer",
-                    session_name=SESSION_NAME, terminal_id=TERMINAL_ID,
+                    provider="claude_code",
+                    agent_profile="developer",
+                    session_name=SESSION_NAME,
+                    terminal_id=TERMINAL_ID,
                     lease_token=SimpleNamespace(terminal_id=TERMINAL_ID),
                     fork_context=ForkContext(
-                        mode="resume", session_uuid=source_uuid, base_name="base",
-                        provider="claude_code", initial_preamble="",
+                        mode="resume",
+                        session_uuid=source_uuid,
+                        base_name="base",
+                        provider="claude_code",
+                        initial_preamble="",
                     ),
                 )
         assert str(caught.value) == "quarantine_persist_failed"
-        assert epoch_recovery_service._normalize_creation_error(caught.value) == "quarantine_persist_failed"
-        assert epoch_recovery_service._result(
-            "base", "resume_failed", error_code="quarantine_persist_failed"
-        )["retryable"] is False
+        assert (
+            epoch_recovery_service._normalize_creation_error(caught.value)
+            == "quarantine_persist_failed"
+        )
+        assert (
+            epoch_recovery_service._result(
+                "base", "resume_failed", error_code="quarantine_persist_failed"
+            )["retryable"]
+            is False
+        )
         retained = database.get_terminal_metadata(TERMINAL_ID)
         assert retained["provider_session_id"] == source_uuid
         delete_row.assert_not_called()
@@ -468,7 +560,8 @@ def delete_mocks():
 
         m.get_terminal_metadata.return_value = None
         m.db_delete_terminal.return_value = {
-            "terminal_deleted": True, "intent_deleted": False,
+            "terminal_deleted": True,
+            "intent_deleted": False,
         }
 
         service = MagicMock()

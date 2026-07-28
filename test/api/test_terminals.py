@@ -427,7 +427,12 @@ class TestTerminalProtection:
             ) as lookup,
             patch("cli_agent_orchestrator.api.main.terminal_service") as service,
         ):
-            service.delete_terminal.return_value = True
+            service.delete_terminal.return_value = {
+                "reaped": [{"id": "abcd1234", "status": "reaped"}],
+                "skipped": [],
+                "uncertain": [],
+                "unattempted": [],
+            }
             response = client.delete("/terminals/abcd1234", params={"force": "true"})
 
         assert response.status_code == 200
@@ -872,13 +877,39 @@ class TestDeleteTerminalEndpoint:
     def test_delete_terminal_success(self, client):
         """DELETE /terminals/{terminal_id} deletes and returns success."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.delete_terminal.return_value = True
+            mock_svc.delete_terminal.return_value = {
+                "reaped": [{"id": "abcd1234", "status": "reaped"}],
+                "skipped": [],
+                "uncertain": [],
+                "unattempted": [],
+            }
 
             response = client.delete("/terminals/abcd1234")
 
             assert response.status_code == 200
-            assert response.json() == {"success": True}
+            assert response.json() == {
+                "success": True,
+                "reaped": [{"id": "abcd1234", "status": "reaped"}],
+                "skipped": [],
+                "uncertain": [],
+                "unattempted": [],
+            }
             mock_svc.delete_terminal.assert_called_once_with("abcd1234", registry=ANY)
+
+    def test_delete_terminal_forwards_orphan_true(self, client):
+        """The public opt-out reaches the cascade service as a true value."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.delete_terminal.return_value = {
+                "reaped": [{"id": "abcd1234", "status": "reaped"}],
+                "skipped": [{"id": "child123", "reason": "orphan_requested"}],
+                "uncertain": [],
+                "unattempted": [],
+            }
+
+            response = client.delete("/terminals/abcd1234", params={"orphan": "true"})
+
+        assert response.status_code == 200
+        mock_svc.delete_terminal.assert_called_once_with("abcd1234", registry=ANY, orphan=True)
 
     def test_delete_terminal_not_found(self, client):
         """DELETE /terminals/{terminal_id} returns 404 for missing terminal."""
@@ -898,6 +929,39 @@ class TestDeleteTerminalEndpoint:
 
             assert response.status_code == 500
             assert "Failed to delete terminal" in response.json()["detail"]
+
+
+class TestFleetEndpoint:
+    def test_fleet_serializes_orphan_and_depth_values_in_one_response(self, client):
+        payload = {
+            "session_name": "cao-test",
+            "terminals": [
+                {
+                    "id": "child123",
+                    "profile": "developer",
+                    "provider": "codex",
+                    "window_index": "2",
+                    "window_name": "worker",
+                    "parent_id": "deadbeef",
+                    "depth": 2,
+                    "orphan": True,
+                    "status": "idle",
+                    "since_last_input": 1.0,
+                    "lifecycle": "ephemeral",
+                    "reparented_from": None,
+                }
+            ],
+        }
+        with patch(
+            "cli_agent_orchestrator.services.fleet_service.build_fleet",
+            return_value=payload,
+        ) as build:
+            response = client.get("/sessions/cao-test/fleet")
+
+        assert response.status_code == 200
+        assert response.json()["terminals"][0]["orphan"] is True
+        assert response.json()["terminals"][0]["depth"] == 2
+        build.assert_called_once_with("cao-test")
 
 
 class TestCreateInboxMessageEndpoint:

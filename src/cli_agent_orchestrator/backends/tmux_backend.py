@@ -102,6 +102,12 @@ class TmuxBackend(TerminalBackend):
             return "gone"
         return "error"
 
+    def get_session_windows(self, session_name: str) -> List[Dict[str, object]]:
+        return self._client.get_session_windows(session_name)
+
+    def set_window_parent(self, session_name: str, window_name: str, parent_id: str | None) -> None:
+        self._client.set_window_parent(session_name, window_name, parent_id)
+
     # --- Input ---
 
     def send_keys(

@@ -22,13 +22,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, EnumType
-from typing import Any, Generic, Iterable, NoReturn, Protocol, TypeVar, runtime_checkable
+from typing import Any, Generic, Iterable, Literal, NoReturn, Protocol, TypeVar, runtime_checkable
 
 __all__ = [
     "ProofClass",
     "TaggedProofMeta",
     "ProofMember",
     "TaggedProof",
+    "CoverageProof",
+    "CoverageNegative",
+    "CoverageUnobs",
+    "CoverageReason",
+    "Covered",
     "Deadline",
     "RetryTrigger",
     "Proven",
@@ -182,6 +187,22 @@ class TaggedProof(str, Enum, metaclass=TaggedProofMeta):
 # key is now the member's NAME under its class, which the allocator never
 # reuses.
 _SEALED_PROOF_CLASS: dict[tuple[type, str], ProofClass] = {}
+
+
+class CoverageProof(TaggedProof):
+    """Arrival-class evidence that an artifact's entries match the delta."""
+
+    ENTRIES_MATCH = ("entries_match", ProofClass.ARRIVAL)
+
+
+CoverageNegative = Literal["entry_mismatch"]
+CoverageUnobs = Literal["apparatus_unavailable", "unhashable_entry"]
+CoverageReason = CoverageNegative | CoverageUnobs
+
+
+@dataclass(frozen=True)
+class Covered:
+    """The artifact covers the delta; evidence is carried by ``Proven.by``."""
 
 
 def _sealed_proof_class(member: ProofMember) -> ProofClass:

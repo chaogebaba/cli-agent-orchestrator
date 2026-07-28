@@ -725,6 +725,10 @@ def mark_ready(
     sha, hashes = captured.git_sha, captured.dirty_hashes()
     if captured.acquisition_error or not sha:
         raise ForkContextError(f"snapshot_{captured.acquisition_error or 'git-failure'}")
+    from cli_agent_orchestrator.services.base_digest_service import projected_manifest_bytes
+
+    entry_count = len(captured.entries)
+    manifest_bytes = projected_manifest_bytes(captured.entries)
     row = register_provider_session(
         name=name,
         provider=provider,
@@ -739,7 +743,11 @@ def mark_ready(
         session_name=terminal["tmux_session"],
     )
     update_terminal_provider_session_id(terminal_id, session_uuid)
-    return row
+    return dict(
+        row,
+        _entry_count=entry_count,
+        _projected_manifest_bytes=manifest_bytes,
+    )
 
 
 def list_bases() -> list[dict[str, Any]]:

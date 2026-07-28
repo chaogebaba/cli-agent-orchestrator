@@ -32,6 +32,8 @@ from cli_agent_orchestrator.models.observation import (
     Unobservable,
     fold,
 )
+from cli_agent_orchestrator.services import base_digest_service
+from cli_agent_orchestrator.services.fork_context_service import SnapshotDelta, SnapshotEntry
 
 # --------------------------------------------------------------------------
 # Adopter fixtures: the three proof enums, declared the way adopters declare
@@ -609,14 +611,68 @@ def test_ac7a_failed_member_yields_unobservable_not_disproven() -> None:
     assert isinstance(verdict, Unobservable)
 
 
-def test_ac8b_coverage_precedence_both_directions() -> None:
-    """An acquisition failure AND a genuine mismatch settles Unobservable."""
+def test_fold_unobservable_dominates_disproven_both_orders() -> None:
+    """The generic fold's Unobservable disposition dominates in both orders."""
     components: list[Observation[MemberAnswer, CoverageProof, EntryReason]] = [
         Disproven("entry_mismatch"),
         Unobservable("entry_unobservable", retry_after=Deadline(60.0)),
     ]
     assert isinstance(fold(components, COVERAGE_AGGREGATE), Unobservable)
     assert isinstance(fold(list(reversed(components)), COVERAGE_AGGREGATE), Unobservable)
+
+
+def test_ac8b_ordered_selection_reasons(tmp_path: pathlib.Path) -> None:
+    """Digest coverage selects ordered causes without collapsing their reasons."""
+    matching = SnapshotEntry("same.py", "sha256", "a" * 64)
+    different = SnapshotEntry("different.py", "sha256", "b" * 64)
+    unhashable = SnapshotEntry("same.py", "unhashable")
+    artifact = base_digest_service.BaseDigestArtifact(
+        path=tmp_path / "digest.md",
+        base="base",
+        parent_artifact_sha="genesis",
+        artifact_sha="c" * 64,
+        entries=(matching,),
+        body="context",
+    )
+
+    acquisition = base_digest_service.coverage(
+        artifact,
+        SnapshotDelta(None, (matching,), acquisition_error="git-failure"),
+        clock=lambda: 11.0,
+    )
+    hashability = base_digest_service.coverage(
+        artifact,
+        SnapshotDelta("head", (unhashable,)),
+        clock=lambda: 12.0,
+    )
+    both = base_digest_service.coverage(
+        artifact,
+        SnapshotDelta(None, (unhashable,), acquisition_error="git-failure"),
+        clock=lambda: 13.0,
+    )
+    acquisition_and_mismatch = base_digest_service.coverage(
+        artifact,
+        SnapshotDelta(None, (different,), acquisition_error="git-failure"),
+        clock=lambda: 14.0,
+    )
+
+    assert isinstance(acquisition, Unobservable)
+    assert (acquisition.reason, acquisition.retry_after) == (
+        "apparatus_unavailable",
+        Deadline(11.0),
+    )
+    assert isinstance(hashability, Unobservable)
+    assert (hashability.reason, hashability.retry_after) == (
+        "unhashable_entry",
+        Deadline(12.0),
+    )
+    assert isinstance(both, Unobservable)
+    assert (both.reason, both.retry_after) == ("apparatus_unavailable", Deadline(13.0))
+    assert isinstance(acquisition_and_mismatch, Unobservable)
+    assert (acquisition_and_mismatch.reason, acquisition_and_mismatch.retry_after) == (
+        "apparatus_unavailable",
+        Deadline(14.0),
+    )
 
 
 # --------------------------------------------------------------------------

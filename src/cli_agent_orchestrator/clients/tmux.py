@@ -261,6 +261,20 @@ class TmuxClient:
             logger.error(f"Failed to create window in session {session_name}: {e}")
             raise
 
+    def set_window_parent(self, session_name: str, window_name: str, parent_id: str | None) -> None:
+        """Write the denormalized parent cache and per-window display format."""
+        session = self.server.sessions.get(session_name=session_name)
+        if not session:
+            raise ValueError(f"Session '{session_name}' not found")
+        window = session.windows.get(window_name=window_name)
+        if not window:
+            raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
+        window.set_option("@cao_parent", parent_id or "")
+        window.set_option(
+            "window-status-format",
+            "#{?#{!=:#{@cao_parent},},  └─ ,}#I:#W#{?window_flags,#{window_flags},}",
+        )
+
     # tmux >= 3.7 passes pasted buffer content through vis(3) sanitization
     # (hardening against bracket-end injection): raw ESC (0x1b) bytes loaded
     # into a buffer arrive in the pane as the literal two characters "^[".

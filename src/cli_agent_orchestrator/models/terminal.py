@@ -8,9 +8,7 @@ from cli_agent_orchestrator.models.provider import ProviderType
 
 # Terminal ID validation (8 character hex string)
 TerminalId = Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{8}$")]
-InboxReceiverId = Annotated[
-    str, StringConstraints(pattern=r"^(?:[a-f0-9]{8}|mb_[a-f0-9]{8})$")
-]
+InboxReceiverId = Annotated[str, StringConstraints(pattern=r"^(?:[a-f0-9]{8}|mb_[a-f0-9]{8})$")]
 RecoveryState = Literal[
     "rebind_starting",
     "rebind_exiting",
@@ -49,6 +47,8 @@ class Terminal(BaseModel):
     caller_mailbox_id: Optional[str] = Field(
         None, description="Durable mailbox of the recorded caller, derived by the server"
     )
+    lifecycle: Literal["ephemeral", "sticky"] = "ephemeral"
+    reparented_from: Optional[str] = None
     allowed_tools: Optional[List[str]] = Field(None, description="Allowed CAO tools")
     shell_command: Optional[str] = Field(
         None, description="Shell process name captured before kiro launch"

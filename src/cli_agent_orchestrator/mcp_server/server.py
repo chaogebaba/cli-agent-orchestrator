@@ -8,7 +8,7 @@ import re
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, NamedTuple, Optional, Tuple, Union
 
 import requests
 from fastmcp import FastMCP
@@ -194,6 +194,7 @@ def _create_terminal(
     barrier_member_key: Optional[str] = None,
     park_warm: bool = False,
     model: Optional[str] = None,
+    lifecycle: Literal["ephemeral", "sticky"] | None = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -259,10 +260,10 @@ def _create_terminal(
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
-        json_body: dict[str, Any] | None = None
+        json_body: dict[str, Any] | None = {"lifecycle": lifecycle} if lifecycle else None
         if defer_init:
             params["defer_init"] = "true"
-            json_body = {}
+            json_body = json_body or {}
             if initial_message is not None:
                 json_body["initial_message"] = initial_message
             if initial_message_orchestration_type is not None:
@@ -327,9 +328,7 @@ def _create_terminal(
         # client binds through resolve_endpoint(), which fails closed under
         # G7 sandbox and refuses production :9889. Raw requests bypasses that
         # isolation entirely. post(**kwargs) forwards json= unchanged.
-        response = cao_http.post(
-            "/sessions", params=params, json=json_body, timeout=_mcp_timeout()
-        )
+        response = cao_http.post("/sessions", params=params, json=json_body, timeout=_mcp_timeout())
         response.raise_for_status()
         terminal = response.json()
 
@@ -876,6 +875,23 @@ async def session_manifest(
         return {"success": False, "error": str(exc)}
 
 
+@mcp.tool(description="Read the narrow fleet topology and live status projection.")
+async def fleet(session_name: Optional[str] = None) -> Dict[str, Any]:
+    try:
+        terminal_id = _current_terminal_id()
+        if not session_name:
+            if not terminal_id:
+                raise ValueError("session_name required outside a CAO terminal")
+            response = cao_http.get(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
+            response.raise_for_status()
+            session_name = response.json()["session_name"]
+        response = cao_http.get(f"/sessions/{session_name}/fleet", timeout=_mcp_timeout())
+        response.raise_for_status()
+        return {"success": True, "fleet": response.json()}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
 def _peek_terminal_impl(terminal_id: str, lines: int = 40) -> Dict[str, Any]:
     """Return a read-only terminal pane tail via cao-server."""
     capped_lines = max(1, min(int(lines), 200))
@@ -1166,6 +1182,7 @@ def _assign_impl(
     barrier_member_key: Optional[str] = None,
     park_warm: bool = False,
     model: Optional[str] = None,
+    lifecycle: Literal["ephemeral", "sticky"] | None = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1329,6 +1346,7 @@ def _assign_impl(
             fork_context=fork_context,
             refresh_base_name=refresh_base_name,
             model=model,
+            lifecycle=lifecycle,
             **create_kwargs,
         )
 
@@ -1466,6 +1484,10 @@ async def assign(
         description="Deliver the task without expecting a callback",
     ),
     model: Optional[str] = Field(default=None, description=_model_field_desc),
+    lifecycle: Literal["ephemeral", "sticky"] | None = Field(
+        default=None,
+        description="Worker lifecycle; profile default applies when omitted",
+    ),
 ) -> Dict[str, Any]:
     return _assign_impl(
         agent_profile,
@@ -1478,6 +1500,7 @@ async def assign(
         barrier_member_key,
         park_warm,
         model,
+        lifecycle,
     )
 
 
@@ -1491,14 +1514,24 @@ async def mark_base_ready(
         terminal_id = _current_terminal_id()
         if not terminal_id:
             raise ValueError("CAO_TERMINAL_ID not set")
+        from cli_agent_orchestrator.services.base_digest_service import MAX_DIGEST_BYTES
         from cli_agent_orchestrator.services.fork_context_service import mark_ready
 
         row = mark_ready(terminal_id, name, summary, kind)
+        entry_count = int(row.pop("_entry_count"))
+        projected_manifest_bytes = int(row.pop("_projected_manifest_bytes"))
         result = {
             "success": True,
             "base": _serialize_provider_session(row),
+            "entry_count": entry_count,
+            "projected_manifest_bytes": projected_manifest_bytes,
             "callback": {"status": "not_applicable"},
         }
+        if projected_manifest_bytes > MAX_DIGEST_BYTES / 2:
+            result["manifest_budget_warning"] = (
+                f"Projected digest manifest is {projected_manifest_bytes} bytes "
+                f"of the {MAX_DIGEST_BYTES}-byte cap."
+            )
         try:
             terminal_response = cao_http.get(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
             terminal_response.raise_for_status()
@@ -2136,6 +2169,7 @@ def delete_terminal(
         description="The terminal ID to delete (obtained from assign or handoff results)"
     ),
     force: bool = Field(default=False, description="Override ready-base and profile protection"),
+    orphan: bool = Field(default=False, description="Leave descendants running and re-parent them"),
 ) -> Dict[str, Any]:
     """Delete a terminal that is no longer needed, freeing system resources.
 
@@ -2153,13 +2187,17 @@ def delete_terminal(
         Dict with success status and message
     """
     try:
+        params: dict[str, Any] = {"force": force is True, "orphan": orphan is True}
+        caller_id = _current_terminal_id()
+        if caller_id:
+            params["caller_id"] = caller_id
         response = cao_http.delete(
             f"/terminals/{terminal_id}",
-            params={"force": force is True},
+            params=params,
             timeout=_mcp_timeout(),
         )
         response.raise_for_status()
-        return {"success": True, "message": f"Terminal {terminal_id} deleted successfully"}
+        return response.json()
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
             return {"success": False, "message": f"Terminal {terminal_id} not found"}

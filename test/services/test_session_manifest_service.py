@@ -1,13 +1,12 @@
 import json
 from types import SimpleNamespace
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 import cli_agent_orchestrator.services.session_manifest_service as svc
-
 
 RAW = """---
 name: supervisor
@@ -31,15 +30,66 @@ Never route policy from inventory.
 
 
 def _seed(monkeypatch):
-    monkeypatch.setattr(svc, "list_agent_profiles", lambda: [{"name": "supervisor", "source": "local", "duplicated_in": ["built-in"]}])
+    monkeypatch.setattr(
+        svc,
+        "list_agent_profiles",
+        lambda: [{"name": "supervisor", "source": "local", "duplicated_in": ["built-in"]}],
+    )
     monkeypatch.setattr(svc, "read_agent_profile_source", lambda name: RAW)
-    monkeypatch.setattr(svc, "list_bases", lambda: [{"name": "codex", "provider": "codex", "agent_profile": "codex_base", "source_terminal_id": "base0001", "cwd": "/repo", "git_sha": "abc", "staleness_count": 2, "status": "ready", "updated_at": "now", "dirty_hashes": "CANARY_SECRET"}])
-    monkeypatch.setattr(svc, "list_skills", lambda: [SimpleNamespace(name="worker", description="protocol")])
-    monkeypatch.setattr(svc, "list_workflows", lambda: [SimpleNamespace(name="flow", description="desc", source_path="/flow.yaml")])
-    monkeypatch.setattr(svc, "list_terminals_by_session", lambda name: [{"id": "term0001", "agent_profile": "supervisor", "provider": "claude_code", "caller_id": None, "provider_session_id": "CANARY_SECRET"}])
+    monkeypatch.setattr(
+        svc,
+        "list_bases",
+        lambda: [
+            {
+                "name": "codex",
+                "provider": "codex",
+                "agent_profile": "codex_base",
+                "source_terminal_id": "base0001",
+                "cwd": "/repo",
+                "git_sha": "abc",
+                "staleness_count": 2,
+                "status": "ready",
+                "updated_at": "now",
+                "dirty_hashes": "CANARY_SECRET",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        svc, "list_skills", lambda: [SimpleNamespace(name="worker", description="protocol")]
+    )
+    monkeypatch.setattr(
+        svc,
+        "list_workflows",
+        lambda: [SimpleNamespace(name="flow", description="desc", source_path="/flow.yaml")],
+    )
+    monkeypatch.setattr(
+        svc,
+        "list_terminals_by_session",
+        lambda name: [
+            {
+                "id": "term0001",
+                "agent_profile": "supervisor",
+                "provider": "claude_code",
+                "caller_id": None,
+                "provider_session_id": "CANARY_SECRET",
+            }
+        ],
+    )
     monkeypatch.setattr(svc.status_monitor, "get_status", lambda tid: SimpleNamespace(value="idle"))
-    monkeypatch.setattr("cli_agent_orchestrator.services.terminal_service.get_working_directory", lambda tid: "/repo")
-    monkeypatch.setattr(svc, "deployment_status", lambda root: {"cli_path": "current", "differing_files": 0, "server": "current", "source_root": str(root)})
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.get_working_directory",
+        lambda tid: "/repo",
+    )
+    monkeypatch.setattr(
+        svc,
+        "deployment_status",
+        lambda root: {
+            "cli_path": "current",
+            "differing_files": 0,
+            "server": "current",
+            "source_root": str(root),
+        },
+    )
     monkeypatch.setenv("CAO_SOURCE_REPO", "/repo")
 
 
@@ -50,18 +100,29 @@ def test_manifest_projection_and_renderer_are_safe_and_deterministic(monkeypatch
     encoded = json.dumps(manifest)
     assert manifest["schema_version"] == "cao.session-manifest/v1"
     assert manifest["sections"] == {
-        **{name: "ok" for name in (
-            "profiles", "ready_bases", "skills", "workflows", "terminals", "activation"
-        )},
+        **{
+            name: "ok"
+            for name in (
+                "profiles",
+                "ready_bases",
+                "skills",
+                "workflows",
+                "terminals",
+                "activation",
+            )
+        },
         "tools": "not_collected",
         "ledger": "not_collected",
     }
     assert manifest["complete"] is False
     assert manifest["session"]["supervisors"] == ["term0001"]
-    assert manifest["profiles"][0]["charter"] == "Never route policy from inventory."
+    assert "charter" not in manifest["profiles"][0]
     assert manifest["profiles"][0]["charter_digest"] == "Safe charter digest"
     for canary in (
-        "CANARY_SECRET", "CANARY_ARGS", "CANARY_HOOK", "CANARY_RESOURCE",
+        "CANARY_SECRET",
+        "CANARY_ARGS",
+        "CANARY_HOOK",
+        "CANARY_RESOURCE",
         "CANARY_CONFIG",
     ):
         assert canary not in encoded + brief
@@ -77,10 +138,20 @@ def test_auth_staleness_current_is_observation_only(monkeypatch, tmp_path):
     marker.write_text("{}")
     os = __import__("os")
     os.utime(marker, (100, 100))
-    monkeypatch.setattr(svc, "list_terminals_by_session", lambda _name: [{
-        "id": "term0001", "agent_profile": "supervisor", "provider": "codex",
-        "caller_id": None, "tmux_session": "cao-test", "tmux_window": "w",
-    }])
+    monkeypatch.setattr(
+        svc,
+        "list_terminals_by_session",
+        lambda _name: [
+            {
+                "id": "term0001",
+                "agent_profile": "supervisor",
+                "provider": "codex",
+                "caller_id": None,
+                "tmux_session": "cao-test",
+                "tmux_window": "w",
+            }
+        ],
+    )
     provider = SimpleNamespace(
         provider_process_started_at=lambda _pid: 200,
         auth_state_path=lambda: marker,
@@ -111,14 +182,15 @@ def test_http_endpoint_uses_builder_once_and_preserves_safe_snapshot(monkeypatch
         return real_builder(session_name, terminal_id)
 
     monkeypatch.setattr(svc, "build_session_manifest", counted)
-    response = TestClient(app).get(
-        "/sessions/cao-test/manifest", headers={"Host": "localhost"}
-    )
+    response = TestClient(app).get("/sessions/cao-test/manifest", headers={"Host": "localhost"})
     assert response.status_code == 200
     assert calls == [("cao-test", None)]
     encoded = response.content.decode()
     for canary in (
-        "CANARY_SECRET", "CANARY_ARGS", "CANARY_HOOK", "CANARY_RESOURCE",
+        "CANARY_SECRET",
+        "CANARY_ARGS",
+        "CANARY_HOOK",
+        "CANARY_RESOURCE",
         "CANARY_CONFIG",
     ):
         assert canary not in encoded
@@ -127,7 +199,9 @@ def test_http_endpoint_uses_builder_once_and_preserves_safe_snapshot(monkeypatch
 
 def test_partial_failure_is_honest_and_noncore(monkeypatch):
     _seed(monkeypatch)
-    monkeypatch.setattr(svc, "list_workflows", lambda: (_ for _ in ()).throw(RuntimeError("broken")))
+    monkeypatch.setattr(
+        svc, "list_workflows", lambda: (_ for _ in ()).throw(RuntimeError("broken"))
+    )
     manifest = svc.build_session_manifest("cao-test")
     assert manifest["complete"] is False
     assert manifest["sections"]["workflows"] == "error"
@@ -145,9 +219,7 @@ def test_partial_failure_is_honest_and_noncore(monkeypatch):
         ("activation", "deployment_status"),
     ],
 )
-def test_every_source_failure_is_isolated_with_core_threshold(
-    monkeypatch, section, target
-):
+def test_every_source_failure_is_isolated_with_core_threshold(monkeypatch, section, target):
     _seed(monkeypatch)
     monkeypatch.setattr(
         svc, target, lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(section))
@@ -194,10 +266,19 @@ def test_schema_is_additive_and_renderer_is_inventory_only(monkeypatch):
     _seed(monkeypatch)
     manifest = svc.build_session_manifest("cao-test")
     required = {
-        "schema_version": str, "generated_at": str, "complete": bool,
-        "errors": list, "sections": dict, "session": dict, "profiles": list,
-        "ready_bases": list, "skills": list, "workflows": list,
-        "terminals": list, "ledger": dict, "activation": dict,
+        "schema_version": str,
+        "generated_at": str,
+        "complete": bool,
+        "errors": list,
+        "sections": dict,
+        "session": dict,
+        "profiles": list,
+        "ready_bases": list,
+        "skills": list,
+        "workflows": list,
+        "terminals": list,
+        "ledger": dict,
+        "activation": dict,
     }
     manifest["future_additive_key"] = {"accepted": True}
 
@@ -205,10 +286,19 @@ def test_schema_is_additive_and_renderer_is_inventory_only(monkeypatch):
         for key, expected_type in required.items():
             assert isinstance(payload[key], expected_type)
         nested = {
-            "sections": {name: str for name in (
-                "profiles", "ready_bases", "skills", "workflows", "terminals", "activation",
-                "tools", "ledger",
-            )},
+            "sections": {
+                name: str
+                for name in (
+                    "profiles",
+                    "ready_bases",
+                    "skills",
+                    "workflows",
+                    "terminals",
+                    "activation",
+                    "tools",
+                    "ledger",
+                )
+            },
             "session": {
                 "name": str,
                 "supervisors": list,
@@ -226,6 +316,7 @@ def test_schema_is_additive_and_renderer_is_inventory_only(monkeypatch):
 
     assert parse_compatible(manifest)["future_additive_key"] == {"accepted": True}
     import copy
+
     removed = copy.deepcopy(manifest)
     del removed["profiles"][0]["charter_digest"]
     with pytest.raises((AssertionError, KeyError)):
@@ -266,6 +357,7 @@ def test_supervisor_projection_is_role_based_sorted_and_honest(monkeypatch):
 
 def test_manifest_reads_seeded_profile_skill_directories_and_database(tmp_path, monkeypatch):
     import subprocess
+
     from cli_agent_orchestrator.clients import database
     from cli_agent_orchestrator.services import workflow_spec_service
     from cli_agent_orchestrator.utils import agent_profiles, skills
@@ -309,13 +401,12 @@ def test_manifest_reads_seeded_profile_skill_directories_and_database(tmp_path, 
     database.Base.metadata.create_all(engine)
     monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
     monkeypatch.setattr(
-        "cli_agent_orchestrator.constants.DATABASE_FILE", tmp_path / "manifest.db",
+        "cli_agent_orchestrator.constants.DATABASE_FILE",
+        tmp_path / "manifest.db",
         raising=True,
     )
     database._migrate_workflow_index()
-    database.create_terminal(
-        "term0001", "cao-seeded", "supervisor-1", "codex", "seeded", None
-    )
+    database.create_terminal("term0001", "cao-seeded", "supervisor-1", "codex", "seeded", None)
 
     repo = tmp_path / "base-repo"
     repo.mkdir()
@@ -323,17 +414,36 @@ def test_manifest_reads_seeded_profile_skill_directories_and_database(tmp_path, 
     (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
     subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
     subprocess.run(
-        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-         "commit", "-qm", "base"], cwd=repo, check=True,
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "base",
+        ],
+        cwd=repo,
+        check=True,
     )
     sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True,
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        text=True,
         capture_output=True,
     ).stdout.strip()
     database.register_provider_session(
-        name="seed-base", provider="codex", session_uuid="seed-uuid",
-        cwd=str(repo), agent_profile="codex_base", git_sha=sha,
-        dirty_hashes="{}", summary="seed", source_terminal_id="term0001",
+        name="seed-base",
+        provider="codex",
+        session_uuid="seed-uuid",
+        cwd=str(repo),
+        agent_profile="codex_base",
+        git_sha=sha,
+        dirty_hashes="{}",
+        summary="seed",
+        source_terminal_id="term0001",
     )
     (repo / "tracked.txt").write_text("changed\n", encoding="utf-8")
 
@@ -349,15 +459,23 @@ def test_manifest_reads_seeded_profile_skill_directories_and_database(tmp_path, 
     monkeypatch.setattr(
         workflow_spec_service, "_safe_dir", lambda scan_dir=None: str(workflow_dir.resolve())
     )
-    monkeypatch.setattr(svc.status_monitor, "get_status", lambda _tid: SimpleNamespace(value="idle"))
+    monkeypatch.setattr(
+        svc.status_monitor, "get_status", lambda _tid: SimpleNamespace(value="idle")
+    )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.get_working_directory",
         lambda _tid: str(tmp_path),
     )
-    monkeypatch.setattr(svc, "deployment_status", lambda root: {
-        "cli_path": "current", "differing_files": 0, "server": "current",
-        "source_root": str(root),
-    })
+    monkeypatch.setattr(
+        svc,
+        "deployment_status",
+        lambda root: {
+            "cli_path": "current",
+            "differing_files": 0,
+            "server": "current",
+            "source_root": str(root),
+        },
+    )
     monkeypatch.setenv("CAO_SOURCE_REPO", str(tmp_path))
 
     manifest = svc.build_session_manifest("cao-seeded")

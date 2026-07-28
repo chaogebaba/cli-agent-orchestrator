@@ -103,6 +103,8 @@ class TerminalModel(Base):
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
+    lifecycle = Column(String, nullable=False, default="ephemeral", server_default="ephemeral")
+    reparented_from = Column(String, nullable=True)
     instance_id = Column(String, nullable=True)
     caller_mailbox_id = deferred(Column(String, nullable=True))
     provider_session_id = Column(String, nullable=True)
@@ -118,6 +120,10 @@ class TerminalModel(Base):
     lifecycle_generation = Column(Integer, nullable=False, default=0, server_default="0")
     last_active = Column(DateTime, default=datetime.now)
     __table_args__ = (
+        CheckConstraint(
+            "lifecycle IN ('ephemeral','sticky')",
+            name="ck_terminals_lifecycle",
+        ),
         CheckConstraint(
             "init_state IN ('init_pending','ready','init_failed_notified',"
             "'init_failed_caller_gone')",
@@ -709,6 +715,7 @@ def init_db() -> None:
     _migrate_provider_sessions_retained_persona_home()
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
+    _migrate_fallback_parent_edges()
     _migrate_inbox_orchestration_type()
     _migrate_inbox_failure_reason()
     _migrate_memory_indexes()
@@ -1308,7 +1315,10 @@ def _migrate_terminals_schema() -> None:
             init_columns.issubset(columns)
             and "caller_mailbox_id" in columns
             and "instance_id" in columns
+            and "lifecycle" in columns
+            and "reparented_from" in columns
             and any(row[1] == "lifecycle_generation" and bool(row[3]) for row in table_info)
+            and "lifecycle IN" in table_sql
             and "init_state IN" in table_sql
             and "init_deadline_s >= 1.0" in table_sql
             and has_token_unique
@@ -1333,7 +1343,10 @@ def _migrate_terminals_schema() -> None:
             "CREATE TABLE terminals ("
             "id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL, tmux_window TEXT NOT NULL, "
             "provider TEXT NOT NULL, agent_profile TEXT, allowed_tools TEXT, "
-            "shell_command TEXT, caller_id TEXT, provider_session_id TEXT, instance_id TEXT, "
+            "shell_command TEXT, caller_id TEXT, "
+            "lifecycle TEXT NOT NULL DEFAULT 'ephemeral' "
+            "CHECK (lifecycle IN ('ephemeral','sticky')), reparented_from TEXT, "
+            "provider_session_id TEXT, instance_id TEXT, "
             "caller_mailbox_id TEXT, "
             "recovery_state TEXT, recovery_error TEXT, recovery_updated_at DATETIME, "
             "fallback_terminal_id TEXT, "
@@ -1368,6 +1381,8 @@ def _migrate_terminals_schema() -> None:
             "allowed_tools",
             "shell_command",
             "caller_id",
+            "lifecycle",
+            "reparented_from",
             "provider_session_id",
             "caller_mailbox_id",
             "instance_id",
@@ -1384,10 +1399,14 @@ def _migrate_terminals_schema() -> None:
             "lifecycle_generation",
         ]
         copied = [name for name in destination if name in legacy_columns]
-        selected = [
-            "COALESCE(lifecycle_generation, 0)" if name == "lifecycle_generation" else name
-            for name in copied
-        ]
+        selected = []
+        for name in copied:
+            if name == "lifecycle_generation":
+                selected.append("COALESCE(lifecycle_generation, 0)")
+            elif name == "lifecycle":
+                selected.append("COALESCE(lifecycle, 'ephemeral')")
+            else:
+                selected.append(name)
         conn.execute(
             f"INSERT INTO terminals ({','.join(copied)}) "
             f"SELECT {','.join(selected)} FROM terminals_wpm4a_legacy"
@@ -1409,6 +1428,30 @@ def _migrate_terminals_schema() -> None:
         raise
     finally:
         conn.close()
+
+
+def _migrate_fallback_parent_edges() -> None:
+    """Repair legacy child edges left on settled recovery husks."""
+    with SessionLocal.begin() as db:
+        husks = (
+            db.query(TerminalModel.id, TerminalModel.fallback_terminal_id)
+            .filter(
+                TerminalModel.recovery_state == "fallback_ready",
+                TerminalModel.fallback_terminal_id.is_not(None),
+            )
+            .all()
+        )
+        for old_id, new_id in husks:
+            if db.query(TerminalModel.id).filter_by(id=new_id).one_or_none() is None:
+                continue
+            db.query(TerminalModel).filter(TerminalModel.caller_id == old_id).update(
+                {
+                    TerminalModel.caller_id: new_id,
+                    TerminalModel.caller_mailbox_id: _mailbox_id_for_terminal(db, new_id),
+                    TerminalModel.reparented_from: old_id,
+                },
+                synchronize_session=False,
+            )
 
 
 def _mailbox_schema_available(db: Any) -> bool:
@@ -1523,6 +1566,7 @@ def create_terminal(
     allowed_tools: Optional[List[str]] = None,
     shell_command: Optional[str] = None,
     caller_id: Optional[str] = None,
+    lifecycle: str = "ephemeral",
     provider_session_id: Optional[str] = None,
     init_state: str = "ready",
     init_started_at: Optional[datetime] = None,
@@ -1544,6 +1588,7 @@ def create_terminal(
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
             shell_command=shell_command,
             caller_id=caller_id,
+            lifecycle=lifecycle,
             instance_id=os.environ.get("CAO_INSTANCE_ID") or None,
             caller_mailbox_id=caller_mailbox_id,
             provider_session_id=provider_session_id,
@@ -1579,6 +1624,8 @@ def create_terminal(
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
+            "lifecycle": terminal.lifecycle,
+            "reparented_from": terminal.reparented_from,
             "instance_id": terminal.instance_id,
             "caller_mailbox_id": (
                 terminal.caller_mailbox_id if _terminal_mailbox_column_available(db) else None
@@ -1610,6 +1657,7 @@ def create_terminal_with_warm_intent(
     agent_profile: Optional[str],
     allowed_tools: Optional[List[str]],
     caller_id: Optional[str],
+    lifecycle: str = "ephemeral",
     parent_base_name: Optional[str],
     fork_mode: Optional[str],
     cas_hook=None,
@@ -1633,6 +1681,7 @@ def create_terminal_with_warm_intent(
             agent_profile=agent_profile,
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
             caller_id=caller_id,
+            lifecycle=lifecycle,
             instance_id=os.environ.get("CAO_INSTANCE_ID") or None,
             caller_mailbox_id=caller_mailbox_id,
             init_state=init_state,
@@ -1740,6 +1789,8 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
+            "lifecycle": terminal.lifecycle,
+            "reparented_from": terminal.reparented_from,
             "caller_mailbox_id": terminal.caller_mailbox_id,
             "provider_session_id": terminal.provider_session_id,
             "recovery_state": terminal.recovery_state,
@@ -1782,6 +1833,9 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 ),
                 "shell_command": t.shell_command,
                 "caller_id": t.caller_id,
+                "caller_mailbox_id": t.caller_mailbox_id,
+                "lifecycle": t.lifecycle,
+                "reparented_from": t.reparented_from,
                 "provider_session_id": t.provider_session_id,
                 "recovery_state": t.recovery_state,
                 "recovery_error": t.recovery_error,
@@ -2126,6 +2180,18 @@ def settle_terminal_fallback(old_terminal_id: str, new_terminal_id: str) -> int:
             target_lifecycle_generation=int(new.lifecycle_generation),
             move_mailbox_authority=True,
         )
+        changed += (
+            db.query(TerminalModel)
+            .filter(TerminalModel.caller_id == old_terminal_id)
+            .update(
+                {
+                    TerminalModel.caller_id: new_terminal_id,
+                    TerminalModel.caller_mailbox_id: _mailbox_id_for_terminal(db, new_terminal_id),
+                    TerminalModel.reparented_from: old_terminal_id,
+                },
+                synchronize_session=False,
+            )
+        )
         old.fallback_terminal_id = new_terminal_id
         old.recovery_state = "fallback_ready"
         old.recovery_error = None
@@ -2361,11 +2427,76 @@ def delete_terminal_and_warm_intent(
     terminal_id: str,
     *,
     preserve_warm_intent: bool = False,
+    reparent_target_id: str | None = None,
 ) -> Dict[str, bool]:
-    """Delete the terminal and, unless retained, its warm intent atomically."""
+    """Settle terminal-owned state and delete the row in one transaction."""
     with SessionLocal.begin() as db:
-        _close_owned_barriers_for_gone_terminal_in_db(db, terminal_id)
+        terminal = db.query(TerminalModel).filter_by(id=terminal_id).one_or_none()
+        profile = terminal.agent_profile if terminal is not None else None
+        target_candidate = (
+            terminal.caller_id if reparent_target_id is None and terminal else reparent_target_id
+        )
+        target = (
+            db.query(TerminalModel).filter_by(id=target_candidate).one_or_none()
+            if target_candidate
+            else None
+        )
+        target_id: str | None = None
+        target_mailbox_id: str | None = None
+        target_generation: int | None = None
+        if target is not None:
+            target_id, target_mailbox_id, target_generation = resolve_inbox_receiver(db, target.id)
+
+        held = db.query(InboxModel).filter(
+            InboxModel.receiver_id == terminal_id,
+            InboxModel.status == MessageStatus.HELD.value,
+        )
+        prefix = f"[released from {terminal_id} ({profile or 'unknown'}) — terminal reaped]\n"
+        for row in held.all():
+            row.message = prefix + row.message
+            if target_id is None:
+                row.status = MessageStatus.CANCELLED.value
+                row.failure_reason = "terminal_reaped_no_surviving_ancestor"
+            else:
+                row.receiver_id = target_id
+                row.logical_receiver_id = target_mailbox_id
+                row.enqueue_generation = target_generation or int(target.lifecycle_generation)
+                row.status = MessageStatus.PENDING.value
+                row.failure_reason = None
+
+        now = _barrier_now()
+        owned_barriers = (
+            db.query(CallbackBarrierModel)
+            .filter(
+                CallbackBarrierModel.state == "OPEN",
+                CallbackBarrierModel.owner_terminal_id == terminal_id,
+            )
+            .all()
+        )
+        for barrier in owned_barriers:
+            db.query(InboxModel).filter(
+                InboxModel.barrier_id == barrier.id,
+                InboxModel.status == MessageStatus.HELD.value,
+            ).update(
+                {InboxModel.status: MessageStatus.PENDING.value},
+                synchronize_session=False,
+            )
+            barrier.state = "CANCELLED"
+            barrier.close_reason = "owner_gone"
+            barrier.fired_at = now
+
         _mark_barrier_member_gone_in_db(db, terminal_id)
+        child_values = {
+            TerminalModel.caller_id: target.id if target is not None else None,
+            TerminalModel.caller_mailbox_id: (
+                _mailbox_id_for_terminal(db, target.id) if target is not None else None
+            ),
+            TerminalModel.reparented_from: terminal_id,
+        }
+        db.query(TerminalModel).filter(TerminalModel.caller_id == terminal_id).update(
+            child_values,
+            synchronize_session=False,
+        )
         intent_deleted = False
         if not preserve_warm_intent:
             intent_deleted = (

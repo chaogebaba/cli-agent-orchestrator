@@ -59,7 +59,9 @@ def test_t1_plain_nested_clone_is_excluded_from_snapshot_and_staleness(repo: Pat
         body="nested clone excluded",
         round_number=1,
     )
-    assert base_digest_service.covers(artifact, stale.delta)
+    assert isinstance(
+        base_digest_service.coverage(artifact, stale.delta), base_digest_service.Proven
+    )
 
 
 def test_t2_git_file_marker_is_excluded(repo: Path) -> None:
@@ -268,8 +270,10 @@ def test_t2f_marker_oserror_fails_open_but_real_unhashable_still_blocks(
         entries=coverable.entries,
         body="coverable",
     )
-    assert base_digest_service.covers(artifact, coverable)
-    assert not base_digest_service.covers(artifact, stale.delta)
+    assert isinstance(base_digest_service.coverage(artifact, coverable), base_digest_service.Proven)
+    assert isinstance(
+        base_digest_service.coverage(artifact, stale.delta), base_digest_service.Unobservable
+    )
 
 
 def test_t2g_lexical_intermediate_symlink_follows_marker_and_loop_fails_open(
@@ -355,7 +359,9 @@ def test_t3_hash_failure_stays_unhashable_and_blocks_coverage(repo: Path) -> Non
         entries=captured.entries,
         body="cannot cover",
     )
-    assert not base_digest_service.covers(artifact, captured)
+    assert isinstance(
+        base_digest_service.coverage(artifact, captured), base_digest_service.Unobservable
+    )
 
 
 def test_t4_exclusion_log_is_single_bounded_and_silent_otherwise(

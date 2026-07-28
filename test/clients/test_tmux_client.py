@@ -530,6 +530,40 @@ class TestGetSessionWindows:
         assert result == []
 
 
+class TestSetWindowParent:
+    def test_parent_indent_is_window_local_and_survives_external_rename(self, tmux):
+        options = {}
+        child = MagicMock()
+        child.name = "child"
+        child.set_option.side_effect = lambda name, value: options.__setitem__(name, value)
+        session = MagicMock()
+        session.active_window = MagicMock(name="different-current-window")
+        session.windows.get.return_value = child
+        tmux.server.sessions.get.return_value = session
+
+        tmux.set_window_parent("ses", "child", "parent123")
+        child.name = "renamed-externally"
+
+        assert options["@cao_parent"] == "parent123"
+        assert options["window-status-format"] == (
+            "#{?#{!=:#{@cao_parent},},  └─ ,}#I:#W#{?window_flags,#{window_flags},}"
+        )
+        assert session.active_window is not child
+
+    def test_unset_parent_cache_is_empty(self, tmux):
+        options = {}
+        child = MagicMock()
+        child.set_option.side_effect = lambda name, value: options.__setitem__(name, value)
+        session = MagicMock()
+        session.windows.get.return_value = child
+        tmux.server.sessions.get.return_value = session
+
+        tmux.set_window_parent("ses", "child", None)
+
+        assert options["@cao_parent"] == ""
+        assert "#{@cao_parent}" in options["window-status-format"]
+
+
 # ── kill_session ─────────────────────────────────────────────────────
 
 

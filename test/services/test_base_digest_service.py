@@ -23,8 +23,12 @@ def test_publish_and_evaluate_covered(tmp_path: Path):
     delta = _delta(SnapshotEntry("a:b", "sha256", "a" * 64))
     row = {"name": "base", "cwd": str(tmp_path), "digest_head": None}
     artifact = service.publish(
-        base="base", cwd=str(tmp_path), parent_artifact_sha=None,
-        delta=delta, body="general orientation\n", round_number=1,
+        base="base",
+        cwd=str(tmp_path),
+        parent_artifact_sha=None,
+        delta=delta,
+        body="general orientation\n",
+        round_number=1,
     )
     result = service.evaluate(row, delta)
     assert isinstance(result, service.DigestCovered)
@@ -37,8 +41,12 @@ def test_no_artifact_is_pending_and_uncovered_is_pending(tmp_path: Path):
     row = {"name": "base", "cwd": str(tmp_path), "digest_head": None}
     assert isinstance(service.evaluate(row, delta), service.DigestPending)
     service.publish(
-        base="base", cwd=str(tmp_path), parent_artifact_sha=None,
-        delta=delta, body="ctx", round_number=1,
+        base="base",
+        cwd=str(tmp_path),
+        parent_artifact_sha=None,
+        delta=delta,
+        body="ctx",
+        round_number=1,
     )
     assert isinstance(
         service.evaluate(row, _delta(SnapshotEntry("b", "absent"))),
@@ -49,8 +57,12 @@ def test_no_artifact_is_pending_and_uncovered_is_pending(tmp_path: Path):
 def test_lineage_mismatch_and_acquisition_failure_are_invalid(tmp_path: Path):
     delta = _delta(SnapshotEntry("a", "sha256", "b" * 64))
     service.publish(
-        base="base", cwd=str(tmp_path), parent_artifact_sha=None,
-        delta=delta, body="ctx", round_number=1,
+        base="base",
+        cwd=str(tmp_path),
+        parent_artifact_sha=None,
+        delta=delta,
+        body="ctx",
+        round_number=1,
     )
     row = {"name": "base", "cwd": str(tmp_path), "digest_head": "c" * 64}
     result = service.evaluate(row, delta)
@@ -58,18 +70,52 @@ def test_lineage_mismatch_and_acquisition_failure_are_invalid(tmp_path: Path):
     assert result.reason == "lineage"
     failure = SnapshotDelta(None, acquisition_error="non-utf8-path")
     result = service.evaluate(row, failure)
-    assert isinstance(result, service.DigestInvalid)
-    assert result.reason == "acquisition:non-utf8-path"
+    assert isinstance(result, service.DigestUnobservable)
+    assert result.reason == "apparatus_unavailable"
+    assert result.detail == "non-utf8-path"
 
 
 def test_publish_rejects_over_budget(tmp_path: Path):
-    delta = _delta(SnapshotEntry("a", "absent"))
+    delta = _delta(
+        SnapshotEntry("a", "absent"),
+        SnapshotEntry("bb", "absent"),
+        SnapshotEntry("ccc", "absent"),
+        SnapshotEntry("dddd", "absent"),
+        SnapshotEntry("eeeee", "absent"),
+        SnapshotEntry("ffffff", "absent"),
+    )
     try:
         service.publish(
-            base="base", cwd=str(tmp_path), parent_artifact_sha=None,
-            delta=delta, body="x" * service.MAX_DIGEST_BYTES, round_number=1,
+            base="base",
+            cwd=str(tmp_path),
+            parent_artifact_sha=None,
+            delta=delta,
+            body="x" * service.MAX_DIGEST_BYTES,
+            round_number=1,
         )
-    except ValueError as exc:
-        assert str(exc) == "over-budget"
+    except service.OverBudgetError as exc:
+        assert exc.kind == "rendered"
+        assert exc.detail.manifest_bytes is not None
+        assert exc.detail.body_bytes == service.MAX_DIGEST_BYTES + 1
+        assert exc.detail.cap == service.MAX_DIGEST_BYTES
+        assert exc.detail.top_dirty == tuple(
+            (path, len(f"absent - {path}")) for path in ("ffffff", "eeeee", "dddd", "ccc", "bb")
+        )
     else:
         raise AssertionError("over-budget digest was published")
+
+
+def test_ac10_on_disk_and_rendered_budget_failures_are_distinct(tmp_path: Path):
+    directory = tmp_path / "tmp" / "orch" / "digests"
+    directory.mkdir(parents=True)
+    candidate = directory / "base-2026-07-27-r1.md"
+    candidate.write_bytes(b"x" * (service.MAX_DIGEST_BYTES + 7))
+    delta = _delta(SnapshotEntry("a", "absent"))
+
+    result = service.evaluate({"name": "base", "cwd": str(tmp_path), "digest_head": None}, delta)
+
+    assert isinstance(result, service.DigestInvalid)
+    assert result.reason == "over_budget_artifact"
+    assert isinstance(result.detail, service.BudgetBreakdown)
+    assert result.detail.artifact_bytes == service.MAX_DIGEST_BYTES + 7
+    assert result.detail.cap == service.MAX_DIGEST_BYTES

@@ -526,7 +526,9 @@ class TestDeleteTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_delete_terminal_full_path(self, mock_meta, mock_tmux, mock_pm, mock_db_del):
         """Delete should stop pipe-pane, kill window, cleanup provider, delete DB record."""
-        from cli_agent_orchestrator.services.terminal_service import delete_terminal
+        from cli_agent_orchestrator.services.terminal_service import (
+            _delete_terminal_core as delete_terminal,
+        )
 
         mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
 
@@ -548,7 +550,9 @@ class TestDeleteTerminal:
         self, mock_meta, mock_tmux, mock_pm, mock_db_del
     ):
         """Pipe-pane failure should be logged and not block deletion."""
-        from cli_agent_orchestrator.services.terminal_service import delete_terminal
+        from cli_agent_orchestrator.services.terminal_service import (
+            _delete_terminal_core as delete_terminal,
+        )
 
         mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
         mock_tmux.stop_pipe_pane.side_effect = Exception("pipe error")
@@ -569,7 +573,9 @@ class TestDeleteTerminal:
         self, mock_meta, mock_tmux, mock_pm, mock_db_del
     ):
         """Kill-window failure should be logged and not block deletion."""
-        from cli_agent_orchestrator.services.terminal_service import delete_terminal
+        from cli_agent_orchestrator.services.terminal_service import (
+            _delete_terminal_core as delete_terminal,
+        )
 
         mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
         mock_tmux.kill_window.side_effect = Exception("kill error")
@@ -585,7 +591,9 @@ class TestDeleteTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_delete_terminal_db_failure_raises(self, mock_meta, mock_tmux, mock_pm, mock_db_del):
         """DB delete failure should propagate."""
-        from cli_agent_orchestrator.services.terminal_service import delete_terminal
+        from cli_agent_orchestrator.services.terminal_service import (
+            _delete_terminal_core as delete_terminal,
+        )
 
         mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
         mock_db_del.side_effect = Exception("DB error")
