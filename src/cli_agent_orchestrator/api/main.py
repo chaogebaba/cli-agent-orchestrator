@@ -770,8 +770,12 @@ async def lifespan(app: FastAPI):
     await registry.load()
     app.state.plugin_registry = registry
     await terminal_service.recover_deferred_inits(registry)
-    purged = terminal_service.purge_stale_terminal_records()
-    logger.info("purged %d stale terminals", purged)
+    try:
+        purged = terminal_service.purge_stale_terminal_records()
+    except Exception:
+        logger.exception("Startup stale terminal purge failed; deferring to next boot")
+    else:
+        logger.info("purged %d stale terminals", purged)
 
     # Run cleanup in background
     asyncio.create_task(asyncio.to_thread(cleanup_old_data))

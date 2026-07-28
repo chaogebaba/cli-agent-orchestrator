@@ -146,6 +146,10 @@ class TerminalBackend(ABC):
         """Return live, gone, or error without collapsing backend failures."""
         return "error"
 
+    def get_session_windows(self, session_name: str) -> List[Dict[str, object]]:
+        """Return the windows visible in a session, or an empty inventory."""
+        return []
+
     @abstractmethod
     def create_window(
         self,

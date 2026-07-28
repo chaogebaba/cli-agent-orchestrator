@@ -29,7 +29,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.api.main import app, lifespan
+from cli_agent_orchestrator.api.main import app, health_check, lifespan
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.plugins import PluginRegistry
 
@@ -113,7 +113,7 @@ def _patched_lifespan(backend: object, tasks: list):
         inbox = patch_main("inbox_service")
         inbox.recover_stale_deliveries.return_value = None
         inbox.reconcile_pending_orphans.return_value = None
-        stack.enter_context(
+        purge = stack.enter_context(
             patch(
                 "cli_agent_orchestrator.api.main.terminal_service.purge_stale_terminal_records",
                 return_value=0,
@@ -133,6 +133,7 @@ def _patched_lifespan(backend: object, tasks: list):
         namespace = SimpleNamespace(
             get_backend=patch_main("get_backend", return_value=backend),
             herdr_cls=patch_main("HerdrInboxService"),
+            purge=purge,
             set_svc=patch_main("set_herdr_inbox_service"),
             load=stack.enter_context(patch.object(PluginRegistry, "load", new_callable=AsyncMock)),
             teardown=stack.enter_context(
@@ -284,3 +285,20 @@ class TestLifespanBarrierSweepResilience:
                 async with lifespan(app):
                     # Assert
                     sweep.assert_called_once()
+
+
+class TestLifespanTerminalPurgeResilience:
+    """Terminal enumeration failures must not prevent readiness."""
+
+    @pytest.mark.asyncio
+    async def test_ac13b_startup_purge_failure_still_serves_health(self) -> None:
+        tasks: list = []
+        backend = MagicMock()
+
+        with _patched_lifespan(backend, tasks) as mocks:
+            mocks.purge.side_effect = RuntimeError("terminal listing failed")
+
+            async with lifespan(app):
+                mocks.purge.assert_called_once()
+                mocks.load.assert_awaited_once()
+                assert (await health_check())["status"] == "ok"

@@ -25,9 +25,9 @@ from cli_agent_orchestrator.clients.database import (
     cancel_pending_watchdog_message,
     confirm_batch_from_prior_attempt,
     count_ambiguous_attempts,
+    create_digest_pending_notice,
     create_flow,
     create_inbox_message,
-    create_digest_pending_notice,
     create_terminal,
     create_transcript_binding,
     delete_flow,
@@ -54,6 +54,7 @@ from cli_agent_orchestrator.clients.database import (
     update_message_status,
     update_terminal_provider_session_id_if_null,
     update_terminal_shell_command,
+    update_terminal_tmux_window,
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 
@@ -108,7 +109,9 @@ class TestTerminalOperations:
             assert row.message.startswith("[CAO DIGEST-PENDING] base=base key=k1\n")
 
     def test_digest_pending_notice_deduplicates_across_mailbox_rollover(
-        self, test_db, monkeypatch,
+        self,
+        test_db,
+        monkeypatch,
     ):
         monkeypatch.setattr("cli_agent_orchestrator.clients.database.SessionLocal", test_db)
         create_terminal("old", "cao-session", "window-old", "codex")
@@ -116,13 +119,19 @@ class TestTerminalOperations:
         with test_db.begin() as db:
             db.add(
                 MailboxModel(
-                    id="mb_digest", session_name="cao-session", role="supervisor",
-                    current_terminal_id="old", generation=1, consumed_through_id=0,
+                    id="mb_digest",
+                    session_name="cao-session",
+                    role="supervisor",
+                    current_terminal_id="old",
+                    generation=1,
+                    consumed_through_id=0,
                 )
             )
             db.add(
                 MailboxIncarnationModel(
-                    mailbox_id="mb_digest", generation=1, terminal_id="old",
+                    mailbox_id="mb_digest",
+                    generation=1,
+                    terminal_id="old",
                 )
             )
 
@@ -133,7 +142,9 @@ class TestTerminalOperations:
             mailbox.generation = 2
             db.add(
                 MailboxIncarnationModel(
-                    mailbox_id="mb_digest", generation=2, terminal_id="new",
+                    mailbox_id="mb_digest",
+                    generation=2,
+                    terminal_id="new",
                 )
             )
         second = create_digest_pending_notice("mb_digest", "base", "k1", "body")
@@ -582,6 +593,27 @@ class TestMessageTraceTransactions:
         result = update_terminal_shell_command("nonexistent", "bash")
 
         assert result is False
+
+    def test_update_terminal_tmux_window(self, test_db, monkeypatch):
+        monkeypatch.setattr(database_client, "SessionLocal", test_db)
+        create_terminal("terminal-a", "cao-session", "old-name", "codex")
+
+        assert update_terminal_tmux_window("terminal-a", "new-name") is True
+        assert get_terminal_metadata("terminal-a")["tmux_window"] == "new-name"
+
+    def test_update_terminal_tmux_window_not_found(self, test_db, monkeypatch):
+        monkeypatch.setattr(database_client, "SessionLocal", test_db)
+
+        assert update_terminal_tmux_window("missing", "new-name") is False
+
+    def test_update_terminal_tmux_window_refuses_same_session_conflict(self, test_db, monkeypatch):
+        monkeypatch.setattr(database_client, "SessionLocal", test_db)
+        create_terminal("terminal-a", "cao-session", "old-name", "codex")
+        create_terminal("terminal-b", "cao-session", "claimed-name", "codex")
+
+        assert update_terminal_tmux_window("terminal-a", "claimed-name") is False
+        assert get_terminal_metadata("terminal-a")["tmux_window"] == "old-name"
+        assert get_terminal_metadata("terminal-b")["tmux_window"] == "claimed-name"
 
     @patch(
         "cli_agent_orchestrator.clients.database.delete_terminal_and_warm_intent",

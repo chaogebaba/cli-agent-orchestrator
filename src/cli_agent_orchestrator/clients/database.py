@@ -1874,6 +1874,31 @@ def update_terminal_shell_command(terminal_id: str, shell_command: str) -> bool:
         return False
 
 
+def update_terminal_tmux_window(terminal_id: str, new_tmux_window: str) -> bool:
+    """Update a terminal's window unless another row in its session owns it."""
+    with SessionLocal() as db:
+        db.execute(text("BEGIN IMMEDIATE"))
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal is None:
+            db.rollback()
+            return False
+        conflict = (
+            db.query(TerminalModel.id)
+            .filter(
+                TerminalModel.tmux_session == terminal.tmux_session,
+                TerminalModel.tmux_window == new_tmux_window,
+                TerminalModel.id != terminal_id,
+            )
+            .first()
+        )
+        if conflict is not None:
+            db.rollback()
+            return False
+        terminal.tmux_window = new_tmux_window
+        db.commit()
+        return True
+
+
 def update_terminal_provider_session_id_if_null(terminal_id: str, session_uuid: str) -> str | None:
     """Claim an unset provider session id and return the persisted winner."""
     with SessionLocal.begin() as db:

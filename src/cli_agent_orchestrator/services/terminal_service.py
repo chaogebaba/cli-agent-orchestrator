@@ -54,6 +54,7 @@ from cli_agent_orchestrator.clients.database import (
     update_last_active,
     update_provider_session_snapshot,
     update_terminal_shell_command,
+    update_terminal_tmux_window,
 )
 from cli_agent_orchestrator.constants import (
     FIFO_DIR,
@@ -328,12 +329,58 @@ def purge_stale_terminal_records() -> int:
             )
             continue
         try:
-            backend.get_history(
-                metadata["tmux_session"],
-                metadata["tmux_window"],
-                tail_lines=1,
-            )
-        except Exception:
+            tmux_session = metadata["tmux_session"]
+            tmux_window = metadata["tmux_window"]
+            state = backend.window_liveness(tmux_session, tmux_window)
+            if state == "live":
+                continue
+            if state == "error":
+                continue
+            if getattr(backend, "supports_identity_readback", False) is not True:
+                continue
+
+            windows = backend.get_session_windows(tmux_session)
+            matches: list[str] = []
+            unreadable: list[str] = []
+            for window in windows:
+                name = str(window["name"])
+                result = backend.read_pane_identity(tmux_session, name)
+                if result.reason in {
+                    "read_error",
+                    "pane_cardinality",
+                    "incarnation_changed",
+                }:
+                    unreadable.append(name)
+                    continue
+                if result.identity == terminal_id:
+                    matches.append(name)
+            if len(matches) > 1:
+                logger.warning(
+                    "purge_identity_ambiguous terminal=%s windows=%s", terminal_id, matches
+                )
+                continue
+            match = matches[0] if matches else None
+            if match is not None:
+                if not update_terminal_tmux_window(terminal_id, match):
+                    logger.warning(
+                        "purge_rename_conflict terminal=%s window=%s", terminal_id, match
+                    )
+                else:
+                    logger.info(
+                        "purge_reconciled_rename terminal=%s old=%s new=%s",
+                        terminal_id,
+                        tmux_window,
+                        match,
+                    )
+                continue
+            if unreadable:
+                logger.warning(
+                    "purge_inconclusive terminal=%s session=%s unreadable=%d",
+                    terminal_id,
+                    tmux_session,
+                    len(unreadable),
+                )
+                continue
             if delete_terminal_and_warm_intent(terminal_id, preserve_warm_intent=False)[
                 "terminal_deleted"
             ]:
@@ -347,6 +394,9 @@ def purge_stale_terminal_records() -> int:
                     metadata["tmux_session"],
                     metadata["tmux_window"],
                 )
+        except Exception:
+            logger.exception("purge_row_failed terminal=%s", terminal_id)
+            continue
     return purged
 
 

@@ -299,7 +299,9 @@ def test_probe_01_delayed_relaunch_digests_old_generation_without_replay(
     with scratch_db() as db:
         assert db.get(InboxModel, second.id).status == "pending"
     stale_backend = MagicMock()
-    stale_backend.get_history.side_effect = RuntimeError("missing window")
+    stale_backend.supports_identity_readback = True
+    stale_backend.window_liveness.return_value = "gone"
+    stale_backend.get_session_windows.return_value = []
     with patch.object(terminal_service_module, "get_backend", return_value=stale_backend):
         assert terminal_service_module.purge_stale_terminal_records() == 1
     assert adopt_mailbox_rows_at_startup() == 2
@@ -1790,9 +1792,11 @@ def test_wpq1_purge_uses_shared_p5_transaction_and_notice(scratch_db):
         terminal(db, "stale")
         row = inbox(db, "stale", sender="sender")
     backend = MagicMock()
-    backend.get_history.side_effect = lambda _session, window, **_kwargs: (
-        "alive" if window == "sender" else (_ for _ in ()).throw(RuntimeError("gone"))
+    backend.supports_identity_readback = True
+    backend.window_liveness.side_effect = lambda _session, window: (
+        "live" if window == "sender" else "gone"
     )
+    backend.get_session_windows.return_value = []
 
     with patch.object(terminal_service_module, "get_backend", return_value=backend):
         assert terminal_service_module.purge_stale_terminal_records() == 1
