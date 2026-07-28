@@ -8,6 +8,7 @@ from cli_agent_orchestrator.cli.commands.barrier import barrier
 from cli_agent_orchestrator.cli.commands.base import base
 from cli_agent_orchestrator.cli.commands.config import config
 from cli_agent_orchestrator.cli.commands.env import env
+from cli_agent_orchestrator.cli.commands.fold import fold
 from cli_agent_orchestrator.cli.commands.info import info
 from cli_agent_orchestrator.cli.commands.init import init
 from cli_agent_orchestrator.cli.commands.install import install
@@ -67,6 +68,7 @@ cli.add_command(terminal)
 cli.add_command(workflow)
 cli.add_command(messages)
 cli.add_command(mailbox)
+cli.add_command(fold)
 cli.add_command(suite)
 cli.add_command(verify)
 cli.add_command(ledger)
