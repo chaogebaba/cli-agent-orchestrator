@@ -118,6 +118,16 @@ dev = [
     # JWT/JWKS test fixtures (test/fixtures/jwt_factory.py) mint RS256 tokens
     # with authlib; runtime verification needs only pyjwt[crypto].
     "authlib>=1.7.1",
+    # The `agui` and `otel` OPTIONAL extras are dev-required so the suite has a
+    # GREEN baseline. Both features no-op at runtime when absent (that is the
+    # point of the extras), but their tests do not skip -- they FAIL, and 61
+    # permanently-failing tests are a place a real regression hides. A reviewer
+    # should never have to decide by hand which failures are "the normal ones".
+    # (User ruling 2026-07-28, after a merge landed on an 8076/61 baseline.)
+    "ag-ui-protocol>=0.1.19,<0.2.0",
+    "opentelemetry-api>=1.27.0",
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.27.0",
 ]
 
 [tool.black]
