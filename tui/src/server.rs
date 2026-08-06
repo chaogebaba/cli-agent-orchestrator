@@ -685,6 +685,8 @@ fn route(id: CommandId) -> Option<Route> {
         // unbounded for this client's purposes.
         CommandId::WorkflowResume => None,
         CommandId::WorkflowRun => None,
+        // HIDE: fork-only read verb; no TUI roster pane (wp-agents-status)
+        CommandId::AgentsStatus => None,
         // HIDE: fork-only / ops; unclassified default
         CommandId::BarrierCancel => None,
         // HIDE: fork-only / ops; unclassified default
