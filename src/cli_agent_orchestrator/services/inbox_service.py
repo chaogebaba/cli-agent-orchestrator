@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Sequence
 
 from sqlalchemy.exc import OperationalError
+from tzlocal import get_localzone
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
@@ -679,8 +680,8 @@ class InboxService:
             if not isinstance(value, datetime):
                 return datetime.min.replace(tzinfo=timezone.utc)
             if value.tzinfo is None:
-                return value.replace(tzinfo=timezone.utc)
-            return value
+                return value.replace(tzinfo=get_localzone(), fold=0).astimezone(timezone.utc)
+            return value.astimezone(timezone.utc)
 
         candidates.sort(key=_last_active_key, reverse=True)
         return str(candidates[0]["id"])
