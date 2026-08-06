@@ -38,7 +38,21 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
 
 ### Profiles, providers, and settings
 
-- `/agents/profiles*` lists, reads, and installs profiles.
+- `GET /agents/profiles` and `GET /agents/profiles/{name}` list and inspect
+  installed profiles.
+- `GET /agents/profiles/search` ranks installed, loadable profiles by capability
+  using the same service as `cao profile find`.
+- `GET /agents/profiles/templates` lists public template metadata (`name` and
+  `description` only); internal template filesystem paths are never returned.
+- `GET /agents/profiles/templates/{category}/{name}/schema` returns a template's
+  JSON-Schema.
+- `POST /agents/profiles/templates/validate` validates a config object against
+  a template's JSON-Schema without writing a profile.
+- `POST /agents/profiles/templates/preview` validates and renders a template to
+  Markdown without writing a profile.
+- `POST /agents/profiles/install` installs a profile.
+- Template validation and preview require the selected template to include a
+  `schema.json` file.
 - `/agents/providers` reports provider availability.
 - `/settings/*` exposes supported agent-directory, skill-directory, and memory
   settings.
@@ -79,8 +93,20 @@ than calling these routes directly.
 ### Workflows
 
 - `/workflows*` validates and inspects workflow specifications.
-- `/workflows/runs*` starts, inspects, cancels, and resumes runs and retrieves
-  run output.
+- `POST /workflows/runs` starts a run **inline** and holds the connection until it
+  finishes, returning the complete result.
+- `POST /workflows/runs:submit` starts a run **asynchronously**: it returns `202` with
+  `{run_id, state, links}` as soon as the run is durably journaled, then drives the run in
+  the background. The `links` map always carries `self`/`status`/`result`/`cancel`;
+  `events` appears only on a build that serves the events route, so treat it as optional.
+- `GET /workflows/runs` lists journaled runs newest-first (`?state=`, `?limit=`).
+- `GET /workflows/runs/{run_id}` returns a point-in-time status snapshot.
+- `GET /workflows/runs/{run_id}/result` returns the complete retained result. It is
+  assembled from the journal, so it answers for a **detached, in-flight, or post-restart**
+  run — not only a finished one. No run-level `output` field is returned (run-level output
+  is not journaled); per-step outputs are on `steps[].output`.
+- `POST /workflows/runs/{run_id}/cancel` cooperatively cancels a run;
+  `POST /workflows/runs/{run_id}/resume` re-drives a crashed/failed one.
 
 See [Workflows](workflows.md).
 
@@ -88,6 +114,10 @@ See [Workflows](workflows.md).
 
 - `/settings/memory` reports memory enablement (including `learning_enabled`).
 - `/memory*` lists, reads, exports, and deletes memories.
+- `/memory/relationships*` lists, creates, patches, promotes, rejects, and
+  soft-deletes typed relationships between memories. `GET` is read-scoped and
+  capped by `limit` (default 50, max 100); the mutating routes are write-scoped.
+  `DELETE` is a soft-delete — the row is retained with `status=deleted`.
 - `/graph/{provider}*` projects and exports graph views.
 - `/outcomes` records (`POST`, write-scope) and lists (`GET`) workflow
   outcomes for the self-learning loop. Both return 404 while

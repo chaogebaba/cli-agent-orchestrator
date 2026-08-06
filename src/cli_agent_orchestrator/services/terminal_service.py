@@ -28,7 +28,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, Optional, Protocol, assert_never, cast
+from typing import Any, Callable, Dict, Optional, Protocol, assert_never, cast
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
@@ -63,8 +63,10 @@ from cli_agent_orchestrator.constants import (
     SESSION_PREFIX,
     TERMINAL_LOG_DIR,
 )
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.native_publish import DispatchTxn, NativePublishRequest
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.plugins import (
@@ -90,6 +92,12 @@ from cli_agent_orchestrator.services.draft_guard import (
     prepare_native_stash_before_send,
     preserve_draft_before_send,
     stash_draft_before_send,
+)
+from cli_agent_orchestrator.providers.kiro_capabilities import (
+    KiroCapabilities,
+    KiroPhase0KASError,
+    probe_kiro_capabilities,
+    requested_kiro_capabilities,
 )
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.fork_context_service import snapshot as fork_snapshot
@@ -677,6 +685,8 @@ async def create_terminal(
     fallback_source_lease_token=None,
     dispatch_barrier: dict[str, object] | None = None,
     park_warm: bool = False,
+    engine: Optional[KiroEngine | str] = None,
+    kiro_capability_probe: Optional[Callable[[KiroEngine, set[str]], KiroCapabilities]] = None,
     model: Optional[str] = None,
     lifecycle: str | None = None,
 ) -> Terminal:
@@ -708,6 +718,9 @@ async def create_terminal(
             via handoff/assign. Recorded so send_message can route callbacks
             structurally instead of parsing IDs out of message text (issue #284).
             None for operator-launched terminals.
+        engine: Explicit Kiro engine. For Kiro, it must agree with the selected
+            profile's engine when both are present; omitted resolves to v2.
+        kiro_capability_probe: Optional test seam for the bounded wrapper probe.
         model: Explicit per-call model override, forwarded to the provider
             (where supported -- see each provider's own __init__) ahead of
             the provider's existing profile/providers.toml resolution. Lets a
@@ -825,6 +838,62 @@ async def create_terminal(
     fifo_attached = False
     db_created = False
     try:
+        # Resolve profile policy and Kiro engine BEFORE allocating any backend
+        # resource. A KAS request must probe then fail closed with no window,
+        # database row, FIFO, Herdr registration, or provider process.
+        try:
+            profile = load_agent_profile(agent_profile)
+        except FileNotFoundError:
+            profile = None
+        # Production loaders return AgentProfile. Treat a test double or an
+        # otherwise malformed object as no selected profile rather than
+        # accepting arbitrary attributes as configuration.
+        if profile is not None and not isinstance(profile, AgentProfile):
+            profile = None
+
+        if provider == ProviderType.KIRO_CLI.value:
+            resolved_engine = resolve_kiro_engine(
+                explicit=engine,
+                profile=getattr(profile, "engine", None),
+            )
+            if allowed_tools is None and profile is not None:
+                from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+                mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+                allowed_tools = resolve_allowed_tools(
+                    profile.allowedTools, profile.role, mcp_server_names
+                )
+            # Kiro runs headlessly, so current CAO behavior always bypasses its
+            # interactive approval prompt. Profile/MCP policy remains enforced
+            # by CAO, while unrestricted profiles additionally force legacy UI.
+            # Mirror the launch-time precedence (`model or profile.model`, see
+            # _get_profile_model): probing the profile snapshot alone would let an
+            # explicit override launch --model on a wrapper never probed for it.
+            requested = requested_kiro_capabilities(
+                resolved_engine,
+                model=model or (profile.model if profile else None),
+                yolo=True,
+            )
+            probe = kiro_capability_probe or probe_kiro_capabilities
+            await asyncio.to_thread(probe, resolved_engine, requested)
+            if resolved_engine == KiroEngine.KAS:
+                raise KiroPhase0KASError(
+                    bool(profile and (profile.allowedTools or profile.toolsSettings))
+                )
+        else:
+            if engine is not None:
+                raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
+            resolved_engine = None
+
+        # Resolve tool policy before persistence for non-Kiro providers too.
+        if allowed_tools is None and profile is not None:
+            from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+            mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+            allowed_tools = resolve_allowed_tools(
+                profile.allowedTools, profile.role, mcp_server_names
+            )
+
         # Step 1: Generate unique identifiers
         terminal_id = terminal_id or generate_terminal_id()
         assert terminal_id is not None
@@ -912,13 +981,8 @@ async def create_terminal(
         if callable(parent_writer):
             parent_writer(session_name, window_name, caller_id)
 
-        # Step 3: Load the profile once for allowed tool resolution before
-        # provider initialization. The skill catalog is computed only for
-        # providers that consume it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
-        try:
-            profile = load_agent_profile(agent_profile)
-        except FileNotFoundError:
-            profile = None
+        # Step 3: Build a runtime skill catalog only for providers that consume
+        # it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
         skill_prompt = (
             build_skill_catalog(profile.skills if profile else None)
             if provider in RUNTIME_SKILL_PROMPT_PROVIDERS
@@ -1037,6 +1101,9 @@ async def create_terminal(
                                 ),
                                 parent_base_name=fork_context.base_name,
                                 fork_mode=fork_context.mode,
+                                engine=(
+                                    resolved_engine.value if resolved_engine is not None else None
+                                ),
                                 **init_fields,
                             )
                         else:
@@ -1056,6 +1123,9 @@ async def create_terminal(
                                 parent_base_name=fork_context.base_name,
                                 fork_mode=fork_context.mode,
                                 dispatch_barrier=dispatch_barrier,
+                                engine=(
+                                    resolved_engine.value if resolved_engine is not None else None
+                                ),
                                 **init_fields,
                             )
                     else:
@@ -1076,6 +1146,11 @@ async def create_terminal(
                                         else {}
                                     ),
                                     provider_session_id=attempted_resume_uuid,
+                                    engine=(
+                                        resolved_engine.value
+                                        if resolved_engine is not None
+                                        else None
+                                    ),
                                     **init_fields,
                                 )
                             else:
@@ -1094,6 +1169,11 @@ async def create_terminal(
                                     ),
                                     provider_session_id=attempted_resume_uuid,
                                     dispatch_barrier=dispatch_barrier,
+                                    engine=(
+                                        resolved_engine.value
+                                        if resolved_engine is not None
+                                        else None
+                                    ),
                                     **init_fields,
                                 )
                         else:
@@ -1110,6 +1190,11 @@ async def create_terminal(
                                         {"lifecycle": resolved_lifecycle}
                                         if resolved_lifecycle != "ephemeral"
                                         else {}
+                                    ),
+                                    engine=(
+                                        resolved_engine.value
+                                        if resolved_engine is not None
+                                        else None
                                     ),
                                     **init_fields,
                                 )
@@ -1128,6 +1213,11 @@ async def create_terminal(
                                         else {}
                                     ),
                                     dispatch_barrier=dispatch_barrier,
+                                    engine=(
+                                        resolved_engine.value
+                                        if resolved_engine is not None
+                                        else None
+                                    ),
                                     **init_fields,
                                 )
         except Exception as exc:
@@ -1202,6 +1292,7 @@ async def create_terminal(
                 model=model,
                 fork_context=fork_context,
                 persona_plan=persona_plan,
+                engine=resolved_engine,
             )
         except Exception as exc:
             if lease_token is not None:
@@ -1210,6 +1301,7 @@ async def create_terminal(
         allocated_uuid = getattr(provider_instance, "allocated_session_uuid", None)
         if not isinstance(allocated_uuid, str):
             allocated_uuid = None
+            engine=resolved_engine,
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
         # block on `provider.initialize()`. The remaining initialize + input
@@ -1299,6 +1391,7 @@ async def create_terminal(
             caller_id=caller_id,
             lifecycle=resolved_lifecycle,
             allowed_tools=allowed_tools,
+            engine=resolved_engine,
             shell_command=shell_command,
             status=initial_status,
             last_active=datetime.now(),
@@ -2960,6 +3053,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "caller_mailbox_id": metadata.get("caller_mailbox_id"),
             "allowed_tools": metadata.get("allowed_tools"),
             "provider_session_id": metadata.get("provider_session_id"),
+            "engine": metadata.get("engine"),
             "status": status,
             "input_gen": input_gen,
             "status_gen": 0 if status_gen is None else status_gen,
@@ -3020,6 +3114,12 @@ def send_input(
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
+
+        if (
+            metadata.get("provider") == ProviderType.KIRO_CLI.value
+            and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.KAS
+        ):
+            raise KiroPhase0KASError(profile_has_v2_policy=False)
 
         provider = provider_manager.get_provider(terminal_id)
         orchestration_value = (

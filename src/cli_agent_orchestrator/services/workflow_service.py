@@ -590,6 +590,7 @@ async def _collect_structured_output(
             teardown=True,
             timeout=WORKFLOW_STEP_TIMEOUT,
             cancel_signal=cancel_signal,
+            engine=step.engine,
             env_vars={
                 "CAO_WORKFLOW_RUN_ID": record.run_id,
                 "CAO_WORKFLOW_STEP_ID": step.id,
@@ -647,6 +648,7 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
                 teardown=True,
                 timeout=WORKFLOW_STEP_TIMEOUT,
                 cancel_signal=record.cancel_signal,
+                engine=step.engine,
                 env_vars={
                     "CAO_WORKFLOW_RUN_ID": record.run_id,
                     "CAO_WORKFLOW_STEP_ID": step.id,
@@ -891,6 +893,44 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
     finally:
         await _await_cancelling_journal(record)
         _active_drives.discard(run_id)
+        record.cancel_signal = None
+        record.cancel_loop = None
+
+
+async def start_run_prepared(record: RunRecord) -> WorkflowRunResult:
+    """Drive an already-admitted, already-journaled, already-registered YAML run (U2, ADR-3).
+
+    The DEDICATED prepared entry the async submission path's background task
+    (``_run_in_background``) invokes. It is the EXACT tail of :func:`start_run`
+    (L822-832) with the pre-drive admission/insert/registration REMOVED: the async
+    handler (C1) has already run ``_check_run_id_available``, validated + capped the
+    inputs, run the reserved-mode guard, done the atomic durable insert, and
+    registered the ``record`` in ``run_registry`` BEFORE acking with 202. This
+    entry therefore re-runs NONE of that — it only marks the drive live and drives.
+
+    Re-entering the blocking :func:`start_run` here would be wrong on two counts
+    (ADR-3): it would call ``insert_run`` again (a plain INSERT -> ``IntegrityError``
+    on the already-journaled id) AND ``_check_run_id_available`` would see the id the
+    handler just registered as already-claimed and raise ``KeyError`` (-> 409) on
+    EVERY async YAML run — the double-admission hazard. A ``skip_insert`` flag
+    cannot fix the second problem; only a dedicated drive-only entry can.
+
+    ``_topological_order`` and ``_drive`` are reused UNCHANGED, so the async drive
+    settles the terminal state and per-step write-throughs identically to a blocking
+    run. The ``finally`` clears the ``_active_drives`` liveness mark on EVERY exit
+    path (complete, fail, engine error, cancel), so a settled run stays resumable.
+    """
+    # Same cancel ownership as start_run: signal must be installed on THIS loop
+    # so cancel_run can set it (record.cancel_loop is loop) and must be cleared
+    # when the drive ends so a settled record is not left with a dead Event.
+    _install_cancel_signal(record)
+    _active_drives.add(record.run_id)
+    try:
+        order = _topological_order(record.spec)
+        return await _drive(record, order)
+    finally:
+        await _await_cancelling_journal(record)
+        _active_drives.discard(record.run_id)
         record.cancel_signal = None
         record.cancel_loop = None
 

@@ -2917,7 +2917,10 @@ class TestCodexProviderTrustPrompt:
             "test-session", "window-0", "Enter"
         )
 
-    def test_get_status_trust_prompt_v2_is_waiting(self):
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_trust_prompt_v2_is_waiting(self, mock_backend):
+        """V2 trust dialog in bottom region classifies WAITING_USER_ANSWER."""
+        mock_backend.return_value.get_pane_current_command.return_value = "codex"
         output = (
             "Note: You're in a subdirectory of a Git project.\n"
             "Trusting will apply to the repository root: /Users/test/project\n\n"
@@ -2929,7 +2932,10 @@ class TestCodexProviderTrustPrompt:
 
         assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
 
-    def test_get_status_trust_v2_in_scrollback_does_not_false_positive(self):
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_trust_v2_in_scrollback_does_not_false_positive(self, mock_backend):
+        """V2 trust text in scrollback (not bottom) must NOT trigger WAITING."""
+        mock_backend.return_value.get_pane_current_command.return_value = "codex"
         output = (
             "› explain trust prompts\n"
             '• The dialog says "Do you trust the contents of this directory?"\n'
@@ -2952,6 +2958,15 @@ class TestCodexProviderTrustPrompt:
         provider = CodexProvider("test1234", "test-session", "window-0")
 
         assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_backend_registry_is_clean_at_test_start(self):
+        """Regression for #522: autouse fixture resets the backend singleton."""
+        from cli_agent_orchestrator.backends import registry
+
+        assert registry._backend is None, (
+            "Backend singleton leaked from a prior test — "
+            "_reset_backend_registry fixture is not working"
+        )
 
 
 class TestCodexProviderUpdateDialog:

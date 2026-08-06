@@ -30,6 +30,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
 from cli_agent_orchestrator.constants import SESSION_PREFIX
 from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.plugins import (
     PluginRegistry,
@@ -101,6 +102,7 @@ async def create_session(
     registry: PluginRegistry | None = None,
     env_vars: dict[str, str] | None = None,
     allow_incomplete_brief: bool = False,
+    engine: KiroEngine | str | None = None,
     initial_message: str | None = None,
     initial_message_orchestration_type: OrchestrationType | None = None,
     model: str | None = None,
@@ -163,6 +165,7 @@ async def create_session(
         env_vars=session_env,
         allow_incomplete_brief=allow_incomplete_brief,
         fork_context=fork_context,
+        engine=engine,
         defer_init=initial_message is not None,
         initial_message=initial_message,
         initial_message_orchestration_type=initial_message_orchestration_type,

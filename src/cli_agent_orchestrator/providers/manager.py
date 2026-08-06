@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from cli_agent_orchestrator.utils.persona_context import PersonaPlan
 
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import ForkContext
 from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
@@ -19,6 +20,7 @@ from cli_agent_orchestrator.providers.cursor_cli import CursorCliProvider
 from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
+from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
@@ -67,6 +69,7 @@ class ProviderManager:
         model: Optional[str] = None,
         fork_context: Optional[ForkContext] = None,
         persona_plan: "PersonaPlan | None | object" = _NO_PERSONA_PLAN,
+        engine: Optional[KiroEngine] = None,
     ) -> BaseProvider:
         """Construct and commit a provider for ordinary terminal creation."""
         provider = self.construct_provider(
@@ -80,6 +83,7 @@ class ProviderManager:
             model,
             fork_context,
             persona_plan,
+            engine,
         )
         self.commit_provider(terminal_id, provider)
         return provider
@@ -96,6 +100,7 @@ class ProviderManager:
         model: Optional[str] = None,
         fork_context: Optional[ForkContext] = None,
         persona_plan: "PersonaPlan | None | object" = _NO_PERSONA_PLAN,
+        engine: Optional[KiroEngine] = None,
     ) -> BaseProvider:
         """Construct without mutating the live terminal mapping."""
         try:
@@ -110,12 +115,16 @@ class ProviderManager:
             if provider_type == ProviderType.KIRO_CLI.value:
                 if not agent_profile:
                     raise ValueError("Kiro CLI provider requires agent_profile parameter")
+                resolved_engine = resolve_kiro_engine(persisted=engine)
+                if resolved_engine == KiroEngine.KAS:
+                    raise KiroPhase0KASError(profile_has_v2_policy=False)
                 provider = KiroCliProvider(
                     terminal_id,
                     tmux_session,
                     tmux_window,
                     agent_profile,
                     allowed_tools,
+                    engine=resolved_engine,
                     model=model,
                 )
             elif provider_type == ProviderType.GROK_CLI.value:
@@ -261,6 +270,11 @@ class ProviderManager:
         with self._lock:
             provider = self._providers.get(terminal_id)
         if provider:
+            if (
+                isinstance(provider, KiroCliProvider)
+                and getattr(provider, "_engine", None) == KiroEngine.KAS
+            ):
+                raise KiroPhase0KASError(profile_has_v2_policy=False)
             return provider
 
         # Try to create on-demand from database metadata
@@ -272,6 +286,14 @@ class ProviderManager:
                 f"provider unavailable during recovery: {metadata['recovery_state']}"
             )
 
+        persisted_engine = (
+            resolve_kiro_engine(persisted=metadata.get("engine"))
+            if metadata["provider"] == ProviderType.KIRO_CLI.value
+            else None
+        )
+        if persisted_engine == KiroEngine.KAS:
+            raise KiroPhase0KASError(profile_has_v2_policy=False)
+
         # Create provider on-demand
         provider = self.create_provider(
             metadata["provider"],
@@ -279,6 +301,7 @@ class ProviderManager:
             metadata["tmux_session"],
             metadata["tmux_window"],
             metadata["agent_profile"],
+            engine=persisted_engine,
         )
         # Restore shell_command baseline from DB so get_status() can detect kiro exit.
         # The terminal already exists in the DB, so its CLI has long since

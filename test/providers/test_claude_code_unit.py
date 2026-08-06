@@ -1,8 +1,12 @@
 """Unit tests for Claude Code provider."""
 
 import json
+import os
+import re
 import shlex
 import shutil
+import stat
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, mock_open, patch
@@ -2087,8 +2091,9 @@ class TestClaudeCodeProviderYoloRootRegression:
 class TestClaudeCodeProviderStartupPrompts:
     """Tests for Claude Code startup prompt handling (trust + bypass)."""
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_startup_prompts_detected_and_accepted(self, mock_tmux):
+    async def test_handle_startup_prompts_detected_and_accepted(self, mock_tmux):
         """Test that trust prompt is detected and auto-accepted."""
         mock_tmux.get_history.side_effect = [
             "\x1b[1m❯\x1b[0m 1. Yes, I trust this folder\n  2. No, don't trust\n",
@@ -2096,30 +2101,39 @@ class TestClaudeCodeProviderStartupPrompts:
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(idle_gap=2.0)
+        await provider._handle_startup_prompts(idle_gap=2.0)
 
         mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_startup_prompts_not_needed(self, mock_tmux):
+    async def test_handle_startup_prompts_not_needed(self, mock_tmux):
         """Test early return when Claude Code starts without prompts."""
         mock_tmux.get_history.return_value = "Welcome to Claude Code v2.1.0"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(idle_gap=2.0)
+        await provider._handle_startup_prompts(idle_gap=2.0)
 
         mock_tmux.send_special_key.assert_not_called()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings")
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.providers.claude_code.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_startup_prompts_timeout(self, mock_tmux, mock_time, mock_settings):
+    async def test_handle_startup_prompts_timeout(
+        self, mock_tmux, mock_time, mock_sleep, mock_settings
+    ):
         """Handler gives up gracefully at the outer cap when no prompt ever appears.
 
         should-fix-3: the idle-gap exit does not apply until a first prompt has
         been handled, so with only "Loading..." ever showing, the loop runs
         until the outer cap (provider_init_timeout=60) rather than the old
-        20s idle-gap boundary.
+        20s idle-gap boundary. harness-control#215: the loop's own sleep is
+        now asyncio.sleep (mocked here to keep the test instant), and the
+        blocking get_history call is offloaded via asyncio.to_thread — both
+        transparent to this test since it mocks the backend/time layer, not
+        asyncio.to_thread itself.
         """
         mock_settings.return_value = {
             "provider_init_timeout": 60,
@@ -2131,15 +2145,15 @@ class TestClaudeCodeProviderStartupPrompts:
         # iter-2 now (still no prompt -> idle-gap check skipped), iter-3 now
         # (61s >= 60s outer cap -> return).
         mock_time.monotonic.side_effect = [0.0, 0.0, 0.0, 25.0, 61.0]
-        mock_time.sleep = MagicMock()
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(idle_gap=20.0)
+        await provider._handle_startup_prompts(idle_gap=20.0)
 
         mock_tmux.send_special_key.assert_not_called()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_startup_prompts_empty_output_then_detected(self, mock_tmux):
+    async def test_handle_startup_prompts_empty_output_then_detected(self, mock_tmux):
         """Test trust prompt detection after initially empty output."""
         mock_tmux.get_history.side_effect = [
             "",
@@ -2148,12 +2162,13 @@ class TestClaudeCodeProviderStartupPrompts:
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(idle_gap=5.0)
+        await provider._handle_startup_prompts(idle_gap=5.0)
 
         mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_bypass_prompt_detected_and_accepted(self, mock_tmux):
+    async def test_handle_bypass_prompt_detected_and_accepted(self, mock_tmux):
         """Test that bypass permissions prompt is detected and auto-accepted."""
         # First poll: bypass prompt; second poll: welcome banner (after dismissal)
         mock_tmux.get_history.side_effect = [
@@ -2163,14 +2178,15 @@ class TestClaudeCodeProviderStartupPrompts:
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(idle_gap=5.0)
+        await provider._handle_startup_prompts(idle_gap=5.0)
 
         # Verify Down arrow sent via send_keys and Enter via send_special_key
         mock_tmux.send_keys.assert_called_once()
         mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_bypass_then_trust_prompt(self, mock_tmux):
+    async def test_handle_bypass_then_trust_prompt(self, mock_tmux):
         """Test that bypass prompt is handled, then trust prompt follows."""
         # Poll 1: bypass prompt; Poll 2: trust prompt (after bypass dismissed)
         mock_tmux.get_history.side_effect = [
@@ -2180,15 +2196,18 @@ class TestClaudeCodeProviderStartupPrompts:
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(idle_gap=5.0)
+        await provider._handle_startup_prompts(idle_gap=5.0)
 
         # Bypass: send_keys (Down) + send_special_key (Enter)
         # Trust: send_special_key (Enter) — called twice total
         assert mock_tmux.send_keys.call_count == 1  # Down arrow for bypass
         assert mock_tmux.send_special_key.call_count == 2  # Enter for bypass + Enter for trust
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_trust_then_external_import_prompt_rejects_import(self, mock_tmux, monkeypatch):
+    async def test_handle_trust_then_external_import_prompt_rejects_import(
+        self, mock_tmux, monkeypatch
+    ):
         """Sandbox startup rejects external CLAUDE.md imports after trusting the repo."""
         monkeypatch.setattr(
             "cli_agent_orchestrator.providers.claude_code.provider_home",
@@ -2202,15 +2221,16 @@ class TestClaudeCodeProviderStartupPrompts:
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(outer_timeout=5.0)
+        await provider._handle_startup_prompts(outer_timeout=5.0)
 
         mock_tmux.send_keys.assert_called_once_with(
             "test-session", "window-0", "\x1b[B", enter_count=0
         )
         assert mock_tmux.send_special_key.call_count == 2
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_external_import_prompt_does_not_change_production_policy(
+    async def test_handle_external_import_prompt_does_not_change_production_policy(
         self, mock_tmux, monkeypatch
     ):
         """Production startup leaves the external-import decision to the operator."""
@@ -2225,7 +2245,7 @@ class TestClaudeCodeProviderStartupPrompts:
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(outer_timeout=5.0)
+        await provider._handle_startup_prompts(outer_timeout=5.0)
 
         mock_tmux.send_keys.assert_not_called()
         mock_tmux.send_special_key.assert_not_called()
@@ -2279,29 +2299,38 @@ class TestClaudeCodeProviderStartupPrompts:
 
 
 class TestClaudeCodeProviderSettings:
-    """Tests for Claude Code settings management."""
+    """Tests for Claude Code settings management.
 
-    @patch("cli_agent_orchestrator.providers.claude_code.Path")
-    def test_ensure_skip_bypass_prompt_already_set(self, mock_path_cls):
-        """Test no-op when setting is already present."""
-        mock_settings_path = MagicMock()
-        mock_settings_path.exists.return_value = True
-        mock_path_cls.home.return_value.__truediv__ = MagicMock(
-            side_effect=lambda _: mock_settings_path
+    Production writes via ``provider_home("claude_code").home / "settings.json"``
+    (sandbox isolation plane), NOT ``Path.home()``. All tests here patch that seam.
+    """
+
+    @staticmethod
+    def _patch_provider_home(settings_file: Path):
+        """Patch provider_home so settings land at settings_file under its parent home."""
+        return patch(
+            "cli_agent_orchestrator.providers.claude_code.provider_home",
+            return_value=MagicMock(home=settings_file.parent),
         )
-        # Chain .home() / ".claude" / "settings.json"
-        mock_home = MagicMock()
-        mock_claude_dir = MagicMock()
-        mock_path_cls.home.return_value = mock_home
-        mock_home.__truediv__ = MagicMock(return_value=mock_claude_dir)
-        mock_claude_dir.__truediv__ = MagicMock(return_value=mock_settings_path)
 
-        existing = json.dumps({"skipDangerousModePermissionPrompt": True})
-        with patch("builtins.open", mock_open(read_data=existing)):
+    def test_ensure_skip_bypass_prompt_already_set(self, tmp_path):
+        """Test no-op when setting is already present (no rewrite)."""
+        settings_file = tmp_path / ".claude" / "settings.json"
+        settings_file.parent.mkdir(parents=True)
+        existing = {
+            "skipDangerousModePermissionPrompt": True,
+            "permissions": {"allow": []},
+        }
+        settings_file.write_text(json.dumps(existing))
+        before = settings_file.read_text()
+
+        with self._patch_provider_home(settings_file):
             ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
 
-        # Should not write (file handle's write not called)
-        mock_settings_path.parent.mkdir.assert_not_called()
+        assert settings_file.read_text() == before
+        result = json.loads(settings_file.read_text())
+        assert result["skipDangerousModePermissionPrompt"] is True
+        assert result["permissions"] == {"allow": []}
 
     def test_ensure_skip_bypass_prompt_writes_setting(self, tmp_path):
         """Test that setting is written when missing."""
@@ -2309,11 +2338,7 @@ class TestClaudeCodeProviderSettings:
         settings_file.parent.mkdir(parents=True)
         settings_file.write_text(json.dumps({"permissions": {"allow": []}}))
 
-        with patch(
-            "cli_agent_orchestrator.providers.claude_code.provider_home",
-            return_value=MagicMock(home=settings_file.parent),
-        ):
-
+        with self._patch_provider_home(settings_file):
             ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
 
         result = json.loads(settings_file.read_text())
@@ -2325,15 +2350,86 @@ class TestClaudeCodeProviderSettings:
         """Test that settings file is created when it doesn't exist."""
         settings_file = tmp_path / ".claude" / "settings.json"
 
-        with patch(
-            "cli_agent_orchestrator.providers.claude_code.provider_home",
-            return_value=MagicMock(home=settings_file.parent),
-        ):
-
+        with self._patch_provider_home(settings_file):
             ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
 
         result = json.loads(settings_file.read_text())
         assert result["skipDangerousModePermissionPrompt"] is True
+
+    def test_ensure_skip_bypass_prompt_preserves_file_mode(self, tmp_path):
+        """Regression test (review finding on PR #451): the atomic
+        tmp-file + os.replace write must not downgrade an existing
+        settings.json's permissions to the process umask."""
+        settings_file = tmp_path / ".claude" / "settings.json"
+        settings_file.parent.mkdir(parents=True)
+        settings_file.write_text(json.dumps({"permissions": {"allow": []}}))
+        settings_file.chmod(0o600)
+
+        with self._patch_provider_home(settings_file):
+            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+
+        assert stat.S_IMODE(settings_file.stat().st_mode) == 0o600
+
+    def test_ensure_skip_bypass_prompt_new_file_defaults_to_0600(self, tmp_path):
+        """A freshly-created settings.json (no prior file to inherit a mode
+        from) should default to 0600, not the process umask -- it may carry
+        `env`/`apiKeyHelper` secrets."""
+        settings_file = tmp_path / ".claude" / "settings.json"
+
+        with self._patch_provider_home(settings_file):
+            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+
+        assert settings_file.exists()
+        assert stat.S_IMODE(settings_file.stat().st_mode) == 0o600
+
+    def test_ensure_skip_bypass_prompt_concurrent_writes_preserve_keys(self, tmp_path):
+        """Regression test (review finding on PR #451): N concurrent
+        initializers must not race the settings.json read-modify-write and
+        drop pre-existing keys. Pre-lock, a thread reading mid-write would
+        JSON-decode-fail, fall back to {}, and clobber every other key."""
+        settings_file = tmp_path / ".claude" / "settings.json"
+        settings_file.parent.mkdir(parents=True)
+        seed = {f"key{i}": f"value{i}" for i in range(6)}
+        settings_file.write_text(json.dumps(seed))
+
+        with self._patch_provider_home(settings_file):
+            threads = [
+                threading.Thread(target=ClaudeCodeProvider._ensure_skip_bypass_prompt_setting)
+                for _ in range(32)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        result = json.loads(settings_file.read_text())
+        for key, value in seed.items():
+            assert result[key] == value
+        assert result["skipDangerousModePermissionPrompt"] is True
+        assert list(settings_file.parent.glob("*.json.tmp.*")) == []
+
+    def test_ensure_skip_bypass_prompt_uses_atomic_replace(self, tmp_path):
+        """Pin the atomic-write mechanics: os.replace must be the mechanism
+        that lands the tmp file onto settings.json (contrast
+        test_skill_injection.py:158, which pins its own atomic write the
+        same way)."""
+        settings_file = tmp_path / ".claude" / "settings.json"
+
+        with (
+            self._patch_provider_home(settings_file),
+            patch(
+                "cli_agent_orchestrator.providers.claude_code.os.replace", wraps=os.replace
+            ) as mock_replace,
+        ):
+            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+
+        mock_replace.assert_called_once()
+        tmp_arg = mock_replace.call_args[0][0]
+        # PID-suffixed (e.g. "settings.json.tmp.12345") so a stale tmp file
+        # from a prior crashed process can never collide with this write.
+        assert re.search(r"\.json\.tmp\.\d+$", str(tmp_arg))
+        assert settings_file.exists()
+        assert json.loads(settings_file.read_text())["skipDangerousModePermissionPrompt"] is True
 
 
 class TestClaudeCodeMcpCallNotCompleted:
