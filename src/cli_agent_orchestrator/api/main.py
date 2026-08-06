@@ -46,6 +46,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     TRANSCRIPT_BINDING_SOURCES,
+    TRANSCRIPT_HOOK_BINDING_SOURCES,
     adopt_mailbox_rows_at_startup,
     callback_barrier_status,
     cancel_callback_barrier,
@@ -568,7 +569,7 @@ class TranscriptBindingRequest(BaseModel):
     @field_validator("source")
     @classmethod
     def validate_source(cls, value: str) -> str:
-        if value not in TRANSCRIPT_BINDING_SOURCES - {"server_recovery"}:
+        if value not in TRANSCRIPT_HOOK_BINDING_SOURCES:
             raise ValueError("invalid transcript binding source")
         return value
 
