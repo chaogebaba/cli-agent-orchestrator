@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
+
 PermissionMode = Literal["default", "acceptEdits", "plan", "auto", "bypassPermissions"]
 MemoryType = Literal["user", "feedback", "project", "reference"]
 
@@ -75,6 +77,7 @@ class AgentProfile(BaseModel):
     role: Optional[str] = None  # "supervisor", "developer", "reviewer"
     protected: Optional[bool] = None  # Refuse MCP deletion unless force=true
     lifecycle: Optional[Literal["ephemeral", "sticky"]] = None
+    engine: Optional[KiroEngine] = None  # Kiro v2/KAS selection; omitted resolves to v2.
 
     # CAO-native. Per-agent skill-catalog scope: when set, only skills whose name
     # matches one of these patterns (exact name or fnmatch glob, e.g. "ads-*") are

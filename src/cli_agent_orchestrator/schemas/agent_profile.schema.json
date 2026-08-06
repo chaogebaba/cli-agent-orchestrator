@@ -86,6 +86,11 @@
         }
       }
     },
+    "engine": {
+      "type": "string",
+      "enum": ["v2", "kas"],
+      "description": "Kiro engine selection."
+    },
     "allowedTools": {
       "type": "array",
       "items": {"type": "string"},

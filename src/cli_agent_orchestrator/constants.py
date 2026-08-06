@@ -154,6 +154,16 @@ DRAFT_LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 FIFO_DIR = CAO_HOME_DIR / "fifos"  # Named pipes for tmux pipe-pane streaming
 FIFO_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 
+# Sidecar lock directory for utils/atomic_file.locked_atomic_rewrite. The
+# targets it serializes (AGENTS.md / .claude/CLAUDE.md / dev.agent.md) live in
+# the USER's working tree, so a lock file placed beside each target would leave
+# permanent untracked ``*.lock`` files polluting the user's repo. Keeping the
+# lock files here — under CAO's own home dir, keyed by a hash of the target's
+# resolved absolute path — means every process (CLI and cao-server) that locks
+# the same target agrees on the same lock file while the user's tree gains ZERO
+# new files. Created lazily (0o700) on first use by the lock helper.
+LOCK_DIR = CAO_HOME_DIR / "locks"
+
 # =============================================================================
 # Event-Driven State Detection Configuration
 # =============================================================================
@@ -480,6 +490,94 @@ WS_ALLOWED_CLIENTS = [
     "localhost",
 ] + _split_env_list("CAO_WS_ALLOWED_CLIENTS")
 
+# Extra Origin values accepted on the WebSocket PTY attach handshake, on top of
+# the same-origin match and the ``CORS_ORIGINS`` list the HTTP surface already
+# trusts. The browser sends ``Origin`` on every cross-site WebSocket handshake,
+# but — unlike ``fetch`` — the Same-Origin Policy does NOT block the connection
+# and Starlette's ``CORSMiddleware`` never runs for the WebSocket ASGI scope,
+# so the handler must validate ``Origin`` itself or any web page the victim
+# visits can drive the local PTY (CWE-1385, cross-site WebSocket hijacking).
+# Operators serving the terminal viewer from a genuinely cross-origin page can
+# allow it here; a literal ``*`` disables the Origin check entirely, mirroring
+# ``CAO_WS_ALLOWED_CLIENTS="*"`` for trusted setups.
+WS_ALLOWED_ORIGINS = _split_env_list("CAO_WS_ALLOWED_ORIGINS")
+
+
+def _origin_authority(origin: str) -> "str | None":
+    """Return the ``host[:port]`` authority of an http/https ``Origin``.
+
+    ``None`` for anything that is not a plain http/https origin — an opaque
+    ``"null"`` origin, a ``file://``/``data:`` scheme, or a malformed value —
+    so those never satisfy the same-origin match below.
+    """
+    parts = urlsplit(origin)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return None
+    # ``netloc`` may carry userinfo (user:pass@host); the authority a browser
+    # actually reports in ``Origin`` never does, but strip it defensively so a
+    # crafted value can't smuggle the trusted host into the userinfo segment.
+    return parts.netloc.rsplit("@", 1)[-1]
+
+
+def is_ws_origin_allowed(origin: "str | None", host: "str | None" = None) -> bool:
+    """Whether a WebSocket handshake ``Origin`` header may open a PTY socket.
+
+    Rules, tightest-safe first:
+
+    * A missing / empty ``Origin`` is allowed. Browsers *always* send it on a
+      cross-site WebSocket handshake, so its absence means the caller is a
+      non-browser client (native ``websockets`` lib, CLI, tests). Those are
+      still gated by the loopback IP allowlist (``WS_ALLOWED_CLIENTS``); the
+      cross-site-request-forgery threat this guards against is browser-only.
+    * A literal ``*`` in ``WS_ALLOWED_ORIGINS`` disables the check (opt-in
+      escape hatch for trusted tunnels, matching ``WS_ALLOWED_CLIENTS``).
+    * **Same-origin**: the ``Origin`` authority equals the request ``Host``.
+      This is the request the browser makes when the viewer is served by
+      cao-server itself, and it is exactly what a cross-site attacker CANNOT
+      forge — script-set ``Host`` is forbidden and the real ``Host`` is the
+      CAO server the socket is opened to, not the attacker's page. Matching on
+      the live ``Host`` is what lets the imported-app deployment
+      (``uvicorn ...:app``, which never runs ``add_local_cors_origins``) and
+      dynamic reverse-proxy / Codespaces hostnames work without pre-registering
+      every origin.
+
+      This branch trusts ``Host`` and so is only as safe as ``Host`` itself:
+      ``TrustedHostMiddleware`` validates ``Host`` against ``ALLOWED_HOSTS`` on
+      the same WebSocket scope BEFORE this handler runs, which is what makes
+      the match DNS-rebinding-safe in the default (loopback) config. Setting
+      ``CAO_ALLOWED_HOSTS="*"`` turns that validation off (``allow_any``), so an
+      operator who does that has opted out of the DNS-rebinding protection for
+      this branch too — the same explicit-opt-out tradeoff as
+      ``CAO_WS_ALLOWED_CLIENTS="*"``. Keep ``ALLOWED_HOSTS`` scoped to the real
+      serving hostname(s) rather than ``*`` whenever possible.
+    * Otherwise the ``Origin`` must appear in the explicit allowlists: the same
+      ``CORS_ORIGINS`` list the HTTP API enforces plus any
+      ``CAO_WS_ALLOWED_ORIGINS`` entries. Exact-string match mirrors how the
+      browser reports ``Origin`` and how ``CORSMiddleware`` compares it.
+
+    A ``*`` entry in ``CORS_ORIGINS`` (i.e. ``CAO_CORS_ORIGINS="*"``) is
+    **deliberately NOT** treated as a wildcard here: it would open unauthenticated
+    PTY access — keystroke injection is RCE — to every website the victim
+    visits, a far higher blast radius than the read-oriented HTTP surface
+    ``CORSMiddleware`` guards. Disabling this check therefore requires the
+    dedicated, more conspicuous ``CAO_WS_ALLOWED_ORIGINS="*"`` opt-in, matching
+    the ``CAO_WS_ALLOWED_CLIENTS="*"`` escape hatch for the IP check. This
+    divergence from ``CORSMiddleware`` is intentional.
+    """
+    if not origin:
+        return True
+    if "*" in WS_ALLOWED_ORIGINS:
+        return True
+    if host:
+        authority = _origin_authority(origin)
+        if authority is not None and authority == host:
+            return True
+    # Membership only — an operator's ``CAO_CORS_ORIGINS="*"`` lands as the
+    # literal string "*" in this list and matches ONLY a literal "*" Origin
+    # (which no browser sends), so it never widens PTY trust. See docstring.
+    return origin in CORS_ORIGINS or origin in WS_ALLOWED_ORIGINS
+
+
 # Trusted upstream IP allowlist for uvicorn's ``proxy_headers`` and
 # ``forwarded_allow_ips`` settings. When cao-server is bound to a
 # non-loopback address (Codespaces, devcontainer, reverse proxy), uvicorn
@@ -644,6 +742,31 @@ WORKFLOW_STEP_TIMEOUT = 600.0
 # running near the 100-step ceiling can raise it via the env override if needed.
 WORKFLOW_RUN_REQUEST_TIMEOUT = (WORKFLOW_STEP_TIMEOUT + 120.0) * 12 + 180.0  # = 8820.0s (~2.45h)
 
+# Poll interval (seconds) for the async-run FOLLOWERS: ``cao workflow run`` (bare
+# follow-to-terminal + ``wait``) and the ``workflow_wait`` MCP tool (issue #505,
+# U5/U6). ADR-4 chose a poll loop over the snapshot route (Option A) rather than
+# consuming the events stream (that live follower is U10); the value itself was
+# delegated to functional design and pinned here (U5-FP-5). Named — not a magic
+# literal — so both the CLI follower and the MCP poll tool reference one constant.
+# Each poll's HTTP call uses the normal per-call timeout (MCP_REQUEST_TIMEOUT /
+# ``_mcp_timeout()``), NOT the long blocking WORKFLOW_RUN_REQUEST_TIMEOUT — the
+# long ceiling bounds only the OVERALL wait, never a single snapshot read.
+WORKFLOW_POLL_INTERVAL_SECONDS = 1.0
+
+# Admission ceiling on CONCURRENT background drives started by the async submit
+# route ``POST /workflows/runs:submit`` (issue #505 review, AB-1). The blocking
+# twin ``POST /workflows/runs`` is self-throttling — the caller holds the socket
+# for the whole run, so an overloaded server backs pressure up into its clients.
+# The async route deliberately REMOVES that property (that is the point of a 202),
+# so N submits would otherwise mean N concurrent drives, each spawning terminals.
+# The bound is applied INSIDE the background task (never at the handler), so a
+# submit over the ceiling still gets its durable row and its 202 and simply QUEUES
+# — admission stays decoupled from execution, and INV-1
+# (run-id-allocated-before-ack) is untouched. Sized to match the 12-step blocking
+# ceiling reasoning above rather than CPU count: each drive is dominated by
+# subprocess/agent wait, not local compute.
+WORKFLOW_MAX_CONCURRENT_BACKGROUND_DRIVES = 12
+
 # Script-linter rule inputs (Bolt 2, U1/C2, FR-1.3 / U1-BR-8). Import prefixes
 # whose first dotted segment marks a CAO-internal import — scripts reach CAO
 # over HTTP only (C-1). The ``cao_workflow`` shim (U6, ADR-6) is the sanctioned
@@ -687,6 +810,38 @@ WORKFLOW_ENV_VALUE_MAX_LEN = 256
 # id across all nine providers, including OpenCode's "vendor/model" form.
 MODEL_ID_RE = r"^[A-Za-z0-9._:/-]+$"
 MODEL_ID_MAX_LEN = 128
+
+# Live-event follower (issue #505, U10). The CLI ``cao workflow events --follow``
+# and the MCP ``workflow_events`` open #504's events-follow SSE route
+# (``GET /workflows/runs/{id}/events`` with ``Accept: text/event-stream``) as thin
+# HTTP clients. A ``(connect, read)`` timeout tuple bounds the streamed GET — the
+# read leg must comfortably exceed #504's SSE heartbeat/poll cadence (250ms tail),
+# mirroring the AG-UI stream reader's 10s/60s split so a quiet run does not trip a
+# spurious read timeout between frames. The reconnect budget bounds how many times
+# a dropped connection is re-opened (resuming exactly via ``?after_seq=<last_seq>``,
+# RS-1/RS-3) before the follower gives up and does a final terminal status check —
+# so a flapping stream can never spin forever.
+WORKFLOW_EVENTS_CONNECT_TIMEOUT = 10.0
+WORKFLOW_EVENTS_READ_TIMEOUT = 60.0
+WORKFLOW_EVENTS_MAX_RECONNECTS = 5
+
+# Bound on frames the bounded MCP ``workflow_events`` follower drains before it
+# returns (an MCP tool call cannot stream indefinitely). The follower stops at a
+# terminal state OR this many events, whichever comes first (U10 MCP bound).
+WORKFLOW_EVENTS_MCP_MAX_EVENTS = 500
+
+# WALL-CLOCK bound (seconds) on the same bounded MCP ``workflow_events`` follower
+# (issue #505 review, TB-1). WORKFLOW_EVENTS_MCP_MAX_EVENTS above bounds the call in
+# EVENTS, which is not a bound at all for a stream that delivers no events: SSE
+# ``:keep-alive`` comment lines are skipped by ``parse_sse_frames`` (they yield no
+# frame, so they never count toward the event ceiling and never carry a terminal
+# event type) while still being traffic that resets the socket read timeout. So a
+# heartbeat-only stream satisfies neither existing bound and the tool would block
+# indefinitely. This is the independent time bound that makes "BOUNDED" true on
+# every stream shape. Set below the 60s read timeout so the deadline — not a socket
+# error — is what ends a quiet stream, giving the caller a clean partial result plus
+# ``timed_out: true`` to resume from.
+WORKFLOW_EVENTS_MCP_MAX_SECONDS = 45.0
 
 # Script-runner subprocess lifecycle (Bolt 3, U4/C1). Wall-clock bound + grace,
 # output ring-buffer cap, engine-owned scratch root for resume materialization.

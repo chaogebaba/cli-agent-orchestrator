@@ -29,8 +29,11 @@ from enum import Enum
 from typing import Callable, Optional
 
 from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine, parse_kiro_engine
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
+from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.services import receiver_state_view, terminal_service
 from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -61,18 +64,30 @@ class _CompletionOutcome(str, Enum):
 async def _wait_for_completion(
     terminal_id: str,
     *,
-    input_gen: int,
+    input_gen: int = 0,
     timeout: float,
     polling_interval: float = 1.0,
     cancel_signal: Optional[asyncio.Event] = None,
+    cancel_event: Optional[asyncio.Event] = None,
 ) -> _CompletionOutcome:
-    """Poll the in-process monitor for a post-input terminal outcome."""
+    """Poll the in-process monitor for a post-input terminal outcome.
+
+    ``cancel_signal`` is the canonical cooperative-cancel name (workflow engine).
+    ``cancel_event`` is accepted as an upstream alias for the same Event.
+    When the signal fires mid-wait, raises ``StepCancelledError`` promptly
+    (issue #409b) so cancel latency is not bounded by the poll interval.
+    """
     from cli_agent_orchestrator.services.auto_responder import auto_responder
+
+    if cancel_signal is None:
+        cancel_signal = cancel_event
+    elif cancel_event is not None and cancel_event is not cancel_signal:
+        raise TypeError("pass only one of cancel_signal/cancel_event")
 
     start = time.time()
     while time.time() - start < timeout:
         if cancel_signal is not None and cancel_signal.is_set():
-            return _CompletionOutcome.CANCELLED
+            raise StepCancelledError(terminal_id=terminal_id)
         current = receiver_state_view.snapshot_view(
             "agent_step.status_reads",
             terminal_id,
@@ -101,9 +116,19 @@ async def _wait_for_completion(
                 status_gen,
                 input_gen,
             )
-        await asyncio.sleep(polling_interval)
+        # Sleep one poll interval, but wake IMMEDIATELY if cancel fires so the
+        # cancel latency is not bounded below by the poll cadence (#409b).
+        if cancel_signal is not None:
+            try:
+                await asyncio.wait_for(cancel_signal.wait(), timeout=polling_interval)
+            except asyncio.TimeoutError:
+                pass
+            else:
+                raise StepCancelledError(terminal_id=terminal_id)
+        else:
+            await asyncio.sleep(polling_interval)
     if cancel_signal is not None and cancel_signal.is_set():
-        return _CompletionOutcome.CANCELLED
+        raise StepCancelledError(terminal_id=terminal_id)
     return _CompletionOutcome.TIMEOUT
 
 
@@ -121,6 +146,54 @@ async def _teardown_terminal(terminal_id: str, registry: Optional[PluginRegistry
         await asyncio.to_thread(terminal_service.delete_terminal, terminal_id, registry=registry)
     except Exception as exc:  # noqa: BLE001 - teardown is best-effort
         logger.warning("run_agent_step: failed to tear down terminal %s: %s", terminal_id, exc)
+
+
+async def _validate_reused_terminal(
+    terminal_id: str,
+    requested_provider: str,
+    requested_engine: Optional[KiroEngine | str],
+) -> None:
+    """Require reuse constraints to agree with authoritative terminal metadata.
+
+    When no engine is requested and metadata is missing, skip (best-effort):
+    pre-engine reuse unit tests mock the terminal layer without DB metadata.
+    An explicit engine always requires live metadata so KAS/v2 cannot be
+    misapplied to a missing or mismatched terminal.
+    """
+    metadata = await asyncio.to_thread(terminal_service.get_terminal_metadata, terminal_id)
+    if metadata is None:
+        if requested_engine is None:
+            return
+        raise ValueError(f"Terminal '{terminal_id}' not found")
+
+    persisted_provider = metadata.get("provider")
+    if persisted_provider != requested_provider:
+        raise ValueError(
+            f"Provider mismatch for reused terminal '{terminal_id}': "
+            f"requested {requested_provider!r}, persisted {persisted_provider!r}"
+        )
+
+    if requested_engine is None:
+        return
+    if persisted_provider != ProviderType.KIRO_CLI.value:
+        raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
+
+    explicit_engine = parse_kiro_engine(requested_engine)
+    assert explicit_engine is not None
+    if explicit_engine == KiroEngine.KAS:
+        # KAS remains unavailable regardless of which engine the terminal
+        # persisted; use the same structured Phase 0 guard as terminal creation.
+        raise KiroPhase0KASError(profile_has_v2_policy=False)
+
+    persisted_engine = parse_kiro_engine(metadata.get("engine"))
+    if persisted_engine is None:
+        # Legacy Kiro rows predate the engine column and are v2 by definition.
+        persisted_engine = KiroEngine.V2
+    if explicit_engine != persisted_engine:
+        raise ValueError(
+            f"Kiro engine mismatch for reused terminal '{terminal_id}': "
+            f"requested {explicit_engine.value!r}, persisted {persisted_engine.value!r}"
+        )
 
 
 class StepExecutionError(Exception):
@@ -151,6 +224,35 @@ class StepExecutionError(Exception):
         self.terminal_id = terminal_id
 
 
+class StepCancelledError(StepExecutionError):
+    """The in-flight step wait was interrupted by a cancellation signal (#409b).
+
+    Distinct from a run-failure: a cancellation is NOT retried. Subclasses
+    ``StepExecutionError`` with ``kind="cancelled"`` so callers that only know
+    the structured-kind contract (workflow engine) and callers that catch the
+    dedicated type (upstream #409b) both observe the same event.
+    """
+
+    def __init__(self, terminal_id: Optional[str] = None) -> None:
+        super().__init__(
+            "step wait interrupted by cancellation",
+            kind="cancelled",
+            terminal_id=terminal_id,
+        )
+
+
+def _resolve_cancel_signal(
+    cancel_signal: Optional[asyncio.Event],
+    cancel_event: Optional[asyncio.Event],
+) -> Optional[asyncio.Event]:
+    """Canonicalize cancel_signal; accept upstream cancel_event as alias."""
+    if cancel_signal is None:
+        return cancel_event
+    if cancel_event is not None and cancel_event is not cancel_signal:
+        raise TypeError("pass only one of cancel_signal/cancel_event")
+    return cancel_signal
+
+
 async def run_agent_step(
     provider: str,
     agent: str,
@@ -167,6 +269,8 @@ async def run_agent_step(
     env_vars: Optional[dict[str, str]] = None,
     on_terminal_created: Optional[Callable[[str], None]] = None,
     cancel_signal: Optional[asyncio.Event] = None,
+    cancel_event: Optional[asyncio.Event] = None,
+    engine: Optional[KiroEngine | str] = None,
     model: Optional[str] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
@@ -240,6 +344,7 @@ async def run_agent_step(
             checked before send, during the completion poll, and before extraction.
             Synchronous send/extraction already running in ``to_thread`` cannot be
             force-cancelled; cancellation is classified when that call returns.
+            ``cancel_event`` is accepted as an upstream alias for the same Event.
         model: Explicit per-call model override for a freshly created
             terminal (ignored when reusing a terminal), forwarded to
             ``terminal_service.create_terminal``. Lets a handoff caller pin
@@ -315,6 +420,7 @@ async def run_agent_step(
             caller_id=caller_id,
             env_vars=env_vars,
             fork_context=fork_context,
+            engine=engine,
             model=model,
         )
         terminal_id = terminal.id
@@ -350,18 +456,18 @@ async def run_agent_step(
                 kind="timeout",
                 terminal_id=terminal_id,
             )
+    else:
+        assert terminal_id is not None
+        await _validate_reused_terminal(terminal_id, provider, engine)
 
     assert terminal_id is not None  # for type-checkers: set in both branches
+    cancel_signal = _resolve_cancel_signal(cancel_signal, cancel_event)
     cleanup = False
     extraction_succeeded = False
     try:
         if cancel_signal is not None and cancel_signal.is_set():
             cleanup = True
-            raise StepExecutionError(
-                f"step on terminal {terminal_id} was cancelled",
-                kind="cancelled",
-                terminal_id=terminal_id,
-            )
+            raise StepCancelledError(terminal_id=terminal_id)
 
         try:
             await asyncio.to_thread(
@@ -373,11 +479,7 @@ async def run_agent_step(
         except TerminalInputBlockedError as exc:
             if cancel_signal is not None and cancel_signal.is_set():
                 cleanup = True
-                raise StepExecutionError(
-                    f"step on terminal {terminal_id} was cancelled during send",
-                    kind="cancelled",
-                    terminal_id=terminal_id,
-                ) from exc
+                raise StepCancelledError(terminal_id=terminal_id) from exc
             current = receiver_state_view.snapshot_view(
                 "agent_step.status_reads",
                 terminal_id,
@@ -401,35 +503,27 @@ async def run_agent_step(
         except Exception as exc:
             if cancel_signal is not None and cancel_signal.is_set():
                 cleanup = True
-                raise StepExecutionError(
-                    f"step on terminal {terminal_id} was cancelled during send",
-                    kind="cancelled",
-                    terminal_id=terminal_id,
-                ) from exc
+                raise StepCancelledError(terminal_id=terminal_id) from exc
             raise
 
         if cancel_signal is not None and cancel_signal.is_set():
             cleanup = True
-            raise StepExecutionError(
-                f"step on terminal {terminal_id} was cancelled",
-                kind="cancelled",
-                terminal_id=terminal_id,
-            )
+            raise StepCancelledError(terminal_id=terminal_id)
 
         input_gen = status_monitor.get_input_gen(terminal_id)
-        outcome = await _wait_for_completion(
-            terminal_id,
-            input_gen=input_gen,
-            timeout=timeout,
-            cancel_signal=cancel_signal,
-        )
+        try:
+            outcome = await _wait_for_completion(
+                terminal_id,
+                input_gen=input_gen,
+                timeout=timeout,
+                cancel_signal=cancel_signal,
+            )
+        except StepCancelledError:
+            cleanup = True
+            raise
         if outcome == _CompletionOutcome.CANCELLED:
             cleanup = True
-            raise StepExecutionError(
-                f"step on terminal {terminal_id} was cancelled",
-                kind="cancelled",
-                terminal_id=terminal_id,
-            )
+            raise StepCancelledError(terminal_id=terminal_id)
         if outcome == _CompletionOutcome.ERROR:
             raise StepExecutionError(
                 f"terminal {terminal_id} reached ERROR status",
@@ -477,11 +571,7 @@ async def run_agent_step(
             )
         if cancel_signal is not None and cancel_signal.is_set():
             cleanup = True
-            raise StepExecutionError(
-                f"step on terminal {terminal_id} was cancelled before extraction",
-                kind="cancelled",
-                terminal_id=terminal_id,
-            )
+            raise StepCancelledError(terminal_id=terminal_id)
 
         try:
             last_message = await asyncio.to_thread(
@@ -491,11 +581,7 @@ async def run_agent_step(
         except Exception as exc:
             if cancel_signal is not None and cancel_signal.is_set():
                 cleanup = True
-                raise StepExecutionError(
-                    f"step on terminal {terminal_id} was cancelled during extraction",
-                    kind="cancelled",
-                    terminal_id=terminal_id,
-                ) from exc
+                raise StepCancelledError(terminal_id=terminal_id) from exc
             raise
 
         cleanup = True
