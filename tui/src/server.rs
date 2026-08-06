@@ -734,6 +734,8 @@ fn route(id: CommandId) -> Option<Route> {
         // HIDE: fork-only / ops; unclassified default
         CommandId::VerifyDeploy => None,
         // HIDE: fork-only / ops; unclassified default
+        CommandId::VerifyManifest => None,
+        // HIDE: fork-only / ops; unclassified default
         CommandId::VerifyScope => None,
         // HIDE: fork-only / ops; unclassified default
         CommandId::VerifySuiteLog => None,

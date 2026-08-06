@@ -5,6 +5,7 @@ from pathlib import Path
 
 import click
 
+from cli_agent_orchestrator.kernel.receiver_state.trace_manifest import regenerate_manifest
 from cli_agent_orchestrator.services.verification_service import (
     changed_files,
     cli_deploy_root,
@@ -18,6 +19,19 @@ from cli_agent_orchestrator.services.verification_service import (
 @click.group()
 def verify() -> None:
     """Verify repository and installed runtime state."""
+
+
+@verify.command("manifest")
+@click.option("--regen", is_flag=True, help="Regenerate the receiver-state trace manifest.")
+def manifest(regen: bool) -> None:
+    """Maintain the receiver-state trace manifest."""
+    if not regen:
+        raise click.UsageError("Pass --regen to regenerate the trace manifest.")
+    hits, files_touched, changed = regenerate_manifest(git_root())
+    click.echo(
+        f"Trace manifest: hits={hits} files_touched={files_touched} "
+        f"changed={'yes' if changed else 'no'}"
+    )
 
 
 @verify.command("suite-log")
@@ -60,8 +74,11 @@ def scope(files: tuple[Path, ...]) -> None:
     root = git_root()
     actual = set(changed_files(root))
     expected = {
-        str((Path.cwd() / path).resolve().relative_to(root)) if not path.is_absolute()
-        else str(path.resolve().relative_to(root))
+        (
+            str((Path.cwd() / path).resolve().relative_to(root))
+            if not path.is_absolute()
+            else str(path.resolve().relative_to(root))
+        )
         for path in files
     }
     unexpected, missing = sorted(actual - expected), sorted(expected - actual)
