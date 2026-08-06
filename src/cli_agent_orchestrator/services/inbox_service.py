@@ -36,6 +36,7 @@ from cli_agent_orchestrator.clients.database import (
     find_inferred_delivery_evidence,
     get_attempt_mailbox_authority,
     get_current_mailbox_terminal,
+    get_latest_compact_transcript_binding,
     get_message_trace,
     get_owned_legacy_parked_messages,
     get_park_warm_for_message_ids,
@@ -83,6 +84,7 @@ from cli_agent_orchestrator.services import receiver_state_view, settings_servic
 from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.message_trace_service import (
+    binding_presumed_stale,
     clear_binding_staleness_state,
     confirm_delivery,
     continuity_aware_lookup,
@@ -111,6 +113,11 @@ logger = logging.getLogger(__name__)
 IDLE_STALL_AGE = 30 * 60
 ABS_STALLED_NOTICE_AGE = 4 * 60 * 60
 WPM2_STALE_OPEN_AGE_SECONDS = 60
+# After this many presumed-stale suppress cycles, stop blocking delivery and
+# allow the normal confirm path (often send_returned_unverified). Matches the
+# binding-authority notice threshold so the operator is told at the same time
+# the deadlock is broken.
+BINDING_SUPPRESS_MAX_CYCLES = 3
 
 
 @dataclass(frozen=True)
@@ -436,6 +443,8 @@ def clear_terminal_delivery_state(terminal_id: str) -> None:
     if isinstance(service, InboxService):
         service._clear_identity_authority(terminal_id)
         service.reset_binding_episodes(terminal_id)
+        with service._binding_lock:
+            service._binding_suppress_counts.pop(terminal_id, None)
         with service._gone_lock:
             service._gone_streaks.pop(terminal_id, None)
     clear_binding_staleness_state(terminal_id)
@@ -461,6 +470,8 @@ class InboxService:
         self._identity_authority: dict[tuple[str, str], _IdentityAuthorityEpisode] = {}
         self._identity_lock = threading.Lock()
         self._binding_authority: dict[tuple[str, str], _IdentityAuthorityEpisode] = {}
+        # Monotonic per-terminal suppress count for B3 escape (not reset on rebind).
+        self._binding_suppress_counts: dict[str, int] = {}
         self._binding_lock = threading.Lock()
         self._gone_streaks: dict[str, int] = {}
         self._gone_lock = threading.Lock()
@@ -605,6 +616,15 @@ class InboxService:
         return str(generation)
 
     @staticmethod
+    def _evidence_for_confirmed_attempt(
+        terminal_id: str, evidence: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Tag confirmed-settlement evidence when the binding is presumed_stale."""
+        if binding_presumed_stale(terminal_id):
+            return {**evidence, "kind": "binding_presumed_stale"}
+        return dict(evidence)
+
+    @staticmethod
     def _identity_notice_receiver(terminal_id: str, metadata: dict[str, Any]) -> str | None:
         caller_id = metadata.get("caller_id")
         if isinstance(caller_id, str) and get_terminal_metadata(caller_id) is not None:
@@ -613,18 +633,57 @@ class InboxService:
         if not isinstance(session_name, str):
             return None
         from cli_agent_orchestrator.clients.database import list_terminals_by_session
+        from cli_agent_orchestrator.services.fleet_service import build_fleet
         from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
+        try:
+            fleet = build_fleet(session_name)
+        except ValueError:
+            return None
+        fleet_terminals = list(fleet.get("terminals", []))
+        live_ids = {
+            str(item["id"])
+            for item in fleet_terminals
+            if item.get("status") != TerminalStatus.ERROR.value and not item.get("orphan")
+        }
+        candidates: list[dict[str, Any]] = []
         for row in list_terminals_by_session(session_name):
-            if row.get("id") == terminal_id:
+            row_id = row.get("id")
+            if row_id == terminal_id or row_id not in live_ids:
                 continue
             try:
                 profile = load_agent_profile(row.get("agent_profile") or "")
             except (FileNotFoundError, ValueError):
                 continue
             if getattr(profile, "role", None) == "supervisor":
-                return str(row["id"])
-        return None
+                candidates.append(row)
+        if not candidates:
+            return None
+
+        # Parent → most-recent-live → critical. Prefer the subject's own live
+        # supervisor (metadata caller_id / fleet parent_id) before last_active.
+        parent_id = metadata.get("caller_id")
+        if not isinstance(parent_id, str):
+            subject = next(
+                (item for item in fleet_terminals if str(item.get("id")) == terminal_id),
+                None,
+            )
+            parent_id = subject.get("parent_id") if subject is not None else None
+        if isinstance(parent_id, str) and parent_id in live_ids:
+            for candidate in candidates:
+                if str(candidate.get("id")) == parent_id:
+                    return parent_id
+
+        def _last_active_key(row: dict[str, Any]) -> datetime:
+            value = row.get("last_active")
+            if not isinstance(value, datetime):
+                return datetime.min.replace(tzinfo=timezone.utc)
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value
+
+        candidates.sort(key=_last_active_key, reverse=True)
+        return str(candidates[0]["id"])
 
     def _record_identity_authority_failure(
         self,
@@ -728,12 +787,40 @@ class InboxService:
         metadata: dict[str, Any],
         prior_lookups: Sequence[tuple[dict[str, Any], str, dict[str, Any]]],
     ) -> tuple[str, dict[str, Any] | None, dict[str, Any], str | None] | None:
-        """Resolve one presumed-stale binding before any new attempt can open."""
+        """Resolve one presumed-stale binding before any new attempt can open.
+
+        Compact/clear rotations are first-class: when a compact binding points at
+        a different transcript path, rebind and stop suppressing. Suppression is
+        bounded by BINDING_SUPPRESS_MAX_CYCLES — after that, return None so
+        delivery may open without transcript confirmation (unverified path).
+        """
         if not any(result == "absent" for _, result, _ in prior_lookups):
             return None
         stale = observe_binding_absence(metadata)
         if stale is None or not stale.presumed_stale:
             return None
+
+        compact = get_latest_compact_transcript_binding(terminal_id)
+        if compact is not None:
+            compact_path = Path(str(compact.get("transcript_path") or "")).resolve(strict=False)
+            if compact_path != stale.path and str(compact_path):
+                recovery = recover_transcript_binding_if_current(
+                    terminal_id, stale.binding_id, str(compact_path)
+                )
+                if recovery in {"inserted", "authority_changed"}:
+                    clear_binding_staleness_state(terminal_id)
+                    for prior, _, prior_evidence in prior_lookups:
+                        refreshed, refreshed_evidence = _wpm2_lookup(
+                            metadata,
+                            prior["payload_hash"],
+                            prior.get("started_at"),
+                            prior_evidence,
+                        )
+                        if refreshed == "hit":
+                            return "hit", prior, refreshed_evidence, str(compact_path)
+                    # Rotation followed; allow a fresh delivery attempt to open.
+                    return None
+
         for prior, _, prior_evidence in prior_lookups:
             candidate_result, candidate_evidence, candidate = scan_binding_candidates(
                 stale,
@@ -756,8 +843,29 @@ class InboxService:
                 if refreshed == "hit":
                     return "hit", prior, refreshed_evidence, None
                 return "authority_changed", None, {}, None
-            return "hit", prior, candidate_evidence, str(candidate)
+            return (
+                "hit",
+                prior,
+                {**candidate_evidence, "kind": "binding_presumed_stale"},
+                str(candidate),
+            )
         self._record_binding_authority_failure(terminal_id, stale.binding_id, metadata)
+        # Escape counter is per-terminal (not per binding_id): rebind/POST must not
+        # restart the N-cycle climb and starve the deadlock break (S3).
+        with self._binding_lock:
+            count = self._binding_suppress_counts.get(terminal_id, 0) + 1
+            self._binding_suppress_counts[terminal_id] = count
+        if count >= BINDING_SUPPRESS_MAX_CYCLES:
+            logger.error(
+                "binding_authority_suppress_exhausted terminal=%s binding=%s count=%s "
+                "allowing_unverified_delivery",
+                terminal_id,
+                stale.binding_id,
+                count,
+            )
+            # Do NOT clear _declared_presumed_stale: escaped delivery must still
+            # tag kind=binding_presumed_stale so mailbox reports confirmed_unverified (S1).
+            return None
         return "suppressed", None, {}, None
 
     def _evict_defer_state(self, messages) -> None:
@@ -890,7 +998,9 @@ class InboxService:
         classified = _classify_probable_delivery(evidence, terminal_id, opener_ref)
         if not is_probable_delivered(classified):
             return False, classified
-        settlement_evidence = {**classified, "kind": "execution_evidence"}
+        settlement_evidence = self._evidence_for_confirmed_attempt(
+            terminal_id, {**classified, "kind": "execution_evidence"}
+        )
         ordered_ids = sorted(message_ids)
         won = _confirmed_settlement(
             lambda: settle_attempt_inferred_delivered_batch(
@@ -2249,6 +2359,7 @@ class InboxService:
                         else None
                     )
                     if inferred is not None:
+                        inferred = self._evidence_for_confirmed_attempt(terminal_id, inferred)
                         won = _confirmed_settlement(
                             lambda: settle_open_attempt_inferred_delivered(
                                 attempt_uuid,
@@ -2271,6 +2382,8 @@ class InboxService:
                             self._evict_defer_state(batch)
                             return
                     if outcome in {"hit", "unverified"}:
+                        if outcome == "hit":
+                            evidence = self._evidence_for_confirmed_attempt(terminal_id, evidence)
                         _confirmed_settlement(
                             lambda: settle_delivery_attempt(
                                 attempt_uuid,

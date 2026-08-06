@@ -72,6 +72,8 @@ class WatchdogInsertResult:
 
 
 TRANSCRIPT_BINDING_SOURCES = frozenset({"startup", "resume", "clear", "compact", "server_recovery"})
+# Provider SessionStart-hook sources (api/main TranscriptBindingRequest allowlist).
+TRANSCRIPT_HOOK_BINDING_SOURCES = TRANSCRIPT_BINDING_SOURCES - {"server_recovery"}
 
 SEAM_ACTIVATION_CONSUMER_OPS = (
     "watchdog.cached_status",
@@ -2402,6 +2404,33 @@ def get_latest_compact_transcript_binding(terminal_id: str) -> Optional[Dict[str
             row = (
                 db.query(TranscriptBindingModel)
                 .filter_by(terminal_id=terminal_id, source="compact")
+                .order_by(
+                    TranscriptBindingModel.received_at.desc(),
+                    TranscriptBindingModel.id.desc(),
+                )
+                .first()
+            )
+            if row is None:
+                return None
+            return {column.name: getattr(row, column.name) for column in row.__table__.columns}
+    except Exception as exc:
+        if "no such table: transcript_bindings" in str(exc):
+            return None
+        raise
+
+
+def get_latest_hook_transcript_binding(terminal_id: str) -> Optional[Dict[str, Any]]:
+    """Return the newest provider-hook binding (startup/resume/clear/compact)."""
+    if not terminal_id:
+        return None
+    try:
+        with SessionLocal() as db:
+            row = (
+                db.query(TranscriptBindingModel)
+                .filter(
+                    TranscriptBindingModel.terminal_id == terminal_id,
+                    TranscriptBindingModel.source.in_(TRANSCRIPT_HOOK_BINDING_SOURCES),
+                )
                 .order_by(
                     TranscriptBindingModel.received_at.desc(),
                     TranscriptBindingModel.id.desc(),
@@ -4919,7 +4948,12 @@ def make_admission_proof(
             evidence = {}
         cursor = _valid_cursor(evidence.get("last_observed_ref"))
         if cursor is not None and row.get("outcome") not in {None, "confirmed", "failed"}:
-            binding = get_current_transcript_binding(row["receiver_terminal_id"])
+            # Same selector confirm/staleness uses — proof names the binding that was read.
+            from cli_agent_orchestrator.services.message_trace_service import (
+                binding_for_transcript_confirm,
+            )
+
+            binding = binding_for_transcript_confirm(row["receiver_terminal_id"])
             authority = {
                 "binding_id": binding.get("id") if binding else None,
                 "session_id": binding.get("session_id") if binding else None,
@@ -5708,6 +5742,7 @@ def settle_open_attempt_inferred_delivered(
         now = _utcnow()
         row.outcome = "confirmed"
         row.reason = "inferred_by_reply"
+        row.evidence = _canonical_json(dict(evidence))
         row.settled_at = row.last_at = now
         db.add(
             InboxMessageTraceEventModel(

@@ -562,7 +562,7 @@ def _attempt_outcome(db: Any, message_id: int) -> str:
             evidence = {}
         return (
             "confirmed_unverified"
-            if evidence.get("kind") == "send_returned_unverified"
+            if evidence.get("kind") in {"send_returned_unverified", "binding_presumed_stale"}
             else "confirmed_hit"
         )
     return (
