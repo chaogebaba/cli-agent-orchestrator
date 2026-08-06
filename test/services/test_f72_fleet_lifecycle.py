@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 from click.testing import CliRunner
@@ -515,6 +516,30 @@ def test_fleet_reports_exact_multilevel_depths(f72_env):
 
     depths = {row["id"]: row["depth"] for row in result["terminals"]}
     assert depths == {"11111111": 0, "22222222": 1, "33333333": 2}
+
+
+def test_fleet_since_last_input_converts_local_naive_clock_to_utc(f72_env, monkeypatch):
+    sessions, backend = f72_env
+    add_terminal(backend, "11111111")
+    local_zone = ZoneInfo("Asia/Kolkata")
+    now_utc = datetime(2026, 8, 6, 6, 30, tzinfo=timezone.utc)
+    local_last_active = now_utc.astimezone(local_zone).replace(tzinfo=None) - timedelta(seconds=120)
+    with sessions.begin() as db:
+        db.get(TerminalModel, "11111111").last_active = local_last_active
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is not None:
+                return now_utc.astimezone(tz)
+            return now_utc.astimezone(local_zone).replace(tzinfo=None)
+
+    monkeypatch.setattr(fleet_service, "datetime", FixedDateTime)
+    monkeypatch.setattr(fleet_service, "get_localzone", lambda: local_zone)
+
+    result = fleet_service.build_fleet("cao-f72")
+
+    assert result["terminals"][0]["since_last_input"] == pytest.approx(120.0, abs=1.0)
 
 
 def test_fleet_drill_projection_is_under_8192_bytes_with_profile_count_recorded(f72_env):

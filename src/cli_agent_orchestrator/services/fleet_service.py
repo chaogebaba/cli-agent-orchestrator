@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from tzlocal import get_localzone
+
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -74,7 +76,11 @@ def build_fleet(session_name: str) -> dict[str, Any]:
         last_active = row.get("last_active")
         if last_active is not None:
             if last_active.tzinfo is None:
-                last_active = last_active.replace(tzinfo=timezone.utc)
+                last_active = last_active.replace(tzinfo=get_localzone(), fold=0).astimezone(
+                    timezone.utc
+                )
+            else:
+                last_active = last_active.astimezone(timezone.utc)
             since_last_input = max(0.0, (now - last_active).total_seconds())
         else:
             since_last_input = None

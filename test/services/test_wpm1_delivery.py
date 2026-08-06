@@ -7,6 +7,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import create_engine, event
@@ -488,6 +489,47 @@ def test_wpm1_cleanup_reaps_terminal_batch_attempt_and_notice_together(
         assert (
             db.query(InboxModel).filter(InboxModel.message.startswith("wpm1-notice ")).count() == 0
         )
+
+
+def test_wpm1_cleanup_retains_settlement_just_inside_correct_utc_cutoff(
+    wpm1_db, monkeypatch, tmp_path
+):
+    from cli_agent_orchestrator.services import cleanup_service
+
+    message, attempt = _ambiguous()
+    local_zone = ZoneInfo("Asia/Kolkata")
+    local_now = datetime(2026, 8, 6, 12, 0)
+    cutoff_utc = (
+        (local_now - timedelta(days=cleanup_service.RETENTION_DAYS))
+        .replace(tzinfo=local_zone, fold=0)
+        .astimezone(timezone.utc)
+    )
+    with wpm1_db.begin() as db:
+        db.get(InboxModel, message.id).status = MessageStatus.DELIVERED.value
+        db.get(InboxModel, message.id).created_at = local_now - timedelta(days=20)
+        evidence = json.loads(db.get(InboxDeliveryAttemptModel, attempt).evidence)
+        evidence["terminal_settled_at"] = (
+            (cutoff_utc + timedelta(seconds=60)).isoformat().replace("+00:00", "Z")
+        )
+        db.get(InboxDeliveryAttemptModel, attempt).evidence = json.dumps(evidence)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return local_now
+            return local_now.replace(tzinfo=local_zone).astimezone(tz)
+
+    monkeypatch.setattr(cleanup_service, "datetime", FixedDateTime)
+    monkeypatch.setattr(cleanup_service, "get_localzone", lambda: local_zone)
+    monkeypatch.setattr(cleanup_service, "SessionLocal", wpm1_db)
+    monkeypatch.setattr(cleanup_service, "TERMINAL_LOG_DIR", tmp_path / "terminal")
+    monkeypatch.setattr(cleanup_service, "LOG_DIR", tmp_path / "logs")
+
+    cleanup_service.cleanup_old_data()
+
+    with wpm1_db() as db:
+        assert db.get(InboxModel, message.id) is not None
 
 
 @pytest.mark.parametrize(

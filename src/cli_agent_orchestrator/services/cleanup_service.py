@@ -6,6 +6,8 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from tzlocal import get_localzone
+
 from cli_agent_orchestrator.clients.database import (
     CallbackBarrierMemberModel,
     CallbackBarrierModel,
@@ -109,7 +111,9 @@ def cleanup_old_data():
                 .all()
             )
             exempt_batches = 0
-            now_cutoff = cutoff_date.replace(tzinfo=timezone.utc)
+            now_cutoff = cutoff_date.replace(tzinfo=get_localzone(), fold=0).astimezone(
+                timezone.utc
+            )
             for key, attempts in attempts_by_batch.items():
                 rows = db.query(InboxModel).filter(InboxModel.id.in_(key)).all()
                 if len(rows) != len(key):
