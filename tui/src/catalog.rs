@@ -1,6 +1,6 @@
 //! The static run-policy table: what the TUI offers, and how (issue #321).
 //!
-//! One row per leaf command of the CAO Click tree — **95 of them** — each classified `InApp`,
+//! One row per leaf command of the CAO Click tree — **96 of them** — each classified `InApp`,
 //! `Handoff`, or `Hidden`. Three infallible lookups read that table and nothing else.
 //!
 //! # No I/O, and that is the security property (SR-1)
@@ -64,7 +64,7 @@ use std::vec::Vec;
 
 /// The number of leaf commands in the CAO Click tree.
 ///
-/// **95 as of this merge.** Two separate merges from `main` each brought four new leaf commands
+/// **96 as of this merge.** Two separate merges from `main` each brought four new leaf commands
 /// that this table did not know about, and both were caught by
 /// `test/test_command_catalog_matches_click.py` rather than by review — the second one in CI,
 /// because CI tests the PR MERGED against `main` while a local run only sees the branch. That is
@@ -86,7 +86,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 95;
+const COMMAND_COUNT: usize = 96;
 
 /// What the TUI does with a command.
 ///
@@ -183,7 +183,7 @@ pub struct Command {
 ///
 /// `pub(crate)` since Bolt 3: `server-client`'s route-table tests walk it to assert that every
 /// IN-APP command has a route and that no HANDOFF or HIDE command does. Deriving that set any
-/// other way would mean re-listing 95 commands in a second place, which is a worse trade than
+/// other way would mean re-listing 96 commands in a second place, which is a worse trade than
 /// widening the visibility of a compile-time constant. Still crate-private — no consumer outside
 /// this crate exists, and the table is not a public API. (#321)
 pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
@@ -280,11 +280,12 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::SessionStart,
     CommandId::Suite,
     CommandId::VerifyDeploy,
+    CommandId::VerifyIdentity,
     CommandId::VerifyScope,
     CommandId::VerifySuiteLog,
 ];
 
-/// One variant per leaf command — **all 95**.
+/// One variant per leaf command — **all 96**.
 ///
 /// Why an enum rather than a `String` key is the subject of this module's own docs: it is what
 /// makes an unclassified command a **compile error** instead of a runtime `None` (FR-4.2).
@@ -522,11 +523,12 @@ pub enum CommandId {
     // `cao verify *`
     /// `cao verify deploy`
     VerifyDeploy,
+    /// `cao verify identity`
+    VerifyIdentity,
     /// `cao verify scope`
     VerifyScope,
     /// `cao verify suite-log`
     VerifySuiteLog,
-
 }
 
 /// The one place a command's row is written.
@@ -1524,6 +1526,16 @@ fn entry(id: CommandId) -> Command {
             handoff_reason: None,
             // HIDE: fork-only / ops command; unclassified default (project.md)
         },
+        CommandId::VerifyIdentity => Command {
+            id: CommandId::VerifyIdentity,
+            parent: Some("verify"),
+            leaf_name: "identity",
+            summary: "Verify MCP, pane, and database identity using offline local sources.",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: offline operator diagnostic; shell-run, never a TUI action (F94R)
+        },
         CommandId::VerifyScope => Command {
             id: CommandId::VerifyScope,
             parent: Some("verify"),
@@ -1622,7 +1634,7 @@ mod tests {
         counts
     }
 
-    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 53 HIDE, totalling 95.**
+    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 54 HIDE, totalling 96.**
     ///
     /// Every number here is a **hard-coded literal**, and that is the entire design of the test.
     /// Deriving any of them from the table — `assert_eq!(in_app, TABLE.iter().filter(..).count())`
@@ -1659,27 +1671,27 @@ mod tests {
     /// consistent and every test green, because nothing compared the table against the CLI. That
     /// is what `test/test_command_catalog_matches_click.py` now does. (Review on PR #547.)
     #[test]
-    fn the_policy_distribution_is_twentyfour_eighteen_fiftythree() {
+    fn the_policy_distribution_is_twentyfour_eighteen_fiftyfour() {
         let (in_app, handoff, hidden) = distribution();
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 53, "expected 53 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 54, "expected 54 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            95,
-            "the three policy counts must account for all 95 leaf commands of the Click tree"
+            96,
+            "the three policy counts must account for all 96 leaf commands of the Click tree"
         );
 
-        // The three counts summing to 95 does not prove 95 *distinct* commands were counted: a
+        // The three counts summing to 96 does not prove 96 *distinct* commands were counted: a
         // duplicated entry in DISPLAY_ORDER would inflate one policy while a real command went
         // uncounted, and the arithmetic above would still close. DISPLAY_ORDER is generated, so
         // this is a live hazard rather than a theoretical one.
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            95,
-            "DISPLAY_ORDER must list 95 DISTINCT commands; a duplicate would let one command go \
+            96,
+            "DISPLAY_ORDER must list 96 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -1701,7 +1713,7 @@ mod tests {
     ///
     /// Neither existing guard catches it. [`the_policy_distribution_is_twentytwo_sixteen_twentythree`]
     /// counts what `DISPLAY_ORDER` *contains*, so a variant missing from it is simply never
-    /// counted; and its `distinct.len() == 95` assertion detects a **duplicate**, which is the
+    /// counted; and its `distinct.len() == 96` assertion detects a **duplicate**, which is the
     /// opposite direction. [`COMMAND_COUNT`] pins the array's *length*, never its membership.
     ///
     /// # Why an exhaustive match and NOT a discriminant trick
@@ -1839,6 +1851,7 @@ mod tests {
                     CommandId::SessionStart => CommandId::SessionStart,
                     CommandId::Suite => CommandId::Suite,
                     CommandId::VerifyDeploy => CommandId::VerifyDeploy,
+                    CommandId::VerifyIdentity => CommandId::VerifyIdentity,
                     CommandId::VerifyScope => CommandId::VerifyScope,
                     CommandId::VerifySuiteLog => CommandId::VerifySuiteLog,
                 }
@@ -1939,6 +1952,7 @@ mod tests {
                 CommandId::SessionStart,
                 CommandId::Suite,
                 CommandId::VerifyDeploy,
+                CommandId::VerifyIdentity,
                 CommandId::VerifyScope,
                 CommandId::VerifySuiteLog,
             ]
