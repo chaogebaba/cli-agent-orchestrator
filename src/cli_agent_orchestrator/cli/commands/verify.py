@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 import click
 
 from cli_agent_orchestrator.constants import DATABASE_FILE
+from cli_agent_orchestrator.kernel.receiver_state.trace_manifest import regenerate_manifest
 from cli_agent_orchestrator.services.identity_verify_service import ScanResult, scan_identity
 from cli_agent_orchestrator.services.verification_service import (
     changed_files,
@@ -143,6 +144,18 @@ def identity(json_output: bool, endpoint: str | None, db_path: Path | None) -> N
         _render_identity(result)
     if result["summary"]["fail"]:
         raise click.exceptions.Exit(1)
+
+@verify.command("manifest")
+@click.option("--regen", is_flag=True, help="Regenerate the receiver-state trace manifest.")
+def manifest(regen: bool) -> None:
+    """Maintain the receiver-state trace manifest."""
+    if not regen:
+        raise click.UsageError("Pass --regen to regenerate the trace manifest.")
+    hits, files_touched, changed = regenerate_manifest(git_root())
+    click.echo(
+        f"Trace manifest: hits={hits} files_touched={files_touched} "
+        f"changed={'yes' if changed else 'no'}"
+    )
 
 
 @verify.command("suite-log")

@@ -736,6 +736,8 @@ fn route(id: CommandId) -> Option<Route> {
         // HIDE: offline operator diagnostic, run from a shell (F94R)
         CommandId::VerifyIdentity => None,
         // HIDE: fork-only / ops; unclassified default
+        CommandId::VerifyManifest => None,
+        // HIDE: fork-only / ops; unclassified default
         CommandId::VerifyScope => None,
         // HIDE: fork-only / ops; unclassified default
         CommandId::VerifySuiteLog => None,
