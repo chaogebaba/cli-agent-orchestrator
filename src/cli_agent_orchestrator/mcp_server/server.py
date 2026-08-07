@@ -41,6 +41,10 @@ from cli_agent_orchestrator.services.settings_service import (
 )
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.http import CAOHttpClient
+from cli_agent_orchestrator.utils.session_lookup import (
+    _TERMINAL_ID_PATTERN,
+    resolve_session_name,
+)
 
 cao_http = CAOHttpClient(lambda: requests)
 from cli_agent_orchestrator.utils.terminal import generate_session_name
@@ -76,7 +80,6 @@ ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true")
 # Terminal count threshold for cleanup nudge
 TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
 MAX_USER_PROMPT_ANSWER_LENGTH = 4000
-_TERMINAL_ID_PATTERN = re.compile(r"^[a-f0-9]{8}$")
 
 
 def _current_terminal_id() -> Optional[str]:
@@ -894,13 +897,7 @@ async def session_manifest(
 @mcp.tool(description="Read the narrow fleet topology and live status projection.")
 async def fleet(session_name: Optional[str] = None) -> Dict[str, Any]:
     try:
-        terminal_id = _current_terminal_id()
-        if not session_name:
-            if not terminal_id:
-                raise ValueError("session_name required outside a CAO terminal")
-            response = cao_http.get(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
-            response.raise_for_status()
-            session_name = response.json()["session_name"]
+        session_name = resolve_session_name(session_name, timeout=_mcp_timeout())
         response = cao_http.get(f"/sessions/{session_name}/fleet", timeout=_mcp_timeout())
         response.raise_for_status()
         return {"success": True, "fleet": response.json()}

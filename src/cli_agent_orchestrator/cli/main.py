@@ -4,6 +4,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 import click
 
+from cli_agent_orchestrator.cli.commands.agents import agents
 from cli_agent_orchestrator.cli.commands.barrier import barrier
 from cli_agent_orchestrator.cli.commands.base import base
 from cli_agent_orchestrator.cli.commands.config import config
@@ -47,6 +48,7 @@ def cli():
 
 # Register commands
 cli.add_command(profile)
+cli.add_command(agents)
 cli.add_command(base)
 cli.add_command(barrier)
 cli.add_command(launch)
