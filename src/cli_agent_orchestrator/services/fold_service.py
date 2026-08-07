@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import tempfile
 import tokenize
 from collections import defaultdict, deque
@@ -23,6 +24,7 @@ Operation = Literal["replace", "after", "strike"]
 FootprintKind = Literal["span", "point"]
 ValidatorKind = Literal["P5", "P6"]
 P10Classification = Literal["DEFECT", "HYGIENE"]
+P9Classification = Literal["DEFECT", "HYGIENE"]
 
 
 class FoldUsageError(ValueError):
@@ -51,7 +53,59 @@ class FoldResult:
     new_sha: str
     violations: tuple[str, ...] = ()
     check_only: bool = False
+    p9: P9Report | None = None
     p10: P10Report | None = None
+
+
+@dataclass(frozen=True)
+class RepoMapping:
+    name: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class P9Finding:
+    classification: P9Classification
+    kind: str
+    path: str
+    line: int
+    detail: str
+    offset: int
+
+    def render(self) -> str:
+        return f"P9 {self.classification} {self.path}:{self.line} {self.kind} {self.detail}"
+
+
+@dataclass(frozen=True)
+class P9Status:
+    kind: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class P9Report:
+    path: str
+    population_eligible: bool
+    findings: tuple[P9Finding, ...]
+    statuses: tuple[P9Status, ...]
+    used_mappings: frozenset[str]
+    basename_resolved: int = 0
+    ambiguous_basename: int = 0
+
+    @property
+    def defect_count(self) -> int:
+        return sum(finding.classification == "DEFECT" for finding in self.findings)
+
+    @property
+    def ambiguous_adjacency(self) -> int:
+        return sum(finding.kind == "AMBIGUOUS-ADJACENCY" for finding in self.findings)
+
+    def render_lines(self) -> tuple[str, ...]:
+        findings = tuple(finding.render() for finding in self.findings)
+        statuses = tuple(
+            f"P9 STATUS {status.kind} {self.path} {status.detail}" for status in self.statuses
+        )
+        return findings + statuses
 
 
 @dataclass(frozen=True)
@@ -101,7 +155,33 @@ class P10Report:
 @dataclass(frozen=True)
 class FoldCorpusResult:
     violations: tuple[str, ...]
+    p9_reports: tuple[P9Report, ...]
+    p9_unused_mappings: tuple[RepoMapping, ...]
     p10_reports: tuple[P10Report, ...]
+
+    @property
+    def p9_summary_lines(self) -> tuple[str, ...]:
+        population = sum(report.population_eligible for report in self.p9_reports)
+        defects = sum(report.defect_count for report in self.p9_reports)
+        ambiguous = sum(report.ambiguous_basename for report in self.p9_reports)
+        resolved = sum(report.basename_resolved for report in self.p9_reports)
+        adjacency = sum(report.ambiguous_adjacency for report in self.p9_reports)
+        denominator = ambiguous + resolved
+        rate = (100.0 * ambiguous / denominator) if denominator else 0.0
+        return (
+            f"P9 POPULATION: {population}",
+            f"P9 COVERAGE: {population}/{population} graded",
+            f"P9 DENOMINATOR: {defects} path-missing defect firings",
+            f"P9 HYGIENE: ambiguous-basename={ambiguous}/{denominator} ({rate:.4f}%) "
+            f"ambiguous-adjacency={adjacency}",
+        )
+
+    @property
+    def p9_unused_mapping_lines(self) -> tuple[str, ...]:
+        return tuple(
+            f"P9 STATUS MAPPING-UNUSED - {mapping.name}={mapping.path}"
+            for mapping in self.p9_unused_mappings
+        )
 
     @property
     def p10_summary_lines(self) -> tuple[str, str, str, str]:
@@ -205,6 +285,22 @@ class _P10Token:
 
 
 @dataclass(frozen=True)
+class _P9Citation:
+    raw: str
+    cited_path: str
+    line: int
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class _P9Resolution:
+    hits: tuple[Path, ...]
+    used_mappings: frozenset[str]
+    unreadable: bool = False
+
+
+@dataclass(frozen=True)
 class _AcceptanceUnit:
     text: str
     start_line: int
@@ -212,6 +308,13 @@ class _AcceptanceUnit:
 
 _TOKEN_RE = re.compile(r"§\d+|[\w]+|[^\w\s]", re.UNICODE)
 _LIST_MARKER_RE = re.compile(r"^(?P<indent>[ \t]*)(?P<number>\d+)[.)][ \t]+")
+_P9_CITATION_RE = re.compile(
+    r"`(?P<path>[^`\s]+\.(?:py|md|sh|toml|json|ini|cfg))" r"(?P<location>:\d+(?:-\d+)?)?`"
+)
+_P9_NAME_RE = re.compile(r"`(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\(\))?`")
+_P9_SEARCH_EXCLUDES = frozenset(
+    {".git", "__pycache__", ".venv", "node_modules", ".pytest_cache", "tmp", "archive"}
+)
 _P10_ID = r"[A-Za-z0-9_-]+"
 _P10_BRANCH_TOKEN_RE = re.compile(rf"(?<![A-Za-z0-9_@])@branch\s*:\s*(?P<id>{_P10_ID})")
 _P10_AC_TOKEN_RE = re.compile(rf"(?<![A-Za-z0-9_@])branch\s*:\s*(?P<id>{_P10_ID})")
@@ -322,8 +425,8 @@ def fold_file(path: Path, hunks: Sequence[FoldHunk]) -> FoldResult:
     return FoldResult(old_sha=old_sha, new_sha=_sha(post))
 
 
-def check_file(path: Path) -> FoldResult:
-    """Report absolute P5/P6 and P10 findings without editing or failing."""
+def check_file(path: Path, repos: Sequence[RepoMapping] = ()) -> FoldResult:
+    """Report absolute P5/P6, P9, and P10 findings without editing or failing."""
     _validate_target(path)
     data = _read_markdown(path)
     structure = _parse_structure(data)
@@ -332,11 +435,12 @@ def check_file(path: Path) -> FoldResult:
         new_sha=_sha(data),
         violations=tuple(violation.message for violation in structure.violations),
         check_only=True,
+        p9=_analyze_p9(data, str(path), repos),
         p10=_analyze_p10(data, str(path)),
     )
 
 
-def check_corpus(root: Path) -> FoldCorpusResult:
+def check_corpus(root: Path, repos: Sequence[RepoMapping] = ()) -> FoldCorpusResult:
     """Run file-global checks over the pinned bridge-document corpus."""
     paths = _p10_corpus_paths(root)
     if not paths:
@@ -344,13 +448,17 @@ def check_corpus(root: Path) -> FoldCorpusResult:
             f"{root}: corpus is empty; expected blueprints/, doctrine/, and GOLDEN-TIPS.md"
         )
     violations: list[str] = []
+    p9_reports: list[P9Report] = []
     reports: list[P10Report] = []
     for path in paths:
         data = _read_markdown(path)
         structure = _parse_structure(data)
         violations.extend(violation.message for violation in structure.violations)
+        p9_reports.append(_analyze_p9(data, path.relative_to(root.resolve()).as_posix(), repos))
         reports.append(_analyze_p10(data, path.relative_to(root.resolve()).as_posix()))
-    return FoldCorpusResult(tuple(violations), tuple(reports))
+    used_mappings = set().union(*(report.used_mappings for report in p9_reports))
+    unused = tuple(mapping for mapping in repos if mapping.name not in used_mappings)
+    return FoldCorpusResult(tuple(violations), tuple(p9_reports), unused, tuple(reports))
 
 
 def _p10_corpus_paths(root: Path) -> tuple[Path, ...]:
@@ -360,6 +468,291 @@ def _p10_corpus_paths(root: Path) -> tuple[Path, ...]:
     if tips.is_file():
         candidates.append(tips)
     return tuple(sorted({path.resolve() for path in candidates}, key=lambda path: str(path)))
+
+
+def _analyze_p9(data: bytes, display_path: str, repos: Sequence[RepoMapping]) -> P9Report:
+    text = data.decode("utf-8")
+    citations = _p9_citations(text)
+    if not citations:
+        return P9Report(display_path, False, (), (), frozenset())
+
+    mappings = tuple(RepoMapping(mapping.name, mapping.path.resolve()) for mapping in repos)
+    if not mappings:
+        return P9Report(
+            display_path,
+            True,
+            (),
+            (P9Status("SKIPPED-NO-REPO", "no --repo mapping supplied"),),
+            frozenset(),
+        )
+
+    mapping_by_name = {mapping.name: mapping for mapping in mappings}
+    usable = {mapping.name: _p9_mapping_usable(mapping) for mapping in mappings}
+    excluded_roots = _p9_excluded_worktree_roots(mappings)
+    findings: list[P9Finding] = []
+    statuses: dict[str, str] = {}
+    used_mappings: set[str] = set()
+    basename_resolved = 0
+    ambiguous_basename = 0
+
+    for citation in citations:
+        bound = _p9_bound_mappings(citation.cited_path, mappings, mapping_by_name)
+        used_mappings.update(mapping.name for mapping in bound)
+        unavailable = [mapping for mapping in bound if not usable[mapping.name]]
+        if unavailable:
+            names = ",".join(
+                f"{mapping.name}={mapping.path}"
+                for mapping in sorted(unavailable, key=lambda item: item.name)
+            )
+            statuses.setdefault("SKIPPED-NO-REPO", f"unreadable-or-missing mapping {names}")
+        available = tuple(mapping for mapping in bound if usable[mapping.name])
+        if not available:
+            continue
+
+        resolution = _p9_resolve(citation.cited_path, available, excluded_roots, mapping_by_name)
+        used_mappings.update(resolution.used_mappings)
+        is_basename = "/" not in _p9_relative_citation_path(
+            citation.cited_path, available, mapping_by_name
+        )
+        if not resolution.hits:
+            reason = "unreadable-or-missing" if resolution.unreadable else "missing"
+            findings.append(
+                P9Finding(
+                    "DEFECT",
+                    "path-missing",
+                    display_path,
+                    citation.line,
+                    f"citation={citation.raw} reason={reason}",
+                    citation.start,
+                )
+            )
+            continue
+        if len(resolution.hits) == 1:
+            if is_basename:
+                basename_resolved += 1
+            continue
+
+        if is_basename:
+            ambiguous_basename += 1
+        paths = ",".join(str(path) for path in resolution.hits)
+        findings.append(
+            P9Finding(
+                "HYGIENE",
+                "AMBIGUOUS-BASENAME",
+                display_path,
+                citation.line,
+                f"citation={citation.raw} hits={paths}",
+                citation.start,
+            )
+        )
+
+    findings.extend(_p9_adjacency_findings(text, display_path, citations))
+    findings.sort(
+        key=lambda finding: (
+            finding.path,
+            finding.line,
+            finding.kind,
+            finding.offset,
+            finding.detail,
+        )
+    )
+    return P9Report(
+        display_path,
+        True,
+        tuple(findings),
+        tuple(P9Status(kind, detail) for kind, detail in sorted(statuses.items())),
+        frozenset(used_mappings),
+        basename_resolved,
+        ambiguous_basename,
+    )
+
+
+def _p9_citations(text: str) -> tuple[_P9Citation, ...]:
+    return tuple(
+        _P9Citation(
+            raw=match.group(0)[1:-1],
+            cited_path=match.group("path"),
+            line=text.count("\n", 0, match.start()) + 1,
+            start=match.start(),
+            end=match.end(),
+        )
+        for match in _P9_CITATION_RE.finditer(text)
+    )
+
+
+def _p9_bound_mappings(
+    cited_path: str, mappings: Sequence[RepoMapping], mapping_by_name: dict[str, RepoMapping]
+) -> tuple[RepoMapping, ...]:
+    first, _separator, _rest = cited_path.partition("/")
+    explicit = mapping_by_name.get(first)
+    if explicit is not None:
+        return (explicit,)
+    if len(mappings) == 1:
+        return tuple(mappings)
+    return tuple(mappings)
+
+
+def _p9_relative_citation_path(
+    cited_path: str, mappings: Sequence[RepoMapping], mapping_by_name: dict[str, RepoMapping]
+) -> str:
+    first, separator, rest = cited_path.partition("/")
+    if separator and first in mapping_by_name:
+        return rest
+    return cited_path
+
+
+def _p9_mapping_usable(mapping: RepoMapping) -> bool:
+    return mapping.path.is_dir() and os.access(mapping.path, os.R_OK | os.X_OK)
+
+
+def _p9_resolve(
+    cited_path: str,
+    mappings: Sequence[RepoMapping],
+    excluded_roots: frozenset[Path],
+    mapping_by_name: dict[str, RepoMapping],
+) -> _P9Resolution:
+    relative = _p9_relative_citation_path(cited_path, mappings, mapping_by_name)
+    is_basename = "/" not in relative
+    hits: dict[Path, None] = {}
+    unreadable = False
+    for mapping in mappings:
+        if is_basename:
+            candidates, candidate_unreadable = _p9_search_basename(
+                mapping.path, relative, excluded_roots
+            )
+        else:
+            candidates, candidate_unreadable = _p9_resolve_qualified(mapping.path, relative)
+        hits.update((candidate, None) for candidate in candidates)
+        unreadable = unreadable or candidate_unreadable
+    return _P9Resolution(
+        tuple(sorted(hits, key=str)), frozenset(mapping.name for mapping in mappings), unreadable
+    )
+
+
+def _p9_resolve_qualified(root: Path, relative: str) -> tuple[tuple[Path, ...], bool]:
+    direct, unreadable = _p9_readable_file(root / relative)
+    if direct is not None:
+        return (direct,), unreadable
+    package, package_unreadable = _p9_readable_file(
+        root / "src" / "cli_agent_orchestrator" / relative
+    )
+    return ((package,) if package is not None else (), unreadable or package_unreadable)
+
+
+def _p9_search_basename(
+    root: Path, basename: str, excluded_roots: frozenset[Path]
+) -> tuple[tuple[Path, ...], bool]:
+    hits: list[Path] = []
+    unreadable = False
+    root = root.resolve()
+
+    def onerror(_error: OSError) -> None:
+        nonlocal unreadable
+        unreadable = True
+
+    for directory, directories, files in os.walk(
+        root, topdown=True, followlinks=False, onerror=onerror
+    ):
+        current = Path(directory)
+        directories[:] = [
+            name
+            for name in directories
+            if name not in _P9_SEARCH_EXCLUDES
+            and not _p9_excluded_directory(current / name, excluded_roots)
+        ]
+        if basename not in files:
+            continue
+        candidate, candidate_unreadable = _p9_readable_file(current / basename)
+        unreadable = unreadable or candidate_unreadable
+        if candidate is not None:
+            hits.append(candidate)
+    return tuple(hits), unreadable
+
+
+def _p9_readable_file(candidate: Path) -> tuple[Path | None, bool]:
+    try:
+        if candidate.is_symlink() or not candidate.exists() or not candidate.is_file():
+            return None, False
+        if not os.access(candidate, os.R_OK):
+            return None, True
+        return candidate.resolve(), False
+    except OSError:
+        return None, True
+
+
+def _p9_excluded_directory(candidate: Path, excluded_roots: frozenset[Path]) -> bool:
+    try:
+        return candidate.resolve() in excluded_roots
+    except OSError:
+        return False
+
+
+def _p9_excluded_worktree_roots(mappings: Sequence[RepoMapping]) -> frozenset[Path]:
+    mapping_roots = frozenset(mapping.path.resolve() for mapping in mappings)
+    roots: set[Path] = set()
+    for mapping in mappings:
+        roots.update(_p9_git_worktree_roots(mapping.path))
+    return frozenset(root for root in roots if root not in mapping_roots)
+
+
+def _p9_git_worktree_roots(root: Path) -> tuple[Path, ...]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError:
+        return ()
+    if result.returncode != 0:
+        return ()
+    return tuple(
+        Path(line.removeprefix("worktree ")).resolve()
+        for line in result.stdout.splitlines()
+        if line.startswith("worktree ")
+    )
+
+
+def _p9_adjacency_findings(
+    text: str, display_path: str, citations: Sequence[_P9Citation]
+) -> list[P9Finding]:
+    findings: list[P9Finding] = []
+    by_line: dict[int, list[_P9Citation]] = defaultdict(list)
+    for citation in citations:
+        by_line[citation.line].append(citation)
+    for match in _P9_NAME_RE.finditer(text):
+        line = text.count("\n", 0, match.start()) + 1
+        candidates = by_line.get(line, [])
+        if len(candidates) < 2:
+            continue
+        distances = [
+            (
+                (
+                    citation.start - match.end()
+                    if citation.start >= match.end()
+                    else match.start() - citation.end
+                ),
+                citation,
+            )
+            for citation in candidates
+        ]
+        minimum = min(distance for distance, _citation in distances)
+        tied = [citation for distance, citation in distances if distance == minimum]
+        if len(tied) < 2:
+            continue
+        rendered = ",".join(citation.raw for citation in tied)
+        findings.append(
+            P9Finding(
+                "HYGIENE",
+                "AMBIGUOUS-ADJACENCY",
+                display_path,
+                line,
+                f"name={match.group('name')} citations={rendered}",
+                match.start(),
+            )
+        )
+    return findings
 
 
 def _analyze_p10(data: bytes, display_path: str) -> P10Report:
