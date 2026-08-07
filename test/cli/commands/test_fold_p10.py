@@ -173,6 +173,58 @@ def test_p10_header_string_literal_is_not_an_annotation(tmp_path: Path) -> None:
     assert report.findings == ()
 
 
+def test_p10_multiline_header_accepts_annotation_on_first_line(tmp_path: Path) -> None:
+    report = _report(
+        tmp_path,
+        _document(
+            code=(
+                "if (  # @branch:ready # @branch:ready-fallthrough\n"
+                "    ready\n"
+                "):\n"
+                "    pass\n"
+            ),
+        ),
+    )
+    assert report.findings == ()
+    assert report.statuses == ()
+
+
+def test_p10_multiline_header_accepts_annotation_on_colon_line(tmp_path: Path) -> None:
+    report = _report(
+        tmp_path,
+        _document(
+            code=(
+                "if (\n"
+                "    ready\n"
+                "):  # @branch:ready # @branch:ready-fallthrough\n"
+                "    pass\n"
+            ),
+        ),
+    )
+    assert report.findings == ()
+    assert report.statuses == ()
+
+
+def test_p10_non_header_continuation_annotation_does_not_attach(tmp_path: Path) -> None:
+    report = _report(
+        tmp_path,
+        _document(
+            code=(
+                "value = (\n"
+                "    ready  # @branch:ready # @branch:ready-fallthrough\n"
+                ")\n"
+                "if ready:\n"
+                "    pass\n"
+            ),
+        ),
+    )
+    assert "branches-mismatch" in _hygiene(report)
+    assert {item for item in _defects(report) if item[0] == "no-branch"} == {
+        ("no-branch", "ready"),
+        ("no-branch", "ready-fallthrough"),
+    }
+
+
 def test_p10_tab_indented_nested_else_uses_source_indentation(tmp_path: Path) -> None:
     report = _report(
         tmp_path,

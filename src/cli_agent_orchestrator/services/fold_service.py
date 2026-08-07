@@ -707,6 +707,7 @@ def _p10_python_branches(
     tree = ast.parse(_p10_strip_branch_annotations(fence.body))
     body_lines = fence.body.splitlines()
     if_nodes = [node for node in ast.walk(tree) if isinstance(node, ast.If)]
+    header_end_lines = _p10_python_header_end_lines(fence.body, if_nodes)
     elif_ids = {
         id(node.orelse[0])
         for node in if_nodes
@@ -724,42 +725,77 @@ def _p10_python_branches(
         else:
             implicit_roots.append(root)
 
-    headers: list[tuple[int, bool, ast.If | None]] = [
-        (node.lineno, False, node) for node in if_nodes
+    implicit_ids = {id(root) for root in implicit_roots}
+    headers: list[tuple[int, int, bool]] = [
+        (node.lineno, header_end_lines[id(node)], id(node) in implicit_ids) for node in if_nodes
     ]
     for node in explicit_else_nodes:
-        headers.append((_p10_else_line(node, body_lines), False, None))
-    implicit_lines = {root.lineno: root for root in implicit_roots}
+        else_line = _p10_else_line(node, body_lines)
+        headers.append((else_line, else_line, False))
 
     attached: list[_P10Token] = []
     errors: list[str] = []
     comments_by_line: dict[int, list[str]] = defaultdict(list)
     for comment_line, comment in _p10_python_comments(fence.body):
         comments_by_line[comment_line].append(comment)
-    for line_number, _, _node in sorted(headers, key=lambda item: item[0]):
-        ids = [
-            match.group("id")
+    for start_line, end_line, is_implicit in sorted(headers, key=lambda item: item[0]):
+        tags = [
+            (match.group("id"), line_number)
+            for line_number in range(start_line, end_line + 1)
             for comment in comments_by_line.get(line_number, ())
             for match in _P10_BRANCH_TOKEN_RE.finditer(comment)
         ]
-        expected = 2 if line_number in implicit_lines else 1
+        ids = [branch_id for branch_id, _line_number in tags]
+        expected = 2 if is_implicit else 1
         if len(ids) != expected:
-            errors.append(f"line={line_number} expected-tags={expected} observed={len(ids)}")
-        if ids:
-            attached.append(_P10Token(ids[0], fence.body_line + line_number - 1))
-        if line_number in implicit_lines and len(ids) >= 2:
+            errors.append(f"line={start_line} expected-tags={expected} observed={len(ids)}")
+        if tags:
+            attached.append(_P10Token(tags[0][0], fence.body_line + tags[0][1] - 1))
+        if is_implicit and len(tags) >= 2:
             expected_fallthrough = f"{ids[0]}-fallthrough"
             if ids[1] == expected_fallthrough:
-                attached.append(_P10Token(ids[1], fence.body_line + line_number - 1))
+                attached.append(_P10Token(tags[1][0], fence.body_line + tags[1][1] - 1))
             else:
                 errors.append(
-                    f"line={line_number} expected={expected_fallthrough} observed={ids[1]}"
+                    f"line={start_line} expected={expected_fallthrough} observed={ids[1]}"
                 )
         if len(ids) > expected:
-            errors.append(f"line={line_number} extra-tags={','.join(ids[expected:])}")
+            errors.append(f"line={start_line} extra-tags={','.join(ids[expected:])}")
 
     parsed_count = len(if_nodes) + len(explicit_else_nodes) + len(implicit_roots)
     return attached, parsed_count, errors
+
+
+def _p10_python_header_end_lines(body: str, nodes: Sequence[ast.If]) -> dict[int, int]:
+    tokens = list(tokenize.generate_tokens(io.StringIO(body).readline))
+    ends: dict[int, int] = {}
+    for node in nodes:
+        start = next(
+            (
+                index
+                for index, token in enumerate(tokens)
+                if token.type == tokenize.NAME
+                and token.string in {"if", "elif"}
+                and token.start == (node.lineno, node.col_offset)
+            ),
+            None,
+        )
+        if start is None:
+            raise SyntaxError("could not locate Python branch header")
+        depth = 0
+        for token in tokens[start + 1 :]:
+            if token.type != tokenize.OP:
+                continue
+            if token.string in "([{":
+                depth += 1
+            elif token.string in ")]}":
+                depth -= 1
+            elif token.string == ":" and depth == 0:
+                ends[id(node)] = token.start[0]
+                break
+        if id(node) not in ends:
+            raise SyntaxError("could not locate Python branch header colon")
+    return ends
 
 
 def _p10_else_line(node: ast.If, lines: Sequence[str]) -> int:
