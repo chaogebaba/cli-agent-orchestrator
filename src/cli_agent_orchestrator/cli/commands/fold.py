@@ -11,7 +11,9 @@ from cli_agent_orchestrator.services.fold_service import (
     FoldHunk,
     FoldPostconditionError,
     FoldUsageError,
+    P9Report,
     P10Report,
+    RepoMapping,
     check_corpus,
     check_file,
     fold_file,
@@ -54,6 +56,29 @@ def _render_p10(report: P10Report) -> None:
             click.echo(line)
     else:
         click.echo("P10: no violations")
+
+
+def _render_p9(report: P9Report) -> None:
+    lines = report.render_lines()
+    if lines:
+        for line in lines:
+            click.echo(line)
+    else:
+        click.echo("P9: no violations")
+
+
+def _repo_mappings(specs: tuple[str, ...]) -> tuple[RepoMapping, ...]:
+    mappings: dict[str, RepoMapping] = {}
+    for spec in specs:
+        name, separator, raw_path = spec.partition("=")
+        if not separator or not name or not raw_path:
+            raise click.UsageError("--repo must have the form NAME=PATH")
+        mapping = RepoMapping(name, Path(raw_path).resolve())
+        previous = mappings.get(name)
+        if previous is not None and previous.path != mapping.path:
+            raise click.UsageError(f"duplicate --repo mapping for {name!r}")
+        mappings[name] = mapping
+    return tuple(mappings[name] for name in sorted(mappings))
 
 
 def _flag_hunk(
@@ -117,6 +142,12 @@ def _flag_hunk(
     is_flag=True,
     help="Check the pinned bridge Markdown corpus from the current directory.",
 )
+@click.option(
+    "--repo",
+    "repo_specs",
+    multiple=True,
+    help="Repository mapping NAME=PATH for P9 citation resolution (repeatable).",
+)
 def fold(
     file: Path | None,
     anchors: tuple[str, ...],
@@ -126,12 +157,14 @@ def fold(
     expected_counts: tuple[int, ...],
     check_only: bool,
     corpus: bool,
+    repo_specs: tuple[str, ...],
 ) -> None:
     """Transactionally edit one UTF-8 Markdown FILE, or check its structure."""
     try:
         flag_hunk, flag_present = _flag_hunk(
             anchors, replacements, afters, strikes, expected_counts
         )
+        repos = _repo_mappings(repo_specs)
         if corpus:
             if not check_only:
                 raise click.UsageError("--corpus requires --check")
@@ -139,13 +172,24 @@ def fold(
                 raise click.UsageError("--corpus does not accept a FILE operand")
             if flag_present:
                 raise click.UsageError("--check is mutually exclusive with an edit spec")
-            corpus_result = check_corpus(Path.cwd())
+            corpus_result = check_corpus(Path.cwd(), repos)
             click.echo("skipped: P1, P2, P3 (no edit span under --check)")
             if corpus_result.violations:
                 for violation in corpus_result.violations:
                     click.echo(violation)
             else:
                 click.echo("P5/P6: no violations")
+            p9_lines = [
+                line for report in corpus_result.p9_reports for line in report.render_lines()
+            ]
+            p9_lines.extend(corpus_result.p9_unused_mapping_lines)
+            if p9_lines:
+                for line in p9_lines:
+                    click.echo(line)
+            else:
+                click.echo("P9: no violations")
+            for line in corpus_result.p9_summary_lines:
+                click.echo(line)
             p10_lines = [
                 line for report in corpus_result.p10_reports for line in report.render_lines()
             ]
@@ -163,17 +207,21 @@ def fold(
         if check_only:
             if flag_present:
                 raise click.UsageError("--check is mutually exclusive with an edit spec")
-            check_result = check_file(file)
+            check_result = check_file(file, repos)
             click.echo("skipped: P1, P2, P3 (no edit span under --check)")
             if check_result.violations:
                 for violation in check_result.violations:
                     click.echo(violation)
             else:
                 click.echo("P5/P6: no violations")
+            assert check_result.p9 is not None
+            _render_p9(check_result.p9)
             assert check_result.p10 is not None
             _render_p10(check_result.p10)
             return
 
+        if repo_specs:
+            raise click.UsageError("--repo requires --check")
         if flag_present:
             assert flag_hunk is not None
             hunks = [flag_hunk]
