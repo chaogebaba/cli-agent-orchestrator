@@ -2004,3 +2004,112 @@ class TestKiroKasStatusClassifier:
         # v2 TUI_PROCESSING_PATTERN ("Kiro is working") with no idle after.
         status = provider.get_status("Kiro is working\n")
         assert status == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_kas_live_idle_chrome_is_idle(self, mock_tmux):
+        """G7 E1 fixture (2026-08-07): live KAS idle chrome → IDLE.
+
+        Verbatim tail of probes/error-pane-samples/f107-kas-idle-2026-08-07.txt
+        (kas-manual-test session): v3's lowercase idle placeholder must hit
+        NEW_TUI_IDLE_PATTERN, and the F111 fallback banner must not park it.
+        """
+        provider = KiroCliProvider(
+            "test1234",
+            "test-session",
+            "window-0",
+            "developer",
+            engine=KiroEngine.KAS,
+        )
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+        mock_tmux.return_value.get_pane_current_command.return_value = "kiro-cli"
+        output = (
+            "● agent \"kiro_dev\" not found, using \"default\"\n"
+            " Trust All Tools active, confirmations are off · /quit to exit\n"
+            "Default · Auto · ◔ 3%\n"
+            " ask a question or describe a task ↵\n"
+        )
+        provider.mark_input_received()
+        assert provider.get_status(output) == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_kas_live_processing_chrome_is_processing(self, mock_tmux):
+        """G7 E1 fixture (2026-08-07): live KAS working chrome → PROCESSING.
+
+        Verbatim tail of f107-kas-processing-2026-08-07.txt: "⢹ Thinking..."
+        spinner line + "Kiro is working · Type to steer" footer with NO idle
+        placeholder after the working marker.
+        """
+        provider = KiroCliProvider(
+            "test1234",
+            "test-session",
+            "window-0",
+            "developer",
+            engine=KiroEngine.KAS,
+        )
+        output = (
+            "⢹ Thinking... (esc to cancel)\n"
+            "● agent \"kiro_dev\" not found, using \"default\"\n"
+            " Trust All Tools active, confirmations are off · /quit to exit\n"
+            "Default · Auto · ◔ 3%\n"
+            " Kiro is working · Type to steer · Ctrl+S to queue\n"
+        )
+        provider.mark_input_received()
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_kas_trust_dialog_is_waiting_user_answer(self, mock_tmux):
+        """G7 r4 fixture (2026-08-07): KAS trust dialog → WAITING_USER_ANSWER.
+
+        Verbatim tail of f107-kas-r4-dialog-pre-answer-2026-08-07.txt: dialog
+        with nav footer, no idle prompt below → check 2a must park it as
+        WAITING_USER_ANSWER (this is the state the auto-responder corroborates
+        against before firing Down,Enter).
+        """
+        provider = KiroCliProvider(
+            "test1234",
+            "test-session",
+            "window-0",
+            "developer",
+            engine=KiroEngine.KAS,
+        )
+        output = (
+            " Warning: Kiro is running in trust all tools mode\n"
+            " ❯ No, exit\n"
+            "   Yes, I accept\n"
+            "   Yes, and don't ask again\n"
+            "  esc to cancel · ↑↓ to navigate · ↵ to select\n"
+        )
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_kas_idle_after_processing_marker_is_idle(self, mock_tmux):
+        """G7 E1 fixture: working marker followed by idle placeholder → IDLE.
+
+        Sequence from the live session: "Kiro is working" footer redrawn over
+        by the completed-turn chrome (Credits line + idle placeholder). The
+        idle-after-working ghost-text rule must win over the stale marker.
+        """
+        provider = KiroCliProvider(
+            "test1234",
+            "test-session",
+            "window-0",
+            "developer",
+            engine=KiroEngine.KAS,
+        )
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+        mock_tmux.return_value.get_pane_current_command.return_value = "kiro-cli"
+        output = (
+            " Kiro is working · Type to steer · Ctrl+S to queue\n"
+            "▸ Credits: 0.14 • Time: 5s\n"
+            "● agent \"kiro_dev\" not found, using \"default\"\n"
+            " Trust All Tools active, confirmations are off · /quit to exit\n"
+            "Default · Auto · ◔ 3%\n"
+            " ask a question or describe a task ↵\n"
+        )
+        provider.mark_input_received()
+        # Credits footer + bordered response box reads as COMPLETED (turn done);
+        # the load-bearing assertion is idle-after-working: NOT PROCESSING.
+        assert provider.get_status(output) != TerminalStatus.PROCESSING
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
