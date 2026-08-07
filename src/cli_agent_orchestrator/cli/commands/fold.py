@@ -11,6 +11,8 @@ from cli_agent_orchestrator.services.fold_service import (
     FoldHunk,
     FoldPostconditionError,
     FoldUsageError,
+    P10Report,
+    check_corpus,
     check_file,
     fold_file,
     parse_hunks_document,
@@ -37,11 +39,21 @@ def _operand(value: str, option: str) -> str:
         raise click.UsageError(f"{option}: cannot read {path}: {exc}") from exc
 
 
-def _usage_message(file: Path, observed: object) -> str:
+def _usage_message(file: Path | None, observed: object) -> str:
+    target = file if file is not None else Path.cwd()
     return (
-        f"{file}: expected a valid fold request; observed {observed}; "
+        f"{target}: expected a valid fold request; observed {observed}; "
         "hint: correct the edit spec and retry"
     )
+
+
+def _render_p10(report: P10Report) -> None:
+    lines = report.render_lines()
+    if lines:
+        for line in lines:
+            click.echo(line)
+    else:
+        click.echo("P10: no violations")
 
 
 def _flag_hunk(
@@ -81,7 +93,7 @@ def _flag_hunk(
 
 
 @click.command()
-@click.argument("file", type=click.Path(path_type=Path, dir_okay=False))
+@click.argument("file", required=False, type=click.Path(path_type=Path, dir_okay=False))
 @click.option("--anchor", "anchors", multiple=True, help="Literal anchor text.")
 @click.option(
     "--replace-with",
@@ -94,31 +106,72 @@ def _flag_hunk(
 @click.option(
     "--expect-count", "expected_counts", type=int, multiple=True, help="Required match count."
 )
-@click.option("--check", "check_only", is_flag=True, help="Report file-global P5/P6 violations.")
+@click.option(
+    "--check",
+    "check_only",
+    is_flag=True,
+    help="Report file-global P5/P6/P10 violations.",
+)
+@click.option(
+    "--corpus",
+    is_flag=True,
+    help="Check the pinned bridge Markdown corpus from the current directory.",
+)
 def fold(
-    file: Path,
+    file: Path | None,
     anchors: tuple[str, ...],
     replacements: tuple[str, ...],
     afters: tuple[str, ...],
     strikes: tuple[bool, ...],
     expected_counts: tuple[int, ...],
     check_only: bool,
+    corpus: bool,
 ) -> None:
     """Transactionally edit one UTF-8 Markdown FILE, or check its structure."""
     try:
         flag_hunk, flag_present = _flag_hunk(
             anchors, replacements, afters, strikes, expected_counts
         )
-        if check_only:
+        if corpus:
+            if not check_only:
+                raise click.UsageError("--corpus requires --check")
+            if file is not None:
+                raise click.UsageError("--corpus does not accept a FILE operand")
             if flag_present:
                 raise click.UsageError("--check is mutually exclusive with an edit spec")
-            result = check_file(file)
+            corpus_result = check_corpus(Path.cwd())
             click.echo("skipped: P1, P2, P3 (no edit span under --check)")
-            if result.violations:
-                for violation in result.violations:
+            if corpus_result.violations:
+                for violation in corpus_result.violations:
                     click.echo(violation)
             else:
                 click.echo("P5/P6: no violations")
+            p10_lines = [
+                line for report in corpus_result.p10_reports for line in report.render_lines()
+            ]
+            if p10_lines:
+                for line in p10_lines:
+                    click.echo(line)
+            else:
+                click.echo("P10: no violations")
+            for line in corpus_result.p10_summary_lines:
+                click.echo(line)
+            return
+
+        if file is None:
+            raise click.UsageError("FILE is required unless --corpus is used")
+        if check_only:
+            if flag_present:
+                raise click.UsageError("--check is mutually exclusive with an edit spec")
+            check_result = check_file(file)
+            click.echo("skipped: P1, P2, P3 (no edit span under --check)")
+            if check_result.violations:
+                for violation in check_result.violations:
+                    click.echo(violation)
+            else:
+                click.echo("P5/P6: no violations")
+            assert check_result.p10 is not None
+            _render_p10(check_result.p10)
             return
 
         if flag_present:
@@ -129,7 +182,7 @@ def fold(
             if stdin.isatty():
                 raise click.UsageError("no edit spec supplied; refusing to read from a TTY")
             hunks = parse_hunks_document(click.get_binary_stream("stdin").read())
-        result = fold_file(file, hunks)
+        fold_result = fold_file(file, hunks)
     except FoldUsageError as exc:
         raise click.UsageError(_usage_message(file, exc)) from exc
     except click.UsageError as exc:
@@ -137,4 +190,4 @@ def fold(
     except FoldPostconditionError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    click.echo(f"{file} -> WROTE ({result.old_sha} -> {result.new_sha})")
+    click.echo(f"{file} -> WROTE ({fold_result.old_sha} -> {fold_result.new_sha})")
