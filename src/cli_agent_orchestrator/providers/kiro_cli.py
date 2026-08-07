@@ -146,6 +146,7 @@ ERROR_INDICATORS = ["Kiro is having trouble responding right now"]
 
 
 class KiroCliProvider(BaseProvider):
+    supports_screen_detection = True  # F110: auto-responder opt-in (G7 R2 root cause)
     """Provider for Kiro CLI tool integration.
 
     This provider manages the lifecycle of a Kiro CLI chat session within a tmux window,
