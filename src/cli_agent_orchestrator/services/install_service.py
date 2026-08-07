@@ -345,11 +345,16 @@ def install_agent(
         safe_filename = profile.name.replace("/", "__")
 
         if provider == ProviderType.KIRO_CLI.value:
-            if profile.engine == KiroEngine.KAS:
+            # F107 A8: v3 honors v2 JSON agent configs by backward compat.
+            # Reject only v2-ONLY fields on KAS profiles (toolsSettings, hooks),
+            # not the engine itself.
+            if profile.engine == KiroEngine.KAS and (
+                profile.toolsSettings is not None or profile.hooks is not None
+            ):
                 raise ValueError(
-                    "Kiro KAS profiles cannot be installed in Phase 0: CAO cannot "
-                    "render KAS profiles or translate allowedTools/toolsSettings to Cedar. "
-                    "Set engine: v2 or wait for a later migration phase."
+                    "Kiro KAS profiles cannot set toolsSettings or hooks "
+                    "(v2-only fields; v3 uses permissions). Remove those fields "
+                    "or set engine: v2."
                 )
             KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
             # Kiro natively supports skill:// resources with progressive loading

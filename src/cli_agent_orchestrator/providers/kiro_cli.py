@@ -26,11 +26,13 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
-from cli_agent_orchestrator.providers.kiro_capabilities import (
-    KiroPhase0KASError,
-    build_kiro_command,
+from cli_agent_orchestrator.providers.kiro_capabilities import build_kiro_command
+from cli_agent_orchestrator.services.settings_service import (
+    get_provider_defaults,
+    get_provider_profile_defaults,
+    get_server_settings,
+    resolve_provider_string_option,
 )
-from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -236,25 +238,37 @@ class KiroCliProvider(BaseProvider):
         return 2000
 
     def _get_profile_model(self) -> Optional[str]:
-        """Return the explicit per-call model override if given, else
-        profile.model if the agent profile can be loaded, else None.
+        """Resolve model: spawn override > providers.toml > profile field.
+
+        F107 B2: kiro joins codex/grok/claude on resolve_provider_string_option
+        so ``[kiro_cli] model = "auto"`` in providers.toml is honored.
 
         Best-effort: historically the Kiro CLI provider has not required the
         CAO agent profile to be loadable at runtime (kiro-cli has its own
-        agent store). A missing or unparseable profile must not block launch.
+        agent store). A missing or unparseable profile must not block launch;
+        toml defaults still apply when the profile is absent.
         """
         if self._model:
             return self._model
+        profile = None
         try:
             profile = load_agent_profile(self._agent_profile)
         except (FileNotFoundError, RuntimeError) as exc:
             logger.debug(
-                "Profile '%s' not loadable by CAO; skipping --model resolution: %s",
+                "Profile '%s' not loadable by CAO; falling back to providers.toml: %s",
                 self._agent_profile,
                 exc,
             )
-            return None
-        return profile.model or None
+        provider_defaults = get_provider_defaults("kiro_cli")
+        profile_name = getattr(profile, "name", None) or self._agent_profile
+        profile_defaults = get_provider_profile_defaults(provider_defaults, profile_name)
+        return resolve_provider_string_option(
+            profile_defaults,
+            provider_defaults,
+            profile,
+            "model",
+            "model",
+        )
 
     async def initialize(self) -> bool:
         """Initialize Kiro CLI provider by starting kiro-cli chat command.
@@ -271,12 +285,6 @@ class KiroCliProvider(BaseProvider):
             TimeoutError: If shell or Kiro CLI initialization times out
         """
         from cli_agent_orchestrator.services.status_monitor import status_monitor
-
-        if self._engine == KiroEngine.KAS:
-            # This defensive guard makes direct provider use fail closed too.
-            # Normal terminal creation has already probed and rejected KAS before
-            # a backend window or provider is allocated.
-            raise KiroPhase0KASError(profile_has_v2_policy=False)
 
         # Step 1: Wait for shell prompt to appear in the tmux window
         # This ensures the terminal is ready before we send commands
@@ -411,6 +419,10 @@ class KiroCliProvider(BaseProvider):
         which is why kiro never reached IDLE and init timed out. The shared
         BaseProvider helper consults the backend and disambiguates herdr's
         ambiguous "idle" via _task_dispatched (set by mark_input_received).
+
+        F107 B3: engine-branched. v2 path is unchanged; KAS uses a dedicated
+        seat with best-effort v3 guesses until G7 live sampling (E1) pins
+        the final chrome strings.
         """
         native = self._resolve_native_status(output)
         if native is not None:
@@ -422,6 +434,41 @@ class KiroCliProvider(BaseProvider):
         if not output:
             return TerminalStatus.UNKNOWN
 
+        if self._engine == KiroEngine.KAS:
+            return self._get_status_kas(output)
+        return self._get_status_v2(output)
+
+    def _get_status_kas(self, output: str) -> TerminalStatus:
+        """F107 B3 KAS (--v3) classifier seat.
+
+        Best-effort provisional chrome until G7 live sampling (E1) pins the
+        final strings. Known/guessed KAS markers are checked first; anything
+        unmatched falls through to the v2 classifier as a provisional baseline
+        (v3 agent configs are backward-compatible; chrome may still diverge).
+        """
+        # Best-effort v3 guesses (provisional — G7 E1 replaces/extends these):
+        # - "Thinking..." already covered by TUI_PROCESSING_PATTERN in the v2 body
+        # - possible alternate working chrome observed on early KAS builds
+        clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+        kas_working = re.search(
+            r"Working on (?:your |the )?request|Agent is thinking|Generating response",
+            clean_output,
+            re.IGNORECASE,
+        )
+        if kas_working:
+            # Only park as PROCESSING when no idle chrome follows the marker
+            # (same ghost-text discipline as the v2 working check).
+            after = clean_output[kas_working.end() :]
+            if not (
+                re.search(self._idle_prompt_pattern, after)
+                or re.search(NEW_TUI_IDLE_PATTERN, after)
+            ):
+                return TerminalStatus.PROCESSING
+        # Provisional baseline: reuse v2 classification for shared chrome.
+        return self._get_status_v2(output)
+
+    def _get_status_v2(self, output: str) -> TerminalStatus:
+        """v2 / legacy-UI status classifier (byte-identical pre-F107 behavior)."""
         # Strip ONLY SGR colour codes for pattern matching. Carriage returns and
         # cursor-movement sequences are intentionally preserved: the permission
         # check below counts idle prompts per "\n"-delimited line and relies on

@@ -16,7 +16,6 @@ import pytest
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.services.agent_step import (
     StepCancelledError,
     StepExecutionError,
@@ -296,7 +295,8 @@ class TestHappyPath:
             "reuse99", "x", orchestration_type=OrchestrationType.HANDOFF
         )
 
-    def test_reuse_conflicting_kas_uses_phase0_guard_before_send(self):
+    def test_reuse_conflicting_kas_uses_engine_mismatch_before_send(self):
+        """A7 flip: KAS is allowed; engine mismatch still fails closed."""
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
         with (
             create as m_create,
@@ -310,7 +310,7 @@ class TestHappyPath:
                 f"{_MODULE}.terminal_service.get_terminal_metadata",
                 return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
             ),
-            pytest.raises(KiroPhase0KASError, match="Phase 0"),
+            pytest.raises(ValueError, match="engine mismatch"),
         ):
             asyncio.run(
                 run_agent_step(

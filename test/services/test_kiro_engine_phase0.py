@@ -12,7 +12,6 @@ from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
     KiroCapabilityError,
-    KiroPhase0KASError,
     probe_kiro_capabilities,
 )
 from cli_agent_orchestrator.services.agent_step import run_agent_step
@@ -31,13 +30,19 @@ async def test_capability_probe_does_not_block_event_loop():
     def blocking_probe(engine: KiroEngine, requested: set[str]) -> KiroCapabilities:
         probe_started.set()
         assert release_probe.wait(timeout=2)
-        return KiroCapabilities(version="3.0.0", flags=frozenset({"--v3", "--agent"}))
+        return KiroCapabilities(
+            version="3.0.0", flags=frozenset({"--v3", "--agent", "--trust-all-tools"})
+        )
 
     async def heartbeat() -> None:
         nonlocal heartbeat_ticks
         while not release_probe.is_set():
             heartbeat_ticks += 1
             await asyncio.sleep(0)
+
+    provider = MagicMock()
+    provider.initialize = AsyncMock(return_value=True)
+    provider.shell_baseline = None
 
     with (
         patch(
@@ -50,9 +55,16 @@ async def test_capability_probe_does_not_block_event_loop():
         ),
         patch(f"{_MODULE}.get_backend") as backend,
         patch(f"{_MODULE}.db_create_terminal") as db_create,
-        patch(f"{_MODULE}.fifo_manager") as fifo,
+        patch(f"{_MODULE}.fifo_manager"),
         patch(f"{_MODULE}.provider_manager") as providers,
+        patch(f"{_MODULE}.generate_terminal_id", return_value="testkas1"),
+        patch(f"{_MODULE}.generate_session_name", return_value="session"),
+        patch(f"{_MODULE}.generate_window_name", return_value="kas-window"),
+        patch(f"{_MODULE}.get_herdr_inbox_service", return_value=None),
     ):
+        backend.return_value.session_exists.return_value = False
+        backend.return_value.supports_event_inbox.return_value = True
+        providers.create_provider.return_value = provider
         create_task = asyncio.create_task(
             create_terminal(
                 provider="kiro_cli",
@@ -68,53 +80,62 @@ async def test_capability_probe_does_not_block_event_loop():
         ticks_while_blocked = heartbeat_ticks
         release_probe.set()
 
-        with pytest.raises(KiroPhase0KASError):
-            await create_task
+        terminal = await create_task
         await heartbeat_task
 
     assert ticks_while_blocked > 0
-    backend.return_value.create_session.assert_not_called()
-    backend.return_value.create_window.assert_not_called()
-    db_create.assert_not_called()
-    fifo.create_reader.assert_not_called()
-    providers.create_provider.assert_not_called()
+    assert terminal.engine == KiroEngine.KAS
+    backend.return_value.create_session.assert_called_once()
+    db_create.assert_called_once()
+    providers.create_provider.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_kas_probes_then_rejects_before_backend_or_persistence_allocation():
-    """KAS Phase 0 rejection happens before every terminal lifecycle side effect."""
+async def test_kas_probes_then_proceeds_to_backend_and_persistence_allocation():
+    """KAS is enabled: probe then allocate backend/provider/DB like v2."""
     probe = Mock(
-        return_value=KiroCapabilities(version="2.13.0", flags=frozenset({"--v3", "--agent"}))
+        return_value=KiroCapabilities(
+            version="2.13.0", flags=frozenset({"--v3", "--agent", "--trust-all-tools"})
+        )
     )
     profile = AgentProfile(
         name="kas-profile",
         description="KAS profile",
         engine=KiroEngine.KAS,
         allowedTools=["fs_read"],
-        toolsSettings={"cao-mcp-server": {"enabled": True}},
     )
+    provider = MagicMock()
+    provider.initialize = AsyncMock(return_value=True)
+    provider.shell_baseline = None
 
     with (
         patch(f"{_MODULE}.load_agent_profile", return_value=profile),
         patch(f"{_MODULE}.get_backend") as backend,
         patch(f"{_MODULE}.db_create_terminal") as db_create,
-        patch(f"{_MODULE}.fifo_manager") as fifo,
+        patch(f"{_MODULE}.fifo_manager"),
         patch(f"{_MODULE}.provider_manager") as providers,
+        patch(f"{_MODULE}.generate_terminal_id", return_value="testkas2"),
+        patch(f"{_MODULE}.generate_session_name", return_value="session"),
+        patch(f"{_MODULE}.generate_window_name", return_value="kas-window"),
+        patch(f"{_MODULE}.get_herdr_inbox_service", return_value=None),
     ):
-        with pytest.raises(KiroPhase0KASError, match="Cedar"):
-            await create_terminal(
-                provider="kiro_cli",
-                agent_profile="kas-profile",
-                new_session=True,
-                kiro_capability_probe=probe,
-            )
+        backend.return_value.session_exists.return_value = False
+        backend.return_value.supports_event_inbox.return_value = True
+        providers.create_provider.return_value = provider
+        terminal = await create_terminal(
+            provider="kiro_cli",
+            agent_profile="kas-profile",
+            new_session=True,
+            kiro_capability_probe=probe,
+        )
 
-    probe.assert_called_once_with(KiroEngine.KAS, {"profile"})
-    backend.return_value.create_session.assert_not_called()
-    backend.return_value.create_window.assert_not_called()
-    db_create.assert_not_called()
-    fifo.create_reader.assert_not_called()
-    providers.create_provider.assert_not_called()
+    assert terminal.engine == KiroEngine.KAS
+    probe.assert_called_once_with(KiroEngine.KAS, {"profile", "trust"})
+    backend.return_value.create_session.assert_called_once()
+    db_create.assert_called_once()
+    assert db_create.call_args.kwargs["engine"] == "kas"
+    assert providers.create_provider.call_args.kwargs["engine"] == KiroEngine.KAS
+    provider.initialize.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -230,6 +251,63 @@ async def test_explicit_model_override_is_probed_even_when_profile_has_none():
 
     assert "model" in probe.call_args.args[1]
     assert providers.create_provider.call_args.kwargs["model"] == "claude-sonnet-5"
+
+
+@pytest.mark.asyncio
+async def test_toml_only_model_missing_flag_rejects_before_allocation():
+    """F107 B2 r1 B1: toml-only model must reach the probe and refuse before allocate.
+
+    A providers.toml ``model = "auto"`` with no spawn override and no profile
+    model must request the model capability; a wrapper lacking ``--model``
+    fails closed with zero backend/DB/provider allocation.
+    """
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if command[-1] == "--version":
+            return subprocess.CompletedProcess(command, 0, stdout="kiro-cli version 2.13.0", stderr="")
+        # Advertise agent/trust/ui but NOT --model.
+        output = (
+            "--agent-engine v2|v1|v3\n--v3\n--agent NAME\n"
+            "--legacy-ui\n--trust-all-tools\n"
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+
+    def probe(engine: KiroEngine, requested: set[str]) -> KiroCapabilities:
+        return probe_kiro_capabilities(engine, requested, runner=runner)
+
+    with (
+        patch(
+            f"{_MODULE}.load_agent_profile",
+            return_value=AgentProfile(name="developer", description="Developer"),
+        ),
+        patch(
+            f"{_MODULE}.get_provider_defaults",
+            return_value={"model": "auto"},
+        ),
+        patch(
+            f"{_MODULE}.get_provider_profile_defaults",
+            return_value={},
+        ),
+        patch(f"{_MODULE}.get_backend") as backend,
+        patch(f"{_MODULE}.db_create_terminal") as db_create,
+        patch(f"{_MODULE}.fifo_manager") as fifo,
+        patch(f"{_MODULE}.provider_manager") as providers,
+    ):
+        with pytest.raises(KiroCapabilityError, match="--model") as exc_info:
+            await create_terminal(
+                provider="kiro_cli",
+                agent_profile="developer",
+                new_session=True,
+                kiro_capability_probe=probe,
+            )
+
+    assert exc_info.value.capability == "--model"
+    assert "model" in (exc_info.value.capability or "")
+    backend.return_value.create_session.assert_not_called()
+    backend.return_value.create_window.assert_not_called()
+    db_create.assert_not_called()
+    fifo.create_reader.assert_not_called()
+    providers.create_provider.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -415,7 +493,8 @@ async def test_v2_agent_engine_value_exclusion_rejects_before_allocation():
     providers.create_provider.assert_not_called()
 
 
-def test_send_input_rejects_persisted_kas_before_provider_or_pane_access():
+def test_send_input_allows_persisted_kas_to_reach_provider():
+    """A5 flip: persisted KAS terminals reach get_provider / paste path."""
     metadata = {
         "id": "persisted-kas",
         "provider": "kiro_cli",
@@ -423,23 +502,36 @@ def test_send_input_rejects_persisted_kas_before_provider_or_pane_access():
         "tmux_session": "cao-session",
         "tmux_window": "developer-window",
     }
+    provider = MagicMock()
+    provider.paste_enter_count = 1
+    provider.composer_stash_keys = None
+    provider.blocks_orchestrated_input_while_waiting_user_answer = False
 
     with (
         patch(f"{_MODULE}.get_terminal_metadata", return_value=metadata),
         patch(f"{_MODULE}.provider_manager") as providers,
         patch(f"{_MODULE}.get_backend") as backend,
+        patch(f"{_MODULE}.status_monitor") as status_monitor,
+        patch(f"{_MODULE}.inject_memory_context", side_effect=lambda m, _t: m),
+        patch(f"{_MODULE}.preserve_draft_before_send", return_value=None),
+        patch(f"{_MODULE}._append_message_contract", side_effect=lambda m, *_a, **_k: m),
     ):
-        with pytest.raises(KiroPhase0KASError, match="Cedar"):
-            from cli_agent_orchestrator.services.terminal_service import send_input
+        providers.get_provider.return_value = provider
+        status_monitor.get_status.return_value = MagicMock()
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
 
-            send_input("persisted-kas", "must not be delivered")
+        status_monitor.get_status.return_value = TerminalStatus.IDLE
+        from cli_agent_orchestrator.services.terminal_service import send_input
 
-    providers.get_provider.assert_not_called()
-    backend.return_value.send_keys.assert_not_called()
+        send_input("persisted-kas", "hello kas")
+
+    providers.get_provider.assert_called_once_with("persisted-kas")
+    backend.return_value.send_keys.assert_called()
 
 
 @pytest.mark.asyncio
-async def test_agent_step_reuse_rejects_persisted_kas_before_pane_write():
+async def test_agent_step_reuse_allows_persisted_kas_to_reach_send():
+    """A5/A7 flip: reusing a KAS terminal reaches the send path (no Phase-0 guard)."""
     metadata = {
         "id": "persisted-kas",
         "provider": "kiro_cli",
@@ -450,16 +542,44 @@ async def test_agent_step_reuse_rejects_persisted_kas_before_pane_write():
 
     with (
         patch(f"{_MODULE}.get_terminal_metadata", return_value=metadata),
+        patch(
+            "cli_agent_orchestrator.services.agent_step.terminal_service.get_terminal_metadata",
+            return_value=metadata,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.agent_step.terminal_service.send_input",
+            return_value=True,
+        ) as send,
+        patch(
+            "cli_agent_orchestrator.services.agent_step.wait_until_status",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.agent_step._wait_for_completion",
+            new_callable=AsyncMock,
+        ) as wait_done,
+        patch(
+            "cli_agent_orchestrator.services.agent_step.terminal_service.get_output",
+            return_value="done",
+        ),
         patch(f"{_MODULE}.provider_manager") as providers,
         patch(f"{_MODULE}.get_backend") as backend,
     ):
-        with pytest.raises(KiroPhase0KASError, match="Cedar"):
-            await run_agent_step(
-                provider="kiro_cli",
-                agent="developer",
-                prompt="must not be delivered",
-                reuse_terminal_id="persisted-kas",
-            )
+        from cli_agent_orchestrator.services.agent_step import _CompletionOutcome
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
 
-    providers.get_provider.assert_not_called()
+        wait_done.return_value = _CompletionOutcome.COMPLETED
+        # ready wait uses status_monitor via wait_until_status mock above
+        result = await run_agent_step(
+            provider="kiro_cli",
+            agent="developer",
+            prompt="deliver to kas",
+            reuse_terminal_id="persisted-kas",
+            teardown=False,
+        )
+
+    assert result.terminal_id == "persisted-kas"
+    send.assert_called_once()
+    # send_input is mocked at agent_step layer — pane keys not touched here
     backend.return_value.send_keys.assert_not_called()

@@ -728,15 +728,16 @@ class TestTerminalCreationWithWorkingDirectory:
             assert response.status_code == 400
             mock_svc.create_terminal.assert_not_called()
 
-    def test_create_terminal_kas_refusal_maps_to_400_not_404(self, client):
-        """A KAS refusal is a bad request, not a missing resource.
+    def test_create_terminal_capability_refusal_maps_to_400_not_404(self, client):
+        """A Kiro capability refusal is a bad request, not a missing resource.
 
-        KiroPhase0KASError subclasses ValueError, and this endpoint's generic
+        KiroCapabilityError subclasses ValueError, and this endpoint's generic
         ValueError arm means "session/window not found" -- so without a narrower
-        arm ordered first, an engine rejection reports 404. POST /sessions
+        arm ordered first, a capability rejection reports 404. POST /sessions
         already returns 400 for the identical failure.
         """
-        from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
+        from cli_agent_orchestrator.models.kiro_engine import KiroEngine
+        from cli_agent_orchestrator.providers.kiro_capabilities import KiroCapabilityError
 
         with (
             patch(
@@ -746,7 +747,12 @@ class TestTerminalCreationWithWorkingDirectory:
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
         ):
             mock_svc.create_terminal = AsyncMock(
-                side_effect=KiroPhase0KASError(profile_has_v2_policy=False)
+                side_effect=KiroCapabilityError(
+                    "unsupported_capability",
+                    KiroEngine.KAS,
+                    "Kiro engine 'kas' requires wrapper flag '--v3'",
+                    capability="--v3",
+                )
             )
 
             response = client.post(

@@ -100,23 +100,6 @@ class KiroCapabilityError(ValueError):
         self.version = version
 
 
-class KiroPhase0KASError(ValueError):
-    """Raised after KAS capability probing, before runtime allocation."""
-
-    def __init__(self, profile_has_v2_policy: bool) -> None:
-        profile_note = (
-            " The selected profile contains v2 allowedTools/toolsSettings that "
-            "cannot be translated to Cedar in Phase 0."
-            if profile_has_v2_policy
-            else ""
-        )
-        super().__init__(
-            "Kiro engine 'kas' is not available in Phase 0: KAS profiles and Cedar "
-            "policy translation are not implemented. Retry with engine 'v2'." + profile_note
-        )
-        self.engine = KiroEngine.KAS
-
-
 @dataclass(frozen=True)
 class KiroCapabilities:
     """Wrapper capabilities discovered for one creation attempt."""
@@ -402,7 +385,9 @@ def build_kiro_command(
 ) -> list[str]:
     """Build a deterministic Kiro command without executing it."""
     if engine == KiroEngine.KAS:
-        command = ["kiro-cli", "--v3", "chat"]
+        # F107 B1: KAS honors --trust-all-tools as a session-scope override
+        # (v3 permissions doc; CI path). Always append for autonomous workers.
+        command = ["kiro-cli", "--v3", "chat", "--trust-all-tools"]
     else:
         command = ["kiro-cli", "chat", "--agent-engine", KiroEngine.V2.value]
         if legacy_ui:
@@ -422,7 +407,10 @@ def requested_kiro_capabilities(
     requested = {"profile"}
     if model:
         requested.add("model")
-    if engine == KiroEngine.V2:
+    if engine == KiroEngine.KAS:
+        # F107 B1: KAS launch always passes --trust-all-tools.
+        requested.add("trust")
+    elif engine == KiroEngine.V2:
         # Non-yolo launches may retry with --legacy-ui after a TUI startup
         # timeout, so this flag must be verified before any allocation.
         requested.add("ui")

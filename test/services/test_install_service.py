@@ -300,9 +300,10 @@ class TestInstallAgent:
         # persisted=True prefers the stable PATH launcher.
         assert entry["command"] == "/home/u/.local/bin/cao-mcp-server"
 
-    def test_install_rejects_kas_profile_before_writing_kiro_config(
+    def test_install_allows_kas_profile_without_v2_only_fields(
         self, install_paths: dict[str, Path]
     ) -> None:
+        """A8 flip: KAS profiles install when toolsSettings/hooks are absent."""
         profile_path = install_paths["local_store_dir"] / "kas-agent.md"
         profile_path.write_text(
             "---\n"
@@ -317,9 +318,32 @@ class TestInstallAgent:
 
         result = install_agent("kas-agent", "kiro_cli")
 
+        assert result.success is True
+        assert (install_paths["kiro_dir"] / "kas-agent.json").exists()
+
+    def test_install_rejects_kas_profile_with_v2_only_fields(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """A8: toolsSettings/hooks remain forbidden on KAS profiles."""
+        profile_path = install_paths["local_store_dir"] / "kas-hooks.md"
+        profile_path.write_text(
+            "---\n"
+            "name: kas-hooks\n"
+            "description: KAS with hooks\n"
+            "engine: kas\n"
+            "hooks:\n"
+            "  agentSpawn:\n"
+            "    - command: echo hi\n"
+            "---\n"
+            "KAS profile with v2-only hooks.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("kas-hooks", "kiro_cli")
+
         assert result.success is False
-        assert "Cedar" in result.message
-        assert not (install_paths["kiro_dir"] / "kas-agent.json").exists()
+        assert "toolsSettings" in result.message or "hooks" in result.message
+        assert not (install_paths["kiro_dir"] / "kas-hooks.json").exists()
 
     def test_install_sets_env_vars_before_profile_loading(
         self, install_paths: dict[str, Path]
