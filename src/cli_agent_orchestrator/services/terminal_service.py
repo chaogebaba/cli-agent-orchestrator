@@ -98,6 +98,11 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     probe_kiro_capabilities,
     requested_kiro_capabilities,
 )
+from cli_agent_orchestrator.services.settings_service import (
+    get_provider_defaults,
+    get_provider_profile_defaults,
+    resolve_provider_string_option,
+)
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.fork_context_service import snapshot as fork_snapshot
 from cli_agent_orchestrator.services.fork_context_service import staleness as fork_staleness
@@ -866,12 +871,31 @@ async def create_terminal(
             # Kiro runs headlessly, so current CAO behavior always bypasses its
             # interactive approval prompt. Profile/MCP policy remains enforced
             # by CAO, while unrestricted profiles additionally force legacy UI.
-            # Mirror the launch-time precedence (`model or profile.model`, see
-            # _get_profile_model): probing the profile snapshot alone would let an
-            # explicit override launch --model on a wrapper never probed for it.
+            # F107 B2 (build-gate r1 B1): resolve the effective model ONCE via
+            # the same seam as launch (spawn override > providers.toml >
+            # profile field) BEFORE the pre-allocation probe, and pass that
+            # value to BOTH requested_kiro_capabilities and create_provider.
+            # Probing only `model or profile.model` would let a toml-only
+            # model = "auto" allocate then fail at argv construction.
+            if model:
+                resolved_model = model
+            else:
+                provider_defaults = get_provider_defaults("kiro_cli")
+                profile_name = getattr(profile, "name", None) or agent_profile
+                profile_defaults = get_provider_profile_defaults(
+                    provider_defaults, profile_name
+                )
+                resolved_model = resolve_provider_string_option(
+                    profile_defaults,
+                    provider_defaults,
+                    profile,
+                    "model",
+                    "model",
+                )
+            model = resolved_model
             requested = requested_kiro_capabilities(
                 resolved_engine,
-                model=model or (profile.model if profile else None),
+                model=model,
                 yolo=True,
             )
             probe = kiro_capability_probe or probe_kiro_capabilities

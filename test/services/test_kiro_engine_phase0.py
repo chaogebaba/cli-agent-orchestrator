@@ -254,6 +254,63 @@ async def test_explicit_model_override_is_probed_even_when_profile_has_none():
 
 
 @pytest.mark.asyncio
+async def test_toml_only_model_missing_flag_rejects_before_allocation():
+    """F107 B2 r1 B1: toml-only model must reach the probe and refuse before allocate.
+
+    A providers.toml ``model = "auto"`` with no spawn override and no profile
+    model must request the model capability; a wrapper lacking ``--model``
+    fails closed with zero backend/DB/provider allocation.
+    """
+
+    def runner(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if command[-1] == "--version":
+            return subprocess.CompletedProcess(command, 0, stdout="kiro-cli version 2.13.0", stderr="")
+        # Advertise agent/trust/ui but NOT --model.
+        output = (
+            "--agent-engine v2|v1|v3\n--v3\n--agent NAME\n"
+            "--legacy-ui\n--trust-all-tools\n"
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+
+    def probe(engine: KiroEngine, requested: set[str]) -> KiroCapabilities:
+        return probe_kiro_capabilities(engine, requested, runner=runner)
+
+    with (
+        patch(
+            f"{_MODULE}.load_agent_profile",
+            return_value=AgentProfile(name="developer", description="Developer"),
+        ),
+        patch(
+            f"{_MODULE}.get_provider_defaults",
+            return_value={"model": "auto"},
+        ),
+        patch(
+            f"{_MODULE}.get_provider_profile_defaults",
+            return_value={},
+        ),
+        patch(f"{_MODULE}.get_backend") as backend,
+        patch(f"{_MODULE}.db_create_terminal") as db_create,
+        patch(f"{_MODULE}.fifo_manager") as fifo,
+        patch(f"{_MODULE}.provider_manager") as providers,
+    ):
+        with pytest.raises(KiroCapabilityError, match="--model") as exc_info:
+            await create_terminal(
+                provider="kiro_cli",
+                agent_profile="developer",
+                new_session=True,
+                kiro_capability_probe=probe,
+            )
+
+    assert exc_info.value.capability == "--model"
+    assert "model" in (exc_info.value.capability or "")
+    backend.return_value.create_session.assert_not_called()
+    backend.return_value.create_window.assert_not_called()
+    db_create.assert_not_called()
+    fifo.create_reader.assert_not_called()
+    providers.create_provider.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_non_yolo_v2_missing_legacy_ui_rejects_before_allocation():
     """The optional fallback flag is probed before any v2 lifecycle allocation."""
 

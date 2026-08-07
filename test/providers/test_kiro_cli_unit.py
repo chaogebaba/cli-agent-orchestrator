@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 
@@ -1957,3 +1958,49 @@ class TestKiroCli211Regressions:
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         provider.mark_input_received()
         assert provider.get_status(output) != TerminalStatus.COMPLETED
+
+
+class TestKiroKasStatusClassifier:
+    """F107 B3 / build-gate r1 S2: focused KAS get_status branch coverage."""
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_kas_classifier_working_marker_is_processing(self, mock_tmux):
+        """KAS-only working chrome parks as PROCESSING (provisional B3 seat)."""
+        provider = KiroCliProvider(
+            "test1234",
+            "test-session",
+            "window-0",
+            "developer",
+            engine=KiroEngine.KAS,
+        )
+        status = provider.get_status("Working on your request...\n")
+        assert status == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_kas_classifier_idle_after_working_marker_is_ghost_text(self, mock_tmux):
+        """Idle chrome after a KAS working marker must not stay PROCESSING."""
+        provider = KiroCliProvider(
+            "test1234",
+            "test-session",
+            "window-0",
+            "developer",
+            engine=KiroEngine.KAS,
+        )
+        output = "Working on your request...\n[developer] > "
+        status = provider.get_status(output)
+        assert status != TerminalStatus.PROCESSING
+        assert status == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_kas_classifier_falls_back_to_v2_processing_patterns(self, mock_tmux):
+        """Unmatched KAS chrome falls through to the v2 classifier body."""
+        provider = KiroCliProvider(
+            "test1234",
+            "test-session",
+            "window-0",
+            "developer",
+            engine=KiroEngine.KAS,
+        )
+        # v2 TUI_PROCESSING_PATTERN ("Kiro is working") with no idle after.
+        status = provider.get_status("Kiro is working\n")
+        assert status == TerminalStatus.PROCESSING
