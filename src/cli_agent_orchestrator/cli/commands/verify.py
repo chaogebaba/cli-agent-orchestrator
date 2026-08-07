@@ -29,7 +29,10 @@ def verify() -> None:
 
 
 def _loopback_endpoint(value: str) -> str:
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise click.BadParameter("must be a loopback http origin") from exc
     if (
         parsed.scheme != "http"
         or not parsed.hostname

@@ -224,9 +224,11 @@ def test_ac6_healthy_multiplicity_and_parent_classification(tmp_path: Path) -> N
         panes={("s", "w"): PaneIdentityReadResult(identity="same1111")},
     )
     assert [row["verdict"] for row in result["rows"]] == ["OK", "OK"]
-    assert [(row["parent_pid"], row["parent_kind"]) for row in result["rows"]] == [
-        (101, "claude"),
-        (102, "bg-spare"),
+    assert [
+        (row["parent_pid"], row["parent_cmd"], row["parent_kind"]) for row in result["rows"]
+    ] == [
+        (101, "claude --flag", "claude"),
+        (102, "claude bg-spare --flag", "bg-spare"),
     ]
 
 
@@ -236,18 +238,21 @@ def test_ac6_default_parent_seam_distinguishes_carrier_and_parent_loss(
     db = _database(tmp_path, ("same1111", "s", "w", "worker"))
     monkeypatch.setattr(identity_service, "_read_carrier_status", lambda pid: 900 + pid)
 
+    def scan() -> dict[str, Any]:
+        return scan_identity(
+            endpoint=PRODUCTION,
+            db_path=db,
+            processes=[_carrier(1)],
+            process_environ_reader={1: _env("same1111")}.__getitem__,
+            window_reader=lambda session, window: (session, window) == ("s", "w"),
+            pane_reader=lambda _session, _window: PaneIdentityReadResult(identity="same1111"),
+        )
+
     def parent_gone(_ppid: int) -> str:
         raise FileNotFoundError
 
     monkeypatch.setattr(identity_service, "_read_parent_cmdline", parent_gone)
-    parent_loss = _scan(
-        db,
-        [_carrier(1)],
-        {1: _env("same1111")},
-        parent_reader=identity_service.read_parent,
-        windows={("s", "w"): True},
-        panes={("s", "w"): PaneIdentityReadResult(identity="same1111")},
-    )
+    parent_loss = scan()
     assert parent_loss["vanished_pids"] == []
     assert parent_loss["rows"][0]["parent_pid"] is None
     assert parent_loss["rows"][0]["parent_kind"] == "other"
@@ -256,14 +261,86 @@ def test_ac6_default_parent_seam_distinguishes_carrier_and_parent_loss(
         raise FileNotFoundError
 
     monkeypatch.setattr(identity_service, "_read_carrier_status", carrier_gone)
-    carrier_loss = _scan(
+    carrier_loss = scan()
+    assert carrier_loss["vanished_pids"] == [1]
+    assert carrier_loss["rows"] == []
+
+
+def test_parent_kind_uses_full_cmdline_before_stored_value_is_truncated(tmp_path: Path) -> None:
+    db = _database(tmp_path, ("same1111", "s", "w", "worker"))
+    full_cmdline = f"{'x' * 201} bg-spare --flag"
+    result = _scan(
         db,
         [_carrier(1)],
         {1: _env("same1111")},
-        parent_reader=identity_service.read_parent,
+        parents={1: (101, full_cmdline)},
+        windows={("s", "w"): True},
+        panes={("s", "w"): PaneIdentityReadResult(identity="same1111")},
     )
-    assert carrier_loss["vanished_pids"] == [1]
-    assert carrier_loss["rows"] == []
+    row = result["rows"][0]
+    assert row["parent_kind"] == "bg-spare"
+    assert row["parent_cmd"] == "x" * 200
+
+
+def test_live_processes_keeps_exact_comm_carrier_with_non_utf8_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ProcFile:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def read_text(self, *, encoding: str) -> str:
+            assert (self.name, encoding) == ("comm", "utf-8")
+            return "cao-mcp-server\n"
+
+        def read_bytes(self) -> bytes:
+            assert self.name == "cmdline"
+            return b"python\0\xff\0"
+
+    class ProcEntry:
+        name = "123"
+
+        def __truediv__(self, name: str) -> ProcFile:
+            return ProcFile(name)
+
+    class ProcRoot:
+        def iterdir(self) -> list[ProcEntry]:
+            return [ProcEntry()]
+
+    def fake_path(value: str) -> ProcRoot | ProcFile:
+        if value == "/proc":
+            return ProcRoot()
+        assert value == "/proc/123/cmdline"
+        return ProcFile("cmdline")
+
+    monkeypatch.setattr(identity_service, "Path", fake_path)
+    processes = identity_service._live_processes()
+    assert processes == [ProcSnapshot(123, "cao-mcp-server", ["python", "\ufffd"])]
+    assert identity_service._is_carrier(processes[0])
+
+
+def test_non_utf8_parent_cmdline_becomes_unknown_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = _database(tmp_path, ("same1111", "s", "w", "worker"))
+    monkeypatch.setattr(identity_service, "_read_carrier_status", lambda _pid: 901)
+
+    def non_utf8_parent(_ppid: int) -> str:
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(identity_service, "_read_parent_cmdline", non_utf8_parent)
+    result = scan_identity(
+        endpoint=PRODUCTION,
+        db_path=db,
+        processes=[_carrier(1)],
+        process_environ_reader={1: _env("same1111")}.__getitem__,
+        window_reader=lambda session, window: (session, window) == ("s", "w"),
+        pane_reader=lambda _session, _window: PaneIdentityReadResult(identity="same1111"),
+    )
+    assert result["vanished_pids"] == []
+    assert result["rows"][0]["parent_pid"] is None
+    assert result["rows"][0]["parent_cmd"] == ""
+    assert result["rows"][0]["parent_kind"] == "other"
 
 
 def test_ac7_process_count_and_mcp_json_residue_never_fail(
@@ -601,6 +678,17 @@ def test_ac12_default_host_and_cli_validators(
         relative = runner.invoke(cli, ["verify", "identity", "--db", relative_path.name])
     assert remote.exit_code == 2
     assert relative.exit_code == 2
+
+
+def test_malformed_endpoint_url_exits_two(tmp_path: Path) -> None:
+    db = _database(tmp_path)
+    result = CliRunner().invoke(
+        cli,
+        ["verify", "identity", "--endpoint", "http://[::1", "--db", str(db)],
+    )
+    assert result.exit_code == 2
+    assert isinstance(result.exception, SystemExit)
+    assert "Invalid value" in result.output
 
 
 def test_ac12_human_output_carries_pane_reason(

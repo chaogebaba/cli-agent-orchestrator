@@ -38,7 +38,7 @@ class ProcSnapshot:
 
 def _read_argv(pid: int) -> list[str]:
     raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    return [item.decode("utf-8") for item in raw.split(b"\0") if item]
+    return [item.decode("utf-8", errors="replace") for item in raw.split(b"\0") if item]
 
 
 def _live_processes() -> list[ProcSnapshot]:
@@ -109,7 +109,7 @@ def read_parent(pid: int) -> tuple[int | None, str]:
         return None, ""
     try:
         return ppid, _read_parent_cmdline(ppid)
-    except (FileNotFoundError, ProcessLookupError):
+    except (FileNotFoundError, ProcessLookupError, UnicodeDecodeError):
         return None, ""
 
 
@@ -218,6 +218,7 @@ def scan_identity(
         except (FileNotFoundError, ProcessLookupError):
             vanished_pids.append(process.pid)
             continue
+        parent_kind = _parent_kind(parent_cmd)
         parent_cmd = parent_cmd[:200]
         mcp_tid = environ.get("CAO_TERMINAL_ID") or None
 
@@ -271,7 +272,7 @@ def scan_identity(
                 "endpoint_source": endpoint_source,
                 "parent_pid": parent_pid,
                 "parent_cmd": parent_cmd,
-                "parent_kind": _parent_kind(parent_cmd),
+                "parent_kind": parent_kind,
                 "tid_in_db": tid_in_db,
                 "db": db_row,
                 "window_live": is_window_live,
