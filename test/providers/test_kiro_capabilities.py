@@ -369,6 +369,7 @@ def test_builds_explicit_v2_and_deterministic_kas_commands():
         "kiro-cli",
         "--v3",
         "chat",
+        "--trust-all-tools",
         "--agent",
         "developer",
     ]

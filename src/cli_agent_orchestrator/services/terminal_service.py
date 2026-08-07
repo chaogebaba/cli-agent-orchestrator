@@ -95,7 +95,6 @@ from cli_agent_orchestrator.services.draft_guard import (
 )
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
-    KiroPhase0KASError,
     probe_kiro_capabilities,
     requested_kiro_capabilities,
 )
@@ -839,8 +838,9 @@ async def create_terminal(
     db_created = False
     try:
         # Resolve profile policy and Kiro engine BEFORE allocating any backend
-        # resource. A KAS request must probe then fail closed with no window,
-        # database row, FIFO, Herdr registration, or provider process.
+        # resource. Capability probe runs first so a missing wrapper flag fails
+        # closed with no window, database row, FIFO, Herdr registration, or
+        # provider process (F107: KAS is enabled once the probe accepts it).
         try:
             profile = load_agent_profile(agent_profile)
         except FileNotFoundError:
@@ -876,10 +876,6 @@ async def create_terminal(
             )
             probe = kiro_capability_probe or probe_kiro_capabilities
             await asyncio.to_thread(probe, resolved_engine, requested)
-            if resolved_engine == KiroEngine.KAS:
-                raise KiroPhase0KASError(
-                    bool(profile and (profile.allowedTools or profile.toolsSettings))
-                )
         else:
             if engine is not None:
                 raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
@@ -3114,12 +3110,6 @@ def send_input(
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
-
-        if (
-            metadata.get("provider") == ProviderType.KIRO_CLI.value
-            and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.KAS
-        ):
-            raise KiroPhase0KASError(profile_has_v2_policy=False)
 
         provider = provider_manager.get_provider(terminal_id)
         orchestration_value = (

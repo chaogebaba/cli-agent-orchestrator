@@ -9,7 +9,8 @@ from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
+from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.manager import ProviderManager
 
 
@@ -286,28 +287,25 @@ def test_get_provider_marks_kiro_initialized_on_restore():
     assert provider._initialized is True
 
 
-def test_get_provider_rejects_persisted_kas_before_provider_construction():
-    """A persisted KAS terminal is never restored as a runnable provider."""
+def test_get_provider_restores_persisted_kas_from_metadata():
+    """A3 flip: persisted KAS terminals restore via create_provider(engine=KAS)."""
     manager = ProviderManager()
 
-    with (
-        patch(
-            "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
-            return_value={
-                "provider": ProviderType.KIRO_CLI.value,
-                "tmux_session": "s1",
-                "tmux_window": "w1",
-                "agent_profile": "developer",
-                "engine": "kas",
-            },
-        ),
-        patch("cli_agent_orchestrator.providers.manager.KiroCliProvider") as provider_class,
+    with patch(
+        "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+        return_value={
+            "provider": ProviderType.KIRO_CLI.value,
+            "tmux_session": "s1",
+            "tmux_window": "w1",
+            "agent_profile": "developer",
+            "engine": "kas",
+        },
     ):
-        with pytest.raises(KiroPhase0KASError, match="Cedar"):
-            manager.get_provider("t1")
+        provider = manager.get_provider("t1")
 
-    provider_class.assert_not_called()
-    assert "t1" not in manager._providers
+    assert isinstance(provider, KiroCliProvider)
+    assert provider._engine == KiroEngine.KAS
+    assert manager.get_provider("t1") is provider
 
 
 def test_get_provider_no_shell_baseline_when_metadata_missing_shell_command():

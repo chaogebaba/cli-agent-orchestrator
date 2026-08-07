@@ -33,7 +33,6 @@ from cli_agent_orchestrator.models.kiro_engine import KiroEngine, parse_kiro_eng
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.services import receiver_state_view, terminal_service
 from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -180,10 +179,6 @@ async def _validate_reused_terminal(
 
     explicit_engine = parse_kiro_engine(requested_engine)
     assert explicit_engine is not None
-    if explicit_engine == KiroEngine.KAS:
-        # KAS remains unavailable regardless of which engine the terminal
-        # persisted; use the same structured Phase 0 guard as terminal creation.
-        raise KiroPhase0KASError(profile_has_v2_policy=False)
 
     persisted_engine = parse_kiro_engine(metadata.get("engine"))
     if persisted_engine is None:
