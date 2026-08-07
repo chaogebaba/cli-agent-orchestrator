@@ -309,7 +309,7 @@ class _AcceptanceUnit:
 _TOKEN_RE = re.compile(r"§\d+|[\w]+|[^\w\s]", re.UNICODE)
 _LIST_MARKER_RE = re.compile(r"^(?P<indent>[ \t]*)(?P<number>\d+)[.)][ \t]+")
 _P9_CITATION_RE = re.compile(
-    r"`(?P<path>[^`\s]+\.(?:py|md|sh|toml|json|ini|cfg))" r"(?P<location>:\d+(?:-\d+)?)?`"
+    r"`(?P<path>[^`\s]+\.(?:py|md|sh|toml|json|ini|cfg))" r"(?P<location>:\d+(?:-\d+)?)`"
 )
 _P9_NAME_RE = re.compile(r"`(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\(\))?`")
 _P9_SEARCH_EXCLUDES = frozenset(

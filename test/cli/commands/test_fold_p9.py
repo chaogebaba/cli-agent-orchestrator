@@ -45,6 +45,18 @@ def test_p9_doctrine_merge_witness_fires_exactly_one_path_missing(tmp_path: Path
     )
 
 
+def test_p9_bare_path_without_location_is_not_a_citation(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    document = _write(tmp_path / "probe.md", "`missing.py`\n")
+
+    report = _report(document, RepoMapping("repo", repo))
+
+    assert report.population_eligible is False
+    assert report.findings == ()
+    assert report.statuses == ()
+
+
 def test_p9_resolves_direct_package_and_bare_citations(tmp_path: Path) -> None:
     repo = tmp_path / "fork"
     _write(repo / "docs" / "contract.md")
