@@ -225,6 +225,28 @@ def test_p10_non_header_continuation_annotation_does_not_attach(tmp_path: Path) 
     }
 
 
+def test_p10_multiline_if_elif_else_headers_attach_three_of_three(tmp_path: Path) -> None:
+    report = _report(
+        tmp_path,
+        _document(
+            opener="``` # @branches: 3 lang=python",
+            code=(
+                "if first: # @branch:first\n"
+                "    pass\n"
+                "elif (\n"
+                "    second\n"
+                "): # @branch:second\n"
+                "    pass\n"
+                "else: # @branch:otherwise\n"
+                "    pass\n"
+            ),
+            acceptance="| AC1 | branch:first branch:second branch:otherwise |",
+        ),
+    )
+    assert report.findings == ()
+    assert report.statuses == ()
+
+
 def test_p10_tab_indented_nested_else_uses_source_indentation(tmp_path: Path) -> None:
     report = _report(
         tmp_path,
