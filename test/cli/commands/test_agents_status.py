@@ -191,6 +191,17 @@ def test_ac5_rows_render_missing_idx_parent_window_and_warning(monkeypatch):
     assert rows[3][-1] == "⚠"
 
 
+def test_ac4_malformed_terminal_json_names_cao_server(monkeypatch):
+    monkeypatch.setenv("CAO_TERMINAL_ID", "11111111")
+    malformed = _response(None)
+    malformed.json.side_effect = requests.exceptions.JSONDecodeError("bad JSON", "{", 1)
+    with patch.object(agents_command.cao_http, "get", return_value=malformed):
+        result = CliRunner().invoke(cli, ["agents", "status"])
+    assert result.exit_code == 1
+    assert "cao-server" in result.output
+    assert "session_name required outside a CAO terminal" not in result.output
+
+
 def test_ac7_unknown_and_server_down_keep_json_stdout_empty(monkeypatch):
     runner = CliRunner()
     error = requests.HTTPError("404")

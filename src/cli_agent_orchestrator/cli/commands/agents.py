@@ -88,7 +88,7 @@ def _resolution_error(exc: Exception, terminal_id: str | None) -> click.ClickExc
         return click.ClickException(
             f"could not resolve the session for terminal {terminal_id or _MISSING}"
         )
-    if isinstance(exc, ValueError):
+    if isinstance(exc, ValueError) and str(exc) == ("session_name required outside a CAO terminal"):
         return click.ClickException(str(exc))
     return click.ClickException(f"could not connect to cao-server: {exc}")
 
