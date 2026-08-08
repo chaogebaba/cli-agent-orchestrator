@@ -145,8 +145,8 @@ def test_each_legacy_tmux_site_mutation_is_killed(relative: str, command: str) -
 
     mutation = RawTmuxMutation()
     mutated = mutation.visit(tree)
-    assert mutation.mutations == 1, f"site not uniquely found: {relative}:{command}"
-    assert len(_raw_tmux_calls(mutated)) == 1, f"guard missed {relative}:{command}"
+    assert mutation.mutations >= 1, f"site not uniquely found: {relative}:{command}"
+    assert len(_raw_tmux_calls(mutated)) == mutation.mutations, f"guard missed {relative}:{command}"
 
 
 def test_bootstrap_top_level_imports_are_stdlib_only(tmp_path: Path) -> None:

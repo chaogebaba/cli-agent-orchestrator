@@ -86,7 +86,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 98;
+const COMMAND_COUNT: usize = 99;
 
 /// What the TUI does with a command.
 ///
@@ -261,6 +261,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::BarrierStatus,
     CommandId::BaseRegister,
     CommandId::ConfigReconcile,
+    CommandId::Doctor,
     CommandId::Fold,
     CommandId::LedgerCheck,
     CommandId::MailboxDelete,
@@ -287,7 +288,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::VerifySuiteLog,
 ];
 
-/// One variant per leaf command — **all 98**.
+/// One variant per leaf command — **all 99**.
 ///
 /// Why an enum rather than a `String` key is the subject of this module's own docs: it is what
 /// makes an unclassified command a **compile error** instead of a runtime `None` (FR-4.2).
@@ -298,6 +299,8 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CommandId {
     // Top-level leaves.
+    /// `cao doctor`
+    Doctor,
     /// `cao info`
     Info,
     /// `cao init`
@@ -553,6 +556,16 @@ pub enum CommandId {
 fn entry(id: CommandId) -> Command {
     match id {
 
+        CommandId::Doctor => Command {
+            id: CommandId::Doctor,
+            parent: None,
+            leaf_name: "doctor",
+            summary: "Pre-flight diagnostics: check provider binaries, server health, and profile validity.",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: diagnostic command, no TUI integration needed
+        },
         CommandId::Info => Command {
             id: CommandId::Info,
             parent: None,
@@ -1699,19 +1712,19 @@ mod tests {
     /// consistent and every test green, because nothing compared the table against the CLI. That
     /// is what `test/test_command_catalog_matches_click.py` now does. (Review on PR #547.)
     #[test]
-    fn the_policy_distribution_is_twentyfour_eighteen_fiftysix() {
+    fn the_policy_distribution_is_twentyfour_eighteen_fiftyseven() {
         let (in_app, handoff, hidden) = distribution();
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 56, "expected 56 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 57, "expected 57 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            98,
-            "the three policy counts must account for all 98 leaf commands of the Click tree"
+            99,
+            "the three policy counts must account for all 99 leaf commands of the Click tree"
         );
 
-        // The three counts summing to 98 does not prove 98 *distinct* commands were counted: a
+        // The three counts summing to 99 does not prove 99 *distinct* commands were counted: a
         // duplicated entry in DISPLAY_ORDER would inflate one policy while a real command went
         // uncounted, and the arithmetic above would still close. DISPLAY_ORDER is generated, so
         // this is a live hazard rather than a theoretical one.
@@ -1786,6 +1799,7 @@ mod tests {
             #[allow(clippy::needless_match)]
             fn identity(id: CommandId) -> CommandId {
                 match id {
+                    CommandId::Doctor => CommandId::Doctor,
                     CommandId::Info => CommandId::Info,
                     CommandId::Init => CommandId::Init,
                     CommandId::Install => CommandId::Install,

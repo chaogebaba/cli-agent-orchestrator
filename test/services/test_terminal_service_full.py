@@ -360,11 +360,11 @@ class TestCreateTerminal:
         mock_fifo_manager,
         mock_status_monitor,
     ):
-        """With no explicit override, terminal_service must pass None.
+        """With no explicit override, kiro resolves model from profile/toml chain.
 
-        The provider then runs its existing profile/providers.toml chain. Passing
-        profile.model here would collapse those layers before the provider can
-        apply the documented TOML precedence.
+        F107 B2: kiro_cli pre-resolves the effective model (spawn override >
+        providers.toml > profile field) BEFORE create_provider, so the resolved
+        value — not None — is what reaches the provider constructor.
         """
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
@@ -380,7 +380,8 @@ class TestCreateTerminal:
 
         await create_terminal("kiro_cli", "developer", new_session=True)
 
-        assert mock_provider_manager.create_provider.call_args.kwargs["model"] is None
+        # kiro resolves model eagerly — profile.model flows through when no toml/override
+        assert mock_provider_manager.create_provider.call_args.kwargs["model"] == "profile-default-model"
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
