@@ -303,6 +303,17 @@ class StalledCallbackWatchdog:
             else:
                 episode.idle_since = None
                 episode.last_screen_fp = None
+            # F97: garbage-collect completed episodes
+            self._gc_fired_episodes()
+
+    def _gc_fired_episodes(self) -> None:
+        """Remove episodes that have both fired and seen their callback (F97)."""
+        dead = [
+            tid for tid, ep in self._episodes.items()
+            if ep.callback_seen and ep.fired
+        ]
+        for tid in dead:
+            del self._episodes[tid]
 
     def poll_unarmed_statuses(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now

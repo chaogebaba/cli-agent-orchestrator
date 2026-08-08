@@ -51,6 +51,19 @@ UNKNOWN_DIALOG_PAYLOAD_CHARS = 600
 DIALOG_PROXIMITY_CHARS = 200
 DIALOG_REGION_LINES = 15
 
+# F86: Known permission/AskUserQuestion patterns — these are interactive prompts
+# from the host CLI (claude_code, kiro) that should NOT trigger unknown-dialog
+# escalation. The auto-responder returns WAITING_USER_ANSWER without pushing.
+_PERMISSION_PROMPT_PATTERNS = (
+    re.compile(r"Select an option", re.IGNORECASE),
+    re.compile(r"Use arrow keys", re.IGNORECASE),
+    re.compile(r"[↑↓].*to navigate.*[↵⏎].*to select", re.IGNORECASE),
+    re.compile(r"Yes, I trust this folder"),
+    re.compile(r"Yes, I accept"),
+    re.compile(r"Allow (?:once|always)", re.IGNORECASE),
+    re.compile(r"\[y/n(?:/t)?\]"),
+)
+
 # Seed rule files, created only if absent -- never overwritten. Keys are the
 # provider filename (``<provider>.yaml``); values are the verbatim YAML from
 # the blueprint.
@@ -579,6 +592,11 @@ class AutoResponder:
         supplied_status: TerminalStatus | None,
         incarnation: TerminalIncarnation,
     ) -> Optional[TerminalStatus]:
+        # F86: exempt known permission/AskUserQuestion prompts — return
+        # WAITING_USER_ANSWER without escalating to the supervisor.
+        if any(pat.search(region.normalized) for pat in _PERMISSION_PROMPT_PATTERNS):
+            return TerminalStatus.WAITING_USER_ANSWER
+
         shape_suspect = self._looks_like_dialog(region.normalized, provider_name)
         is_suspect = supplied_status == TerminalStatus.WAITING_USER_ANSWER or (
             shape_suspect
