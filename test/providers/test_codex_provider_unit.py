@@ -27,6 +27,17 @@ from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 STATUSLINE_CORPUS_DIR = FIXTURES_DIR / "codex_statusline_corpus"
+
+
+@pytest.fixture(autouse=True)
+def _mock_resolve_binary():
+    """Patch resolve_provider_binary to return bare 'codex' for unit tests."""
+    with patch(
+        "cli_agent_orchestrator.providers.codex.resolve_provider_binary", return_value="codex"
+    ):
+        yield
+
+
 STATUSLINE_VARIANTS = {
     "01-git-master-full": TerminalStatus.IDLE,
     "02-nongit-tmpx-full": TerminalStatus.IDLE,

@@ -1263,6 +1263,7 @@ async def health_check():
 
         manifest = validate_active_sandbox()
         if manifest is None:
+            logger.exception("Sandbox identity unavailable during health check")
             raise HTTPException(status_code=500, detail="sandbox identity unavailable")
         source = source_identity(Path(manifest["source"]["fork_root"]))
         module_path = Path(__file__).resolve()
@@ -2097,6 +2098,7 @@ async def get_agent_profile_endpoint(name: str) -> Dict:
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except RuntimeError as e:
+        logger.exception("Agent profile load failed for '%s'", name)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
@@ -4085,6 +4087,7 @@ async def start_workflow_run_endpoint(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except workflow_service.WorkflowEngineError as e:
+        logger.exception("Workflow engine error during start_run")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     return result.model_dump()
 
@@ -4688,6 +4691,7 @@ async def resume_workflow_run_endpoint(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except workflow_service.WorkflowEngineError as e:
+        logger.exception("Workflow engine error during resume")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     return result.model_dump()
 

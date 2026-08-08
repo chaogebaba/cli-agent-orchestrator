@@ -4124,7 +4124,7 @@ def _delete_terminal_under_lease(
         except Exception as exc:
             logger.warning(f"Failed to stop FIFO reader for {terminal_id}: {exc}")
         try:
-            status_monitor.clear_terminal(terminal_id)
+            status_monitor.unregister(terminal_id)
         except Exception as exc:
             logger.warning(f"Failed to clear state detector for {terminal_id}: {exc}")
 

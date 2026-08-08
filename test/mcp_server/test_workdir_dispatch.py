@@ -28,15 +28,22 @@ def _init_repo(path: Path, *, commit=False):
 
 
 def _fork_assign(row, requested=None):
-    with patch.dict(os.environ, {"CAO_TERMINAL_ID": "abcd1234"}), patch(
-        "cli_agent_orchestrator.services.fork_context_service.resolve_base", return_value=row
-    ), patch.object(server, "resolve_provider", return_value=row["provider"]), patch(
-        "pathlib.Path.glob",
-        return_value=[SimpleNamespace(name=f"rollout-{row['session_uuid']}.jsonl")],
-    ), patch(
-        "cli_agent_orchestrator.services.fork_context_service.staleness",
-        return_value=StalenessResult(SnapshotDelta("head"), "[FRESH]", 0),
-    ) as stale, patch.object(server, "_create_terminal") as create:
+    with (
+        patch.dict(os.environ, {"CAO_TERMINAL_ID": "abcd1234"}),
+        patch(
+            "cli_agent_orchestrator.services.fork_context_service.resolve_base", return_value=row
+        ),
+        patch.object(server, "resolve_provider", return_value=row["provider"]),
+        patch(
+            "pathlib.Path.glob",
+            return_value=[SimpleNamespace(name=f"rollout-{row['session_uuid']}.jsonl")],
+        ),
+        patch(
+            "cli_agent_orchestrator.services.fork_context_service.staleness",
+            return_value=StalenessResult(SnapshotDelta("head"), "[FRESH]", 0),
+        ) as stale,
+        patch.object(server, "_create_terminal") as create,
+    ):
         create.return_value = ("feed1234", row["provider"])
         result = server._assign_impl(
             "developer", "task", working_directory=requested, fork_from="base"
@@ -57,17 +64,20 @@ def test_strict_supervisor_cwd_failure_modes(mode):
     if mode == "non_200":
         response.raise_for_status.side_effect = server.requests.HTTPError("404")
     side_effect = server.requests.ConnectionError("down") if mode == "request_error" else None
-    with patch.dict(os.environ, env, clear=True), patch.object(
-        server.requests, "get", return_value=response, side_effect=side_effect
+    with (
+        patch.dict(os.environ, env, clear=True),
+        patch.object(server.requests, "get", return_value=response, side_effect=side_effect),
     ):
         with pytest.raises(ValueError, match="supervisor_working_directory_unavailable"):
             server.strict_supervisor_cwd()
 
 
 def test_assign_omitted_uses_strict_supervisor_cwd():
-    with patch.dict(os.environ, {"CAO_TERMINAL_ID": "abcd1234"}), patch.object(
-        server, "strict_supervisor_cwd", return_value="/supervisor"
-    ) as cwd, patch.object(server, "_create_terminal", return_value=("feed1234", "codex")) as create:
+    with (
+        patch.dict(os.environ, {"CAO_TERMINAL_ID": "abcd1234"}),
+        patch.object(server, "strict_supervisor_cwd", return_value="/supervisor") as cwd,
+        patch.object(server, "_create_terminal", return_value=("feed1234", "codex")) as create,
+    ):
         result = server._assign_impl("developer", "task")
     assert result["success"] is True
     cwd.assert_called_once_with()
@@ -75,12 +85,20 @@ def test_assign_omitted_uses_strict_supervisor_cwd():
 
 
 def test_handoff_omitted_uses_strict_supervisor_cwd():
-    with patch.object(server, "strict_supervisor_cwd", return_value="/supervisor") as cwd, patch.object(
-        server, "_resolve_handoff_provider", return_value=server.HandoffContext("kiro_cli", None, None, None)
-    ), patch.object(server.requests, "post") as post:
+    with (
+        patch.object(server, "strict_supervisor_cwd", return_value="/supervisor") as cwd,
+        patch.object(
+            server,
+            "_resolve_handoff_provider",
+            return_value=server.HandoffContext("kiro_cli", None, None, None),
+        ),
+        patch.object(server.requests, "post") as post,
+    ):
         post.return_value.status_code = 200
         post.return_value.json.return_value = {
-            "terminal_id": "feed1234", "last_message": "done", "status": "completed"
+            "terminal_id": "feed1234",
+            "last_message": "done",
+            "status": "completed",
         }
         result = asyncio.run(server._handoff_impl("developer", "task"))
     assert result.success
@@ -93,22 +111,29 @@ def test_explicit_workdir_threads_through_assign_and_handoff(tmp_path):
     target.mkdir()
     alias = tmp_path / "alias"
     alias.symlink_to(target, target_is_directory=True)
-    with patch.dict(os.environ, {"CAO_TERMINAL_ID": "abcd1234"}), patch.object(
-        server, "strict_supervisor_cwd"
-    ) as strict, patch.object(
-        server, "_create_terminal", return_value=("feed1234", "codex")
-    ) as create:
+    with (
+        patch.dict(os.environ, {"CAO_TERMINAL_ID": "abcd1234"}),
+        patch.object(server, "strict_supervisor_cwd") as strict,
+        patch.object(server, "_create_terminal", return_value=("feed1234", "codex")) as create,
+    ):
         assert server._assign_impl("developer", "task", str(alias))["success"]
     strict.assert_not_called()
     assert create.call_args.args[1] == str(alias)
 
-    with patch.object(server, "strict_supervisor_cwd") as strict, patch.object(
-        server, "_resolve_handoff_provider",
-        return_value=server.HandoffContext("kiro_cli", None, None, None),
-    ), patch.object(server.requests, "post") as post:
+    with (
+        patch.object(server, "strict_supervisor_cwd") as strict,
+        patch.object(
+            server,
+            "_resolve_handoff_provider",
+            return_value=server.HandoffContext("kiro_cli", None, None, None),
+        ),
+        patch.object(server.requests, "post") as post,
+    ):
         post.return_value.status_code = 200
         post.return_value.json.return_value = {
-            "terminal_id": "feed1234", "last_message": "done", "status": "completed"
+            "terminal_id": "feed1234",
+            "last_message": "done",
+            "status": "completed",
         }
         assert asyncio.run(
             server._handoff_impl("developer", "task", working_directory=str(alias))
@@ -119,18 +144,23 @@ def test_explicit_workdir_threads_through_assign_and_handoff(tmp_path):
 
 def test_mcp_invalid_workdir_surfaces_detail():
     detail = "invalid_working_directory: Working directory does not exist: /missing"
-    with patch.dict(os.environ, {"CAO_TERMINAL_ID": "abcd1234"}), patch.object(
-        server, "_create_terminal", side_effect=ValueError(detail)
+    with (
+        patch.dict(os.environ, {"CAO_TERMINAL_ID": "abcd1234"}),
+        patch.object(server, "_create_terminal", side_effect=ValueError(detail)),
     ):
         result = server._assign_impl("developer", "task", "/missing")
     assert result["message"] == f"Assignment failed: {detail}"
 
     response = MagicMock(status_code=400)
     response.json.return_value = {"detail": detail}
-    with patch.object(
-        server, "_resolve_handoff_provider",
-        return_value=server.HandoffContext("kiro_cli", None, None, None),
-    ), patch.object(server.requests, "post", return_value=response):
+    with (
+        patch.object(
+            server,
+            "_resolve_handoff_provider",
+            return_value=server.HandoffContext("kiro_cli", None, None, None),
+        ),
+        patch.object(server.requests, "post", return_value=response),
+    ):
         result = asyncio.run(
             server._handoff_impl("developer", "task", working_directory="/missing")
         )
@@ -146,11 +176,12 @@ def test_strict_failures_stop_each_tool_before_dispatch(mode, tool):
     if mode == "non_200":
         response.raise_for_status.side_effect = server.requests.HTTPError("404")
     get_effect = server.requests.ConnectionError("down") if mode == "request_error" else None
-    with patch.dict(os.environ, env, clear=True), patch.object(
-        server.requests, "get", return_value=response, side_effect=get_effect
-    ), patch.object(server, "_create_terminal") as create, patch.object(
-        server.requests, "post"
-    ) as post:
+    with (
+        patch.dict(os.environ, env, clear=True),
+        patch.object(server.requests, "get", return_value=response, side_effect=get_effect),
+        patch.object(server, "_create_terminal") as create,
+        patch.object(server.requests, "post") as post,
+    ):
         if tool == "assign":
             result = server._assign_impl("developer", "task")
             message = result["message"]
@@ -166,8 +197,11 @@ def test_fork_omitted_uses_base_and_never_supervisor_default(tmp_path):
     repo = tmp_path / "repo"
     _init_repo(repo)
     row = {
-        "name": "base", "provider": "codex", "session_uuid": "uuid",
-        "cwd": str(repo), "agent_profile": "developer",
+        "name": "base",
+        "provider": "codex",
+        "session_uuid": "uuid",
+        "cwd": str(repo),
+        "agent_profile": "developer",
     }
     with patch.object(server, "strict_supervisor_cwd") as strict:
         result, create, _ = _fork_assign(row)
@@ -176,10 +210,13 @@ def test_fork_omitted_uses_base_and_never_supervisor_default(tmp_path):
     assert create.call_args.args[1] == str(repo)
 
 
-def test_grok_distinct_fork_workdir_rejected():
+def test_grok_distinct_fork_workdir_returns_warning():
+    """Provider gate removed (f100-A2): non-codex providers now fall through to
+    git identity check; if identity fails, they get a warning preamble."""
     row = {"provider": "grok_cli", "cwd": "/base"}
-    with pytest.raises(ValueError, match="provider_unsupported"):
-        server._resolve_fork_working_directory(row, "/target")
+    cwd, preamble = server._resolve_fork_working_directory(row, "/target")
+    assert cwd == "/target"
+    assert "warning" in preamble.lower()
 
 
 def test_codex_linked_worktree_allowed_and_preamble(tmp_path):
@@ -194,8 +231,11 @@ def test_codex_linked_worktree_allowed_and_preamble(tmp_path):
     assert line == f"[WORKDIR] launched in {worktree}, base snapshot taken in {repo}."
 
     row = {
-        "name": "base", "provider": "codex", "session_uuid": "uuid",
-        "cwd": str(repo), "agent_profile": "developer",
+        "name": "base",
+        "provider": "codex",
+        "session_uuid": "uuid",
+        "cwd": str(repo),
+        "agent_profile": "developer",
     }
     result, create, stale = _fork_assign(row, str(worktree))
     assert result["success"]
@@ -209,7 +249,7 @@ def test_git_identity_ignores_git_dir_environment(tmp_path, monkeypatch):
     _init_repo(repo_a)
     _init_repo(repo_b)
     monkeypatch.setenv("GIT_DIR", str(repo_a / ".git"))
-    with pytest.raises(ValueError, match="mismatch"):
+    with pytest.raises(server._CrossRepoBaseExclusion):
         server._resolve_fork_working_directory(
             {"provider": "codex", "cwd": str(repo_a)}, str(repo_b)
         )
@@ -224,23 +264,29 @@ def test_git_identity_uses_absolute_common_dir_flag(tmp_path):
     assert any("--path-format=absolute" in call.args[0] for call in run.call_args_list)
 
 
-def test_different_repositories_error_names_both_paths_and_does_not_spawn(tmp_path):
+def test_different_repositories_falls_back_cold_with_cross_repo_preamble(tmp_path):
+    """f100-A2: cross-repo base exclusion falls back to cold instead of failing."""
     base, requested = tmp_path / "base", tmp_path / "requested"
     _init_repo(base)
     _init_repo(requested)
     row = {
-        "name": "base", "provider": "codex", "session_uuid": "uuid",
-        "cwd": str(base), "agent_profile": "developer",
+        "name": "base",
+        "provider": "codex",
+        "session_uuid": "uuid",
+        "cwd": str(base),
+        "agent_profile": "developer",
     }
     result, create, _ = _fork_assign(row, str(requested))
-    assert not result["success"]
-    assert str(base) in result["message"]
-    assert str(requested) in result["message"]
-    create.assert_not_called()
+    assert result["success"]
+    assert result["forked_from"] is None
+    # Worker message contains the CROSS-REPO preamble
+    call_kwargs = create.call_args
+    assert "CROSS-REPO" in str(call_kwargs)
 
 
 @pytest.mark.parametrize("case", ["deleted_base", "nongit_target", "nongit_base"])
-def test_unprovable_fork_identity_names_paths_and_does_not_spawn(tmp_path, case):
+def test_unprovable_fork_identity_falls_back_with_warning(tmp_path, case):
+    """f100-A2: identity failures now return warning preamble and succeed."""
     base, requested = tmp_path / "base", tmp_path / "requested"
     base.mkdir()
     requested.mkdir()
@@ -251,27 +297,30 @@ def test_unprovable_fork_identity_names_paths_and_does_not_spawn(tmp_path, case)
     if case == "deleted_base":
         shutil.rmtree(base)
     row = {
-        "name": "base", "provider": "codex", "session_uuid": "uuid",
-        "cwd": str(base), "agent_profile": "developer",
+        "name": "base",
+        "provider": "codex",
+        "session_uuid": "uuid",
+        "cwd": str(base),
+        "agent_profile": "developer",
     }
     result, create, _ = _fork_assign(row, str(requested))
-    assert not result["success"]
-    assert str(base) in result["message"]
-    assert str(requested) in result["message"]
-    create.assert_not_called()
+    assert result["success"]
+    create.assert_called_once()
 
 
-def test_rev_parse_execution_error_names_paths_and_does_not_spawn(tmp_path):
+def test_rev_parse_execution_error_falls_back_with_warning(tmp_path):
+    """f100-A2: OSError from git falls back gracefully with warning preamble."""
     base, requested = tmp_path / "base", tmp_path / "requested"
     base.mkdir()
     requested.mkdir()
     row = {
-        "name": "base", "provider": "codex", "session_uuid": "uuid",
-        "cwd": str(base), "agent_profile": "developer",
+        "name": "base",
+        "provider": "codex",
+        "session_uuid": "uuid",
+        "cwd": str(base),
+        "agent_profile": "developer",
     }
     with patch.object(server.subprocess, "run", side_effect=OSError("git unavailable")):
         result, create, _ = _fork_assign(row, str(requested))
-    assert not result["success"]
-    assert str(base) in result["message"]
-    assert str(requested) in result["message"]
-    create.assert_not_called()
+    assert result["success"]
+    create.assert_called_once()

@@ -524,7 +524,8 @@ def test_timeout_zero_arrivals_and_cancel_release_are_lossless(barrier_db):
     with barrier_db() as db:
         combined = db.query(InboxModel).filter_by(id=fired[0]).one()
         assert "0/2" in combined.message
-        assert combined.message.count("[MISSING") == 2
+        # FAM-3: members are now terminalized as FAILED before render
+        assert combined.message.count("[FAILED: barrier_closed_timeout]") == 2
 
     _dispatch_pair("cancel")
     held = create_inbox_message("worker-a", "owner", "held before cancel")

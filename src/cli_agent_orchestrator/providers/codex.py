@@ -35,6 +35,7 @@ from cli_agent_orchestrator.services.settings_service import (
 )
 from cli_agent_orchestrator.utils import provider_plane
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.binary_resolution import resolve_provider_binary
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.provider_plane import provider_home
 from cli_agent_orchestrator.utils.sandbox_guard import bind_mcp_server_identity
@@ -682,9 +683,7 @@ def _has_startup_idle_composer(clean_output: str) -> bool:
     # footer below it so typed drafts and ordinary output are not treated as ready.
     for index in range(len(tail_lines) - 1, -1, -1):
         if re.match(STARTUP_IDLE_PLACEHOLDER_PATTERN, tail_lines[index]):
-            return any(
-                re.search(STARTUP_FOOTER_PATTERN, line) for line in tail_lines[index + 1 :]
-            )
+            return any(re.search(STARTUP_FOOTER_PATTERN, line) for line in tail_lines[index + 1 :])
     return False
 
 
@@ -755,7 +754,7 @@ class CodexProvider(BaseProvider):
     def seed_resume_identity(cls, cwd: str, agent_profile: str) -> str:
         """Create and validate a native Codex rollout without CAO coordinates."""
         profile = load_agent_profile(agent_profile)
-        argv = ["codex", "exec", "--skip-git-repo-check", "-C", cwd]
+        argv = [resolve_provider_binary("codex"), "exec", "--skip-git-repo-check", "-C", cwd]
         model, config = _resolved_codex_profile_config(profile, agent_profile)
         if isinstance(model, str) and model:
             argv.extend(["--model", model])
@@ -806,7 +805,6 @@ class CodexProvider(BaseProvider):
         """
         return CAO_HOME_DIR / "tmp" / f"{self.terminal_id}.codex_developer_instructions"
 
-
     def _build_codex_command(self) -> str:
         """Build Codex command with agent profile if provided.
 
@@ -830,9 +828,13 @@ class CodexProvider(BaseProvider):
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
         if profile and profile.codexProfile and not yolo:
-            command_parts: list[str] = ["codex", "--profile", profile.codexProfile]
+            command_parts: list[str] = [
+                resolve_provider_binary("codex"),
+                "--profile",
+                profile.codexProfile,
+            ]
         else:
-            command_parts = ["codex", "--yolo"]
+            command_parts = [resolve_provider_binary("codex"), "--yolo"]
         command_parts.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
 
         model, codex_config = _resolved_codex_profile_config(profile, self._agent_profile)

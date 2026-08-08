@@ -427,6 +427,15 @@ def _git_identity(path: str) -> tuple[str, str]:
     return os.path.realpath(top), os.path.realpath(common)
 
 
+class _CrossRepoBaseExclusion(Exception):
+    """Raised when a fork base lives in a different git repository than the target."""
+
+    def __init__(self, base_top: str, target_top: str):
+        self.base_top = base_top
+        self.target_top = target_top
+        super().__init__(f"cross_repo: base={base_top}, target={target_top}")
+
+
 def _resolve_fork_working_directory(
     row: Dict[str, Any], requested: Optional[str]
 ) -> tuple[str, str]:
@@ -434,29 +443,19 @@ def _resolve_fork_working_directory(
     base = row["cwd"]
     if requested is None or os.path.realpath(requested) == os.path.realpath(base):
         return base, ""
-    if row["provider"] != "codex":
-        raise ValueError(
-            f"fork_working_directory_provider_unsupported: {row['provider']} base cwd {base}, "
-            f"requested {requested}"
-        )
     try:
         base_top, base_common = _git_identity(base)
-    except ValueError as exc:
-        raise ValueError(
-            f"fork_working_directory_identity_failed: base {base}, requested {requested}; "
-            f"base identity unavailable"
-        ) from exc
+    except ValueError:
+        return requested, f"[WORKDIR] launched in {requested}, base identity unavailable (warning)."
     try:
         target_top, target_common = _git_identity(requested)
-    except ValueError as exc:
-        raise ValueError(
-            f"fork_working_directory_identity_failed: base {base}, requested {requested}; "
-            f"requested identity unavailable"
-        ) from exc
-    if base_top != target_top and base_common != target_common:
-        raise ValueError(
-            f"fork_working_directory_mismatch: base {base_top}, requested {target_top}"
+    except ValueError:
+        return (
+            requested,
+            f"[WORKDIR] launched in {requested}, target identity unavailable (warning).",
         )
+    if base_top != target_top and base_common != target_common:
+        raise _CrossRepoBaseExclusion(base_top, target_top)
     return requested, f"[WORKDIR] launched in {requested}, base snapshot taken in {base}."
 
 
@@ -1252,10 +1251,11 @@ def _assign_impl(
         fork_context = None
         refresh_base_name = None
         assignment_preamble = None
+        forked_from_info = None
         if resume and not fork_from:
             raise ValueError("resume_requires_fork_from")
         defaulted_fork = False
-        if fork_from == "cold":
+        if fork_from in ("cold", "none"):
             fork_from = None
         elif fork_from is None and not resume:
             fork_from = _configured_default_fork_base(agent_profile)
@@ -1322,22 +1322,38 @@ def _assign_impl(
                     raise ValueError("session_live_owned")
                 if state == "error":
                     raise ValueError("owner_probe_failed")
-            working_directory, workdir_preamble = _resolve_fork_working_directory(
-                row, working_directory
-            )
-            stale = staleness(row)
-            preamble = stale.preamble
-            if stale and not resume:
-                refresh_base_name = row["name"]
-            if workdir_preamble:
-                preamble = f"{preamble}\n{workdir_preamble}"
-            fork_context = ForkContext(
-                mode="resume" if resume else "fork",
-                session_uuid=row["session_uuid"],
-                base_name=row["name"],
-                provider=provider,
-                initial_preamble=preamble,
-            )
+            try:
+                working_directory, workdir_preamble = _resolve_fork_working_directory(
+                    row, working_directory
+                )
+            except _CrossRepoBaseExclusion as exc:
+                assignment_preamble = (
+                    f"[CROSS-REPO] base '{row['name']}' is in {exc.base_top}, "
+                    f"requested working_directory is in {exc.target_top}; "
+                    f"started cold (base excluded from candidacy)."
+                )
+                row = None
+                workdir_preamble = ""
+            if row is not None:
+                stale = staleness(row)
+                forked_from_info = {
+                    "name": row["name"],
+                    "cwd": row["cwd"],
+                    "git_sha": row.get("git_sha"),
+                    "staleness_count": stale.changed_count if stale else 0,
+                }
+                preamble = stale.preamble
+                if stale and not resume:
+                    refresh_base_name = row["name"]
+                if workdir_preamble:
+                    preamble = f"{preamble}\n{workdir_preamble}"
+                fork_context = ForkContext(
+                    mode="resume" if resume else "fork",
+                    session_uuid=row["session_uuid"],
+                    base_name=row["name"],
+                    provider=provider,
+                    initial_preamble=preamble,
+                )
         elif working_directory is None:
             working_directory = strict_supervisor_cwd()
         # Fail fast before creating the worker terminal when CAO_TERMINAL_ID is
@@ -1408,6 +1424,7 @@ def _assign_impl(
         return {
             "success": True,
             "terminal_id": terminal_id,
+            "forked_from": forked_from_info,
             "message": (
                 f"Task assigned to {agent_profile} (terminal: {terminal_id}). "
                 f"Worker is initializing in the background; your task will be "
@@ -1417,6 +1434,15 @@ def _assign_impl(
             ),
         }
 
+    except requests.HTTPError as exc:
+        detail = (
+            _extract_error_detail(exc.response, str(exc)) if exc.response is not None else str(exc)
+        )
+        return {
+            "success": False,
+            "terminal_id": terminal_id,
+            "message": f"Assignment failed: {detail}",
+        }
     except Exception as e:
         # Surface the terminal_id when creation succeeded before the failure
         # (e.g. the send POST failed) so the orphaned terminal can be
@@ -2321,9 +2347,7 @@ def _require_discovery_marker(own_terminal_id: str, action: str) -> Optional[Dic
     authorized.
     """
     try:
-        response = cao_http.get(
-            f"/terminals/{own_terminal_id}", timeout=_mcp_timeout()
-        )
+        response = cao_http.get(f"/terminals/{own_terminal_id}", timeout=_mcp_timeout())
         response.raise_for_status()
         allowed_tools = response.json().get("allowed_tools")
     except Exception as e:

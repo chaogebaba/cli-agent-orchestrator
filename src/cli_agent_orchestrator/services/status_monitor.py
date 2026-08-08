@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, NotRequired, Optional, Tuple, TypedDict
 
+from cli_agent_orchestrator.backends.herdr_backend import map_native_status
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
     PYTE_QUIESCENCE_DELAY_S,
@@ -23,20 +24,19 @@ from cli_agent_orchestrator.constants import (
 from cli_agent_orchestrator.kernel.receiver_state import (
     FreshnessProof,
     FreshToken,
+    NativeEvidence,
     PassOutcome,
     ProbeEvidence,
     ReceiverState,
     ReceiverStateStore,
-    NativeEvidence,
     pass_outcome_for_source,
 )
-from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.native_publish import (
     DispatchTxn,
     NativePublishRequest,
     SettlementFence,
 )
-from cli_agent_orchestrator.backends.herdr_backend import map_native_status
+from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -256,6 +256,9 @@ class StatusMonitor:
         self._settlement_tasks: set[asyncio.Task] = set()
         self._latest_native_request: Dict[str, NativePublishRequest] = {}
         self._dispatch_had_native: set[tuple[str, int]] = set()
+        # --- unregister / quarantine state (B5, f100) ---
+        self._consecutive_errors: Dict[str, int] = {}
+        self._quarantined: set[str] = set()
 
     @property
     def receiver_state_store(self) -> ReceiverStateStore:
@@ -1633,6 +1636,47 @@ class StatusMonitor:
             handle = self._quiesce_handle.pop(terminal_id, None)
             self._receiver_state_store.invalidate_terminal(terminal_id)
         self._cancel_quiesce_handle(handle)
+
+    def unregister(self, terminal_id: str) -> None:
+        """Unregister a terminal from monitoring (called on delete).
+
+        Clears all monitoring state and removes the terminal from quarantine
+        and error tracking.
+        """
+        with self._lock:
+            self._consecutive_errors.pop(terminal_id, None)
+            self._quarantined.discard(terminal_id)
+        self.clear_terminal(terminal_id)
+
+    def record_probe_error(self, terminal_id: str) -> bool:
+        """Record a consecutive probe error for a terminal.
+
+        Returns True if the terminal was auto-quarantined (3 consecutive errors).
+        """
+        with self._lock:
+            if terminal_id in self._quarantined:
+                return True
+            count = self._consecutive_errors.get(terminal_id, 0) + 1
+            self._consecutive_errors[terminal_id] = count
+            if count >= 3:
+                self._quarantined.add(terminal_id)
+                logger.warning(
+                    f"StatusMonitor: terminal {terminal_id} quarantined after "
+                    f"{count} consecutive probe errors (not found)"
+                )
+                return True
+            return False
+
+    def reset_probe_errors(self, terminal_id: str) -> None:
+        """Reset consecutive error count on a successful probe."""
+        with self._lock:
+            if terminal_id in self._consecutive_errors:
+                self._consecutive_errors[terminal_id] = 0
+
+    def is_quarantined(self, terminal_id: str) -> bool:
+        """Return whether a terminal has been quarantined due to probe errors."""
+        with self._lock:
+            return terminal_id in self._quarantined
 
     def reset_buffer(self, terminal_id: str) -> None:
         """Clear the rolling buffer + last-known status WITHOUT forgetting the
