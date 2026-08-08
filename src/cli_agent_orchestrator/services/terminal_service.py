@@ -233,16 +233,20 @@ def seed_resume_bootstrap(agent_profile: str, provider_name: str, cwd: str):
     provider_class = get_provider_class(provider_name)
     if provider_class.supports_seed_resume_identity is not True:
         return None
-    from cli_agent_orchestrator.models.terminal import ForkContext
+    try:
+        from cli_agent_orchestrator.models.terminal import ForkContext
 
-    session_uuid = provider_class.seed_resume_identity(cwd, agent_profile)
-    return ForkContext(
-        mode="resume",
-        session_uuid=session_uuid,
-        base_name="seed",
-        provider=provider_name,
-        initial_preamble="",
-    )
+        session_uuid = provider_class.seed_resume_identity(cwd, agent_profile)
+        return ForkContext(
+            mode="resume",
+            session_uuid=session_uuid,
+            base_name="seed",
+            provider=provider_name,
+            initial_preamble="",
+        )
+    except Exception as exc:
+        logger.error(f"seed_resume_bootstrap failed for {agent_profile}/{provider_name}: {exc}")
+        raise
 
 
 def has_deferred_init(terminal_id: str) -> bool:

@@ -757,6 +757,12 @@ def list_bases() -> list[dict[str, Any]]:
             continue
         stale = staleness(row)
         row["staleness_count"] = stale.changed_count
+        if stale.changed_count is not None and stale.changed_count >= 100:
+            logger.warning(
+                "base '%s' staleness=%d exceeds threshold (100) — consider refreshing",
+                row.get("name", "?"),
+                stale.changed_count,
+            )
         result.append(row)
     return result
 

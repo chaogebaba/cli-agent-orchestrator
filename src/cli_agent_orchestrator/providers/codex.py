@@ -762,6 +762,7 @@ class CodexProvider(BaseProvider):
         for key, value in config.items():
             argv.extend(["-c", _toml_override(key, value)])
         argv.append("Reply exactly: SEED_OK then stop.")
+        logger.info(f"codex seed_resume_identity: starting seed for {agent_profile} in {cwd}")
         try:
             completed = subprocess.run(
                 argv,
@@ -772,9 +773,12 @@ class CodexProvider(BaseProvider):
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
+            logger.error(f"codex seed_resume_identity: TIMEOUT after 90s for {agent_profile}")
             raise RuntimeError("seed_timeout") from exc
         except OSError as exc:
+            logger.error(f"codex seed_resume_identity: exec failed: {exc}")
             raise RuntimeError("seed_exec_failed") from exc
+        logger.info(f"codex seed_resume_identity: completed rc={completed.returncode}")
         if completed.returncode != 0:
             raise RuntimeError("seed_exec_failed")
         matches: set[str] = set(
