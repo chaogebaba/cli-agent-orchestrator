@@ -1008,10 +1008,12 @@ class TestCreateTerminalWorktree:
         "cli_agent_orchestrator.services.terminal_service.resolve_and_validate_path",
         side_effect=lambda path, description="path": path,
     )
+    @patch("cli_agent_orchestrator.services.terminal_service._preflight_disk_space")
     @patch("cli_agent_orchestrator.services.terminal_service.worktree_service")
     async def test_use_worktree_overrides_working_directory_for_the_new_window(
         self,
         mock_worktree_service,
+        _mock_preflight_disk,
         _mock_resolve_path,
         mock_load_profile,
         mock_gen_id,

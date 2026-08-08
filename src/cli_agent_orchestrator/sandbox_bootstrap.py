@@ -574,6 +574,16 @@ def _initialize_claude_native_home(manifest: dict[str, Any]) -> Path:
 
 def command_up(args: argparse.Namespace) -> int:
     root = Path(args.root)
+    # F119: disk-space pre-flight guard
+    usage = shutil.disk_usage(str(root.parent if not root.exists() else root))
+    free_gb = usage.free / (1024**3)
+    if free_gb < 3.0:
+        print(
+            f"ERROR: disk_space_low: {free_gb:.1f}GB free on {root} "
+            f"(floor: 3.0GB). Refusing to start sandbox — free disk space first.",
+            file=sys.stderr,
+        )
+        return 1
     manifest: dict[str, Any] | None = None
     sentinel_created = False
     child: subprocess.Popen[bytes] | None = None

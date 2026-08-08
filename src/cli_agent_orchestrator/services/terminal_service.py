@@ -22,6 +22,7 @@ import concurrent.futures
 import logging
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -194,6 +195,7 @@ _deferred_tasks_lock = threading.Lock()
 POLL_INTERVAL = 2.0
 DEFERRED_TASK_QUIESCE_S = 10.0
 FORK_REFRESH_WAIT_BUDGET = 120.0
+DISK_SPACE_FLOOR_GB = 3.0
 SERVER_INIT_OWNER_EPOCH = str(uuid.uuid4())
 
 
@@ -213,6 +215,17 @@ _fork_refresh_locks: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock] =
 
 class TerminalInputBlockedError(Exception):
     """Raised when orchestrated input would answer an active interactive prompt."""
+
+
+def _preflight_disk_space(path: str, floor_gb: float = DISK_SPACE_FLOOR_GB) -> None:
+    """Raise RuntimeError if free disk on *path*'s filesystem is below *floor_gb*."""
+    usage = shutil.disk_usage(path)
+    free_gb = usage.free / (1024**3)
+    if free_gb < floor_gb:
+        raise RuntimeError(
+            f"disk_space_low: {free_gb:.1f}GB free on {path} "
+            f"(floor: {floor_gb}GB). Refusing to create terminal — free disk space first."
+        )
 
 
 def seed_resume_bootstrap(agent_profile: str, provider_name: str, cwd: str):
@@ -774,6 +787,7 @@ async def create_terminal(
             raise ValueError(f"invalid_working_directory: {exc}") from exc
     else:
         working_directory = resolve_and_validate_path(os.getcwd(), description="Working directory")
+    _preflight_disk_space(working_directory)
     provider_class = get_provider_class(provider)
     if provider_class.supports_seed_resume_identity is True and fork_context is None:
         raise RuntimeError("seed_required")
