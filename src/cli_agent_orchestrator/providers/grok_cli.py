@@ -47,8 +47,11 @@ USER_PROMPT_PATTERN = r"^\s*❯\s+(.+)$"
 PROCESSING_PATTERN = (
     r"Waiting for response…"
     r"|Waiting for response\.\.\."
-    r"|^\s*(?:⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏)?\s*(?:Thinking|Responding)\b"
-    r"|^[^\S\r\n]*(?:⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏)[^\S\r\n]+\S"
+    # Mid-row spinner (◆ or braille) optionally behind ┃ separator + Thinking/Responding
+    r"|[^\S\r\n]*(?:┃[^\S\r\n]*)?(?:◆|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏)"
+    r"[^\S\r\n]*(?:Thinking|Responding)\b"
+    # Bare spinner with any trailing text (mid-row or row-start) — fold r1 B1
+    r"|(?:┃[^\S\r\n]*)?(?:⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏)[^\S\r\n]+\S"
     r"| - (?:Waiting for response|Thinking|Responding) - "
 )
 COMPLETION_PATTERN = r"^\s*(?:Turn completed in [\d.]+s\.|Worked for [\d.]+s\.)\s*$"
@@ -56,6 +59,9 @@ RUNNING_PATTERN = r"^\s*Worked for [\d.]+s\.\s+\d+ commands? still running\.\s*$
 WAITING_USER_ANSWER_PATTERN = (
     r"Run Grok Build in a project directory\?" r"|↑/↓ navigate" r"|Enter:submit"
 )
+# Real grok dialogs render in the bottom rows (question + options + footer = 5 rows max).
+# Waiting signals from higher scrollback rows are stale quoted prose, not real dialogs.
+WAITING_VIEWPORT_ROWS = 5
 ERROR_PATTERN = (
     r"^\s*(?:"
     r"Error:\s+.+"
@@ -392,7 +398,8 @@ class GrokCliProvider(BaseProvider):
         newest_completion = max(completion_rows, default=-1)
         for index, row in enumerate(rows):
             if re.search(WAITING_USER_ANSWER_PATTERN, row):
-                signals.append(ScreenSignal("waiting", "WAITING_USER_ANSWER_PATTERN", index))
+                if index >= len(rows) - WAITING_VIEWPORT_ROWS:
+                    signals.append(ScreenSignal("waiting", "WAITING_USER_ANSWER_PATTERN", index))
             if re.search(PROCESSING_PATTERN, row):
                 if "Waiting for response" in row:
                     signals.append(
@@ -415,6 +422,12 @@ class GrokCliProvider(BaseProvider):
                 signals.append(ScreenSignal("chrome", "IDLE_FOOTER_PATTERN", index))
             if re.search(COMPOSER_PROMPT_PATTERN, row):
                 signals.append(ScreenSignal("chrome", "COMPOSER_PROMPT_PATTERN", index))
+        # Same-row mutual exclusion: progress on a row suppresses waiting on that row (§4.3)
+        progress_rows = {s.row_index for s in signals if s.signal_class == "progress"}
+        signals = [
+            s for s in signals
+            if not (s.signal_class == "waiting" and s.row_index in progress_rows)
+        ]
         return tuple(signals)
 
     def classify_injection_hazard(self, rows: List[str]) -> str | None:
