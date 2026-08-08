@@ -1048,6 +1048,24 @@ async def create_terminal(
         if callable(parent_writer):
             parent_writer(session_name, window_name, caller_id)
 
+        # HOTFIX F114: kiro MCP subprocess drops pane env; write terminal id
+        # to a well-known per-window file so cao-mcp-server can recover.
+        # Session+window only here — do NOT call get_pane_id (herdr tests assert
+        # call counts). Pane-keyed file is written later when herdr already
+        # resolves pane_id.
+        try:
+            from cli_agent_orchestrator.utils.terminal_id_fallback import (
+                write_terminal_id_fallback,
+            )
+
+            write_terminal_id_fallback(
+                terminal_id=terminal_id,
+                session_name=session_name,
+                window_name=window_name,
+            )
+        except Exception as exc:
+            logger.warning("HOTFIX F114: failed to write terminal-id fallback: %s", exc)
+
         # Step 3: Build a runtime skill catalog only for providers that consume
         # it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
         skill_prompt = (
@@ -1500,6 +1518,23 @@ async def create_terminal(
                 pane_id = get_backend().get_pane_id(terminal_id, session_name, window_name)
                 is_kiro = provider == ProviderType.KIRO_CLI.value
                 svc.register_terminal(terminal_id, pane_id, is_kiro)
+                # HOTFIX F114: pane-keyed identity file (get_pane_id already paid for)
+                try:
+                    from cli_agent_orchestrator.utils.terminal_id_fallback import (
+                        write_terminal_id_fallback,
+                    )
+
+                    write_terminal_id_fallback(
+                        terminal_id=terminal_id,
+                        pane_id=pane_id,
+                        session_name=session_name,
+                        window_name=window_name,
+                    )
+                except Exception as f114_exc:
+                    logger.warning(
+                        "HOTFIX F114: failed to write pane terminal-id fallback: %s",
+                        f114_exc,
+                    )
             except Exception as e:
                 if strict_backend_registration:
                     raise RuntimeError("herdr_register_failed") from e

@@ -85,6 +85,10 @@ MAX_USER_PROMPT_ANSWER_LENGTH = 4000
 
 def _current_terminal_id() -> Optional[str]:
     """Return a valid CAO terminal ID from the MCP environment, if configured."""
+    # HOTFIX F114: recovery is applied once in main() into os.environ so this
+    # helper (and every raw os.environ.get site) sees the restored id. Lazy
+    # recovery is intentionally NOT done here — unit tests patch the env and
+    # must observe the unset state without inheriting the parent pane's tid.
     terminal_id = os.environ.get("CAO_TERMINAL_ID")
     if not terminal_id:
         return None
@@ -3730,6 +3734,17 @@ register_mcp_server_surfaces(mcp)
 
 def main():
     """Main entry point for the MCP server."""
+    # HOTFIX F114: recover CAO_TERMINAL_ID into os.environ before any tool runs.
+    # kiro-cli spawns this process via node without pane env; without recovery
+    # every MCP call fails with "no CAO terminal context".
+    try:
+        from cli_agent_orchestrator.utils.terminal_id_fallback import (
+            recover_and_apply_terminal_identity,
+        )
+
+        recover_and_apply_terminal_identity()
+    except Exception as exc:
+        logger.warning("HOTFIX F114: startup identity recovery failed: %s", exc)
     mcp.run()
 
 
