@@ -268,12 +268,40 @@ def evaluate(row: dict[str, Any], delta: SnapshotDelta) -> DigestDecision:
     try:
         if candidate.stat().st_size > MAX_DIGEST_BYTES:
             artifact_bytes = candidate.stat().st_size
+            manifest_bytes: int | None = None
+            body_bytes: int | None = None
+            top_dirty: tuple[tuple[str, int], ...] = ()
+            try:
+                raw = candidate.read_bytes()
+                if raw.startswith(_MANIFEST_START):
+                    end = raw.find(_MANIFEST_END, len(_MANIFEST_START))
+                    if end >= 0:
+                        manifest_bytes = end + len(_MANIFEST_END)
+                        body_bytes = len(raw) - manifest_bytes
+                        # Extract top dirty paths from manifest for diagnostics
+                        manifest_text = raw[len(_MANIFEST_START) : end].decode("utf-8", "replace")
+                        entry_sizes: list[tuple[str, int]] = []
+                        for line in manifest_text.splitlines():
+                            if not line or line.startswith(
+                                ("base:", "parent_artifact_sha:", "artifact_sha:")
+                            ):
+                                continue
+                            parts = line.split(" ", 2)
+                            if len(parts) == 3:
+                                entry_sizes.append((parts[2], len(line.encode("utf-8"))))
+                        entry_sizes.sort(key=lambda item: (-item[1], item[0]))
+                        top_dirty = tuple(entry_sizes[:5])
+            except OSError:
+                pass
             return DigestInvalid(
                 "over_budget_artifact",
                 delta,
                 detail=BudgetBreakdown(
                     artifact_bytes=artifact_bytes,
                     cap=MAX_DIGEST_BYTES,
+                    manifest_bytes=manifest_bytes,
+                    body_bytes=body_bytes,
+                    top_dirty=top_dirty,
                 ),
             )
         artifact = _parse_manifest(candidate)
@@ -290,7 +318,11 @@ def evaluate(row: dict[str, Any], delta: SnapshotDelta) -> DigestDecision:
     if isinstance(observation, Disproven):
         return DigestPending(delta)
     if isinstance(observation, Unobservable):
-        return DigestUnobservable(cast(CoverageUnobs, observation.reason), delta)
+        detail: str | None = None
+        if observation.reason == "unhashable_entry":
+            unhashable_paths = [e.path for e in delta.entries if e.state == "unhashable"][:10]
+            detail = f"unhashable_paths={unhashable_paths}"
+        return DigestUnobservable(cast(CoverageUnobs, observation.reason), delta, detail=detail)
     if isinstance(observation, Proven):
         return DigestCovered(artifact)
     assert_never(observation)

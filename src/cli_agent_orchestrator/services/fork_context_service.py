@@ -725,10 +725,31 @@ def mark_ready(
     sha, hashes = captured.git_sha, captured.dirty_hashes()
     if captured.acquisition_error or not sha:
         raise ForkContextError(f"snapshot_{captured.acquisition_error or 'git-failure'}")
-    from cli_agent_orchestrator.services.base_digest_service import projected_manifest_bytes
+    from cli_agent_orchestrator.services.base_digest_service import (
+        MAX_DIGEST_BYTES,
+        projected_manifest_bytes,
+    )
 
     entry_count = len(captured.entries)
     manifest_bytes = projected_manifest_bytes(captured.entries)
+
+    if entry_count > 0:
+        logger.warning(
+            "base_registered_dirty base=%s dirty_files=%d projected_manifest=%d",
+            name,
+            entry_count,
+            manifest_bytes,
+        )
+
+    if manifest_bytes > MAX_DIGEST_BYTES * 0.8:
+        logger.warning(
+            "base_manifest_near_cap base=%s manifest_bytes=%d cap=%d dirty_files=%d "
+            "— consider .gitignoring noisy paths",
+            name,
+            manifest_bytes,
+            MAX_DIGEST_BYTES,
+            entry_count,
+        )
     row = register_provider_session(
         name=name,
         provider=provider,

@@ -5,13 +5,13 @@ from unittest.mock import patch
 
 import pytest
 
-from cli_agent_orchestrator.services import fork_context_service
-from cli_agent_orchestrator.services.fork_context_service import SnapshotDelta, SnapshotEntry
 from cli_agent_orchestrator.mcp_server.server import (
     list_base_sessions,
     mark_base_ready,
     unregister_base,
 )
+from cli_agent_orchestrator.services import fork_context_service
+from cli_agent_orchestrator.services.fork_context_service import SnapshotDelta, SnapshotEntry
 
 
 def test_ac11_mark_ready_computes_metrics_before_snapshot_state_is_lost(
@@ -268,3 +268,49 @@ async def test_ac11_manifest_warning_is_strictly_above_half_the_cap(
     assert response["entry_count"] == 3
     assert response["projected_manifest_bytes"] == projected_bytes
     assert ("manifest_budget_warning" in response) is warns
+
+
+@pytest.mark.asyncio
+async def test_f80_mark_base_ready_surfaces_dirty_file_count(monkeypatch):
+    """F80: MCP response includes dirty_file_count and manifest_warning."""
+    row = {
+        "name": "base",
+        "dirty_hashes": '{"a.py":"abc","b.py":"def","c.py":null}',
+        "_entry_count": 3,
+        "_projected_manifest_bytes": 100,
+    }
+    monkeypatch.setenv("CAO_TERMINAL_ID", "a1b2c3d4")
+    with (
+        patch("cli_agent_orchestrator.services.fork_context_service.mark_ready", return_value=row),
+        patch("cli_agent_orchestrator.mcp_server.server.requests.get") as mock_get,
+    ):
+        mock_get.return_value.json.return_value = {"caller_id": None}
+        response = await mark_base_ready("base")
+
+    assert response["success"] is True
+    assert response["dirty_file_count"] == 3
+    assert response["manifest_warning"] is None  # 100 is well below 80% of 12000
+
+
+@pytest.mark.asyncio
+async def test_f80_mark_base_ready_manifest_warning_near_cap(monkeypatch):
+    """F80: manifest_warning set when projected manifest exceeds 80% cap."""
+    from cli_agent_orchestrator.services.base_digest_service import MAX_DIGEST_BYTES
+
+    near_cap_bytes = int(MAX_DIGEST_BYTES * 0.81)
+    row = {
+        "name": "base",
+        "dirty_hashes": '{"a.py":"abc"}',
+        "_entry_count": 90,
+        "_projected_manifest_bytes": near_cap_bytes,
+    }
+    monkeypatch.setenv("CAO_TERMINAL_ID", "a1b2c3d4")
+    with (
+        patch("cli_agent_orchestrator.services.fork_context_service.mark_ready", return_value=row),
+        patch("cli_agent_orchestrator.mcp_server.server.requests.get") as mock_get,
+    ):
+        mock_get.return_value.json.return_value = {"caller_id": None}
+        response = await mark_base_ready("base")
+
+    assert response["manifest_warning"] == "near budget cap"
+    assert response["dirty_file_count"] == 90

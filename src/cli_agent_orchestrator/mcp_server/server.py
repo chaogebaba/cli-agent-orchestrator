@@ -1643,6 +1643,10 @@ async def mark_base_ready(
             "base": _serialize_provider_session(row),
             "entry_count": entry_count,
             "projected_manifest_bytes": projected_manifest_bytes,
+            "dirty_file_count": entry_count,
+            "manifest_warning": (
+                "near budget cap" if projected_manifest_bytes > MAX_DIGEST_BYTES * 0.8 else None
+            ),
             "callback": {"status": "not_applicable"},
         }
         if projected_manifest_bytes > MAX_DIGEST_BYTES / 2:
