@@ -108,6 +108,10 @@ def _native_memory_metadata(path: Path) -> tuple[str, str] | None:
         post = frontmatter.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, ValueError):
         return None
+    except Exception:
+        # yaml.YAMLError (ParserError, ScannerError) and any other frontmatter
+        # parse failure — skip gracefully; the file cannot contribute.
+        return None
     name = post.metadata.get("name")
     metadata = post.metadata.get("metadata")
     memory_type = metadata.get("type") if isinstance(metadata, dict) else None
