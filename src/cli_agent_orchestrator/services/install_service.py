@@ -78,6 +78,41 @@ _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _KIRO_MCP_TOOL_TIMEOUT_MS = 1_200_000
 
 
+def _inject_kiro_identity_env(
+    mcp_servers: Optional[Dict[str, object]],
+) -> Optional[Dict[str, object]]:
+    """Inject ``${VAR}`` identity env vars into EVERY mcpServers entry.
+
+    kiro-cli expands ``${VAR}`` syntax from its own process environment at MCP
+    spawn time.  The pane env carries CAO_TERMINAL_ID (set by tmux_client at
+    launch), so a single statically-installed base JSON serves every terminal
+    without per-terminal file copies.
+
+    Per F118 gate-fold D3: inject into ALL entries (not just cao-mcp-server)
+    because extra env vars are harmless to non-CAO servers and this removes any
+    matching-decision from the install path.
+    """
+    if not mcp_servers:
+        return mcp_servers
+
+    _IDENTITY_VARS = {
+        "CAO_TERMINAL_ID": "${CAO_TERMINAL_ID}",
+        "CAO_INSTANCE_ID": "${CAO_INSTANCE_ID}",
+        "CAO_ENDPOINT": "${CAO_ENDPOINT}",
+    }
+
+    result: Dict[str, object] = {}
+    for name, cfg in mcp_servers.items():
+        if not isinstance(cfg, dict):
+            result[name] = cfg
+            continue
+        env = dict(cfg.get("env") or {})
+        for key, val in _IDENTITY_VARS.items():
+            env.setdefault(key, val)
+        result[name] = {**cfg, "env": env}
+    return result
+
+
 def _inject_kiro_mcp_timeout(
     mcp_servers: Optional[Dict[str, object]],
 ) -> Optional[Dict[str, object]]:
@@ -403,7 +438,11 @@ def install_agent(
                 prompt=raw_prompt,
                 # Raise the cao-mcp-server tool-call timeout so kiro doesn't
                 # cancel long handoff RPCs client-side (see helper docstring).
-                mcpServers=_inject_kiro_mcp_timeout(profile.mcpServers),
+                # F118: inject ${VAR} identity env into every MCP entry so
+                # kiro-cli expands CAO_TERMINAL_ID et al from its pane env.
+                mcpServers=_inject_kiro_identity_env(
+                    _inject_kiro_mcp_timeout(profile.mcpServers)
+                ),
                 toolAliases=profile.toolAliases,
                 toolsSettings=profile.toolsSettings,
                 hooks=profile.hooks,

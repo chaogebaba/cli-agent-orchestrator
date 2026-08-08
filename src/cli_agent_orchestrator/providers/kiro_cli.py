@@ -17,9 +17,7 @@ The provider detects the following terminal states:
 - ERROR: Agent encountered an error during processing
 """
 
-import json
 import logging
-import os
 import re
 import shlex
 from pathlib import Path
@@ -38,8 +36,6 @@ from cli_agent_orchestrator.services.settings_service import (
     resolve_provider_string_option,
 )
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
-from cli_agent_orchestrator.utils.sandbox_guard import bind_mcp_server_identity
 from cli_agent_orchestrator.utils.terminal import (
     BlockedWaitPolicy,
     wait_for_shell,
@@ -281,38 +277,69 @@ class KiroCliProvider(BaseProvider):
             "model",
         )
 
-    def _write_per_terminal_agent_config(self) -> Path:
-        """Write a per-terminal kiro agent JSON with identity-bound MCP servers.
+    def _assert_kiro_identity_guard(self) -> None:
+        """F118 §7 loud identity guard — runs at the top of initialize().
 
-        kiro-cli resolves --agent by scanning ~/.kiro/agents/*.json for a matching
-        ``name`` field, so the per-terminal copy lives in KIRO_AGENTS_DIR with a
-        unique name derived from the terminal_id.
+        Raises on:
+        (a) Profile declares a provider != kiro_cli (misroute from explicit param).
+        (b) Base agent JSON missing (profile never installed for kiro → kiro_default).
         """
-        base_config_path = KIRO_AGENTS_DIR / f"{self._agent_profile.replace('/', '__')}.json"
-        config = json.loads(base_config_path.read_text(encoding="utf-8"))
-
-        # Set a per-terminal name so kiro-cli can find it via --agent <name>
-        per_terminal_name = f"cao-{self.terminal_id}"
-        config["name"] = per_terminal_name
-
-        if config.get("mcpServers"):
-            for server_name, server_cfg in config["mcpServers"].items():
-                config["mcpServers"][server_name] = bind_mcp_server_identity(
-                    resolve_mcp_server_config(server_cfg), self.terminal_id
+        # (a) Provider-routing mismatch: profile says it belongs to another provider.
+        try:
+            profile = load_agent_profile(self._agent_profile)
+            if profile.provider and profile.provider != "kiro_cli":
+                raise RuntimeError(
+                    f"Provider routing mismatch: profile '{self._agent_profile}' declares "
+                    f"provider='{profile.provider}' but was routed to kiro_cli. Refusing to "
+                    f"launch — fix the routing or the profile's provider field."
                 )
+        except (FileNotFoundError, RuntimeError) as exc:
+            # If we can't load the profile at all, that's fine for the mismatch
+            # check — the base-exists check below is what matters.
+            if "routing mismatch" in str(exc):
+                raise
+            logger.debug(
+                "Profile '%s' not loadable for mismatch check: %s",
+                self._agent_profile,
+                exc,
+            )
 
-        per_terminal = KIRO_AGENTS_DIR / f"{self.terminal_id}.kiro-agent.json"
-        # Write-temp-then-os.replace for atomicity
-        tmp_file = per_terminal.with_suffix(".tmp")
-        tmp_file.write_text(json.dumps(config, indent=2), encoding="utf-8")
-        os.replace(str(tmp_file), str(per_terminal))
-        return per_terminal
+        # (b) Base agent JSON must exist (installed by `cao install`).
+        base = KIRO_AGENTS_DIR / f"{self._agent_profile.replace('/', '__')}.json"
+        if not base.exists():
+            raise RuntimeError(
+                f"kiro base agent JSON missing: {base} (profile '{self._agent_profile}' has no "
+                f"installed kiro agent; re-run `cao install` for a kiro variant, or fix the "
+                f"provider routing). Refusing to launch unprofiled kiro_default."
+            )
 
-    def _apply_per_terminal_agent(self, command: list[str], agent_path: Path) -> list[str]:
-        """Replace the `--agent <name>` value with the per-terminal agent name."""
-        i = command.index("--agent")
-        command[i + 1] = f"cao-{self.terminal_id}"
-        return command
+    def _assert_postlaunch_identity(self) -> None:
+        """F118 §7.2 post-launch assertion — verify status bar shows expected agent.
+
+        Polls the pane buffer for the kiro not-found banner or kiro_default status.
+        Raises on mismatch so the launch fails loudly instead of running unprofiled.
+        """
+        pane_content = get_backend().capture_viewport(self.session_name, self.window_name)
+        if not pane_content:
+            return  # No content yet — skip (timeout will catch real failures)
+
+        # Check for the "agent not found" banner
+        not_found_pattern = r'agent ".*?" not found, using "kiro_default"'
+        if re.search(not_found_pattern, pane_content):
+            raise RuntimeError(
+                f"kiro-cli launched with kiro_default (agent '{self._agent_profile}' not found "
+                f"in kiro registry). The base agent JSON may be corrupt or the name field "
+                f"doesn't match. Re-run `cao install`."
+            )
+
+        # Check the TUI header for agent name — if it shows a different agent, fail.
+        # Only assert if we can positively see the header (absence is not a failure).
+        if re.search(r"kiro_default\s+·", pane_content):
+            raise RuntimeError(
+                f"kiro-cli status bar shows 'kiro_default' instead of "
+                f"'{self._agent_profile}'. The agent JSON name field may not match "
+                f"the profile name. Re-run `cao install`."
+            )
 
     async def initialize(self) -> bool:
         """Initialize Kiro CLI provider by starting kiro-cli chat command.
@@ -329,6 +356,9 @@ class KiroCliProvider(BaseProvider):
             TimeoutError: If shell or Kiro CLI initialization times out
         """
         from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        # F118 §7: Loud identity guard — fail fast on misroute or missing base JSON.
+        self._assert_kiro_identity_guard()
 
         # Step 1: Wait for shell prompt to appear in the tmux window
         # This ensures the terminal is ready before we send commands
@@ -388,9 +418,6 @@ class KiroCliProvider(BaseProvider):
                 model=model,
                 yolo=True,
             )
-        # Write per-terminal agent JSON with identity-bound MCP servers
-        per_terminal_agent = self._write_per_terminal_agent_config()
-        self._apply_per_terminal_agent(base_args, per_terminal_agent)
         command = shlex.join(base_args)
         # Arm the StatusMonitor stickiness gate before launching the CLI so
         # the IDLE → PROCESSING → IDLE/COMPLETED transition is honored.
@@ -457,7 +484,6 @@ class KiroCliProvider(BaseProvider):
                 yolo=True,
                 legacy_ui=True,
             )
-            self._apply_per_terminal_agent(legacy_args, per_terminal_agent)
             legacy_command = shlex.join(legacy_args)
             status_monitor.notify_input_sent(self.terminal_id)
             get_backend().send_keys(self.session_name, self.window_name, legacy_command)
@@ -478,6 +504,9 @@ class KiroCliProvider(BaseProvider):
                 raise TimeoutError(
                     f"Kiro CLI initialization timed out with TUI and `--legacy-ui`{suffix}"
                 )
+
+        # F118 §7.2: Post-launch identity assertion — catch kiro_default fallback.
+        self._assert_postlaunch_identity()
 
         self._initialized = True
         return True
@@ -1009,6 +1038,3 @@ class KiroCliProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up Kiro CLI provider."""
         self._initialized = False
-        # Remove per-terminal agent JSON written by _write_per_terminal_agent_config
-        per_terminal = KIRO_AGENTS_DIR / f"{self.terminal_id}.kiro-agent.json"
-        per_terminal.unlink(missing_ok=True)
