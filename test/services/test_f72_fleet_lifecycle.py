@@ -991,3 +991,40 @@ def test_ac15_barrier_cancelled_before_terminal_row_removed(f72_env):
         # The held row was released to PENDING (member release)
         row = db.query(InboxModel).filter(InboxModel.message.contains("barrier-held")).one()
         assert row.status == MessageStatus.PENDING.value
+
+
+def test_ac14_cascade_parent_with_n_children_leaves_zero_held_rows(f72_env):
+    """AC#14: A cascade reap of a parent with N children leaves zero held rows
+    across all N+1 terminals — the amplification case."""
+    sessions, backend = f72_env
+    add_terminal(backend, "11111111")
+    seed_mailbox(sessions, "11111111")
+    add_terminal(backend, "22222222", "11111111")
+    # Four children of 22222222 (the drill's exact shape)
+    for tid in ("33333333", "44444444", "55555555", "66666666"):
+        add_terminal(backend, tid, "22222222")
+    # Seed held rows on parent and all four children
+    with sessions.begin() as db:
+        for receiver_id in ("22222222", "33333333", "44444444", "55555555", "66666666"):
+            db.add(
+                InboxModel(
+                    sender_id="11111111",
+                    receiver_id=receiver_id,
+                    message=f"held-{receiver_id}",
+                    orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+                    status=MessageStatus.HELD.value,
+                )
+            )
+
+    terminal_service.delete_terminal("22222222", caller_id="11111111")
+
+    with sessions() as db:
+        held_rows = db.query(InboxModel).filter(InboxModel.status == MessageStatus.HELD.value).all()
+        assert held_rows == [], f"Expected zero HELD rows, got {len(held_rows)}"
+        # All rows should be re-addressed to the surviving ancestor
+        all_rows = db.query(InboxModel).all()
+        assert len(all_rows) == 5
+        for row in all_rows:
+            assert row.receiver_id == "11111111"
+            assert row.logical_receiver_id == "mb_11111111"
+            assert row.status == MessageStatus.PENDING.value
