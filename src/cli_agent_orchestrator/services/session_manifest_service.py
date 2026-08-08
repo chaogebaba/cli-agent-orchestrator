@@ -74,6 +74,35 @@ def build_session_manifest(session_name: str, terminal_id: str | None = None) ->
     if not raw_terminals and sections["terminals"] == "ok":
         raise ValueError(f"Session '{session_name}' not found")
 
+    # Filter out terminals whose pane is dead (D1: dead-pane exclusion)
+    # Only filter when the tmux session exists but the specific window is gone.
+    try:
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        backend = get_backend()
+        live_terminals: list[dict[str, Any]] = []
+        _session_alive_cache: dict[str, bool] = {}
+        for item in raw_terminals:
+            tmux_session = item.get("tmux_session", "")
+            window = item.get("tmux_window", "")
+            if tmux_session and window:
+                if tmux_session not in _session_alive_cache:
+                    try:
+                        _session_alive_cache[tmux_session] = backend.session_exists(tmux_session)
+                    except Exception:
+                        _session_alive_cache[tmux_session] = False
+                if _session_alive_cache.get(tmux_session, False):
+                    try:
+                        liveness = backend.window_liveness(tmux_session, window)
+                    except Exception:
+                        liveness = "error"
+                    if liveness == "gone":
+                        continue  # dead pane — exclude from manifest
+            live_terminals.append(item)
+        raw_terminals = live_terminals
+    except Exception:
+        pass  # backend unavailable — skip dead-pane filter
+
     def terminals() -> list[dict[str, Any]]:
         rows = []
         from cli_agent_orchestrator.services.terminal_service import get_working_directory

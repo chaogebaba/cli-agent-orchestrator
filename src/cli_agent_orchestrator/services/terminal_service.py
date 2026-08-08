@@ -2515,8 +2515,13 @@ async def _prepare_fork_refresh(
                         caller_id,
                         base_name,
                         base_digest_service.state_key(decision.delta),
-                        "A covered digest artifact is required before refresh.",
+                        (
+                            "A covered digest artifact is required before refresh."
+                            if row.get("digest_head")
+                            else "Base has never published a digest."
+                        ),
                         deadline=deadline,
+                        genesis=row.get("digest_head") is None,
                     )
                 except Exception:
                     logger.exception("digest_pending_notice_failed base=%s", base_name)

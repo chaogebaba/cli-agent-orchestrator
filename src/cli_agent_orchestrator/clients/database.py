@@ -4929,6 +4929,8 @@ def create_digest_pending_notice(
     base: str,
     state_key: str,
     body: str,
+    *,
+    genesis: bool = False,
 ) -> InboxMessage | None:
     """Insert one parked digest-pending notice, deduplicated by its first line.
 
@@ -4937,7 +4939,9 @@ def create_digest_pending_notice(
     callback-barrier members.
     """
     sender_id = f"cao-digest:{base}"
-    header = f"[CAO DIGEST-PENDING] base={base} key={state_key}\n"
+    qualifier = "genesis" if genesis else ""
+    tag = f": {qualifier}" if qualifier else ""
+    header = f"[CAO DIGEST-PENDING{tag}] base={base} key={state_key}\n"
     with SessionLocal() as db:
         db.execute(text("BEGIN IMMEDIATE"))
         try:

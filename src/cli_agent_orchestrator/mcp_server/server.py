@@ -1650,6 +1650,38 @@ async def mark_base_ready(
                 f"Projected digest manifest is {projected_manifest_bytes} bytes "
                 f"of the {MAX_DIGEST_BYTES}-byte cap."
             )
+        # A6: auto-publish genesis digest on clean tree with zero prior digests
+        try:
+            from cli_agent_orchestrator.services.base_digest_service import (
+                get_digest_head,
+                publish_genesis_digest,
+            )
+
+            cwd = row.get("cwd")
+            digest_head = get_digest_head(name)
+            if digest_head is None and cwd:
+                porcelain = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                tree_clean = porcelain.returncode == 0 and not porcelain.stdout.strip()
+                if tree_clean:
+                    publish_genesis_digest(name, cwd)
+                    logger.info("genesis_digest_auto_published base=%s", name)
+                    result["genesis_digest"] = "published"
+                else:
+                    logger.warning(
+                        "genesis_digest_skipped_dirty base=%s dirty_files=%d",
+                        name,
+                        len(porcelain.stdout.strip().splitlines()),
+                    )
+                    result["genesis_digest"] = "skipped_dirty"
+        except Exception as genesis_exc:
+            logger.warning("genesis_digest_auto_publish_failed base=%s: %s", name, genesis_exc)
+            result["genesis_digest"] = f"failed:{genesis_exc}"
         try:
             terminal_response = cao_http.get(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
             terminal_response.raise_for_status()

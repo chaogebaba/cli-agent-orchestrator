@@ -23,7 +23,6 @@ from cli_agent_orchestrator.models.observation import (
     Proven,
     Unobservable,
 )
-
 from cli_agent_orchestrator.services.fork_context_service import (
     SnapshotDelta,
     SnapshotEntry,
@@ -377,3 +376,45 @@ def refresh_prompt(artifact: BaseDigestArtifact) -> str:
         "Ingest it as your updated general project context; do no unrelated work "
         "and reply only after the refresh is complete."
     )
+
+
+def get_digest_head(base_name: str) -> str | None:
+    """Return the current digest_head SHA for a base, or None if no digest published."""
+    from cli_agent_orchestrator.clients.database import get_ready_provider_session
+
+    row = get_ready_provider_session(base_name)
+    if row is None:
+        return None
+    return row.get("digest_head")
+
+
+def publish_genesis_digest(base_name: str, cwd: str) -> BaseDigestArtifact:
+    """Publish a zero-entry genesis digest for a fresh base on a clean tree.
+
+    The genesis digest has parent_artifact_sha='genesis' and an empty entry set,
+    establishing the lineage root for all future digests.
+    """
+    delta = SnapshotDelta(git_sha=None, entries=())
+    artifact = publish(
+        base=base_name,
+        cwd=cwd,
+        parent_artifact_sha=None,
+        delta=delta,
+        body="Genesis digest: base registered with clean worktree.\n",
+        round_number=0,
+    )
+    # Update the base row's digest_head to the new artifact SHA
+    from cli_agent_orchestrator.clients.database import (
+        get_ready_provider_session,
+        update_provider_session_snapshot,
+    )
+
+    row = get_ready_provider_session(base_name)
+    if row is not None:
+        update_provider_session_snapshot(
+            row["id"],
+            git_sha=row.get("git_sha"),
+            dirty_hashes=row.get("dirty_hashes", "{}"),
+            digest_head=artifact.artifact_sha,
+        )
+    return artifact

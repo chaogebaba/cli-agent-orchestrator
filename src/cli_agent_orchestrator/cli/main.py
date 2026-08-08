@@ -8,6 +8,7 @@ from cli_agent_orchestrator.cli.commands.agents import agents
 from cli_agent_orchestrator.cli.commands.barrier import barrier
 from cli_agent_orchestrator.cli.commands.base import base
 from cli_agent_orchestrator.cli.commands.config import config
+from cli_agent_orchestrator.cli.commands.doctor import doctor
 from cli_agent_orchestrator.cli.commands.env import env
 from cli_agent_orchestrator.cli.commands.fold import fold
 from cli_agent_orchestrator.cli.commands.info import info
@@ -51,6 +52,7 @@ cli.add_command(profile)
 cli.add_command(agents)
 cli.add_command(base)
 cli.add_command(barrier)
+cli.add_command(doctor)
 cli.add_command(launch)
 cli.add_command(config)
 cli.add_command(init)
