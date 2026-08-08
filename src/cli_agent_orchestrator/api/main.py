@@ -147,11 +147,11 @@ from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.mailbox_service import MailboxDomainError
-from cli_agent_orchestrator.services.receiver_state_view import activate_native_publisher
-from cli_agent_orchestrator.services.stalled_callback_watchdog import stalled_callback_watchdog
 from cli_agent_orchestrator.services.profile_search import (
     DEFAULT_LIMIT as PROFILE_SEARCH_DEFAULT_LIMIT,
 )
+from cli_agent_orchestrator.services.receiver_state_view import activate_native_publisher
+from cli_agent_orchestrator.services.stalled_callback_watchdog import stalled_callback_watchdog
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_guard_service import (
@@ -945,6 +945,14 @@ async def lifespan(app: FastAPI):
         logger.exception("Startup stale terminal purge failed; deferring to next boot")
     else:
         logger.info("purged %d stale terminals", purged)
+
+    # F77: repair orphaned lifecycle pointers (idempotent)
+    try:
+        from cli_agent_orchestrator.clients.database import _migrate_f77_lifecycle_pointers
+
+        _migrate_f77_lifecycle_pointers()
+    except Exception:
+        logger.exception("F77 lifecycle-pointer migration failed; deferring to next boot")
 
     # Run cleanup in background
     asyncio.create_task(asyncio.to_thread(cleanup_old_data))

@@ -1428,6 +1428,54 @@ def _backfill_legacy_related_keys(conn: Any) -> None:
         )
 
 
+def _migrate_f77_lifecycle_pointers() -> None:
+    """F77 data-repair: terminalize orphaned lifecycle pointers (idempotent).
+
+    1. AWAITING barrier members under non-OPEN barriers → FAILED(barrier_closed_historical)
+    2. PENDING inbox rows whose receiver_id is gone AND logical_receiver_id is a mailbox
+       → DELIVERY_FAILED(receiver_gone_historical)
+    """
+    with SessionLocal.begin() as db:
+        # (1) Stranded AWAITING members under already-closed barriers
+        from sqlalchemy import and_
+
+        subq = (
+            db.query(CallbackBarrierMemberModel.id)
+            .join(
+                CallbackBarrierModel,
+                CallbackBarrierMemberModel.barrier_id == CallbackBarrierModel.id,
+            )
+            .filter(
+                CallbackBarrierMemberModel.state == "AWAITING",
+                CallbackBarrierModel.state != "OPEN",
+            )
+            .subquery()
+        )
+        db.query(CallbackBarrierMemberModel).filter(
+            CallbackBarrierMemberModel.id.in_(subq.select())
+        ).update(
+            {
+                CallbackBarrierMemberModel.state: "FAILED",
+                CallbackBarrierMemberModel.failure_class: "barrier_closed_historical",
+            },
+            synchronize_session=False,
+        )
+
+        # (2) Stranded PENDING inbox rows addressed to dead terminals via mailbox
+        dead_pending = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.logical_receiver_id.isnot(None),
+                ~InboxModel.receiver_id.in_(db.query(TerminalModel.id)),
+            )
+            .all()
+        )
+        for row in dead_pending:
+            row.status = MessageStatus.DELIVERY_FAILED.value
+            row.failure_reason = "receiver_gone_historical"
+
+
 def _migrate_workflow_index() -> None:
     """Create/upgrade the derived ``workflow_index`` table (issue #312, N2).
 
@@ -2232,6 +2280,7 @@ def terminal_exists(terminal_id: str) -> bool:
         return (
             db.query(TerminalModel.id).filter(TerminalModel.id == terminal_id).first() is not None
         )
+
 
 def update_terminal_group(terminal_id: str, group: Optional[List[str]]) -> bool:
     """Replace a terminal's group array. ``None``/``[]`` clears it (opts out of discovery)."""
@@ -3102,6 +3151,12 @@ def delete_terminal_and_warm_intent(
             barrier.state = "CANCELLED"
             barrier.close_reason = "owner_gone"
             barrier.fired_at = now
+
+        # FAM-1: nullify mailbox authority when this terminal is the current incarnation
+        db.query(MailboxModel).filter(MailboxModel.current_terminal_id == terminal_id).update(
+            {MailboxModel.current_terminal_id: None},
+            synchronize_session=False,
+        )
 
         _mark_barrier_member_gone_in_db(db, terminal_id)
         child_values = {
@@ -4294,7 +4349,18 @@ def _resolve_barrier_owner_or_none(db: Any, barrier: Any) -> tuple[str, str | No
         mailbox = db.query(MailboxModel).filter_by(id=barrier.owner_mailbox_id).one_or_none()
         if mailbox is None:
             return None
-        return (str(mailbox.current_terminal_id or mailbox.id), str(mailbox.id))
+        # FAM-2: verify the cached terminal still exists
+        if mailbox.current_terminal_id is not None:
+            exists = (
+                db.query(TerminalModel.id)
+                .filter(TerminalModel.id == mailbox.current_terminal_id)
+                .scalar()
+            )
+            if exists is None:
+                return None  # owner's terminal is dead
+        else:
+            return None  # no current incarnation
+        return (str(mailbox.current_terminal_id), str(mailbox.id))
     owner_terminal_id = barrier.owner_terminal_id
     exists = db.query(TerminalModel.id).filter(TerminalModel.id == owner_terminal_id).scalar()
     if exists is None:
@@ -4330,6 +4396,17 @@ def _close_barrier_owner_gone_in_db(db: Any, barrier: Any, now: datetime) -> Non
         {
             InboxModel.status: MessageStatus.CANCELLED.value,
             InboxModel.failure_reason: "barrier_owner_gone",
+        },
+        synchronize_session=False,
+    )
+    # FAM-3: terminalize AWAITING members on owner-gone close
+    db.query(CallbackBarrierMemberModel).filter(
+        CallbackBarrierMemberModel.barrier_id == barrier.id,
+        CallbackBarrierMemberModel.state == "AWAITING",
+    ).update(
+        {
+            CallbackBarrierMemberModel.state: "FAILED",
+            CallbackBarrierMemberModel.failure_class: "barrier_owner_gone",
         },
         synchronize_session=False,
     )
@@ -4390,6 +4467,17 @@ def _fire_open_barrier_in_db(
     )
     if changed != 1:
         return None
+    # FAM-3: terminalize AWAITING members that didn't arrive before close
+    db.query(CallbackBarrierMemberModel).filter(
+        CallbackBarrierMemberModel.barrier_id == barrier.id,
+        CallbackBarrierMemberModel.state == "AWAITING",
+    ).update(
+        {
+            CallbackBarrierMemberModel.state: "FAILED",
+            CallbackBarrierMemberModel.failure_class: f"barrier_closed_{close_reason}",
+        },
+        synchronize_session=False,
+    )
     members = (
         db.query(CallbackBarrierMemberModel)
         .filter_by(barrier_id=barrier.id)
@@ -4680,6 +4768,17 @@ def cancel_callback_barrier(
         barrier.state = "CANCELLED"
         barrier.close_reason = "cancelled"
         barrier.fired_at = _barrier_now()
+        # FAM-3: terminalize AWAITING members on cancel
+        db.query(CallbackBarrierMemberModel).filter(
+            CallbackBarrierMemberModel.barrier_id == barrier.id,
+            CallbackBarrierMemberModel.state == "AWAITING",
+        ).update(
+            {
+                CallbackBarrierMemberModel.state: "FAILED",
+                CallbackBarrierMemberModel.failure_class: "barrier_closed_cancel",
+            },
+            synchronize_session=False,
+        )
         return {
             "id": int(barrier.id),
             "state": barrier.state,
