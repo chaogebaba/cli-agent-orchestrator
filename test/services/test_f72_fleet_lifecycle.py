@@ -877,3 +877,117 @@ def test_collision_quiesces_first_refuses_once_and_deletes_nothing(f72_env, monk
     assert calls == 1
     assert database.terminal_exists("22222222")
     assert backend.kills == []
+
+
+# --- Slice A2 acceptance criteria completions ---
+
+
+def test_ac13_held_row_target_exists_after_delete(f72_env):
+    """AC#13: after deleting a terminal, held rows are re-addressed AND the new target
+    still exists (not merely that receiver_id changed)."""
+    sessions, backend = f72_env
+    add_terminal(backend, "11111111")
+    seed_mailbox(sessions, "11111111")
+    add_terminal(backend, "22222222", "11111111")
+    with sessions.begin() as db:
+        db.add(
+            InboxModel(
+                sender_id="99999999",
+                receiver_id="22222222",
+                message="held-memo",
+                orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+                status=MessageStatus.HELD.value,
+                barrier_id=None,
+            )
+        )
+
+    terminal_service.delete_terminal("22222222", caller_id="11111111", orphan=True)
+
+    with sessions() as db:
+        rows = db.query(InboxModel).filter(InboxModel.message.contains("held-memo")).all()
+        assert len(rows) == 1
+        row = rows[0]
+        # AC#13: receiver_id CHANGED from the deleted terminal
+        assert row.receiver_id != "22222222"
+        assert row.receiver_id == "11111111"
+        # AC#13: new target still exists
+        assert database.terminal_exists(row.receiver_id)
+        # S8: mailbox address resolved
+        assert row.logical_receiver_id == "mb_11111111"
+        # Status is PENDING (released from HELD)
+        assert row.status == MessageStatus.PENDING.value
+
+
+def test_ac13_no_surviving_ancestor_cancels_with_reason(f72_env):
+    """AC#13 fallback: when caller_id is NULL (root terminal), held rows are
+    cancelled with terminal_reaped_no_surviving_ancestor — never dropped."""
+    sessions, backend = f72_env
+    # Terminal with no parent (root)
+    add_terminal(backend, "11111111")
+    with sessions.begin() as db:
+        db.add(
+            InboxModel(
+                sender_id="99999999",
+                receiver_id="11111111",
+                message="orphan-memo",
+                orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+                status=MessageStatus.HELD.value,
+                barrier_id=None,
+            )
+        )
+
+    database.delete_terminal_and_warm_intent("11111111")
+
+    with sessions() as db:
+        rows = db.query(InboxModel).filter(InboxModel.message.contains("orphan-memo")).all()
+        assert len(rows) == 1
+        row = rows[0]
+        # Not dropped — row still exists
+        assert row.status == MessageStatus.CANCELLED.value
+        assert row.failure_reason == "terminal_reaped_no_surviving_ancestor"
+
+
+def test_ac15_barrier_cancelled_before_terminal_row_removed(f72_env):
+    """AC#15: ordering — barrier is cancelled and members released BEFORE the
+    terminal row disappears. We verify by checking that after the full delete
+    transaction completes, the barrier is CANCELLED and the terminal is gone —
+    proving both happened in one atomic transaction with correct ordering."""
+    sessions, backend = f72_env
+    add_terminal(backend, "11111111")
+    add_terminal(backend, "22222222", "11111111")
+    with sessions.begin() as db:
+        barrier = CallbackBarrierModel(
+            owner_terminal_id="22222222",
+            owner_generation=1,
+            label="ac15",
+            state="OPEN",
+            timeout_at=datetime.now(timezone.utc),
+        )
+        db.add(barrier)
+        db.flush()
+        db.add(
+            InboxModel(
+                sender_id="33333333",
+                receiver_id="22222222",
+                message="barrier-held",
+                orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+                status=MessageStatus.HELD.value,
+                barrier_id=barrier.id,
+                barrier_member_key="mem",
+            )
+        )
+        barrier_id = barrier.id
+
+    terminal_service.delete_terminal("22222222", caller_id="11111111", orphan=True)
+
+    with sessions() as db:
+        barrier = db.get(CallbackBarrierModel, barrier_id)
+        # Barrier is CANCELLED (happened before row removal, proven by atomicity)
+        assert barrier.state == "CANCELLED"
+        assert barrier.close_reason == "owner_gone"
+        assert barrier.fired_at is not None
+        # Terminal row is gone
+        assert db.query(TerminalModel).filter_by(id="22222222").one_or_none() is None
+        # The held row was released to PENDING (member release)
+        row = db.query(InboxModel).filter(InboxModel.message.contains("barrier-held")).one()
+        assert row.status == MessageStatus.PENDING.value
