@@ -20,6 +20,7 @@ The provider detects the following terminal states:
 import logging
 import re
 import shlex
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -142,6 +143,17 @@ TUI_PERMISSION_PATTERN = (
 # Matches the footer navigation chrome to avoid false positives on warning text in agent output.
 # Must be anchored to bottom screen region (see get_status WAITING check) to avoid stale matches.
 TUI_TRUST_ALL_TOOLS_FOOTER = r"esc to cancel · ↑↓ to navigate · ↵ to select"
+
+# Distinctive consent-dialog body text. TUI_TRUST_ALL_TOOLS_FOOTER above is
+# kiro's GENERIC list-selector chrome — an update/login/onboarding selector
+# renders it identically — so before answering we require this trust-specific
+# line, and require the ❯ cursor to sit on "No, exit" so Down lands on
+# "Yes, I accept" (not "Yes, and don't ask again"). Anything else fails closed.
+TUI_TRUST_ALL_TOOLS_BODY = r"Kiro is running in trust all tools mode"
+TUI_TRUST_ALL_TOOLS_CURSOR = r"❯\s*No, exit"
+
+# Bottom pane lines scanned for the consent dialog (mirrors codex's window).
+STARTUP_PROMPT_BOTTOM_LINES = 15
 
 # =============================================================================
 # Error Detection
@@ -446,13 +458,10 @@ class KiroCliProvider(BaseProvider):
             on_first_blocked=notify_blocked,
         )
 
-        init_timeout = float(get_server_settings()["provider_init_timeout"])
-        if not await wait_until_status(
-            self.terminal_id,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=init_timeout,
-            blocked_policy=blocked_policy,
-        ):
+        # _wait_ready_accepting_trust_dialog also auto-answers the
+        # --trust-all-tools startup consent dialog (see its docstring), which
+        # kiro-cli >= 2.1 shows in the default TUI *and* under --legacy-ui.
+        if not await self._wait_ready_accepting_trust_dialog(blocked_policy=blocked_policy):
             if yolo:
                 # Yolo already launched with --legacy-ui; no further fallback.
                 suffix = (
@@ -490,12 +499,7 @@ class KiroCliProvider(BaseProvider):
             # Reset last_blocked_rule so a rule from the first wait doesn't
             # falsely label a second-wait timeout that never parked (fold r1/D1).
             blocked_policy.last_blocked_rule = None
-            if not await wait_until_status(
-                self.terminal_id,
-                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-                timeout=float(get_server_settings()["provider_init_timeout"]),
-                blocked_policy=blocked_policy,
-            ):
+            if not await self._wait_ready_accepting_trust_dialog(blocked_policy=blocked_policy):
                 suffix = (
                     f" after blocked wait rule '{blocked_policy.last_blocked_rule}'"
                     if blocked_policy.last_blocked_rule
@@ -516,6 +520,106 @@ class KiroCliProvider(BaseProvider):
             "interactive_dialog"
             if self.get_status_from_screen(rows) == TerminalStatus.WAITING_USER_ANSWER
             else None
+        )
+
+    async def _wait_ready_accepting_trust_dialog(
+        self, *, blocked_policy: "BlockedWaitPolicy | None" = None
+    ) -> bool:
+        """Wait for the agent prompt, auto-answering the trust-all-tools dialog.
+
+        CAO always launches kiro-cli with ``--trust-all-tools`` (there is no
+        human at the terminal to answer per-tool permission prompts in headless
+        orchestration; CAO enforces tool scoping at its own profile/MCP layers).
+        Since kiro-cli 2.1, ``--trust-all-tools`` opens a one-time startup
+        consent dialog *before* the chat prompt is interactive:
+
+            ❯ No, exit
+              Yes, I accept
+              Yes, and don't ask again
+
+        The default TUI shows this dialog on kiro-cli 2.16.1 (verified), so the
+        earlier "force --legacy-ui to skip it" workaround no longer helps and
+        init just times out on the dialog. This helper is applied to the
+        ``--legacy-ui`` fallback path too, so if a kiro build shows the dialog
+        there as well it is handled without a version check. get_status()
+        classifies the dialog as WAITING_USER_ANSWER off generic selector
+        chrome, so before answering we VERIFY the dialog body and the ❯ cursor
+        line (fail closed on anything else), then select **"Yes, I accept"**
+        (Down, Enter) — the one-line-down option. We deliberately do NOT pick
+        "Yes, and don't ask again", which would persist a trust-all-tools
+        bypass into the user's kiro config; CAO's acceptance is scoped to this
+        ephemeral session only.
+
+        Returns:
+            True if the terminal reached IDLE or COMPLETED (dialog answered if
+            it was verified and shown), False if it timed out or a
+            WAITING_USER_ANSWER could not be verified as the consent dialog.
+        """
+        init_timeout = float(get_server_settings()["provider_init_timeout"])
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        start = time.monotonic()
+        ready = await wait_until_status(
+            self.terminal_id,
+            {
+                TerminalStatus.IDLE,
+                TerminalStatus.COMPLETED,
+                TerminalStatus.WAITING_USER_ANSWER,
+            },
+            timeout=init_timeout,
+            blocked_policy=blocked_policy,
+        )
+        if not ready:
+            return False
+        # Ready-flap window: wait_until_status returned on WAITING_USER_ANSWER,
+        # but get_status is re-read here rather than trusted from the wait. If it
+        # has since flapped to IDLE/COMPLETED, treat the terminal as ready and do
+        # NOT send dialog keys (a blind Down+Enter into a live prompt would be a
+        # stray message). Low probability given the sticky latch, but explicit.
+        if status_monitor.get_status(self.terminal_id) != TerminalStatus.WAITING_USER_ANSWER:
+            return True
+
+        # WAITING_USER_ANSWER is classified from TUI_TRUST_ALL_TOOLS_FOOTER,
+        # which is kiro's GENERIC list-selector chrome. Verify the dialog BODY
+        # and the ❯ cursor position before answering — a blind Down+Enter on
+        # some other startup selector would pick an arbitrary option. Same
+        # fail-closed shape as codex's directory-trust check. On any mismatch,
+        # fall through to the normal timeout/fallback path.
+        backend = get_backend()
+        pane = strip_terminal_escapes(
+            re.sub(ANSI_CODE_PATTERN, "", backend.get_history(self.session_name, self.window_name))
+        )
+        bottom = "\n".join(pane.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+        if not (
+            re.search(TUI_TRUST_ALL_TOOLS_BODY, bottom)
+            and re.search(TUI_TRUST_ALL_TOOLS_CURSOR, bottom)
+        ):
+            logger.warning(
+                "kiro_cli: WAITING_USER_ANSWER but the trust-all-tools consent "
+                "dialog (body + '❯ No, exit') was not verified; not answering"
+            )
+            return False
+
+        # Verified consent dialog: cursor on "No, exit", so Down lands on
+        # "Yes, I accept" (session-scoped — NOT "Yes, and don't ask again").
+        logger.info(
+            "kiro_cli: answering --trust-all-tools startup consent dialog "
+            "with 'Yes, I accept' (session-scoped)"
+        )
+        # Arm the PROCESSING latch before the keystrokes, like every other
+        # send_special_key path, so answering the dialog isn't blocked by the
+        # WAITING_USER_ANSWER we just observed.
+        status_monitor.notify_input_sent(self.terminal_id)
+        backend.send_special_key(self.session_name, self.window_name, "Down")
+        backend.send_special_key(self.session_name, self.window_name, "Enter")
+        # Bound the post-accept wait by the time already spent, so total startup
+        # stays within provider_init_timeout rather than up to 2x it.
+        remaining = max(0.0, init_timeout - (time.monotonic() - start))
+        return await wait_until_status(
+            self.terminal_id,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=remaining,
+            blocked_policy=blocked_policy,
         )
 
     def get_status(self, output: str) -> TerminalStatus:
