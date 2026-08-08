@@ -88,6 +88,7 @@ class TestCreateSession:
 
         with patch(
             "cli_agent_orchestrator.services.terminal_service.seed_resume_bootstrap",
+            new_callable=AsyncMock,
             return_value=None,
         ):
             await create_session(
@@ -214,7 +215,7 @@ class TestCreateSession:
         )
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.terminal_service.seed_resume_bootstrap",
-            lambda *_args, **_kwargs: None,
+            AsyncMock(return_value=None),
         )
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.inbox_service.terminal_service.send_prepared_input",
@@ -294,6 +295,7 @@ class TestCreateSession:
     @pytest.mark.asyncio
     @patch(
         "cli_agent_orchestrator.services.terminal_service.seed_resume_bootstrap",
+        new_callable=AsyncMock,
         return_value=None,
     )
     @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")

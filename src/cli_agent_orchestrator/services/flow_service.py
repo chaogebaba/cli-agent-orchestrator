@@ -303,7 +303,7 @@ async def execute_flow(name: str) -> bool:
             get_backend().kill_session(session_name)
         from cli_agent_orchestrator.services.terminal_service import seed_resume_bootstrap
 
-        fork_context = seed_resume_bootstrap(flow.agent_profile, flow.provider, os.getcwd())
+        fork_context = await seed_resume_bootstrap(flow.agent_profile, flow.provider, os.getcwd())
         terminal = await create_terminal(
             session_name=session_name,
             provider=flow.provider,

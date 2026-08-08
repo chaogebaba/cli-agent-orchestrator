@@ -3694,3 +3694,39 @@ class TestCodexProviderBlocksOrchestratedInputWhileWaitingUserAnswer:
         mock_tmux.send_keys.assert_not_called()
         mock_settle.assert_not_called()  # worker left alive, not torn down
         mock_create_inbox.assert_called()  # task queued for later delivery
+
+
+class TestMCPInterruptNotBlockingIdle:
+    """C5: MCP-interrupt bullet lines should not block IDLE classification."""
+
+    def test_mcp_interrupt_bullet_does_not_block_idle(self):
+        """Codex startup with MCP-interrupt text + footer + idle prompt → IDLE."""
+        output = (
+            "OpenAI Codex (v0.145.0)\n"
+            "  • MCP startup interrupted: cao-mcp-server\n"
+            "  • MCP startup interrupted: another-server\n"
+            "› \n"
+            "  gpt-5.6-sol medium · Context 100% left\n"
+        )
+        assert _has_startup_idle_composer(output) is True
+
+    def test_genuine_activity_bullet_still_blocks_idle(self):
+        """A real activity bullet (not MCP-interrupt) should still block IDLE."""
+        output = (
+            "OpenAI Codex (v0.145.0)\n"
+            "  • Reading file src/main.py\n"
+            "› \n"
+            "  gpt-5.6-sol medium · Context 100% left\n"
+        )
+        assert _has_startup_idle_composer(output) is False
+
+    def test_mcp_interrupt_mixed_with_activity_blocks_idle(self):
+        """Mixed MCP-interrupt + real activity → still blocked."""
+        output = (
+            "OpenAI Codex (v0.145.0)\n"
+            "  • MCP startup interrupted: cao-mcp-server\n"
+            "  • Writing to disk...\n"
+            "› \n"
+            "  gpt-5.6-sol medium · Context 100% left\n"
+        )
+        assert _has_startup_idle_composer(output) is False

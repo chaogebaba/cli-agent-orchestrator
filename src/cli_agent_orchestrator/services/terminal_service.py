@@ -227,7 +227,7 @@ def _preflight_disk_space(path: str, floor_gb: float = DISK_SPACE_FLOOR_GB) -> N
         )
 
 
-def seed_resume_bootstrap(agent_profile: str, provider_name: str, cwd: str):
+async def seed_resume_bootstrap(agent_profile: str, provider_name: str, cwd: str):
     """Return an authoritative resume ForkContext for seed-capable providers."""
     provider_class = get_provider_class(provider_name)
     if provider_class.supports_seed_resume_identity is not True:
@@ -235,7 +235,9 @@ def seed_resume_bootstrap(agent_profile: str, provider_name: str, cwd: str):
     try:
         from cli_agent_orchestrator.models.terminal import ForkContext
 
-        session_uuid = provider_class.seed_resume_identity(cwd, agent_profile)
+        session_uuid = await asyncio.to_thread(
+            provider_class.seed_resume_identity, cwd, agent_profile
+        )
         return ForkContext(
             mode="resume",
             session_uuid=session_uuid,
@@ -1678,6 +1680,7 @@ def _notice_text(
     worker: str,
     profile: str,
     provider: str,
+    reason: str = "",
 ) -> str:
     fields = (code, token, worker, profile, provider)
     if any(
@@ -1690,10 +1693,13 @@ def _notice_text(
         for value in fields
     ):
         raise ValueError("deferred_notice_identifier_invalid")
-    return (
+    base = (
         f"code={code} deadline_s={repr(float(deadline_s))} token={token} "
         f"worker={worker} profile={profile} provider={provider}"
     )
+    if reason:
+        base += f" reason={reason}"
+    return base
 
 
 def _register_deferred_call(terminal_id: str, generation: str, call: DeferredCall) -> None:
@@ -1980,6 +1986,7 @@ async def _claim_and_settle_deferred_failure(
     uuid_lease_token=None,
     *,
     fatal_claim_failure: bool = False,
+    reason: str = "",
 ) -> None:
     token = str(uuid.uuid4())
     owner_epoch = snapshot.get("init_owner_epoch")
@@ -2056,6 +2063,7 @@ async def _claim_and_settle_deferred_failure(
             worker=terminal_id,
             profile=snapshot.get("agent_profile"),
             provider=snapshot.get("provider"),
+            reason=reason,
         )
     except ValueError:
         notice = (
@@ -2980,16 +2988,31 @@ def _schedule_deferred_init(
                 # embedded the callback instructions into initial_message.
                 # We still pass sender_id=caller_id if present in DB metadata
                 # so plugin events see it.
-                await _tracked_blocking(
-                    terminal_id,
-                    generation,
-                    "abandonable",
-                    "send_input",
-                    send_input,
-                    terminal_id,
-                    prepared_message,
-                    **send_kwargs,
-                )
+                _DEFERRED_DELIVERY_MAX_RETRIES = 3
+                _DEFERRED_DELIVERY_RETRY_DELAY = 2.0
+                for _attempt in range(_DEFERRED_DELIVERY_MAX_RETRIES):
+                    try:
+                        await _tracked_blocking(
+                            terminal_id,
+                            generation,
+                            "abandonable",
+                            "send_input",
+                            send_input,
+                            terminal_id,
+                            prepared_message,
+                            **send_kwargs,
+                        )
+                        break
+                    except DeliveryDeferredError:
+                        if _attempt == _DEFERRED_DELIVERY_MAX_RETRIES - 1:
+                            raise  # falls to outer handler → teardown
+                        logger.warning(
+                            "deferred_init_delivery_deferred terminal=%s attempt=%d/%d",
+                            terminal_id,
+                            _attempt + 1,
+                            _DEFERRED_DELIVERY_MAX_RETRIES,
+                        )
+                        await asyncio.sleep(_DEFERRED_DELIVERY_RETRY_DELAY)
                 started = await _confirm_worker_started_or_resubmit(
                     terminal_id,
                     prepared_message,
@@ -3095,6 +3118,7 @@ def _schedule_deferred_init(
                 _failure_code(e),
                 registry,
                 uuid_lease_token,
+                reason=repr(e)[:200],
             )
         finally:
             if owns_uuid_lease and uuid_lease_token is not None:

@@ -207,6 +207,7 @@ _UPDATE_DIALOG_ROW_PATTERNS = (
 )
 STARTUP_PROMPT_BOTTOM_LINES = 15
 STARTUP_ACTIVITY_PATTERN = r"^\s*•[^\S\n]+\S"
+_MCP_INTERRUPT_PATTERN = re.compile(r"MCP startup interrupted", re.IGNORECASE)
 STARTUP_BLOCKING_INPUT_PATTERN = (
     r"(?:Command Approval Required|\[[aA]\]\s+Accept\b|"
     r"\[[dD]\]\s+Decline\b|Press enter to continue)"
@@ -667,7 +668,11 @@ def _has_startup_idle_composer(clean_output: str) -> bool:
     tail_lines = all_lines[-STARTUP_PROMPT_BOTTOM_LINES:]
     tail_output = "\n".join(tail_lines)
 
-    if re.search(STARTUP_ACTIVITY_PATTERN, tail_output, re.MULTILINE):
+    # Filter out known informational MCP messages before activity check
+    active_lines = [line for line in tail_lines if not _MCP_INTERRUPT_PATTERN.search(line)]
+    active_tail = "\n".join(active_lines)
+
+    if re.search(STARTUP_ACTIVITY_PATTERN, active_tail, re.MULTILINE):
         return False
     if re.search(WAITING_PROMPT_PATTERN, tail_output, re.IGNORECASE | re.MULTILINE):
         return False

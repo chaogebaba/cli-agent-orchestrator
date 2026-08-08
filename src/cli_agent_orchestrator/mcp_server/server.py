@@ -1347,6 +1347,19 @@ def _assign_impl(
                     refresh_base_name = row["name"]
                 if workdir_preamble:
                     preamble = f"{preamble}\n{workdir_preamble}"
+                # Context fence: warn forked workers about stale base context
+                base_cwd = row["cwd"]
+                base_sha = (row.get("git_sha") or "unknown")[:8]
+                fence = (
+                    f"[CONTEXT FENCE] Base '{row['name']}' was snapshot at "
+                    f"{base_cwd}@{base_sha}. If that names a different repository than "
+                    f"your working directory, inherited context from it does NOT apply "
+                    f"to your current task."
+                )
+                if preamble:
+                    preamble = f"{preamble}\n{fence}"
+                else:
+                    preamble = fence
                 fork_context = ForkContext(
                     mode="resume" if resume else "fork",
                     session_uuid=row["session_uuid"],

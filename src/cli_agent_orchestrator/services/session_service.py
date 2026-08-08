@@ -158,7 +158,7 @@ async def create_session(
 
     from cli_agent_orchestrator.services.terminal_service import seed_resume_bootstrap
 
-    fork_context = seed_resume_bootstrap(
+    fork_context = await seed_resume_bootstrap(
         agent_profile, resolved_provider, working_directory or os.getcwd()
     )
     terminal = await create_terminal(

@@ -410,7 +410,7 @@ async def run_agent_step(
 
         # create_terminal already runs provider.initialize() (which waits for
         # IDLE); a failure raises (ValueError/TimeoutError) and propagates.
-        fork_context = terminal_service.seed_resume_bootstrap(
+        fork_context = await terminal_service.seed_resume_bootstrap(
             agent, provider, working_directory or os.getcwd()
         )
         terminal = await terminal_service.create_terminal(

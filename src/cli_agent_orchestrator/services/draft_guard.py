@@ -98,9 +98,7 @@ def prepare_native_stash_before_send(
             state = "unresolved"
         chip_present = False
     else:
-        raise DeliveryDeferredError(
-            f"Composer state is unreadable for terminal {terminal_id}"
-        )
+        raise DeliveryDeferredError(f"Composer state is unreadable for terminal {terminal_id}")
     if state == "dialog":
         raise DeliveryDeferredError("Claude dialog is active")
     if state != "empty":
@@ -185,15 +183,29 @@ def _read_stash_snapshot(
     provider: Any,
     defer_on_dialog: bool = False,
 ) -> ComposerSnapshot | None:
-    try:
-        captured = get_backend().get_history(
-            metadata["tmux_session"],
-            metadata["tmux_window"],
-            tail_lines=PYTE_SCREEN_ROWS,
-            strip_escapes=False,
-        )
-    except Exception:
-        return None
+    for _attempt in range(2):
+        try:
+            captured = get_backend().get_history(
+                metadata["tmux_session"],
+                metadata["tmux_window"],
+                tail_lines=PYTE_SCREEN_ROWS,
+                strip_escapes=False,
+            )
+            break
+        except Exception:
+            if _attempt == 0:
+                import time
+
+                time.sleep(0.5)
+                continue
+            # Both get_history attempts failed — try capture_viewport fallback
+            try:
+                captured = get_backend().capture_viewport(
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                )
+            except Exception:
+                return None
     match_capture = strip_terminal_escapes(captured)
     if defer_on_dialog and CLAUDE_DIALOG_PATTERN.search(match_capture):
         raise DeliveryDeferredError("Claude dialog is active")
@@ -252,9 +264,7 @@ def preserve_draft_before_send(
 
     draft = _read_provider_draft(terminal_id, metadata, provider)
     if draft is None:
-        raise DeliveryDeferredError(
-            f"Composer state is unreadable for terminal {terminal_id}"
-        )
+        raise DeliveryDeferredError(f"Composer state is unreadable for terminal {terminal_id}")
     if draft == "":
         return None
 
@@ -277,9 +287,7 @@ def preserve_draft_before_send(
     if not _clear_composer(terminal_id, metadata, provider):
         # Never restore what we could not clear: re-pasting on top of the
         # leftover text would duplicate it in the composer.
-        raise DeliveryDeferredError(
-            f"Could not confirm composer clear for terminal {terminal_id}"
-        )
+        raise DeliveryDeferredError(f"Could not confirm composer clear for terminal {terminal_id}")
     return PreservedDraft(
         terminal_id=terminal_id,
         session_name=metadata["tmux_session"],
@@ -298,9 +306,7 @@ def _wait_for_stable_draft(
     time.sleep(DRAFT_STABILITY_INITIAL_DELAY_SECONDS)
     latest = _read_provider_draft(terminal_id, metadata, provider)
     if latest is None:
-        raise DeliveryDeferredError(
-            f"Composer state became unreadable for terminal {terminal_id}"
-        )
+        raise DeliveryDeferredError(f"Composer state became unreadable for terminal {terminal_id}")
     if latest == first_draft:
         return latest
 
@@ -324,7 +330,9 @@ def _send_clear_keys(terminal_id: str, metadata: dict[str, Any], provider: Any) 
     """Send one round of the provider's composer clear keys. False if none configured."""
     clear_keys = list(getattr(provider, "composer_clear_keys", []) or [])
     if not clear_keys:
-        logger.warning("Draft preservation enabled for %s but no clear keys configured", terminal_id)
+        logger.warning(
+            "Draft preservation enabled for %s but no clear keys configured", terminal_id
+        )
         return False
     backend = get_backend()
     for key in clear_keys:
@@ -362,8 +370,7 @@ def _clear_step_changed_draft(
                     f"Composer clear was not confirmed for terminal {terminal_id}"
                 )
             logger.info(
-                "clear-probe terminal=%s path=reread attempt=%d/%d current=%r "
-                "verdict=%s",
+                "clear-probe terminal=%s path=reread attempt=%d/%d current=%r " "verdict=%s",
                 terminal_id,
                 attempt + 1,
                 attempts,
@@ -419,14 +426,10 @@ def _read_draft_via_capture(
     return None from an escape-preserving parse get a plain-capture last resort.
     """
     if _provider_accepts_escapes(provider):
-        draft = _read_provider_draft_from_capture(
-            metadata, provider, strip_escapes=False
-        )
+        draft = _read_provider_draft_from_capture(metadata, provider, strip_escapes=False)
         if draft is not None:
             return draft
-        return _read_provider_draft_from_capture(
-            metadata, provider, strip_escapes=True
-        )
+        return _read_provider_draft_from_capture(metadata, provider, strip_escapes=True)
     return _read_provider_draft_from_capture(metadata, provider, strip_escapes=True)
 
 

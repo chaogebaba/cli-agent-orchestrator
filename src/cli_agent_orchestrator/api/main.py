@@ -2450,7 +2450,7 @@ async def create_session(
                 try:
                     from cli_agent_orchestrator.services import terminal_service
 
-                    sidecar_context = terminal_service.seed_resume_bootstrap(
+                    sidecar_context = await terminal_service.seed_resume_bootstrap(
                         "memory_manager", sidecar_provider, working_directory or os.getcwd()
                     )
                     await terminal_service.create_terminal(
@@ -2555,7 +2555,7 @@ async def start_session_endpoint(
 
         async def _spawn_start_sidecar() -> None:
             try:
-                context = terminal_service.seed_resume_bootstrap(
+                context = await terminal_service.seed_resume_bootstrap(
                     "memory_manager", sidecar_provider, working_directory or os.getcwd()
                 )
                 await terminal_service.create_terminal(
@@ -2958,7 +2958,7 @@ async def create_terminal_in_session(
 
         fork_context = body.fork_context if body else None
         if fork_context is None:
-            fork_context = terminal_service.seed_resume_bootstrap(
+            fork_context = await terminal_service.seed_resume_bootstrap(
                 agent_profile, resolved_provider, working_directory or os.getcwd()
             )
         result = await terminal_service.create_terminal(

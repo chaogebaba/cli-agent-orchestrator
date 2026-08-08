@@ -15,7 +15,7 @@ import tarfile
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 import requests as http_requests
@@ -362,7 +362,7 @@ def test_probe_02_real_publication_races_have_one_winner_and_teardown_loser(
     monkeypatch.setattr(session_service, "create_terminal", create_terminal_side_effect)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.seed_resume_bootstrap",
-        lambda *_args, **_kwargs: None,
+        AsyncMock(return_value=None),
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.delete_terminal",
@@ -1195,7 +1195,7 @@ def test_probe_12_publication_cleanup_failure_keeps_typed_original_cause(
     monkeypatch.setattr(session_service, "create_terminal", create_terminal_side_effect)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.seed_resume_bootstrap",
-        lambda *_args, **_kwargs: None,
+        AsyncMock(return_value=None),
     )
     cause = MailboxDomainError("mailbox_conflict", "original conflict")
     monkeypatch.setattr(

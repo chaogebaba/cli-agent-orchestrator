@@ -373,8 +373,14 @@ class GrokCliProvider(BaseProvider):
         if self._input_received and last_completed:
             return TerminalStatus.COMPLETED
 
-        if last_idle or re.search(IDLE_FOOTER_PATTERN, tail):
+        if last_idle:
             return TerminalStatus.IDLE
+        if re.search(IDLE_FOOTER_PATTERN, tail):
+            # Arm 2: footer visible — require composer prompt in last 8 lines
+            visible_lines = tail.splitlines()
+            if any(re.match(COMPOSER_PROMPT_PATTERN, line) for line in visible_lines[-8:]):
+                return TerminalStatus.IDLE
+            # Footer without composer — stay PROCESSING (re-checks next tick)
 
         if self._initialized and self.shell_baseline:
             current_cmd = get_backend().get_pane_current_command(
@@ -425,8 +431,7 @@ class GrokCliProvider(BaseProvider):
         # Same-row mutual exclusion: progress on a row suppresses waiting on that row (§4.3)
         progress_rows = {s.row_index for s in signals if s.signal_class == "progress"}
         signals = [
-            s for s in signals
-            if not (s.signal_class == "waiting" and s.row_index in progress_rows)
+            s for s in signals if not (s.signal_class == "waiting" and s.row_index in progress_rows)
         ]
         return tuple(signals)
 
