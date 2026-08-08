@@ -452,6 +452,8 @@ class TestWorkingDirectoryEndpoint:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.get_working_directory.return_value = "/home/user/project"
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.get("/terminals/abcd1234/working-directory")
 
             assert response.status_code == 200
@@ -464,6 +466,8 @@ class TestWorkingDirectoryEndpoint:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.get_working_directory.return_value = None
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.get("/terminals/abcd1234/working-directory")
 
             assert response.status_code == 200
@@ -473,6 +477,8 @@ class TestWorkingDirectoryEndpoint:
         """Test 404 when terminal doesn't exist."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.get_working_directory.side_effect = ValueError("Terminal 'abcd5678' not found")
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.get("/terminals/abcd5678/working-directory")
 
@@ -484,6 +490,8 @@ class TestWorkingDirectoryEndpoint:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.get_working_directory.side_effect = Exception("TMux error")
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.get("/terminals/abcd1234/working-directory")
 
             assert response.status_code == 500
@@ -493,6 +501,8 @@ class TestWorkingDirectoryEndpoint:
         """Test 500 when internal error occurs."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.get_working_directory.side_effect = RuntimeError("Internal service error")
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.get("/terminals/abcd1234/working-directory")
 
@@ -580,6 +590,8 @@ class TestTerminalCreationWithWorkingDirectory:
                 )
             )
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
@@ -603,6 +615,8 @@ class TestTerminalCreationWithWorkingDirectory:
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
         ):
             mock_svc.create_terminal = AsyncMock(side_effect=ValueError(detail))
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
@@ -633,6 +647,8 @@ class TestTerminalCreationWithWorkingDirectory:
                     caller_id="dcba8765",
                 )
             )
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.post(
                 "/sessions/test-session/terminals",
@@ -668,6 +684,8 @@ class TestTerminalCreationWithWorkingDirectory:
                 )
             )
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
@@ -699,6 +717,8 @@ class TestTerminalCreationWithWorkingDirectory:
                 )
             )
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={"provider": "kiro_cli", "agent_profile": "analyst"},
@@ -721,6 +741,8 @@ class TestTerminalCreationWithWorkingDirectory:
             ),
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
         ):
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
@@ -760,6 +782,8 @@ class TestTerminalCreationWithWorkingDirectory:
                 )
             )
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
@@ -781,6 +805,8 @@ class TestTerminalCreationWithWorkingDirectory:
             ),
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
         ):
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
@@ -811,6 +837,8 @@ class TestTerminalCreationWithWorkingDirectory:
                     agent_profile="analyst",
                 )
             )
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.post(
                 "/sessions/test-session/terminals",
@@ -845,6 +873,8 @@ class TestTerminalCreationWithWorkingDirectory:
                 )
             )
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
@@ -876,6 +906,8 @@ class TestTerminalCreationWithWorkingDirectory:
                 )
             )
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={"provider": "kiro_cli", "agent_profile": "analyst"},
@@ -901,6 +933,8 @@ class TestTerminalCreationWithWorkingDirectory:
                 side_effect=WorktreeError("'/tmp/x' is not inside a git repository")
             )
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
@@ -924,6 +958,8 @@ class TestTerminalCreationWithWorkingDirectory:
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
         ):
             mock_svc.create_terminal = AsyncMock()
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.post(
                 "/sessions/test-session/terminals",
@@ -975,6 +1011,8 @@ class TestExitTerminalEndpoint:
     def test_exit_terminal_delegates_and_returns_success(self, client):
         """A successful exit delegates to exit_terminal_cli and returns 200."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post("/terminals/abcd1234/exit")
 
             assert response.status_code == 200
@@ -986,6 +1024,8 @@ class TestExitTerminalEndpoint:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.exit_terminal_cli.side_effect = ValueError("Provider not found for terminal x")
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post("/terminals/deadbeef/exit")
 
             assert response.status_code == 404
@@ -995,6 +1035,8 @@ class TestExitTerminalEndpoint:
         """An unexpected error maps to 500."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.exit_terminal_cli.side_effect = RuntimeError("TMux error")
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.post("/terminals/abcd1234/exit")
 
@@ -1014,6 +1056,8 @@ class TestDeleteTerminalEndpoint:
                 "uncertain": [],
                 "unattempted": [],
             }
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.delete("/terminals/abcd1234")
 
@@ -1037,6 +1081,8 @@ class TestDeleteTerminalEndpoint:
                 "unattempted": [],
             }
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.delete("/terminals/abcd1234", params={"orphan": "true"})
 
         assert response.status_code == 200
@@ -1047,6 +1093,8 @@ class TestDeleteTerminalEndpoint:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.delete_terminal.side_effect = ValueError("Terminal not found")
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.delete("/terminals/deadbeef")
 
             assert response.status_code == 404
@@ -1055,6 +1103,8 @@ class TestDeleteTerminalEndpoint:
         """DELETE /terminals/{terminal_id} returns 500 on internal error."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.delete_terminal.side_effect = Exception("TMux error")
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.delete("/terminals/abcd1234")
 
@@ -1968,6 +2018,8 @@ class TestCrossProviderResolution:
                 )
             )
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
@@ -1999,6 +2051,8 @@ class TestCrossProviderResolution:
                     agent_profile="reviewer",
                 )
             )
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.post(
                 "/sessions/test-session/terminals",
@@ -2125,6 +2179,8 @@ class TestUpdateTerminalGroupEndpoint:
             mock_svc.update_group.return_value = True
             mock_svc.get_terminal.return_value = _terminal_dict(group=["tenant_1", "project_9"])
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.patch(
                 "/terminals/abcd1234/group", json={"group": ["tenant_1", "project_9"]}
             )
@@ -2138,6 +2194,8 @@ class TestUpdateTerminalGroupEndpoint:
             mock_svc.update_group.return_value = True
             mock_svc.get_terminal.return_value = _terminal_dict(group=None)
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.patch("/terminals/abcd1234/group", json={"group": []})
 
             assert response.status_code == 200
@@ -2147,6 +2205,8 @@ class TestUpdateTerminalGroupEndpoint:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.update_group.return_value = False
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.patch("/terminals/deadbeef/group", json={"group": ["tenant_1"]})
 
             assert response.status_code == 404
@@ -2154,6 +2214,8 @@ class TestUpdateTerminalGroupEndpoint:
     def test_update_group_server_error(self, client):
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.update_group.side_effect = Exception("db exploded")
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.patch("/terminals/abcd1234/group", json={"group": ["tenant_1"]})
 
@@ -2166,6 +2228,8 @@ class TestUpdateTerminalGroupEndpoint:
         ``null`` (which clears the group) -- a partial/empty body must never
         accidentally clear data."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.patch("/terminals/abcd1234/group", json={})
 
             assert response.status_code == 422
@@ -2177,6 +2241,8 @@ class TestUpdateTerminalGroupEndpoint:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.update_group.return_value = True
             mock_svc.get_terminal.return_value = _terminal_dict(group=None)
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.patch("/terminals/abcd1234/group", json={"group": None})
 
@@ -2192,6 +2258,8 @@ class TestUpdateTerminalMetadataEndpoint:
             mock_svc.update_metadata.return_value = True
             mock_svc.get_terminal.return_value = _terminal_dict(metadata={"task": "writing tests"})
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.patch(
                 "/terminals/abcd1234/metadata", json={"metadata": {"task": "writing tests"}}
             )
@@ -2204,6 +2272,8 @@ class TestUpdateTerminalMetadataEndpoint:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.update_metadata.return_value = False
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.patch(
                 "/terminals/deadbeef/metadata", json={"metadata": {"task": "x"}}
             )
@@ -2215,6 +2285,8 @@ class TestUpdateTerminalMetadataEndpoint:
         an omitted ``metadata`` field must be rejected (422), not silently
         treated as an explicit clearing ``null``."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.patch("/terminals/abcd1234/metadata", json={})
 
             assert response.status_code == 422
@@ -2224,6 +2296,8 @@ class TestUpdateTerminalMetadataEndpoint:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.update_metadata.return_value = True
             mock_svc.get_terminal.return_value = _terminal_dict(metadata=None)
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.patch("/terminals/abcd1234/metadata", json={"metadata": None})
 
@@ -2246,6 +2320,8 @@ class TestListSiblingsEndpoint:
                 {"id": "sib-1", "group": ["tenant_1"], "metadata": {"task": "x"}}
             ]
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.get("/terminals/abcd1234/siblings")
 
             assert response.status_code == 200
@@ -2260,6 +2336,8 @@ class TestListSiblingsEndpoint:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.get_terminal.return_value = _terminal_dict(group=["tenant_1", "project_5"])
             mock_svc.list_siblings.return_value = []
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.get("/terminals/abcd1234/siblings", params={"depth": 2})
 
@@ -2283,6 +2361,8 @@ class TestListSiblingsEndpoint:
             mock_svc.get_terminal.return_value = _terminal_dict(group=["tenant_1"])
             mock_svc.list_siblings.return_value = []
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.get("/terminals/abcd1234/siblings", params={"cross_session": "true"})
 
             assert response.status_code == 200
@@ -2296,6 +2376,8 @@ class TestListSiblingsEndpoint:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.get_terminal.return_value = _terminal_dict(group=["tenant_1"])
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.get("/terminals/abcd1234/siblings", params={"depth": 0})
 
             assert response.status_code == 422
@@ -2305,6 +2387,8 @@ class TestListSiblingsEndpoint:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.get_terminal.return_value = _terminal_dict(group=["tenant_1"])
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.get("/terminals/abcd1234/siblings", params={"depth": -1})
 
             assert response.status_code == 422
@@ -2313,6 +2397,8 @@ class TestListSiblingsEndpoint:
     def test_list_siblings_terminal_not_found(self, client):
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.get_terminal.side_effect = ValueError("Terminal 'deadbeef' not found")
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.get("/terminals/deadbeef/siblings")
 
@@ -2325,6 +2411,8 @@ class TestListSiblingsEndpoint:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.get_terminal.return_value = _terminal_dict(group=None)
             mock_svc.list_siblings.return_value = []
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.get("/terminals/abcd1234/siblings")
 
@@ -2344,6 +2432,8 @@ class TestGroupSizeCap:
             mock_svc.update_group.return_value = True
             mock_svc.get_terminal.return_value = _terminal_dict(group=group)
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.patch("/terminals/abcd1234/group", json={"group": group})
 
             assert response.status_code == 200
@@ -2352,6 +2442,8 @@ class TestGroupSizeCap:
     def test_group_over_element_count_cap_rejected(self, client):
         group = [f"g{i}" for i in range(TERMINAL_GROUP_MAX_ELEMENTS + 1)]
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.patch("/terminals/abcd1234/group", json={"group": group})
 
             assert response.status_code == 422
@@ -2363,6 +2455,8 @@ class TestGroupSizeCap:
             mock_svc.update_group.return_value = True
             mock_svc.get_terminal.return_value = _terminal_dict(group=[element])
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.patch("/terminals/abcd1234/group", json={"group": [element]})
 
             assert response.status_code == 200
@@ -2370,6 +2464,8 @@ class TestGroupSizeCap:
     def test_group_element_over_length_cap_rejected(self, client):
         element = "x" * (TERMINAL_GROUP_ELEMENT_MAX_LEN + 1)
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.patch("/terminals/abcd1234/group", json={"group": [element]})
 
             assert response.status_code == 422
@@ -2381,6 +2477,8 @@ class TestGroupSizeCap:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.update_group.return_value = True
             mock_svc.get_terminal.return_value = _terminal_dict(group=None)
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.patch("/terminals/abcd1234/group", json={"group": []})
 
@@ -2413,6 +2511,8 @@ class TestMetadataSizeCap:
             mock_svc.update_metadata.return_value = True
             mock_svc.get_terminal.return_value = _terminal_dict(metadata=metadata)
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.patch("/terminals/abcd1234/metadata", json={"metadata": metadata})
 
             assert response.status_code == 200
@@ -2421,6 +2521,8 @@ class TestMetadataSizeCap:
         padding = "x" * TERMINAL_METADATA_MAX_BYTES
         metadata = {"k": padding}
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.patch("/terminals/abcd1234/metadata", json={"metadata": metadata})
 
             assert response.status_code == 422
@@ -2430,6 +2532,8 @@ class TestMetadataSizeCap:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.update_metadata.return_value = True
             mock_svc.get_terminal.return_value = _terminal_dict(metadata=None)
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.patch("/terminals/abcd1234/metadata", json={"metadata": {}})
 

@@ -783,6 +783,7 @@ class TestCreateTerminalInSession:
             # The endpoint awaits terminal_service.create_terminal, so the
             # patched attribute must be an AsyncMock to return an awaitable.
             mock_svc.create_terminal = AsyncMock(return_value=mock_terminal)
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.post(
                 "/sessions/test-session/terminals",
@@ -805,6 +806,7 @@ class TestCreateTerminalInSession:
     def test_create_terminal_session_not_found(self, client):
         """POST /sessions/{name}/terminals returns 404 for nonexistent session."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
             mock_svc.create_terminal.side_effect = ValueError("Session 'nonexistent' not found")
 
             response = client.post(
@@ -821,6 +823,7 @@ class TestCreateTerminalInSession:
     def test_create_terminal_server_error(self, client):
         """POST /sessions/{name}/terminals returns 500 on error."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
             mock_svc.create_terminal.side_effect = Exception("TMux error")
 
             response = client.post(
