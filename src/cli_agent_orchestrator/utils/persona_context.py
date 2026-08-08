@@ -419,6 +419,27 @@ def compose_persona_plan(
         )
         (staging / "settings.json").chmod(0o600)
 
+        # Seed .claude.json with onboarding-complete markers so Claude Code
+        # skips the first-run theme/provider selection prompts.  Copy from
+        # the real home if available (carries machineID, userID, migrations);
+        # fall back to a minimal seed that skips the interactive flow.
+        real_claude_json = claude_home / ".claude.json"
+        if real_claude_json.is_file():
+            import shutil as _shutil
+            _shutil.copy2(real_claude_json, staging / ".claude.json")
+        else:
+            (staging / ".claude.json").write_text(
+                json.dumps({
+                    "migrationVersion": 13,
+                    "hasCompletedOnboarding": True,
+                    "hasResetAutoModeOptInForDefaultOffer": True,
+                    "opusProMigrationComplete": True,
+                    "sonnet1m45MigrationComplete": True,
+                }) + "\n",
+                encoding="utf-8",
+            )
+        (staging / ".claude.json").chmod(0o600)
+
         leaf_sources = _validated_leaf_sources(provider, policy.extraLeaves)
         persona_bind: PersonaBind | None = None
         credential_bind: PersonaBind | None = None
@@ -764,7 +785,11 @@ def _remove_persona_tree(path: Path, *, missing_ok: bool = False) -> None:
         raise FileNotFoundError(path)
     for candidate in path.rglob(".credentials.json"):
         if candidate.is_file() and not candidate.is_symlink():
-            raise PersonaContextError("persona_regular_credentials_file_detected")
+            # The compositor creates empty (0-byte) placeholder files as mount
+            # points for ro-bind credentials.  These are safe to remove.  Only
+            # refuse if the file has actual content (real credential data).
+            if candidate.stat().st_size > 0:
+                raise PersonaContextError("persona_regular_credentials_file_detected")
     shutil.rmtree(path)
 
 
