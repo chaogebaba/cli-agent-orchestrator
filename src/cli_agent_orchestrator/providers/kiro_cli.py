@@ -23,6 +23,7 @@ import shlex
 from typing import Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.constants import BLOCKED_WAIT_CAP_S
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
@@ -34,7 +35,11 @@ from cli_agent_orchestrator.services.settings_service import (
     resolve_provider_string_option,
 )
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.terminal import (
+    BlockedWaitPolicy,
+    wait_for_shell,
+    wait_until_status,
+)
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
@@ -354,23 +359,51 @@ class KiroCliProvider(BaseProvider):
         # Step 3: Wait for Kiro CLI to fully initialize and show the agent prompt.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
+        #
+        # F109: Build a BlockedWaitPolicy (mirrors codex.py) so that named
+        # auto-responder wait rules pause the init deadline instead of burning it.
+        from cli_agent_orchestrator.services.auto_responder import auto_responder
+
+        async def notify_blocked(rule_name: str) -> None:
+            if self.blocked_wait_notifier is not None:
+                await self.blocked_wait_notifier(rule_name)
+
+        def probe_blocked() -> tuple[str, str] | None:
+            gate = auto_responder.waiting_gate(self.terminal_id)
+            return gate if isinstance(gate, tuple) else None
+
+        blocked_policy = BlockedWaitPolicy(
+            probe=probe_blocked,
+            blocked_cap_s=BLOCKED_WAIT_CAP_S,
+            on_first_blocked=notify_blocked,
+        )
+
+        init_timeout = float(get_server_settings()["provider_init_timeout"])
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=float(get_server_settings()["provider_init_timeout"]),
+            timeout=init_timeout,
+            blocked_policy=blocked_policy,
         ):
             if yolo:
                 # Yolo already launched with --legacy-ui; no further fallback.
-                raise TimeoutError("Kiro CLI initialization timed out with --legacy-ui (yolo mode)")
+                suffix = (
+                    f" after blocked wait rule '{blocked_policy.last_blocked_rule}'"
+                    if blocked_policy.last_blocked_rule
+                    else ""
+                )
+                raise TimeoutError(
+                    f"Kiro CLI initialization timed out with --legacy-ui (yolo mode){suffix}"
+                )
             # Non-yolo TUI mode failed — fall back to --legacy-ui
             logger.warning("Kiro CLI TUI initialization timed out, retrying with --legacy-ui")
             # Exit the current session and start fresh with --legacy-ui
             status_monitor.notify_input_sent(self.terminal_id)
             get_backend().send_keys(self.session_name, self.window_name, "/exit")
-            init_timeout = get_server_settings()["provider_init_timeout"]
-            if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
+            init_timeout_shell = get_server_settings()["provider_init_timeout"]
+            if not await wait_for_shell(self.terminal_id, timeout=init_timeout_shell):
                 raise TimeoutError(
-                    f"Shell recovery timed out after {init_timeout}s (--legacy-ui fallback)"
+                    f"Shell recovery timed out after {init_timeout_shell}s (--legacy-ui fallback)"
                 )
             # Clear the StatusMonitor buffer so the --legacy-ui attempt is detected
             # against a clean buffer, not one still full of stale TUI marker bytes
@@ -386,12 +419,23 @@ class KiroCliProvider(BaseProvider):
             legacy_command = shlex.join(legacy_args)
             status_monitor.notify_input_sent(self.terminal_id)
             get_backend().send_keys(self.session_name, self.window_name, legacy_command)
+            # Reset last_blocked_rule so a rule from the first wait doesn't
+            # falsely label a second-wait timeout that never parked (fold r1/D1).
+            blocked_policy.last_blocked_rule = None
             if not await wait_until_status(
                 self.terminal_id,
                 {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
                 timeout=float(get_server_settings()["provider_init_timeout"]),
+                blocked_policy=blocked_policy,
             ):
-                raise TimeoutError("Kiro CLI initialization timed out with TUI and `--legacy-ui`")
+                suffix = (
+                    f" after blocked wait rule '{blocked_policy.last_blocked_rule}'"
+                    if blocked_policy.last_blocked_rule
+                    else ""
+                )
+                raise TimeoutError(
+                    f"Kiro CLI initialization timed out with TUI and `--legacy-ui`{suffix}"
+                )
 
         self._initialized = True
         return True
