@@ -40,7 +40,10 @@ def persona_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Pa
     codex_home = home / ".codex"
     claude_home.mkdir(parents=True)
     codex_home.mkdir(parents=True)
-    (claude_home / ".credentials.json").write_text('{"token":"test"}\n', encoding="utf-8")
+    (claude_home / ".credentials.json").write_text(
+        '{"claudeAiOauth":{"accessToken":"test-token","expiresAt":9999999999999}}\n',
+        encoding="utf-8",
+    )
     (claude_home / "CLAUDE.md").write_text("# global context\n", encoding="utf-8")
     (codex_home / "auth.json").write_text('{"token":"test"}\n', encoding="utf-8")
     (codex_home / "config.toml").write_text(
@@ -110,8 +113,9 @@ def test_filter_and_compose_claude_manifest_rehydration(persona_env: dict[str, P
     assert stat.S_IMODE(generation.stat().st_mode) == 0o700
     assert stat.S_IMODE((generation / "persona-manifest.json").stat().st_mode) == 0o600
     assert not any(
-        path.is_file() and not path.is_symlink() for path in generation.rglob(".credentials.json")
-    )
+        path.is_file() and not path.is_symlink() and path.stat().st_size > 0
+        for path in generation.rglob(".credentials.json")
+    ), "persona tree must not contain real credential data (non-empty .credentials.json)"
     copied = generation / "projects" / cwd_key(persona_env["cwd"].resolve()) / "memory"
     assert sorted(path.name for path in copied.glob("*.md")) == [
         "MEMORY.md",

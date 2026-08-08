@@ -103,6 +103,24 @@ def _header(profile_name: str, policy_hash: str) -> str:
     )
 
 
+def _credentials_have_valid_token(path: Path) -> bool:
+    """Check if a Claude credentials file has a non-empty, non-expired access token."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        oauth = data.get("claudeAiOauth", {})
+        access_token = oauth.get("accessToken", "")
+        if not access_token:
+            return False
+        # expiresAt is epoch millis; treat 0 or past as expired
+        expires_at = oauth.get("expiresAt", 0)
+        import time
+        if expires_at and expires_at < time.time() * 1000:
+            return False
+        return True
+    except (OSError, json.JSONDecodeError, TypeError):
+        return False
+
+
 def _native_memory_metadata(path: Path) -> tuple[str, str] | None:
     try:
         post = frontmatter.loads(path.read_text(encoding="utf-8"))
@@ -453,8 +471,6 @@ def compose_persona_plan(
 
         if provider == "claude_code":
             real_credentials = claude_home / ".credentials.json"
-            if real_credentials.is_symlink() or not real_credentials.is_file():
-                raise PersonaContextError("persona_claude_credentials_invalid")
             shadow_root = staging / "cwd-shadow"
             shadow_claude_dir = shadow_root / ".claude"
             shadow_claude_dir.mkdir(parents=True, mode=0o700)
@@ -467,9 +483,23 @@ def compose_persona_plan(
             bwrap_executable = Path(executable).resolve(strict=True)
             destination = claude_home
             persona_bind = PersonaBind(generation_dir, destination)
-            credential_bind = PersonaBind(
-                real_credentials.resolve(), destination / ".credentials.json"
-            )
+            # Only bind credentials if the file exists AND has a valid
+            # (non-empty) access token.  Expired/empty OAuth creds block
+            # env-based auth fallback (CPA_API_KEY) — better to skip the
+            # bind and let Claude Code discover the key from env.
+            if (
+                real_credentials.is_file()
+                and not real_credentials.is_symlink()
+                and _credentials_have_valid_token(real_credentials)
+            ):
+                credential_bind = PersonaBind(
+                    real_credentials.resolve(), destination / ".credentials.json"
+                )
+                # Create empty mount-point placeholder for the bind
+                (staging / ".credentials.json").write_bytes(b"")
+                (staging / ".credentials.json").chmod(0o444)
+            # If no credential bind: don't create .credentials.json in the
+            # persona tree at all — Claude Code falls through to env auth.
             leaf_binds = tuple(
                 PersonaBind(source, destination / leaf) for leaf, source in leaf_sources
             )
@@ -478,7 +508,10 @@ def compose_persona_plan(
                 PersonaBind(generation_dir / "cwd-shadow" / ".claude", cwd / ".claude"),
             )
             env_set = {"CLAUDE_CONFIG_DIR": str(destination)}
-            env_unset = PERSONA_ENV_UNSET
+            # Only unset API key env vars when we have a valid credential bind
+            # (forces OAuth). Without a bind, let env-based auth (CPA_API_KEY,
+            # ANTHROPIC_API_KEY) pass through to Claude Code.
+            env_unset = PERSONA_ENV_UNSET if credential_bind else ()
         else:
             real_codex_home = provider_home("codex").home.resolve()
             codex_home = generation_dir / "codex-home"
@@ -632,20 +665,28 @@ def load_persona_plan(terminal_id: str) -> PersonaPlan | None:
         expected_env = (
             {"CLAUDE_CONFIG_DIR": str(persona_bind.dst)} if persona_bind is not None else {}
         )
+        # credential_bind may be None when OAuth tokens are expired —
+        # env-based auth (CPA_API_KEY) is used instead; env_unset is
+        # then empty (don't strip API key vars the fallback needs).
+        valid_env_unset = (
+            tuple(env_unset) == PERSONA_ENV_UNSET
+            if credential_bind is not None
+            else tuple(env_unset) == ()
+        )
         if (
             persona_bind is None
-            or credential_bind is None
             or bwrap is None
             or env_set != expected_env
-            or tuple(env_unset) != PERSONA_ENV_UNSET
+            or not valid_env_unset
         ):
             raise PersonaContextError("persona_manifest_invalid:claude_wrapper")
         if persona_bind.src.resolve() != generation_dir:
             raise PersonaContextError("persona_manifest_invalid:persona_bind.src")
-        if credential_bind.dst != persona_bind.dst / ".credentials.json":
-            raise PersonaContextError("persona_manifest_invalid:credential_bind.dst")
-        if credential_bind.src.is_symlink() or not credential_bind.src.is_file():
-            raise PersonaContextError("persona_manifest_invalid:credential_bind.src")
+        if credential_bind is not None:
+            if credential_bind.dst != persona_bind.dst / ".credentials.json":
+                raise PersonaContextError("persona_manifest_invalid:credential_bind.dst")
+            if credential_bind.src.is_symlink() or not credential_bind.src.is_file():
+                raise PersonaContextError("persona_manifest_invalid:credential_bind.src")
         if not bwrap.is_file():
             raise PersonaContextError("persona_manifest_invalid:bwrap_executable")
         for bind in leaf_binds:
