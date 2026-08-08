@@ -336,7 +336,8 @@ markers = [
     "integration: marks integration tests",
     "e2e: marks end-to-end tests",
     "live: marks tests that require live external services or authenticated CLIs",
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')"
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "pty: marks tests that require a real PTY (fail under nested tmux/pty envs)"
 ]
 asyncio_mode = "strict"
 testpaths = ["test"]
@@ -344,4 +345,4 @@ python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
 # Local/default: skip e2e + slow real-binary tests. CI passes --cov explicitly.
-addopts = "-m 'not e2e and not slow and not live'"
+addopts = "-m 'not e2e and not slow and not live and not pty'"

@@ -456,6 +456,7 @@ fn raw_escape_and_non_utf8_bytes_survive_capture_verbatim() {
 /// finishes, so a naive `trap 'stty size' WINCH; sleep N` script reports nothing and the test
 /// would fail for a reason that has nothing to do with resize. (#321)
 #[test]
+#[ignore = "environmental: fails under tmux/nested-pty (F103)"]
 fn resize_is_visible_to_the_child_and_to_the_kernel() {
     let before = PtySize::default();
     let after = PtySize {
