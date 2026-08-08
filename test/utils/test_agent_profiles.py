@@ -711,3 +711,66 @@ class TestCodexConfigParsing:
         profile = parse_agent_profile_text(text, "codex-agent")
 
         assert profile.codexConfig is None
+
+
+class TestPermissionsFrontmatter:
+    """F113 AC3: permissions frontmatter survives the AgentProfile parse path."""
+
+    def test_permissions_parsed_from_frontmatter(self):
+        """Declared permissions are retained through parse_agent_profile_text."""
+        text = (
+            "---\n"
+            "name: perms-agent\n"
+            "description: Agent with permissions\n"
+            "engine: kas\n"
+            "permissions:\n"
+            "  rules:\n"
+            "    - capability: shell\n"
+            "      effect: allow\n"
+            "    - capability: mcp\n"
+            "      match:\n"
+            "        - builtin/*\n"
+            "      effect: allow\n"
+            "---\n"
+            "System prompt content\n"
+        )
+
+        profile = parse_agent_profile_text(text, "perms-agent")
+
+        assert profile.permissions == {
+            "rules": [
+                {"capability": "shell", "effect": "allow"},
+                {"capability": "mcp", "match": ["builtin/*"], "effect": "allow"},
+            ]
+        }
+
+    def test_permissions_none_when_absent(self):
+        """Undeclared permissions stay None (not silently dropped as empty)."""
+        text = (
+            "---\n"
+            "name: no-perms\n"
+            "description: Agent without permissions\n"
+            "engine: kas\n"
+            "---\n"
+            "System prompt content\n"
+        )
+
+        profile = parse_agent_profile_text(text, "no-perms")
+
+        assert profile.permissions is None
+
+    def test_empty_permissions_parsed_as_empty_dict(self):
+        """Explicit permissions: {} parses as empty dict, not None."""
+        text = (
+            "---\n"
+            "name: empty-perms\n"
+            "description: Agent with empty permissions\n"
+            "engine: kas\n"
+            "permissions: {}\n"
+            "---\n"
+            "System prompt content\n"
+        )
+
+        profile = parse_agent_profile_text(text, "empty-perms")
+
+        assert profile.permissions == {}

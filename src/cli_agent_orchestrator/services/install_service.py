@@ -4,7 +4,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlparse
 
 import frontmatter
@@ -356,6 +356,34 @@ def install_agent(
                     "(v2-only fields; v3 uses permissions). Remove those fields "
                     "or set engine: v2."
                 )
+
+            # F113 D2 tripwire: v2 tolerance of an extra permissions key is
+            # unverified — warn when a non-KAS profile declares one.
+            if profile.engine != KiroEngine.KAS and profile.permissions is not None:
+                logger.warning(
+                    "Profile '%s' declares permissions but engine is %s "
+                    "(v2 tolerance of this key is unverified).",
+                    profile.name,
+                    profile.engine,
+                )
+
+            # F113: KAS profiles require a permissions block for registry load.
+            # Default to the standard autonomous-worker rules when not declared;
+            # explicit permissions (including {}) pass through verbatim.
+            kiro_permissions: Optional[Dict[str, Any]] = profile.permissions
+            if profile.engine == KiroEngine.KAS and kiro_permissions is None:
+                kiro_permissions = {
+                    "rules": [
+                        {"capability": "shell", "effect": "allow"},
+                        {"capability": "web_fetch", "effect": "allow"},
+                        {
+                            "capability": "mcp",
+                            "match": ["builtin/*", "cao-mcp-server/*"],
+                            "effect": "allow",
+                        },
+                    ]
+                }
+
             KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
             # Kiro natively supports skill:// resources with progressive loading
             # (metadata at startup, full content on demand).
@@ -380,6 +408,7 @@ def install_agent(
                 toolsSettings=profile.toolsSettings,
                 hooks=profile.hooks,
                 model=profile.model,
+                permissions=kiro_permissions,
             )
             agent_file = KIRO_AGENTS_DIR / f"{safe_filename}.json"
             agent_file.write_text(

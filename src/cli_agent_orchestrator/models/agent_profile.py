@@ -119,6 +119,7 @@ class AgentProfile(BaseModel):
     toolsSettings: Optional[Dict[str, Any]] = None
     resources: Optional[List[str]] = None
     hooks: Optional[Dict[str, Any]] = None
+    permissions: Optional[Dict[str, Any]] = None
     useLegacyMcpJson: Optional[bool] = None
     model: Optional[str] = None
     # Generic model-effort hint; consumed by grok_cli and claude_code.

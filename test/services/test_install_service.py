@@ -1169,3 +1169,128 @@ class TestInjectKiroMcpTimeout:
 
         assert _inject_kiro_mcp_timeout(None) is None
         assert _inject_kiro_mcp_timeout({}) == {}
+
+
+class TestInstallKASPermissions:
+    """F113 AC2: permissions handling in the KAS install branch."""
+
+    def test_kas_no_permissions_writes_default_rules(self, install_paths: dict[str, Path]) -> None:
+        """KAS profile without permissions gets the standard default rules."""
+        profile_path = install_paths["local_store_dir"] / "kas-dev.md"
+        profile_path.write_text(
+            "---\n"
+            "name: kas-dev\n"
+            "description: KAS developer\n"
+            "engine: kas\n"
+            "---\n"
+            "KAS profile.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("kas-dev", "kiro_cli")
+
+        assert result.success is True
+        kiro_config = json.loads((install_paths["kiro_dir"] / "kas-dev.json").read_text())
+        assert kiro_config["permissions"] == {
+            "rules": [
+                {"capability": "shell", "effect": "allow"},
+                {"capability": "web_fetch", "effect": "allow"},
+                {
+                    "capability": "mcp",
+                    "match": ["builtin/*", "cao-mcp-server/*"],
+                    "effect": "allow",
+                },
+            ]
+        }
+
+    def test_kas_explicit_permissions_written_verbatim(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """KAS profile with explicit permissions passes them through verbatim."""
+        profile_path = install_paths["local_store_dir"] / "kas-custom.md"
+        profile_path.write_text(
+            "---\n"
+            "name: kas-custom\n"
+            "description: KAS custom\n"
+            "engine: kas\n"
+            "permissions:\n"
+            "  rules:\n"
+            "    - capability: shell\n"
+            "      effect: deny\n"
+            "---\n"
+            "KAS custom profile.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("kas-custom", "kiro_cli")
+
+        assert result.success is True
+        kiro_config = json.loads((install_paths["kiro_dir"] / "kas-custom.json").read_text())
+        assert kiro_config["permissions"] == {"rules": [{"capability": "shell", "effect": "deny"}]}
+
+    def test_v2_no_permissions_writes_no_key(self, install_paths: dict[str, Path]) -> None:
+        """v2-engine profile without permissions omits the key entirely."""
+        profile_path = install_paths["local_store_dir"] / "v2-agent.md"
+        profile_path.write_text(
+            "---\n"
+            "name: v2-agent\n"
+            "description: v2 agent\n"
+            "engine: v2\n"
+            "---\n"
+            "v2 profile.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("v2-agent", "kiro_cli")
+
+        assert result.success is True
+        kiro_config = json.loads((install_paths["kiro_dir"] / "v2-agent.json").read_text())
+        assert "permissions" not in kiro_config
+
+    def test_kas_empty_permissions_written_verbatim(self, install_paths: dict[str, Path]) -> None:
+        """KAS profile with permissions: {} writes empty dict verbatim (D1)."""
+        profile_path = install_paths["local_store_dir"] / "kas-empty.md"
+        profile_path.write_text(
+            "---\n"
+            "name: kas-empty\n"
+            "description: KAS empty perms\n"
+            "engine: kas\n"
+            "permissions: {}\n"
+            "---\n"
+            "KAS empty permissions profile.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("kas-empty", "kiro_cli")
+
+        assert result.success is True
+        kiro_config = json.loads((install_paths["kiro_dir"] / "kas-empty.json").read_text())
+        assert kiro_config["permissions"] == {}
+
+    def test_v2_with_permissions_logs_warning(
+        self, install_paths: dict[str, Path], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """D2 tripwire: v2 profile with permissions logs a warning."""
+        profile_path = install_paths["local_store_dir"] / "v2-perms.md"
+        profile_path.write_text(
+            "---\n"
+            "name: v2-perms\n"
+            "description: v2 with perms\n"
+            "engine: v2\n"
+            "permissions:\n"
+            "  rules:\n"
+            "    - capability: shell\n"
+            "      effect: allow\n"
+            "---\n"
+            "v2 profile with permissions.\n",
+            encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = install_agent("v2-perms", "kiro_cli")
+
+        assert result.success is True
+        assert "v2 tolerance of this key is unverified" in caplog.text
+        # Still passes through when declared (pass-through-if-declared)
+        kiro_config = json.loads((install_paths["kiro_dir"] / "v2-perms.json").read_text())
+        assert kiro_config["permissions"] == {"rules": [{"capability": "shell", "effect": "allow"}]}
