@@ -165,6 +165,12 @@ class HerdrInboxService:
             with self._identity_guard:
                 self._register_terminal_locked(terminal_id, pane_id, is_kiro)
 
+        # Layer B (F115): un-suppress on re-register so a rebound terminal
+        # resumes receiving auto-responder scans for genuine dialogs.
+        from cli_agent_orchestrator.services.auto_responder import auto_responder
+
+        auto_responder.unmark_exit_suppress(terminal_id)
+
         logger.info(f"Registered terminal {terminal_id} (pane={pane_id}, kiro={is_kiro})")
 
     def _register_terminal_under_guard(
@@ -179,6 +185,11 @@ class HerdrInboxService:
             raise RuntimeError("delivery_guard_not_active_for_terminal")
         with self._identity_guard:
             self._register_terminal_locked(terminal_id, pane_id, is_kiro)
+
+        # Layer B (F115): un-suppress on re-register (same as register_terminal).
+        from cli_agent_orchestrator.services.auto_responder import auto_responder
+
+        auto_responder.unmark_exit_suppress(terminal_id)
 
     def unregister_terminal(self, terminal_id: str) -> None:
         """Remove a terminal from managed set.

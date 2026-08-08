@@ -232,6 +232,7 @@ class AutoResponder:
         self._wait_rule_active: Dict[str, tuple[str, float]] = {}
         self._retry_exhausted: set[str] = set()
         self._terminal_generation: Dict[str, int] = {}
+        self._exit_suppressed: set[str] = set()
 
     def _waiting_gate_locked(self, terminal_id: str) -> str | tuple[str, str] | None:
         state = self._unknown_state.get(terminal_id)
@@ -287,8 +288,31 @@ class AutoResponder:
             self._wait_rule_active.pop(terminal_id, None)
             self._retry_exhausted.discard(terminal_id)
             self._unknown_state.pop(terminal_id, None)
+            self._exit_suppressed.discard(terminal_id)
             for key in [key for key in self._rule_state if key[0] == terminal_id]:
                 self._rule_state.pop(key, None)
+
+    def mark_exit_suppress(self, terminal_id: str) -> None:
+        """Suppress all on_screen effects for a terminal that is exiting (Layer B).
+
+        Called from exit_terminal_cli after successfully sending the exit command.
+        Cleared on re-register (rebind) or clear_terminal (delete).
+        """
+        with self._lock:
+            self._exit_suppressed.add(terminal_id)
+
+    def unmark_exit_suppress(self, terminal_id: str) -> None:
+        """Remove exit suppression, e.g. after rebind re-register.
+
+        Allows a rebound terminal to resume receiving auto-responder scans.
+        """
+        with self._lock:
+            self._exit_suppressed.discard(terminal_id)
+
+    def is_exit_suppressed(self, terminal_id: str) -> bool:
+        """Check if a terminal is exit-suppressed (for testing)."""
+        with self._lock:
+            return terminal_id in self._exit_suppressed
 
     def _clear_wait_rule(self, terminal_id: str) -> None:
         with self._lock:
@@ -324,6 +348,11 @@ class AutoResponder:
     ) -> Optional[TerminalStatus]:
         from cli_agent_orchestrator.clients.database import get_terminal_metadata
         from cli_agent_orchestrator.services.session_env import get_session_env
+
+        # Layer B (F115): suppress all on_screen effects after exit.
+        with self._lock:
+            if terminal_id in self._exit_suppressed:
+                return None
 
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
@@ -599,6 +628,20 @@ class AutoResponder:
                 state.last_push_at = now
 
         if should_push:
+            # Layer A (F115): last-line recheck before push — validate metadata
+            # still present, terminal not suppressed, and incarnation current.
+            from cli_agent_orchestrator.clients.database import get_terminal_metadata as _get_meta
+
+            recheck_meta = _get_meta(terminal_id)
+            if recheck_meta is None:
+                return TerminalStatus.WAITING_USER_ANSWER
+            with self._lock:
+                if terminal_id in self._exit_suppressed:
+                    return TerminalStatus.WAITING_USER_ANSWER
+            recheck_incarnation = self._snapshot_incarnation(terminal_id, recheck_meta)
+            if recheck_incarnation != incarnation:
+                return TerminalStatus.WAITING_USER_ANSWER
+
             dialog_text = self._payload_excerpt(normalized)
             self._push(
                 terminal_id,

@@ -602,5 +602,13 @@ def test_m4_effect_and_real_delete_terminal_are_serialized_by_delivery_lock(monk
     assert not responder.is_alive()
     assert not deleting.is_alive()
     assert delete_done.is_set()
-    assert order.index("send-end") < order.index("clear") < order.index("db-delete")
-    assert engine._terminal_generation["term1"] == 1
+    # Layer C (F115) adds an early idempotent clear at _delete_terminal_under_lease
+    # start (before any lock), so "clear" may appear before "send-end". The key
+    # serialization invariant is: the LATE clear (under delivery lock) and db-delete
+    # both follow send-end. With two clears, check the last clear is properly ordered.
+    clear_indices = [i for i, v in enumerate(order) if v == "clear"]
+    assert len(clear_indices) >= 1
+    last_clear = clear_indices[-1]
+    assert order.index("send-end") < last_clear < order.index("db-delete")
+    # Generation bumps: early clear (1) + late clear under lock (2)
+    assert engine._terminal_generation["term1"] == 2

@@ -3678,6 +3678,13 @@ def exit_terminal_cli(terminal_id: str) -> None:
     else:
         send_input(terminal_id, exit_command)
 
+    # Layer B (F115): suppress auto-responder scans on this terminal after exit.
+    # Exit residue (final report table + exit chrome) should not trigger unknown
+    # dialog alerts. Cleared on re-register (rebind) or clear_terminal (delete).
+    from cli_agent_orchestrator.services.auto_responder import auto_responder
+
+    auto_responder.mark_exit_suppress(terminal_id)
+
 
 def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     """Get terminal output.
@@ -4085,6 +4092,14 @@ def _delete_terminal_under_lease(
     reparent_target_id: str | None = None,
 ) -> Dict:
     """Delete terminal and kill its tmux window."""
+    # Layer C (F115): early auto_responder.clear_terminal at start of delete.
+    # Bumps generation + wipes episode state so any in-flight _check_unknown
+    # that already read metadata will fail the incarnation fence on _push.
+    # The late clear (~:4299 under delivery lock) is kept as idempotent belt.
+    from cli_agent_orchestrator.services.auto_responder import auto_responder
+
+    auto_responder.clear_terminal(terminal_id)
+
     from cli_agent_orchestrator.services.rebind_lease import validate_rebind_lease
 
     validate_rebind_lease(terminal_id, lease_token)
