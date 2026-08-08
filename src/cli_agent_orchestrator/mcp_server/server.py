@@ -16,6 +16,7 @@ from pydantic import Field
 
 from cli_agent_orchestrator.constants import (
     DEFAULT_PROVIDER,
+    DISCOVERY_TOOL_MARKER,
     WORKFLOW_EVENTS_CONNECT_TIMEOUT,
     WORKFLOW_EVENTS_MCP_MAX_EVENTS,
     WORKFLOW_EVENTS_MCP_MAX_SECONDS,
@@ -209,6 +210,7 @@ def _create_terminal(
     park_warm: bool = False,
     model: Optional[str] = None,
     lifecycle: Literal["ephemeral", "sticky"] | None = None,
+    use_worktree: bool = False,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -235,6 +237,11 @@ def _create_terminal(
             existing-session and new-session branches: our caveat that the
             new-session route dropped ``model`` expired when upstream added it
             to ``POST /sessions`` (``api/main.py`` create_session).
+        use_worktree: If True, the created terminal gets an isolated git
+            worktree (issue #100 Phase 1) instead of sharing
+            ``working_directory`` as given. Only meaningful on the
+            existing-session (assign) branch below -- the new-session branch
+            has no live caller today.
 
     Returns:
         Tuple of (terminal_id, provider)
@@ -274,6 +281,8 @@ def _create_terminal(
             params["engine"] = engine
         if model is not None:
             params["model"] = model
+        if use_worktree:
+            params["use_worktree"] = "true"
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
@@ -939,6 +948,7 @@ async def _handoff_impl(
     working_directory: Optional[str] = None,
     engine: Optional[str] = None,
     model: Optional[str] = None,
+    use_worktree: bool = False,
 ) -> HandoffResult:
     """Implementation of handoff logic.
 
@@ -1003,6 +1013,7 @@ async def _handoff_impl(
             "prompt": shaped_message,
             "teardown": True,
             "timeout": float(timeout),
+            "use_worktree": use_worktree,
         }
         if ctx.session_name:
             payload["session_name"] = ctx.session_name
@@ -1123,6 +1134,13 @@ async def handoff(
         description="Optional working directory where the agent should execute",
     ),
     model: Optional[str] = Field(default=None, description=_model_field_desc),
+    use_worktree: bool = Field(
+        default=False,
+        description=(
+            "If true, provision an isolated git worktree for this handoff instead of "
+            "sharing the supervisor's working directory. Default false."
+        ),
+    ),
 ) -> HandoffResult:
     """Hand off a task to another agent via CAO terminal and wait for completion.
 
@@ -1162,11 +1180,28 @@ async def handoff(
         timeout: Maximum wait time in seconds
         working_directory: Optional directory path where agent should execute
         model: Optional model override (not honored by every provider)
+        use_worktree: If true, isolate this handoff in its own git worktree
+
+    ## Isolated worktrees (use_worktree)
+
+    - Set use_worktree=true to give this handoff its own git worktree instead of
+      sharing the supervisor's (or working_directory's) checkout -- closes the
+      "parallel agents editing the same branch/files" race.
+    - The worktree is created from the resolved directory's repo, on its own
+      branch, and torn down when the handoff's terminal is torn down (success or
+      failure): the checkout's working-tree contents are always discarded, but the
+      branch is only deleted if it has no unmerged commits. Commit AND merge/push
+      any results you need kept before the handoff completes -- an uncommitted or
+      unmerged result is not preserved.
+    - Requires the resolved working directory to actually be inside a git
+      repository; otherwise the handoff fails with a clear error.
 
     Returns:
         HandoffResult with success status, message, and agent output
     """
-    return await _handoff_impl(agent_profile, message, timeout, working_directory, model)
+    return await _handoff_impl(
+        agent_profile, message, timeout, working_directory, model=model, use_worktree=use_worktree
+    )
 
 
 # Implementation function for assign
@@ -1200,6 +1235,7 @@ def _assign_impl(
     model: Optional[str] = None,
     lifecycle: Literal["ephemeral", "sticky"] | None = None,
     engine: Optional[str] = None,
+    use_worktree: bool = False,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1365,6 +1401,7 @@ def _assign_impl(
             refresh_base_name=refresh_base_name,
             model=model,
             lifecycle=lifecycle,
+            use_worktree=use_worktree,
             **create_kwargs,
         )
 
@@ -1427,6 +1464,17 @@ Example message: "Analyze the logs. When done, send results back to terminal ee3
 - You can pin a specific model for this one worker via the model parameter, without
   needing a dedicated agent profile -- not honored by every provider
 
+## Isolated worktrees (use_worktree)
+
+- Set use_worktree=true to give this worker its own git worktree instead of sharing
+  the supervisor's checkout -- closes the "parallel agents editing the same
+  branch/files" race.
+- The worktree is created on its own branch. When you call delete_terminal on the
+  worker, the checkout's working-tree contents are always discarded, but the branch
+  is only deleted if it has no unmerged commits -- commit AND merge/push results
+  before deleting the worker if you need them kept.
+- Requires the resolved working directory to be inside a git repository.
+
 ## Cleanup
 
 When you are done with an assigned terminal (received results or no longer need it),
@@ -1442,6 +1490,7 @@ Args:
 
     desc += """
     model: Optional model override for the worker (not honored by every provider)
+    use_worktree: If true, isolate this worker in its own git worktree
 
 Returns:
     Dict with success status, worker terminal_id, and message"""
@@ -1509,6 +1558,13 @@ async def assign(
     engine: Optional[str] = Field(
         default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
     ),
+    use_worktree: bool = Field(
+        default=False,
+        description=(
+            "If true, provision an isolated git worktree for this worker instead of "
+            "sharing the supervisor's working directory. Default false."
+        ),
+    ),
 ) -> Dict[str, Any]:
     return _assign_impl(
         agent_profile,
@@ -1523,6 +1579,7 @@ async def assign(
         model,
         lifecycle,
         engine=engine,
+        use_worktree=use_worktree,
     )
 
 
@@ -2226,6 +2283,213 @@ def delete_terminal(
         return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
     except Exception as e:
         return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
+
+
+def _own_terminal_id_or_error(action: str) -> Union[str, Dict[str, Any]]:
+    """Resolve this MCP process's own terminal id, or an error dict.
+
+    The identity comes from this process's own environment — set by CAO when
+    the terminal was spawned, never a client-supplied argument the calling
+    model could set — the same trust mechanism ``send_message``/``handoff``
+    already rely on (#432).
+    """
+    own_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    if not own_terminal_id:
+        return {
+            "success": False,
+            "error": f"CAO_TERMINAL_ID not set - cannot {action} (must run within a CAO terminal)",
+        }
+    return own_terminal_id
+
+
+def _require_discovery_marker(own_terminal_id: str, action: str) -> Optional[Dict[str, Any]]:
+    """Enforce the discovery opt-in marker (issue #432 design discussion).
+
+    Sibling discovery (list_siblings/update_metadata) is deliberately NOT
+    bundled into @cao-mcp-server's all-or-nothing MCP-server-level grant --
+    a profile must additionally list ``"discovery"`` in its own
+    ``allowedTools`` (or be unrestricted) to use these two tools, even if it
+    already has orchestration tools. See
+    docs/discovery-tool-coexistence.md for the full rationale and why this
+    is enforced here (a runtime check inside the tool handler) rather than
+    by hiding the tool from the model entirely -- cao-mcp-server is one
+    process shared by every profile that wires it in, with no existing
+    mechanism to filter which of its tools a given caller sees.
+
+    Returns an error dict if the marker is missing (call this and return its
+    result immediately when non-None), or ``None`` if the caller is
+    authorized.
+    """
+    try:
+        response = cao_http.get(
+            f"/terminals/{own_terminal_id}", timeout=_mcp_timeout()
+        )
+        response.raise_for_status()
+        allowed_tools = response.json().get("allowed_tools")
+    except Exception as e:
+        # Fail closed: an unresolvable allowed_tools lookup must not silently
+        # grant discovery -- same posture as _own_terminal_id_or_error above.
+        return {
+            "success": False,
+            "error": f"Failed to {action}: could not resolve this terminal's allowed_tools: {e}",
+        }
+    # None (no role/allowedTools resolved at all) and "*" both mean
+    # unrestricted, matching resolve_allowed_tools' own semantics elsewhere.
+    if (
+        allowed_tools is not None
+        and "*" not in allowed_tools
+        and (DISCOVERY_TOOL_MARKER not in allowed_tools)
+    ):
+        return {
+            "success": False,
+            "error": (
+                f"Failed to {action}: this agent profile is not granted the "
+                f"'{DISCOVERY_TOOL_MARKER}' tool. Add '{DISCOVERY_TOOL_MARKER}' to "
+                "allowedTools to use sibling discovery (list_siblings/"
+                "update_metadata) -- see docs/tool-restrictions.md."
+            ),
+        }
+    return None
+
+
+def _list_siblings_impl(depth: Optional[int], cross_session: bool = False) -> Dict[str, Any]:
+    """Implementation of list_siblings logic."""
+    own_terminal_id = _own_terminal_id_or_error("list siblings")
+    if isinstance(own_terminal_id, dict):
+        return own_terminal_id
+
+    denied = _require_discovery_marker(own_terminal_id, "list siblings")
+    if denied is not None:
+        return denied
+
+    try:
+        params: Dict[str, Any] = {}
+        if depth is not None:
+            params["depth"] = depth
+        if cross_session:
+            params["cross_session"] = "true"
+        response = cao_http.get(
+            f"/terminals/{own_terminal_id}/siblings",
+            params=params,
+            timeout=_mcp_timeout(),
+        )
+        response.raise_for_status()
+        return {"success": True, "siblings": response.json()}
+    except requests.HTTPError as e:
+        detail = _extract_error_detail(e.response, str(e)) if e.response is not None else str(e)
+        return {"success": False, "error": f"Failed to list siblings: {detail}"}
+    except Exception as e:
+        return {"success": False, "error": f"Failed to list siblings: {str(e)}"}
+
+
+def _update_metadata_impl(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Implementation of update_metadata logic."""
+    own_terminal_id = _own_terminal_id_or_error("update metadata")
+    if isinstance(own_terminal_id, dict):
+        return own_terminal_id
+
+    denied = _require_discovery_marker(own_terminal_id, "update metadata")
+    if denied is not None:
+        return denied
+
+    try:
+        response = cao_http.patch(
+            f"/terminals/{own_terminal_id}/metadata",
+            json={"metadata": metadata},
+            timeout=_mcp_timeout(),
+        )
+        response.raise_for_status()
+        return {"success": True, "metadata": response.json().get("metadata")}
+    except requests.HTTPError as e:
+        detail = _extract_error_detail(e.response, str(e)) if e.response is not None else str(e)
+        return {"success": False, "error": f"Failed to update metadata: {detail}"}
+    except Exception as e:
+        return {"success": False, "error": f"Failed to update metadata: {str(e)}"}
+
+
+@mcp.tool()
+async def list_siblings(
+    depth: Optional[int] = Field(
+        default=None,
+        description=(
+            "How many leading elements of THIS terminal's own group to match "
+            "against. Omit for the widest scope you're allowed to see (your "
+            "full own group). The server clamps this to your own group's "
+            "length — you can never see a wider scope than your own group — "
+            "and rejects 0 outright rather than treating it as an unscoped, "
+            "all-terminals query."
+        ),
+    ),
+    cross_session: bool = Field(
+        default=False,
+        description=(
+            "Discovery is scoped to your own tmux session by default -- set "
+            "this to true to also see matching siblings in OTHER CAO "
+            "sessions. Explicit opt-in only; two unrelated sessions that "
+            "happen to reuse the same group prefix must not silently "
+            "discover each other."
+        ),
+    ),
+) -> Dict[str, Any]:
+    """Discover sibling terminals sharing a leading prefix of your own group.
+
+    Requires the 'discovery' tool to be granted in your agent profile's
+    allowedTools -- sibling discovery is a separate opt-in from the
+    handoff/assign/send_message orchestration trio, not bundled into
+    @cao-mcp-server (see docs/tool-restrictions.md).
+
+    Resolves your identity from your own CAO_TERMINAL_ID (never a value you
+    pass in) and looks up your own persisted `group`. Returns the id, group,
+    metadata, and status of every OTHER terminal whose group shares the
+    resolved prefix AND is in your own tmux session, unless
+    cross_session=true. If you have no group set, you have no siblings —
+    this is not an error.
+
+    `group` is an organizational label, not a security boundary -- on a
+    default install with auth disabled, a worker already has local shell
+    access, so nothing here provides tenant isolation even with session
+    scoping applied.
+
+    `status` is a live snapshot at call time, not a guarantee -- a sibling
+    (especially a handoff terminal) can complete and delete itself between
+    this call and your next message to it, so expect send_message to a
+    discovered sibling to occasionally fail even when status looked healthy
+    here.
+
+    Use this to find other agents working in the same project/folder/tenant,
+    then message them with send_message using the returned id.
+    """
+    return _list_siblings_impl(depth, cross_session)
+
+
+@mcp.tool()
+async def update_metadata(
+    metadata: Dict[str, Any] = Field(
+        description=(
+            "Free-form JSON describing what this terminal is doing right "
+            "now. Replaces any existing metadata entirely (not merged) -- "
+            "concurrent calls are last-write-wins, so if you're updating "
+            "part of a larger metadata dict, re-send the whole thing each "
+            "time rather than assuming earlier fields still apply. Visible "
+            "to sibling terminals via list_siblings."
+        )
+    ),
+) -> Dict[str, Any]:
+    """Update your own terminal's metadata, visible to siblings via list_siblings.
+
+    Requires the 'discovery' tool to be granted in your agent profile's
+    allowedTools -- sibling discovery is a separate opt-in from the
+    handoff/assign/send_message orchestration trio, not bundled into
+    @cao-mcp-server (see docs/tool-restrictions.md).
+
+    Use this so other agents in your group can see a short description of
+    what you're currently working on without messaging you directly. Whole-
+    dict replace, last-write-wins under concurrent calls -- not an
+    accumulating/merging store. Metadata you publish here is visible to any
+    sibling that can discover you -- treat it as you would any other
+    inter-agent message, not as private state.
+    """
+    return _update_metadata_impl(metadata)
 
 
 # =============================================================================

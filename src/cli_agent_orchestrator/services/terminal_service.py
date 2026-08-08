@@ -28,7 +28,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Dict, Optional, Protocol, assert_never, cast
+from typing import Any, Callable, Dict, List, Optional, Protocol, assert_never, cast
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
@@ -42,6 +42,7 @@ from cli_agent_orchestrator.clients.database import (
     delete_terminal_and_warm_intent,
     get_ready_provider_session,
     get_terminal_metadata,
+    list_siblings_by_group_prefix,
 )
 from cli_agent_orchestrator.clients.database import list_all_terminals as db_list_all_terminals
 from cli_agent_orchestrator.clients.database import (
@@ -53,6 +54,8 @@ from cli_agent_orchestrator.clients.database import (
     terminal_exists,
     update_last_active,
     update_provider_session_snapshot,
+    update_terminal_group,
+    update_terminal_metadata,
     update_terminal_shell_command,
     update_terminal_tmux_window,
 )
@@ -103,6 +106,7 @@ from cli_agent_orchestrator.services.settings_service import (
     get_provider_profile_defaults,
     resolve_provider_string_option,
 )
+from cli_agent_orchestrator.services import worktree_service
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.fork_context_service import snapshot as fork_snapshot
 from cli_agent_orchestrator.services.fork_context_service import staleness as fork_staleness
@@ -693,6 +697,9 @@ async def create_terminal(
     kiro_capability_probe: Optional[Callable[[KiroEngine, set[str]], KiroCapabilities]] = None,
     model: Optional[str] = None,
     lifecycle: str | None = None,
+    use_worktree: bool = False,
+    group: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -731,6 +738,19 @@ async def create_terminal(
             caller (e.g. MCP handoff/assign's own `model` parameter) pin a
             specific model for one worker without needing a dedicated agent profile.
             None leaves that existing resolution chain unchanged.
+        use_worktree: If True, provision an isolated ``git worktree`` (issue
+            #100) for this terminal instead of using ``working_directory`` as
+            given -- resolves the repo root from ``working_directory`` (or the
+            server's own cwd when unset), creates a fresh worktree on its own
+            branch there, and overrides ``working_directory`` to the new
+            worktree path before the tmux session/window is created. Requires
+            the resolved directory to actually be inside a git repository.
+            Default False = behavior unchanged.
+        group: Ordered, general-to-specific grouping array for list_siblings
+            discovery (#432). None = this terminal opts out of discovery.
+        metadata: Free-form JSON describing what this terminal is doing.
+            Also updatable later by the running agent via the
+            ``update_metadata`` MCP tool.
 
     Returns:
         Terminal object with all metadata populated
@@ -841,6 +861,11 @@ async def create_terminal(
     window_created = False
     fifo_attached = False
     db_created = False
+    # Reassigned to the resolved repo root once a worktree is actually created
+    # below (Step 1b), so the failure-cleanup path (the `except` block) knows
+    # whether there is a worktree to roll back too. Still None if Step 1b never
+    # ran (use_worktree=False) or itself failed before create_worktree returned.
+    worktree_repo_root: Optional[str] = None
     try:
         # Resolve profile policy and Kiro engine BEFORE allocating any backend
         # resource. Capability probe runs first so a missing wrapper flag fails
@@ -946,6 +971,28 @@ async def create_terminal(
         env_vars = bind_pane_identity(env_vars, terminal_id, plan=persona_plan)
 
         window_name = generate_window_name(agent_profile)
+
+        # Step 1b: Provision an isolated git worktree (issue #100, Phase 1) before
+        # the tmux session/window below consumes `working_directory` -- the
+        # worktree's own path REPLACES whatever `working_directory` was given
+        # (explicit or caller-inherited), so the terminal always launches inside
+        # its own isolated checkout rather than the shared one it would
+        # otherwise have used.
+        if use_worktree:
+            # `find_repo_root`/`create_worktree` are synchronous `subprocess.run`
+            # calls (a full worktree checkout can take seconds to tens of
+            # seconds on a large repo); `create_terminal` is awaited directly on
+            # the shared event loop, so running them in-line here would freeze
+            # every other cao-server request (status monitor ticks, inbox
+            # delivery, unrelated terminal calls) for the duration. Offload to a
+            # thread, same posture as `delete_terminal`'s own blocking subprocess
+            # work (see its `run_in_executor` call site in api/main.py).
+            worktree_repo_root = await asyncio.to_thread(
+                worktree_service.find_repo_root, working_directory or os.getcwd()
+            )
+            working_directory = await asyncio.to_thread(
+                worktree_service.create_worktree, worktree_repo_root, terminal_id
+            )
 
         # Step 2: Create tmux session or window
         if new_session:
@@ -1124,6 +1171,8 @@ async def create_terminal(
                                 engine=(
                                     resolved_engine.value if resolved_engine is not None else None
                                 ),
+                                group=group,
+                                metadata=metadata,
                                 **init_fields,
                             )
                         else:
@@ -1146,6 +1195,8 @@ async def create_terminal(
                                 engine=(
                                     resolved_engine.value if resolved_engine is not None else None
                                 ),
+                                group=group,
+                                metadata=metadata,
                                 **init_fields,
                             )
                     else:
@@ -1171,6 +1222,8 @@ async def create_terminal(
                                         if resolved_engine is not None
                                         else None
                                     ),
+                                    group=group,
+                                    metadata=metadata,
                                     **init_fields,
                                 )
                             else:
@@ -1194,6 +1247,8 @@ async def create_terminal(
                                         if resolved_engine is not None
                                         else None
                                     ),
+                                    group=group,
+                                    metadata=metadata,
                                     **init_fields,
                                 )
                         else:
@@ -1216,6 +1271,8 @@ async def create_terminal(
                                         if resolved_engine is not None
                                         else None
                                     ),
+                                    group=group,
+                                    metadata=metadata,
                                     **init_fields,
                                 )
                             else:
@@ -1238,6 +1295,8 @@ async def create_terminal(
                                         if resolved_engine is not None
                                         else None
                                     ),
+                                    group=group,
+                                    metadata=metadata,
                                     **init_fields,
                                 )
         except Exception as exc:
@@ -1413,6 +1472,8 @@ async def create_terminal(
             allowed_tools=allowed_tools,
             engine=resolved_engine,
             shell_command=shell_command,
+            group=group,
+            metadata=metadata,
             status=initial_status,
             last_active=datetime.now(),
             provider_session_id=resume_uuid or allocated_uuid,
@@ -1548,6 +1609,18 @@ async def create_terminal(
                 pass
         if settlement_error:
             raise RuntimeError(settlement_error) from e
+        if worktree_repo_root is not None:
+            # A worktree WAS created (Step 1b succeeded) before some later step
+            # failed -- roll it back too, same best-effort posture as everything
+            # else in this block. Without this, a provider-init timeout (or any
+            # later failure) on a worktree-backed terminal would leave an orphan
+            # worktree + branch behind with no CAO-side record pointing at it.
+            # Offloaded to a thread for the same reason Step 1b's create is:
+            # `git worktree remove` is a blocking subprocess call and this
+            # `except` block still runs on the shared event loop.
+            await asyncio.to_thread(
+                worktree_service.remove_worktree, worktree_repo_root, terminal_id
+            )
         raise
 
 
@@ -3074,6 +3147,8 @@ def get_terminal(terminal_id: str) -> Dict:
             "allowed_tools": metadata.get("allowed_tools"),
             "provider_session_id": metadata.get("provider_session_id"),
             "engine": metadata.get("engine"),
+            "group": metadata.get("group"),
+            "metadata": metadata.get("metadata"),
             "status": status,
             "input_gen": input_gen,
             "status_gen": 0 if status_gen is None else status_gen,
@@ -3083,6 +3158,82 @@ def get_terminal(terminal_id: str) -> Dict:
     except Exception as e:
         logger.error(f"Failed to get terminal {terminal_id}: {e}")
         raise
+
+
+def update_group(terminal_id: str, group: Optional[List[str]]) -> bool:
+    """Replace a terminal's group array.
+
+    Used by consumers whose own grouping can change after a terminal already
+    exists (e.g. harness-control folder/project reassignment) so ``group``
+    doesn't go stale (#432). ``None``/``[]`` opts the terminal back out of
+    discovery.
+
+    Returns:
+        False if the terminal does not exist, True otherwise.
+    """
+    return update_terminal_group(terminal_id, group)
+
+
+def update_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]]) -> bool:
+    """Replace a terminal's free-form metadata dict.
+
+    Whole-dict replace, not a merge: concurrent calls are last-write-wins
+    (tedswinyar, PR #433 review). Acceptable for this field -- callers should
+    re-send the full intended dict each time rather than assuming a partial
+    update accumulates on top of a prior one.
+
+    Returns:
+        False if the terminal does not exist, True otherwise.
+    """
+    return update_terminal_metadata(terminal_id, metadata)
+
+
+def list_siblings(
+    caller_id: str, depth: Optional[int] = None, cross_session: bool = False
+) -> List[Dict[str, Any]]:
+    """Resolve ``caller_id``'s own group and return matching sibling terminals.
+
+    Depth is clamped server-side to ``[1, len(caller_group)]`` (#432): it can
+    never be widened past the caller's own group length, and an explicit 0 is
+    rejected by the API layer's query-param validation before this is ever
+    called (never silently reinterpreted as an unscoped, all-terminals
+    query). ``depth=None`` defaults to the caller's full own group length —
+    the widest scope the caller is allowed to see.
+
+    A caller with no group set finds no siblings (participates in no
+    discovery, per #432) rather than erroring.
+
+    Session-scoped by default (issue #432 design discussion): results are
+    additionally filtered to the caller's own ``tmux_session`` unless
+    ``cross_session=True`` is explicitly passed — see
+    ``list_siblings_by_group_prefix``'s own docstring for the full rationale.
+
+    Returns:
+        List of ``{id, group, metadata, status}`` dicts for every OTHER
+        terminal whose group shares the resolved prefix. ``status`` is a
+        live, point-in-time snapshot (tedswinyar, PR #433 review): a handoff
+        terminal that has COMPLETED can still delete itself between this
+        call returning and a caller's follow-up ``send_message`` to it, so a
+        discovered sibling is never a guarantee it's still reachable --
+        ``status`` lets a caller skip an obviously-finished sibling
+        proactively, but callers should still expect sends to occasionally
+        fail against a sibling that disappeared in that window.
+    """
+    caller_metadata = get_terminal_metadata(caller_id)
+    caller_group = caller_metadata.get("group") if caller_metadata else None
+    if not caller_group:
+        return []
+    caller_session = caller_metadata.get("tmux_session") if caller_metadata else None
+    max_depth = len(caller_group)
+    effective_depth = max_depth if depth is None else depth
+    effective_depth = max(1, min(effective_depth, max_depth))
+    prefix = caller_group[:effective_depth]
+    siblings = list_siblings_by_group_prefix(
+        caller_id, prefix, caller_session=caller_session, cross_session=cross_session
+    )
+    for sibling in siblings:
+        sibling["status"] = status_monitor.get_status(sibling["id"]).value
+    return siblings
 
 
 def get_working_directory(terminal_id: str) -> Optional[str]:
@@ -3958,6 +4109,22 @@ def _delete_terminal_under_lease(
         metadata = provisional
 
         if metadata:
+            # Read the pane's live working directory BEFORE kill_window below
+            # destroys the pane. Single read, reused for two purposes: the
+            # scrollback snapshot below, and issue #100 Phase 1's worktree
+            # cleanup (recognizing a worktree-backed terminal from its live
+            # cwd alone -- there is no separate CAO-side record of which
+            # terminals are worktree-backed). Best-effort: a read failure
+            # means the snapshot's working_directory field is None and no
+            # worktree cleanup runs below.
+            live_working_directory = None
+            try:
+                live_working_directory = get_backend().get_pane_working_directory(
+                    metadata["tmux_session"], metadata["tmux_window"]
+                )
+            except Exception as e:
+                logger.warning(f"Failed to read working directory for {terminal_id}: {e}")
+
             # Snapshot scrollback + metadata before killing (for debugging/restore)
             try:
                 # Capture plain text full scrollback (no -e, no line cap)
@@ -3978,9 +4145,7 @@ def _delete_terminal_under_lease(
                     "window_name": metadata["tmux_window"],
                     "agent_profile": metadata.get("agent_profile"),
                     "provider": metadata["provider"],
-                    "working_directory": get_backend().get_pane_working_directory(
-                        metadata["tmux_session"], metadata["tmux_window"]
-                    ),
+                    "working_directory": live_working_directory,
                     "allowed_tools": metadata.get("allowed_tools"),
                     "caller_id": metadata.get("caller_id"),
                 }
@@ -4047,6 +4212,31 @@ def _delete_terminal_under_lease(
                     persona_retention_error = retain_codex_persona_home(
                         terminal_id, persona_retention_intent
                     )
+
+        # issue #100 Phase 1: if this terminal was worktree-backed (its live
+        # cwd matched the CAO-managed worktree path shape), remove the
+        # worktree + branch now that the process using it is gone.
+        # `remove_worktree` is itself best-effort/never-raises, matching
+        # every other step in this teardown.
+        #
+        # The parsed terminal_id MUST match the terminal actually being
+        # deleted here, not just "some" CAO worktree path. Without this
+        # guard: a worktree-backed terminal A (cwd
+        # .../.cao/worktrees/A) can spawn a non-worktree terminal B with
+        # working_directory explicitly set to A's cwd (handoff/assign
+        # both accept an explicit working_directory, and "here" -- the
+        # caller's own directory -- is a common choice). Deleting B --
+        # including handoff's automatic success teardown -- would then
+        # read B's pane cwd (== A's worktree path), parse terminal_id
+        # "A" out of it, and force-remove A's still-running worktree.
+        # Mismatched parses now fall through as a no-op leak (Phase 3
+        # territory) instead of destroying another terminal's checkout.
+        if metadata is not None:
+            parsed = worktree_service.parse_worktree_path(live_working_directory)
+            if parsed is not None:
+                worktree_repo_root, worktree_terminal_id = parsed
+                if worktree_terminal_id == terminal_id:
+                    worktree_service.remove_worktree(worktree_repo_root, worktree_terminal_id)
 
         # Cleanup provider state and database record
         provider_manager.cleanup_provider(terminal_id)

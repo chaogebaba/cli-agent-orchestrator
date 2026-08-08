@@ -302,6 +302,8 @@ class TestCreateSession:
             initial_message_orchestration_type=None,
             model=None,
             lifecycle=None,
+            group=None,
+            metadata=None,
         )
 
     def test_create_session_passes_explicit_kiro_engine(self, client):

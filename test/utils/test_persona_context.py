@@ -309,10 +309,17 @@ def test_two_codex_personas_render_distinct_developer_instructions(
     command_two = CodexProvider(
         "codex-project", "session", "window-two", "maker", persona_plan=second
     )._build_codex_command()
-    args_one = shlex.split(command_one)
-    args_two = shlex.split(command_two)
-    instructions_one = next(arg for arg in args_one if arg.startswith("developer_instructions="))
-    instructions_two = next(arg for arg in args_two if arg.startswith("developer_instructions="))
+    # developer_instructions live in a temp file + $(cat) fragment (upstream 0e7b70bb)
+    import re
+    from pathlib import Path as _P
+
+    def _read_dev_instr(command: str) -> str:
+        m = re.search(r"\$\(cat (\S+)\)", command)
+        assert m is not None, command
+        return _P(m.group(1)).read_text(encoding="utf-8")
+
+    instructions_one = _read_dev_instr(command_one)
+    instructions_two = _read_dev_instr(command_two)
     assert "feedback body" in instructions_one and "project body" not in instructions_one
     assert "project body" in instructions_two and "feedback body" not in instructions_two
     assert instructions_one != instructions_two

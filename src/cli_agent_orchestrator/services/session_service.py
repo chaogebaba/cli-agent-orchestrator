@@ -24,7 +24,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
@@ -107,6 +107,8 @@ async def create_session(
     initial_message_orchestration_type: OrchestrationType | None = None,
     model: str | None = None,
     lifecycle: str | None = None,
+    group: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
@@ -120,6 +122,11 @@ async def create_session(
     initialization behavior used by existing callers.
     On the deferred path, the ``post_create_session`` plugin event is dispatched
     before provider initialization and message delivery finish.
+
+    ``group``/``metadata`` are the #432 discovery fields, set on the initial
+    terminal at creation time (``group`` is also updatable later via
+    ``PATCH /terminals/{id}/group``, ``metadata`` via the ``update_metadata``
+    MCP tool).
     """
     if initial_message == "":
         raise ValueError("initial_message must not be empty")
@@ -171,6 +178,8 @@ async def create_session(
         initial_message_orchestration_type=initial_message_orchestration_type,
         model=model,
         lifecycle=lifecycle,
+        group=group,
+        metadata=metadata,
     )
     if mailbox_claim is not None:
         from cli_agent_orchestrator.clients.database import get_terminal_metadata
