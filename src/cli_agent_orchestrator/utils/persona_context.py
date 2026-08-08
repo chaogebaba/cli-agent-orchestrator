@@ -353,7 +353,7 @@ def persona_wrapper_prefix(plan: PersonaPlan) -> list[str]:
     ]
     for bind, mode in (
         *((((plan.persona_bind, "--bind"),) if plan.persona_bind else ())),
-        *((((plan.credential_bind, "--ro-bind"),) if plan.credential_bind else ())),
+        *((((plan.credential_bind, "--bind"),) if plan.credential_bind else ())),
     ):
         prefix.extend((mode, str(bind.src), str(bind.dst)))
     for bind in (*plan.leaf_binds, *plan.shadow_binds):
@@ -483,15 +483,12 @@ def compose_persona_plan(
             bwrap_executable = Path(executable).resolve(strict=True)
             destination = claude_home
             persona_bind = PersonaBind(generation_dir, destination)
-            # Only bind credentials if the file exists AND has a valid
-            # (non-empty) access token.  Expired/empty OAuth creds block
-            # env-based auth fallback (CPA_API_KEY) — better to skip the
-            # bind and let Claude Code discover the key from env.
-            if (
-                real_credentials.is_file()
-                and not real_credentials.is_symlink()
-                and _credentials_have_valid_token(real_credentials)
-            ):
+            # Always bind credentials if the file exists — Claude Code
+            # auto-refreshes expired tokens using the refreshToken field.
+            # Without the file, Claude Code has nothing to refresh FROM and
+            # shows "Login expired".  Use --bind (not --ro-bind) so the
+            # refresh can write the new accessToken back.
+            if real_credentials.is_file() and not real_credentials.is_symlink():
                 credential_bind = PersonaBind(
                     real_credentials.resolve(), destination / ".credentials.json"
                 )
@@ -508,9 +505,8 @@ def compose_persona_plan(
                 PersonaBind(generation_dir / "cwd-shadow" / ".claude", cwd / ".claude"),
             )
             env_set = {"CLAUDE_CONFIG_DIR": str(destination)}
-            # Only unset API key env vars when we have a valid credential bind
-            # (forces OAuth). Without a bind, let env-based auth (CPA_API_KEY,
-            # ANTHROPIC_API_KEY) pass through to Claude Code.
+            # Unset API key env vars to force OAuth credential flow (the bound
+            # .credentials.json provides auth via token refresh).
             env_unset = PERSONA_ENV_UNSET if credential_bind else ()
         else:
             real_codex_home = provider_home("codex").home.resolve()
@@ -665,9 +661,8 @@ def load_persona_plan(terminal_id: str) -> PersonaPlan | None:
         expected_env = (
             {"CLAUDE_CONFIG_DIR": str(persona_bind.dst)} if persona_bind is not None else {}
         )
-        # credential_bind may be None when OAuth tokens are expired —
-        # env-based auth (CPA_API_KEY) is used instead; env_unset is
-        # then empty (don't strip API key vars the fallback needs).
+        # credential_bind may be None if the credentials file was absent at
+        # compose time (fresh install, no OAuth login ever performed).
         valid_env_unset = (
             tuple(env_unset) == PERSONA_ENV_UNSET
             if credential_bind is not None
