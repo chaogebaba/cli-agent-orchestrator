@@ -104,24 +104,6 @@ def _header(profile_name: str, policy_hash: str) -> str:
     )
 
 
-def _credentials_have_valid_token(path: Path) -> bool:
-    """Check if a Claude credentials file has a non-empty, non-expired access token."""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        oauth = data.get("claudeAiOauth", {})
-        access_token = oauth.get("accessToken", "")
-        if not access_token:
-            return False
-        # expiresAt is epoch millis; treat 0 or past as expired
-        expires_at = oauth.get("expiresAt", 0)
-        import time
-        if expires_at and expires_at < time.time() * 1000:
-            return False
-        return True
-    except (OSError, json.JSONDecodeError, TypeError):
-        return False
-
-
 def _native_memory_metadata(path: Path) -> tuple[str, str] | None:
     try:
         post = frontmatter.loads(path.read_text(encoding="utf-8"))
