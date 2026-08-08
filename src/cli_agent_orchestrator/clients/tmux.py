@@ -195,8 +195,11 @@ class TmuxClient:
 
         command = "kill-window" if window_name is not None else "kill-session"
         try:
+            # Must go through tmux_argv (G7A closed-world socket choke point):
+            # raw ["tmux", ...] would hit the default server and bypass
+            # CAO_TMUX_SOCKET sandbox isolation.
             result = subprocess.run(
-                ["tmux", command, "-t", target],
+                tmux_argv(command, "-t", target),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -232,8 +235,11 @@ class TmuxClient:
             logger.error("Cannot build tmux has-session target: %s", e)
             return None
         try:
+            # Socket-aware argv via tmux_argv — same G7A choke point as every
+            # other product tmux execution (has-session is read-only, but must
+            # still probe the sandbox server, not the default one).
             result = subprocess.run(
-                ["tmux", "has-session", "-t", target],
+                tmux_argv("has-session", "-t", target),
                 capture_output=True,
                 text=True,
                 check=False,
