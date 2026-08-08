@@ -649,14 +649,13 @@ class ClaudeCodeProvider(BaseProvider):
                     real_data = json.loads(real_settings.read_text(encoding="utf-8"))
                     real_env = real_data.get("env")
                     if isinstance(real_env, dict):
-                        # Only carry auth/proxy vars, not model overrides or feature flags
-                        _AUTH_ENV_KEYS = {
-                            "ANTHROPIC_AUTH_TOKEN",
-                            "ANTHROPIC_BASE_URL",
-                            "ANTHROPIC_API_KEY",
-                        }
+                        # Only carry auth/proxy vars, not model overrides or feature flags.
+                        # Uses the same set as PERSONA_ENV_UNSET (persona_context.py) —
+                        # the vars bwrap strips are exactly the vars settings.env must restore.
+                        from cli_agent_orchestrator.utils.persona_context import PERSONA_ENV_UNSET
+
                         auth_env = {
-                            k: v for k, v in real_env.items() if k in _AUTH_ENV_KEYS
+                            k: v for k, v in real_env.items() if k in PERSONA_ENV_UNSET
                         }
                         if auth_env:
                             settings["env"] = auth_env

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 import frontmatter
+import yaml
 
 from cli_agent_orchestrator.models.agent_profile import ContextPolicy
 from cli_agent_orchestrator.utils.provider_plane import provider_home
@@ -126,9 +127,9 @@ def _native_memory_metadata(path: Path) -> tuple[str, str] | None:
         post = frontmatter.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, ValueError):
         return None
-    except Exception:
-        # yaml.YAMLError (ParserError, ScannerError) and any other frontmatter
-        # parse failure — skip gracefully; the file cannot contribute.
+    except yaml.YAMLError:
+        # ParserError, ScannerError — malformed YAML frontmatter (e.g. unescaped
+        # quotes/brackets in description fields). Skip gracefully.
         return None
     name = post.metadata.get("name")
     metadata = post.metadata.get("metadata")
