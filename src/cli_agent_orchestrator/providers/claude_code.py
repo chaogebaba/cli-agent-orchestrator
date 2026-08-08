@@ -636,6 +636,32 @@ class ClaudeCodeProvider(BaseProvider):
                 ]
             }
         }
+        # When persona composition is active, the real ~/.claude/settings.json
+        # is hidden behind the bwrap overlay.  Merge auth-critical env vars
+        # (ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL, proxy config) from the
+        # real settings so Claude Code can reach the API through the local proxy.
+        if self._persona_plan is not None:
+            from cli_agent_orchestrator.utils.provider_plane import provider_home
+
+            real_settings = provider_home("claude_code").home / "settings.json"
+            if real_settings.is_file():
+                try:
+                    real_data = json.loads(real_settings.read_text(encoding="utf-8"))
+                    real_env = real_data.get("env")
+                    if isinstance(real_env, dict):
+                        # Only carry auth/proxy vars, not model overrides or feature flags
+                        _AUTH_ENV_KEYS = {
+                            "ANTHROPIC_AUTH_TOKEN",
+                            "ANTHROPIC_BASE_URL",
+                            "ANTHROPIC_API_KEY",
+                        }
+                        auth_env = {
+                            k: v for k, v in real_env.items() if k in _AUTH_ENV_KEYS
+                        }
+                        if auth_env:
+                            settings["env"] = auth_env
+                except (OSError, json.JSONDecodeError):
+                    pass
         path = tmp_dir / f"{self.terminal_id}.settings.json"
         path.write_text(json.dumps(settings), encoding="utf-8")
         try:
