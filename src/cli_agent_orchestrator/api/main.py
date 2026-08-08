@@ -2691,7 +2691,10 @@ async def _apply_recovery_nudges(
     reason: str,
     nudge: bool | None,
 ) -> dict[str, Any]:
-    engaged = reason == "content-flag" or nudge is True
+    # F30: default to nudging after recovery so workers don't park idle.
+    # content-flag always engages (needs structured nudge tracking for decontamination).
+    # Other reasons: engage by default, skip only when explicitly --no-nudge.
+    engaged = reason == "content-flag" or nudge is not False
     if not engaged:
         return result
     from cli_agent_orchestrator.services.wpd1_decontam import (
