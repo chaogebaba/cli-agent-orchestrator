@@ -17,13 +17,16 @@ The provider detects the following terminal states:
 - ERROR: Agent encountered an error during processing
 """
 
+import json
 import logging
+import os
 import re
 import shlex
+from pathlib import Path
 from typing import Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.constants import BLOCKED_WAIT_CAP_S
+from cli_agent_orchestrator.constants import BLOCKED_WAIT_CAP_S, KIRO_AGENTS_DIR
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
@@ -35,6 +38,8 @@ from cli_agent_orchestrator.services.settings_service import (
     resolve_provider_string_option,
 )
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+from cli_agent_orchestrator.utils.sandbox_guard import bind_mcp_server_identity
 from cli_agent_orchestrator.utils.terminal import (
     BlockedWaitPolicy,
     wait_for_shell,
@@ -276,6 +281,39 @@ class KiroCliProvider(BaseProvider):
             "model",
         )
 
+    def _write_per_terminal_agent_config(self) -> Path:
+        """Write a per-terminal kiro agent JSON with identity-bound MCP servers.
+
+        kiro-cli resolves --agent by scanning ~/.kiro/agents/*.json for a matching
+        ``name`` field, so the per-terminal copy lives in KIRO_AGENTS_DIR with a
+        unique name derived from the terminal_id.
+        """
+        base_config_path = KIRO_AGENTS_DIR / f"{self._agent_profile.replace('/', '__')}.json"
+        config = json.loads(base_config_path.read_text(encoding="utf-8"))
+
+        # Set a per-terminal name so kiro-cli can find it via --agent <name>
+        per_terminal_name = f"cao-{self.terminal_id}"
+        config["name"] = per_terminal_name
+
+        if config.get("mcpServers"):
+            for server_name, server_cfg in config["mcpServers"].items():
+                config["mcpServers"][server_name] = bind_mcp_server_identity(
+                    resolve_mcp_server_config(server_cfg), self.terminal_id
+                )
+
+        per_terminal = KIRO_AGENTS_DIR / f"{self.terminal_id}.kiro-agent.json"
+        # Write-temp-then-os.replace for atomicity
+        tmp_file = per_terminal.with_suffix(".tmp")
+        tmp_file.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        os.replace(str(tmp_file), str(per_terminal))
+        return per_terminal
+
+    def _apply_per_terminal_agent(self, command: list[str], agent_path: Path) -> list[str]:
+        """Replace the `--agent <name>` value with the per-terminal agent name."""
+        i = command.index("--agent")
+        command[i + 1] = f"cao-{self.terminal_id}"
+        return command
+
     async def initialize(self) -> bool:
         """Initialize Kiro CLI provider by starting kiro-cli chat command.
 
@@ -350,6 +388,9 @@ class KiroCliProvider(BaseProvider):
                 model=model,
                 yolo=True,
             )
+        # Write per-terminal agent JSON with identity-bound MCP servers
+        per_terminal_agent = self._write_per_terminal_agent_config()
+        self._apply_per_terminal_agent(base_args, per_terminal_agent)
         command = shlex.join(base_args)
         # Arm the StatusMonitor stickiness gate before launching the CLI so
         # the IDLE → PROCESSING → IDLE/COMPLETED transition is honored.
@@ -416,6 +457,7 @@ class KiroCliProvider(BaseProvider):
                 yolo=True,
                 legacy_ui=True,
             )
+            self._apply_per_terminal_agent(legacy_args, per_terminal_agent)
             legacy_command = shlex.join(legacy_args)
             status_monitor.notify_input_sent(self.terminal_id)
             get_backend().send_keys(self.session_name, self.window_name, legacy_command)
@@ -967,3 +1009,6 @@ class KiroCliProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up Kiro CLI provider."""
         self._initialized = False
+        # Remove per-terminal agent JSON written by _write_per_terminal_agent_config
+        per_terminal = KIRO_AGENTS_DIR / f"{self.terminal_id}.kiro-agent.json"
+        per_terminal.unlink(missing_ok=True)

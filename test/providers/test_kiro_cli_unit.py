@@ -13,6 +13,11 @@ from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 # Test fixtures directory
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
+# Fixed path used when patching _write_per_terminal_agent_config in init tests
+_FAKE_AGENT_PATH = Path("/tmp/cao-test/test1234.kiro-agent.json")
+_FAKE_AGENT_NAME = "cao-test1234"
+
+
 
 def load_fixture(filename: str) -> str:
     """Load a fixture file and return its contents."""
@@ -22,6 +27,16 @@ def load_fixture(filename: str) -> str:
 
 class TestKiroCliProviderInitialization:
     """Test Kiro CLI provider initialization."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_per_terminal_agent(self):
+        """Patch _write_per_terminal_agent_config so init tests don't need a real agents dir."""
+        with patch.object(
+            KiroCliProvider,
+            "_write_per_terminal_agent_config",
+            return_value=_FAKE_AGENT_PATH,
+        ):
+            yield
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
@@ -44,7 +59,7 @@ class TestKiroCliProviderInitialization:
         mock_tmux.return_value.send_keys.assert_called_once_with(
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 --trust-all-tools --agent developer",
+            "kiro-cli chat --agent-engine v2 --trust-all-tools --agent cao-test1234",
         )
         mock_wait_status.assert_called_once()
 
@@ -102,13 +117,13 @@ class TestKiroCliProviderInitialization:
         assert calls[0].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 --trust-all-tools --agent developer",
+            "kiro-cli chat --agent-engine v2 --trust-all-tools --agent cao-test1234",
         )
         assert calls[1].args == ("test-session", "window-0", "/exit")
         assert calls[2].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --agent developer",
+            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --agent cao-test1234",
         )
 
     @pytest.mark.asyncio
@@ -136,7 +151,7 @@ class TestKiroCliProviderInitialization:
         mock_tmux.return_value.send_keys.assert_called_once_with(
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --agent developer",
+            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --agent cao-test1234",
         )
 
     @pytest.mark.asyncio
@@ -161,7 +176,7 @@ class TestKiroCliProviderInitialization:
             "test-session",
             "window-0",
             "kiro-cli chat --agent-engine v2 --trust-all-tools "
-            "--model claude-opus-4-6 --agent developer",
+            "--model claude-opus-4-6 --agent cao-test1234",
         )
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
@@ -212,7 +227,7 @@ class TestKiroCliProviderInitialization:
         mock_tmux.return_value.send_keys.assert_called_once_with(
             "test-session",
             "window-0",
-            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --model claude-opus-4.6 --agent developer",
+            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --model claude-opus-4.6 --agent cao-test1234",
         )
 
     @pytest.mark.asyncio
@@ -266,14 +281,14 @@ class TestKiroCliProviderInitialization:
             "test-session",
             "window-0",
             "kiro-cli chat --agent-engine v2 --trust-all-tools "
-            "--model claude-opus-4.6 --agent developer",
+            "--model claude-opus-4.6 --agent cao-test1234",
         )
         assert calls[1].args == ("test-session", "window-0", "/exit")
         assert calls[2].args == (
             "test-session",
             "window-0",
             "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools "
-            "--model claude-opus-4.6 --agent developer",
+            "--model claude-opus-4.6 --agent cao-test1234",
         )
 
     def test_initialization_with_different_agent_profiles(self):
