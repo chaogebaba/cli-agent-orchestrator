@@ -7,8 +7,8 @@ import pytest
 from cli_agent_orchestrator.services.terminal_service import (
     exit_terminal_cli,
     get_working_directory,
-    purge_stale_terminal_records,
     list_siblings,
+    purge_stale_terminal_records,
     send_special_key,
 )
 
@@ -43,7 +43,7 @@ class TestPurgeStaleTerminalRecords:
         backend = mock_backend.return_value
         backend.supports_identity_readback = True
         backend.window_liveness.side_effect = ["live", "gone"]
-        backend.get_session_windows.return_value = []
+        backend.enumerate_windows.return_value = ("ok", [])
         mock_settle.return_value.busy_aborted = False
 
         assert purge_stale_terminal_records() == 1

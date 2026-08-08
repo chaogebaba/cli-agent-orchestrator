@@ -146,6 +146,16 @@ class TerminalBackend(ABC):
         """Return live, gone, or error without collapsing backend failures."""
         return "error"
 
+    def enumerate_windows(
+        self, session_name: str
+    ) -> tuple[Literal["ok", "error"], List[Dict[str, object]] | None]:
+        """Enumerate windows via subprocess. Classifies its own failure.
+
+        Returns ("ok", [...]) on success, ("ok", []) when the session is
+        genuinely absent, or ("error", None) when the read itself failed.
+        """
+        return ("error", None)
+
     def get_session_windows(self, session_name: str) -> List[Dict[str, object]]:
         """Return the windows visible in a session, or an empty inventory."""
         return []

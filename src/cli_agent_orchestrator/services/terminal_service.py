@@ -43,11 +43,11 @@ from cli_agent_orchestrator.clients.database import (
     delete_terminal_and_warm_intent,
     get_ready_provider_session,
     get_terminal_metadata,
-    list_siblings_by_group_prefix,
 )
 from cli_agent_orchestrator.clients.database import list_all_terminals as db_list_all_terminals
 from cli_agent_orchestrator.clients.database import (
     list_deferred_init_recovery_rows,
+    list_siblings_by_group_prefix,
     list_terminals_by_provider_session_id,
     list_terminals_by_session,
     mark_terminal_init_ready,
@@ -69,8 +69,8 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
-from cli_agent_orchestrator.models.native_publish import DispatchTxn, NativePublishRequest
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
+from cli_agent_orchestrator.models.native_publish import DispatchTxn, NativePublishRequest
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.plugins import (
@@ -83,8 +83,13 @@ from cli_agent_orchestrator.providers.base import (
     RetryableArtifactValidation,
     TerminalArtifactValidation,
 )
+from cli_agent_orchestrator.providers.kiro_capabilities import (
+    KiroCapabilities,
+    probe_kiro_capabilities,
+    requested_kiro_capabilities,
+)
 from cli_agent_orchestrator.providers.manager import get_provider_class, provider_manager
-from cli_agent_orchestrator.services import base_digest_service
+from cli_agent_orchestrator.services import base_digest_service, worktree_service
 from cli_agent_orchestrator.services.deferred_dispatcher import (
     DeferredCall,
     DeferredExecutorSaturated,
@@ -97,17 +102,6 @@ from cli_agent_orchestrator.services.draft_guard import (
     preserve_draft_before_send,
     stash_draft_before_send,
 )
-from cli_agent_orchestrator.providers.kiro_capabilities import (
-    KiroCapabilities,
-    probe_kiro_capabilities,
-    requested_kiro_capabilities,
-)
-from cli_agent_orchestrator.services.settings_service import (
-    get_provider_defaults,
-    get_provider_profile_defaults,
-    resolve_provider_string_option,
-)
-from cli_agent_orchestrator.services import worktree_service
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.fork_context_service import snapshot as fork_snapshot
 from cli_agent_orchestrator.services.fork_context_service import staleness as fork_staleness
@@ -118,6 +112,11 @@ from cli_agent_orchestrator.services.session_env import (
     clear_session_env,
     get_session_env,
     set_session_env,
+)
+from cli_agent_orchestrator.services.settings_service import (
+    get_provider_defaults,
+    get_provider_profile_defaults,
+    resolve_provider_string_option,
 )
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor, status_monitor
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -372,10 +371,14 @@ def purge_stale_terminal_records() -> int:
             if getattr(backend, "supports_identity_readback", False) is not True:
                 continue
 
-            windows = backend.get_session_windows(tmux_session)
+            enum_state, windows = backend.enumerate_windows(tmux_session)
+            enumeration_failed = enum_state == "error"
+            if enumeration_failed:
+                windows = []  # type narrowing — loop won't execute
+
             matches: list[str] = []
             unreadable: list[str] = []
-            for window in windows:
+            for window in windows:  # type: ignore[union-attr]
                 name = str(window["name"])
                 result = backend.read_pane_identity(tmux_session, name)
                 if result.reason in {
@@ -406,11 +409,12 @@ def purge_stale_terminal_records() -> int:
                         match,
                     )
                 continue
-            if unreadable:
+            if enumeration_failed or unreadable:
                 logger.warning(
-                    "purge_inconclusive terminal=%s session=%s unreadable=%d",
+                    "purge_inconclusive terminal=%s session=%s enumeration_failed=%s unreadable=%d",
                     terminal_id,
                     tmux_session,
+                    enumeration_failed,
                     len(unreadable),
                 )
                 continue
@@ -925,9 +929,7 @@ async def create_terminal(
             else:
                 provider_defaults = get_provider_defaults("kiro_cli")
                 profile_name = getattr(profile, "name", None) or agent_profile
-                profile_defaults = get_provider_profile_defaults(
-                    provider_defaults, profile_name
-                )
+                profile_defaults = get_provider_profile_defaults(provider_defaults, profile_name)
                 resolved_model = resolve_provider_string_option(
                     profile_defaults,
                     provider_defaults,
@@ -1398,7 +1400,7 @@ async def create_terminal(
         allocated_uuid = getattr(provider_instance, "allocated_session_uuid", None)
         if not isinstance(allocated_uuid, str):
             allocated_uuid = None
-            engine=resolved_engine,
+            engine = (resolved_engine,)
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
         # block on `provider.initialize()`. The remaining initialize + input

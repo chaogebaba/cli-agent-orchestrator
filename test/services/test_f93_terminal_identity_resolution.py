@@ -79,7 +79,7 @@ def test_ac3_rename_self_heals_and_routes_subsequent_input(monkeypatch, purge_ef
     metadata = _row("terminal-a", "old-name")
     backend = _identity_backend()
     backend.window_liveness.return_value = "gone"
-    backend.get_session_windows.return_value = [{"name": "new-name", "index": "1"}]
+    backend.enumerate_windows.return_value = ("ok", [{"name": "new-name", "index": "1"}])
     backend.read_pane_identity.return_value = PaneIdentityReadResult(identity="terminal-a")
 
     def update(terminal_id: str, window: str) -> bool:
@@ -125,7 +125,7 @@ def test_ac3_rename_self_heals_and_routes_subsequent_input(monkeypatch, purge_ef
 def test_ac4_genuinely_dead_window_purges_under_clean_scan(monkeypatch, purge_effects) -> None:
     backend = _identity_backend()
     backend.window_liveness.return_value = "gone"
-    backend.get_session_windows.return_value = [{"name": "ordinary", "index": "1"}]
+    backend.enumerate_windows.return_value = ("ok", [{"name": "ordinary", "index": "1"}])
     backend.read_pane_identity.return_value = PaneIdentityReadResult(reason="missing_env")
     monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
     monkeypatch.setattr(terminal_service, "db_list_all_terminals", lambda: [_row("dead", "old")])
@@ -139,10 +139,13 @@ def test_ac4b_unreadable_window_defers_then_clean_scan_purges(
 ) -> None:
     backend = _identity_backend()
     backend.window_liveness.return_value = "gone"
-    backend.get_session_windows.return_value = [
-        {"name": "split", "index": "1"},
-        {"name": "clean", "index": "2"},
-    ]
+    backend.enumerate_windows.return_value = (
+        "ok",
+        [
+            {"name": "split", "index": "1"},
+            {"name": "clean", "index": "2"},
+        ],
+    )
 
     def first_read(_session: str, window: str) -> PaneIdentityReadResult:
         if window == "split":
@@ -158,7 +161,7 @@ def test_ac4b_unreadable_window_defers_then_clean_scan_purges(
     assert purge_effects.deleted == []
     assert "purge_inconclusive terminal=dead" in caplog.text
 
-    backend.get_session_windows.return_value = [{"name": "clean", "index": "2"}]
+    backend.enumerate_windows.return_value = ("ok", [{"name": "clean", "index": "2"}])
     backend.read_pane_identity.side_effect = None
     backend.read_pane_identity.return_value = PaneIdentityReadResult(reason="missing_env")
 
@@ -185,7 +188,7 @@ def test_ac11_unreadable_identity_reason_is_never_absence(
 ) -> None:
     backend = _identity_backend()
     backend.window_liveness.return_value = "gone"
-    backend.get_session_windows.return_value = [{"name": "renamed", "index": "1"}]
+    backend.enumerate_windows.return_value = ("ok", [{"name": "renamed", "index": "1"}])
     backend.read_pane_identity.return_value = PaneIdentityReadResult(reason=reason)
     monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
     monkeypatch.setattr(terminal_service, "db_list_all_terminals", lambda: [_row("worker", "old")])
@@ -206,7 +209,7 @@ def test_ac12_conflicting_name_declines_then_reconciles_after_conflict_clears(
     backend.window_liveness.side_effect = lambda _session, window: (
         "gone" if window == "stale-name" else "live"
     )
-    backend.get_session_windows.return_value = [{"name": "claimed-name", "index": "1"}]
+    backend.enumerate_windows.return_value = ("ok", [{"name": "claimed-name", "index": "1"}])
     backend.read_pane_identity.return_value = PaneIdentityReadResult(identity="terminal-a")
     monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
     monkeypatch.setattr(terminal_service, "db_list_all_terminals", lambda: rows)
@@ -241,12 +244,15 @@ def test_ac13_one_row_raise_skips_it_and_processes_remaining_rows(
         "live" if window == "live" else "gone"
     )
 
-    def windows(_session: str):
-        if backend.get_session_windows.call_count == 1:
-            raise RuntimeError("inventory failed")
-        return [{"name": "clean", "index": "1"}]
+    call_count = {"n": 0}
 
-    backend.get_session_windows.side_effect = windows
+    def enum_windows(_session: str):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("inventory failed")
+        return ("ok", [{"name": "clean", "index": "1"}])
+
+    backend.enumerate_windows.side_effect = enum_windows
     backend.read_pane_identity.return_value = PaneIdentityReadResult(reason="missing_env")
     monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
     monkeypatch.setattr(terminal_service, "db_list_all_terminals", lambda: rows)
@@ -280,6 +286,10 @@ def test_ac14_no_identity_readback_skips_gone_row_without_scanning(
         def window_liveness(self, _session: str, _window: str) -> str:
             return "gone"
 
+        def enumerate_windows(self, _session: str):
+            self.scan_calls += 1
+            return ("ok", [])
+
         def get_session_windows(self, _session: str):
             self.scan_calls += 1
             return []
@@ -303,10 +313,13 @@ def test_ac15_duplicate_identity_is_ambiguous_before_first_match_pick(
 ) -> None:
     backend = _identity_backend()
     backend.window_liveness.return_value = "gone"
-    backend.get_session_windows.return_value = [
-        {"name": "clone-one", "index": "1"},
-        {"name": "clone-two", "index": "2"},
-    ]
+    backend.enumerate_windows.return_value = (
+        "ok",
+        [
+            {"name": "clone-one", "index": "1"},
+            {"name": "clone-two", "index": "2"},
+        ],
+    )
     backend.read_pane_identity.return_value = PaneIdentityReadResult(identity="terminal-a")
     monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
     monkeypatch.setattr(
@@ -322,3 +335,68 @@ def test_ac15_duplicate_identity_is_ambiguous_before_first_match_pick(
     assert "purge_identity_ambiguous terminal=terminal-a" in caplog.text
     assert "clone-one" in caplog.text
     assert "clone-two" in caplog.text
+
+
+# --- §1.8 amendment: enumerate_windows subprocess-only discrimination ---
+
+
+def test_ac_a1_enumeration_error_preserves_row(monkeypatch, purge_effects, caplog) -> None:
+    """enumerate_windows returns (\"error\", None) with session alive + stored window renamed
+    → row PRESERVED, purge_inconclusive logged."""
+    backend = _identity_backend()
+    backend.window_liveness.return_value = "gone"
+    backend.enumerate_windows.return_value = ("error", None)
+    monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+    monkeypatch.setattr(terminal_service, "db_list_all_terminals", lambda: [_row("alive", "old")])
+    caplog.set_level(logging.WARNING)
+
+    assert terminal_service.purge_stale_terminal_records() == 0
+    assert purge_effects.deleted == []
+    assert "purge_inconclusive terminal=alive" in caplog.text
+    assert "enumeration_failed=True" in caplog.text
+
+
+def test_ac_a2_session_absent_deletes_row(monkeypatch, purge_effects) -> None:
+    """Session ABSENT (subprocess stderr \"can't find session\") → (\"ok\", []) → row DELETED."""
+    backend = _identity_backend()
+    backend.window_liveness.return_value = "gone"
+    backend.enumerate_windows.return_value = ("ok", [])
+    # No windows → no identity matches, no unreadable → hits delete path
+    monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+    monkeypatch.setattr(terminal_service, "db_list_all_terminals", lambda: [_row("dead", "old")])
+
+    assert terminal_service.purge_stale_terminal_records() == 1
+    assert purge_effects.deleted == ["dead"]
+
+
+def test_ac_a3_ok_windows_with_identity_match_reconciles(monkeypatch, purge_effects) -> None:
+    """(\"ok\", windows) with identity match → rename reconciles (unchanged behavior)."""
+    backend = _identity_backend()
+    backend.window_liveness.return_value = "gone"
+    backend.enumerate_windows.return_value = ("ok", [{"name": "new-win"}])
+    backend.read_pane_identity.return_value = PaneIdentityReadResult(identity="terminal-x")
+    monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+    monkeypatch.setattr(
+        terminal_service, "db_list_all_terminals", lambda: [_row("terminal-x", "old-win")]
+    )
+
+    assert terminal_service.purge_stale_terminal_records() == 0
+    assert purge_effects.deleted == []
+    assert purge_effects.updated == [("terminal-x", "new-win")]
+
+
+def test_ac_a5_unclassifiable_failure_preserves_row(monkeypatch, purge_effects, caplog) -> None:
+    """Unclassifiable failure (permission denied, timeout) → (\"error\", None) → row PRESERVED."""
+    backend = _identity_backend()
+    backend.window_liveness.return_value = "gone"
+    backend.enumerate_windows.return_value = ("error", None)
+    monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+    monkeypatch.setattr(
+        terminal_service, "db_list_all_terminals", lambda: [_row("perm-denied", "win")]
+    )
+    caplog.set_level(logging.WARNING)
+
+    assert terminal_service.purge_stale_terminal_records() == 0
+    assert purge_effects.deleted == []
+    assert "purge_inconclusive terminal=perm-denied" in caplog.text
+    assert "enumeration_failed=True" in caplog.text

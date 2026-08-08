@@ -301,6 +301,7 @@ def test_probe_01_delayed_relaunch_digests_old_generation_without_replay(
     stale_backend = MagicMock()
     stale_backend.supports_identity_readback = True
     stale_backend.window_liveness.return_value = "gone"
+    stale_backend.enumerate_windows.return_value = ("ok", [])
     stale_backend.get_session_windows.return_value = []
     with patch.object(terminal_service_module, "get_backend", return_value=stale_backend):
         assert terminal_service_module.purge_stale_terminal_records() == 1
@@ -1796,6 +1797,7 @@ def test_wpq1_purge_uses_shared_p5_transaction_and_notice(scratch_db):
     backend.window_liveness.side_effect = lambda _session, window: (
         "live" if window == "sender" else "gone"
     )
+    backend.enumerate_windows.return_value = ("ok", [])
     backend.get_session_windows.return_value = []
 
     with patch.object(terminal_service_module, "get_backend", return_value=backend):

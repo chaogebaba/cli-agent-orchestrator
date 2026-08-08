@@ -7,7 +7,7 @@ no alternative is configured.
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 from cli_agent_orchestrator.backends.base import (
     PaneIdentityReadResult,
@@ -101,6 +101,33 @@ class TmuxBackend(TerminalBackend):
         if "can't find session" in stderr or "no server running" in stderr:
             return "gone"
         return "error"
+
+    def enumerate_windows(
+        self, session_name: str
+    ) -> tuple[Literal["ok", "error"], List[Dict[str, object]] | None]:
+        """Enumerate windows via subprocess. Classifies its own failure."""
+        import subprocess
+
+        try:
+            proc = subprocess.run(
+                tmux_argv("list-windows", "-t", session_name, "-F", "#{window_name}"),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if proc.returncode == 0:
+                windows: List[Dict[str, object]] = [
+                    {"name": name} for name in proc.stdout.splitlines() if name
+                ]
+                return ("ok", windows)
+            stderr = proc.stderr.lower()
+            if "can't find session" in stderr or "no server running" in stderr:
+                return ("ok", [])  # genuinely absent — not a failure
+            return ("error", None)  # unclassifiable
+        except subprocess.TimeoutExpired:
+            return ("error", None)
+        except Exception:
+            return ("error", None)
 
     def get_session_windows(self, session_name: str) -> List[Dict[str, object]]:
         return self._client.get_session_windows(session_name)
