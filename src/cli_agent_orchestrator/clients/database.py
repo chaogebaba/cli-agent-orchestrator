@@ -4795,10 +4795,7 @@ def fire_due_barriers(now: datetime | None = None) -> list[int]:
     with SessionLocal.begin() as db:
         due = (
             db.query(CallbackBarrierModel)
-            .filter(
-                CallbackBarrierModel.state == "OPEN",
-                CallbackBarrierModel.timeout_at <= now,
-            )
+            .filter(CallbackBarrierModel.state == "OPEN")
             .order_by(CallbackBarrierModel.timeout_at, CallbackBarrierModel.id)
             .all()
         )
@@ -4808,13 +4805,19 @@ def fire_due_barriers(now: datetime | None = None) -> list[int]:
             # since the sweep is retried unchanged it would never fire again.
             try:
                 with db.begin_nested():
-                    message_id = _fire_open_barrier_in_db(
-                        db,
-                        barrier,
-                        state="FIRED_TIMEOUT",
-                        close_reason="timeout",
-                        now=now,
-                    )
+                    # Completion outranks timeout (COMPLETION LAW): an all-ARRIVED
+                    # barrier closes FIRED_COMPLETE even if it is also past its
+                    # deadline. None covers BOTH "not all members arrived" AND the
+                    # owner-gone check closing the barrier internally.
+                    message_id = _maybe_fire_completed_barrier(db, barrier)
+                    if message_id is None and barrier.timeout_at <= now:
+                        message_id = _fire_open_barrier_in_db(
+                            db,
+                            barrier,
+                            state="FIRED_TIMEOUT",
+                            close_reason="timeout",
+                            now=now,
+                        )
             except Exception:
                 logger.exception(
                     "callback_barrier_fire_failed barrier=%s label=%s",

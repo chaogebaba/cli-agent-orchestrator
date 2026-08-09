@@ -26,6 +26,7 @@ from cli_agent_orchestrator.clients.database import (
     MailboxModel,
     TerminalModel,
     _fire_open_barrier_in_db,
+    _maybe_fire_completed_barrier,
     callback_barrier_dispatch_allowed,
     callback_barrier_status,
     cancel_callback_barrier,
@@ -1207,3 +1208,167 @@ def test_one_unfireable_barrier_does_not_wedge_the_others(barrier_db, monkeypatc
         states = {row.label: row.state for row in db.query(CallbackBarrierModel).all()}
     assert states["healthy"] == "FIRED_TIMEOUT"
     assert states["poison"] == "OPEN"
+
+
+# ---------------------------------------------------------------------------
+# F71 — sweep closing branch: completion-outranks-timeout (blueprint §1)
+# ---------------------------------------------------------------------------
+
+
+def _seed_all_arrived_barrier(sessions, *, timeout_at: datetime):
+    """Seed an all-ARRIVED barrier holding callback messages, never fired.
+
+    Reproduces the F71 live shape (barrier 5 `drill-r2-brainstorm`): every
+    member delivered its callback (held), all members stamped ARRIVED, but the
+    last-arrival `_maybe_fire_completed_barrier` call was skipped by a crash, so
+    the barrier sits OPEN. The sweep must close it FIRED_COMPLETE.
+    """
+    _seed_raw(sessions)
+    _dispatch_pair("f71")
+    create_inbox_message("worker-a", "owner", "answer a")
+    with sessions.begin() as db:
+        # Stamp every member ARRIVED without firing the last one, as F71 left it.
+        # (The second real callback would fire COMPLETE through the arrival path —
+        # the crash is exactly that `_maybe_fire_completed_barrier` call being
+        # skipped, so we reproduce the state as found, not as the API can reach.)
+        for member in db.query(CallbackBarrierMemberModel).all():
+            member.state = "ARRIVED"
+        db.query(CallbackBarrierModel).update(
+            {CallbackBarrierModel.timeout_at: timeout_at},
+            synchronize_session=False,
+        )
+    with sessions() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "OPEN", "precondition: barrier must still be open"
+        assert barrier.combined_message_id is None
+        # worker-a holds a callback; worker-b is stamped ARRIVED raw with none.
+        assert db.query(InboxModel).filter_by(status=MessageStatus.HELD.value).count() == 1
+
+
+@pytest.mark.parametrize("timeout_in_future", [False, True], ids=["expired", "not-yet-due"])
+def test_f71_sweep_closes_all_arrived_barrier_fired_complete(barrier_db, timeout_in_future):
+    """AC#1 + AC#2 — an all-ARRIVED barrier closes FIRED_COMPLETE on the sweep.
+
+    AC#1: timeout in the past (would previously have fired FIRED_TIMEOUT).
+    AC#2: timeout in the future — the exact live shape (barrier 5 all-ARRIVED at
+    06:28, never a timeout). Completion runs on every OPEN pass, not just
+    timed-out ones.
+    """
+    now = datetime.now(timezone.utc)
+    timeout_at = now + timedelta(hours=1) if timeout_in_future else now - timedelta(hours=1)
+    _seed_all_arrived_barrier(barrier_db, timeout_at=timeout_at)
+
+    fired = fire_due_barriers(now)
+
+    assert len(fired) == 1
+    with barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "FIRED_COMPLETE"
+        assert barrier.close_reason == "complete"
+        combined = db.query(InboxModel).filter_by(id=barrier.combined_message_id).one()
+        assert combined.status == MessageStatus.PENDING.value
+        assert combined.message.startswith("[callback barrier COMPLETE] f71 — 2/2 in ")
+        assert "answer a" in combined.message
+        assert db.query(InboxModel).filter(InboxModel.sender_id.like("barrier:%")).count() == 1
+
+
+def test_f71_sweep_leaves_incomplete_untimed_out_barrier_open(barrier_db):
+    """AC#3 — an incomplete, not-yet-timed-out barrier is untouched by the sweep."""
+    _seed_raw(barrier_db)
+    _dispatch_pair("f71-open")
+    create_inbox_message("worker-a", "owner", "answer a")  # worker-b still AWAITING
+
+    fired = fire_due_barriers(datetime.now(timezone.utc))
+
+    assert fired == []
+    with barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "OPEN"
+        assert barrier.combined_message_id is None
+
+
+def test_f71_completion_vs_sweep_race_has_exactly_one_winner(barrier_db):
+    """AC#4 — a concurrent completion-fire and sweep-fire yield one combined row.
+
+    The CAS in `_fire_open_barrier_in_db` is the single serialization point: the
+    winner fires, the loser no-ops. Completion-vs-sweep is structurally the same
+    interleaving as the existing arrival-vs-timeout race.
+    """
+    _seed_raw(barrier_db, workers=("worker-a",))
+    create_inbox_message("owner", "worker-a", "task", dispatch_barrier={"label": "f71-race"})
+    with barrier_db.begin() as db:
+        db.query(CallbackBarrierModel).update(
+            {CallbackBarrierModel.timeout_at: datetime.now() - timedelta(seconds=1)}
+        )
+    start = threading.Barrier(2)
+    errors = []
+
+    def complete():
+        try:
+            start.wait()
+            with barrier_db.begin() as db:
+                barrier = db.query(CallbackBarrierModel).one()
+                _maybe_fire_completed_barrier(db, barrier)
+        except Exception as exc:  # pragma: no cover - assertion reports the race
+            errors.append(exc)
+
+    def sweep():
+        try:
+            start.wait()
+            fire_due_barriers(datetime.now(timezone.utc))
+        except Exception as exc:  # pragma: no cover - assertion reports the race
+            errors.append(exc)
+
+    threads = [threading.Thread(target=complete), threading.Thread(target=sweep)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(3)
+
+    assert errors == []
+    with barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state in {"FIRED_COMPLETE", "FIRED_TIMEOUT"}
+        assert db.query(InboxModel).filter(InboxModel.sender_id.like("barrier:%")).count() == 1
+
+
+@pytest.fixture
+def completed_orphaned_barrier_db(barrier_db):
+    """All-ARRIVED barrier WITH held messages, then owner orphaned.
+
+    AC#5 sub-case: the existing `orphaned_barrier_db` holds 0 callback messages,
+    so it cannot prove that an owner-gone close wins over a COMPLETE fire when
+    held content is present. This fixture seeds the all-ARRIVED barrier with held
+    messages first, then orphans the owner AFTER seeding.
+    """
+    _seed_all_arrived_barrier(
+        barrier_db, timeout_at=datetime.now(timezone.utc) - timedelta(hours=1)
+    )
+    _orphan_owner(barrier_db)
+    return barrier_db
+
+
+def test_f71_owner_gone_wins_over_complete(completed_orphaned_barrier_db):
+    """AC#5 — an all-ARRIVED barrier whose owner is gone closes CANCELLED, not COMPLETE.
+
+    The owner-gone check in `_fire_open_barrier_in_db` runs before the CAS and
+    must win even for a complete barrier — delivering a combined callback to a
+    dead receiver would raise.
+    """
+    fired = fire_due_barriers(datetime.now(timezone.utc))
+
+    assert fired == []
+    with completed_orphaned_barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "CANCELLED"
+        assert barrier.close_reason == "owner_gone"
+        assert barrier.combined_message_id is None
+        assert (
+            db.query(InboxModel)
+            .filter_by(status=MessageStatus.PENDING.value, receiver_id="owner")
+            .count()
+            == 0
+        )
+        held = db.query(InboxModel).filter_by(barrier_id=barrier.id).all()
+        assert len(held) == 1
+        assert {row.status for row in held} == {MessageStatus.CANCELLED.value}

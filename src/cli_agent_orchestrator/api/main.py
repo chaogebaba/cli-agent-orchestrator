@@ -243,7 +243,7 @@ async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
 
 
 async def callback_barrier_daemon() -> None:
-    """Fire overdue callback barriers; deadlines never move on sweep failure."""
+    """Fire overdue and completed callback barriers; deadlines never move on sweep failure."""
     while True:
         try:
             fired = await asyncio.to_thread(fire_due_barriers, datetime.now(timezone.utc))
