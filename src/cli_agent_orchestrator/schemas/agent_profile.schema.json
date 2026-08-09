@@ -38,8 +38,17 @@
       "type": "string",
       "description": "Provider override (e.g. claude_code, kiro_cli, codex)."
     },
+    "lifecycle": {
+      "type": "string",
+      "enum": ["ephemeral", "sticky"]
+    },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": true
+    },
     "provider_init_timeout": {
-      "type": "integer"
+      "type": "integer",
+      "minimum": 1
     },
     "container": {
       "type": "object",
@@ -52,8 +61,8 @@
             "additionalProperties": false,
             "required": ["host", "guest"],
             "properties": {
-              "host": {"type": "string"},
-              "guest": {"type": "string"}
+              "host": {"type": "string", "minLength": 1},
+              "guest": {"type": "string", "minLength": 1}
             }
           }
         }
