@@ -158,7 +158,7 @@ class TestCodexProviderInitialization:
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_wpq1_blocked_rule_name_reaches_notifier_and_timeout(
-        self, mock_tmux, mock_wait_shell, mock_wait_status, _sleep
+        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_sleep
     ):
         mock_wait_shell.return_value = True
         mock_tmux.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
@@ -180,6 +180,33 @@ class TestCodexProviderInitialization:
             await provider.initialize()
 
         notified.assert_awaited_once_with("codex-update-available")
+        # Iteration cap bounds the loop — verify sleep was called a bounded
+        # number of times rather than millions.  initialize() calls sleep(2.0)
+        # once before _handle_trust_prompt, then the loop runs at most
+        # int(20.0 * 3) = 60 iterations.
+        assert mock_sleep.await_count <= 65
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_iteration_cap_bounds_loop(
+        self, mock_tmux, mock_sleep
+    ):
+        """Prove the iteration cap exits the loop under instant-sleep mock.
+
+        With timeout=5.0, max_iterations = int(5.0 * 3) = 15.  The loop must
+        exit after exactly 15 iterations (not millions) and sleep must be
+        awaited no more than 15 times.
+        """
+        mock_tmux.return_value.get_history.return_value = "some output no prompt"
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+
+        # _handle_trust_prompt returns None (no error) on timeout — it only logs.
+        await provider._handle_trust_prompt(timeout=5.0)
+
+        # With instant sleep, wall-clock guard never fires — iteration cap is
+        # the only exit.  Cap = int(5.0 * 3) = 15.
+        assert mock_sleep.await_count == 15
 
 
 class TestCodexBuildCommand:

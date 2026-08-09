@@ -1123,13 +1123,24 @@ class CodexProvider(BaseProvider):
         with '3'+Enter so CAO never selects the default global-install action.
         """
         start_time = time.time()
-        while time.time() - start_time < timeout:
+        # Iteration cap: prevents unbounded spin when asyncio.sleep is mocked
+        # (wall-clock guard alone is defeated by instant-return mocks).
+        max_iterations = int(timeout * 3)
+        iterations = 0
+        while time.time() - start_time < timeout and iterations < max_iterations:
+            iterations += 1
             output = get_backend().get_history(self.session_name, self.window_name)
             if not output:
                 await asyncio.sleep(1.0)
                 continue
 
-            clean_output = strip_terminal_escapes(re.sub(ANSI_CODE_PATTERN, "", output))
+            # Cheap pre-check: skip the expensive regex chain when output is
+            # already clean (no ESC, no CR, no C1 CSI opener).  Covers ~100% of
+            # mocked-test iterations and many real iterations after startup.
+            if "\x1b" not in output and "\r" not in output and "\x9b" not in output:
+                clean_output = output
+            else:
+                clean_output = strip_terminal_escapes(re.sub(ANSI_CODE_PATTERN, "", output))
             bottom_region = "\n".join(clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
 
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
