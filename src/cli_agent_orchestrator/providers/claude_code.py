@@ -654,9 +654,7 @@ class ClaudeCodeProvider(BaseProvider):
                         # the vars bwrap strips are exactly the vars settings.env must restore.
                         from cli_agent_orchestrator.utils.persona_context import PERSONA_ENV_UNSET
 
-                        auth_env = {
-                            k: v for k, v in real_env.items() if k in PERSONA_ENV_UNSET
-                        }
+                        auth_env = {k: v for k, v in real_env.items() if k in PERSONA_ENV_UNSET}
                         if auth_env:
                             settings["env"] = auth_env
                 except (OSError, json.JSONDecodeError):
@@ -997,7 +995,10 @@ class ClaudeCodeProvider(BaseProvider):
         poll = 0.5
         deadline = time.monotonic() + timeout
         previous: Optional[str] = None
-        while time.monotonic() < deadline:
+        max_iterations = int(timeout / 0.5 * 3)
+        iterations = 0
+        while time.monotonic() < deadline and iterations < max_iterations:
+            iterations += 1
             try:
                 current = get_backend().get_history(
                     self.session_name, self.window_name, tail_lines=40
@@ -1014,6 +1015,10 @@ class ClaudeCodeProvider(BaseProvider):
                 return True
             previous = current
             await asyncio.sleep(poll)
+        if iterations >= max_iterations:
+            logger.warning(
+                "wait_until_input_ready: iteration cap reached (%d), exiting", max_iterations
+            )
         logger.warning(
             "input-ready settle check timed out after %.1fs for %s; proceeding anyway",
             timeout,

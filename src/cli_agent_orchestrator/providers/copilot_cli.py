@@ -127,8 +127,11 @@ class CopilotCliProvider(BaseProvider):
         start_time = time.time()
         previous_output: Optional[str] = None
         stable_reads = 0
+        max_iterations = int(timeout / polling_interval * 3)
+        iterations = 0
 
-        while time.time() - start_time < timeout:
+        while time.time() - start_time < timeout and iterations < max_iterations:
+            iterations += 1
             output = await asyncio.to_thread(self._history, tail_lines=120)
             if output and output.strip():
                 if previous_output is not None and output == previous_output:
@@ -141,6 +144,10 @@ class CopilotCliProvider(BaseProvider):
             previous_output = output
             await asyncio.sleep(polling_interval)
 
+        if iterations >= max_iterations:
+            logger.warning(
+                "_wait_for_shell_ready: iteration cap reached (%d), exiting", max_iterations
+            )
         return False
 
     def _command(self) -> str:
@@ -222,7 +229,10 @@ class CopilotCliProvider(BaseProvider):
         loop while polling.
         """
         start = time.time()
-        while time.time() - start < timeout:
+        max_iterations = int(timeout / 1.0 * 3)
+        iterations = 0
+        while time.time() - start < timeout and iterations < max_iterations:
+            iterations += 1
             raw_content = await asyncio.to_thread(self._history, tail_lines=120)
             content = raw_content.lower()
 
@@ -274,6 +284,10 @@ class CopilotCliProvider(BaseProvider):
                 return
             await asyncio.sleep(1)
 
+        if iterations >= max_iterations:
+            logger.warning(
+                "_accept_trust_prompts: iteration cap reached (%d), exiting", max_iterations
+            )
         logger.warning(
             "Trust prompt handler timed out for %s:%s",
             self.session_name,
@@ -317,7 +331,10 @@ class CopilotCliProvider(BaseProvider):
 
         deadline = time.time() + 60.0
         await self._accept_trust_prompts(timeout=10.0)
-        while time.time() < deadline:
+        max_iterations = int(60.0 / 1.0 * 3)
+        iterations = 0
+        while time.time() < deadline and iterations < max_iterations:
+            iterations += 1
             status = status_monitor.get_status(self.terminal_id)
             if status == TerminalStatus.WAITING_USER_ANSWER:
                 await self._accept_trust_prompts(timeout=5.0)
@@ -332,6 +349,8 @@ class CopilotCliProvider(BaseProvider):
                 return True
             await asyncio.sleep(1.0)
 
+        if iterations >= max_iterations:
+            logger.warning("initialize: iteration cap reached (%d), exiting", max_iterations)
         raise TimeoutError("Copilot initialization timed out after 60 seconds")
 
     @staticmethod
