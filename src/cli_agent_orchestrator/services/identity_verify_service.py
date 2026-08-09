@@ -200,7 +200,7 @@ def _resolve_pane_window(pane_id: str) -> tuple[str, str] | None:
     try:
         result = subprocess.run(
             tmux_argv(
-                "display-message", "-p", "-t", f"%{pane_id}", "#{session_name}:#{window_name}"
+                "display-message", "-p", "-t", pane_id, "#{session_name}:#{window_name}"
             ),
             capture_output=True,
             text=True,
