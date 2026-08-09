@@ -82,50 +82,48 @@ def test_mcp_delete_409_surfaces_detail() -> None:
 
 
 def test_server_logs_conflict_cause(caplog: pytest.LogCaptureFixture) -> None:
-    """TerminalProtectionError is logged at WARNING with terminal_id and detail."""
+    """TerminalProtectionError is logged at WARNING with terminal_id and detail (AC2)."""
+    import asyncio
+
+    from cli_agent_orchestrator.api.main import delete_terminal as api_delete_terminal
     from cli_agent_orchestrator.services.terminal_guard_service import TerminalProtectionError
 
     terminal_id = "deadbeef"
     caller_id = "cafecafe"
 
+    def _raise_protection(*args: Any, **kwargs: Any) -> None:
+        raise TerminalProtectionError("cascade_outside_caller_subtree")
+
+    async def _run() -> None:
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as exc_info:
+            await api_delete_terminal(
+                request=MagicMock(),
+                terminal_id=terminal_id,
+                force=False,
+                orphan=False,
+                caller_id=caller_id,
+            )
+        assert exc_info.value.status_code == 409
+
     with (
+        patch("cli_agent_orchestrator.api.main.require_delete_allowed"),
         patch(
-            "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
-            return_value={
-                "id": terminal_id,
-                "tmux_session": "cao_test",
-                "tmux_window": "win1",
-            },
+            "cli_agent_orchestrator.api.main.asyncio.to_thread",
+            side_effect=_raise_protection,
         ),
-        patch(
-            "cli_agent_orchestrator.services.terminal_service.list_terminals_by_session",
-            return_value=[
-                {
-                    "id": terminal_id,
-                    "tmux_session": "cao_test",
-                    "tmux_window": "win1",
-                    "caller_id": None,
-                    "recovery_state": None,
-                },
-            ],
-        ),
-        patch(
-            "cli_agent_orchestrator.services.terminal_service.quiesce_deferred_session_sync",
-        ),
-        patch(
-            "cli_agent_orchestrator.services.session_lifecycle_lease.acquire_session_lifecycle_exclusive",
-            return_value="lease",
-        ),
-        patch(
-            "cli_agent_orchestrator.services.session_lifecycle_lease.release_session_lifecycle_lease",
-        ),
-        patch(
-            "cli_agent_orchestrator.services.terminal_guard_service.require_delete_allowed",
-        ),
+        patch("cli_agent_orchestrator.api.main.get_plugin_registry", return_value=MagicMock()),
+        caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.api.main"),
     ):
-        # _caller_owns_target will return False (caller not in chain) → TerminalProtectionError
-        with pytest.raises(TerminalProtectionError, match="cascade_outside_caller_subtree"):
-            delete_terminal(terminal_id, force=False, caller_id=caller_id)
+        asyncio.run(_run())
+
+    # Assert the WARNING log was emitted with terminal_id and detail
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        terminal_id in r.message and "cascade_outside_caller_subtree" in r.message
+        for r in warning_records
+    ), f"Expected WARNING with terminal_id and detail, got: {[r.message for r in warning_records]}"
 
 
 # ---------------------------------------------------------------------------
