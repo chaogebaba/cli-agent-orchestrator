@@ -7,7 +7,7 @@ regression where the echoed launch command false-matched the idle prompt).
 
 import re
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -121,10 +121,10 @@ class TestHandleStartupPromptsBranches:
         await provider._handle_startup_prompts(idle_gap=1.0)
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_trust_prompt_detected(self, mock_backend, mock_sleep, provider):
-        """Trust prompt sends Enter to accept via backend send_special_key."""
+        """Trust prompt sends Enter and settles at idle gap (bounded iterations)."""
         mock_backend.get_history.return_value = (
             "Do you trust the files in this folder?\n" "❯ Yes, I trust this folder"
         )
@@ -134,6 +134,10 @@ class TestHandleStartupPromptsBranches:
         mock_backend.send_special_key.assert_called_once_with(
             provider.session_name, provider.window_name, "Enter"
         )
+        # With the trust branch setting any_prompt_handled=True, the handler
+        # settles after the idle gap.  Under instant-sleep mock it should NOT
+        # spin to the outer timeout (60s / hundreds of iterations).
+        assert mock_sleep.await_count <= 20
 
 
 class TestDatabaseListAllTerminals:

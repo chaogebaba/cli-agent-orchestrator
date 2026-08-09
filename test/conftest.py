@@ -58,6 +58,7 @@ pytest_plugins = (
     "test.fixtures.jwt_factory",
     "test.fixtures.jwks_server",
     "test.fixtures.terminal_factory",
+    "test.plugins.rss_guard",
 )
 
 

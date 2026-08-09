@@ -74,6 +74,7 @@ class TestClaudeCodeIdleGap:
             18.0,  # last_prompt_time reset to 18
             # continues past the old 20s total window...
             35.0,  # iter2 now: gap=35-18=17<20, trust prompt → handled → continue
+            35.0,  # last_prompt_time reset to 35 (trust branch)
             36.0,  # iter3: welcome banner → return (composed post-trust loop)
         ]
         mock_backend.get_history.side_effect = [
@@ -143,6 +144,7 @@ class TestClaudeCodeIdleGap:
             0.0,  # last_prompt_time = 0
             35.0,  # iter1 now: no prompt handled yet -> idle-gap check skipped ->
             # trust prompt found in output -> handled -> continue
+            35.0,  # last_prompt_time reset to 35 (trust branch)
             36.0,  # iter2: welcome banner -> return
         ]
         mock_backend.get_history.side_effect = [
@@ -203,6 +205,7 @@ class TestClaudeCodeIdleGap:
             3.0,  # last_prompt_time reset
             # loop continues
             8.0,  # iter2: gap=8-3=5<20, trust prompt → handled → continue
+            8.0,  # last_prompt_time reset (trust branch)
             9.0,  # iter3: welcome banner → return
         ]
         mock_backend.get_history.side_effect = [
@@ -236,6 +239,7 @@ class TestClaudeCodeIdleGap:
             5.0,  # last_prompt_time reset to 5
             # continues
             22.0,  # iter2: gap=22-5=17<20, trust prompt → handled → continue
+            22.0,  # last_prompt_time reset to 22 (trust branch)
             23.0,  # iter3: welcome banner → return
         ]
         mock_backend.get_history.side_effect = [

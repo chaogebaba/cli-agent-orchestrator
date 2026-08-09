@@ -209,6 +209,7 @@ async def test_idle_timeout_prompt_handler(mock_backend, mock_time, mock_sleep):
         18.0,  # iter1: gap 18<20 and 18<180 -> bypass handled, timer reset
         18.0,  # last_prompt_time reset to 18
         35.0,  # iter2: gap 35-18=17<20 and 35<180 -> trust handled -> continue (composed law)
+        35.0,  # last_prompt_time reset to 35 (trust branch)
         36.0,  # iter3: welcome banner -> return (lawful settle after trust)
     ]
     mock_backend.get_history.side_effect = [

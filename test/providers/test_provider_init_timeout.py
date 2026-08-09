@@ -258,6 +258,7 @@ class TestStartupPromptHandlerHonorsOuterTimeout:
             0.0,  # outer_deadline = 0 + 180 = 180
             0.0,  # last_prompt_time = 0
             100.0,  # iter1 now: 100<180 (alive), gap 100<1000 -> trust prompt -> handled -> continue
+            100.0,  # last_prompt_time reset to 100 (trust branch)
             101.0,  # iter2: welcome banner -> return (composed continues after trust)
         ]
         mock_backend.get_history.side_effect = [

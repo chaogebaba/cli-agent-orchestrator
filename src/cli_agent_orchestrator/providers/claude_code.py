@@ -884,6 +884,8 @@ class ClaudeCodeProvider(BaseProvider):
                 status_monitor.notify_input_sent(self.terminal_id)
                 get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 trust_accepted = True
+                any_prompt_handled = True
+                last_prompt_time = time.monotonic()
                 time.sleep(1.0)
                 continue
 
