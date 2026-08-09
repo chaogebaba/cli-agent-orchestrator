@@ -261,6 +261,20 @@ async def callback_barrier_daemon() -> None:
         await asyncio.sleep(CALLBACK_BARRIER_POLL_INTERVAL)
 
 
+async def deferred_init_watchdog(registry: PluginRegistry) -> None:
+    """Settle overdue init_pending terminals; a stuck row must not stay silent."""
+    from cli_agent_orchestrator.services import terminal_service
+
+    while True:
+        try:
+            await terminal_service.sweep_overdue_deferred_inits(registry)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Deferred init watchdog sweep failed")
+        await asyncio.sleep(INBOX_RECONCILE_INTERVAL)
+
+
 # Response Models
 class TerminalOutputResponse(BaseModel):
     output: str
@@ -1007,6 +1021,7 @@ async def lifespan(app: FastAPI):
     inbox_reconcile_task = asyncio.create_task(inbox_reconciliation_daemon(registry))
     watchdog_task = asyncio.create_task(stalled_callback_watchdog.run(registry))
     callback_barrier_task = asyncio.create_task(callback_barrier_daemon())
+    deferred_init_watchdog_task = asyncio.create_task(deferred_init_watchdog(registry))
 
     # Herdr delivers inbox via its own socket events; the tmux backend uses the
     # FIFO -> EventBus pipeline (StatusMonitor / LogWriter / InboxService) started
@@ -1052,6 +1067,7 @@ async def lifespan(app: FastAPI):
     inbox_service_task.cancel()
     watchdog_task.cancel()
     callback_barrier_task.cancel()
+    deferred_init_watchdog_task.cancel()
     # Cancel approval bridge on shutdown
     if approval_bridge_task is not None:
         approval_bridge_task.cancel()
@@ -1070,6 +1086,7 @@ async def lifespan(app: FastAPI):
             inbox_service_task,
             watchdog_task,
             callback_barrier_task,
+            deferred_init_watchdog_task,
             *([daemon_task] if daemon_task is not None else []),
             return_exceptions=True,
         )

@@ -46,6 +46,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.clients.database import list_all_terminals as db_list_all_terminals
 from cli_agent_orchestrator.clients.database import (
+    list_deferred_init_overdue_pending_rows,
     list_deferred_init_recovery_rows,
     list_siblings_by_group_prefix,
     list_terminals_by_provider_session_id,
@@ -2396,6 +2397,38 @@ async def recover_deferred_inits(
                 logger.exception("deferred_init_settlement_failed terminal=%s", terminal_id)
 
 
+async def sweep_overdue_deferred_inits(registry: PluginRegistry | None = None) -> int:
+    """Settle init_pending rows whose deadline has elapsed (runtime watchdog body).
+
+    Returns the number of rows for which settlement was attempted.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    overdue = list_deferred_init_overdue_pending_rows(now)
+    if not overdue:
+        return 0
+
+    async def _settle_overdue(row: dict) -> None:
+        tid = row["id"]
+        try:
+            await _claim_and_settle_deferred_failure(
+                tid,
+                f"watchdog-{SERVER_INIT_OWNER_EPOCH}",
+                row,
+                "deferred_init_watchdog_deadline",
+                registry,
+                reason="watchdog_deadline_elapsed",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("deferred_init_watchdog_settle_failed terminal=%s", tid)
+
+    await asyncio.gather(*[_settle_overdue(row) for row in overdue])
+    return len(overdue)
+
+
 def _fork_refresh_lock(base_name: str) -> asyncio.Lock:
     loop = asyncio.get_running_loop()
     key = (loop, base_name)
@@ -3111,6 +3144,18 @@ def _schedule_deferred_init(
                 except Exception:
                     logger.exception("Deferred blocked notice failed terminal=%s", terminal_id)
         except asyncio.CancelledError:
+            # Log the cancellation (making this path non-silent — the original
+            # F110 seam). Actual settlement is deferred to the periodic watchdog
+            # (§2) rather than inline, because the CancelledError may arrive
+            # while the dispatcher thread still holds the DB slot from the
+            # in-flight operation that was interrupted — inline settlement via
+            # _tracked_blocking would deadlock.
+            logger.warning(
+                "Deferred init for terminal %s cancelled before completion; "
+                "watchdog will settle if row remains init_pending.",
+                terminal_id,
+                exc_info=True,
+            )
             raise
         except Exception as e:
             # exc_info=True preserves the traceback for debugging; {e!r} avoids
@@ -3156,6 +3201,10 @@ def _schedule_deferred_init(
         loop = asyncio.get_running_loop()
     except RuntimeError:
         logger.error(f"Deferred init for {terminal_id}: no running event loop; init skipped")
+        try:
+            _settle_deferred_failure_sync(terminal_id, registry)
+        except Exception:
+            logger.exception("Deferred init no-loop settlement failed terminal=%s", terminal_id)
         return
     task = loop.create_task(_run())
     _deferred_init_tasks.add(task)
@@ -3177,6 +3226,27 @@ def _schedule_deferred_init(
                 and (record.current_call is None or record.current_call.future.done())
             ):
                 _deferred_tasks_by_terminal.pop(terminal_id, None)
+
+        # §1a: if the task did not complete normally and the row is still
+        # init_pending, log a warning. The periodic watchdog (§2) will settle
+        # the row on its next sweep. We avoid inline settlement here because
+        # the done-callback fires after task teardown and the dispatcher may
+        # still hold the old task's thread slot — inline re-entry through
+        # _tracked_blocking would deadlock the single-threaded dispatcher.
+        if not completed.cancelled() and completed.exception() is None:
+            # Normal completion — init committed ready (or the task body already
+            # settled via _claim_and_settle_deferred_failure). Nothing to do.
+            return
+        if loop.is_closed():
+            return
+        meta = get_terminal_metadata(terminal_id)
+        if meta is not None and meta.get("init_state") == "init_pending":
+            logger.warning(
+                "Deferred init done-callback detected unsettled init_pending for "
+                "terminal %s (cancelled=%s); watchdog will settle on next sweep.",
+                terminal_id,
+                completed.cancelled(),
+            )
 
     task.add_done_callback(_done)
 

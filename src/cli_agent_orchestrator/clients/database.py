@@ -3744,6 +3744,33 @@ def list_deferred_init_recovery_rows(current_owner_epoch: str) -> List[Dict[str,
         ]
 
 
+def list_deferred_init_overdue_pending_rows(now: datetime) -> List[Dict[str, Any]]:
+    """Return init_pending rows whose deadline has elapsed (per-row arithmetic).
+
+    Unlike list_deferred_init_recovery_rows this does NOT filter on
+    init_owner_epoch — a stuck row is stuck regardless of which server epoch
+    stamped it.
+    """
+    with SessionLocal() as db:
+        rows = (
+            db.query(TerminalModel)
+            .filter(
+                TerminalModel.init_state == "init_pending",
+                TerminalModel.init_started_at.isnot(None),
+                TerminalModel.init_deadline_s.isnot(None),
+                text(
+                    "julianday(init_started_at) + (init_deadline_s / 86400.0)" " < julianday(:now)"
+                ),
+            )
+            .params(now=now.isoformat())
+            .all()
+        )
+        return [
+            {column.name: getattr(row, column.name) for column in row.__table__.columns}
+            for row in rows
+        ]
+
+
 def begin_teardown_intent(workspace_id: str, session_name: str) -> Dict[str, Any]:
     """Create or supersede the single active close authority for a workspace."""
     now = _utcnow()
