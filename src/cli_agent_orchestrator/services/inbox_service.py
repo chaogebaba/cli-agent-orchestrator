@@ -2757,6 +2757,37 @@ class InboxService:
                     [mid for mid in message_ids if statuses.get(mid) in terminal_states],
                 )
                 return
+            # F44-T6: before resurrecting to PENDING, classify the persisted opener
+            # evidence. If it proves the payload was executed, settle inferred-delivered
+            # instead of re-driving the message. Falls through to resurrection when the
+            # predicate is False or the inferred-delivered settle loses its CAS.
+            opener_ref = _opener_transcript_ref(evidence)
+            classified = _classify_probable_delivery(evidence, terminal_id, opener_ref)
+            if is_probable_delivered(classified):
+                settlement_evidence = self._evidence_for_confirmed_attempt(
+                    terminal_id, {**classified, "kind": "execution_evidence"}
+                )
+                won = _confirmed_settlement(
+                    lambda: settle_attempt_inferred_delivered_batch(
+                        attempt_uuid,
+                        sorted(message_ids),
+                        settlement_evidence,
+                        on_confirmed=lambda: self._commit_watchdog_ops(
+                            terminal_id,
+                            attempt["sender_id"],
+                            OrchestrationType(attempt["orchestration_type"]),
+                            metadata,
+                            get_park_warm_for_message_ids(message_ids),
+                        ),
+                    )
+                )
+                if won:
+                    logger.info(
+                        "T6 recovery inferred_delivered %s receiver=%s",
+                        sorted(message_ids),
+                        terminal_id,
+                    )
+                    return
             recover_wpm2_stale_attempt(
                 attempt_uuid,
                 message_ids,
