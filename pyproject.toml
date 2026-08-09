@@ -345,4 +345,4 @@ python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
 # Local/default: skip e2e + slow real-binary tests. CI passes --cov explicitly.
-addopts = "-m 'not e2e and not slow and not live and not pty'"
+addopts = "-n 4 -m 'not e2e and not slow and not live and not pty'"
