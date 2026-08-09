@@ -4924,6 +4924,12 @@ async def delete_terminal(
         )
         return {"success": True, **result}
     except TerminalProtectionError as e:
+        logger.warning(
+            "delete_terminal conflict terminal_id=%s detail=%s caller=%s",
+            terminal_id,
+            str(e),
+            caller_id,
+        )
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
