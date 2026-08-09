@@ -136,6 +136,49 @@ class TestCache:
         assert calls["n"] == 2
 
 
+class TestResolvePaneWindowArgv:
+    def test_pane_id_passed_literally_to_tmux_not_percent_wrapped(
+        self, monkeypatch, tmp_path
+    ):
+        """F99 regression: the pane id must reach ``display-message -t`` verbatim
+        (``%5``), NOT wrapped as ``%{%5}``. tmux silently resolves the wrapped
+        form to EMPTY, so every diagnosis read the OWNER pane's pid. This pins
+        the actual argv through the subprocess seam (prod code, resolver intact),
+        not a monkeypatched resolver."""
+        monkeypatch.setenv("TMUX_PANE", "%5")
+        db = _database(tmp_path, ("abcd1234", "s", "w", "worker"))
+        captured: dict[str, list[str]] = {}
+
+        class _FakeResult:
+            returncode = 0
+            stderr = ""
+
+            def __init__(self, stdout: str = ""):
+                self.stdout = stdout
+
+        def fake_run(argv, **kwargs):
+            is_display_message = "display-message" in argv
+            captured.setdefault("argv", argv)
+            if is_display_message:
+                return _FakeResult(stdout="s:w")  # pane %5 -> session:window
+            return _FakeResult(stdout="4242")  # list-panes -> pane pid
+
+        monkeypatch.setattr(idservice.subprocess, "run", fake_run)
+        result = idservice.diagnose_own_terminal(
+            "abcd1234", db_path=db, pane_pid_self=lambda pid: pid == 4242
+        )
+        argv = captured["argv"]
+        assert "display-message" in argv
+        # The pane id is passed LITERALLY as a standalone argv element — the
+        # pre-fix f"%{pane_id}" form ("%{%5}") would fail this assertion.
+        assert "%5" in argv
+        assert "%{%5}" not in argv
+        # The resolution succeeded (returned s:w), proving argv reached tmux.
+        assert result["branch"] == "row_gone"
+        assert result["session"] == "s"
+        assert result["window"] == "w"
+
+
 class TestF94RPrimitivesReused:
     def test_no_pane_or_db_read_logic_in_server_side(self):
         """AC7: the seam calls diagnose_own_terminal; server.py must not
