@@ -1625,6 +1625,17 @@ class InboxService:
             )
 
             if is_supervisor_mailbox_pull_terminal(terminal_id):
+                # WP-W2M-PUSH-BRIDGE: attempt teammate-push notification (best-effort).
+                from cli_agent_orchestrator.services.teammate_push_service import (
+                    _should_teammate_push,
+                    attempt_teammate_push,
+                )
+
+                if _should_teammate_push(terminal_id):
+                    try:
+                        attempt_teammate_push(terminal_id, messages)
+                    except Exception as _push_exc:
+                        logger.debug(f"teammate_push side-effect failed: {_push_exc}")
                 return
             # --- end WP-MAILBOX-CHANNEL gate ---
 
@@ -2609,19 +2620,17 @@ class InboxService:
                 logger.debug(f"Inbox reconciliation failed for {terminal_id}: {e}")
         self.recover_stale_deliveries(recurring=True)
         # WP-MAILBOX-CHANNEL: quarantine malformed mailbox rows on daemon heartbeat.
+        from cli_agent_orchestrator.services.config_service import ConfigService
         from cli_agent_orchestrator.services.mailbox_service import (
             quarantine_malformed_mailbox_rows,
         )
-        from cli_agent_orchestrator.services.config_service import ConfigService
 
         if ConfigService.get("supervisor.mailbox_pull"):
             from cli_agent_orchestrator.clients.database import MailboxModel as _MBModel
             from cli_agent_orchestrator.clients.database import SessionLocal as _SL
 
             with _SL() as _db:
-                supervisor_mailboxes = (
-                    _db.query(_MBModel).filter_by(role="supervisor").all()
-                )
+                supervisor_mailboxes = _db.query(_MBModel).filter_by(role="supervisor").all()
                 for mb in supervisor_mailboxes:
                     try:
                         quarantine_malformed_mailbox_rows(mb.id)
