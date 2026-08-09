@@ -29,6 +29,12 @@ from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck
 from cli_agent_orchestrator.security.auth import get_local_bearer
+from cli_agent_orchestrator.services.identity_verify_service import (
+    _is_self_or_ancestor,
+)
+from cli_agent_orchestrator.services.identity_verify_service import (
+    diagnose_own_terminal as _diagnose_own_terminal_service,
+)
 from cli_agent_orchestrator.services.memory_service import (
     MEMORY_DISABLED_MESSAGE,
     MemoryDisabledError,
@@ -119,6 +125,71 @@ def _get_cleanup_nudge() -> str:
     except Exception:
         pass
     return ""
+
+
+def _render_diagnosis(diagnosis: Dict[str, Any]) -> str:
+    """Render an identity diagnosis dict into the appended text block.
+
+    PASS branch (row_gone): the caller is alive in its own pane but the DB row is
+    gone — the F93 incident class. AMBIGUOUS: N rows claim the window, never pick.
+    Fail branches name why the diagnosis is not trusted and keep the original 404.
+    """
+    branch = diagnosis.get("branch")
+    if branch == "row_gone":
+        session = diagnosis.get("session", "?")
+        window = diagnosis.get("window", "?")
+        pane_pid = diagnosis.get("pane_pid", "?")
+        matches = diagnosis.get("db_matches", [])
+        if matches:
+            claim = f"{len(matches)} rows claim this window: {','.join(matches)}"
+        else:
+            claim = "no other row claims this window"
+        return (
+            f"\n\n[CAO identity diagnosis] your terminal row is GONE from the DB but "
+            f"your pane is alive. resolved window: {session}:{window}, pane_pid={pane_pid}. "
+            f"This is the F93 incident class: the row was wrongly purged while the pane "
+            f"survived. {claim}. Restart cao-server to re-register, or run "
+            "`cao verify identity` for the full scan. Original error follows:"
+        )
+    if branch == "ambiguous":
+        session = diagnosis.get("session", "?")
+        window = diagnosis.get("window", "?")
+        pane_pid = diagnosis.get("pane_pid", "?")
+        matches = diagnosis.get("db_matches", [])
+        return (
+            f"\n\n[CAO identity diagnosis] your terminal row is GONE from the DB but "
+            f"{len(matches)} rows claim your live window {session}:{window} "
+            f"(pane_pid={pane_pid}): {','.join(matches)} — identity is ambiguous, "
+            "no single row adopted. Original error follows:"
+        )
+    if branch == "self_proof_fail":
+        session = diagnosis.get("session", "?")
+        window = diagnosis.get("window", "?")
+        pane_pid = diagnosis.get("pane_pid", "?")
+        return (
+            f"\n\n[CAO identity diagnosis] resolution attempted but NOT trusted: pane "
+            f"{session}:{window} has pane_pid={pane_pid}, which is not this process or "
+            "an ancestor. The pane is someone else's (stale TMUX_PANE after a tmux "
+            "server restart, per Probe 10). Original 404 unchanged. Run `cao verify "
+            "identity` for the full scan."
+        )
+    if branch == "no_pane":
+        return "\n\n[CAO identity diagnosis] TMUX_PANE absent — cannot diagnose."
+    return ""
+
+
+def _diagnose_own_404(own_id: str, response: requests.Response) -> str:
+    """Enrich a 404 on the caller's OWN id with identity diagnosis.
+
+    Called ONLY by the own-id call sites listed in §1.2 of the F99 blueprint.
+    Never by a tool that takes an explicit target terminal_id. Returns a text
+    block to append to the call site's error detail, or "" to leave the original
+    404 unchanged.
+    """
+    if response.status_code != 404:
+        return ""
+    diagnosis = _diagnose_own_terminal_service(own_id, pane_pid_self=_is_self_or_ancestor)
+    return _render_diagnosis(diagnosis)
 
 
 # Create MCP server
@@ -257,6 +328,7 @@ def _create_terminal(
     if current_terminal_id:
         # Get terminal metadata via API
         response = cao_http.get(f"/terminals/{current_terminal_id}", timeout=_mcp_timeout())
+        diagnosis = _diagnose_own_404(current_terminal_id, response)
         response.raise_for_status()
         terminal_metadata = response.json()
 
@@ -373,9 +445,11 @@ def strict_supervisor_cwd() -> str:
             f"/terminals/{terminal_id}/working-directory",
             timeout=_mcp_timeout(),
         )
+        diagnosis = _diagnose_own_404(terminal_id, response)
         response.raise_for_status()
     except requests.RequestException as exc:
-        raise ValueError(f"supervisor_working_directory_unavailable: {exc}") from exc
+        diag = diagnosis if "diagnosis" in locals() else ""
+        raise ValueError(f"supervisor_working_directory_unavailable: {exc}" + diag) from exc
     cwd = response.json().get("working_directory")
     if not cwd:
         raise ValueError("supervisor_working_directory_unavailable: empty working_directory")
@@ -701,6 +775,7 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
         )
 
     response = cao_http.get(f"/terminals/{current_terminal_id}", timeout=_mcp_timeout())
+    diagnosis = _diagnose_own_404(current_terminal_id, response)
     response.raise_for_status()
     terminal_metadata = response.json()
 
@@ -882,10 +957,12 @@ async def session_manifest(
 ) -> Dict[str, Any]:
     try:
         terminal_id = _current_terminal_id()
+        diagnosis = ""
         if not session_name:
             if not terminal_id:
                 raise ValueError("session_name required outside a CAO terminal")
             response = cao_http.get(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
+            diagnosis = _diagnose_own_404(terminal_id, response)
             response.raise_for_status()
             session_name = response.json()["session_name"]
         response = cao_http.get(f"/sessions/{session_name}/manifest", timeout=_mcp_timeout())
@@ -899,7 +976,7 @@ async def session_manifest(
             return {"success": True, "brief": render_session_brief(manifest)}
         return {"success": True, "manifest": manifest}
     except Exception as exc:
-        return {"success": False, "error": str(exc)}
+        return {"success": False, "error": f"{str(exc)}{diagnosis}"}
 
 
 @mcp.tool(description="Read the narrow fleet topology and live status projection.")
@@ -1215,6 +1292,13 @@ def _configured_default_fork_base(agent_profile: str) -> Optional[str]:
         fallback_provider = response.json()["provider"]
         provider = resolve_provider(agent_profile, fallback_provider=fallback_provider)
     except (requests.RequestException, KeyError, TypeError, ValueError):
+        try:
+            if response.status_code == 404:
+                logger.warning(
+                    "F99 identity diagnosis: %s", _diagnose_own_404(terminal_id, response)
+                )
+        except (AttributeError, UnboundLocalError):
+            pass
         return None
     from cli_agent_orchestrator.services.settings_service import get_default_fork_base
 
@@ -1688,6 +1772,7 @@ async def mark_base_ready(
             result["genesis_digest"] = f"failed:{genesis_exc}"
         try:
             terminal_response = cao_http.get(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
+            diagnosis = _diagnose_own_404(terminal_id, terminal_response)
             terminal_response.raise_for_status()
             caller_id = terminal_response.json().get("caller_id")
             if caller_id:
@@ -1757,11 +1842,12 @@ def _send_message_impl(
                 response.raise_for_status()
             except requests.HTTPError as exc:
                 detail = _extract_error_detail(response, str(exc))
+                diagnosis = _diagnose_own_404(own_terminal_id, response)
                 return {
                     "success": False,
                     "error": (
                         f"receiver_id not provided and the caller lookup for this "
-                        f"terminal ({own_terminal_id}) failed: {detail}. Pass "
+                        f"terminal ({own_terminal_id}) failed: {detail}{diagnosis}. Pass "
                         "receiver_id explicitly."
                     ),
                 }
@@ -1924,10 +2010,14 @@ def _ack_messages_impl(up_to_id: int) -> Dict[str, Any]:
         response.raise_for_status()
         return response.json()
     except requests.HTTPError as exc:
+        diagnosis = _diagnose_own_404(terminal_id, response)
         try:
-            return response.json()
+            payload = response.json()
         except ValueError:
-            return {"detail": str(exc)}
+            return {"detail": f"{str(exc)}{diagnosis}"}
+        if isinstance(payload, dict) and isinstance(payload.get("detail"), str):
+            payload = {**payload, "detail": payload["detail"] + diagnosis}
+        return payload
     except Exception as exc:
         return {"success": False, "error": str(exc)}
 
@@ -2402,9 +2492,15 @@ def _require_discovery_marker(own_terminal_id: str, action: str) -> Optional[Dic
     except Exception as e:
         # Fail closed: an unresolvable allowed_tools lookup must not silently
         # grant discovery -- same posture as _own_terminal_id_or_error above.
+        extra = ""
+        try:
+            if response.status_code == 404:
+                extra = _diagnose_own_404(own_terminal_id, response)
+        except (AttributeError, UnboundLocalError):
+            pass
         return {
             "success": False,
-            "error": f"Failed to {action}: could not resolve this terminal's allowed_tools: {e}",
+            "error": f"Failed to {action}: could not resolve this terminal's allowed_tools: {e}{extra}",
         }
     # None (no role/allowedTools resolved at all) and "*" both mean
     # unrestricted, matching resolve_allowed_tools' own semantics elsewhere.
@@ -2450,7 +2546,8 @@ def _list_siblings_impl(depth: Optional[int], cross_session: bool = False) -> Di
         return {"success": True, "siblings": response.json()}
     except requests.HTTPError as e:
         detail = _extract_error_detail(e.response, str(e)) if e.response is not None else str(e)
-        return {"success": False, "error": f"Failed to list siblings: {detail}"}
+        extra = _diagnose_own_404(own_terminal_id, e.response) if e.response is not None else ""
+        return {"success": False, "error": f"Failed to list siblings: {detail}{extra}"}
     except Exception as e:
         return {"success": False, "error": f"Failed to list siblings: {str(e)}"}
 
@@ -2475,7 +2572,8 @@ def _update_metadata_impl(metadata: Dict[str, Any]) -> Dict[str, Any]:
         return {"success": True, "metadata": response.json().get("metadata")}
     except requests.HTTPError as e:
         detail = _extract_error_detail(e.response, str(e)) if e.response is not None else str(e)
-        return {"success": False, "error": f"Failed to update metadata: {detail}"}
+        extra = _diagnose_own_404(own_terminal_id, e.response) if e.response is not None else ""
+        return {"success": False, "error": f"Failed to update metadata: {detail}{extra}"}
     except Exception as e:
         return {"success": False, "error": f"Failed to update metadata: {str(e)}"}
 
@@ -2634,7 +2732,6 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
             "provider": meta["provider"],
             "agent_profile": meta.get("agent_profile"),
         }
-        # Try to get working directory for project scope resolution
         try:
             wd_resp = cao_http.get(
                 f"/terminals/{terminal_id}/working-directory",
@@ -2647,6 +2744,13 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
         return ctx
     except Exception as e:
         logger.warning(f"Failed to get terminal context for memory tools: {e}")
+        try:
+            if response.status_code == 404:
+                logger.warning(
+                    "F99 identity diagnosis: %s", _diagnose_own_404(terminal_id, response)
+                )
+        except (AttributeError, UnboundLocalError):
+            pass
         return None
 
 

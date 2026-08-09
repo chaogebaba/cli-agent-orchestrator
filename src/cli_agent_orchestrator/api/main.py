@@ -3044,6 +3044,35 @@ async def list_terminals_in_session(session_name: str) -> List[Dict]:
         )
 
 
+@app.get("/terminals/by-window", response_model=Terminal)
+async def resolve_terminal_by_window(session: str, window: str) -> Terminal:
+    """Resolve a terminal by its live tmux window. Registered ABOVE
+    `/terminals/{terminal_id}` so the literal path is not shadowed. One row →
+    200; zero → 404; ≥2 → 409 (never pick first — F99 §1.4)."""
+    try:
+        from cli_agent_orchestrator.clients.database import list_terminals_by_session
+
+        rows = [r for r in list_terminals_by_session(session) if r["tmux_window"] == window]
+        if not rows:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="no terminal in that window"
+            )
+        if len(rows) > 1:
+            ids = sorted(str(r["id"]) for r in rows)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"N rows claim this window: {','.join(ids)}",
+            )
+        return Terminal(**await asyncio.to_thread(terminal_service.get_terminal, rows[0]["id"]))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to resolve terminal by window: {str(e)}",
+        )
+
+
 @app.get("/terminals/{terminal_id}", response_model=Terminal)
 async def get_terminal(terminal_id: TerminalId) -> Terminal:
     try:

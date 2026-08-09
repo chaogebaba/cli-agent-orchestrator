@@ -6,9 +6,11 @@ diagnoses is one where that surface may be bound to a stale terminal identity.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import subprocess
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +18,7 @@ from typing import Any, Callable, Sequence
 
 from cli_agent_orchestrator.backends.base import PaneIdentityReadResult
 from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
+from cli_agent_orchestrator.constants import DATABASE_FILE
 from cli_agent_orchestrator.utils.tmux_command import tmux_argv
 
 ScanResult = dict[str, Any]
@@ -25,6 +28,8 @@ WindowReader = Callable[[str, str], bool]
 PaneReader = Callable[[str, str], PaneIdentityReadResult]
 
 _MCP_MODULE = "cli_agent_orchestrator.mcp_server.server"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -162,6 +167,147 @@ def _read_terminal_rows(db_path: Path) -> list[dict[str, Any]]:
     finally:
         connection.close()
     return [dict(row) for row in rows]
+
+
+def _is_self_or_ancestor(pid: int) -> bool:
+    """True when ``pid`` is this process or an ancestor of it (Probe-10 self-proof).
+
+    Walks the ppid chain upward from ``os.getpid()`` reusing this module's
+    ``_read_carrier_status`` (/proc/{pid}/status → ``PPid:``), stopping at a
+    match or pid ≤ 1. O(ancestry depth) — do NOT use
+    ``fork_context_service._descendants`` which is O(all processes).
+    """
+
+    current = os.getpid()
+    while current > 1:
+        if current == pid:
+            return True
+        try:
+            current = _read_carrier_status(current)
+        except (FileNotFoundError, ProcessLookupError, ValueError, OSError):
+            return False
+    return current == pid
+
+
+def _resolve_pane_window(pane_id: str) -> tuple[str, str] | None:
+    """Resolve a tmux pane id to its CURRENT ``session:window`` via tmux.
+
+    Uses the single-command form ``display-message -p -t %N`` verified live by
+    the F99 gates (NOT a list-panes membership scan). Returns ``None`` on any
+    resolution failure (tmux absent, pane gone, command error).
+    """
+
+    try:
+        result = subprocess.run(
+            tmux_argv(
+                "display-message", "-p", "-t", f"%{pane_id}", "#{session_name}:#{window_name}"
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, ValueError) as exc:
+        logger.warning("diagnose_own_terminal: tmux display-message failed: %s", exc)
+        return None
+    if result.returncode != 0:
+        logger.warning(
+            "diagnose_own_terminal: tmux display-message rc=%s stderr=%s",
+            result.returncode,
+            (result.stderr or "").strip(),
+        )
+        return None
+    text = (result.stdout or "").strip()
+    if not text or ":" not in text:
+        return None
+    session_name, window_name = text.split(":", 1)
+    return session_name, window_name
+
+
+# Failed-resolution cache: positive-only, 60s TTL, keyed by own_id.
+# A single 404 → diagnosis fires a tmux subprocess; the TTL collapses a retry
+# storm to one probe. Negative/indeterminate outcomes are NOT cached so a
+# recovering tmux is re-probed on the next 404.
+_DIAG_CACHE_TTL_S = 60.0
+_diag_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def diagnose_own_terminal(
+    own_id: str,
+    *,
+    db_path: Path | None = None,
+    pane_pid_self: Callable[[int], bool] = _is_self_or_ancestor,
+) -> dict[str, Any]:
+    """Single-caller diagnosis for a 404 on the caller's OWN terminal id.
+
+    Reuses this module's pane/DB primitives (read_pane_identity,
+    _read_terminal_rows). Returns a dict with the two-branch verdict:
+    ``row_gone`` (PASS — caller alive in its own pane, DB row gone),
+    ``ambiguous`` (≥2 rows claim the window), ``self_proof_fail``,
+    ``no_pane``. Positive outcomes are cached for 60s keyed by ``own_id``.
+    """
+
+    try:
+        pane_id = os.environ["TMUX_PANE"]
+    except KeyError:
+        return {"branch": "no_pane"}
+
+    now = time.monotonic()
+    cached = _diag_cache.get(own_id)
+    if cached is not None and now - cached[0] < _DIAG_CACHE_TTL_S:
+        return cached[1]
+
+    resolved = _resolve_pane_window(pane_id)
+    if resolved is None:
+        return {"branch": "no_pane"}
+
+    session_name, window_name = resolved
+    try:
+        pane_pids = TmuxBackend()._pane_pids(session_name, window_name)
+    except (OSError, ValueError) as exc:
+        logger.warning("diagnose_own_terminal: pane_pid read failed: %s", exc)
+        return {"branch": "self_proof_fail", "session": session_name, "window": window_name}
+    if len(pane_pids) != 1:
+        return {"branch": "self_proof_fail", "session": session_name, "window": window_name}
+    pane_pid_value = pane_pids[0]
+
+    # Probe-10 self-proof: accept the pane ONLY if its pid is this process or
+    # an ancestor. Otherwise the pane is someone else's (stale TMUX_PANE after
+    # a tmux server restart) and the diagnosis is not trusted.
+    if not pane_pid_self(pane_pid_value):
+        return {
+            "branch": "self_proof_fail",
+            "session": session_name,
+            "window": window_name,
+            "pane_pid": pane_pid_value,
+        }
+
+    terminal_rows = _read_terminal_rows(db_path or DATABASE_FILE)
+    db_matches = sorted(
+        str(row["id"])
+        for row in terminal_rows
+        if str(row["tmux_session"]) == session_name and str(row["tmux_window"]) == window_name
+    )
+
+    result: dict[str, Any]
+    if len(db_matches) > 1:
+        result = {
+            "branch": "ambiguous",
+            "session": session_name,
+            "window": window_name,
+            "pane_pid": pane_pid_value,
+            "db_matches": db_matches,
+        }
+    else:
+        result = {
+            "branch": "row_gone",
+            "session": session_name,
+            "window": window_name,
+            "pane_pid": pane_pid_value,
+            "db_matches": db_matches,
+        }
+
+    _diag_cache[own_id] = (now, result)
+    return result
 
 
 def scan_identity(
