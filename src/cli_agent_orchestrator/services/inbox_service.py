@@ -1616,6 +1616,18 @@ class InboxService:
             if not messages:
                 return
 
+            # --- WP-MAILBOX-CHANNEL: pull-mode gate (D6) ---
+            # If the supervisor.mailbox_pull flag is on AND this terminal is the
+            # current supervisor mailbox incarnation, skip the push entirely.
+            # Rows stay PENDING; the supervisor drains them via list_messages/ack.
+            from cli_agent_orchestrator.services.mailbox_service import (
+                is_supervisor_mailbox_pull_terminal,
+            )
+
+            if is_supervisor_mailbox_pull_terminal(terminal_id):
+                return
+            # --- end WP-MAILBOX-CHANNEL gate ---
+
             # Deliver in contiguous runs of the same sender and orchestration mode.
             # With the default num_messages=1 this is a single run; when draining
             # all pending messages (num_messages=0) a batch can span multiple groups,
@@ -2596,6 +2608,25 @@ class InboxService:
             except Exception as e:
                 logger.debug(f"Inbox reconciliation failed for {terminal_id}: {e}")
         self.recover_stale_deliveries(recurring=True)
+        # WP-MAILBOX-CHANNEL: quarantine malformed mailbox rows on daemon heartbeat.
+        from cli_agent_orchestrator.services.mailbox_service import (
+            quarantine_malformed_mailbox_rows,
+        )
+        from cli_agent_orchestrator.services.config_service import ConfigService
+
+        if ConfigService.get("supervisor.mailbox_pull"):
+            from cli_agent_orchestrator.clients.database import MailboxModel as _MBModel
+            from cli_agent_orchestrator.clients.database import SessionLocal as _SL
+
+            with _SL() as _db:
+                supervisor_mailboxes = (
+                    _db.query(_MBModel).filter_by(role="supervisor").all()
+                )
+                for mb in supervisor_mailboxes:
+                    try:
+                        quarantine_malformed_mailbox_rows(mb.id)
+                    except Exception as e:
+                        logger.debug(f"Mailbox quarantine sweep failed for {mb.id}: {e}")
 
     def reconcile_pending_orphans(self) -> OrphanReconcileResult:
         """Settle one bounded batch of PENDING rows with absent receivers."""

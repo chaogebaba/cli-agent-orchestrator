@@ -29,6 +29,7 @@ from cli_agent_orchestrator.clients.database import (
     _insert_routed_inbox_row,
     _stamp_enqueue_generation,
     resolve_inbox_receiver,
+    settle_attempt_inferred_delivered_batch,
 )
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 
@@ -94,6 +95,35 @@ def _address_ids(db: Any, mailbox_id: str) -> list[str]:
         .filter_by(mailbox_id=mailbox_id)
         .all()
     ]
+
+
+def is_supervisor_mailbox_pull_terminal(terminal_id: str) -> bool:
+    """Check if terminal_id is the current incarnation of a supervisor mailbox with pull enabled.
+
+    Returns True only when:
+    - CAO_SUPERVISOR_MAILBOX_PULL / supervisor.mailbox_pull is truthy
+    - terminal_id resolves to a mailbox with role == "supervisor"
+    - mailbox.current_terminal_id == terminal_id (current incarnation)
+    - mailbox.schema_version is compatible (== 1)
+    """
+    from cli_agent_orchestrator.services.config_service import ConfigService
+
+    if not ConfigService.get("supervisor.mailbox_pull"):
+        return False
+    with SessionLocal() as db:
+        mailbox: Any = (
+            db.query(MailboxModel).filter_by(current_terminal_id=terminal_id).one_or_none()
+        )
+        if mailbox is None:
+            return False
+        if mailbox.role != "supervisor":
+            return False
+        if mailbox.current_terminal_id != terminal_id:
+            return False
+        schema_version = getattr(mailbox, "schema_version", 1)
+        if schema_version != 1:
+            return False
+        return True
 
 
 def _park_owner_generation(
@@ -734,15 +764,97 @@ def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
             )
             if changed != 1:
                 raise MailboxDomainError("not_current_incarnation", "terminal is not current")
+            # --- WP-MAILBOX-CHANNEL: settle drained PENDING rows to DELIVERED ---
+            address_scope = or_(
+                InboxModel.logical_receiver_id == mailbox.id,
+                InboxModel.receiver_id.in_(addresses),
+            )
+            settled_count = (
+                db.query(InboxModel)
+                .filter(
+                    InboxModel.id <= up_to_id,
+                    InboxModel.status == MessageStatus.PENDING.value,
+                    address_scope,
+                )
+                .update(
+                    {
+                        InboxModel.status: MessageStatus.DELIVERED.value,
+                        InboxModel.failure_reason: "mailbox_pull_acked",
+                    },
+                    synchronize_session=False,
+                )
+            )
+            # AC#9 safety net: settle any prior open push-era attempts on acked rows.
+            open_attempts = (
+                db.query(InboxDeliveryAttemptModel)
+                .join(
+                    InboxDeliveryAttemptMemberModel,
+                    InboxDeliveryAttemptMemberModel.attempt_uuid
+                    == InboxDeliveryAttemptModel.attempt_uuid,
+                )
+                .join(
+                    InboxModel,
+                    InboxModel.id == InboxDeliveryAttemptMemberModel.message_id,
+                )
+                .filter(
+                    InboxDeliveryAttemptModel.settled_at.is_(None),
+                    InboxModel.id <= up_to_id,
+                    address_scope,
+                )
+                .all()
+            )
+            now = datetime.now()
+            for attempt in open_attempts:
+                attempt.outcome = "confirmed"
+                attempt.reason = "mailbox_pull_acked"
+                attempt.settled_at = now
+                attempt.last_at = now
+            # --- end WP-MAILBOX-CHANNEL settlement ---
             prior = mailbox.consumed_through_id
             db.commit()
             return {
                 "mailbox_id": mailbox.id,
                 "consumed_through_id": up_to_id,
                 "changed": prior != up_to_id,
+                "settled_count": settled_count,
             }
     finally:
         lock.release()
+
+
+def quarantine_malformed_mailbox_rows(mailbox_id: str) -> int:
+    """Settle malformed PENDING rows as DELIVERY_FAILED (quarantine sweep).
+
+    Called inside reconcile_orphaned_messages on the daemon heartbeat.
+    A row is malformed if its message body is not valid UTF-8 or is empty.
+    """
+    with SessionLocal() as db:
+        db.execute(text("BEGIN IMMEDIATE"))
+        addresses = _address_ids(db, mailbox_id)
+        address_scope = or_(
+            InboxModel.logical_receiver_id == mailbox_id,
+            InboxModel.receiver_id.in_(addresses),
+        )
+        pending_rows = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                address_scope,
+            )
+            .all()
+        )
+        quarantined = 0
+        for row in pending_rows:
+            try:
+                if not row.message or not isinstance(row.message, str):
+                    raise ValueError("empty or non-string message body")
+                row.message.encode("utf-8")
+            except (ValueError, UnicodeEncodeError):
+                row.status = MessageStatus.DELIVERY_FAILED.value
+                row.failure_reason = "mailbox_payload_malformed"
+                quarantined += 1
+        db.commit()
+    return quarantined
 
 
 def list_mailboxes() -> dict[str, Any]:

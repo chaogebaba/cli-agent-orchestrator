@@ -194,6 +194,7 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
         20,
     ),
     "CAO_STATE_BUFFER_MAX": ("server.state_buffer_max", "int", 32768),
+    "CAO_SUPERVISOR_MAILBOX_PULL": ("supervisor.mailbox_pull", "bool", False),
 }
 
 # Reverse index: dotted path -> env var name, for get()'s env-precedence lookup.
@@ -460,6 +461,7 @@ _ALL_PATHS = sorted(
         "memory.compile_mode",
         "memory.flush_threshold",
         "memory.compile_timeout_s",
+        "supervisor.mailbox_pull",
     }
 )
 

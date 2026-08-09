@@ -249,6 +249,7 @@ class MailboxModel(Base):
     current_terminal_id = Column(String, nullable=True)
     generation = Column(Integer, nullable=False, default=1, server_default="1")
     consumed_through_id = Column(Integer, nullable=False, default=0, server_default="0")
+    schema_version = Column(Integer, nullable=False, default=1, server_default="1")
     created_at = Column(DateTime, nullable=False, default=datetime.now)
     updated_at = Column(DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
     __table_args__ = (UniqueConstraint("session_name", "role", name="uq_mailbox_session_role"),)
@@ -856,6 +857,18 @@ def init_db() -> None:
     # #504 also migrates, so registry order is immaterial — never reorder the
     # entries above.
     _migrate_memory_relationships()
+    _migrate_mailbox_schema_version()
+
+
+def _migrate_mailbox_schema_version() -> None:
+    """Add schema_version column to mailboxes table (WP-MAILBOX-CHANNEL)."""
+    with engine.begin() as connection:
+        columns = connection.execute(text("PRAGMA table_info(mailboxes)")).mappings().all()
+        if not columns or "schema_version" in {col["name"] for col in columns}:
+            return
+        connection.execute(
+            text("ALTER TABLE mailboxes ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1")
+        )
 
 
 def _bootstrap_seam_activation() -> None:
