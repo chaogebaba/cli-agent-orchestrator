@@ -73,7 +73,7 @@ from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.native_publish import DispatchTxn, NativePublishRequest
 from cli_agent_orchestrator.models.provider import ProviderType
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
+from cli_agent_orchestrator.models.terminal import RecoveryState, Terminal, TerminalStatus
 from cli_agent_orchestrator.plugins import (
     PluginRegistry,
     PostCreateTerminalEvent,
@@ -4016,6 +4016,74 @@ def _cascade_plan(
     return reaped, skipped
 
 
+def _recovery_state_is_active(state: RecoveryState) -> bool:
+    """Return True if *state* represents an in-progress recovery.
+
+    Uses assert_never so mypy flags unhandled variants when the Literal expands.
+    """
+    if state == "rebind_starting":
+        return True
+    if state == "rebind_exiting":
+        return True
+    if state == "fallback_starting":
+        return True
+    if state == "fallback_ready":
+        return True
+    if state == "rebound":
+        return False
+    if state == "rebind_failed":
+        return False
+    assert_never(state)
+
+
+_ACTIVE_RECOVERY_STATES: frozenset[str] = frozenset(
+    s for s in ("rebind_starting", "rebind_exiting", "fallback_starting", "fallback_ready")
+)
+
+
+def _owner_root_is_dead(
+    terminals: list[dict[str, Any]],
+    terminal_id: str,
+) -> bool:
+    """Return True if the root of terminal_id's caller chain has a dead window.
+
+    Uses window_liveness (tmux_backend) — the same primitive that
+    fleet_service.py uses for its parent_dead/orphan projection.
+    Fail-closed: returns False on any error or ambiguity.
+    """
+    by_id = {row["id"]: row for row in terminals}
+    current = terminal_id
+    seen: set[str] = set()
+    while current in by_id:
+        if current in seen:
+            return False  # cycle — fail closed
+        seen.add(current)
+        parent = by_id[current].get("caller_id")
+        if not parent or parent not in by_id:
+            break  # current is the root
+        current = parent
+
+    root = by_id.get(current)
+    if not root:
+        return False
+
+    # A supervisor mid-restart has its window briefly absent but is NOT dead.
+    # If the root row carries an active recovery/respawn state, treat as alive.
+    recovery = root.get("recovery_state")
+    if recovery is not None and recovery in _ACTIVE_RECOVERY_STATES:
+        return False  # restart in progress — fail closed
+
+    tmux_session = root.get("tmux_session")
+    tmux_window = root.get("tmux_window")
+    if not tmux_session or not tmux_window:
+        return False
+    try:
+        liveness = get_backend().window_liveness(tmux_session, tmux_window)
+        return liveness == "gone"
+    except Exception:
+        return False  # fail closed
+
+
 def _caller_owns_target(terminals: list[dict[str, Any]], caller_id: str, target_id: str) -> bool:
     if caller_id == target_id:
         return False
@@ -4084,7 +4152,11 @@ def delete_terminal(
     try:
         terminals = list_terminals_by_session(session_name)
         if caller_id is not None and not _caller_owns_target(terminals, caller_id, terminal_id):
-            raise TerminalProtectionError("cascade_outside_caller_subtree")
+            # Bypass: allow force-delete when the target's root owner is dead
+            if force and _owner_root_is_dead(terminals, terminal_id):
+                logger.info("dead-owner bypass: force-deleting %s (root owner gone)", terminal_id)
+            else:
+                raise TerminalProtectionError("cascade_outside_caller_subtree")
         order, skipped = _cascade_plan(
             terminals,
             terminal_id,

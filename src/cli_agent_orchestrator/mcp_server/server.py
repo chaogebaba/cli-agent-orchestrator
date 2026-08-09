@@ -2445,7 +2445,15 @@ def delete_terminal(
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
             return {"success": False, "message": f"Terminal {terminal_id} not found"}
-        return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
+        # Surface server detail for all non-404 errors
+        detail = ""
+        if e.response is not None:
+            try:
+                detail = e.response.json().get("detail", "")
+            except (ValueError, AttributeError):
+                detail = e.response.text[:200] if e.response.text else ""
+        msg = f"Failed to delete terminal: {e}" + (f" ({detail})" if detail else "")
+        return {"success": False, "message": msg}
     except Exception as e:
         return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
 
