@@ -312,7 +312,14 @@ def _wait_for_stable_draft(
 
     deadline = time.monotonic() + DRAFT_STABILITY_TIMEOUT_SECONDS
     previous = latest
-    while time.monotonic() < deadline:
+    max_iterations = (
+        max(1, int(DRAFT_STABILITY_TIMEOUT_SECONDS / DRAFT_STABILITY_RECHECK_SECONDS * 3))
+        if DRAFT_STABILITY_RECHECK_SECONDS > 0
+        else 180
+    )
+    iterations = 0
+    while time.monotonic() < deadline and iterations < max_iterations:
+        iterations += 1
         time.sleep(DRAFT_STABILITY_RECHECK_SECONDS)
         latest = _read_provider_draft(terminal_id, metadata, provider)
         if latest is None:
@@ -322,6 +329,10 @@ def _wait_for_stable_draft(
         if latest == previous:
             return latest
         previous = latest
+    if iterations >= max_iterations:
+        logger.warning(
+            "_wait_for_stable_draft: iteration cap reached (%d), exiting", max_iterations
+        )
     logger.warning("Composer draft for terminal %s did not stabilize before delivery", terminal_id)
     return previous
 

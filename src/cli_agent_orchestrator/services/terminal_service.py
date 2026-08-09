@@ -2465,7 +2465,10 @@ async def _wait_for_base_ready(
     *,
     input_gen: int | None = None,
 ) -> bool:
-    while time.monotonic() < deadline:
+    max_iterations = max(1, int((deadline - time.monotonic()) / 0.1 * 3))
+    iterations = 0
+    while time.monotonic() < deadline and iterations < max_iterations:
+        iterations += 1
         status = status_monitor.get_status(base_terminal_id)
         if status == TerminalStatus.ERROR:
             return False
@@ -2478,6 +2481,8 @@ async def _wait_for_base_ready(
             if status_gen is None or status_gen >= input_gen:
                 return True
         await asyncio.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    if iterations >= max_iterations:
+        logger.warning("_wait_for_base_ready: iteration cap reached (%d), exiting", max_iterations)
     return False
 
 

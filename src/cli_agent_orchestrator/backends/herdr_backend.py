@@ -966,12 +966,19 @@ class HerdrBackend(TerminalBackend):
 
         # Poll up to 15 seconds for the socket to appear.
         deadline = time.time() + 15.0
-        while time.time() < deadline:
+        max_iterations = max(1, int(15.0 / 0.1 * 3))
+        iterations = 0
+        while time.time() < deadline and iterations < max_iterations:
+            iterations += 1
             if os.path.exists(socket_path):
                 logger.info(f"Herdr session '{self._herdr_session}' is ready.")
                 return
             time.sleep(0.1)
 
+        if iterations >= max_iterations:
+            logger.warning(
+                "_ensure_herdr_running: iteration cap reached (%d), exiting", max_iterations
+            )
         logger.warning(
             f"Herdr session '{self._herdr_session}' socket did not appear within 15s "
             f"at {socket_path}. The first herdr operation will fail with a clear error."
