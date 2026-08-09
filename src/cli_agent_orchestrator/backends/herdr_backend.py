@@ -966,7 +966,7 @@ class HerdrBackend(TerminalBackend):
 
         # Poll up to 15 seconds for the socket to appear.
         deadline = time.time() + 15.0
-        max_iterations = int(15.0 / 0.1 * 3)
+        max_iterations = max(1, int(15.0 / 0.1 * 3))
         iterations = 0
         while time.time() < deadline and iterations < max_iterations:
             iterations += 1

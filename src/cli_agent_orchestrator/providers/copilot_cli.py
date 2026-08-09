@@ -127,7 +127,7 @@ class CopilotCliProvider(BaseProvider):
         start_time = time.time()
         previous_output: Optional[str] = None
         stable_reads = 0
-        max_iterations = int(timeout / polling_interval * 3)
+        max_iterations = max(1, int(timeout / polling_interval * 3))
         iterations = 0
 
         while time.time() - start_time < timeout and iterations < max_iterations:
@@ -229,7 +229,7 @@ class CopilotCliProvider(BaseProvider):
         loop while polling.
         """
         start = time.time()
-        max_iterations = int(timeout / 1.0 * 3)
+        max_iterations = max(1, int(timeout / 1.0 * 3))
         iterations = 0
         while time.time() - start < timeout and iterations < max_iterations:
             iterations += 1
@@ -331,7 +331,7 @@ class CopilotCliProvider(BaseProvider):
 
         deadline = time.time() + 60.0
         await self._accept_trust_prompts(timeout=10.0)
-        max_iterations = int(60.0 / 1.0 * 3)
+        max_iterations = max(1, int(60.0 / 1.0 * 3))
         iterations = 0
         while time.time() < deadline and iterations < max_iterations:
             iterations += 1

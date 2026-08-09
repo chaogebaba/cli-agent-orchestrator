@@ -312,3 +312,46 @@ def test_draft_guard_wait_for_stable_draft_cap() -> None:
     loop_iterations = call_count - 1
     assert loop_iterations <= expected_cap + 1
     assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# Test 8: floor guarantee — cap never drops to 0 (B1 regression pin)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_wait_for_base_ready_floor_guarantees_one_iteration() -> None:
+    """When deadline is nearly reached, cap must be >= 1 so the loop body runs."""
+    from cli_agent_orchestrator.services import terminal_service
+
+    frozen_mono = 1000.0
+    # Tiny budget: 0.02s → int(0.02/0.1*3) = int(0.6) = 0 without floor
+    deadline = frozen_mono + 0.02
+
+    call_count = 0
+
+    async def mock_sleep(t):  # type: ignore[no-untyped-def]
+        nonlocal call_count
+        call_count += 1
+
+    from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+    with (
+        patch("time.monotonic", return_value=frozen_mono),
+        patch("asyncio.sleep", side_effect=mock_sleep),
+        patch.object(
+            terminal_service.status_monitor,
+            "get_status",
+            return_value=TerminalStatus.UNKNOWN,
+        ),
+        patch.object(
+            terminal_service,
+            "terminal_exists",
+            return_value=True,
+        ),
+    ):
+        result = await terminal_service._wait_for_base_ready("base1", deadline)
+
+    assert result is False
+    # Without max(1,...) floor this would be 0 iterations; with floor it's >= 1
+    assert call_count >= 1

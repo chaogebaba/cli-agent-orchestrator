@@ -2465,7 +2465,7 @@ async def _wait_for_base_ready(
     *,
     input_gen: int | None = None,
 ) -> bool:
-    max_iterations = int((deadline - time.monotonic()) / 0.1 * 3)
+    max_iterations = max(1, int((deadline - time.monotonic()) / 0.1 * 3))
     iterations = 0
     while time.monotonic() < deadline and iterations < max_iterations:
         iterations += 1

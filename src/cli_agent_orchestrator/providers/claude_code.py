@@ -654,7 +654,11 @@ class ClaudeCodeProvider(BaseProvider):
                         # the vars bwrap strips are exactly the vars settings.env must restore.
                         from cli_agent_orchestrator.utils.persona_context import PERSONA_ENV_UNSET
 
-                        auth_env = {k: v for k, v in real_env.items() if k in PERSONA_ENV_UNSET}
+                        # fmt: off
+                        auth_env = {
+                            k: v for k, v in real_env.items() if k in PERSONA_ENV_UNSET
+                        }
+                        # fmt: on
                         if auth_env:
                             settings["env"] = auth_env
                 except (OSError, json.JSONDecodeError):
@@ -995,7 +999,7 @@ class ClaudeCodeProvider(BaseProvider):
         poll = 0.5
         deadline = time.monotonic() + timeout
         previous: Optional[str] = None
-        max_iterations = int(timeout / 0.5 * 3)
+        max_iterations = max(1, int(timeout / 0.5 * 3))
         iterations = 0
         while time.monotonic() < deadline and iterations < max_iterations:
             iterations += 1

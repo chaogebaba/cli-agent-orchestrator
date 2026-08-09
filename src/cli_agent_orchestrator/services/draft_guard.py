@@ -313,7 +313,7 @@ def _wait_for_stable_draft(
     deadline = time.monotonic() + DRAFT_STABILITY_TIMEOUT_SECONDS
     previous = latest
     max_iterations = (
-        int(DRAFT_STABILITY_TIMEOUT_SECONDS / DRAFT_STABILITY_RECHECK_SECONDS * 3)
+        max(1, int(DRAFT_STABILITY_TIMEOUT_SECONDS / DRAFT_STABILITY_RECHECK_SECONDS * 3))
         if DRAFT_STABILITY_RECHECK_SECONDS > 0
         else 180
     )
