@@ -464,6 +464,26 @@ def _defer_messages(terminal_id: str, messages) -> None:
 class InboxService:
     """Delivers one pending message per terminal per IDLE cycle."""
 
+    # --- F74: message-state authority helper ---
+    @staticmethod
+    def _message_statuses(message_ids: list[int]) -> dict[int, str]:
+        """Read current MESSAGE-level statuses for a batch of IDs.
+
+        Single query, no lock — advisory pre-check before recovery actions.
+        The CAS in recover_wpm2_stale_attempt remains the last-line invariant.
+        """
+        if not message_ids:
+            return {}
+        from cli_agent_orchestrator.clients.database import InboxModel, SessionLocal
+
+        with SessionLocal() as db:
+            rows = (
+                db.query(InboxModel.id, InboxModel.status)
+                .filter(InboxModel.id.in_(message_ids))
+                .all()
+            )
+        return {int(row_id): status for row_id, status in rows}
+
     def __init__(self) -> None:
         self._defer_attempts: dict[int, int] = {}
         self._defer_notified: set[int] = set()
@@ -2663,9 +2683,19 @@ class InboxService:
         try:
             metadata = get_terminal_metadata(terminal_id)
             if not metadata:
+                # F74: don't mark already-terminal messages as DELIVERY_FAILED
+                statuses = self._message_statuses(message_ids)
+                terminal_states = {
+                    MessageStatus.DELIVERED.value,
+                    MessageStatus.DELIVERY_FAILED.value,
+                    MessageStatus.DIGESTED.value,
+                }
+                eligible = [mid for mid in message_ids if statuses.get(mid) not in terminal_states]
+                if not eligible:
+                    return
                 recover_wpm2_stale_attempt(
                     attempt_uuid,
-                    message_ids,
+                    eligible,
                     MessageStatus.DELIVERY_FAILED,
                     "failed",
                     "receiver_gone",
@@ -2712,6 +2742,21 @@ class InboxService:
                     "lookup_kind": lookup_evidence.get("kind", "transcript_unresolved"),
                 },
             }
+            # F74: before resurrecting to PENDING, verify messages are still
+            # eligible (DELIVERING).  A message already at a terminal state
+            # (DELIVERED, DELIVERY_FAILED, DIGESTED) must not be re-driven.
+            statuses = self._message_statuses(message_ids)
+            terminal_states = {
+                MessageStatus.DELIVERED.value,
+                MessageStatus.DELIVERY_FAILED.value,
+                MessageStatus.DIGESTED.value,
+            }
+            if any(statuses.get(mid) in terminal_states for mid in message_ids):
+                logger.info(
+                    "F74: skipping resurrection to PENDING — messages %s already terminal",
+                    [mid for mid in message_ids if statuses.get(mid) in terminal_states],
+                )
+                return
             recover_wpm2_stale_attempt(
                 attempt_uuid,
                 message_ids,
