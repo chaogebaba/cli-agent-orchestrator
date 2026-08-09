@@ -24,6 +24,8 @@ import logging
 import os
 import subprocess
 
+from cli_agent_orchestrator.services.fork_context_service import assert_cwd_live
+
 logger = logging.getLogger(__name__)
 
 # Kept out of the repo's own working tree root and namespaced under one
@@ -79,6 +81,7 @@ def find_repo_root(start_path: str) -> str:
     Raises:
         WorktreeError: ``start_path`` is not inside a git repository.
     """
+    assert_cwd_live(start_path, error_factory=WorktreeError)
     result = _run_git(["rev-parse", "--show-toplevel"], cwd=start_path)
     if result.returncode != 0:
         raise WorktreeError(

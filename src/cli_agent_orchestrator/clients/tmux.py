@@ -27,6 +27,11 @@ from cli_agent_orchestrator.utils.tmux_command import tmux_argv, tmux_socket_nam
 
 logger = logging.getLogger(__name__)
 
+# F26: tmux's literal suffix for a pane whose current working directory was
+# deleted (probe 2026-08-09). Pinned here as a single constant so a platform
+# format change is a one-line fix, not a hunt (R2).
+_DELETED_CWD_SUFFIX = " (deleted)"
+
 _T = TypeVar("_T")
 
 
@@ -1047,6 +1052,17 @@ class TmuxClient:
         parse failure. None already means "unknown" for this method (it is what
         an absent session/window returns too), so there is no "gone" claim to
         get wrong; the failure is logged rather than raised.
+
+        A trailing literal ``" (deleted)"`` in the raw tmux ``pane_current_path``
+        is the platform's signal that the pane's cwd was deleted (F26). It is
+        resolved here so every consumer either sees a clean path or ``None`` —
+        never a dangling literal:
+        1. no suffix → return unchanged, ``os.path.exists`` never called (fast path);
+        2. suffix + the full literal exists → a real dir legally named
+           ``" (deleted)"`` → return it unchanged (never suffix-strip a legal name);
+        3. suffix + the stripped path exists → deleted-then-recreated; the shell's
+           cwd is still the freed inode → ``None`` (never misstate the live dir);
+        4. otherwise → genuinely deleted → ``None``.
         """
         try:
             session = self._find_session(session_name)
@@ -1062,7 +1078,18 @@ class TmuxClient:
                 # Get pane_current_path from tmux
                 result = pane.cmd("display-message", "-p", "#{pane_current_path}")
                 if result.stdout:
-                    return result.stdout[0].strip()
+                    raw = result.stdout[0].strip()
+                    if not raw.endswith(_DELETED_CWD_SUFFIX):
+                        return raw
+                    full = raw
+                    stripped = full[: -len(_DELETED_CWD_SUFFIX)]
+                    if os.path.exists(full):
+                        return full
+                    if os.path.exists(stripped):
+                        logger.warning("cwd_deleted_recreated cwd=%s", stripped)
+                        return None
+                    logger.warning("cwd_deleted cwd=%s", stripped)
+                    return None
             return None
         except Exception as e:
             logger.error(f"Failed to get working directory for {session_name}:{window_name}: {e}")

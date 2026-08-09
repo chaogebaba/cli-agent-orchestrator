@@ -1470,3 +1470,48 @@ async def test_delete_is_busy_with_zero_teardown_at_commit_boundaries(monkeypatc
     assert result["status"] == "rebound"
     assert observed == (["p12", "p13"] if boundary == "p12_p13" else [boundary])
     teardown.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_f26_ac9_rebind_none_cwd_marks_unresumable_not_typeerror(monkeypatch):
+    """AC9: a rebind resume attempt whose pane cwd is None is marked
+    unresumable with a directed reason (cwd_unavailable), never a TypeError
+    from quote(None) and never a wrong-cwd fallback."""
+    _old, _candidate, _states = _install_transaction_harness(monkeypatch)
+    backend = MagicMock()
+    backend.get_pane_working_directory.return_value = None
+    monkeypatch.setattr(service, "get_backend", lambda: backend)
+    result = await service.rebind_terminal("txn")
+    assert result["status"] == "unresumable"
+    assert result["error_code"] == "cwd_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_f26_ac11_rebind_create_path_none_cwd_fails_directed_not_getcwd(monkeypatch):
+    """AC11: rebind create_terminal path with a None cwd fails directed
+    (unresumable) and NEVER falls back to os.getcwd()."""
+    from cli_agent_orchestrator.services import provider_rebind_service as svc
+
+    metadata = {
+        "id": "txn",
+        "tmux_session": "cao-test",
+        "tmux_window": "worker",
+        "provider_session_id": "uuid",
+        "provider": "codex",
+        "agent_profile": "dev",
+        "allowed_tools": None,
+        "shell_command": "bash",
+    }
+    backend = MagicMock()
+    backend.get_pane_working_directory.return_value = None
+    monkeypatch.setattr(svc, "get_backend", lambda: backend)
+    monkeypatch.setattr(svc, "set_terminal_recovery_state", lambda *a, **k: True)
+    monkeypatch.setattr(svc, "get_terminal_metadata", lambda _tid: metadata)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.create_terminal",
+        AsyncMock(side_effect=AssertionError("create_terminal must not be called")),
+    )
+    result = await svc._fallback(metadata, "uuid", None, None)
+    assert result["status"] == "unresumable"
+    assert result["error_code"] == "cwd_unavailable"
+    assert result["new_terminal_id"] is None

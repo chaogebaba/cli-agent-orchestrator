@@ -96,6 +96,29 @@ class TestFindRepoRoot:
         with pytest.raises(WorktreeError):
             find_repo_root(str(nonexistent))
 
+    def test_f26_ac6_deleted_cwd_raises_directed_worktree_error(self, tmp_path: Path) -> None:
+        """AC6: find_repo_root with a deleted start_path raises WorktreeError
+        naming 'worker deleted its own cwd' — NOT the generic
+        'not inside a git repository'."""
+        deleted = tmp_path / "f26" / "worker-deleted" / "cwd"
+        with pytest.raises(WorktreeError, match="worker deleted its own cwd"):
+            find_repo_root(str(deleted))
+
+    def test_f26_ac7_no_rescue_never_substitutes_repo_root(self, tmp_path: Path) -> None:
+        """AC7: on a deleted cwd, no fs mutation and no fallback path is
+        returned — the directed error fires instead of a silent relocation."""
+        from unittest.mock import patch
+
+        deleted = tmp_path / "f26" / "no-rescue"
+        with patch(
+            "cli_agent_orchestrator.services.fork_context_service.os.path.exists",
+            side_effect=lambda p: False,
+        ):
+            with pytest.raises(WorktreeError, match="worker deleted its own cwd"):
+                find_repo_root(str(deleted))
+        # nothing was created / no fallback returned: the dir still does not exist
+        assert not deleted.exists()
+
 
 class TestCreateAndRemoveWorktree:
     def test_create_worktree_produces_a_real_checkout_on_its_own_branch(self, repo: Path) -> None:

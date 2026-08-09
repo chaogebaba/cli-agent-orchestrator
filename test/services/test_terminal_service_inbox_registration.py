@@ -602,3 +602,30 @@ class TestDeleteTerminalHerdrUnregistration:
         # Assert
         m.service.unregister_terminal.assert_not_called()
         assert result is True
+
+
+def test_f26_ac10_none_cwd_fails_through_own_failure_channel(monkeypatch):
+    """AC10: _prepare_provider_runtime_identity with a None pane cwd fails
+    through the site's own failure channel (a recognized _PERSIST_FAILURE_CODES
+    code), never a TypeError from quote(None) inside capture_session_uuid."""
+    import cli_agent_orchestrator.services.terminal_service as ts
+
+    provider = MagicMock(supports_reauth_rebind=True, shell_baseline="bash")
+    providermeta = {"tmux_session": "s", "tmux_window": "w"}
+    backend = MagicMock()
+    backend.get_pane_working_directory.return_value = None
+    monkeypatch.setattr(ts, "get_backend", lambda: backend)
+    monkeypatch.setattr(ts, "get_terminal_metadata", lambda _tid: providermeta)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.fork_context_service.pane_pid", lambda *_a: 1
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.fork_context_service.pane_launch_epoch", lambda _pid: 2
+    )
+    provider.capture_session_uuid = MagicMock(
+        side_effect=AssertionError("capture_session_uuid must not be called with None cwd")
+    )
+    with pytest.raises(RuntimeError) as caught:
+        ts._prepare_provider_runtime_identity(provider, "term", settlement_form="resume")
+    assert str(caught.value) == "terminal_cwd_unavailable"
+    assert "terminal_cwd_unavailable" in ts._PERSIST_FAILURE_CODES

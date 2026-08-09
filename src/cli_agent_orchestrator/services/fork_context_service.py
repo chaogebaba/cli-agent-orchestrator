@@ -196,6 +196,24 @@ def _entry_for_path(cwd: str, path_name: str) -> SnapshotEntry:
         return SnapshotEntry(path_name, "unhashable")
 
 
+def assert_cwd_live(cwd: str, *, error_factory):
+    """F26: fail directed when ``cwd`` is not a live directory before a git seam
+    consumes it.
+
+    ``get_pane_working_directory`` resolves a deleted pane cwd to ``None`` (its
+    existing "unknown" contract), but ``None`` alone still collapses to the
+    opaque ``snapshot_git-failure`` / generic "not inside a git repository"
+    mystery. This helper converts that into a named, actionable error at the
+    two git-consuming seams (fork dispatch, worktree resolution) instead — the
+    worker deleted its own cwd, so the failure is a directed verdict, never a
+    silent rescue (D3).
+    """
+    if not os.path.exists(cwd):
+        raise error_factory(
+            f"worker deleted its own cwd: {cwd} " f"(pane_current_path reported ' (deleted)')"
+        )
+
+
 def snapshot(cwd: str) -> SnapshotDelta:
     try:
         sha = _run_git_bytes(cwd, "rev-parse", "HEAD").decode("utf-8", "strict").strip()
@@ -721,6 +739,7 @@ def mark_ready(
         session_uuid = candidate_uuid
     else:
         raise ForkContextError("provider_lacks_fork_capability")
+    assert_cwd_live(cwd, error_factory=ForkContextError)
     captured = snapshot(cwd)
     sha, hashes = captured.git_sha, captured.dirty_hashes()
     if captured.acquisition_error or not sha:

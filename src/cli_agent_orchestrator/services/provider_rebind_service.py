@@ -215,11 +215,20 @@ async def _fallback(metadata: dict, session_uuid: str, source_lease, lifecycle_l
         mode="resume", session_uuid=session_uuid, base_name="reauth-fallback",
         provider=metadata["provider"], initial_preamble="",
     )
+    cwd = get_backend().get_pane_working_directory(
+        metadata["tmux_session"], metadata["tmux_window"])
+    if cwd is None:
+        # F26 AC11: never fall back to os.getcwd() for a deleted/unavailable
+        # pane cwd — recreating the terminal in the wrong directory is the
+        # silent wrong-repo incident class D3 rejects. Fail directed.
+        return {
+            "status": "unresumable", "new_terminal_id": None,
+            "error_code": "cwd_unavailable",
+        }
     replacement = await create_terminal(
         provider=metadata["provider"], agent_profile=metadata["agent_profile"],
         session_name=metadata["tmux_session"], new_session=False,
-        working_directory=get_backend().get_pane_working_directory(
-            metadata["tmux_session"], metadata["tmux_window"]),
+        working_directory=cwd,
         allowed_tools=metadata.get("allowed_tools"), caller_id=metadata.get("caller_id"),
         fork_context=context,
         fallback_source_terminal_id=metadata["id"],
@@ -306,6 +315,12 @@ async def rebind_terminal(
             return _result(terminal_id, "unresumable", error_code="shell_baseline_missing", interrupt=interrupt)
         pid = pane_pid(metadata["tmux_session"], metadata["tmux_window"])
         cwd = get_backend().get_pane_working_directory(metadata["tmux_session"], metadata["tmux_window"])
+        if cwd is None:
+            # F26 D5: a deleted/unavailable pane cwd must mark the rebind
+            # unresumable with a directed reason, never escape as a TypeError
+            # from quote(None) inside capture_session_uuid /
+            # validate_session_artifact.
+            return _result(terminal_id, "unresumable", error_code="cwd_unavailable", interrupt=interrupt)
         session_uuid = metadata.get("provider_session_id")
         phase = "p4"
         if not session_uuid:

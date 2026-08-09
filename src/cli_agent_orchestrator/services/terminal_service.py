@@ -285,6 +285,12 @@ def _prepare_provider_runtime_identity(
     cwd = get_backend().get_pane_working_directory(
         metadata["tmux_session"], metadata["tmux_window"]
     )
+    if cwd is None:
+        # F26 D5: a deleted/unavailable pane cwd must fail through this site's
+        # own failure channel (a recognized _PERSIST_FAILURE_CODES code), never
+        # escape as a TypeError from quote(None) inside capture_session_uuid /
+        # validate_session_artifact.
+        raise RuntimeError("terminal_cwd_unavailable")
     allocated = getattr(provider_instance, "allocated_session_uuid", None)
     try:
         hint = provider_instance.resume_session_uuid()
@@ -1651,6 +1657,7 @@ _PERSIST_FAILURE_CODES = {
     "identity_persist_failed",
     "shell_baseline_unavailable",
     "terminal_identity_persist_failed",
+    "terminal_cwd_unavailable",
 }
 
 
