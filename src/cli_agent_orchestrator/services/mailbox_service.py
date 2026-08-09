@@ -29,7 +29,6 @@ from cli_agent_orchestrator.clients.database import (
     _insert_routed_inbox_row,
     _stamp_enqueue_generation,
     resolve_inbox_receiver,
-    settle_attempt_inferred_delivered_batch,
 )
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 
