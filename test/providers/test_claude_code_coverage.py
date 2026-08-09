@@ -139,6 +139,33 @@ class TestHandleStartupPromptsBranches:
         # spin to the outer timeout (60s / hundreds of iterations).
         assert mock_sleep.await_count <= 20
 
+    @pytest.mark.asyncio
+    @patch(
+        "cli_agent_orchestrator.providers.claude_code.provider_home",
+        return_value=MagicMock(classification="shared-auth-read-only"),
+    )
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_external_imports_prompt_settles_at_idle_gap(
+        self, mock_backend, mock_sleep, _mock_home, provider
+    ):
+        """Lone external-imports prompt settles at idle gap, not outer timeout."""
+        mock_backend.get_history.return_value = (
+            "Allow external CLAUDE.md file imports?\n"
+            "❯ 1. Yes\n"
+            "  2. No\n"
+        )
+
+        await provider._handle_startup_prompts(idle_gap=1.0)
+
+        # External imports rejected via Down arrow + Enter
+        mock_backend.send_keys.assert_called_once()
+        mock_backend.send_special_key.assert_called_once_with(
+            provider.session_name, provider.window_name, "Enter"
+        )
+        # Settles at idle gap — bounded iterations, not 60s spin
+        assert mock_sleep.await_count <= 20
+
 
 class TestDatabaseListAllTerminals:
     """Test list_all_terminals database function (lines 149-151)."""
