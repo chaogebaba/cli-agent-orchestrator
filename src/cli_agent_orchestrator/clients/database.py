@@ -4574,6 +4574,54 @@ def _maybe_fire_completed_barrier(db: Any, barrier: Any) -> int | None:
     return None
 
 
+def _is_supervisor_mailbox_id(db: Any, mailbox_id: str) -> bool:
+    """Return True if mailbox_id belongs to a supervisor-role mailbox (F123)."""
+    row = db.query(MailboxModel).filter_by(id=mailbox_id, role="supervisor").first()
+    return row is not None
+
+
+def _touch_supervisor_pending_flag() -> None:
+    """Create the supervisor-pending sentinel for the PostToolUse hook fast-path (F123)."""
+    from cli_agent_orchestrator.constants import CAO_HOME_DIR
+
+    flag = CAO_HOME_DIR / "supervisor-pending.flag"
+    try:
+        flag.touch(exist_ok=True)
+    except OSError:
+        pass  # Best-effort; staleness is safe in both directions.
+
+
+def _remove_supervisor_pending_flag_if_drained() -> None:
+    """Remove sentinel when no supervisor-bound PENDING rows remain (F123).
+
+    Called after settlement paths. Opens its own read-only session for the
+    existence check. Safe to call outside a transaction.
+    """
+    from cli_agent_orchestrator.constants import CAO_HOME_DIR
+
+    flag = CAO_HOME_DIR / "supervisor-pending.flag"
+    if not flag.exists():
+        return
+    try:
+        with SessionLocal() as db:
+            sup_mbox = db.query(MailboxModel).filter_by(role="supervisor").first()
+            if sup_mbox is None:
+                flag.unlink(missing_ok=True)
+                return
+            has_pending = db.query(
+                db.query(InboxModel)
+                .filter(
+                    InboxModel.status == MessageStatus.PENDING.value,
+                    InboxModel.logical_receiver_id == str(sup_mbox.id),
+                )
+                .exists()
+            ).scalar()
+            if not has_pending:
+                flag.unlink(missing_ok=True)
+    except Exception:
+        pass  # Best-effort; stale flag just costs one empty drain.
+
+
 def _insert_routed_inbox_row(
     db: Any,
     *,
@@ -4650,6 +4698,13 @@ def _insert_routed_inbox_row(
             member.message_id = int(row.id)
             member.arrived_at = _barrier_now()
         _maybe_fire_completed_barrier(db, barrier)
+    # F123: touch supervisor-pending sentinel for hook fast-path.
+    if (
+        status == MessageStatus.PENDING
+        and logical_receiver_id is not None
+        and _is_supervisor_mailbox_id(db, logical_receiver_id)
+    ):
+        _touch_supervisor_pending_flag()
     return row
 
 
@@ -6818,6 +6873,8 @@ def settle_pending_orphan_messages(
 
     result = _run_wpm1_immediate(operation)
     if isinstance(result, OrphanReconcileResult):
+        if result.settled_count > 0:
+            _remove_supervisor_pending_flag_if_drained()
         return result
     return OrphanReconcileResult(busy_aborted=True)
 

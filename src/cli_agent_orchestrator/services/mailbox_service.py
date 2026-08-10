@@ -822,6 +822,10 @@ def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
             # --- end WP-MAILBOX-CHANNEL settlement ---
             prior = mailbox.consumed_through_id
             db.commit()
+            # F123: re-evaluate supervisor-pending sentinel after ack settlement.
+            if settled_count > 0:
+                from cli_agent_orchestrator.clients.database import _remove_supervisor_pending_flag_if_drained
+                _remove_supervisor_pending_flag_if_drained()
             return {
                 "mailbox_id": mailbox.id,
                 "consumed_through_id": up_to_id,
@@ -864,6 +868,10 @@ def quarantine_malformed_mailbox_rows(mailbox_id: str) -> int:
                 row.failure_reason = "mailbox_payload_malformed"
                 quarantined += 1
         db.commit()
+    # F123: re-evaluate supervisor-pending sentinel after quarantine settlement.
+    if quarantined > 0:
+        from cli_agent_orchestrator.clients.database import _remove_supervisor_pending_flag_if_drained
+        _remove_supervisor_pending_flag_if_drained()
     return quarantined
 
 

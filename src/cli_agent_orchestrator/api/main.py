@@ -974,6 +974,35 @@ async def lifespan(app: FastAPI):
     _reconcile_memory_at_startup()
     inbox_service.recover_stale_deliveries()
     adopt_mailbox_rows_at_startup()
+    # F123: reconcile supervisor-pending sentinel at startup.
+    try:
+        from cli_agent_orchestrator.clients.database import (
+            _remove_supervisor_pending_flag_if_drained,
+            _touch_supervisor_pending_flag,
+            InboxModel,
+            MailboxModel,
+            MessageStatus,
+            SessionLocal,
+        )
+        with SessionLocal() as db:
+            sup_mbox = db.query(MailboxModel).filter_by(role="supervisor").first()
+            if sup_mbox:
+                has_pending = db.query(
+                    db.query(InboxModel)
+                    .filter(
+                        InboxModel.status == MessageStatus.PENDING.value,
+                        InboxModel.logical_receiver_id == str(sup_mbox.id),
+                    )
+                    .exists()
+                ).scalar()
+                if has_pending:
+                    _touch_supervisor_pending_flag()
+                else:
+                    _remove_supervisor_pending_flag_if_drained()
+            else:
+                _remove_supervisor_pending_flag_if_drained()
+    except Exception:
+        logger.warning("F123 sentinel reconciliation failed; continuing", exc_info=True)
     inbox_service.reconcile_pending_orphans()
     # A barrier sweep is best-effort at startup: the daemon retries every poll,
     # and no barrier is worth refusing to boot over. Fail-stop belongs to the

@@ -271,6 +271,14 @@ def attempt_teammate_push(terminal_id: str, messages: List[InboxMessage]) -> boo
 
     inbox_path = _resolve_inbox_path(terminal_id)
     if inbox_path is None:
+        logger.warning(
+            "teammate_push_outcome",
+            extra={
+                "event": "teammate_push_no_inbox",
+                "terminal_id": terminal_id,
+                "reason": "inbox_path_not_resolved",
+            },
+        )
         return False
 
     # Dedup: only notify for messages with id > last_notified (SHOULD-2 / Risk#3).
@@ -293,12 +301,24 @@ def attempt_teammate_push(terminal_id: str, messages: List[InboxMessage]) -> boo
         max_id = max(m.id for m in new_messages)
         _persist_last_notified_id(terminal_id, max_id)
         logger.info(
-            f"teammate_push: wrote notification for {len(new_messages)} message(s) "
-            f"to {inbox_path} (terminal {terminal_id})"
+            "teammate_push_outcome",
+            extra={
+                "event": "teammate_push_ok",
+                "terminal_id": terminal_id,
+                "msg_count": len(new_messages),
+                "msg_ids": [m.id for m in new_messages],
+                "high_water": max_id,
+            },
         )
     else:
         logger.warning(
-            f"teammate_push: write failed for terminal {terminal_id}, " f"falling back to pull-only"
+            "teammate_push_outcome",
+            extra={
+                "event": "teammate_push_fail",
+                "terminal_id": terminal_id,
+                "reason": "write_failed",
+                "msg_ids": [m.id for m in new_messages],
+            },
         )
 
     return success
