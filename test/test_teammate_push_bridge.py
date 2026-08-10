@@ -33,6 +33,7 @@ from cli_agent_orchestrator.services.teammate_push_service import (
     _should_teammate_push,
     _write_inbox_entry,
     attempt_teammate_push,
+    attempt_teammate_push_on_insert,
 )
 
 _NOW = datetime(2025, 1, 1, 0, 0, 0)
@@ -540,3 +541,102 @@ class TestShouldTeammatePush:
             mock_cfg.get.return_value = True
             mock_meta.return_value = _metadata_with_path("/tmp/inbox.json")
             assert _should_teammate_push("sup-001") is True
+
+
+class TestOnInsertConfigGateBypass:
+    """F123-P0 — attempt_teammate_push_on_insert bypasses the config flag.
+
+    The insert-path push must fire unconditionally (mailbox_pull mode implies
+    the push bridge is required for supervisor wake-up), while still validating
+    the cc_team_inbox_path metadata. These tests directly exercise the function
+    to kill the gate-bypass and validation mutants (B1).
+    """
+
+    def test_push_succeeds_when_config_flag_false(self, tmp_path: Path) -> None:
+        """Flag OFF still writes a CC inbox entry on insert (proves the bypass)."""
+        inbox_path = tmp_path / "teams" / "session-abc" / "inboxes" / "team-lead.json"
+        _last_notified.clear()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.teammate_push_service.ConfigService"
+            ) as mock_cfg,
+            patch(
+                "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
+            ) as mock_meta,
+            patch(
+                "cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata"
+            ),
+        ):
+            mock_cfg.get.return_value = False
+            mock_meta.return_value = _metadata_with_path(str(inbox_path))
+            result = attempt_teammate_push_on_insert("sup-001", [_make_message(msg_id=5)])
+
+        assert result is True
+        assert inbox_path.exists()
+        entries = json.loads(inbox_path.read_text())
+        assert len(entries) == 1
+        assert entries[0]["from"] == _TEAMMATE_FROM
+
+    def test_returns_false_when_no_inbox_path_in_metadata(self, tmp_path: Path) -> None:
+        """No cc_team_inbox_path in metadata → validation blocks the push."""
+        inbox_path = tmp_path / "should_not_exist" / "inbox.json"
+        _last_notified.clear()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.teammate_push_service.ConfigService"
+            ),
+            patch(
+                "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
+            ) as mock_meta,
+            patch(
+                "cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata"
+            ),
+        ):
+            mock_meta.return_value = _metadata_without_path()
+            result = attempt_teammate_push_on_insert("sup-001", [_make_message(msg_id=5)])
+
+        assert result is False
+        assert not inbox_path.exists()
+
+    def test_returns_false_on_empty_messages(self, tmp_path: Path) -> None:
+        """Empty messages list → early-out, no write."""
+        inbox_path = tmp_path / "should_not_exist" / "inbox.json"
+        _last_notified.clear()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.teammate_push_service.ConfigService"
+            ),
+            patch(
+                "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
+            ) as mock_meta,
+            patch(
+                "cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata"
+            ),
+        ):
+            mock_meta.return_value = _metadata_with_path(str(inbox_path))
+            result = attempt_teammate_push_on_insert("sup-001", [])
+
+        assert result is False
+        assert not inbox_path.exists()
+
+    def test_returns_false_on_empty_string_terminal_id(self, tmp_path: Path) -> None:
+        """Empty terminal_id → early-out, no write (guards the truthiness guard)."""
+        inbox_path = tmp_path / "should_not_exist" / "inbox.json"
+        _last_notified.clear()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.teammate_push_service.ConfigService"
+            ),
+            patch(
+                "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
+            ) as mock_meta,
+        ):
+            mock_meta.return_value = _metadata_with_path(str(inbox_path))
+            result = attempt_teammate_push_on_insert("", [_make_message(msg_id=5)])
+
+        assert result is False
+        assert not inbox_path.exists()

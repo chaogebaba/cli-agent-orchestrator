@@ -560,7 +560,7 @@ def create_logical_inbox_message(
 
                                 attempt_teammate_push_on_insert(_push_terminal, [result])
                             except Exception as _push_err:
-                                logger.debug(
+                                logger.info(
                                     f"F123-P0: teammate_push on insert failed: {_push_err}"
                                 )
 
