@@ -277,7 +277,9 @@ def publish_supervisor_incarnation(claim: MailboxClaim, terminal_id: str) -> dic
                     return result
                 raise MailboxDomainError("mailbox_conflict", "mailbox publication conflict")
 
-            now = datetime.now()
+            # F130 hotfix: write mailbox created_at/updated_at as aware-UTC so
+            # created_at-bearing mailbox reads agree with the inbox UTC path.
+            now = datetime.now(timezone.utc)
             if claim.mailbox_id is None:
                 mailbox = MailboxModel(
                     id=f"mb_{uuid.uuid4().hex[:8]}",
@@ -638,6 +640,15 @@ def list_messages(
         else:
             query = query.filter(InboxModel.receiver_id == receiver)
         if since is not None:
+            # F130 hotfix: inbox/mailbox created_at is stored as UTC (naive in
+            # sqlite). Normalize the filter to aware-UTC so the comparison is
+            # correct regardless of how the caller expressed the timestamp. A
+            # naive `since` is interpreted as UTC, matching the stored values.
+            # Legacy naive rows written before the hotfix are LOCAL time; they
+            # are compared against aware-UTC here, which is a documented known
+            # skew for those rows (they predate the fix).
+            if since.tzinfo is not None:
+                since = since.astimezone(timezone.utc)
             query = query.filter(InboxModel.created_at >= since)
         if after_id is not None:
             query = query.filter(InboxModel.id > after_id)
@@ -756,7 +767,7 @@ def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
                 .update(
                     {
                         MailboxModel.consumed_through_id: up_to_id,
-                        MailboxModel.updated_at: datetime.now(),
+                        MailboxModel.updated_at: datetime.now(timezone.utc),
                     },
                     synchronize_session=False,
                 )
@@ -802,7 +813,7 @@ def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
                 )
                 .all()
             )
-            now = datetime.now()
+            now = datetime.now(timezone.utc)
             for attempt in open_attempts:
                 attempt.outcome = "confirmed"
                 attempt.reason = "mailbox_pull_acked"

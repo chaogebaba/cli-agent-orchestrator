@@ -250,7 +250,7 @@ class MailboxModel(Base):
     generation = Column(Integer, nullable=False, default=1, server_default="1")
     consumed_through_id = Column(Integer, nullable=False, default=0, server_default="0")
     schema_version = Column(Integer, nullable=False, default=1, server_default="1")
-    created_at = Column(DateTime, nullable=False, default=datetime.now)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
     __table_args__ = (UniqueConstraint("session_name", "role", name="uq_mailbox_session_role"),)
 
@@ -307,7 +307,7 @@ class InboxModel(Base):
     owner_generation = deferred(Column(Integer, nullable=True))
     barrier_id = deferred(Column(Integer, nullable=True))
     barrier_member_key = deferred(Column(String, nullable=True))
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
 
 
 class CallbackBarrierModel(Base):

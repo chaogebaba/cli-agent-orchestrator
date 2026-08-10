@@ -9,7 +9,7 @@ from __future__ import annotations
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -619,3 +619,96 @@ def test_ac9_prior_push_era_attempt_settled_by_ack(scratch_db, monkeypatch):
         msg = db.get(InboxModel, row_id)
         assert msg.status == MessageStatus.DELIVERED.value
         assert msg.failure_reason == "mailbox_pull_acked"
+
+
+# ---------------------------------------------------------------------------
+# P0 hotfix (2026-08-09): supervisor-addressed pending rows must push by default
+# ---------------------------------------------------------------------------
+
+
+def test_p0_hotfix_supervisor_row_pushes_when_receiver_idle(scratch_db, monkeypatch):
+    """F123 surface: with the CAO_SUPERVISOR_MAILBOX_PULL flag absent/false (the
+    new deployed default), a supervisor-addressed pending row is NOT skipped by
+    the pull gate — deliver_pending proceeds past it (the push path is entered)
+    instead of returning early at the gate. This restores push delivery for
+    supervisor callbacks."""
+    # Ensure the flag is off (absent env → default, or explicitly empty).
+    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "")
+    with scratch_db.begin() as db:
+        _terminal(db, "sup-001")
+        _mailbox(db)
+        row = _inbox_row(db, "sup-001", logical="mb_sup", message="F123 supervisor callback")
+        row_id = row.id
+
+    gate_called = []
+    original_fn = is_supervisor_mailbox_pull_terminal
+
+    def traced_fn(tid):
+        result = original_fn(tid)
+        gate_called.append((tid, result))
+        return result
+
+    with (
+        patch(
+            "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
+            traced_fn,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.get_terminal_metadata",
+            return_value={
+                "tmux_session": "cao-test",
+                "tmux_window": "sup-001",
+                "lifecycle_generation": 1,
+                "recovery_state": None,
+            },
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.status_monitor",
+            MagicMock(),
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.provider_manager",
+            MagicMock(),
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.terminal_service",
+            MagicMock(),
+        ),
+    ):
+        svc = InboxService.__new__(InboxService)
+        svc._gone_lock = threading.Lock()
+        svc._gone_streaks = {}
+        svc.deliver_pending("sup-001")
+
+    # The pull gate was evaluated and resolved False (push not short-circuited).
+    assert any(tid == "sup-001" and result is False for tid, result in gate_called)
+    # The row was NOT settled by the pull gate (it is not acked/DELIVERED here);
+    # it remains PENDING for the ordinary push path to pick up.
+    with scratch_db() as db:
+        msg = db.get(InboxModel, row_id)
+        assert msg.status == MessageStatus.PENDING.value
+
+
+def test_p0_hotfix_list_messages_since_utc_returns_row_created_now(scratch_db, monkeypatch):
+    """F130 surface: list_messages with an aware-UTC `since` (e.g. the ISO the
+    supervisor passes) returns a row created "now" (UTC). The stored created_at
+    is written timezone-aware UTC and the since filter is normalized to
+    aware-UTC, so the comparison is correct."""
+    monkeypatch.setenv("CAO_SUPERVISOR_MAILBOX_PULL", "")
+    with scratch_db.begin() as db:
+        _terminal(db, "sup-001")
+        _mailbox(db)
+        row = _inbox_row(
+            db,
+            "sup-001",
+            logical="mb_sup",
+            message="F130 UTC row",
+            created_at=datetime.now(timezone.utc),
+        )
+        row_id = row.id
+
+    # since = a moment before the row was created, expressed in aware UTC.
+    since = datetime.now(timezone.utc) - timedelta(seconds=5)
+    result = list_messages("mb_sup", since=since)
+    ids = [item["id"] for item in result["items"]]
+    assert row_id in ids

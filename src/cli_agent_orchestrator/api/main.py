@@ -5282,8 +5282,12 @@ async def list_messages_endpoint(
     if since is not None:
         try:
             parsed_since = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            # F130 hotfix: inbox/mailbox created_at is stored as UTC (naive in
+            # sqlite). Normalize the filter to aware-UTC so the comparison is
+            # correct regardless of how the caller expressed the timestamp.
+            # A naive `since` is interpreted as UTC, matching the stored values.
             if parsed_since.tzinfo is not None:
-                parsed_since = parsed_since.astimezone().replace(tzinfo=None)
+                parsed_since = parsed_since.astimezone(timezone.utc)
         except ValueError as exc:
             raise HTTPException(
                 status_code=400,
