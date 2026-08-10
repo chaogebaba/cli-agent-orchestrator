@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, cast
 
@@ -14,6 +14,7 @@ import frontmatter  # type: ignore
 from apscheduler.triggers.cron import CronTrigger  # type: ignore
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.clients.database import _utcnow
 from cli_agent_orchestrator.clients.database import create_flow as db_create_flow
 from cli_agent_orchestrator.clients.database import delete_flow as db_delete_flow
 from cli_agent_orchestrator.clients.database import get_flow as db_get_flow
@@ -40,14 +41,16 @@ logger = logging.getLogger(__name__)
 
 
 def _get_next_run_time(cron_expression: str) -> datetime:
-    """Calculate next run time from cron expression."""
+    """Calculate next run time from cron expression, stored as naive-UTC."""
     trigger = CronTrigger.from_crontab(cron_expression)
-    next_time = trigger.get_next_fire_time(None, datetime.now())
+    next_time = trigger.get_next_fire_time(None, _utcnow())
     if next_time is None:
         raise ValueError(
             f"Could not calculate next run time for cron expression: {cron_expression}"
         )
-    return cast(datetime, next_time)
+    # CronTrigger returns local-TZ-aware; convert to UTC, strip tzinfo
+    # for sqlite storage (convention: naive-UTC-at-rest).
+    return cast(datetime, next_time.astimezone(timezone.utc).replace(tzinfo=None))
 
 
 def _parse_flow_file(file_path: Path) -> Tuple[Dict, str]:
@@ -255,7 +258,7 @@ async def execute_flow(name: str) -> bool:
                 raise ValueError("Script output missing 'output' field")
 
         # Update last_run and calculate next_run
-        now = datetime.now()
+        now = _utcnow()
         next_run = _get_next_run_time(flow.schedule)
         db_update_flow_run_times(name, last_run=now, next_run=next_run)
 

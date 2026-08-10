@@ -24,6 +24,7 @@ from cli_agent_orchestrator.clients.database import (
     list_pending_receiver_ids,
     list_ready_backlog_observations,
     terminal_exists,
+    _utcnow,
 )
 from cli_agent_orchestrator.constants import (
     CAO_WAITING_INBOX_GRACE_SECONDS,
@@ -210,7 +211,7 @@ class StalledCallbackWatchdog:
         if caller_id.startswith("watchdog:"):
             return
         now = time.monotonic()
-        wall_now = datetime.now()
+        wall_now = _utcnow()
         with self._lock:
             if terminal_id in self._paused:
                 return

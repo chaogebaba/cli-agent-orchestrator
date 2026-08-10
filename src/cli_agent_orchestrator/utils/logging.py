@@ -2,6 +2,7 @@ import logging
 import re
 import sys
 from datetime import datetime
+from cli_agent_orchestrator.clients.database import _utcnow
 
 from cli_agent_orchestrator.constants import LOG_DIR
 from cli_agent_orchestrator.services.config_service import ConfigService
@@ -49,7 +50,7 @@ def setup_logging() -> None:
 
     # Ensure log directory exists
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    timestamp = _utcnow().strftime("%Y-%m-%d_%H-%M-%S")
     log_file = LOG_DIR / f"cao_{timestamp}.log"
 
     fmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

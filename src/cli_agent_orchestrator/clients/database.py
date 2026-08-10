@@ -92,6 +92,25 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _as_utc(dt: datetime | None) -> datetime | None:
+    """Stamp naive-at-rest DB reads as UTC (our storage convention).
+
+    Post-hotfix rows: naive-UTC-at-rest -> correct.
+    Pre-hotfix rows: naive-local-at-rest -> <=4h skew, direction varies by
+    consumer site (all harmless — see blueprint table). Ages out by 2026-08-24.
+
+    MUST NOT be applied to barrier columns (fired_at, timeout_at, arrived_at)
+    which were ALREADY naive-UTC via _barrier_now() -- they need no coercion.
+    """
+    if dt is None:
+        return None
+    # Convenience for non-DB callers passing already-aware values; DB reads
+    # NEVER take this branch (SQLAlchemy-sqlite always returns tzinfo=None).
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc)
+    return dt.replace(tzinfo=timezone.utc)
+
+
 class TerminalModel(Base):
     """SQLAlchemy model for terminal metadata only."""
 
@@ -131,7 +150,7 @@ class TerminalModel(Base):
     # MetaData object on every mapped class; the DB column itself is still
     # literally named "metadata" per #432's design.
     metadata_json = Column("metadata", Text, nullable=True)
-    last_active = Column(DateTime, default=datetime.now)
+    last_active = Column(DateTime, default=_utcnow)
     __table_args__ = (
         CheckConstraint(
             "lifecycle IN ('ephemeral','sticky')",
@@ -251,7 +270,7 @@ class MailboxModel(Base):
     consumed_through_id = Column(Integer, nullable=False, default=0, server_default="0")
     schema_version = Column(Integer, nullable=False, default=1, server_default="1")
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
-    updated_at = Column(DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+    updated_at = Column(DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
     __table_args__ = (UniqueConstraint("session_name", "role", name="uq_mailbox_session_role"),)
 
 
@@ -262,7 +281,7 @@ class MailboxIncarnationModel(Base):
     mailbox_id = Column(String, ForeignKey("mailboxes.id"), primary_key=True, nullable=False)
     generation = Column(Integer, primary_key=True, nullable=False)
     terminal_id = Column(String, nullable=False, unique=True)
-    published_at = Column(DateTime, nullable=False, default=datetime.now)
+    published_at = Column(DateTime, nullable=False, default=_utcnow)
     digest_message_id = Column(Integer, nullable=True)
 
 
@@ -2485,7 +2504,7 @@ def update_last_active(terminal_id: str) -> bool:
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal:
-            terminal.last_active = datetime.now()
+            terminal.last_active = _utcnow()
             db.commit()
             return True
         return False
@@ -2605,7 +2624,7 @@ def _reactivate_parked_rows_in_db(
         ):
             if move_mailbox_authority:
                 mailbox.current_terminal_id = target_terminal_id
-                mailbox.updated_at = datetime.now()
+                mailbox.updated_at = _utcnow()
             changed += (
                 db.query(InboxModel)
                 .filter(
@@ -3938,11 +3957,14 @@ def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
     The join on ``terminals`` drops messages whose receiver terminal no longer
     exists, so the sweep does not keep retrying deliveries to deleted agents.
 
-    ``created_at`` is stored local-naive (``InboxModel.created_at`` defaults to
-    ``datetime.now``), so the cutoff uses ``datetime.now()`` to match — the same
-    convention as the retention query in ``cleanup_service.cleanup_old_data``.
+    ``created_at`` is stored as naive-UTC-at-rest (post-hotfix 5959fc82,
+    2026-08-10). Pre-hotfix rows (before 2026-08-10) are naive-local-at-rest
+    (UTC-4); treating them as UTC yields <=4h over-collection at this site
+    (harmless: idempotent downstream). All pre-hotfix rows age out by 2026-08-24
+    (14-day retention). The cutoff uses ``_utcnow()`` to match the post-hotfix
+    convention.
     """
-    cutoff = datetime.now() - timedelta(seconds=min_age_seconds)
+    cutoff = _utcnow() - timedelta(seconds=min_age_seconds)
     with SessionLocal() as db:
         rows = (
             db.query(InboxModel.receiver_id)
@@ -4032,7 +4054,7 @@ def list_ready_backlog_observations() -> list[ReadyBacklogObservation]:
                 has_open or attempt_settled is None,
             )
 
-        now = datetime.now()
+        now = _utcnow()
         result = []
         for receiver_id, oldest in oldest_by_receiver.items():
             count, started, settled, last, has_open = progress.get(
@@ -4042,7 +4064,7 @@ def list_ready_backlog_observations() -> list[ReadyBacklogObservation]:
                 ReadyBacklogObservation(
                     receiver_id=receiver_id,
                     oldest_message_id=oldest.id,
-                    oldest_pending_age_seconds=max(0.0, (now - oldest.created_at).total_seconds()),
+                    oldest_pending_age_seconds=max(0.0, (now - _as_utc(oldest.created_at)).total_seconds()),
                     has_open_delivering_attempt=has_open,
                     attempt_fingerprint=(count, started, settled, last),
                 )
@@ -7564,7 +7586,7 @@ def delete_flow(name: str) -> bool:
 def get_flows_to_run() -> List[Flow]:
     """Get enabled flows where next_run <= now."""
     with SessionLocal() as db:
-        now = datetime.now()
+        now = _utcnow()
         flows = (
             db.query(FlowModel).filter(FlowModel.enabled == True, FlowModel.next_run <= now).all()
         )

@@ -29,6 +29,7 @@ from cli_agent_orchestrator.clients.database import (
     _insert_routed_inbox_row,
     _stamp_enqueue_generation,
     resolve_inbox_receiver,
+    _utcnow,
 )
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 
@@ -388,7 +389,7 @@ def publish_supervisor_incarnation(claim: MailboxClaim, terminal_id: str) -> dic
             for barrier in historical_barriers:
                 barrier.state = "DIGESTED_REBIND"
                 barrier.close_reason = "supervisor_rebind"
-                barrier.fired_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                barrier.fired_at = _utcnow()
                 historical_held.extend(
                     db.query(InboxModel)
                     .filter(

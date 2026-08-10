@@ -1,7 +1,7 @@
 """Tests for the database client."""
 
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -696,8 +696,8 @@ class TestMessageTraceTransactions:
         Uses the real in-memory DB (not a mocked session) so the age cutoff,
         status filter, and terminal join are actually exercised.
         """
-        old = datetime.now() - timedelta(seconds=120)
-        fresh = datetime.now()
+        old = datetime.now(timezone.utc) - timedelta(seconds=120)
+        fresh = datetime.now(timezone.utc)
 
         with test_db() as seed:
             seed.add_all(

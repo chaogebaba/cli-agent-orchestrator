@@ -17,6 +17,7 @@ from cli_agent_orchestrator.clients.database import (
     SessionLocal,
     TerminalModel,
     delete_terminal_and_warm_intent,
+    _utcnow,
 )
 from cli_agent_orchestrator.constants import (
     LOG_DIR,
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 def cleanup_old_data():
     """Clean up terminals, inbox messages, and log files older than RETENTION_DAYS."""
     try:
-        cutoff_date = datetime.now() - timedelta(days=RETENTION_DAYS)
+        cutoff_date = _utcnow() - timedelta(days=RETENTION_DAYS)
         logger.info(
             f"Starting cleanup of data older than {RETENTION_DAYS} days (before {cutoff_date})"
         )

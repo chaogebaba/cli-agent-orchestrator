@@ -484,7 +484,7 @@ def test_ac8_reconciliation_sweep_does_not_fight_pull_mode(scratch_db, monkeypat
     from cli_agent_orchestrator.services.inbox_service import INBOX_RECONCILE_GRACE_SECONDS
     from cli_agent_orchestrator.clients.database import list_pending_receiver_ids_older_than
 
-    old_time = datetime.now() - timedelta(seconds=INBOX_RECONCILE_GRACE_SECONDS + 60)
+    old_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=INBOX_RECONCILE_GRACE_SECONDS + 60)
     with scratch_db.begin() as db:
         _terminal(db, "sup-001")
         _mailbox(db)
@@ -494,7 +494,7 @@ def test_ac8_reconciliation_sweep_does_not_fight_pull_mode(scratch_db, monkeypat
         )
         # Young row (within grace) — should NOT appear
         young_row = _inbox_row(
-            db, "sup-001", logical="mb_sup", message="young msg", created_at=datetime.now()
+            db, "sup-001", logical="mb_sup", message="young msg", created_at=datetime.now(timezone.utc).replace(tzinfo=None)
         )
         old_id, young_id = old_row.id, young_row.id
 

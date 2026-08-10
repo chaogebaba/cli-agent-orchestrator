@@ -60,6 +60,7 @@ from cli_agent_orchestrator.clients.database import (
     update_terminal_metadata,
     update_terminal_shell_command,
     update_terminal_tmux_window,
+    _utcnow,
 )
 from cli_agent_orchestrator.constants import (
     FIFO_DIR,
@@ -1504,7 +1505,7 @@ async def create_terminal(
             group=group,
             metadata=metadata,
             status=initial_status,
-            last_active=datetime.now(),
+            last_active=_utcnow(),
             provider_session_id=resume_uuid or allocated_uuid,
         )
 
