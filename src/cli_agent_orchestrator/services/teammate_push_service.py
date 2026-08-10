@@ -338,7 +338,7 @@ def attempt_teammate_push_on_insert(terminal_id: str, messages: List[InboxMessag
 
     inbox_path = _resolve_inbox_path(terminal_id)
     if inbox_path is None:
-        logger.debug(
+        logger.info(
             "teammate_push_on_insert: no inbox_path for terminal=%s, skipping",
             terminal_id,
         )
