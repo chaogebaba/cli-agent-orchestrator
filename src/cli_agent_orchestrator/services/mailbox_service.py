@@ -537,6 +537,33 @@ def create_logical_inbox_message(
                 db.commit()
                 db.refresh(row)
                 result = _inbox_message_from_row(row)
+
+                # F123-P0: fire teammate push on supervisor-bound PENDING insert
+                # to wake an idle supervisor (bypasses config gate — mailbox_pull
+                # mode implies push bridge is required).
+                if row.status == "pending" and logical_receiver_id is not None:
+                    from cli_agent_orchestrator.clients.database import (
+                        _is_supervisor_mailbox_id as _is_sup_mb,
+                    )
+
+                    if _is_sup_mb(db, logical_receiver_id):
+                        _push_terminal = (
+                            receiver_cache
+                            if (receiver_cache and not receiver_cache.startswith("mb_"))
+                            else None
+                        )
+                        if _push_terminal:
+                            try:
+                                from cli_agent_orchestrator.services.teammate_push_service import (
+                                    attempt_teammate_push_on_insert,
+                                )
+
+                                attempt_teammate_push_on_insert(_push_terminal, [result])
+                            except Exception as _push_err:
+                                logger.debug(
+                                    f"F123-P0: teammate_push on insert failed: {_push_err}"
+                                )
+
                 if result.barrier_id is not None and result.barrier_member_key is not None:
                     stalled_callback_watchdog.record_callback_if_to_caller(
                         sender_id, logical_receiver_id or receiver_cache

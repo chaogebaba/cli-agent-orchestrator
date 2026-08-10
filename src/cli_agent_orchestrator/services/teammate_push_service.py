@@ -322,3 +322,59 @@ def attempt_teammate_push(terminal_id: str, messages: List[InboxMessage]) -> boo
         )
 
     return success
+
+
+def attempt_teammate_push_on_insert(terminal_id: str, messages: List[InboxMessage]) -> bool:
+    """Fire teammate push unconditionally on supervisor-bound PENDING insert.
+
+    Bypasses the supervisor.teammate_push feature flag — mailbox_pull mode
+    implies the push bridge is required for wake-up (F123-P0 hotfix).
+    Still requires cc_team_inbox_path metadata on the terminal.
+
+    Returns True if a notification was written, False otherwise.
+    """
+    if not terminal_id or not messages:
+        return False
+
+    inbox_path = _resolve_inbox_path(terminal_id)
+    if inbox_path is None:
+        logger.debug(
+            "teammate_push_on_insert: no inbox_path for terminal=%s, skipping",
+            terminal_id,
+        )
+        return False
+
+    # Shape notification (same as attempt_teammate_push but skip dedup for insert path).
+    first_msg = messages[0]
+    worker_name = first_msg.sender_id
+    message_preview = first_msg.message.split("\n", 1)[0] if first_msg.message else ""
+
+    entry = _build_entry(worker_name, message_preview, len(messages))
+
+    success = _write_inbox_entry(inbox_path, entry)
+    if success:
+        max_id = max(m.id for m in messages)
+        _persist_last_notified_id(terminal_id, max_id)
+        logger.info(
+            "teammate_push_outcome",
+            extra={
+                "event": "teammate_push_ok",
+                "terminal_id": terminal_id,
+                "msg_ids": [m.id for m in messages],
+                "high_water": max_id,
+                "trigger": "insert_path",
+            },
+        )
+    else:
+        logger.warning(
+            "teammate_push_outcome",
+            extra={
+                "event": "teammate_push_fail",
+                "terminal_id": terminal_id,
+                "reason": "write_failed",
+                "msg_ids": [m.id for m in messages],
+                "trigger": "insert_path",
+            },
+        )
+
+    return success
