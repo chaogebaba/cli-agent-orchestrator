@@ -626,7 +626,7 @@ def _configure_failing_sync_create(
     monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
     monkeypatch.setattr(terminal_service, "load_agent_profile", lambda _profile: None)
     monkeypatch.setattr(terminal_service, "generate_terminal_id", lambda: "worker99")
-    monkeypatch.setattr(terminal_service, "generate_window_name", lambda _profile: "worker")
+    monkeypatch.setattr(terminal_service, "generate_window_name", lambda *_a: "worker")
     monkeypatch.setattr(terminal_service, "clear_session_env", lambda _session: None)
     monkeypatch.setattr(terminal_service, "set_session_env", lambda *_args: None)
     monkeypatch.setattr(
