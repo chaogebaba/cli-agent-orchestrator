@@ -34,6 +34,7 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, assert_never, 
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
+    _utcnow,
     claim_deferred_init_failure,
     create_digest_pending_notice,
     create_inbox_message,
@@ -61,7 +62,6 @@ from cli_agent_orchestrator.clients.database import (
     update_terminal_metadata,
     update_terminal_shell_command,
     update_terminal_tmux_window,
-    _utcnow,
 )
 from cli_agent_orchestrator.constants import (
     FIFO_DIR,
@@ -122,6 +122,7 @@ from cli_agent_orchestrator.services.settings_service import (
     resolve_provider_string_option,
 )
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor, status_monitor
+from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
 from cli_agent_orchestrator.utils.provider_auth import ProviderAuthRefreshFailed
@@ -181,6 +182,15 @@ class _LegacyWarmTerminalPublisher(Protocol):
         init_deadline_s: Optional[float] = None,
     ) -> Dict[str, Any]: ...
 
+
+# Upper bound (bytes) on a single offset-ranged read of a terminal log
+# (U5 / #504, BR-2). ``read_output_range`` clamps its ``length`` to this so a
+# caller (playback fetching output around a selected event) can never trigger
+# an unbounded read of a large log file. 1 MiB is a defensible ceiling: it is
+# far larger than any realistic per-event output window (the rolling
+# STATE_BUFFER_MAX is only 8 KiB) yet bounds the worst-case allocation and
+# response size to a fixed, predictable amount regardless of on-disk log size.
+TERMINAL_RANGE_MAX_LENGTH = 1024 * 1024
 
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
@@ -734,9 +744,7 @@ def _capture_f138_issuance_context() -> tuple[int | None, str | None]:
     except OSError:
         pass
     try:
-        issuance_ticks = int(
-            time.clock_gettime(time.CLOCK_BOOTTIME) * os.sysconf("SC_CLK_TCK")
-        )
+        issuance_ticks = int(time.clock_gettime(time.CLOCK_BOOTTIME) * os.sysconf("SC_CLK_TCK"))
     except (OSError, ValueError, AttributeError):
         pass
     return issuance_ticks, issuance_boot_id
@@ -1131,7 +1139,8 @@ async def create_terminal(
             )
             # F121: Build the CAO-owned authority record for branch integrity
             # verification. Written in the same INSERT as the terminal row below.
-            from datetime import datetime as _dt, timezone as _tz
+            from datetime import datetime as _dt
+            from datetime import timezone as _tz
 
             _worktree_info_dict: dict[str, str] | None = {
                 "repo_root": worktree_repo_root,
@@ -1714,9 +1723,7 @@ async def create_terminal(
                 )
             except Exception:
                 fr_result = None
-                logger.exception(
-                    "f138_sync_post_exposure_force_failed terminal=%s", terminal_id
-                )
+                logger.exception("f138_sync_post_exposure_force_failed terminal=%s", terminal_id)
 
             durable = fr_result is not None and fr_result.outcome in (
                 "created",
@@ -1734,9 +1741,7 @@ async def create_terminal(
                         error=f"sync_post_exposure_non_durable: {repr(e)[:150]}",
                     )
                 except Exception:
-                    logger.exception(
-                        "f138_sync_quarantine_failed terminal=%s", terminal_id
-                    )
+                    logger.exception("f138_sync_quarantine_failed terminal=%s", terminal_id)
                 f138_emit_attention_message(
                     terminal_id,
                     f"[F138] Terminal {terminal_id} sync post-exposure failure "
@@ -1921,27 +1926,28 @@ def _notice_text(
 
 
 # F124 S7: pre-delivery failure codes — task was NOT delivered to the worker
-_PRE_DELIVERY_CODES = frozenset({
-    "provider_launch_failed",
-    "identity_persist_failed",
-    "terminal_cwd_unavailable",
-    "shell_baseline_unavailable",
-    "terminal_metadata_missing",
-})
+_PRE_DELIVERY_CODES = frozenset(
+    {
+        "provider_launch_failed",
+        "identity_persist_failed",
+        "terminal_cwd_unavailable",
+        "shell_baseline_unavailable",
+        "terminal_metadata_missing",
+    }
+)
 
 # F124 S7: unknown-delivery codes — watchdog fired but delivery state is ambiguous
-_UNKNOWN_DELIVERY_CODES = frozenset({
-    "deferred_init_watchdog_deadline",
-})
+_UNKNOWN_DELIVERY_CODES = frozenset(
+    {
+        "deferred_init_watchdog_deadline",
+    }
+)
 
 
 def _notice_action_hint(code: str) -> str:
     """F124 S7: return a plain-text actionable hint for the failure code."""
     if code in _PRE_DELIVERY_CODES:
-        return (
-            "The assigned task was NOT delivered. "
-            "Re-dispatch with assign if needed."
-        )
+        return "The assigned task was NOT delivered. " "Re-dispatch with assign if needed."
     if code in _UNKNOWN_DELIVERY_CODES:
         return (
             "Worker initialization timed out; task delivery state is unknown. "
@@ -3536,8 +3542,7 @@ def _schedule_deferred_init(
             # newline/control-character injection into logs and the inbox message
             # (the exception text can contain provider-supplied content).
             logger.error(
-                "Deferred init for terminal %s failed: %r. "
-                "exposure_crossed=%s",
+                "Deferred init for terminal %s failed: %r. " "exposure_crossed=%s",
                 terminal_id,
                 e,
                 _f138_exposure_crossed,
@@ -3614,14 +3619,10 @@ def _schedule_deferred_init(
                             error=f"post_exposure_non_durable: {repr(e)[:150]}",
                         )
                     except Exception:
-                        logger.exception(
-                            "f138_quarantine_commit_failed terminal=%s", terminal_id
-                        )
+                        logger.exception("f138_quarantine_commit_failed terminal=%s", terminal_id)
 
                     # Shared DB-only one-shot attention (works even without caller_id)
-                    detail = (
-                        f"quarantine={'persisted' if quarantine_persisted else 'FAILED'}"
-                    )
+                    detail = f"quarantine={'persisted' if quarantine_persisted else 'FAILED'}"
                     f138_emit_attention_message(
                         terminal_id,
                         f"[F138] Terminal {terminal_id} post-exposure failure "
@@ -4504,6 +4505,91 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
         raise
 
 
+def read_output_range(terminal_id: str, offset: int, length: int) -> str:
+    """Read a byte range from a terminal's append-only on-disk log (U5 / #504).
+
+    This is a SEPARATE read path from ``get_output``: that function returns the
+    bounded rolling buffer / tmux tail, whereas this reads an exact byte window
+    from ``TERMINAL_LOG_DIR / f"{terminal_id}.log"`` — the append-only,
+    monotonic file LogWriter maintains (BR-1). Playback (FR-4.3 / FR-7.3) uses
+    the ``terminal_offset_start`` / ``terminal_offset_len`` an event carries to
+    fetch exactly the output produced around that event, without copying the
+    log into the journal (BR-3).
+
+    Args:
+        terminal_id: The terminal whose log to read. Validated against the
+            workflow name/id charset before it is joined into the log path, so
+            a value containing ``/`` / ``..`` / a NUL can never escape
+            ``TERMINAL_LOG_DIR`` (path-traversal defense; reuses
+            ``_validate_key_part``).
+        offset: Byte offset to seek to. Must be ``>= 0``. An offset at or beyond
+            EOF is not an error — the read simply returns the available tail
+            (empty string when nothing follows the offset) so playback degrades
+            gracefully (BR-4).
+        length: Maximum number of bytes to read. Clamped to
+            ``TERMINAL_RANGE_MAX_LENGTH`` (BR-2) to bound the read.
+
+    Returns:
+        The decoded slice, ``bytes.decode("utf-8", errors="replace")`` so a
+        range that starts or ends mid-multibyte-sequence never raises (BR-5,
+        matching LogWriter's write encoding). Returns ``""`` for a valid
+        terminal whose log does not exist yet (nothing has been logged) — a
+        missing log is NOT a playback-breaking error (BR-4).
+
+    Raises:
+        ValueError: ``terminal_id`` fails id validation, or ``offset`` is
+            negative. Translated to a 400 at the request boundary.
+        OSError: A genuine file I/O failure (e.g. a permission error, or the
+            path exists but is unreadable). Surfaced to the caller, NOT
+            swallowed into an empty string — "nothing logged yet" (return "")
+            and "the read failed" (raise) are deliberately distinct outcomes
+            (BR-4 / construction error-handling guardrail).
+    """
+    # Path-traversal defense: reject any id that is not a plain key BEFORE it is
+    # joined into the log path. Reuses the workflow key/id validator so the
+    # charset rule is defined once (rejects "/", "..", ".", NUL, whitespace).
+    _validate_key_part(terminal_id, "terminal_id")
+
+    if offset < 0:
+        raise ValueError(f"offset must be >= 0, got {offset}")
+
+    # Clamp the read window (BR-2). A non-positive length reads nothing rather
+    # than raising — the route enforces length >= 1, so this is defense in depth.
+    capped_length = max(0, min(length, TERMINAL_RANGE_MAX_LENGTH))
+
+    log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
+
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(offset)  # seeking past EOF is legal; the read below yields b""
+            data = f.read(capped_length)
+    except FileNotFoundError:
+        # Valid terminal that has not logged anything yet (or whose log has been
+        # cleaned up): an empty range, never an error (BR-4).
+        logger.debug(
+            "read_output_range: no log file for terminal %s (offset=%d, length=%d) — "
+            "returning empty range",
+            terminal_id,
+            offset,
+            capped_length,
+        )
+        return ""
+    except OSError as e:
+        # A genuine I/O failure (permission, etc.) is NOT the same as "nothing
+        # logged" — surface it rather than masking a real fault as empty output.
+        logger.error(
+            "read_output_range: I/O error reading log for terminal %s "
+            "(offset=%d, length=%d): %s",
+            terminal_id,
+            offset,
+            capped_length,
+            e,
+        )
+        raise
+
+    return data.decode("utf-8", errors="replace")
+
+
 def peek_terminal(terminal_id: str, lines: int = 40) -> str:
     """Return the rendered pane tail for a terminal through the active backend."""
     metadata = get_terminal_metadata(terminal_id)
@@ -4929,10 +5015,11 @@ def _delete_terminal_under_lease(
                 # F121: worktree branch integrity check at teardown
                 _teardown_worktree_info = metadata.get("worktree_info")
                 if _teardown_worktree_info and live_working_directory:
+                    from dataclasses import asdict as _asdict
+
                     from cli_agent_orchestrator.services.worktree_service import (
                         verify_worktree_integrity,
                     )
-                    from dataclasses import asdict as _asdict
 
                     _integrity = verify_worktree_integrity(
                         live_working_directory, _teardown_worktree_info
@@ -5084,9 +5171,7 @@ def _delete_terminal_under_lease(
                     f138_get_incarnation_by_terminal_generation,
                 )
 
-                _inc_row = f138_get_incarnation_by_terminal_generation(
-                    terminal_id, _term_gen
-                )
+                _inc_row = f138_get_incarnation_by_terminal_generation(terminal_id, _term_gen)
                 if _inc_row is not None:
                     try:
                         _fr = f138_force_reconcile_incarnation(

@@ -189,9 +189,7 @@ class TestCodexProviderInitialization:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
-    async def test_handle_trust_prompt_iteration_cap_bounds_loop(
-        self, mock_tmux, mock_sleep
-    ):
+    async def test_handle_trust_prompt_iteration_cap_bounds_loop(self, mock_tmux, mock_sleep):
         """Prove the iteration cap exits the loop under instant-sleep mock.
 
         With timeout=5.0, max_iterations = int(5.0 * 3) = 15.  The loop must
@@ -3680,13 +3678,23 @@ class TestCodexProviderBlocksOrchestratedInputWhileWaitingUserAnswer:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
     @patch("cli_agent_orchestrator.services.terminal_service._claim_and_settle_deferred_failure")
-    @patch("cli_agent_orchestrator.services.terminal_service._confirm_launch_health", new_callable=AsyncMock)
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service._confirm_launch_health",
+        new_callable=AsyncMock,
+    )
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_waiting_on_login_menu_leaves_worker_alive_task_undelivered(
-        self, mock_tmux, mock_pm, mock_status_monitor, mock_meta, _mock_launch_health, mock_settle, mock_create_inbox
+        self,
+        mock_tmux,
+        mock_pm,
+        mock_status_monitor,
+        mock_meta,
+        _mock_launch_health,
+        mock_settle,
+        mock_create_inbox,
     ):
         """Fork-adapted PR #540 guard: WAITING_USER_ANSWER after init must not paste.
 
