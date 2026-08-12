@@ -15,31 +15,146 @@
 #       __mock_error__         → emit ERROR indicator (drives ERROR status)
 #       __mock_sleep_<N>       → sleep N seconds (exercises long PROCESSING)
 #
+# F139 fixture variants (activated by --variant):
+#   healthy              — default REPL (same as no --variant)
+#   empty-shell          — emit ready prompt, then exit 0
+#   post-send-death      — on first input, write atomic receipt, then exit 1
+#   process-less         — should never be invoked (provider skips child)
+#   procfs-unavailable   — healthy REPL (server-side proc-root is separate)
+#
 # Not on PATH outside pytest — see test/conftest.py PATH-prepend.
 
 set -u
 
 DELAY_MS=50
 PROMPT=$'\xe2\x9d\xaf '   # "❯ "  — same prompt char family as Claude Code
+VARIANT=""
+STATE_DIR=""
+TERMINAL_ID=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --delay-ms) DELAY_MS="${2:?--delay-ms requires a value}"; shift 2 ;;
-        --version)  echo "mock_cli 0.1.0"; exit 0 ;;
+        --variant)  VARIANT="${2:?--variant requires a value}"; shift 2 ;;
+        --state-dir) STATE_DIR="${2:?--state-dir requires a value}"; shift 2 ;;
+        --terminal-id) TERMINAL_ID="${2:?--terminal-id requires a value}"; shift 2 ;;
+        --version)  echo "mock_cli 0.2.0"; exit 0 ;;
         --help)
             cat <<'EOF'
 mock_cli — deterministic CLI agent stub for CAO tests.
 
-Usage: mock_cli [--delay-ms N] [--version] [--help]
+Usage: mock_cli [--delay-ms N] [--variant V] [--state-dir D] [--terminal-id ID]
+               [--version] [--help]
 
 This binary is intentionally minimal. See docs/mock-cli-provider.md
 in the cli-agent-orchestrator repo for the full protocol.
 EOF
             exit 0 ;;
-        *) shift ;;   # ignore unknown flags so future providers can pass extras
+        *) echo "ERROR: unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
+# F139: validate variant if provided
+ALLOWED_VARIANTS="healthy empty-shell post-send-death process-less procfs-unavailable spawn-then-fault"
+if [[ -n "$VARIANT" ]]; then
+    valid=0
+    for v in $ALLOWED_VARIANTS; do
+        if [[ "$VARIANT" == "$v" ]]; then valid=1; break; fi
+    done
+    if [[ $valid -eq 0 ]]; then
+        echo "ERROR: unknown variant: $VARIANT" >&2
+        exit 2
+    fi
+    # Validate terminal-id (required for fixture variants)
+    if [[ -z "$TERMINAL_ID" ]]; then
+        echo "ERROR: --terminal-id is required for fixture variants" >&2
+        exit 2
+    fi
+    if ! [[ "$TERMINAL_ID" =~ ^[0-9a-f]{8}$ ]]; then
+        echo "ERROR: --terminal-id must be canonical 8-hex: $TERMINAL_ID" >&2
+        exit 2
+    fi
+    # Validate state-dir (required for fixture variants)
+    if [[ -z "$STATE_DIR" ]]; then
+        echo "ERROR: --state-dir is required for fixture variants" >&2
+        exit 2
+    fi
+    if [[ ! -d "$STATE_DIR" ]]; then
+        echo "ERROR: --state-dir does not exist: $STATE_DIR" >&2
+        exit 2
+    fi
+fi
+
+# F139: variant-specific behavior
+case "$VARIANT" in
+    empty-shell)
+        # Emit ready prompt, then exit
+        echo "MockCli ready."
+        printf '%s' "$PROMPT"
+        exit 0
+        ;;
+    post-send-death)
+        # Emit ready, wait for first input, write atomic receipt, exit 1
+        echo "MockCli ready."
+        printf '%s' "$PROMPT"
+        if IFS= read -r line; then
+            clean_line="${line#$'\x1b[200~'}"
+            clean_line="${clean_line%$'\x1b[201~'}"
+            # Atomic receipt: write to temp then rename
+            receipt="$STATE_DIR/receipt-$TERMINAL_ID"
+            tmp_receipt="${receipt}.tmp.$$"
+            printf '%s' "$clean_line" > "$tmp_receipt"
+            sync "$tmp_receipt" 2>/dev/null || true
+            mv "$tmp_receipt" "$receipt"
+            sync "$STATE_DIR" 2>/dev/null || true
+        fi
+        exit 1
+        ;;
+    process-less)
+        # Should never be invoked — provider skips child start
+        echo "ERROR: process-less variant should not be invoked" >&2
+        exit 2
+        ;;
+    spawn-then-fault)
+        # F138-R6: spawn a token-bearing cooperative child + a TERM-ignoring
+        # escaped child, then exit non-zero so provider initialize() raises.
+        # The cooperative child reads the incarnation token from pane env.
+        # The escaped child starts a new session (setsid) and ignores SIGTERM.
+        _token="${CAO_PROCESS_INCARNATION:-}"
+
+        # Cooperative child: will respond to SIGTERM
+        (
+            echo "spawn-then-fault:cooperative:$$:token=$_token" > "$STATE_DIR/cooperative-$TERMINAL_ID.pid"
+            sleep 300
+        ) &
+        _coop_pid=$!
+
+        # Escaped child: new session, ignores SIGTERM
+        setsid bash -c "
+            trap '' TERM
+            echo \$\$ > '$STATE_DIR/escaped-$TERMINAL_ID.pid'
+            sleep 300
+        " &
+        _escaped_pid=$!
+
+        # Wait for both pid files to exist (max 5s)
+        _waited=0
+        while [[ $_waited -lt 50 ]]; do
+            if [[ -f "$STATE_DIR/cooperative-$TERMINAL_ID.pid" ]] && \
+               [[ -f "$STATE_DIR/escaped-$TERMINAL_ID.pid" ]]; then
+                break
+            fi
+            sleep 0.1
+            (( _waited++ )) || true
+        done
+
+        # Signal readiness then fault
+        echo "MockCli spawn-then-fault: children spawned, faulting."
+        exit 1
+        ;;
+esac
+
+# Default / healthy / procfs-unavailable: standard REPL
 # Convert ms → seconds via bash arithmetic only (no awk/bc dependency).
 DELAY_SEC="0.$(printf '%03d' "$DELAY_MS")"
 

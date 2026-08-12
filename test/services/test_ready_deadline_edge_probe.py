@@ -41,6 +41,7 @@ async def test_ready_completion_at_deadline_has_one_lawful_owner(
 ):
     original_do_commit = isolated_db.dialect.do_commit
     outcomes: list[str] = []
+    monkeypatch.setattr(terminals, "_confirm_launch_health", AsyncMock())
 
     for iteration in range(60):
         terminal_id = f"ready-edge-{iteration}"

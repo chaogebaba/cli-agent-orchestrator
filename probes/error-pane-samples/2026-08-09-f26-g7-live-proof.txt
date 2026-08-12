@@ -1,0 +1,46 @@
+F26 G7 LIVE SANDBOX PROOF — cwd-deleted guard (fork commit 99466b5a)
+============================================================
+Server: isolation sandbox /home/chao/cao-sandbox-f26 (instance 45dde042, :9894)
+  tmux socket cao-sbx-45dde042, real session f26test / pane1.
+  Trigger = real: create real dir, cd real pane into it, rm -rf while pane lives.
+  Probe ran in-process against the sandbox fork module (same venv) driving the
+  live sandbox tmux socket; warnings captured from the module logger.
+
+S1 GENUINE DELETED CWD
+  pre:  pane_current_path = /tmp/f26-live-test/deletedir
+  rm -rf deletedir (pane still holds inode)
+  post: pane_current_path = /tmp/f26-live-test/deletedir (deleted)
+  get_pane_working_directory -> None
+  logger.warning: cwd_deleted cwd=/tmp/f26-live-test/deletedir
+  PASS: None + cwd_deleted warn; no "(deleted)"-suffixed path reaches consumer.
+
+S3 DELETED-THEN-RECREATED
+  mkdir deletedir at same path (new inode); pane still old inode
+  pane_current_path = /tmp/f26-live-test/deletedir (deleted)
+  get_pane_working_directory -> None
+  logger.warning: cwd_deleted_recreated cwd=/tmp/f26-live-test/deletedir
+  PASS: None + cwd_deleted_recreated warn; never the stripped live path.
+
+S4 LEGAL-NAME DIR literally ending " (deleted)"
+  mkdir '/tmp/f26-live-test/legaldir (deleted)'; cd pane into it
+  pane_current_path = /tmp/f26-live-test/legaldir (deleted)
+  get_pane_working_directory -> /tmp/f26-live-test/legaldir (deleted)  (UNCHANGED)
+  no warning, no None
+  PASS: legal name returned unchanged, never suffix-stripped.
+
+S5 HEALTHY FAST PATH
+  cd pane into /tmp/f26-live-test/normaldir (no suffix)
+  get_pane_working_directory -> /tmp/f26-live-test/normaldir
+  os.path.exists probe calls whose arg == cwd or cwd+" (deleted)": []  (none)
+  PASS: path returned unchanged, no exists probe on the fast path.
+
+S2 DIRECTED ERROR AT GIT SEAMS (deleted cwd -> NOT cryptic git failure)
+  find_repo_root(deleted) -> WorktreeError:
+    "worker deleted its own cwd: /tmp/f26-live-test/deletedir (pane_current_path reported ' (deleted)')"
+    (NOT "not inside a git repository")
+  assert_cwd_live(deleted, ForkContextError) -> ForkContextError:
+    "worker deleted its own cwd: /tmp/f26-live-test/deletedir (pane_current_path reported ' (deleted)')"
+    (NOT "snapshot_git-failure")
+  PASS: directed error names the deleted cwd at both seams.
+
+RESULT: all 5 scenarios PASS. Quirk ledger: none observed.

@@ -150,7 +150,13 @@ class TerminalModel(Base):
     # MetaData object on every mapped class; the DB column itself is still
     # literally named "metadata" per #432's design.
     metadata_json = Column("metadata", Text, nullable=True)
-    last_active = Column(DateTime, default=_utcnow)
+    # Dedicated CAO-owned worktree authority record (F121). JSON-encoded dict
+    # with keys: repo_root, worktree_path, expected_branch, terminal_id,
+    # provisioned_at. Written once at provision time via server-internal
+    # accessors; never exposed through the worker-reachable metadata API.
+    # Protected by a SQLite BEFORE UPDATE trigger (immutable once non-NULL).
+    worktree_info = Column("worktree_info", Text, nullable=True)
+    last_active = Column(DateTime(timezone=True), default=_utcnow)
     __table_args__ = (
         CheckConstraint(
             "lifecycle IN ('ephemeral','sticky')",
@@ -269,9 +275,27 @@ class MailboxModel(Base):
     generation = Column(Integer, nullable=False, default=1, server_default="1")
     consumed_through_id = Column(Integer, nullable=False, default=0, server_default="0")
     schema_version = Column(Integer, nullable=False, default=1, server_default="1")
+    # F136: callback notification cursor and path authority
+    callback_notified_through_id = Column(Integer, nullable=True)
+    cc_inbox_path = Column(String, nullable=True)
+    cc_inbox_path_version = Column(Integer, nullable=False, default=0, server_default="0")
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
-    updated_at = Column(DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow)
     __table_args__ = (UniqueConstraint("session_name", "role", name="uq_mailbox_session_role"),)
+
+
+class CallbackReplayQueueModel(Base):
+    """F136: Durable replay set for old IDs that become newly eligible."""
+
+    __tablename__ = "callback_replay_queue"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    mailbox_id = Column(String, ForeignKey("mailboxes.id"), nullable=False)
+    inbox_row_id = Column(Integer, ForeignKey("inbox.id"), nullable=False)
+    queued_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    __table_args__ = (
+        UniqueConstraint("mailbox_id", "inbox_row_id", name="uq_replay_mailbox_row"),
+        Index("ix_callback_replay_mailbox_row", "mailbox_id", "inbox_row_id"),
+    )
 
 
 class MailboxIncarnationModel(Base):
@@ -281,7 +305,7 @@ class MailboxIncarnationModel(Base):
     mailbox_id = Column(String, ForeignKey("mailboxes.id"), primary_key=True, nullable=False)
     generation = Column(Integer, primary_key=True, nullable=False)
     terminal_id = Column(String, nullable=False, unique=True)
-    published_at = Column(DateTime, nullable=False, default=_utcnow)
+    published_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
     digest_message_id = Column(Integer, nullable=True)
 
 
@@ -696,8 +720,8 @@ class FlowModel(Base):
     agent_profile = Column(String, nullable=False)
     provider = Column(String, nullable=False)
     script = Column(String, nullable=True)
-    last_run = Column(DateTime, nullable=True)
-    next_run = Column(DateTime, nullable=True)
+    last_run = Column(DateTime(timezone=True), nullable=True)
+    next_run = Column(DateTime(timezone=True), nullable=True)
     enabled = Column(Boolean, default=True)
 
 
@@ -813,6 +837,66 @@ class SeamParityMismatchModel(Base):
     )
 
 
+# --- F138: process incarnation and orphan reconciliation models ---------------
+
+
+class ProcessIncarnationModel(Base):
+    """Immutable per-launch incarnation row. Survives terminal deletion."""
+
+    __tablename__ = "process_incarnations"
+
+    id = Column(String, primary_key=True)
+    terminal_id = Column(String, nullable=False)
+    terminal_generation = Column(Integer, nullable=False)
+    token = Column(String, nullable=False, unique=True)
+    token_hash = Column(String, nullable=False, unique=True)
+    owner_uid = Column(Integer, nullable=False)
+    provider = Column(String, nullable=False)
+    pane_pid = Column(Integer, nullable=True)
+    pane_start_ticks = Column(Integer, nullable=True)
+    state = Column(String, nullable=False)
+    issuance_ticks = Column(Integer, nullable=True)
+    issuance_boot_id = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    activated_at = Column(DateTime(timezone=True), nullable=True)
+    reconciled_at = Column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        UniqueConstraint("terminal_id", "terminal_generation", name="uq_incarnation_term_gen"),
+        CheckConstraint(
+            "state IN ('launching','active','reconcile_pending','reconciled','abandoned')",
+            name="ck_incarnation_state",
+        ),
+    )
+
+
+class OrphanReconcileJobModel(Base):
+    """Durable leased orphan-reconciliation job."""
+
+    __tablename__ = "orphan_reconcile_jobs"
+
+    id = Column(String, primary_key=True)
+    incarnation_id = Column(String, nullable=False, unique=True)
+    terminal_id = Column(String, nullable=False)
+    terminal_generation = Column(Integer, nullable=False)
+    state = Column(String, nullable=False)
+    attempt = Column(Integer, nullable=False, default=0)
+    lease_owner = Column(String, nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    next_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    gone_observed_at = Column(DateTime(timezone=True), nullable=False)
+    source = Column(String, nullable=False)
+    last_result_json = Column(Text, nullable=True)
+    notified_failure_code = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('pending','leased','retry_wait','succeeded','attention_required')",
+            name="ck_reconcile_job_state",
+        ),
+    )
+
+
 def _ensure_db_dir() -> None:
     """Create the DB dir owner-only (0o700).
 
@@ -877,6 +961,52 @@ def init_db() -> None:
     # entries above.
     _migrate_memory_relationships()
     _migrate_mailbox_schema_version()
+    _migrate_f136_callback_delivery()
+    _migrate_f138_orphan_reconciliation()
+
+
+def _migrate_f136_callback_delivery() -> None:
+    """F136: Add callback cursor/path columns to mailboxes and replay queue table."""
+    with engine.begin() as connection:
+        # Mailbox columns
+        columns = connection.execute(text("PRAGMA table_info(mailboxes)")).mappings().all()
+        col_names = {col["name"] for col in columns}
+        if "callback_notified_through_id" not in col_names:
+            connection.execute(
+                text("ALTER TABLE mailboxes ADD COLUMN callback_notified_through_id INTEGER")
+            )
+        if "cc_inbox_path" not in col_names:
+            connection.execute(
+                text("ALTER TABLE mailboxes ADD COLUMN cc_inbox_path TEXT")
+            )
+        if "cc_inbox_path_version" not in col_names:
+            connection.execute(
+                text(
+                    "ALTER TABLE mailboxes ADD COLUMN cc_inbox_path_version INTEGER NOT NULL DEFAULT 0"
+                )
+            )
+        # Replay queue table
+        tables = connection.execute(
+            text("SELECT name FROM sqlite_master WHERE type='table' AND name='callback_replay_queue'")
+        ).fetchall()
+        if not tables:
+            connection.execute(
+                text(
+                    "CREATE TABLE callback_replay_queue ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  mailbox_id TEXT NOT NULL REFERENCES mailboxes(id),"
+                    "  inbox_row_id INTEGER NOT NULL REFERENCES inbox(id),"
+                    "  queued_at DATETIME NOT NULL,"
+                    "  UNIQUE(mailbox_id, inbox_row_id)"
+                    ")"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_callback_replay_mailbox_row "
+                    "ON callback_replay_queue(mailbox_id, inbox_row_id)"
+                )
+            )
 
 
 def _migrate_mailbox_schema_version() -> None:
@@ -1769,6 +1899,13 @@ def _migrate_terminals_schema() -> None:
             ).fetchone()
             is not None
         )
+        worktree_info_trigger_exists = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' AND "
+                "name='terminals_worktree_info_immutable'"
+            ).fetchone()
+            is not None
+        )
         schema_current = (
             init_columns.issubset(columns)
             and "caller_mailbox_id" in columns
@@ -1806,6 +1943,20 @@ def _migrate_terminals_schema() -> None:
                     "BEGIN SELECT RAISE(ABORT, 'init_failure_token_immutable'); END"
                 )
                 conn.execute("COMMIT")
+            if "worktree_info" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN worktree_info TEXT")
+                conn.commit()
+                logger.info("Migration: added worktree_info column to terminals table")
+            if not worktree_info_trigger_exists:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "CREATE TRIGGER terminals_worktree_info_immutable "
+                    "BEFORE UPDATE OF worktree_info ON terminals "
+                    "WHEN OLD.worktree_info IS NOT NULL AND "
+                    "NEW.worktree_info IS NOT OLD.worktree_info "
+                    "BEGIN SELECT RAISE(ABORT, 'worktree_info_immutable'); END"
+                )
+                conn.execute("COMMIT")
             return
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("ALTER TABLE terminals RENAME TO terminals_wpm4a_legacy")
@@ -1828,6 +1979,7 @@ def _migrate_terminals_schema() -> None:
             "lifecycle_generation INTEGER NOT NULL DEFAULT 0, "
             '"group" TEXT, '
             '"metadata" TEXT, '
+            "worktree_info TEXT, "
             "last_active DATETIME, "
             "CHECK (init_state != 'init_pending' OR "
             "(init_started_at IS NOT NULL AND init_owner_epoch IS NOT NULL AND "
@@ -1870,6 +2022,7 @@ def _migrate_terminals_schema() -> None:
             "init_failure_token",
             "init_deadline_s",
             "lifecycle_generation",
+            "worktree_info",
         ]
         copied = [name for name in destination if name in legacy_columns]
         selected = []
@@ -1891,6 +2044,13 @@ def _migrate_terminals_schema() -> None:
             "WHEN OLD.init_failure_token IS NOT NULL AND "
             "NEW.init_failure_token IS NOT OLD.init_failure_token "
             "BEGIN SELECT RAISE(ABORT, 'init_failure_token_immutable'); END"
+        )
+        conn.execute(
+            "CREATE TRIGGER terminals_worktree_info_immutable "
+            "BEFORE UPDATE OF worktree_info ON terminals "
+            "WHEN OLD.worktree_info IS NOT NULL AND "
+            "NEW.worktree_info IS NOT OLD.worktree_info "
+            "BEGIN SELECT RAISE(ABORT, 'worktree_info_immutable'); END"
         )
         conn.execute("COMMIT")
         logger.info("Migration: atomically installed deferred-init terminal schema")
@@ -2049,6 +2209,7 @@ def create_terminal(
     engine: Optional[str] = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    worktree_info: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -2075,6 +2236,7 @@ def create_terminal(
             engine=engine,
             group=_json.dumps(group) if group else None,
             metadata_json=_json.dumps(metadata) if metadata else None,
+            worktree_info=_json.dumps(worktree_info) if worktree_info else None,
         )
         db.add(terminal)
         db.flush()
@@ -2157,6 +2319,7 @@ def create_terminal_with_warm_intent(
     engine: Optional[str] = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    worktree_info: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Publish terminal metadata and a fork-only warm intent together."""
     import json as _json
@@ -2182,6 +2345,7 @@ def create_terminal_with_warm_intent(
             engine=engine,
             group=_json.dumps(group) if group else None,
             metadata_json=_json.dumps(metadata) if metadata else None,
+            worktree_info=_json.dumps(worktree_info) if worktree_info else None,
         )
         db.add(terminal)
         db.flush()
@@ -2276,6 +2440,11 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
         allowed_tools = _json.loads(terminal.allowed_tools) if terminal.allowed_tools else None
         group = _json.loads(terminal.group) if terminal.group else None
         metadata = _json.loads(terminal.metadata_json) if terminal.metadata_json else None
+        worktree_info_raw = (
+            _json.loads(terminal.worktree_info)
+            if isinstance(terminal.worktree_info, str)
+            else None
+        )
         return {
             "id": terminal.id,
             "tmux_session": terminal.tmux_session,
@@ -2302,6 +2471,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "engine": terminal.engine or ("v2" if terminal.provider == "kiro_cli" else None),
             "group": group,
             "metadata": metadata,
+            "worktree_info": worktree_info_raw,
             "last_active": terminal.last_active,
         }
 
@@ -2338,6 +2508,43 @@ def update_terminal_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]
         terminal.metadata_json = _json.dumps(metadata) if metadata else None
         db.commit()
         return True
+
+
+def set_terminal_worktree_info(terminal_id: str, info: Dict[str, str]) -> None:
+    """Recovery/idempotency seam: write worktree_info only when NULL.
+
+    Accepts an identical retry (same JSON string). Raises ValueError on a
+    conflicting second value. Normal creation writes via the INSERT in
+    create_terminal and does not need this.
+    """
+    import json as _json
+
+    encoded = _json.dumps(info)
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            raise ValueError(f"Terminal '{terminal_id}' not found")
+        if terminal.worktree_info is None:
+            terminal.worktree_info = encoded
+            db.commit()
+        elif terminal.worktree_info == encoded:
+            # Identical retry -- idempotent no-op.
+            pass
+        else:
+            raise ValueError(
+                f"worktree_info for terminal '{terminal_id}' is already set to a different value"
+            )
+
+
+def get_terminal_worktree_info(terminal_id: str) -> Optional[Dict[str, str]]:
+    """Return the dedicated worktree_info dict or None."""
+    import json as _json
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return None
+        return _json.loads(terminal.worktree_info) if terminal.worktree_info else None
 
 
 def get_terminal_group(terminal_id: str) -> Optional[List[str]]:
@@ -2609,9 +2816,12 @@ def _reactivate_parked_rows_in_db(
     target_terminal_id: str,
     target_lifecycle_generation: int,
     move_mailbox_authority: bool,
-) -> int:
-    """Reactivate only mail owned by the exact resumed source incarnation."""
-    changed = 0
+) -> list[int]:
+    """Reactivate only mail owned by the exact resumed source incarnation.
+
+    Returns list of reactivated inbox row IDs (F136-D3: callers use this for replay enqueue).
+    """
+    reactivated_ids: list[int] = []
     incarnation = (
         db.query(MailboxIncarnationModel).filter_by(terminal_id=source_terminal_id).one_or_none()
     )
@@ -2625,15 +2835,20 @@ def _reactivate_parked_rows_in_db(
             if move_mailbox_authority:
                 mailbox.current_terminal_id = target_terminal_id
                 mailbox.updated_at = _utcnow()
-            changed += (
-                db.query(InboxModel)
+            # Collect IDs before bulk update
+            logical_ids = [
+                row_id for (row_id,) in
+                db.query(InboxModel.id)
                 .filter(
                     InboxModel.status == MessageStatus.PARKED.value,
                     InboxModel.logical_receiver_id == incarnation.mailbox_id,
                     InboxModel.owner_receiver_id == source_terminal_id,
                     InboxModel.owner_generation == int(incarnation.generation),
                 )
-                .update(
+                .all()
+            ]
+            if logical_ids:
+                db.query(InboxModel).filter(InboxModel.id.in_(logical_ids)).update(
                     {
                         InboxModel.status: MessageStatus.PENDING.value,
                         InboxModel.receiver_id: target_terminal_id,
@@ -2641,16 +2856,21 @@ def _reactivate_parked_rows_in_db(
                     },
                     synchronize_session=False,
                 )
-            )
-    changed += (
-        db.query(InboxModel)
+                reactivated_ids.extend(logical_ids)
+    # Also reactivate non-logical (direct) parked rows
+    direct_ids = [
+        row_id for (row_id,) in
+        db.query(InboxModel.id)
         .filter(
             InboxModel.status == MessageStatus.PARKED.value,
             InboxModel.logical_receiver_id.is_(None),
             InboxModel.owner_receiver_id == source_terminal_id,
             InboxModel.owner_generation == source_lifecycle_generation,
         )
-        .update(
+        .all()
+    ]
+    if direct_ids:
+        db.query(InboxModel).filter(InboxModel.id.in_(direct_ids)).update(
             {
                 InboxModel.status: MessageStatus.PENDING.value,
                 InboxModel.receiver_id: target_terminal_id,
@@ -2658,8 +2878,8 @@ def _reactivate_parked_rows_in_db(
             },
             synchronize_session=False,
         )
-    )
-    return changed
+        reactivated_ids.extend(direct_ids)
+    return reactivated_ids
 
 
 def settle_terminal_rebound(
@@ -2673,6 +2893,15 @@ def settle_terminal_rebound(
         if row is None:
             return 0
         source_generation = int(row.lifecycle_generation)
+        # F138: Queue old active incarnation for reconciliation before replacement.
+        _old_inc = (
+            db.query(ProcessIncarnationModel)
+            .filter_by(terminal_id=terminal_id, state="active")
+            .one_or_none()
+        )
+        if _old_inc is not None:
+            _old_inc.state = "reconcile_pending"
+            # Job insertion deferred to after commit (below)
         row.provider_session_id = session_uuid
         row.shell_command = shell_command
         row.recovery_state = "rebound"
@@ -2680,7 +2909,7 @@ def settle_terminal_rebound(
         row.recovery_updated_at = _utcnow()
         row.lifecycle_generation = source_generation + 1
         db.flush()
-        _reactivate_parked_rows_in_db(
+        reactivated_ids = _reactivate_parked_rows_in_db(
             db,
             source_terminal_id=terminal_id,
             source_lifecycle_generation=source_generation,
@@ -2688,7 +2917,29 @@ def settle_terminal_rebound(
             target_lifecycle_generation=int(row.lifecycle_generation),
             move_mailbox_authority=False,
         )
-        return int(row.lifecycle_generation)
+        # F136-D3: enqueue replay for reactivated rows below cursor
+        if reactivated_ids:
+            inc = db.query(MailboxIncarnationModel).filter_by(terminal_id=terminal_id).one_or_none()
+            if inc:
+                mb: Any = db.query(MailboxModel).filter_by(id=inc.mailbox_id).one_or_none()
+                if mb and mb.callback_notified_through_id is not None:
+                    cursor_val = int(mb.callback_notified_through_id)
+                    below = [rid for rid in reactivated_ids if rid <= cursor_val]
+                    if below:
+                        enqueue_callback_replay(db, mailbox_id=str(inc.mailbox_id), inbox_row_ids=below)
+        _f138_old_inc_id = _old_inc.id if _old_inc is not None else None
+        _result_generation = int(row.lifecycle_generation)
+    # F138: Queue reconciliation job for old incarnation after DB commit
+    if _f138_old_inc_id is not None:
+        try:
+            f138_request_reconciliation(incarnation_id=_f138_old_inc_id, source="settle_rebound")
+        except Exception:
+            logger.warning(
+                "f138_rebound_reconcile_queue_failed terminal=%s incarnation=%s",
+                terminal_id,
+                _f138_old_inc_id,
+            )
+    return _result_generation
 
 
 def fail_terminal_rebound(
@@ -2844,7 +3095,7 @@ def settle_terminal_fallback(old_terminal_id: str, new_terminal_id: str) -> int:
             else:
                 pending.enqueue_generation = int(new.lifecycle_generation)
             changed += 1
-        changed += _reactivate_parked_rows_in_db(
+        reactivated_ids = _reactivate_parked_rows_in_db(
             db,
             source_terminal_id=old_terminal_id,
             source_lifecycle_generation=int(old.lifecycle_generation),
@@ -2852,6 +3103,17 @@ def settle_terminal_fallback(old_terminal_id: str, new_terminal_id: str) -> int:
             target_lifecycle_generation=int(new.lifecycle_generation),
             move_mailbox_authority=True,
         )
+        changed += len(reactivated_ids)
+        # F136-D3: enqueue replay for reactivated rows below cursor
+        if reactivated_ids:
+            inc = db.query(MailboxIncarnationModel).filter_by(terminal_id=new_terminal_id).one_or_none()
+            if inc:
+                mb_row: Any = db.query(MailboxModel).filter_by(id=inc.mailbox_id).one_or_none()
+                if mb_row and mb_row.callback_notified_through_id is not None:
+                    cursor_val = int(mb_row.callback_notified_through_id)
+                    below = [rid for rid in reactivated_ids if rid <= cursor_val]
+                    if below:
+                        enqueue_callback_replay(db, mailbox_id=str(inc.mailbox_id), inbox_row_ids=below)
         changed += (
             db.query(TerminalModel)
             .filter(TerminalModel.caller_id == old_terminal_id)
@@ -3760,13 +4022,21 @@ def list_deferred_init_recovery_rows(current_owner_epoch: str) -> List[Dict[str,
             db.query(TerminalModel)
             .filter(
                 (
-                    (TerminalModel.init_state == "init_pending")
-                    & (
-                        (TerminalModel.init_owner_epoch != current_owner_epoch)
-                        | TerminalModel.init_owner_epoch.is_(None)
+                    TerminalModel.recovery_state.is_(None)
+                    | (TerminalModel.recovery_state != "rollback_kill_uncertain")
+                ),
+                (
+                    (
+                        (TerminalModel.init_state == "init_pending")
+                        & (
+                            (TerminalModel.init_owner_epoch != current_owner_epoch)
+                            | TerminalModel.init_owner_epoch.is_(None)
+                        )
                     )
-                )
-                | TerminalModel.init_state.in_(("init_failed_notified", "init_failed_caller_gone"))
+                    | TerminalModel.init_state.in_(
+                        ("init_failed_notified", "init_failed_caller_gone")
+                    )
+                ),
             )
             .all()
         )
@@ -3787,6 +4057,10 @@ def list_deferred_init_overdue_pending_rows(now: datetime) -> List[Dict[str, Any
         rows = (
             db.query(TerminalModel)
             .filter(
+                (
+                    TerminalModel.recovery_state.is_(None)
+                    | (TerminalModel.recovery_state != "rollback_kill_uncertain")
+                ),
                 TerminalModel.init_state == "init_pending",
                 TerminalModel.init_started_at.isnot(None),
                 TerminalModel.init_deadline_s.isnot(None),
@@ -4896,6 +5170,29 @@ def cancel_callback_barrier(
             },
             synchronize_session=False,
         )
+
+        # F136-D3: enqueue replay for released rows below cursor
+        released_rows = (
+            db.query(InboxModel.id, InboxModel.logical_receiver_id)
+            .filter(
+                InboxModel.barrier_id == barrier.id,
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.logical_receiver_id.isnot(None),
+            )
+            .all()
+        )
+        for row_id, logical_id in released_rows:
+            mb: Any = db.query(MailboxModel).filter_by(id=logical_id).one_or_none()
+            if mb and mb.callback_notified_through_id is not None:
+                if int(row_id) <= int(mb.callback_notified_through_id):
+                    db.execute(
+                        text(
+                            "INSERT OR IGNORE INTO callback_replay_queue "
+                            "(mailbox_id, inbox_row_id, queued_at) VALUES (:mb, :rid, :now)"
+                        ),
+                        {"mb": logical_id, "rid": row_id, "now": _utcnow()},
+                    )
+
         return {
             "id": int(barrier.id),
             "state": barrier.state,
@@ -7605,3 +7902,1095 @@ def get_flows_to_run() -> List[Flow]:
             )
             for f in flows
         ]
+
+
+# ---------------------------------------------------------------------------
+# F136 — Callback delivery typed APIs
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CallbackBatchRow:
+    """One row in a callback notification batch."""
+
+    inbox_row_id: int
+    sender_id: str
+    message: str
+    created_at: datetime
+    tag: str  # "replay" or "forward"
+
+
+@dataclass(frozen=True)
+class CallbackBatchResult:
+    """Result of get_supervisor_callback_batch."""
+
+    kind: str  # "ok", "stale_authority", "retryable_failure", "no_path"
+    rows: tuple[CallbackBatchRow, ...]
+    has_more: bool
+    cursor: int | None
+    inbox_path: str | None
+    path_version: int
+    bootstrap_mode: str | None
+    reason: str
+
+
+@dataclass(frozen=True)
+class CallbackProgressResult:
+    """Result of commit_supervisor_callback_progress."""
+
+    kind: str  # "advanced", "stale_authority", "path_changed", "cas_mismatch",
+    #            "invalid_range", "retryable_failure"
+    reason: str
+
+
+def enqueue_callback_replay(
+    db: Session,
+    *,
+    mailbox_id: str,
+    inbox_row_ids: list[int],
+) -> int:
+    """Insert replay entries for rows that became eligible below the cursor.
+
+    Uses INSERT OR IGNORE for idempotency. Must be called within an existing
+    transaction (the caller owns commit). Returns count of inserted rows.
+    """
+    if not inbox_row_ids:
+        return 0
+    now = _utcnow()
+    inserted = 0
+    for row_id in inbox_row_ids:
+        try:
+            db.execute(
+                text(
+                    "INSERT OR IGNORE INTO callback_replay_queue "
+                    "(mailbox_id, inbox_row_id, queued_at) VALUES (:mb, :rid, :now)"
+                ),
+                {"mb": mailbox_id, "rid": row_id, "now": now},
+            )
+            inserted += 1
+        except IntegrityError:
+            pass
+    return inserted
+
+
+def get_supervisor_callback_batch(
+    *,
+    mailbox_id: str,
+    terminal_id: str,
+    generation: int,
+    limit: int = 50,
+) -> CallbackBatchResult:
+    """D9: Get a batch of rows needing callback notification.
+
+    Handles bootstrap, legacy adoption, replay cleaning, and combined selection.
+    """
+    try:
+        with SessionLocal() as db:
+            db.execute(text("BEGIN IMMEDIATE"))
+
+            # Validate authority
+            mailbox: Any = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
+            if mailbox is None:
+                return CallbackBatchResult(
+                    kind="stale_authority", rows=(), has_more=False,
+                    cursor=None, inbox_path=None, path_version=0,
+                    bootstrap_mode=None, reason="unknown_mailbox",
+                )
+            if (
+                mailbox.current_terminal_id != terminal_id
+                or int(mailbox.generation) != generation
+            ):
+                return CallbackBatchResult(
+                    kind="stale_authority", rows=(), has_more=False,
+                    cursor=None, inbox_path=None, path_version=0,
+                    bootstrap_mode=None, reason="terminal_or_generation_mismatch",
+                )
+
+            inbox_path = mailbox.cc_inbox_path
+            if not inbox_path:
+                return CallbackBatchResult(
+                    kind="no_path", rows=(), has_more=False,
+                    cursor=mailbox.callback_notified_through_id,
+                    inbox_path=None, path_version=int(mailbox.cc_inbox_path_version),
+                    bootstrap_mode=None, reason="no_inbox_path_configured",
+                )
+
+            path_version = int(mailbox.cc_inbox_path_version)
+            bootstrap_mode: str | None = None
+
+            # D6: Adopt legacy raw PENDING rows for this supervisor terminal
+            adopted_ids: list[int] = []
+            legacy_rows = (
+                db.query(InboxModel.id)
+                .filter(
+                    InboxModel.receiver_id == terminal_id,
+                    InboxModel.logical_receiver_id.is_(None),
+                    InboxModel.status == MessageStatus.PENDING.value,
+                )
+                .all()
+            )
+            for (row_id,) in legacy_rows:
+                db.execute(
+                    text(
+                        "UPDATE inbox SET logical_receiver_id = :mb, "
+                        "enqueue_generation = :gen "
+                        "WHERE id = :rid AND logical_receiver_id IS NULL"
+                    ),
+                    {"mb": mailbox_id, "gen": generation, "rid": row_id},
+                )
+                adopted_ids.append(row_id)
+
+            # D8: Bootstrap if cursor is NULL
+            cursor = mailbox.callback_notified_through_id
+            if cursor is None:
+                min_id_row = (
+                    db.query(func.min(InboxModel.id))
+                    .filter(
+                        InboxModel.logical_receiver_id == mailbox_id,
+                        InboxModel.receiver_id == terminal_id,
+                        InboxModel.enqueue_generation == generation,
+                        InboxModel.status == MessageStatus.PENDING.value,
+                    )
+                    .scalar()
+                )
+                cursor = max(0, (min_id_row or 1) - 1)
+                mailbox.callback_notified_through_id = cursor
+                bootstrap_mode = "current_generation_pending_replay"
+
+            # Enqueue adopted rows below cursor into replay
+            for row_id in adopted_ids:
+                if row_id <= cursor:
+                    db.execute(
+                        text(
+                            "INSERT OR IGNORE INTO callback_replay_queue "
+                            "(mailbox_id, inbox_row_id, queued_at) VALUES (:mb, :rid, :now)"
+                        ),
+                        {"mb": mailbox_id, "rid": row_id, "now": _utcnow()},
+                    )
+
+            # Clean replay entries whose inbox row is no longer current eligible PENDING
+            db.execute(
+                text(
+                    "DELETE FROM callback_replay_queue WHERE mailbox_id = :mb "
+                    "AND inbox_row_id NOT IN ("
+                    "  SELECT id FROM inbox WHERE logical_receiver_id = :mb "
+                    "  AND receiver_id = :tid AND enqueue_generation = :gen "
+                    "  AND status = 'pending'"
+                    ")"
+                ),
+                {"mb": mailbox_id, "tid": terminal_id, "gen": generation},
+            )
+
+            # Select replay rows first
+            replay_rows_raw = db.execute(
+                text(
+                    "SELECT crq.inbox_row_id, i.sender_id, i.message, i.created_at "
+                    "FROM callback_replay_queue crq "
+                    "JOIN inbox i ON i.id = crq.inbox_row_id "
+                    "WHERE crq.mailbox_id = :mb "
+                    "  AND i.logical_receiver_id = :mb "
+                    "  AND i.receiver_id = :tid "
+                    "  AND i.enqueue_generation = :gen "
+                    "  AND i.status = 'pending' "
+                    "ORDER BY crq.inbox_row_id ASC "
+                    "LIMIT :lim"
+                ),
+                {"mb": mailbox_id, "tid": terminal_id, "gen": generation, "lim": limit + 1},
+            ).fetchall()
+
+            replay_batch: list[CallbackBatchRow] = []
+            for row in replay_rows_raw[: limit]:
+                replay_batch.append(
+                    CallbackBatchRow(
+                        inbox_row_id=int(row[0]),
+                        sender_id=str(row[1]),
+                        message=str(row[2]),
+                        created_at=row[3] if row[3] else _utcnow(),
+                        tag="replay",
+                    )
+                )
+
+            remaining = limit - len(replay_batch)
+            forward_batch: list[CallbackBatchRow] = []
+            has_more = len(replay_rows_raw) > limit
+
+            if remaining > 0:
+                forward_rows_raw = db.execute(
+                    text(
+                        "SELECT i.id, i.sender_id, i.message, i.created_at "
+                        "FROM inbox i "
+                        "WHERE i.logical_receiver_id = :mb "
+                        "  AND i.receiver_id = :tid "
+                        "  AND i.enqueue_generation = :gen "
+                        "  AND i.status = 'pending' "
+                        "  AND i.id > :cursor "
+                        "ORDER BY i.id ASC "
+                        "LIMIT :lim"
+                    ),
+                    {
+                        "mb": mailbox_id, "tid": terminal_id,
+                        "gen": generation, "cursor": cursor, "lim": remaining + 1,
+                    },
+                ).fetchall()
+
+                for row in forward_rows_raw[: remaining]:
+                    forward_batch.append(
+                        CallbackBatchRow(
+                            inbox_row_id=int(row[0]),
+                            sender_id=str(row[1]),
+                            message=str(row[2]),
+                            created_at=row[3] if row[3] else _utcnow(),
+                            tag="forward",
+                        )
+                    )
+                if len(forward_rows_raw) > remaining:
+                    has_more = True
+
+            db.commit()
+            return CallbackBatchResult(
+                kind="ok",
+                rows=tuple(replay_batch + forward_batch),
+                has_more=has_more,
+                cursor=cursor,
+                inbox_path=inbox_path,
+                path_version=path_version,
+                bootstrap_mode=bootstrap_mode,
+                reason="ok",
+            )
+    except OperationalError as exc:
+        logger.warning("f136_callback_batch_db_error: %s", exc)
+        return CallbackBatchResult(
+            kind="retryable_failure", rows=(), has_more=False,
+            cursor=None, inbox_path=None, path_version=0,
+            bootstrap_mode=None, reason=f"db_error: {exc}",
+        )
+
+
+def commit_supervisor_callback_progress(
+    *,
+    mailbox_id: str,
+    terminal_id: str,
+    generation: int,
+    expected_cursor: int,
+    new_cursor: int,
+    expected_path_version: int,
+    replay_row_ids: tuple[int, ...] = (),
+) -> CallbackProgressResult:
+    """D9: Atomically advance cursor and drain successful replay IDs."""
+    if new_cursor < expected_cursor:
+        return CallbackProgressResult(kind="invalid_range", reason="cursor_retreat")
+
+    try:
+        with SessionLocal() as db:
+            db.execute(text("BEGIN IMMEDIATE"))
+
+            mailbox: Any = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
+            if mailbox is None:
+                return CallbackProgressResult(kind="stale_authority", reason="unknown_mailbox")
+
+            if (
+                mailbox.current_terminal_id != terminal_id
+                or int(mailbox.generation) != generation
+            ):
+                return CallbackProgressResult(
+                    kind="stale_authority", reason="terminal_or_generation_mismatch"
+                )
+
+            if int(mailbox.cc_inbox_path_version) != expected_path_version:
+                return CallbackProgressResult(kind="path_changed", reason="path_version_mismatch")
+
+            current_cursor = mailbox.callback_notified_through_id
+            if current_cursor is None:
+                current_cursor = 0
+            if int(current_cursor) != expected_cursor:
+                return CallbackProgressResult(kind="cas_mismatch", reason="cursor_mismatch")
+
+            # Advance cursor (equal is valid for replay-only progress)
+            if new_cursor > expected_cursor:
+                mailbox.callback_notified_through_id = new_cursor
+                mailbox.updated_at = _utcnow()
+
+            # Delete successful replay IDs
+            if replay_row_ids:
+                for rid in replay_row_ids:
+                    db.execute(
+                        text(
+                            "DELETE FROM callback_replay_queue "
+                            "WHERE mailbox_id = :mb AND inbox_row_id = :rid"
+                        ),
+                        {"mb": mailbox_id, "rid": rid},
+                    )
+
+            db.commit()
+            return CallbackProgressResult(kind="advanced", reason="ok")
+    except OperationalError as exc:
+        logger.warning("f136_callback_progress_db_error: %s", exc)
+        return CallbackProgressResult(kind="retryable_failure", reason=f"db_error: {exc}")
+
+
+# --- F138: Orphan reconciliation migration and DB helpers ---------------------
+
+
+def _migrate_f138_orphan_reconciliation() -> None:
+    """F138: Create process_incarnations and orphan_reconcile_jobs tables."""
+    with engine.begin() as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            ).fetchall()
+        }
+        if "process_incarnations" not in tables:
+            connection.execute(
+                text(
+                    "CREATE TABLE process_incarnations ("
+                    "  id TEXT PRIMARY KEY,"
+                    "  terminal_id TEXT NOT NULL,"
+                    "  terminal_generation INTEGER NOT NULL,"
+                    "  token TEXT NOT NULL UNIQUE,"
+                    "  token_hash TEXT NOT NULL UNIQUE,"
+                    "  owner_uid INTEGER NOT NULL,"
+                    "  provider TEXT NOT NULL,"
+                    "  pane_pid INTEGER,"
+                    "  pane_start_ticks INTEGER,"
+                    "  state TEXT NOT NULL CHECK (state IN "
+                    "    ('launching','active','reconcile_pending','reconciled','abandoned')),"
+                    "  created_at DATETIME NOT NULL,"
+                    "  activated_at DATETIME,"
+                    "  reconciled_at DATETIME,"
+                    "  UNIQUE(terminal_id, terminal_generation)"
+                    ")"
+                )
+            )
+        if "orphan_reconcile_jobs" not in tables:
+            connection.execute(
+                text(
+                    "CREATE TABLE orphan_reconcile_jobs ("
+                    "  id TEXT PRIMARY KEY,"
+                    "  incarnation_id TEXT NOT NULL UNIQUE,"
+                    "  terminal_id TEXT NOT NULL,"
+                    "  terminal_generation INTEGER NOT NULL,"
+                    "  state TEXT NOT NULL CHECK (state IN "
+                    "    ('pending','leased','retry_wait','succeeded','attention_required')),"
+                    "  attempt INTEGER NOT NULL DEFAULT 0,"
+                    "  lease_owner TEXT,"
+                    "  lease_expires_at DATETIME,"
+                    "  next_attempt_at DATETIME,"
+                    "  gone_observed_at DATETIME NOT NULL,"
+                    "  source TEXT NOT NULL,"
+                    "  last_result_json TEXT,"
+                    "  notified_failure_code TEXT,"
+                    "  created_at DATETIME NOT NULL,"
+                    "  updated_at DATETIME NOT NULL"
+                    ")"
+                )
+            )
+        # D17: Issuance context columns (idempotent ALTER)
+        _migrate_f138_issuance_context(connection)
+
+
+def _migrate_f138_issuance_context(connection) -> None:
+    """D17: Add issuance_ticks and issuance_boot_id to process_incarnations if missing."""
+    existing_cols = {
+        row[1]
+        for row in connection.execute(
+            text("PRAGMA table_info('process_incarnations')")
+        ).fetchall()
+    }
+    if "issuance_ticks" not in existing_cols:
+        connection.execute(
+            text("ALTER TABLE process_incarnations ADD COLUMN issuance_ticks INTEGER")
+        )
+    if "issuance_boot_id" not in existing_cols:
+        connection.execute(
+            text("ALTER TABLE process_incarnations ADD COLUMN issuance_boot_id TEXT")
+        )
+
+
+# --- F138 liveness observation tracking (in-memory for confirmation count) ----
+
+import threading as _f138_threading
+
+_f138_observation_lock = _f138_threading.Lock()
+# Key: (terminal_id, terminal_generation, incarnation_id) -> consecutive "gone" count
+_f138_gone_counts: dict[tuple[str, int, str], int] = {}
+_GONE_CONFIRM_THRESHOLD = 2
+
+
+def f138_record_liveness_observation(
+    *,
+    terminal_id: str,
+    terminal_generation: int,
+    incarnation_id: str,
+    state: str,
+    source: str,
+) -> "LivenessObservationResult":
+    """Record liveness observation; queue job on 2 consecutive gone."""
+    from cli_agent_orchestrator.services.orphan_reconcile_service import (
+        LivenessObservationResult,
+    )
+
+    key = (terminal_id, terminal_generation, incarnation_id)
+
+    if state == "error":
+        return LivenessObservationResult(
+            job_queued=False, confirmation_count=0, detail="error_ignored"
+        )
+
+    with _f138_observation_lock:
+        if state == "live":
+            _f138_gone_counts.pop(key, None)
+            return LivenessObservationResult(
+                job_queued=False, confirmation_count=0, detail="reset_live"
+            )
+
+        # state == "gone"
+        count = _f138_gone_counts.get(key, 0) + 1
+        _f138_gone_counts[key] = count
+
+    if count >= _GONE_CONFIRM_THRESHOLD:
+        result = f138_request_reconciliation(incarnation_id=incarnation_id, source=source)
+        # Clean up the counter
+        with _f138_observation_lock:
+            _f138_gone_counts.pop(key, None)
+        return LivenessObservationResult(
+            job_queued=result.created,
+            confirmation_count=count,
+            detail=result.detail,
+        )
+
+    return LivenessObservationResult(
+        job_queued=False, confirmation_count=count, detail="awaiting_confirmation"
+    )
+
+
+def f138_request_reconciliation(
+    *, incarnation_id: str, source: str
+) -> "JobRequestResult":
+    """Insert a unique reconciliation job for an incarnation."""
+    import uuid as _uuid
+    from cli_agent_orchestrator.services.orphan_reconcile_service import JobRequestResult
+
+    now = _utcnow()
+    with SessionLocal.begin() as db:
+        inc = (
+            db.query(ProcessIncarnationModel)
+            .filter_by(id=incarnation_id)
+            .one_or_none()
+        )
+        if inc is None:
+            return JobRequestResult(created=False, job_id=None, detail="incarnation_not_found")
+        if inc.state not in ("active", "reconcile_pending"):
+            return JobRequestResult(
+                created=False, job_id=None, detail=f"incarnation_state={inc.state}"
+            )
+
+        # Check if job already exists
+        existing = (
+            db.query(OrphanReconcileJobModel)
+            .filter_by(incarnation_id=incarnation_id)
+            .one_or_none()
+        )
+        if existing is not None:
+            return JobRequestResult(
+                created=False, job_id=existing.id, detail="job_already_exists"
+            )
+
+        # Mark incarnation reconcile_pending
+        if inc.state == "active":
+            inc.state = "reconcile_pending"
+
+        job_id = str(_uuid.uuid4())
+        job = OrphanReconcileJobModel(
+            id=job_id,
+            incarnation_id=incarnation_id,
+            terminal_id=inc.terminal_id,
+            terminal_generation=inc.terminal_generation,
+            state="pending",
+            attempt=0,
+            gone_observed_at=now,
+            source=source,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(job)
+
+    # Signal dispatcher after DB commit
+    from cli_agent_orchestrator.services.orphan_reconcile_service import orphan_reconcile_service
+
+    orphan_reconcile_service.signal_dirty()
+    return JobRequestResult(created=True, job_id=job_id, detail=None)
+
+
+def f138_claim_jobs(*, limit: int, lease_duration_s: float) -> list[dict[str, str]]:
+    """Claim due pending/retry_wait jobs with a lease."""
+    import uuid as _uuid
+
+    now = _utcnow()
+    lease_owner = str(_uuid.uuid4())
+    expires = now + __import__("datetime").timedelta(seconds=lease_duration_s)
+
+    with SessionLocal.begin() as db:
+        due_jobs = (
+            db.query(OrphanReconcileJobModel)
+            .filter(
+                OrphanReconcileJobModel.state.in_(("pending", "retry_wait", "attention_required")),
+                or_(
+                    OrphanReconcileJobModel.next_attempt_at.is_(None),
+                    OrphanReconcileJobModel.next_attempt_at <= now,
+                ),
+            )
+            .limit(limit)
+            .all()
+        )
+        claimed = []
+        for job in due_jobs:
+            job.state = "leased"
+            job.lease_owner = lease_owner
+            job.lease_expires_at = expires
+            job.attempt = (job.attempt or 0) + 1
+            job.updated_at = now
+            claimed.append({"id": job.id, "incarnation_id": job.incarnation_id})
+        return claimed
+
+
+def f138_get_incarnation_for_job(incarnation_id: str) -> dict[str, Any] | None:
+    """Fetch incarnation data needed for reconciliation."""
+    with SessionLocal() as db:
+        inc = (
+            db.query(ProcessIncarnationModel)
+            .filter_by(id=incarnation_id)
+            .one_or_none()
+        )
+        if inc is None:
+            return None
+        return {
+            "id": inc.id,
+            "terminal_id": inc.terminal_id,
+            "terminal_generation": inc.terminal_generation,
+            "token": inc.token,
+            "token_hash": inc.token_hash,
+            "owner_uid": inc.owner_uid,
+            "provider": inc.provider,
+            "state": inc.state,
+            "issuance_ticks": inc.issuance_ticks,
+            "issuance_boot_id": inc.issuance_boot_id,
+        }
+
+
+def f138_get_job_attempt(job_id: str) -> int:
+    """Get current attempt number for a job."""
+    with SessionLocal() as db:
+        job = db.query(OrphanReconcileJobModel).filter_by(id=job_id).one_or_none()
+        return job.attempt if job else 0
+
+
+def f138_complete_job(job_id: str, state: str, *, detail: str | None = None) -> None:
+    """Mark a job as succeeded."""
+    now = _utcnow()
+    with SessionLocal.begin() as db:
+        job = db.query(OrphanReconcileJobModel).filter_by(id=job_id).one_or_none()
+        if job is None:
+            return
+        job.state = state
+        job.last_result_json = detail
+        job.updated_at = now
+        job.lease_owner = None
+        job.lease_expires_at = None
+
+
+def f138_retry_job(job_id: str, delay_s: float) -> None:
+    """Move job to retry_wait with a scheduled next_attempt_at."""
+    import datetime as _dt
+
+    now = _utcnow()
+    with SessionLocal.begin() as db:
+        job = db.query(OrphanReconcileJobModel).filter_by(id=job_id).one_or_none()
+        if job is None:
+            return
+        job.state = "retry_wait"
+        job.next_attempt_at = now + _dt.timedelta(seconds=delay_s)
+        job.updated_at = now
+        job.lease_owner = None
+        job.lease_expires_at = None
+
+
+def f138_mark_attention_required(job_id: str, failure_code: str) -> None:
+    """Mark job as attention_required with failure code."""
+    now = _utcnow()
+    with SessionLocal.begin() as db:
+        job = db.query(OrphanReconcileJobModel).filter_by(id=job_id).one_or_none()
+        if job is None:
+            return
+        job.state = "attention_required"
+        job.notified_failure_code = failure_code
+        job.updated_at = now
+        job.lease_owner = None
+        job.lease_expires_at = None
+        # Allow periodic retry at 30s cap
+        import datetime as _dt
+
+        job.next_attempt_at = now + _dt.timedelta(seconds=30.0)
+
+
+def f138_renew_lease(job_id: str, duration_s: float) -> None:
+    """Renew an active lease."""
+    import datetime as _dt
+
+    now = _utcnow()
+    with SessionLocal.begin() as db:
+        job = db.query(OrphanReconcileJobModel).filter_by(id=job_id).one_or_none()
+        if job and job.state == "leased":
+            job.lease_expires_at = now + _dt.timedelta(seconds=duration_s)
+            job.updated_at = now
+
+
+def f138_mark_incarnation_reconciled(incarnation_id: str) -> None:
+    """Mark incarnation state as reconciled."""
+    now = _utcnow()
+    with SessionLocal.begin() as db:
+        inc = (
+            db.query(ProcessIncarnationModel)
+            .filter_by(id=incarnation_id)
+            .one_or_none()
+        )
+        if inc is not None:
+            inc.state = "reconciled"
+            inc.reconciled_at = now
+
+
+def f138_startup_recovery() -> None:
+    """At startup: expire stale leases, schedule due work, sweep stale launching."""
+    now = _utcnow()
+    _force_queue_ids: list[tuple[str, str]] = []
+    with SessionLocal.begin() as db:
+        # Expire stale leased jobs (server crashed mid-execution)
+        stale_leased = (
+            db.query(OrphanReconcileJobModel)
+            .filter(
+                OrphanReconcileJobModel.state == "leased",
+                OrphanReconcileJobModel.lease_expires_at < now,
+            )
+            .all()
+        )
+        for job in stale_leased:
+            job.state = "pending"
+            job.lease_owner = None
+            job.lease_expires_at = None
+            job.updated_at = now
+            logger.info("f138_startup_recover_lease job=%s", job.id)
+
+        # Sweep stale 'launching' incarnations
+        import datetime as _dt
+        from cli_agent_orchestrator.services.orphan_reconcile_service import (
+            INCARNATION_LAUNCH_STALE_SECONDS,
+        )
+
+        stale_cutoff = now - _dt.timedelta(seconds=INCARNATION_LAUNCH_STALE_SECONDS)
+        stale_launching = (
+            db.query(ProcessIncarnationModel)
+            .filter(
+                ProcessIncarnationModel.state == "launching",
+                ProcessIncarnationModel.created_at < stale_cutoff,
+            )
+            .all()
+        )
+        for inc in stale_launching:
+            # D10/D24: force-queue gone windows; abandon only truly deleted terminals
+            from cli_agent_orchestrator.backends.registry import get_backend
+
+            try:
+                metadata = (
+                    db.query(TerminalModel)
+                    .filter_by(id=inc.terminal_id)
+                    .one_or_none()
+                )
+                if metadata is None:
+                    # D24: missing terminal row is NOT proof of safe abandon —
+                    # force-queue for post-transaction reconciliation instead.
+                    _force_queue_ids.append(
+                        (inc.id, "startup_stale_missing_terminal")
+                    )
+                    logger.info(
+                        "f138_startup_stale_missing_terminal incarnation=%s terminal=%s",
+                        inc.id,
+                        inc.terminal_id,
+                    )
+                    continue
+                liveness = get_backend().window_liveness(
+                    metadata.tmux_session, metadata.tmux_window
+                )
+                if liveness == "gone":
+                    # D24: collect for force-queue after transaction commits
+                    _force_queue_ids.append((inc.id, "startup_stale_gone"))
+                # error/inconclusive → leave unchanged
+            except Exception:
+                # Leave unchanged for next recovery pass
+                pass
+
+    # D24: Force-queue collected incarnations outside the main transaction
+    for inc_id, src in _force_queue_ids:
+        try:
+            result = f138_force_reconcile_incarnation(inc_id, source=src)
+            if result.outcome in ("created", "job_already_exists", "reconciled_proven"):
+                logger.info(
+                    "f138_startup_force_queue incarnation=%s outcome=%s (durable)",
+                    inc_id,
+                    result.outcome,
+                )
+            else:
+                # non_durable_invariant / non_durable_missing — log warning, do not
+                # treat as successfully enqueued
+                logger.warning(
+                    "f138_startup_force_queue_non_durable incarnation=%s outcome=%s detail=%s",
+                    inc_id,
+                    result.outcome,
+                    result.detail,
+                )
+        except Exception:
+            # DB error propagates as warning — no teardown authority granted
+            logger.warning(
+                "f138_startup_force_queue_failed incarnation=%s", inc_id, exc_info=True
+            )
+
+
+# --- F138 incarnation reservation/activation helpers --------------------------
+
+
+def f138_reserve_incarnation(
+    *,
+    terminal_id: str,
+    terminal_generation: int,
+    token: str,
+    token_hash: str,
+    owner_uid: int,
+    provider: str,
+    pane_pid: int | None = None,
+    pane_start_ticks: int | None = None,
+    issuance_ticks: int | None = None,
+    issuance_boot_id: str | None = None,
+) -> str:
+    """Reserve a process incarnation row. Returns the incarnation ID."""
+    import uuid as _uuid
+
+    now = _utcnow()
+    incarnation_id = str(_uuid.uuid4())
+    with SessionLocal.begin() as db:
+        inc = ProcessIncarnationModel(
+            id=incarnation_id,
+            terminal_id=terminal_id,
+            terminal_generation=terminal_generation,
+            token=token,
+            token_hash=token_hash,
+            owner_uid=owner_uid,
+            provider=provider,
+            pane_pid=pane_pid,
+            pane_start_ticks=pane_start_ticks,
+            issuance_ticks=issuance_ticks,
+            issuance_boot_id=issuance_boot_id,
+            state="launching",
+            created_at=now,
+        )
+        db.add(inc)
+    return incarnation_id
+
+
+def f138_activate_incarnation(incarnation_id: str) -> bool:
+    """CAS launching -> active. Returns True on success."""
+    now = _utcnow()
+    with SessionLocal.begin() as db:
+        inc = (
+            db.query(ProcessIncarnationModel)
+            .filter_by(id=incarnation_id, state="launching")
+            .one_or_none()
+        )
+        if inc is None:
+            return False
+        inc.state = "active"
+        inc.activated_at = now
+    return True
+
+
+def f138_abandon_incarnation(incarnation_id: str) -> None:
+    """Mark incarnation as abandoned (launch failure)."""
+    now = _utcnow()
+    with SessionLocal.begin() as db:
+        inc = (
+            db.query(ProcessIncarnationModel)
+            .filter_by(id=incarnation_id)
+            .one_or_none()
+        )
+        if inc is not None and inc.state == "launching":
+            inc.state = "abandoned"
+            inc.reconciled_at = now
+
+
+def f138_get_active_incarnation(terminal_id: str) -> dict[str, Any] | None:
+    """Get the active incarnation for a terminal (if any)."""
+    with SessionLocal() as db:
+        inc = (
+            db.query(ProcessIncarnationModel)
+            .filter_by(terminal_id=terminal_id, state="active")
+            .one_or_none()
+        )
+        if inc is None:
+            return None
+        return {
+            "id": inc.id,
+            "terminal_id": inc.terminal_id,
+            "terminal_generation": inc.terminal_generation,
+            "token_hash": inc.token_hash,
+        }
+
+
+def f138_update_incarnation_pane(
+    incarnation_id: str, pane_pid: int, pane_start_ticks: int | None
+) -> None:
+    """Update diagnostic pane PID/start ticks after window creation."""
+    with SessionLocal.begin() as db:
+        inc = (
+            db.query(ProcessIncarnationModel)
+            .filter_by(id=incarnation_id)
+            .one_or_none()
+        )
+        if inc is not None:
+            inc.pane_pid = pane_pid
+            inc.pane_start_ticks = pane_start_ticks
+
+
+# --- F138 r7: Typed activation and force-reconciliation primitives (D21-D22) --
+
+
+@dataclass(frozen=True)
+class ActivationResult:
+    """D21: Typed outcome of strict incarnation activation."""
+
+    outcome: str  # "activated", "already_active", "needs_settlement", "missing"
+
+
+def f138_strict_activate(incarnation_id: str) -> ActivationResult:
+    """D21: Exact-row activation. Only launching→active transition is valid.
+
+    Returns typed ActivationResult:
+      - activated: row was launching, now active+activated_at set
+      - already_active: row is already active (idempotent ok)
+      - needs_settlement: row is in reconcile_pending/reconciled/abandoned
+      - missing: no row with this ID exists
+    """
+    now = _utcnow()
+    with SessionLocal.begin() as db:
+        inc = (
+            db.query(ProcessIncarnationModel)
+            .filter_by(id=incarnation_id)
+            .one_or_none()
+        )
+        if inc is None:
+            return ActivationResult(outcome="missing")
+        if inc.state == "active":
+            return ActivationResult(outcome="already_active")
+        if inc.state != "launching":
+            return ActivationResult(outcome="needs_settlement")
+        inc.state = "active"
+        inc.activated_at = now
+    return ActivationResult(outcome="activated")
+
+
+@dataclass(frozen=True)
+class ForceReconcileResult:
+    """D22: Typed outcome of force-reconciliation primitive."""
+
+    outcome: str  # "created", "reconciled_proven", "job_already_exists",
+    #               "non_durable_invariant", "non_durable_missing"
+    job_id: str | None = None
+    detail: str | None = None
+
+
+def f138_force_reconcile_incarnation(incarnation_id: str, source: str) -> ForceReconcileResult:
+    """D22: Atomic force-reconciliation primitive.
+
+    In one transaction: reads exact row, inspects unique job, returns typed result.
+    Order: reconciled row + succeeded job → reconciled_proven |
+           reconciled row WITHOUT succeeded job → non_durable_invariant |
+           succeeded job (repairs row) → reconciled_proven |
+           known due job states (pending/leased/retry_wait) → job_already_exists |
+           attention_required job → job_already_exists |
+           unknown job state → non_durable_invariant |
+           no existing job → normalize state + create.
+    DB errors propagate. Wakes dispatcher after commit when a job is created or pending.
+    """
+    import uuid as _uuid
+
+    now = _utcnow()
+    wake_dispatcher = False
+    result: ForceReconcileResult
+
+    with SessionLocal.begin() as db:
+        inc = (
+            db.query(ProcessIncarnationModel)
+            .filter_by(id=incarnation_id)
+            .one_or_none()
+        )
+        if inc is None:
+            return ForceReconcileResult(
+                outcome="non_durable_missing",
+                detail="incarnation_not_found",
+            )
+
+        # Check existing job first (needed for reconciled-row classification)
+        existing = (
+            db.query(OrphanReconcileJobModel)
+            .filter_by(incarnation_id=incarnation_id)
+            .one_or_none()
+        )
+
+        # Already fully reconciled — but only proven if succeeded job exists
+        if inc.state == "reconciled":
+            if existing is not None and existing.state == "succeeded":
+                return ForceReconcileResult(
+                    outcome="reconciled_proven",
+                    job_id=existing.id,
+                    detail="reconciled_with_succeeded_job",
+                )
+            # Reconciled without succeeded job = invariant violation
+            return ForceReconcileResult(
+                outcome="non_durable_invariant",
+                detail="reconciled_without_succeeded_job",
+            )
+
+        if existing is not None:
+            if existing.state == "succeeded":
+                # Repair: job succeeded but row not updated (crash window)
+                inc.state = "reconciled"
+                inc.reconciled_at = now
+                return ForceReconcileResult(
+                    outcome="reconciled_proven",
+                    job_id=existing.id,
+                    detail="repaired_from_succeeded_job",
+                )
+            if existing.state in ("pending", "leased", "retry_wait"):
+                # Job already in progress — normalize incarnation state
+                if inc.state in ("active", "launching", "abandoned"):
+                    inc.state = "reconcile_pending"
+                wake_dispatcher = True
+                result = ForceReconcileResult(
+                    outcome="job_already_exists",
+                    job_id=existing.id,
+                    detail=f"state={existing.state}",
+                )
+            elif existing.state == "attention_required":
+                # Normalize incarnation state
+                if inc.state in ("active", "launching", "abandoned"):
+                    inc.state = "reconcile_pending"
+                result = ForceReconcileResult(
+                    outcome="job_already_exists",
+                    job_id=existing.id,
+                    detail="attention_required",
+                )
+            else:
+                # Unknown job state = non-durable invariant
+                result = ForceReconcileResult(
+                    outcome="non_durable_invariant",
+                    job_id=existing.id,
+                    detail=f"unknown_job_state={existing.state}",
+                )
+        else:
+            # No existing job — normalize incarnation state + create job
+            if inc.state in ("active", "launching", "abandoned", "reconcile_pending"):
+                inc.state = "reconcile_pending"
+
+            job_id = str(_uuid.uuid4())
+            job = OrphanReconcileJobModel(
+                id=job_id,
+                incarnation_id=incarnation_id,
+                terminal_id=inc.terminal_id,
+                terminal_generation=inc.terminal_generation,
+                state="pending",
+                attempt=0,
+                gone_observed_at=now,
+                source=source,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(job)
+            wake_dispatcher = True
+            result = ForceReconcileResult(outcome="created", job_id=job_id)
+
+    if wake_dispatcher:
+        try:
+            from cli_agent_orchestrator.services.orphan_reconcile_service import (
+                orphan_reconcile_service,
+            )
+
+            orphan_reconcile_service.signal_dirty()
+        except Exception:
+            pass
+
+    return result
+
+
+def f138_emit_attention_message(
+    terminal_id: str, message: str, *, supervisor_id: str | None = None
+) -> bool:
+    """D23: Shared DB-only one-shot attention notification.
+
+    Thread-safe, no async, no locks held. Returns True if message was persisted.
+    Failure is logged but never raises — callers must not depend on this for safety.
+    """
+    try:
+        # Find supervisor from same session if not provided
+        if supervisor_id is None:
+            with SessionLocal() as db:
+                terminal = db.query(TerminalModel).filter_by(id=terminal_id).one_or_none()
+                if terminal is not None:
+                    session_name = terminal.tmux_session
+                    # Find supervisor in same session
+                    candidates = (
+                        db.query(TerminalModel)
+                        .filter(
+                            TerminalModel.tmux_session == session_name,
+                            TerminalModel.id != terminal_id,
+                        )
+                        .all()
+                    )
+                    for c in candidates:
+                        if c.agent_profile and "supervisor" in (c.agent_profile or ""):
+                            supervisor_id = c.id
+                            break
+                    if supervisor_id is None and candidates:
+                        supervisor_id = candidates[0].id
+        if supervisor_id is None:
+            logger.warning(
+                "f138_attention_no_supervisor terminal=%s msg=%s", terminal_id, message[:80]
+            )
+            return False
+        create_inbox_message(terminal_id, supervisor_id, message)
+        return True
+    except Exception:
+        logger.warning(
+            "f138_attention_failed terminal=%s", terminal_id, exc_info=True
+        )
+        return False
+
+
+def f138_get_incarnation_by_terminal_generation(
+    terminal_id: str, terminal_generation: int
+) -> dict[str, Any] | None:
+    """D11/D24: Resolve incarnation by terminal_id + exact lifecycle generation."""
+    with SessionLocal() as db:
+        inc = (
+            db.query(ProcessIncarnationModel)
+            .filter_by(
+                terminal_id=terminal_id,
+                terminal_generation=terminal_generation,
+            )
+            .one_or_none()
+        )
+        if inc is None:
+            return None
+        return {
+            "id": inc.id,
+            "terminal_id": inc.terminal_id,
+            "terminal_generation": inc.terminal_generation,
+            "state": inc.state,
+            "token_hash": inc.token_hash,
+        }

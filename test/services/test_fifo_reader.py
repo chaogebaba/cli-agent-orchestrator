@@ -566,6 +566,8 @@ class TestPipeLivenessWatchdog:
                 "term-enroll",
                 pane_probe=lambda: "content",
                 rearm=lambda: None,
+                terminal_generation=1,
+                incarnation_id="inc-test-001",
             )
             assert "term-enroll" in manager._pane_probe
             assert "term-enroll" in manager._rearm
@@ -740,7 +742,7 @@ class TestColdStartStallDetection:
         content stops changing."""
         manager = self._manager(tmp_path, monkeypatch)
         try:
-            manager.create_reader("term-e2e", pane_probe=lambda: "content", rearm=lambda: None)
+            manager.create_reader("term-e2e", pane_probe=lambda: "content", rearm=lambda: None, terminal_generation=1, incarnation_id=None)
             with manager._lock:
                 assert manager._registered_at.get("term-e2e") is not None
                 assert manager._ever_delivered.get("term-e2e") is False

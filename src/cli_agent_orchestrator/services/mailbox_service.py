@@ -126,6 +126,20 @@ def is_supervisor_mailbox_pull_terminal(terminal_id: str) -> bool:
         return True
 
 
+def get_current_supervisor_terminal_id() -> str | None:
+    """F138: Return the terminal_id of the current live supervisor mailbox, or None."""
+    with SessionLocal() as db:
+        mailbox: Any = (
+            db.query(MailboxModel).filter_by(role="supervisor").one_or_none()
+        )
+        if mailbox is None:
+            return None
+        current_terminal_id = getattr(mailbox, "current_terminal_id", None)
+        if not current_terminal_id:
+            return None
+        return str(current_terminal_id)
+
+
 def _park_owner_generation(
     db: Any,
     row: Any,
@@ -278,8 +292,6 @@ def publish_supervisor_incarnation(claim: MailboxClaim, terminal_id: str) -> dic
                     return result
                 raise MailboxDomainError("mailbox_conflict", "mailbox publication conflict")
 
-            # F130 hotfix: write mailbox created_at/updated_at as aware-UTC so
-            # created_at-bearing mailbox reads agree with the inbox UTC path.
             now = datetime.now(timezone.utc)
             if claim.mailbox_id is None:
                 mailbox = MailboxModel(
@@ -489,7 +501,7 @@ def digest_stale_pending_for_terminal(
         return result(len(stale), generation)
 
 
-def create_logical_inbox_message(
+def _create_logical_inbox_message_inner(
     *,
     sender_id: str,
     mailbox_id: str,
@@ -498,7 +510,7 @@ def create_logical_inbox_message(
     orchestration_type: OrchestrationType = OrchestrationType.SEND_MESSAGE,
     dispatch_barrier: dict[str, Any] | None = None,
     park_warm: bool = False,
-) -> InboxMessage:
+) -> tuple[InboxMessage, str | None]:
     """Holder (d): resolve, guard, and insert one logical row under one authority."""
     with SessionLocal() as db:
         mailbox: Any = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
@@ -538,39 +550,220 @@ def create_logical_inbox_message(
                 db.refresh(row)
                 result = _inbox_message_from_row(row)
 
-                # F123-P0: fire teammate push on supervisor-bound PENDING insert
-                # to wake an idle supervisor (bypasses config gate — mailbox_pull
-                # mode implies push bridge is required).
-                if row.status == "pending" and logical_receiver_id is not None:
-                    from cli_agent_orchestrator.clients.database import (
-                        _is_supervisor_mailbox_id as _is_sup_mb,
-                    )
-
-                    if _is_sup_mb(db, logical_receiver_id):
-                        _push_terminal = (
-                            receiver_cache
-                            if (receiver_cache and not receiver_cache.startswith("mb_"))
-                            else None
-                        )
-                        if _push_terminal:
-                            try:
-                                from cli_agent_orchestrator.services.teammate_push_service import (
-                                    attempt_teammate_push_on_insert,
-                                )
-
-                                attempt_teammate_push_on_insert(_push_terminal, [result])
-                            except Exception as _push_err:
-                                logger.info(
-                                    f"F123-P0: teammate_push on insert failed: {_push_err}"
-                                )
+                # F136-D7: signal delivery after commit (replaces F123-P0 direct append).
+                # The callback runner handles actual file writes.
 
                 if result.barrier_id is not None and result.barrier_member_key is not None:
                     stalled_callback_watchdog.record_callback_if_to_caller(
                         sender_id, logical_receiver_id or receiver_cache
                     )
-                return result
+                _signal_terminal = (
+                    receiver_cache
+                    if (receiver_cache and not receiver_cache.startswith("mb_"))
+                    else None
+                )
+                return result, _signal_terminal
     finally:
         lock.release()
+
+
+def create_logical_inbox_message(
+    *,
+    sender_id: str,
+    mailbox_id: str,
+    message: str,
+    refresh_ingest: bool = False,
+    orchestration_type: OrchestrationType = OrchestrationType.SEND_MESSAGE,
+    dispatch_barrier: dict[str, Any] | None = None,
+    park_warm: bool = False,
+) -> InboxMessage:
+    """Public wrapper: insert + signal delivery (D7)."""
+    result, signal_terminal = _create_logical_inbox_message_inner(
+        sender_id=sender_id,
+        mailbox_id=mailbox_id,
+        message=message,
+        refresh_ingest=refresh_ingest,
+        orchestration_type=orchestration_type,
+        dispatch_barrier=dispatch_barrier,
+        park_warm=park_warm,
+    )
+    # D7: signal after commit and lock release
+    if signal_terminal and result.status == MessageStatus.PENDING:
+        from cli_agent_orchestrator.services.inbox_service import request_delivery
+        request_delivery(signal_terminal)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# F136-D6: Routed producer helper
+# ---------------------------------------------------------------------------
+
+
+def create_routed_inbox_message(
+    sender_id: str,
+    receiver_terminal_id: str,
+    message: str,
+    *,
+    orchestration_type: OrchestrationType = OrchestrationType.SEND_MESSAGE,
+    park_warm: bool = False,
+    dispatch_barrier: dict[str, Any] | None = None,
+) -> InboxMessage:
+    """D6: Route a message to either logical mailbox or raw terminal inbox.
+
+    Resolves whether receiver_terminal_id is the current terminal of a
+    supervisor mailbox. If so, creates a logical row. Otherwise, creates
+    a raw row and signals delivery.
+    """
+    from cli_agent_orchestrator.clients.database import create_inbox_message
+
+    # Check if receiver is a supervisor mailbox terminal
+    with SessionLocal() as db:
+        inc = (
+            db.query(MailboxIncarnationModel)
+            .filter_by(terminal_id=receiver_terminal_id)
+            .one_or_none()
+        )
+        if inc is not None:
+            mailbox: Any = db.query(MailboxModel).filter_by(id=inc.mailbox_id).one_or_none()
+            if (
+                mailbox is not None
+                and mailbox.role == "supervisor"
+                and mailbox.current_terminal_id == receiver_terminal_id
+            ):
+                # Supervisor mailbox: use logical path
+                return create_logical_inbox_message(
+                    sender_id=sender_id,
+                    mailbox_id=str(mailbox.id),
+                    message=message,
+                    orchestration_type=orchestration_type,
+                    park_warm=park_warm,
+                    dispatch_barrier=dispatch_barrier,
+                )
+
+    # Non-supervisor terminal: raw insert then request_delivery
+    result = create_inbox_message(
+        sender_id, receiver_terminal_id, message,
+        orchestration_type=orchestration_type,
+        park_warm=park_warm,
+        dispatch_barrier=dispatch_barrier,
+    )
+    from cli_agent_orchestrator.services.inbox_service import request_delivery
+    request_delivery(receiver_terminal_id)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# F136-D5: Path update protocol
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PathUpdateResult:
+    kind: str  # "updated", "unchanged", "stale_authority", "retryable_failure"
+    path_version: int
+    reason: str = ""
+
+
+def set_supervisor_callback_inbox_path(
+    *,
+    mailbox_id: str,
+    terminal_id: str,
+    generation: int,
+    path: str | None,
+) -> PathUpdateResult:
+    """D5: Atomically update the canonical callback inbox path for a mailbox.
+
+    Uses delivery -> authority lock order. On path change, enqueues current
+    PENDING rows at/below cursor for replay into the new path.
+    """
+    from cli_agent_orchestrator.clients.database import enqueue_callback_replay
+    from cli_agent_orchestrator.services.inbox_service import get_delivery_lock, request_delivery
+
+    delivery_lock = get_delivery_lock(terminal_id)
+    if not delivery_lock.acquire(timeout=30.0):
+        return PathUpdateResult(kind="retryable_failure", path_version=0, reason="delivery_lock_timeout")
+
+    # Resolve authority lock
+    with SessionLocal() as db:
+        mailbox: Any = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
+        if mailbox is None:
+            delivery_lock.release()
+            return PathUpdateResult(kind="stale_authority", path_version=0, reason="unknown_mailbox")
+        session_name = str(mailbox.session_name)
+        role = str(mailbox.role)
+
+    authority_lock = get_mailbox_authority_lock(session_name, role)
+    if not authority_lock.acquire(timeout=30.0):
+        delivery_lock.release()
+        return PathUpdateResult(kind="retryable_failure", path_version=0, reason="authority_lock_timeout")
+
+    try:
+        from sqlalchemy import text as sa_text
+
+        with SessionLocal() as db:
+            db.execute(sa_text("BEGIN IMMEDIATE"))
+
+            mailbox = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
+            if mailbox is None:
+                return PathUpdateResult(kind="stale_authority", path_version=0, reason="unknown_mailbox")
+
+            if (
+                mailbox.current_terminal_id != terminal_id
+                or int(mailbox.generation) != generation
+            ):
+                return PathUpdateResult(
+                    kind="stale_authority",
+                    path_version=int(mailbox.cc_inbox_path_version),
+                    reason="terminal_or_generation_mismatch",
+                )
+
+            current_path = mailbox.cc_inbox_path
+            if current_path == path:
+                # No change
+                db.commit()
+                return PathUpdateResult(
+                    kind="unchanged",
+                    path_version=int(mailbox.cc_inbox_path_version),
+                )
+
+            # Update path and increment version
+            mailbox.cc_inbox_path = path
+            mailbox.cc_inbox_path_version = int(mailbox.cc_inbox_path_version) + 1
+            new_version = int(mailbox.cc_inbox_path_version)
+
+            # Replay: enqueue current PENDING rows at/below cursor
+            cursor = mailbox.callback_notified_through_id
+            if cursor is not None and path is not None:
+                below_cursor_ids = [
+                    row_id for (row_id,) in
+                    db.query(InboxModel.id)
+                    .filter(
+                        InboxModel.logical_receiver_id == mailbox_id,
+                        InboxModel.receiver_id == terminal_id,
+                        InboxModel.enqueue_generation == generation,
+                        InboxModel.status == MessageStatus.PENDING.value,
+                        InboxModel.id <= cursor,
+                    )
+                    .all()
+                ]
+                if below_cursor_ids:
+                    enqueue_callback_replay(db, mailbox_id=mailbox_id, inbox_row_ids=below_cursor_ids)
+
+            mailbox.updated_at = _utcnow()
+            db.commit()
+
+        # Signal delivery after all locks released (below)
+        return PathUpdateResult(kind="updated", path_version=new_version)
+    finally:
+        authority_lock.release()
+        delivery_lock.release()
+        # D5 step 6: signal delivery after release
+        if path is not None:
+            from cli_agent_orchestrator.services.inbox_service import request_delivery
+            try:
+                request_delivery(terminal_id)
+            except Exception:
+                pass
 
 
 def acquire_logical_sender_authority(
@@ -668,14 +861,10 @@ def list_messages(
         else:
             query = query.filter(InboxModel.receiver_id == receiver)
         if since is not None:
-            # F130 hotfix: inbox/mailbox created_at is stored as UTC (naive in
-            # sqlite). Normalize the filter to aware-UTC so the comparison is
-            # correct regardless of how the caller expressed the timestamp. A
-            # naive `since` is interpreted as UTC, matching the stored values.
-            # Legacy naive rows written before the hotfix are LOCAL time; they
-            # are compared against aware-UTC here, which is a documented known
-            # skew for those rows (they predate the fix).
-            if since.tzinfo is not None:
+            # Normalize since to aware-UTC unconditionally.
+            if since.tzinfo is None:
+                since = since.replace(tzinfo=timezone.utc)
+            else:
                 since = since.astimezone(timezone.utc)
             query = query.filter(InboxModel.created_at >= since)
         if after_id is not None:

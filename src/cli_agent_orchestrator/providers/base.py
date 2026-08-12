@@ -87,6 +87,11 @@ class BaseProvider(ABC):
     supports_seed_resume_identity: bool = False
     signal_kinds: frozenset[str] = frozenset()
     liveness_anchor: AnchorSpec | None = None
+    # F124 S4: provider process contract
+    has_process_child: bool = True
+    launch_health_grace_s: float = 0.0
+    # F139 r5 D15: empty-shell fixture signals confirmed-dead to _provider_child_alive
+    launch_health_failure_confirmed: bool = False
     """Abstract base class for CLI tool providers.
 
     All CLI providers must inherit from this class and implement the abstract methods.

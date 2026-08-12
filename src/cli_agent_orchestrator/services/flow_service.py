@@ -41,16 +41,15 @@ logger = logging.getLogger(__name__)
 
 
 def _get_next_run_time(cron_expression: str) -> datetime:
-    """Calculate next run time from cron expression, stored as naive-UTC."""
+    """Calculate next run time from cron expression, stored as aware-UTC."""
     trigger = CronTrigger.from_crontab(cron_expression)
     next_time = trigger.get_next_fire_time(None, _utcnow())
     if next_time is None:
         raise ValueError(
             f"Could not calculate next run time for cron expression: {cron_expression}"
         )
-    # CronTrigger returns local-TZ-aware; convert to UTC, strip tzinfo
-    # for sqlite storage (convention: naive-UTC-at-rest).
-    return cast(datetime, next_time.astimezone(timezone.utc).replace(tzinfo=None))
+    # CronTrigger returns local-TZ-aware; convert to UTC (keep tzinfo for storage).
+    return cast(datetime, next_time.astimezone(timezone.utc))
 
 
 def _parse_flow_file(file_path: Path) -> Tuple[Dict, str]:

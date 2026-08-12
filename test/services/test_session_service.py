@@ -261,6 +261,9 @@ class TestCreateSession:
 
         monkeypatch.setattr(terminal_service, "_tracked_blocking", run_blocking)
         monkeypatch.setattr(
+            terminal_service, "_confirm_launch_health", AsyncMock()
+        )
+        monkeypatch.setattr(
             terminal_service, "_prepare_provider_runtime_identity", lambda *_a, **_k: None
         )
         monkeypatch.setattr(terminal_service, "send_input", caller_submit)

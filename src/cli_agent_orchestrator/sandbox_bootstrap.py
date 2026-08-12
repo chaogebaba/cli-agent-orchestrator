@@ -25,8 +25,24 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 from urllib.parse import urlsplit
+
+FixtureVariant = Literal[
+    "healthy",
+    "empty-shell",
+    "post-send-death",
+    "process-less",
+    "procfs-unavailable",
+]
+FIXTURE_VARIANTS: tuple[str, ...] = (
+    "healthy",
+    "empty-shell",
+    "post-send-death",
+    "process-less",
+    "procfs-unavailable",
+    "spawn-then-fault",
+)
 
 MANIFEST_NAME = "instance-manifest.toml"
 OWNER_LOCK_NAME = "owner.lock"
@@ -212,6 +228,19 @@ def render_manifest(manifest: dict[str, Any]) -> str:
         row = manifest["providers"][provider]
         for key, value in row.items():
             lines.append(f"{key} = {_toml_string(str(value))}\n")
+    # F139: optional fixture_providers table (deterministic field order)
+    fixture_providers = manifest.get("fixture_providers")
+    if fixture_providers:
+        for fp_name, fp_row in fixture_providers.items():
+            lines.append(f"\n[fixture_providers.{fp_name}]\n")
+            for fp_key in (
+                "classification",
+                "binary_realpath",
+                "binary_sha256",
+                "variant",
+                "state_dir",
+            ):
+                lines.append(f"{fp_key} = {_toml_string(str(fp_row[fp_key]))}\n")
     return "".join(lines)
 
 
@@ -267,7 +296,7 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> dict[str
     missing = required - manifest.keys()
     if missing:
         raise SandboxError(f"manifest missing fields: {sorted(missing)}")
-    extra = manifest.keys() - required
+    extra = manifest.keys() - required - {"fixture_providers"}
     if extra:
         raise SandboxError(f"manifest has unknown fields: {sorted(extra)}")
     instance_id = manifest["instance_id"]
@@ -369,6 +398,45 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> dict[str
         _assert_clean_components(expected_credential)
         if not expected_home.is_relative_to(root):
             raise SandboxError(f"provider home is outside sandbox root: {provider}")
+    # F139: validate optional fixture_providers table
+    fixture_providers = manifest.get("fixture_providers")
+    if fixture_providers is not None:
+        if not isinstance(fixture_providers, dict):
+            raise SandboxError("fixture_providers must be a table")
+        if set(fixture_providers.keys()) != {"mock_cli"}:
+            raise SandboxError(
+                f"fixture_providers allows only 'mock_cli', got: {sorted(fixture_providers.keys())}"
+            )
+        fp_row = fixture_providers["mock_cli"]
+        if not isinstance(fp_row, dict):
+            raise SandboxError("fixture_providers.mock_cli must be a table")
+        fp_required = {"classification", "binary_realpath", "binary_sha256", "variant", "state_dir"}
+        if set(fp_row.keys()) != fp_required:
+            raise SandboxError(
+                f"fixture_providers.mock_cli has wrong fields: {sorted(fp_row.keys())}"
+            )
+        if fp_row["classification"] != "fixture-test":
+            raise SandboxError("fixture_providers.mock_cli classification must be 'fixture-test'")
+        if fp_row["variant"] not in FIXTURE_VARIANTS:
+            raise SandboxError(
+                f"fixture_providers.mock_cli variant is invalid: {fp_row['variant']}"
+            )
+        binary_path = Path(str(fp_row["binary_realpath"]))
+        _assert_clean_components(binary_path)
+        binary_path = _canonical(binary_path)
+        if not binary_path.is_file():
+            raise SandboxError("fixture binary is not a regular file")
+        if not os.access(binary_path, os.X_OK):
+            raise SandboxError("fixture binary is not executable")
+        if not binary_path.is_relative_to(fork_root):
+            raise SandboxError("fixture binary is outside the fork root")
+        actual_hash = hashlib.sha256(binary_path.read_bytes()).hexdigest()
+        if actual_hash != fp_row["binary_sha256"]:
+            raise SandboxError("fixture binary SHA-256 mismatch")
+        state_dir = _canonical(Path(str(fp_row["state_dir"])))
+        if not state_dir.is_relative_to(root):
+            raise SandboxError("fixture state_dir is outside sandbox root")
+        _assert_clean_components(Path(str(fp_row["state_dir"])))
     result = dict(manifest)
     result["root"] = str(root)
     result["endpoint"] = endpoint
@@ -503,7 +571,9 @@ def _wait_ready(manifest: dict[str, Any], child: subprocess.Popen[bytes]) -> Non
     raise SandboxError("sandbox server readiness timed out")
 
 
-def _build_manifest(root: Path, port: int) -> dict[str, Any]:
+def _build_manifest(
+    root: Path, port: int, *, fixture_mock_cli_variant: FixtureVariant | None = None
+) -> dict[str, Any]:
     root = _canonical(root)
     if root.exists():
         raise SandboxError("sandbox root already exists")
@@ -555,6 +625,28 @@ def _build_manifest(root: Path, port: int) -> dict[str, Any]:
                 )
         for field, relative in MUTABLE_PATHS.items():
             manifest[field] = str(root / relative)
+        # F139: optional fixture provider manifest row
+        if fixture_mock_cli_variant is not None:
+            binary_path = fork_root / "test" / "providers" / "fixtures" / "bin" / "mock_cli"
+            binary_path = _canonical(binary_path)
+            if not binary_path.is_file():
+                raise SandboxError("fixture binary is not a regular file")
+            if not os.access(binary_path, os.X_OK):
+                raise SandboxError("fixture binary is not executable")
+            if not binary_path.is_relative_to(fork_root):
+                raise SandboxError("fixture binary is outside the fork root")
+            binary_hash = hashlib.sha256(binary_path.read_bytes()).hexdigest()
+            state_dir = root / "fixture-provider-state"
+            state_dir.mkdir(mode=0o700, exist_ok=False)
+            manifest["fixture_providers"] = {
+                "mock_cli": {
+                    "classification": "fixture-test",
+                    "binary_realpath": str(binary_path),
+                    "binary_sha256": binary_hash,
+                    "variant": fixture_mock_cli_variant,
+                    "state_dir": str(state_dir),
+                }
+            }
         return manifest
     except Exception:
         shutil.rmtree(root, ignore_errors=True)
@@ -588,10 +680,33 @@ def command_up(args: argparse.Namespace) -> int:
     sentinel_created = False
     child: subprocess.Popen[bytes] | None = None
     try:
-        manifest = _build_manifest(root, args.port)
+        manifest = _build_manifest(
+            root,
+            args.port,
+            fixture_mock_cli_variant=getattr(args, "fixture_mock_cli_variant", None),
+        )
         manifest_path = Path(manifest["root"]) / MANIFEST_NAME
         validate_manifest(manifest, manifest_path)
-        _write_once(manifest_path, render_manifest(manifest), 0o400)
+        rendered = render_manifest(manifest)
+        _write_once(manifest_path, rendered, 0o400)
+        # F139 D3: immediate read-back round-trip equality check
+        readback = read_manifest(manifest_path)
+        validate_manifest(readback, manifest_path)
+        if manifest.get("fixture_providers"):
+            rb_fp = readback.get("fixture_providers", {}).get("mock_cli", {})
+            mem_fp = manifest["fixture_providers"]["mock_cli"]
+            for fp_key in (
+                "classification",
+                "binary_realpath",
+                "binary_sha256",
+                "variant",
+                "state_dir",
+            ):
+                if str(rb_fp.get(fp_key, "")) != str(mem_fp[fp_key]):
+                    raise SandboxError(
+                        f"fixture manifest round-trip mismatch on {fp_key}: "
+                        f"{rb_fp.get(fp_key)!r} != {mem_fp[fp_key]!r}"
+                    )
         _write_once(
             Path(manifest["root"]) / OWNER_LOCK_NAME,
             json.dumps(
@@ -809,6 +924,13 @@ def build_parser() -> argparse.ArgumentParser:
     up = commands.add_parser("up")
     up.add_argument("--root", required=True)
     up.add_argument("--port", required=True, type=int)
+    up.add_argument(
+        "--fixture-mock-cli-variant",
+        choices=FIXTURE_VARIANTS,
+        default=None,
+        dest="fixture_mock_cli_variant",
+        help="F139: pin one fixture provider behavior for this sandbox instance",
+    )
     up.set_defaults(handler=command_up)
     status_parser = commands.add_parser("status")
     status_parser.add_argument("--root", required=True)

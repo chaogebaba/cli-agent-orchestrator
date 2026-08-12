@@ -838,7 +838,9 @@ class StalledCallbackWatchdog:
             delivery_lock.release()
         if should_deliver:
             try:
-                inbox_service.deliver_pending(action.terminal_id)
+                # F136-D17: use request_delivery, never synchronous on loop
+                from cli_agent_orchestrator.services.inbox_service import request_delivery
+                request_delivery(action.terminal_id)
             except Exception:
                 logger.exception("Failed to deliver auto-resume for %s", action.terminal_id)
         return None
@@ -903,7 +905,8 @@ class StalledCallbackWatchdog:
             notice.idle_reason,
         )
         if handled is None:
-            create_inbox_message(
+            from cli_agent_orchestrator.services.mailbox_service import create_routed_inbox_message
+            create_routed_inbox_message(
                 f"watchdog:{notice.terminal_id}",
                 notice.caller_id,
                 notice.message,
@@ -945,15 +948,15 @@ class StalledCallbackWatchdog:
                     logger.exception("Failed to persist watchdog chain notification")
 
             try:
-                inbox_service.deliver_pending(notice.caller_id, registry=registry)
+                # F136-D17: request_delivery, never synchronous delivery on loop
+                from cli_agent_orchestrator.services.inbox_service import request_delivery
+                request_delivery(notice.caller_id)
             except Exception:
                 logger.exception("Failed to deliver stalled-callback watchdog notification")
             if chain_persisted and reservation is not None:
                 try:
-                    inbox_service.deliver_pending(
-                        reservation.notice.caller_id,
-                        registry=registry,
-                    )
+                    from cli_agent_orchestrator.services.inbox_service import request_delivery as _rd
+                    _rd(reservation.notice.caller_id)
                 except Exception:
                     logger.exception("Failed to deliver watchdog chain notification")
 
@@ -1041,8 +1044,8 @@ class StalledCallbackWatchdog:
                 "(floor 300s)."
             )
             try:
-                create_inbox_message(f"watchdog:{terminal_id}", caller_id, message)
-                inbox_service.deliver_pending(caller_id, registry=registry)
+                from cli_agent_orchestrator.services.mailbox_service import create_routed_inbox_message
+                create_routed_inbox_message(f"watchdog:{terminal_id}", caller_id, message)
             except Exception:
                 logger.warning(
                     "Failed to push waiting-inbox watchdog notification for %s",
@@ -1118,8 +1121,8 @@ class StalledCallbackWatchdog:
                 f"`cao messages trace {message_id}`. Reconciliation remains the retry owner."
             )
             try:
-                create_inbox_message(f"watchdog:{terminal_id}", caller_id, message)
-                inbox_service.deliver_pending(caller_id, registry=registry)
+                from cli_agent_orchestrator.services.mailbox_service import create_routed_inbox_message
+                create_routed_inbox_message(f"watchdog:{terminal_id}", caller_id, message)
             except Exception:
                 logger.warning(
                     "Failed to push ready-backlog watchdog notification for %s",

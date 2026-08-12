@@ -274,7 +274,7 @@ class TestExitTerminalCli:
 
         exit_terminal_cli("abcd1234")
 
-        mock_input.assert_called_once_with("abcd1234", "/exit")
+        mock_input.assert_called_once_with("abcd1234", "/exit", _lifecycle_internal=True)
         mock_special.assert_not_called()
 
     @patch(f"{_TS}.send_input")

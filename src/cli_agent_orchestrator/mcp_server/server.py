@@ -1522,6 +1522,7 @@ def _assign_impl(
             "success": True,
             "terminal_id": terminal_id,
             "forked_from": forked_from_info,
+            "init_health": "launching",
             "message": (
                 f"Task assigned to {agent_profile} (terminal: {terminal_id}). "
                 f"Worker is initializing in the background; your task will be "

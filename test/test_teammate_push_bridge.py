@@ -552,6 +552,7 @@ class TestOnInsertConfigGateBypass:
     to kill the gate-bypass and validation mutants (B1).
     """
 
+    @pytest.mark.xfail(reason="F136 retires attempt_teammate_push_on_insert (D1: single writer)")
     def test_push_succeeds_when_config_flag_false(self, tmp_path: Path) -> None:
         """Flag OFF still writes a CC inbox entry on insert (proves the bypass)."""
         inbox_path = tmp_path / "teams" / "session-abc" / "inboxes" / "team-lead.json"

@@ -93,6 +93,37 @@ def finalize_session(
     )
 
 
+async def _reconcile_inbox_path_on_publish(
+    *, terminal_id: str, mailbox_id: str, generation: int
+) -> None:
+    """F136-D5: Wire set_supervisor_callback_inbox_path at publication lifecycle.
+
+    Reads cc_team_inbox_path from terminal metadata and reconciles it as the
+    canonical callback inbox path for the mailbox. Idempotent no-op when the
+    path is unchanged or absent.
+    """
+    from cli_agent_orchestrator.clients.database import get_terminal_metadata
+    from cli_agent_orchestrator.services.mailbox_service import set_supervisor_callback_inbox_path
+
+    try:
+        meta_record = get_terminal_metadata(terminal_id)
+        if not meta_record:
+            return
+        md = meta_record.get("metadata") or {}
+        candidate_path = md.get("cc_team_inbox_path")
+        if not candidate_path:
+            return
+        await asyncio.to_thread(
+            set_supervisor_callback_inbox_path,
+            mailbox_id=mailbox_id,
+            terminal_id=terminal_id,
+            generation=generation,
+            path=candidate_path,
+        )
+    except Exception as exc:
+        logger.debug("inbox path reconciliation skipped: %s", exc)
+
+
 async def create_session(
     provider: str | None,
     agent_profile: str,
@@ -218,6 +249,12 @@ async def create_session(
             "published supervisor mailbox %s generation %s",
             publication["mailbox_id"],
             publication["generation"],
+        )
+        # F136-D5: reconcile inbox path from terminal metadata at publication
+        await _reconcile_inbox_path_on_publish(
+            terminal_id=terminal.id,
+            mailbox_id=publication["mailbox_id"],
+            generation=publication["generation"],
         )
     dispatch_plugin_event(
         registry,

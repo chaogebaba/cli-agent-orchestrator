@@ -35,7 +35,9 @@ def _legacy_direct_create_is_not_a_seed_capability(monkeypatch):
     monkeypatch.setattr(
         terminal_service_module,
         "get_provider_class",
-        lambda _name: type("Capability", (), {"supports_seed_resume_identity": False}),
+        lambda _name: type(
+            "Capability", (), {"supports_seed_resume_identity": False, "has_process_child": False}
+        ),
     )
 
 
@@ -47,6 +49,10 @@ async def test_blocked_deferred_assign_queues_verbatim_once_and_notifies_once():
     shaped = "MCP-shaped bytes\n[Assigned by terminal caller01]"
 
     with (
+        patch(
+            "cli_agent_orchestrator.services.terminal_service._confirm_launch_health",
+            new_callable=AsyncMock,
+        ),
         patch(
             "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
             return_value={"caller_id": "caller01"},
@@ -79,6 +85,10 @@ async def test_blocked_deferred_assign_enqueue_failure_reports_undelivered():
     provider.shell_baseline = None
 
     with (
+        patch(
+            "cli_agent_orchestrator.services.terminal_service._confirm_launch_health",
+            new_callable=AsyncMock,
+        ),
         patch(
             "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
             return_value={"caller_id": "caller01"},
@@ -279,6 +289,7 @@ class TestCreateTerminal:
             engine="v2",
             group=None,
             metadata=None,
+            worktree_info=None,
         )
         assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 

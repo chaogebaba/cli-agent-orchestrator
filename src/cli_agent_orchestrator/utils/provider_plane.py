@@ -30,6 +30,23 @@ class NativeHomeIsolationUnavailable(RuntimeError):
 
 
 @dataclass(frozen=True)
+class SandboxFixtureProviderCapability:
+    """F139: frozen manifest-pinned fixture provider authority."""
+
+    provider: Literal["mock_cli"]
+    binary_realpath: Path
+    binary_sha256: str
+    variant: Literal[
+        "healthy",
+        "empty-shell",
+        "post-send-death",
+        "process-less",
+        "procfs-unavailable",
+    ]
+    state_dir: Path
+
+
+@dataclass(frozen=True)
 class ProviderHome:
     provider: str
     classification: PlaneClass
@@ -361,9 +378,73 @@ def seed_provider_credential(
 def admit_provider(provider: str) -> None:
     if not os.environ.get("CAO_INSTANCE_ID", "").strip():
         return
+    # F139: three-branch admission — fixture / credential / reject
+    if provider == "mock_cli":
+        load_active_fixture_provider("mock_cli")
+        return
     if provider not in {"codex", "claude_code"}:
         raise SandboxProviderUnsafe(f"sandbox_provider_unsafe:{provider}")
     plane = provider_home(provider)
     seed_provider_credential(plane)
     if provider == "claude_code":
         preflight_claude_native_home(plane)
+
+
+def load_active_fixture_provider(provider: str) -> SandboxFixtureProviderCapability:
+    """F139 D4: validate and return the frozen fixture capability from the active manifest."""
+    import hashlib
+
+    if provider != "mock_cli":
+        raise SandboxProviderUnsafe(f"sandbox_fixture_provider_unknown:{provider}")
+
+    from cli_agent_orchestrator.sandbox_bootstrap import (
+        SandboxError,
+        _assert_clean_components,
+        _canonical,
+        validate_active_sandbox,
+    )
+
+    manifest = validate_active_sandbox()
+    if manifest is None:
+        raise SandboxProviderUnsafe("sandbox_fixture_provider_no_sandbox")
+    fixture_providers = manifest.get("fixture_providers")
+    if not isinstance(fixture_providers, dict):
+        raise SandboxProviderUnsafe("sandbox_fixture_provider_no_manifest_row")
+    row = fixture_providers.get("mock_cli")
+    if not isinstance(row, dict):
+        raise SandboxProviderUnsafe("sandbox_fixture_provider_no_manifest_row")
+    if row.get("classification") != "fixture-test":
+        raise SandboxProviderUnsafe("sandbox_fixture_provider_bad_classification")
+    from cli_agent_orchestrator.sandbox_bootstrap import FIXTURE_VARIANTS
+
+    variant = row.get("variant", "")
+    if variant not in FIXTURE_VARIANTS:
+        raise SandboxProviderUnsafe(f"sandbox_fixture_provider_bad_variant:{variant}")
+    binary_path = _canonical(Path(str(row["binary_realpath"])))
+    _assert_clean_components(binary_path)
+    if not binary_path.is_file():
+        raise SandboxProviderUnsafe("sandbox_fixture_provider_binary_missing")
+    if not os.access(binary_path, os.X_OK):
+        raise SandboxProviderUnsafe("sandbox_fixture_provider_binary_not_executable")
+    # Verify binary stays inside fork root
+    fork_root = _canonical(Path(str(manifest["source"]["fork_root"])))
+    if not binary_path.is_relative_to(fork_root):
+        raise SandboxProviderUnsafe("sandbox_fixture_provider_binary_outside_fork")
+    # Re-verify hash
+    actual_hash = hashlib.sha256(binary_path.read_bytes()).hexdigest()
+    expected_hash = row.get("binary_sha256", "")
+    if actual_hash != expected_hash:
+        raise SandboxProviderUnsafe("sandbox_fixture_provider_hash_mismatch")
+    # Validate state_dir
+    root = _canonical(Path(str(manifest["root"])))
+    state_dir = _canonical(Path(str(row["state_dir"])))
+    if not state_dir.is_relative_to(root):
+        raise SandboxProviderUnsafe("sandbox_fixture_provider_state_dir_escape")
+    _assert_clean_components(Path(str(row["state_dir"])))
+    return SandboxFixtureProviderCapability(
+        provider="mock_cli",
+        binary_realpath=binary_path,
+        binary_sha256=actual_hash,
+        variant=variant,  # type: ignore[arg-type]
+        state_dir=state_dir,
+    )

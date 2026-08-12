@@ -569,6 +569,8 @@ async def test_e1_deferred_schedule_returns_while_refresh_is_running(monkeypatch
     monkeypatch.setattr(terminals, "_prepare_fork_refresh", refresh)
     monkeypatch.setattr(terminals, "send_input", lambda _id, message, **_kw: sent.append(message))
     monkeypatch.setattr(terminals, "mark_terminal_init_ready", lambda *_a, **_k: True)
+    # Synthetic provider has no process tree; F124 launch-health check would raise.
+    monkeypatch.setattr(terminals, "_confirm_launch_health", AsyncMock())
     snapshot = {
         "caller_id": "caller", "agent_profile": "dev", "provider": "codex",
         "init_deadline_s": 1.0,

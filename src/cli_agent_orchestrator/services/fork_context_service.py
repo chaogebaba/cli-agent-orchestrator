@@ -408,9 +408,53 @@ def pane_pid(session: str, window: str) -> int:
     return int(out.strip())
 
 
+# F124 S3: module-level proc root — tests monkeypatch this to a synthetic tree.
+_PROC_ROOT = Path("/proc")
+
+# F139: tracks whether the one-shot fixture runtime configuration has fired.
+_FIXTURE_RUNTIME_CONFIGURED = False
+
+
+def configure_sandbox_fixture_runtime(manifest: dict[str, Any] | None) -> None:
+    """F139 D11: one-shot process-local _PROC_ROOT configuration for procfs-unavailable variant.
+
+    Must be called exactly once during server lifespan, after sandbox validation
+    and DB fence assertion, but before init_db/background tasks. Production and
+    default sandboxes are a no-op.
+    """
+    global _PROC_ROOT, _FIXTURE_RUNTIME_CONFIGURED
+    if _FIXTURE_RUNTIME_CONFIGURED:
+        return  # idempotent — already ran
+    _FIXTURE_RUNTIME_CONFIGURED = True
+    if manifest is None:
+        return  # production — no-op
+    fixture_providers = manifest.get("fixture_providers")
+    if not isinstance(fixture_providers, dict):
+        return  # default sandbox without fixture — no-op
+    row = fixture_providers.get("mock_cli")
+    if not isinstance(row, dict):
+        return
+    variant = row.get("variant", "")
+    if variant != "procfs-unavailable":
+        return  # only this variant mutates _PROC_ROOT
+    state_dir = Path(str(row["state_dir"]))
+    missing_proc = state_dir / "missing-proc"
+    # Assert: path is beneath state_dir, target is absent
+    if missing_proc.exists():
+        raise RuntimeError("F139: missing-proc path unexpectedly exists")
+    if not missing_proc.is_relative_to(state_dir):
+        raise RuntimeError("F139: missing-proc path escape")
+    _PROC_ROOT = missing_proc
+
+
+def _procfs_available() -> bool:
+    """Return whether procfs is accessible (F124 S3)."""
+    return (_PROC_ROOT / "self" / "stat").is_file()
+
+
 def _descendants(root: int) -> list[int]:
     children: dict[int, list[int]] = {}
-    for entry in Path("/proc").iterdir():
+    for entry in _PROC_ROOT.iterdir():
         if not entry.name.isdigit():
             continue
         try:

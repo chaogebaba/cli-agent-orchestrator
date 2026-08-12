@@ -62,6 +62,7 @@ def bind_pane_identity(
     terminal_id: str,
     *,
     plan: "PersonaPlan | None" = None,
+    incarnation_token: str | None = None,
 ) -> dict[str, str]:
     """Force immutable terminal/instance affinity into a pane environment."""
     result = dict(environment or {})
@@ -72,6 +73,9 @@ def bind_pane_identity(
         "CAO_INSTANCE_ID": os.environ.get("CAO_INSTANCE_ID", ""),
         "CAO_ENDPOINT": resolve_endpoint(),
     }
+    # F138: inject incarnation token for process-bearing providers
+    if incarnation_token is not None:
+        expected["CAO_PROCESS_INCARNATION"] = incarnation_token
     for key, value in expected.items():
         supplied = result.get(key)
         if supplied is not None and supplied != value:

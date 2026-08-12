@@ -873,9 +873,32 @@ class SessionRecoverRequest(BaseModel):
     @field_validator("provider")
     @classmethod
     def validate_provider(cls, value: str) -> str:
-        if value not in {"codex", "grok_cli"}:
-            raise ValueError("provider must be codex or grok_cli")
-        return value
+        if value in {"codex", "grok_cli"}:
+            return value
+        # F138 ARM4: sandbox-only fixture provider reauth — fail closed outside sandbox
+        if value == "mock_cli":
+            from cli_agent_orchestrator.utils.sandbox_guard import is_sandbox
+
+            if is_sandbox():
+                from cli_agent_orchestrator.utils.provider_plane import (
+                    load_active_fixture_provider,
+                )
+
+                try:
+                    cap = load_active_fixture_provider("mock_cli")
+                except Exception:
+                    raise ValueError(
+                        "provider mock_cli not admitted: fixture capability validation failed"
+                    )
+                # Only admit if the provider class advertises reauth rebind
+                from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
+
+                if not getattr(MockCliProvider, "supports_reauth_rebind", False):
+                    raise ValueError(
+                        "provider mock_cli does not advertise supports_reauth_rebind"
+                    )
+                return value
+        raise ValueError("provider must be codex or grok_cli")
 
 
 class MessageAckRequest(BaseModel):
@@ -961,6 +984,13 @@ async def lifespan(app: FastAPI):
         if active_manifest is None:
             raise RuntimeError("sandbox startup lost its manifest binding")
         assert_sandbox_db_fence(active_manifest)
+        # F139 D11: one-shot fixture runtime configuration after sandbox validation
+        # and DB fence, before init_db/tasks.
+        from cli_agent_orchestrator.services.fork_context_service import (
+            configure_sandbox_fixture_runtime,
+        )
+
+        configure_sandbox_fixture_runtime(active_manifest)
     init_db()
     from cli_agent_orchestrator.utils.persona_context import reconcile_retained_persona_homes
 
@@ -1085,6 +1115,13 @@ async def lifespan(app: FastAPI):
     callback_barrier_task = asyncio.create_task(callback_barrier_daemon())
     deferred_init_watchdog_task = asyncio.create_task(deferred_init_watchdog(registry))
 
+    # F138: Start orphan reconciliation dispatcher
+    from cli_agent_orchestrator.services.orphan_reconcile_service import orphan_reconcile_service
+
+    await orphan_reconcile_service.startup_recovery()
+    orphan_reconcile_task = asyncio.create_task(orphan_reconcile_service.run())
+    logger.info("F138 OrphanReconcileService started")
+
     # Herdr delivers inbox via its own socket events; the tmux backend uses the
     # FIFO -> EventBus pipeline (StatusMonitor / LogWriter / InboxService) started
     # above. Start the herdr inbox service only when the herdr backend is active
@@ -1130,6 +1167,13 @@ async def lifespan(app: FastAPI):
     watchdog_task.cancel()
     callback_barrier_task.cancel()
     deferred_init_watchdog_task.cancel()
+    # F138: Stop orphan reconciliation dispatcher
+    orphan_reconcile_service.stop()
+    orphan_reconcile_task.cancel()
+    try:
+        await orphan_reconcile_task
+    except asyncio.CancelledError:
+        pass
     # Cancel approval bridge on shutdown
     if approval_bridge_task is not None:
         approval_bridge_task.cancel()
@@ -5394,11 +5438,11 @@ async def cancel_callback_barrier_endpoint(
             barrier_label=barrier_label,
             owner_id=owner,
         )
+        # F136-D17: barrier cancel triggers native callback replay via request_delivery
+        from cli_agent_orchestrator.services.inbox_service import request_delivery
+
         for receiver_id in result.get("receiver_ids", []):
-            await asyncio.to_thread(
-                inbox_service.deliver_pending,
-                receiver_id,
-            )
+            request_delivery(receiver_id)
         return result
     except ValueError as exc:
         code = str(exc)
@@ -5445,6 +5489,45 @@ async def delete_mailbox_endpoint(
                 status_code=400, detail={"code": exc.code, "message": exc.message}
             ) from exc
         raise _mailbox_http_exception(exc) from exc
+
+
+class InboxPathUpdateBody(BaseModel):
+    path: Optional[str] = None
+    terminal_id: str
+    generation: int
+
+
+@app.patch("/mailboxes/{mailbox_id}/inbox-path")
+async def update_mailbox_inbox_path_endpoint(
+    mailbox_id: Annotated[str, Field(pattern=r"^mb_[a-f0-9]{8}$")],
+    body: InboxPathUpdateBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """F136-D5: Set/rebind the supervisor callback inbox path for a mailbox.
+
+    CAS semantics: caller must provide the current terminal_id and generation.
+    Stale terminal/generation is rejected. Path unchanged by rebind is a no-op.
+    """
+    from cli_agent_orchestrator.services.mailbox_service import set_supervisor_callback_inbox_path
+
+    result = await asyncio.to_thread(
+        set_supervisor_callback_inbox_path,
+        mailbox_id=mailbox_id,
+        terminal_id=body.terminal_id,
+        generation=body.generation,
+        path=body.path,
+    )
+    if result.kind == "stale_authority":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "stale_authority", "reason": result.reason, "path_version": result.path_version},
+        )
+    if result.kind == "retryable_failure":
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "retryable_failure", "reason": result.reason},
+        )
+    return {"kind": result.kind, "path_version": result.path_version}
 
 
 @app.websocket("/terminals/{terminal_id}/ws")

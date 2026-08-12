@@ -65,6 +65,9 @@ async def test_done_callback_cannot_clear_call_before_quiescence_snapshot(
     provider = SimpleNamespace(
         initialize=AsyncMock(), supports_reauth_rebind=False, shell_baseline=None,
     )
+    monkeypatch.setattr(
+        terminals, "_confirm_launch_health", AsyncMock()
+    )
     terminals._schedule_deferred_init(
         provider,
         terminal_id,

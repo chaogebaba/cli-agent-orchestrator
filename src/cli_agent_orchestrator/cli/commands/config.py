@@ -1,11 +1,14 @@
 """Config commands for CLI Agent Orchestrator CLI (issue #357)."""
 
 import json
+import sys
+from dataclasses import asdict
 
 import click
 
 from cli_agent_orchestrator.cli.commands.config_reconcile import reconcile
 from cli_agent_orchestrator.services.config_service import ConfigService
+from cli_agent_orchestrator.services.systemd_tmux_preflight import run_activation_preflight
 from cli_agent_orchestrator.utils.sandbox_guard import require_not_sandbox_mutation
 
 
@@ -81,3 +84,62 @@ def path_cmd():
 
 
 config.add_command(reconcile)
+
+
+# ---------------------------------------------------------------------------
+# F137 activation preflight
+# ---------------------------------------------------------------------------
+
+
+def _serialize_check(check) -> dict:
+    """Convert an ActivationPreflightCheck to a JSON-friendly dict."""
+    d = asdict(check)
+    # Convert tuple observed/expected to list for JSON
+    for key in ("observed", "expected"):
+        if isinstance(d[key], tuple):
+            d[key] = list(d[key])
+    return d
+
+
+@config.command(name="preflight")
+@click.option("--activation", is_flag=True, required=True, help="Run activation safety preflight.")
+@click.option("--json", "use_json", is_flag=True, default=False, help="Output as stable JSON.")
+def preflight_cmd(activation: bool, use_json: bool):
+    """Run activation safety preflight (F137).
+
+    Validates systemd configuration is safe for CAO activation.
+    Read-only — never mutates the system.
+
+    Exit 0 = all checks pass. Nonzero = activation blocked.
+    """
+    result = run_activation_preflight()
+
+    if use_json:
+        output = {
+            "ok": result.ok,
+            "mode": result.mode,
+            "version": result.version,
+            "version_policy": result.version_policy,
+            "enabled_prefix_dropins": list(result.enabled_prefix_dropins),
+            "checks": [_serialize_check(c) for c in result.checks],
+        }
+        click.echo(json.dumps(output, indent=2))
+    else:
+        status = "PASS" if result.ok else "FAIL"
+        click.echo(f"{status} — mode={result.mode} version={result.version} policy={result.version_policy}")
+        for check in result.checks:
+            marker = "✓" if check.ok else "✗"
+            line = f"  {marker} {check.code}"
+            if check.detail:
+                line += f": {check.detail}"
+            if not check.ok and check.observed is not None:
+                line += f" (observed={check.observed})"
+            if not check.ok and check.expected is not None:
+                line += f" (expected={check.expected})"
+            click.echo(line)
+        if result.enabled_prefix_dropins:
+            click.echo("  Enabled prefix drop-ins:")
+            for path in result.enabled_prefix_dropins:
+                click.echo(f"    - {path}")
+
+    sys.exit(0 if result.ok else 1)

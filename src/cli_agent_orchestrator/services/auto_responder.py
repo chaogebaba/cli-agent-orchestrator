@@ -976,8 +976,7 @@ class AutoResponder:
         message: str,
         incarnation: TerminalIncarnation | None = None,
     ) -> None:
-        from cli_agent_orchestrator.clients.database import create_inbox_message
-        from cli_agent_orchestrator.services.inbox_service import inbox_service
+        from cli_agent_orchestrator.services.mailbox_service import create_routed_inbox_message
 
         supervisor_id = self._find_supervisor(metadata["tmux_session"])
         if not supervisor_id:
@@ -994,8 +993,8 @@ class AutoResponder:
         try:
 
             def publish() -> None:
-                create_inbox_message(terminal_id, supervisor_id, message)
-                inbox_service.deliver_pending(supervisor_id, registry=None)
+                # F136-D6/D17: routed supervisor push (no inline deliver_pending)
+                create_routed_inbox_message(terminal_id, supervisor_id, message)
 
             self._run_fenced_effect(
                 terminal_id,

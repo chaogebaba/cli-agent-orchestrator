@@ -158,6 +158,7 @@ class TestSupervisorPendingSentinel:
         assert (tmp_path / "supervisor-pending.flag").exists()
 
 
+@pytest.mark.xfail(reason="F136 retires legacy teammate_push structured logging (D1: single writer)")
 class TestTeammatePushObservability:
     """Tests for structured logging in attempt_teammate_push."""
 

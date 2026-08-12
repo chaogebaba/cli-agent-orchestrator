@@ -23,6 +23,9 @@ this project already treats git as authoritative elsewhere.
 import logging
 import os
 import subprocess
+import time
+from dataclasses import dataclass
+from typing import Optional
 
 from cli_agent_orchestrator.services.fork_context_service import assert_cwd_live
 
@@ -259,3 +262,157 @@ def parse_worktree_path(path: object) -> tuple[str, str] | None:
     if not repo_root or not terminal_id:
         return None
     return repo_root, terminal_id
+
+
+
+# --------------------------------------------------------------------------
+# F121: Worktree Branch Integrity — verification at settlement checkpoints
+# --------------------------------------------------------------------------
+
+# Total monotonic deadline for the 3-signal verification. Independent of
+# the 30-second _GIT_TIMEOUT_SECONDS used for provisioning/teardown.
+_VERIFY_DEADLINE_SECONDS = 5.0
+
+
+@dataclass
+class WorktreeIntegrityResult:
+    """Result of a worktree branch-integrity check (F121).
+
+    Every field is populated on every path; ``ok=True`` requires ALL three
+    signals to match.  ``ok=False`` with ``error`` set means git commands
+    failed or timed out (fail-closed).
+    """
+
+    ok: bool
+    expected_branch: str
+    expected_worktree_path: str
+    actual_toplevel: Optional[str] = None
+    actual_common_dir: Optional[str] = None
+    actual_branch: Optional[str] = None
+    cwd_escaped: bool = False
+    branch_escaped: bool = False
+    error: Optional[str] = None
+
+
+def _run_git_bounded(
+    args: list[str], cwd: str, remaining: float
+) -> subprocess.CompletedProcess:
+    """Run git with at most ``remaining`` seconds budget. Never raises."""
+    if remaining <= 0:
+        return subprocess.CompletedProcess(
+            args=["git", *args], returncode=1, stdout="", stderr="verification_timeout"
+        )
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=remaining,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args=["git", *args], returncode=1, stdout="", stderr="verification_timeout"
+        )
+    except OSError as e:
+        return subprocess.CompletedProcess(
+            args=["git", *args], returncode=1, stdout="", stderr=str(e)
+        )
+
+
+def verify_worktree_integrity(
+    live_cwd: str,
+    worktree_info: dict[str, str],
+) -> WorktreeIntegrityResult:
+    """Compare actual git state at live_cwd against CAO-owned expected state.
+
+    Runs three git queries in live_cwd under one 5.0-second monotonic deadline.
+    Any mismatch → ok=False. Git failure or deadline exhaustion → ok=False
+    with error populated (fail-closed).
+    """
+    expected_branch = worktree_info["expected_branch"]
+    expected_worktree_path = worktree_info["worktree_path"]
+    expected_repo_root = worktree_info["repo_root"]
+
+    deadline = time.monotonic() + _VERIFY_DEADLINE_SECONDS
+
+    # Signal 1: --show-toplevel (Class A detection)
+    remaining = deadline - time.monotonic()
+    result = _run_git_bounded(["rev-parse", "--show-toplevel"], live_cwd, remaining)
+    if result.returncode != 0:
+        error_text = result.stderr.strip() or "toplevel_query_failed"
+        if "verification_timeout" in error_text:
+            error_text = "verification_timeout"
+        return WorktreeIntegrityResult(
+            ok=False,
+            expected_branch=expected_branch,
+            expected_worktree_path=expected_worktree_path,
+            error=error_text,
+        )
+    actual_toplevel = result.stdout.strip()
+
+    # Signal 2: --git-common-dir (structural sanity)
+    remaining = deadline - time.monotonic()
+    result = _run_git_bounded(["rev-parse", "--git-common-dir"], live_cwd, remaining)
+    if result.returncode != 0:
+        error_text = result.stderr.strip() or "common_dir_query_failed"
+        if "verification_timeout" in error_text:
+            error_text = "verification_timeout"
+        return WorktreeIntegrityResult(
+            ok=False,
+            expected_branch=expected_branch,
+            expected_worktree_path=expected_worktree_path,
+            actual_toplevel=actual_toplevel,
+            error=error_text,
+        )
+    raw_common_dir = result.stdout.strip()
+    # Resolve relative common-dir against live_cwd
+    if not os.path.isabs(raw_common_dir):
+        actual_common_dir = os.path.realpath(os.path.join(live_cwd, raw_common_dir))
+    else:
+        actual_common_dir = os.path.realpath(raw_common_dir)
+
+    # Signal 3: symbolic-ref (Class B detection)
+    remaining = deadline - time.monotonic()
+    result = _run_git_bounded(["symbolic-ref", "--short", "HEAD"], live_cwd, remaining)
+    if result.returncode != 0:
+        # Detached HEAD or timeout
+        error_text = result.stderr.strip()
+        if "verification_timeout" in error_text:
+            return WorktreeIntegrityResult(
+                ok=False,
+                expected_branch=expected_branch,
+                expected_worktree_path=expected_worktree_path,
+                actual_toplevel=actual_toplevel,
+                actual_common_dir=actual_common_dir,
+                actual_branch=None,
+                branch_escaped=True,
+                cwd_escaped=(
+                    os.path.realpath(actual_toplevel) != os.path.realpath(expected_worktree_path)
+                ),
+                error="verification_timeout",
+            )
+        # Detached HEAD → branch_escaped
+        actual_branch: Optional[str] = None
+    else:
+        actual_branch = result.stdout.strip()
+
+    # Evaluate
+    cwd_escaped = os.path.realpath(actual_toplevel) != os.path.realpath(expected_worktree_path)
+    expected_common = os.path.realpath(os.path.join(expected_repo_root, ".git"))
+    common_dir_ok = os.path.realpath(actual_common_dir) == expected_common
+    branch_escaped = actual_branch != expected_branch
+
+    ok = not cwd_escaped and common_dir_ok and not branch_escaped
+
+    return WorktreeIntegrityResult(
+        ok=ok,
+        expected_branch=expected_branch,
+        expected_worktree_path=expected_worktree_path,
+        actual_toplevel=actual_toplevel,
+        actual_common_dir=actual_common_dir,
+        actual_branch=actual_branch,
+        cwd_escaped=cwd_escaped,
+        branch_escaped=branch_escaped,
+        error=None if ok else (None if not cwd_escaped and not branch_escaped else None),
+    )

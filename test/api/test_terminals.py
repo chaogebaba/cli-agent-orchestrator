@@ -1179,7 +1179,8 @@ class TestCreateInboxMessageEndpoint:
             ),
             patch("cli_agent_orchestrator.api.main.get_backend") as backend,
             patch(
-                "cli_agent_orchestrator.api.main.create_inbox_message", return_value=mock_msg
+                "cli_agent_orchestrator.api.main.create_inbox_message",
+                return_value=mock_msg,
             ) as create,
             patch("cli_agent_orchestrator.api.main.inbox_service"),
         ):
@@ -1207,12 +1208,14 @@ class TestCreateInboxMessageEndpoint:
                 return_value={"tmux_session": "cao-test", "tmux_window": "worker"},
             ),
             patch("cli_agent_orchestrator.api.main.get_backend") as mock_backend,
-            patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
+            patch(
+                "cli_agent_orchestrator.api.main.create_inbox_message",
+                return_value=mock_msg,
+            ) as mock_create,
             patch("cli_agent_orchestrator.api.main.inbox_service") as mock_inbox,
         ):
             mock_backend.return_value.session_exists.return_value = True
             mock_backend.return_value.get_history.return_value = ""
-            mock_create.return_value = mock_msg
 
             response = client.post(
                 "/terminals/abcd1234/inbox/messages",
@@ -1244,12 +1247,14 @@ class TestCreateInboxMessageEndpoint:
                 return_value={"tmux_session": "cao-test", "tmux_window": "worker"},
             ),
             patch("cli_agent_orchestrator.api.main.get_backend") as backend,
-            patch("cli_agent_orchestrator.api.main.create_inbox_message") as create,
+            patch(
+                "cli_agent_orchestrator.api.main.create_inbox_message",
+                return_value=mock_msg,
+            ) as create,
             patch("cli_agent_orchestrator.api.main.inbox_service"),
         ):
             backend.return_value.session_exists.return_value = True
             backend.return_value.get_history.return_value = ""
-            create.return_value = mock_msg
             response = client.post(
                 "/terminals/abcd1234/inbox/messages",
                 params={"sender_id": "sender1", "message": "park", "park_warm": True},
@@ -1261,12 +1266,12 @@ class TestCreateInboxMessageEndpoint:
     def test_logical_inbox_threads_park_warm_through_delivery_entry(self, client):
         row = MagicMock(id=3, sender_id="sender1", receiver_id="abcd1234")
         row.created_at.isoformat.return_value = "2026-07-20T12:00:00"
+        row.status = "pending"
         with (
             patch(
                 "cli_agent_orchestrator.services.mailbox_service.create_logical_inbox_message",
                 return_value=row,
             ) as create,
-            patch("cli_agent_orchestrator.api.main.inbox_service") as inbox,
         ):
             response = client.post(
                 "/terminals/mb_aaaaaaaa/inbox/messages",
@@ -1281,7 +1286,6 @@ class TestCreateInboxMessageEndpoint:
             refresh_ingest=False,
             park_warm=True,
         )
-        inbox.deliver_pending.assert_called_once()
 
     @pytest.mark.parametrize(
         ("barrier_field", "value"),
@@ -1326,12 +1330,14 @@ class TestCreateInboxMessageEndpoint:
                 return_value={"tmux_session": "cao-test", "tmux_window": "worker"},
             ),
             patch("cli_agent_orchestrator.api.main.get_backend") as mock_backend,
-            patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
+            patch(
+                "cli_agent_orchestrator.api.main.create_inbox_message",
+                return_value=mock_msg,
+            ),
             patch("cli_agent_orchestrator.api.main.inbox_service") as mock_inbox,
         ):
             mock_backend.return_value.session_exists.return_value = True
             mock_backend.return_value.get_history.return_value = ""
-            mock_create.return_value = mock_msg
             mock_inbox.deliver_pending.side_effect = Exception("TMux busy")
 
             response = client.post(
@@ -1408,11 +1414,13 @@ class TestCreateInboxMessageEndpoint:
                 return_value={"tmux_session": "cao-test", "tmux_window": "worker"},
             ),
             patch("cli_agent_orchestrator.api.main.get_backend") as mock_backend,
-            patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
+            patch(
+                "cli_agent_orchestrator.api.main.create_inbox_message",
+                side_effect=Exception("DB error"),
+            ),
         ):
             mock_backend.return_value.session_exists.return_value = True
             mock_backend.return_value.get_history.return_value = ""
-            mock_create.side_effect = Exception("DB error")
 
             response = client.post(
                 "/terminals/abcd1234/inbox/messages",

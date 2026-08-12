@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -11,6 +12,43 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+logger = logging.getLogger(__name__)
+
+
+def _as_utc(dt: datetime | None) -> datetime | None:
+    """Coerce a naive-at-rest DB datetime to UTC (same logic as database._as_utc)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc)
+    return dt.replace(tzinfo=timezone.utc)
+
+
+def _compute_init_health(row: dict[str, Any], now: datetime) -> str | None:
+    """Derive init_health from init_state and deadline (F124 S1).
+
+    Returns "ready", "launching", "failed", or None (legacy/missing).
+    """
+    init_state = row.get("init_state")
+    if init_state is None:
+        return None
+    if init_state == "ready":
+        return "ready"
+    if init_state.startswith("init_failed"):
+        return "failed"
+    if init_state == "init_pending":
+        init_started_at = _as_utc(row.get("init_started_at"))
+        deadline_s = row.get("init_deadline_s")
+        if init_started_at is None or not isinstance(deadline_s, (int, float)):
+            # Malformed pending — fail-closed with structured reason, never throw.
+            return "failed"
+        elapsed = (now - init_started_at).total_seconds()
+        if elapsed >= float(deadline_s):
+            return "failed"
+        return "launching"
+    # Unknown state — omit rather than crash.
+    return None
 
 
 def _depths(rows: list[dict[str, Any]]) -> dict[str, int]:
@@ -73,6 +111,10 @@ def build_fleet(session_name: str) -> dict[str, Any]:
             status = TerminalStatus.ERROR
         if has_native_inventory and row["tmux_window"] not in windows:
             status = TerminalStatus.ERROR
+        # F124 S1: compute init_health; failed health overrides status to ERROR.
+        init_health = _compute_init_health(row, now)
+        if init_health == "failed":
+            status = TerminalStatus.ERROR
         last_active = row.get("last_active")
         if last_active is not None:
             if last_active.tzinfo is None:
@@ -100,6 +142,8 @@ def build_fleet(session_name: str) -> dict[str, Any]:
                 "depth": depths[row["id"]],
                 "orphan": orphan,
                 "status": status.value,
+                "init_state": row.get("init_state"),
+                "init_health": init_health,
                 "since_last_input": since_last_input,
                 "lifecycle": row.get("lifecycle", "ephemeral"),
                 "reparented_from": row.get("reparented_from"),

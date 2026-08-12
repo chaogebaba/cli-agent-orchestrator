@@ -44,7 +44,7 @@ def test_cancel_releases_and_wakes_each_receiver(client):
                 "receiver_ids": ["aaaaaaaa", "bbbbbbbb"],
             },
         ),
-        patch("cli_agent_orchestrator.api.main.inbox_service.deliver_pending") as deliver,
+        patch("cli_agent_orchestrator.services.inbox_service.request_delivery") as deliver,
     ):
         response = client.post("/barriers/cancel", params={"barrier_id": 9})
     assert response.status_code == 200

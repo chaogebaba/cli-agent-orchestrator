@@ -29,6 +29,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, assert_never, cast
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -510,6 +511,26 @@ def _rollback_terminal_creation(
     db_created: bool,
 ) -> None:
     """Single rollback seam preserving pipe-pane -> FIFO -> window/session order."""
+    # F138: Abandon the incarnation on creation failure
+    try:
+        from cli_agent_orchestrator.clients.database import (
+            ProcessIncarnationModel,
+            SessionLocal,
+            f138_abandon_incarnation,
+        )
+
+        with SessionLocal() as db:
+            inc = (
+                db.query(ProcessIncarnationModel)
+                .filter_by(terminal_id=terminal_id, state="launching")
+                .order_by(ProcessIncarnationModel.created_at.desc())
+                .first()
+            )
+            if inc is not None:
+                f138_abandon_incarnation(inc.id)
+    except Exception:
+        pass
+
     if db_created:
         try:
             delete_terminal_and_warm_intent(terminal_id, preserve_warm_intent=False)
@@ -697,6 +718,28 @@ def _acquire_resume_creation_authority(
         if owned_lifecycle:
             release_session_lifecycle_lease(session_lifecycle_lease_token)
         raise
+
+
+def _capture_f138_issuance_context() -> tuple[int | None, str | None]:
+    """D18: Capture issuance context for pre-issuance fence.
+
+    Returns (issuance_ticks, issuance_boot_id).
+    issuance_ticks: integer clock ticks since boot (CLOCK_BOOTTIME * SC_CLK_TCK).
+    issuance_boot_id: current kernel boot_id string.
+    """
+    issuance_boot_id: str | None = None
+    issuance_ticks: int | None = None
+    try:
+        issuance_boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        pass
+    try:
+        issuance_ticks = int(
+            time.clock_gettime(time.CLOCK_BOOTTIME) * os.sysconf("SC_CLK_TCK")
+        )
+    except (OSError, ValueError, AttributeError):
+        pass
+    return issuance_ticks, issuance_boot_id
 
 
 async def create_terminal(
@@ -998,7 +1041,70 @@ async def create_terminal(
                     context_policy,
                     working_directory,
                 )
-        env_vars = bind_pane_identity(env_vars, terminal_id, plan=persona_plan)
+        # F138: Reserve process incarnation token before window creation.
+        # Process-less providers (has_process_child=False) skip this entirely.
+        _f138_incarnation_id: str | None = None
+        _f138_token: str | None = None
+        _f138_generation: int = 0
+        _has_process_child = True
+        try:
+            _provider_cls = get_provider_class(provider)
+            _has_process_child = getattr(_provider_cls, "has_process_child", True)
+        except Exception:
+            pass
+
+        # F138-R6 D24: sandbox fixture variant override — manifest is authoritative
+        # for process-less determination before reservation (class attr is too late).
+        if _has_process_child and provider == "mock_cli":
+            try:
+                from cli_agent_orchestrator.utils.provider_plane import (
+                    load_active_fixture_provider,
+                )
+
+                _fixture_cap = load_active_fixture_provider("mock_cli")
+                if _fixture_cap.variant == "process-less":
+                    _has_process_child = False
+            except Exception:
+                pass  # Non-sandbox or manifest read failure → class attr stands
+
+        if _has_process_child:
+            from cli_agent_orchestrator.clients.database import f138_reserve_incarnation
+            from cli_agent_orchestrator.services.orphan_reconcile_service import (
+                generate_incarnation_token,
+                hash_token,
+            )
+
+            _f138_token = generate_incarnation_token()
+            _f138_token_hash = hash_token(_f138_token)
+            # Get current lifecycle_generation from the terminal_id's existing row
+            # (for new terminals it will be incremented by the create call below)
+            _f138_generation = 0
+            try:
+                _existing_meta = get_terminal_metadata(terminal_id)
+                if _existing_meta:
+                    _f138_generation = int(_existing_meta.get("lifecycle_generation", 0)) + 1
+                else:
+                    _f138_generation = 1  # new terminal starts at gen 1
+            except Exception:
+                _f138_generation = 1
+
+            # D18: Capture issuance context for pre-issuance fence.
+            _f138_issuance_ticks, _f138_issuance_boot_id = _capture_f138_issuance_context()
+
+            _f138_incarnation_id = f138_reserve_incarnation(
+                terminal_id=terminal_id,
+                terminal_generation=_f138_generation,
+                token=_f138_token,
+                token_hash=_f138_token_hash,
+                owner_uid=os.getuid(),
+                provider=provider,
+                issuance_ticks=_f138_issuance_ticks,
+                issuance_boot_id=_f138_issuance_boot_id,
+            )
+
+        env_vars = bind_pane_identity(
+            env_vars, terminal_id, plan=persona_plan, incarnation_token=_f138_token
+        )
 
         window_name = generate_window_name(agent_profile)
 
@@ -1023,6 +1129,19 @@ async def create_terminal(
             working_directory = await asyncio.to_thread(
                 worktree_service.create_worktree, worktree_repo_root, terminal_id
             )
+            # F121: Build the CAO-owned authority record for branch integrity
+            # verification. Written in the same INSERT as the terminal row below.
+            from datetime import datetime as _dt, timezone as _tz
+
+            _worktree_info_dict: dict[str, str] | None = {
+                "repo_root": worktree_repo_root,
+                "worktree_path": working_directory,
+                "expected_branch": worktree_service.branch_for(terminal_id),
+                "terminal_id": terminal_id,
+                "provisioned_at": _dt.now(_tz.utc).isoformat(),
+            }
+        else:
+            _worktree_info_dict = None
 
         # Step 2: Create tmux session or window
         if new_session:
@@ -1125,12 +1244,13 @@ async def create_terminal(
                 get_backend().pipe_pane(s, w, p)
 
             try:
-                try:
-                    fifo_manager.create_reader(
-                        terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe
-                    )
-                except TypeError:
-                    fifo_manager.create_reader(terminal_id)
+                fifo_manager.create_reader(
+                    terminal_id,
+                    pane_probe=_probe_pane,
+                    rearm=_rearm_pipe,
+                    terminal_generation=_f138_generation,
+                    incarnation_id=_f138_incarnation_id,
+                )
                 fifo_attached = True
             except Exception as exc:
                 if lease_token is not None:
@@ -1203,6 +1323,7 @@ async def create_terminal(
                                 ),
                                 group=group,
                                 metadata=metadata,
+                                worktree_info=_worktree_info_dict,
                                 **init_fields,
                             )
                         else:
@@ -1227,6 +1348,7 @@ async def create_terminal(
                                 ),
                                 group=group,
                                 metadata=metadata,
+                                worktree_info=_worktree_info_dict,
                                 **init_fields,
                             )
                     else:
@@ -1254,6 +1376,7 @@ async def create_terminal(
                                     ),
                                     group=group,
                                     metadata=metadata,
+                                    worktree_info=_worktree_info_dict,
                                     **init_fields,
                                 )
                             else:
@@ -1279,6 +1402,7 @@ async def create_terminal(
                                     ),
                                     group=group,
                                     metadata=metadata,
+                                    worktree_info=_worktree_info_dict,
                                     **init_fields,
                                 )
                         else:
@@ -1303,6 +1427,7 @@ async def create_terminal(
                                     ),
                                     group=group,
                                     metadata=metadata,
+                                    worktree_info=_worktree_info_dict,
                                     **init_fields,
                                 )
                             else:
@@ -1327,6 +1452,7 @@ async def create_terminal(
                                     ),
                                     group=group,
                                     metadata=metadata,
+                                    worktree_info=_worktree_info_dict,
                                     **init_fields,
                                 )
         except Exception as exc:
@@ -1445,8 +1571,11 @@ async def create_terminal(
                 fork_context=fork_context,
                 refresh_base_name=refresh_base_name,
                 park_warm=park_warm,
+                f138_incarnation_id=_f138_incarnation_id,
             )
         else:
+            # D21: Exposure boundary = pane+token already bound before initialize
+            _f138_sync_exposure_crossed = _f138_incarnation_id is not None
             try:
                 await provider_instance.initialize()
             except (NativeHomeIsolationUnavailable, ProviderAuthRefreshFailed):
@@ -1457,6 +1586,21 @@ async def create_terminal(
                 if lease_token is not None:
                     raise RuntimeError("initialize_failed") from exc
                 raise
+            # F138 D21: strict activation in sync path (after launch health)
+            if _f138_incarnation_id is not None:
+                await _confirm_launch_health(terminal_id, provider_instance)
+                from cli_agent_orchestrator.clients.database import (
+                    f138_strict_activate,
+                )
+
+                _sync_act = f138_strict_activate(_f138_incarnation_id)
+                if _sync_act.outcome in ("activated", "already_active"):
+                    pass  # expected — continue
+                elif _sync_act.outcome == "needs_settlement":
+                    raise RuntimeError("incarnation_needs_settlement")
+                else:
+                    # "missing" with non-null pinned ID = non-durable
+                    raise RuntimeError("incarnation_non_durable_missing")
             try:
                 _persist_provider_runtime_identity(
                     provider_instance,
@@ -1551,6 +1695,58 @@ async def create_terminal(
     except Exception as e:
         # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
+
+        # D23: Post-exposure sync settlement — if exposure boundary was crossed,
+        # force-reconcile first. Only durable proof allows teardown; non-durable
+        # must retain pane/row/FIFO/provider, quarantine, attention, re-raise.
+        _sync_exposed = locals().get("_f138_sync_exposure_crossed", False)
+        _sync_inc_id = locals().get("_f138_incarnation_id")
+        if _sync_exposed and _sync_inc_id is not None:
+            from cli_agent_orchestrator.clients.database import (
+                f138_emit_attention_message,
+                f138_force_reconcile_incarnation,
+                set_terminal_recovery_state,
+            )
+
+            try:
+                fr_result = f138_force_reconcile_incarnation(
+                    _sync_inc_id, source="sync_post_exposure"
+                )
+            except Exception:
+                fr_result = None
+                logger.exception(
+                    "f138_sync_post_exposure_force_failed terminal=%s", terminal_id
+                )
+
+            durable = fr_result is not None and fr_result.outcome in (
+                "created",
+                "job_already_exists",
+                "reconciled_proven",
+            )
+
+            if not durable:
+                # Non-durable: retain physical resources, quarantine, attention, re-raise
+                quarantine_ok = False
+                try:
+                    quarantine_ok = set_terminal_recovery_state(
+                        terminal_id,
+                        "rollback_kill_uncertain",
+                        error=f"sync_post_exposure_non_durable: {repr(e)[:150]}",
+                    )
+                except Exception:
+                    logger.exception(
+                        "f138_sync_quarantine_failed terminal=%s", terminal_id
+                    )
+                f138_emit_attention_message(
+                    terminal_id,
+                    f"[F138] Terminal {terminal_id} sync post-exposure failure "
+                    f"with non-durable reconcile "
+                    f"(quarantine={'persisted' if quarantine_ok else 'FAILED'}). "
+                    f"Physical resources retained. Manual review needed.",
+                )
+                raise  # re-raise original exception without rollback fallthrough
+
+        # --- Ordinary rollback (pre-exposure or durable-proven) ---
         quiesce_error = None
         if defer_init and has_deferred_init(terminal_id):
             try:
@@ -1660,6 +1856,7 @@ _PERSIST_FAILURE_CODES = {
     "shell_baseline_unavailable",
     "terminal_identity_persist_failed",
     "terminal_cwd_unavailable",
+    "provider_launch_failed",
 }
 
 
@@ -1667,6 +1864,14 @@ class _DeferredInitFailure(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+class ProviderLaunchFailed(_DeferredInitFailure):
+    """F124 S6: provider process tree confirmed dead immediately after initialize()."""
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__("provider_launch_failed")
+        self.detail = detail
 
 
 def _failure_code(exc: BaseException) -> str:
@@ -1708,7 +1913,45 @@ def _notice_text(
     )
     if reason:
         base += f" reason={reason}"
+    # F124 S7: append actionable hint based on pre/post delivery classification
+    hint = _notice_action_hint(code)
+    if hint:
+        base += f" | {hint}"
     return base
+
+
+# F124 S7: pre-delivery failure codes — task was NOT delivered to the worker
+_PRE_DELIVERY_CODES = frozenset({
+    "provider_launch_failed",
+    "identity_persist_failed",
+    "terminal_cwd_unavailable",
+    "shell_baseline_unavailable",
+    "terminal_metadata_missing",
+})
+
+# F124 S7: unknown-delivery codes — watchdog fired but delivery state is ambiguous
+_UNKNOWN_DELIVERY_CODES = frozenset({
+    "deferred_init_watchdog_deadline",
+})
+
+
+def _notice_action_hint(code: str) -> str:
+    """F124 S7: return a plain-text actionable hint for the failure code."""
+    if code in _PRE_DELIVERY_CODES:
+        return (
+            "The assigned task was NOT delivered. "
+            "Re-dispatch with assign if needed."
+        )
+    if code in _UNKNOWN_DELIVERY_CODES:
+        return (
+            "Worker initialization timed out; task delivery state is unknown. "
+            "Inspect the terminal before re-dispatching."
+        )
+    # Post-delivery or unclassified code — task MAY have been delivered
+    return (
+        "Task delivery was attempted but the worker died before confirming receipt. "
+        "Re-dispatch with assign if needed."
+    )
 
 
 def _register_deferred_call(terminal_id: str, generation: str, call: DeferredCall) -> None:
@@ -2826,6 +3069,14 @@ async def _confirm_worker_started_or_resubmit(
     ):
         return True
 
+    # F139 D10: a process-less fixture provider has no child and no pane
+    # composer, so status stays IDLE and _message_visible_in_box can never
+    # confirm. The provider reports a stable IDLE immediately after init and
+    # its send path already recorded the sandbox receipt — treat as started.
+    _fixture_cap = getattr(provider, "_fixture_capability", None)
+    if _fixture_cap is not None and getattr(_fixture_cap, "variant", None) == "process-less":
+        return True
+
     for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
         current_status = status_monitor.get_status(terminal_id)
         if current_status == TerminalStatus.WAITING_USER_ANSWER:
@@ -2898,6 +3149,101 @@ async def _confirm_worker_started_or_resubmit(
     return False
 
 
+# --- F124 S5/S6: launch health probe -----------------------------------------
+
+
+async def _provider_child_alive(terminal_id: str, provider) -> bool | None:
+    """F124 S5: prove provider process tree is not an empty/dead pane.
+
+    Returns:
+        True  — alive (descendants found or exec-replaced or no-process provider)
+        False — confirmed dead (empty shell, vanished pane)
+        None  — inconclusive (missing procfs/baseline) → degrade to F110 watchdog
+    """
+    from cli_agent_orchestrator.services.fork_context_service import (
+        _PROC_ROOT,
+        _descendants,
+        _procfs_available,
+    )
+
+    # Step 1: process-less provider short-circuits without procfs access
+    if not getattr(provider, "has_process_child", True):
+        return True
+
+    # Step 1b (F139 r5 D15): provider confirmed fixture child death during
+    # initialize — deterministic False without procfs/tmux race.
+    if provider.launch_health_failure_confirmed:
+        return False
+
+    # Step 2: procfs availability
+    if not _procfs_available():
+        logger.warning(
+            "f124_procfs_unavailable terminal=%s — degrading to F110 watchdog",
+            terminal_id,
+        )
+        return None
+
+    # Step 3: resolve pane PID
+    metadata = get_terminal_metadata(terminal_id)
+    if metadata is None:
+        return False
+
+    from cli_agent_orchestrator.services.fork_context_service import pane_pid as _pane_pid
+
+    try:
+        pid = _pane_pid(metadata["tmux_session"], metadata["tmux_window"])
+    except Exception:
+        return False
+
+    # Verify the pane PID's /proc entry exists
+    if not (_PROC_ROOT / str(pid) / "stat").exists():
+        return False
+
+    # Step 4: full descendant tree
+    descendants = _descendants(pid)
+    if len(descendants) > 1:
+        return True
+
+    # Step 5: exec-replacement check (pane command != shell baseline)
+    baseline = getattr(provider, "shell_baseline", None) or getattr(
+        provider, "_shell_baseline", None
+    )
+    try:
+        from cli_agent_orchestrator.backends.registry import get_backend as _get_backend
+
+        current_command = _get_backend().get_pane_current_command(
+            metadata["tmux_session"], metadata["tmux_window"]
+        )
+    except Exception:
+        current_command = None
+
+    if not baseline or not current_command:
+        # Cannot compare — inconclusive
+        return None
+
+    if current_command != baseline:
+        # Shell was exec-replaced by the provider binary
+        return True
+
+    # Step 6: current command equals baseline → confirmed empty shell
+    return False
+
+
+async def _confirm_launch_health(terminal_id: str, provider) -> None:
+    """F124 S6: confirm provider is alive after initialize(); raise on confirmed death."""
+    import asyncio as _asyncio
+
+    grace = max(0.0, float(getattr(provider, "launch_health_grace_s", 0.0)))
+    if grace:
+        await _asyncio.sleep(grace)
+
+    alive = await _provider_child_alive(terminal_id, provider)
+    if alive is False:
+        raise ProviderLaunchFailed(
+            f"provider process tree is empty/dead for terminal {terminal_id}"
+        )
+
+
 def _schedule_deferred_init(
     provider_instance,
     terminal_id: str,
@@ -2913,6 +3259,7 @@ def _schedule_deferred_init(
     fork_context=None,
     refresh_base_name: str | None = None,
     park_warm: bool = False,
+    f138_incarnation_id: str | None = None,
 ) -> None:
     """Kick off provider.initialize() in the background and, on success,
     deliver the initial message via send_input.
@@ -2975,6 +3322,10 @@ def _schedule_deferred_init(
         )
 
     async def _run() -> None:
+        # D21: Exposure boundary = pane+token already bound by the time _run starts.
+        # If we have a pinned incarnation_id, the process-bearing token is in the
+        # live pane — ANY exception from here on must enter force settlement.
+        _f138_exposure_crossed = f138_incarnation_id is not None
         try:
             provider_instance.blocked_wait_notifier = _notify_blocked_wait
             prepared_message = await _prepare_fork_message(
@@ -2987,6 +3338,23 @@ def _schedule_deferred_init(
                 snapshot,
             )
             await provider_instance.initialize()
+            # F124 S6: confirm provider process is alive before proceeding
+            await _confirm_launch_health(terminal_id, provider_instance)
+            # F138 D21: strict activation with pinned incarnation ID
+            if f138_incarnation_id is not None:
+                from cli_agent_orchestrator.clients.database import (
+                    ActivationResult,
+                    f138_strict_activate,
+                )
+
+                _act_result = f138_strict_activate(f138_incarnation_id)
+                if _act_result.outcome in ("activated", "already_active"):
+                    pass  # expected — continue
+                elif _act_result.outcome == "needs_settlement":
+                    raise _DeferredInitFailure("incarnation_needs_settlement")
+                else:
+                    # "missing" with non-null pinned ID = non-durable, not process-less
+                    raise _DeferredInitFailure("incarnation_activation_missing")
             prepared, _ = await _tracked_blocking(
                 terminal_id,
                 generation,
@@ -3169,20 +3537,99 @@ def _schedule_deferred_init(
             # (the exception text can contain provider-supplied content).
             logger.error(
                 "Deferred init for terminal %s failed: %r. "
-                "Notifying caller and tearing down worker.",
+                "exposure_crossed=%s",
                 terminal_id,
                 e,
+                _f138_exposure_crossed,
                 exc_info=True,
             )
-            await _claim_and_settle_deferred_failure(
-                terminal_id,
-                generation,
-                snapshot,
-                _failure_code(e),
-                registry,
-                uuid_lease_token,
-                reason=repr(e)[:200],
-            )
+            if not _f138_exposure_crossed or f138_incarnation_id is None:
+                # Pre-exposure or process-less: ordinary rollback path
+                await _claim_and_settle_deferred_failure(
+                    terminal_id,
+                    generation,
+                    snapshot,
+                    _failure_code(e),
+                    registry,
+                    uuid_lease_token,
+                    reason=repr(e)[:200],
+                )
+            else:
+                # D23: Post-exposure — force reconcile, then check durability
+                from cli_agent_orchestrator.clients.database import (
+                    f138_emit_attention_message,
+                    f138_force_reconcile_incarnation,
+                    set_terminal_recovery_state,
+                )
+
+                try:
+                    fr_result = f138_force_reconcile_incarnation(
+                        f138_incarnation_id, source="deferred_post_exposure"
+                    )
+                except Exception:
+                    fr_result = None
+                    logger.exception(
+                        "f138_post_exposure_force_reconcile_failed terminal=%s",
+                        terminal_id,
+                    )
+
+                # Durable = force created a job OR proved reconciliation complete
+                durable = fr_result is not None and fr_result.outcome in (
+                    "created",
+                    "job_already_exists",
+                    "reconciled_proven",
+                )
+
+                if durable:
+                    # Durable: teardown allowed — bare delete (no abandon)
+                    logger.info(
+                        "f138_post_exposure_durable terminal=%s outcome=%s — teardown",
+                        terminal_id,
+                        fr_result.outcome,
+                    )
+                    await _claim_and_settle_deferred_failure(
+                        terminal_id,
+                        generation,
+                        snapshot,
+                        _failure_code(e),
+                        registry,
+                        uuid_lease_token,
+                        reason=repr(e)[:200],
+                    )
+                else:
+                    # Non-durable: fail closed — retain pane/row/FIFO/provider.
+                    # Attempt quarantine marker; if THAT fails, still retain
+                    # physical resources and emit best-effort attention.
+                    logger.error(
+                        "f138_post_exposure_non_durable terminal=%s fr_outcome=%s — "
+                        "retaining as rollback_kill_uncertain",
+                        terminal_id,
+                        fr_result.outcome if fr_result else "db_error",
+                    )
+                    quarantine_persisted = False
+                    try:
+                        quarantine_persisted = set_terminal_recovery_state(
+                            terminal_id,
+                            "rollback_kill_uncertain",
+                            error=f"post_exposure_non_durable: {repr(e)[:150]}",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "f138_quarantine_commit_failed terminal=%s", terminal_id
+                        )
+
+                    # Shared DB-only one-shot attention (works even without caller_id)
+                    detail = (
+                        f"quarantine={'persisted' if quarantine_persisted else 'FAILED'}"
+                    )
+                    f138_emit_attention_message(
+                        terminal_id,
+                        f"[F138] Terminal {terminal_id} post-exposure failure "
+                        f"with non-durable reconcile ({detail}). "
+                        f"Physical resources retained. Manual review needed.",
+                    )
+                    # Return without teardown — finally block releases leases only
+                    return
         finally:
             if owns_uuid_lease and uuid_lease_token is not None:
                 from cli_agent_orchestrator.services.provider_session_lease import (
@@ -3268,7 +3715,7 @@ def get_terminal(terminal_id: str) -> Dict:
         input_gen = status_monitor.get_input_gen(terminal_id)
         status_gen = status_monitor.get_status_gen(terminal_id)
 
-        return {
+        result = {
             "id": metadata["id"],
             "name": metadata["tmux_window"],
             "provider": metadata["provider"],
@@ -3286,6 +3733,40 @@ def get_terminal(terminal_id: str) -> Dict:
             "status_gen": 0 if status_gen is None else status_gen,
             "last_active": metadata["last_active"],
         }
+
+        # F121: pull-based branch integrity verification for worktree-backed terminals
+        _wt_info = metadata.get("worktree_info")
+        if _wt_info is not None:
+            from dataclasses import asdict as _asdict
+
+            try:
+                live_cwd = get_backend().get_pane_working_directory(
+                    metadata["tmux_session"], metadata["tmux_window"]
+                )
+            except Exception:
+                live_cwd = None
+            if live_cwd:
+                from cli_agent_orchestrator.services.worktree_service import (
+                    verify_worktree_integrity,
+                )
+
+                integrity = verify_worktree_integrity(live_cwd, _wt_info)
+                result["branch_integrity"] = _asdict(integrity)
+            else:
+                from cli_agent_orchestrator.services.worktree_service import (
+                    WorktreeIntegrityResult,
+                )
+
+                result["branch_integrity"] = _asdict(
+                    WorktreeIntegrityResult(
+                        ok=False,
+                        expected_branch=_wt_info["expected_branch"],
+                        expected_worktree_path=_wt_info["worktree_path"],
+                        error="cwd_unavailable",
+                    )
+                )
+
+        return result
 
     except Exception as e:
         logger.error(f"Failed to get terminal {terminal_id}: {e}")
@@ -3396,6 +3877,67 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
         raise
 
 
+def _is_coroutine_function(value: Any) -> bool:
+    """Return whether ``value`` is an async coroutine function.
+
+    ``asyncio.iscoroutinefunction`` is deprecated in Python 3.16; use the
+    inspect equivalent, which handles both ``def async`` and partial-wrapped
+    coroutines identically for the fixture send-override check.
+    """
+    import inspect
+
+    return inspect.iscoroutinefunction(value)
+
+
+def _fixture_send_input_override(provider, message: str) -> bool:
+    """F139 D9/D10/D11: dispatch a sandbox fixture provider's send_input override.
+
+    Returns True when the provider is a sandbox fixture provider whose
+    manifest-pinned variant requires fixture-specific send behavior
+    (process-less receipt, post-send-death receipt+raise, procfs-unavailable
+    block). The override is an async coroutine; it runs on a fresh event loop
+    in this thread (the module send paths run in a dispatcher/executor thread
+    with no running loop). Production providers never define a fixture
+    capability and are untouched.
+    """
+    if provider is None:
+        return False
+    capability = getattr(provider, "_fixture_capability", None)
+    if capability is None:
+        return False
+    variant = getattr(capability, "variant", None)
+    if variant in (None, "healthy", "empty-shell"):
+        # healthy uses the ordinary paste path; empty-shell never reaches
+        # delivery (F124 launch-health settles it first).
+        return False
+    override = getattr(provider, "send_input", None)
+    if not callable(override) or not _is_coroutine_function(override):
+        return False
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(override(message))
+    else:
+        # Running inside an event-loop thread — run the override on a fresh
+        # daemon thread so we never block the server loop.
+        import threading as _threading
+
+        exc_holder: list[BaseException] = []
+
+        def _run() -> None:
+            try:
+                asyncio.run(override(message))
+            except BaseException as exc:  # noqa: BLE001 - re-raised in caller
+                exc_holder.append(exc)
+
+        thread = _threading.Thread(target=_run, daemon=True)
+        thread.start()
+        thread.join()
+        if exc_holder:
+            raise exc_holder[0]
+    return True
+
+
 def send_input(
     terminal_id: str,
     message: str,
@@ -3405,6 +3947,7 @@ def send_input(
     defer_on_dialog: bool = False,
     *,
     expect_callback: bool = True,
+    _lifecycle_internal: bool = False,
 ) -> bool:
     """Send input to terminal via tmux paste buffer.
 
@@ -3412,6 +3955,13 @@ def send_input(
     of Enter keys sent after pasting is determined by the provider's
     ``paste_enter_count`` property (e.g., some TUIs need 2 Enters because
     bracketed paste triggers multi-line mode).
+
+    Args:
+        _lifecycle_internal: When True, bypass the pre-send status check.
+            Reserved for internal lifecycle operations (exit_terminal_cli)
+            that must send input while the terminal is in a recovery state
+            that would otherwise block public callers.  Never expose this
+            to API callers or orchestration endpoints.
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
@@ -3424,7 +3974,11 @@ def send_input(
             if isinstance(orchestration_type, OrchestrationType)
             else str(orchestration_type or "")
         )
-        if provider:
+        # F139 D9/D10/D11: fixture providers with a manifest-pinned non-healthy
+        # variant intercept the entire send path (receipt / block / raise).
+        if _fixture_send_input_override(provider, message):
+            return True
+        if provider and not _lifecycle_internal:
             current_status = status_monitor.get_status(terminal_id)
             # Pre-paste guard order: dead-provider ERROR, interactive WAITING,
             # then the existing draft guard immediately before injection.
@@ -3656,6 +4210,9 @@ def send_prepared_input(
             )
             raise PaneIdentityMismatchError(identity_failure)
     provider = provider_manager.get_provider(terminal_id)
+    # F139 D9/D10/D11: fixture providers intercept the send path.
+    if _fixture_send_input_override(provider, message):
+        return None
     enter_count = provider.paste_enter_count if provider else 1
     prepared_stash = None
     if isinstance(getattr(provider, "composer_stash_keys", None), list):
@@ -3773,7 +4330,7 @@ def exit_terminal_cli(terminal_id: str) -> None:
     if exit_command.startswith(("C-", "M-")):
         send_special_key(terminal_id, exit_command)
     else:
-        send_input(terminal_id, exit_command)
+        send_input(terminal_id, exit_command, _lifecycle_internal=True)
 
     # Layer B (F115): suppress auto-responder scans on this terminal after exit.
     # Exit residue (final report table + exit chrome) should not trigger unknown
@@ -4368,6 +4925,35 @@ def _delete_terminal_under_lease(
                     "allowed_tools": metadata.get("allowed_tools"),
                     "caller_id": metadata.get("caller_id"),
                 }
+
+                # F121: worktree branch integrity check at teardown
+                _teardown_worktree_info = metadata.get("worktree_info")
+                if _teardown_worktree_info and live_working_directory:
+                    from cli_agent_orchestrator.services.worktree_service import (
+                        verify_worktree_integrity,
+                    )
+                    from dataclasses import asdict as _asdict
+
+                    _integrity = verify_worktree_integrity(
+                        live_working_directory, _teardown_worktree_info
+                    )
+                    snapshot["worktree_branch_integrity"] = _asdict(_integrity)
+                    if not _integrity.ok:
+                        logger.warning(
+                            "F121 branch integrity ESCAPE detected at teardown for "
+                            "terminal %s: expected_branch=%s, actual_branch=%s, "
+                            "expected_worktree_path=%s, actual_toplevel=%s, "
+                            "cwd_escaped=%s, branch_escaped=%s, error=%s",
+                            terminal_id,
+                            _integrity.expected_branch,
+                            _integrity.actual_branch,
+                            _integrity.expected_worktree_path,
+                            _integrity.actual_toplevel,
+                            _integrity.cwd_escaped,
+                            _integrity.branch_escaped,
+                            _integrity.error,
+                        )
+
                 snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
                 snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
             except Exception as e:
@@ -4488,12 +5074,78 @@ def _delete_terminal_under_lease(
             from cli_agent_orchestrator.services.memory_service import _curator_locks
 
             _curator_locks.pop(terminal_id, None)
-            deletion_kwargs: dict[str, Any] = {
-                "preserve_warm_intent": preserve_warm_intent,
-            }
-            if reparent_target_id is not None:
-                deletion_kwargs["reparent_target_id"] = reparent_target_id
-            deletion = delete_terminal_and_warm_intent(terminal_id, **deletion_kwargs)
+            # F138 D11/D24: Force-reconcile by exact terminal_id + persisted generation.
+            # No fallback lookup. Missing row or force failure = fail closed (prevent delete).
+            _f138_delete_authorized = True
+            _term_gen = metadata.get("lifecycle_generation") if metadata else None
+            if _term_gen is not None:
+                from cli_agent_orchestrator.clients.database import (
+                    f138_force_reconcile_incarnation,
+                    f138_get_incarnation_by_terminal_generation,
+                )
+
+                _inc_row = f138_get_incarnation_by_terminal_generation(
+                    terminal_id, _term_gen
+                )
+                if _inc_row is not None:
+                    try:
+                        _fr = f138_force_reconcile_incarnation(
+                            _inc_row["id"], source="delete_terminal"
+                        )
+                        if _fr.outcome in (
+                            "non_durable_invariant",
+                            "non_durable_missing",
+                        ):
+                            # Non-durable: fail closed — prevent deletion
+                            _f138_delete_authorized = False
+                            logger.error(
+                                "f138_delete_non_durable terminal=%s outcome=%s — "
+                                "preventing delete",
+                                terminal_id,
+                                _fr.outcome,
+                            )
+                    except Exception:
+                        # DB error: fail closed — prevent deletion
+                        _f138_delete_authorized = False
+                        logger.error(
+                            "f138_delete_force_db_error terminal=%s — preventing delete",
+                            terminal_id,
+                            exc_info=True,
+                        )
+                # _inc_row is None with a known generation: process-less provider,
+                # no incarnation row exists — deletion is safe
+
+            if not _f138_delete_authorized:
+                from cli_agent_orchestrator.clients.database import (
+                    f138_emit_attention_message,
+                    set_terminal_recovery_state,
+                )
+
+                try:
+                    set_terminal_recovery_state(
+                        terminal_id,
+                        "rollback_kill_uncertain",
+                        error="delete_non_durable_force",
+                    )
+                except Exception:
+                    pass
+                f138_emit_attention_message(
+                    terminal_id,
+                    f"[F138] Delete of {terminal_id} blocked: force-reconcile "
+                    f"non-durable. Terminal retained for manual review.",
+                )
+                # Fake a "not deleted" result to preserve the terminal
+                deletion = {
+                    "terminal_deleted": False,
+                    "intent_deleted": False,
+                }
+            else:
+                deletion_kwargs: dict[str, Any] = {
+                    "preserve_warm_intent": preserve_warm_intent,
+                }
+                if reparent_target_id is not None:
+                    deletion_kwargs["reparent_target_id"] = reparent_target_id
+                deletion = delete_terminal_and_warm_intent(terminal_id, **deletion_kwargs)
         finally:
             delivery_lock.release()
         deleted = deletion["terminal_deleted"]

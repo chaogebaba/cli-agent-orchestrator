@@ -1010,15 +1010,15 @@ class HerdrInboxService:
             workspace_id, proven=bool(intent and intent.get("state") == "issued_ok")
         )
 
-    # TODO: _deliver() calls callback synchronously — if callback is async,
-    # this will need a threadsafe bridge (out of scope for this change).
+    # F136-D17: Herdr uses request_delivery, never synchronous delivery on loop.
     def _deliver(self, terminal_id: str) -> None:
-        """Check and deliver pending messages for a terminal."""
-        if self._delivery_callback:
-            try:
-                self._delivery_callback(terminal_id)
-            except Exception as e:
-                logger.error(f"Delivery failed for terminal {terminal_id}: {e}")
+        """Signal that deliverable work exists for a terminal (F136)."""
+        from cli_agent_orchestrator.services.inbox_service import request_delivery
+
+        try:
+            request_delivery(terminal_id)
+        except Exception as e:
+            logger.error(f"Delivery signal failed for terminal {terminal_id}: {e}")
 
     async def check_kiro_supplements(self) -> None:
         """Periodic check for kiro-cli terminals stuck in 'working' state.

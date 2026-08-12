@@ -3,6 +3,7 @@
 Publisher: terminal.{id}.output
 """
 
+from dataclasses import dataclass
 import logging
 import os
 import select
@@ -19,6 +20,23 @@ from cli_agent_orchestrator.constants import (
     PIPE_LIVENESS_STALL_CHECKS,
 )
 from cli_agent_orchestrator.services.event_bus import bus
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class EnrollmentAuthority:
+    """Immutable authority tuple pinned at FIFO enrollment time (D19)."""
+    terminal_id: str
+    terminal_generation: int | None
+    incarnation_id: str | None  # None = explicit process-less marker
+    epoch: int
+
+
+# Private sentinel distinguishing omitted authority (error) from explicit None (process-less).
+_AUTHORITY_UNSET = object()
+
+# D20: Attention threshold for confirmed-gone report failures.
+CONFIRMED_GONE_REPORT_ATTENTION_ATTEMPTS = 5
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +69,24 @@ _COALESCE_MAX_BYTES = 64 * 1024
 # fakes. terminal_service wires the real backend calls at create_reader time.
 PaneProbe = Callable[[], str]  # returns the live pane content (tmux capture-pane tail)
 RearmPipe = Callable[[], None]  # re-attaches pipe-pane (stop then start, NOT a bare toggle)
+
+
+# D19: Enrollment authority — immutable identity tuple pinned at create_reader time.
+@dataclass(frozen=True)
+class EnrollmentAuthority:
+    terminal_id: str
+    terminal_generation: int | None
+    incarnation_id: str | None
+    epoch: int
+
+
+# Private sentinel: if pane_probe/rearm enrolls watchdog, create_reader
+# REQUIRES explicit terminal_generation and incarnation_id. Explicit None =
+# process-less. Omission (sentinel) = error.
+_AUTHORITY_UNSET = object()
+
+# D20: Maximum consecutive non-launching report failures before attention notification.
+CONFIRMED_GONE_REPORT_ATTENTION_ATTEMPTS = 5
 
 
 class FifoManager:
@@ -136,6 +172,16 @@ class FifoManager:
         # any successful re-arm; once it hits PIPE_LIVENESS_MAX_REARM_FAILURES
         # the terminal is dropped from the watchdog instead of retrying forever.
         self._rearm_failures: Dict[str, int] = {}
+        # F138 D15: Per-terminal consecutive definitive-absence count from probe().
+        self._f138_probe_gone_count: Dict[str, int] = {}
+        # D19: Per-terminal enrollment authority (pinned at create_reader time).
+        self._f138_authority: Dict[str, EnrollmentAuthority] = {}
+        # D19: Global enrollment epoch counter (monotonically increasing).
+        self._next_f138_enrollment_epoch: int = 0
+        # D20: Per-terminal consecutive report-failure count.
+        self._f138_report_failures: Dict[str, int] = {}
+        # D20: Per-terminal one-shot attention marker.
+        self._f138_attention_sent: Dict[str, bool] = {}
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: Optional[threading.Thread] = None
 
@@ -146,6 +192,8 @@ class FifoManager:
         terminal_id: str,
         pane_probe: Optional[PaneProbe] = None,
         rearm: Optional[RearmPipe] = None,
+        terminal_generation=_AUTHORITY_UNSET,
+        incarnation_id=_AUTHORITY_UNSET,
     ) -> None:
         """Create FIFO and start reader thread.
 
@@ -153,10 +201,22 @@ class FifoManager:
         (tmux) callers. When both are given, the terminal is enrolled in the
         liveness watchdog (issue #388). Callers that omit them (or backends
         without pipe-pane) get exactly the old behavior — no watchdog.
+
+        D19: When enrolling (pane_probe+rearm given), ``terminal_generation``
+        and ``incarnation_id`` MUST be passed explicitly. ``None`` means
+        process-less (intentional). Omitting them (sentinel) raises TypeError.
         """
         fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
 
         enroll = pane_probe is not None and rearm is not None
+
+        # D19: Validate authority params when enrolling in watchdog.
+        if enroll:
+            if terminal_generation is _AUTHORITY_UNSET or incarnation_id is _AUTHORITY_UNSET:
+                raise TypeError(
+                    f"create_reader for '{terminal_id}': enrolling in watchdog requires "
+                    f"explicit terminal_generation and incarnation_id (use None for process-less)"
+                )
 
         with self._lock:
             if terminal_id in self._readers:
@@ -181,6 +241,15 @@ class FifoManager:
             self._registered_at[terminal_id] = now
             self._ever_delivered[terminal_id] = False
             if enroll:
+                # D19: Increment epoch and pin authority
+                self._next_f138_enrollment_epoch += 1
+                authority = EnrollmentAuthority(
+                    terminal_id=terminal_id,
+                    terminal_generation=terminal_generation,
+                    incarnation_id=incarnation_id,
+                    epoch=self._next_f138_enrollment_epoch,
+                )
+                self._f138_authority[terminal_id] = authority
                 self._pane_probe[terminal_id] = pane_probe
                 self._rearm[terminal_id] = rearm
             thread.start()
@@ -196,6 +265,45 @@ class FifoManager:
             thread = self._threads.get(terminal_id)
             return bool(thread and thread.is_alive())
 
+    def _unenroll(self, terminal_id: str) -> None:
+        """D19/D20: Shared unenroll helper — clears ALL per-enrollment state.
+
+        Must be called under self._lock (or caller must hold it).
+        Never mutates the global _next_f138_enrollment_epoch.
+        """
+        self._pane_probe.pop(terminal_id, None)
+        self._rearm.pop(terminal_id, None)
+        self._liveness.pop(terminal_id, None)
+        self._last_data_at.pop(terminal_id, None)
+        self._rearm_failures.pop(terminal_id, None)
+        self._registered_at.pop(terminal_id, None)
+        self._ever_delivered.pop(terminal_id, None)
+        self._cold_start_attempts.pop(terminal_id, None)
+        self._f138_probe_gone_count.pop(terminal_id, None)
+        self._f138_authority.pop(terminal_id, None)
+        self._f138_report_failures.pop(terminal_id, None)
+        self._f138_attention_sent.pop(terminal_id, None)
+
+    def _unenroll(self, terminal_id: str) -> None:
+        """Clear ALL per-enrollment state for a terminal (D19/D20 shared helper).
+
+        MUST be called under self._lock. Never touches _next_f138_enrollment_epoch.
+        Does NOT pop _readers/_threads (those are reader-thread lifecycle, not
+        enrollment state). Does NOT unlink the FIFO file.
+        """
+        self._pane_probe.pop(terminal_id, None)
+        self._rearm.pop(terminal_id, None)
+        self._liveness.pop(terminal_id, None)
+        self._last_data_at.pop(terminal_id, None)
+        self._rearm_failures.pop(terminal_id, None)
+        self._registered_at.pop(terminal_id, None)
+        self._ever_delivered.pop(terminal_id, None)
+        self._cold_start_attempts.pop(terminal_id, None)
+        self._f138_probe_gone_count.pop(terminal_id, None)
+        self._f138_authority.pop(terminal_id, None)
+        self._f138_report_failures.pop(terminal_id, None)
+        self._f138_attention_sent.pop(terminal_id, None)
+
     def stop_reader(self, terminal_id: str) -> None:
         """Stop the reader thread (if running) and delete the FIFO file.
 
@@ -208,16 +316,8 @@ class FifoManager:
         with self._lock:
             stop_flag = self._readers.pop(terminal_id, None)
             thread = self._threads.pop(terminal_id, None)
-            # Drop watchdog bookkeeping so a re-created terminal starts clean and
-            # the watchdog stops probing a gone pane.
-            self._pane_probe.pop(terminal_id, None)
-            self._rearm.pop(terminal_id, None)
-            self._liveness.pop(terminal_id, None)
-            self._last_data_at.pop(terminal_id, None)
-            self._rearm_failures.pop(terminal_id, None)
-            self._registered_at.pop(terminal_id, None)
-            self._ever_delivered.pop(terminal_id, None)
-            self._cold_start_attempts.pop(terminal_id, None)
+            # Drop ALL watchdog/enrollment bookkeeping via shared helper.
+            self._unenroll(terminal_id)
 
         # Deliberately NOT stopping the watchdog thread here even when this was
         # the last enrolled terminal: doing it under a "now idle" check raced
@@ -403,6 +503,189 @@ class FifoManager:
         if thread is not None:
             thread.join(timeout=2.0)
 
+    def _f138_definitive_absence(self, terminal_id: str) -> None:
+        """D15/D20: Handle a definitive session/window-not-found from probe().
+
+        First hit increments and returns. Second consecutive hit on a later
+        watchdog tick reports confirmed-gone and unenrolls (D20: report BEFORE
+        unenroll; if result is retryable, retain enrollment).
+        """
+        count = self._f138_probe_gone_count.get(terminal_id, 0) + 1
+        self._f138_probe_gone_count[terminal_id] = count
+        if count >= 2:
+            # D20: Report BEFORE unenroll — uses pinned authority.
+            should_unenroll = self._f138_report_confirmed_gone(
+                terminal_id, "fifo_window_gone_confirmed"
+            )
+            if should_unenroll:
+                with self._lock:
+                    self._unenroll(terminal_id)
+        # First hit: just return (count stored, will fire on next tick if repeated).
+
+    def _f138_report_confirmed_gone(self, terminal_id: str, source: str) -> bool:
+        """D19/D20: Report confirmed-gone using pinned enrollment authority.
+
+        Returns True if caller should proceed to unenroll (durable outcome or
+        process-less). Returns False if enrollment should be retained (retryable).
+
+        D20 acknowledgment law:
+        - incarnation_id=None (process-less): discharge without DB call → unenroll
+        - Otherwise: call f138_request_reconciliation directly (bypasses 2-submission threshold)
+        - Classify result:
+          - created/job_already_exists: durable → unenroll
+          - reconciled/abandoned: durable → unenroll
+          - launching: retryable → retain enrollment, cap confirmed count at 2
+          - incarnation_not_found/unknown/errors: retryable → retain enrollment
+        - Report-failure count saturates at CONFIRMED_GONE_REPORT_ATTENTION_ATTEMPTS.
+        """
+        with self._lock:
+            authority = self._f138_authority.get(terminal_id)
+        if authority is None:
+            # No authority pinned — cannot report (should not happen in normal flow).
+            logger.warning(
+                "f138_report_confirmed_gone: no authority for terminal %s — skipping",
+                terminal_id,
+            )
+            return True  # unenroll anyway to avoid infinite loop
+
+        # D20.3: Process-less incarnation — discharge without DB call.
+        if authority.incarnation_id is None:
+            logger.info(
+                "f138_confirmed_gone_processless: terminal=%s gen=%s — "
+                "discharging without DB call",
+                terminal_id,
+                authority.terminal_generation,
+            )
+            return True
+
+        # D20.1: Call f138_request_reconciliation directly.
+        try:
+            from cli_agent_orchestrator.services.orphan_reconcile_service import (
+                request_orphan_reconciliation,
+            )
+
+            result = request_orphan_reconciliation(
+                incarnation_id=authority.incarnation_id,
+                source=source,
+            )
+            detail = result.detail or ""
+            # D20.2: Classify result.
+            if result.created or detail in ("job_already_exists", "reconciled", "abandoned"):
+                # Durable outcome — proceed to unenroll.
+                # Reset failure tracking on success.
+                with self._lock:
+                    self._f138_report_failures.pop(terminal_id, None)
+                    self._f138_attention_sent.pop(terminal_id, None)
+                return True
+            elif detail.startswith("incarnation_state=launching"):
+                # Retryable — retain enrollment, cap confirmed count at 2.
+                self._f138_probe_gone_count[terminal_id] = min(
+                    self._f138_probe_gone_count.get(terminal_id, 0), 2
+                )
+                return False
+            else:
+                # incarnation_not_found / unknown: retryable — retain enrollment.
+                self._f138_probe_gone_count[terminal_id] = min(
+                    self._f138_probe_gone_count.get(terminal_id, 0), 2
+                )
+                self._f138_increment_report_failure(terminal_id, authority, source, detail)
+                return False
+        except Exception:
+            logger.warning(
+                "f138_report_confirmed_gone_failed: terminal=%s", terminal_id, exc_info=True
+            )
+            self._f138_increment_report_failure(terminal_id, authority, source, "exception")
+            return False
+
+    def _f138_increment_report_failure(
+        self, terminal_id: str, authority: "EnrollmentAuthority", source: str, detail: str
+    ) -> None:
+        """D20.4: Increment report-failure count; emit attention at threshold."""
+        with self._lock:
+            failures = self._f138_report_failures.get(terminal_id, 0) + 1
+            self._f138_report_failures[terminal_id] = failures
+            already_sent = self._f138_attention_sent.get(terminal_id, False)
+
+        if failures >= CONFIRMED_GONE_REPORT_ATTENTION_ATTEMPTS and not already_sent:
+            with self._lock:
+                self._f138_attention_sent[terminal_id] = True
+            # Emit exactly one attention notification.
+            self._f138_notify_confirmed_gone_attention(
+                terminal_id=terminal_id,
+                generation=authority.terminal_generation,
+                source=source,
+                detail=detail,
+                token_hash=self._f138_get_token_hash(authority.incarnation_id),
+            )
+
+    def _f138_get_token_hash(self, incarnation_id: str) -> str:
+        """Get token hash for an incarnation (for attention notifications)."""
+        try:
+            from cli_agent_orchestrator.clients.database import (
+                ProcessIncarnationModel,
+                SessionLocal,
+            )
+
+            with SessionLocal() as db:
+                inc = (
+                    db.query(ProcessIncarnationModel)
+                    .filter_by(id=incarnation_id)
+                    .one_or_none()
+                )
+                if inc and hasattr(inc, "token_hash"):
+                    return inc.token_hash or "unknown"
+        except Exception:
+            pass
+        return "unknown"
+
+    def _f138_notify_confirmed_gone_attention(
+        self,
+        *,
+        terminal_id: str,
+        generation: int | None,
+        source: str,
+        detail: str,
+        token_hash: str,
+    ) -> None:
+        """D20.4: Thread-safe DB-only attention notification.
+
+        Emits exactly one inbox message per enrollment when report failures
+        saturate. Uses only DB + mailbox (no async, no event loop).
+        """
+        try:
+            from cli_agent_orchestrator.clients.database import create_inbox_message
+            from cli_agent_orchestrator.services.mailbox_service import (
+                get_current_supervisor_terminal_id,
+            )
+
+            supervisor_id = get_current_supervisor_terminal_id()
+            if supervisor_id is None:
+                logger.warning(
+                    "f138_confirmed_gone_attention_no_supervisor: terminal=%s "
+                    "token_hash=%s — retained for successor",
+                    terminal_id,
+                    token_hash,
+                )
+                return
+
+            message = (
+                f"[F138-D20] Confirmed-gone report failed {CONFIRMED_GONE_REPORT_ATTENTION_ATTEMPTS} "
+                f"times for terminal {terminal_id} (gen={generation}). "
+                f"Source: {source}. Detail: {detail}. "
+                f"Token hash: {token_hash}. Manual intervention may be needed."
+            )
+            create_inbox_message(
+                sender_id=terminal_id,
+                receiver_id=supervisor_id,
+                content=message,
+            )
+        except Exception:
+            logger.exception(
+                "f138_confirmed_gone_attention_failed: terminal=%s token_hash=%s",
+                terminal_id,
+                token_hash,
+            )
+
     def _watchdog_loop(self) -> None:
         while not self._watchdog_stop.wait(PIPE_LIVENESS_CHECK_INTERVAL_S):
             # Snapshot under _lock: create_reader()/stop_reader() mutate
@@ -412,15 +695,19 @@ class FifoManager:
             # Copilot review on #397). The lock is released before calling
             # _check_pipe_liveness(), which takes it again itself per-terminal
             # — so no lock is held across the slow probe()/rearm() calls.
+            # D19: Snapshot authority epoch for each terminal for stale-probe safety.
             with self._lock:
-                terminal_ids = list(self._pane_probe.keys())
-            for terminal_id in terminal_ids:
+                terminals_with_epoch = [
+                    (tid, self._f138_authority[tid].epoch if tid in self._f138_authority else None)
+                    for tid in list(self._pane_probe.keys())
+                ]
+            for terminal_id, dispatch_epoch in terminals_with_epoch:
                 try:
-                    self._check_pipe_liveness(terminal_id)
+                    self._check_pipe_liveness(terminal_id, dispatch_epoch=dispatch_epoch)
                 except Exception:
                     logger.exception("pipe-pane liveness check failed for terminal %s", terminal_id)
 
-    def _check_pipe_liveness(self, terminal_id: str) -> None:
+    def _check_pipe_liveness(self, terminal_id: str, *, dispatch_epoch: int | None = None) -> None:
         """One liveness check for a terminal: re-arm a stalled pipe-pane forwarder.
 
         A stalled forwarder is invisible from inside the FIFO reader (no bytes to
@@ -469,8 +756,51 @@ class FifoManager:
         # probe() is a slow tmux `capture-pane` call — deliberately made
         # without holding self._lock so it never blocks stop_reader() (or
         # other terminals' housekeeping) for its duration.
-        content = probe()
+        try:
+            content = probe()
+        except ValueError as ve:
+            # D19: Check epoch staleness after probe raises
+            if dispatch_epoch is not None:
+                with self._lock:
+                    current_authority = self._f138_authority.get(terminal_id)
+                    if current_authority is None or current_authority.epoch != dispatch_epoch:
+                        return  # Stale — discard
+            # D15: Classify ValueError shapes from get_history().
+            msg = str(ve)
+            if (
+                (msg.startswith("Session '") and msg.endswith("' not found"))
+                or ("not found in session '" in msg and msg.startswith("Window '"))
+            ):
+                # Definitive absence — session/window genuinely gone.
+                return self._f138_definitive_absence(terminal_id)
+            # Unknown ValueError shape: reset counter, re-raise to watchdog handler.
+            self._f138_probe_gone_count.pop(terminal_id, None)
+            raise
+        except Exception:
+            # D19: Check epoch staleness after probe raises
+            if dispatch_epoch is not None:
+                with self._lock:
+                    current_authority = self._f138_authority.get(terminal_id)
+                    if current_authority is None or current_authority.epoch != dispatch_epoch:
+                        return  # Stale — discard
+            # Any other exception (TmuxLookupError, OSError, etc.): reset counter, re-raise.
+            self._f138_probe_gone_count.pop(terminal_id, None)
+            raise
         now = time.monotonic()
+
+        # D19: Check epoch staleness after probe returns — if authority has changed
+        # (stop+rebind happened during our slow probe), discard this result entirely.
+        if dispatch_epoch is not None:
+            with self._lock:
+                current_authority = self._f138_authority.get(terminal_id)
+                if current_authority is None or current_authority.epoch != dispatch_epoch:
+                    return  # Stale result — new enrollment owns this terminal now
+
+        # D15: Successful probe resets definitive-absence count before normal logic.
+        self._f138_probe_gone_count.pop(terminal_id, None)
+        # D20: Success/live resets report-failure count and attention marker.
+        self._f138_report_failures.pop(terminal_id, None)
+        self._f138_attention_sent.pop(terminal_id, None)
 
         do_rearm = False
         cold_start = False
@@ -520,13 +850,6 @@ class FifoManager:
                 attempts = self._cold_start_attempts.get(terminal_id, 0) + 1
                 if attempts > PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS:
                     cold_start_give_up = True
-                    self._pane_probe.pop(terminal_id, None)
-                    self._rearm.pop(terminal_id, None)
-                    self._liveness.pop(terminal_id, None)
-                    self._rearm_failures.pop(terminal_id, None)
-                    self._registered_at.pop(terminal_id, None)
-                    self._ever_delivered.pop(terminal_id, None)
-                    self._cold_start_attempts.pop(terminal_id, None)
                 else:
                     self._cold_start_attempts[terminal_id] = attempts
                     # Reset the grace-period clock so the NEXT evaluation is
@@ -605,6 +928,13 @@ class FifoManager:
                 terminal_id,
                 PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS,
             )
+            # D20: Report confirmed-gone BEFORE unenroll (same API as D15 two-tick).
+            should_unenroll = self._f138_report_confirmed_gone(
+                terminal_id, "fifo_cold_start_exhausted"
+            )
+            if should_unenroll:
+                with self._lock:
+                    self._unenroll(terminal_id)
             return
 
         if not do_rearm:
@@ -662,14 +992,6 @@ class FifoManager:
                 failures = self._rearm_failures.get(terminal_id, 0) + 1
                 self._rearm_failures[terminal_id] = failures
                 give_up = failures >= PIPE_LIVENESS_MAX_REARM_FAILURES
-                if give_up:
-                    self._pane_probe.pop(terminal_id, None)
-                    self._rearm.pop(terminal_id, None)
-                    self._liveness.pop(terminal_id, None)
-                    self._rearm_failures.pop(terminal_id, None)
-                    self._registered_at.pop(terminal_id, None)
-                    self._ever_delivered.pop(terminal_id, None)
-                    self._cold_start_attempts.pop(terminal_id, None)
             if give_up:
                 # Not a silent retry-forever: a re-arm that keeps failing
                 # (e.g. the tmux pane is gone) previously re-struck and
@@ -684,6 +1006,13 @@ class FifoManager:
                     terminal_id,
                     failures,
                 )
+                # D20: Report confirmed-gone BEFORE unenroll.
+                should_unenroll = self._f138_report_confirmed_gone(
+                    terminal_id, "fifo_rearm_exhausted"
+                )
+                if should_unenroll:
+                    with self._lock:
+                        self._unenroll(terminal_id)
             return
 
         replay = content.replace("\n", "\r\n")

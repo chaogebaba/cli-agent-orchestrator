@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import secrets
 import threading
 import time
@@ -417,6 +418,107 @@ _delivery_wake_seq: dict[str, int] = {}
 _delivery_seq_guard = threading.Lock()
 
 
+# ---------------------------------------------------------------------------
+# F136-D15: O(1) wake-admission state machine
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _WakeState:
+    """Per-terminal wake admission state (D15)."""
+
+    dirty_epoch: int = 0
+    immediate_admitted: bool = False
+    holder_epoch: int = 0
+    delayed_token: int = 0
+    delayed_handle: Any = None  # asyncio.TimerHandle | None
+
+
+_wake_states: dict[str, _WakeState] = {}
+
+
+# Failure backoff state (D16)
+_failure_streaks: dict[str, int] = {}
+_BACKOFF_SCHEDULE = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
+
+
+@dataclass
+class CallbackRunOutcome:
+    """D18: Structured outcome of one callback delivery run."""
+
+    selected: int = 0
+    processed: int = 0
+    cursor_before: int | None = None
+    cursor_after: int | None = None
+    replay_selected: int = 0
+    replay_drained: int = 0
+    written: int = 0
+    already_present: int = 0
+    retryable_failure_count: int = 0
+    identity_conflict_count: int = 0
+    bootstrap_mode: str | None = None
+    needs_immediate_wake: bool = False
+    retry_delay_s: float | None = None
+    reason: str = ""
+
+
+def _get_backoff_delay(terminal_id: str) -> float:
+    """D16: Compute backoff delay and increment failure streak."""
+    streak = _failure_streaks.get(terminal_id, 0)
+    _failure_streaks[terminal_id] = streak + 1
+    idx = min(streak, len(_BACKOFF_SCHEDULE) - 1)
+    return _BACKOFF_SCHEDULE[idx]
+
+
+def request_delivery(terminal_id: str) -> None:
+    """D7/D15: Signal that deliverable work exists for a terminal.
+
+    O(1) admission: increments dirty_epoch, invalidates delayed token,
+    and admits at most one immediate callback. Never calls deliver_pending
+    inline and never writes the native inbox.
+    """
+    service = globals().get("inbox_service")
+    if not isinstance(service, InboxService):
+        return
+
+    old_handle: Any = None
+    post_immediate = False
+
+    with _delivery_seq_guard:
+        loop = service._delivery_loop
+        if loop is None or loop.is_closed():
+            return
+
+        state = _wake_states.get(terminal_id)
+        if state is None:
+            state = _WakeState()
+            _wake_states[terminal_id] = state
+
+        state.dirty_epoch += 1
+        # Invalidate delayed token
+        state.delayed_token += 1
+        old_handle = state.delayed_handle
+        state.delayed_handle = None
+
+        # Admit one immediate if none running/posted
+        if not state.immediate_admitted:
+            state.immediate_admitted = True
+            post_immediate = True
+
+    # Cancel old timer and post immediate outside guard
+    if old_handle is not None:
+        old_handle.cancel()
+
+    if post_immediate:
+        try:
+            loop.call_soon_threadsafe(service._f136_start_delivery_wake, terminal_id)
+        except RuntimeError:
+            with _delivery_seq_guard:
+                st = _wake_states.get(terminal_id)
+                if st:
+                    st.immediate_admitted = False
+
+
 @dataclass
 class _IdentityAuthorityEpisode:
     count: int = 0
@@ -610,6 +712,305 @@ class InboxService:
                 logger.exception("scheduled delivery wake failed terminal=%s", key[0])
 
         task.add_done_callback(completed)
+
+    # -------------------------------------------------------------------
+    # F136-D13/D15: Callback delivery runner and wake lifecycle
+    # -------------------------------------------------------------------
+
+    def _f136_start_delivery_wake(self, terminal_id: str) -> None:
+        """D15: Start one delivery run for a terminal on the event loop."""
+
+        async def run_delivery() -> None:
+            outcome = await asyncio.to_thread(self._f136_run_callback_delivery, terminal_id)
+            self._f136_post_delivery(terminal_id, outcome)
+
+        task = asyncio.create_task(run_delivery())
+        self._delivery_tasks.add(task)
+
+        def done(t: asyncio.Task[None]) -> None:
+            self._delivery_tasks.discard(t)
+            try:
+                t.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("f136_delivery_wake_failed terminal=%s", terminal_id)
+
+        task.add_done_callback(done)
+
+    def _f136_run_callback_delivery(self, terminal_id: str) -> "CallbackRunOutcome":
+        """D13/D14: Bounded replay-first, cursor-second write protocol."""
+        from cli_agent_orchestrator.clients.database import (
+            CallbackBatchResult,
+            commit_supervisor_callback_progress,
+            get_supervisor_callback_batch,
+        )
+        from cli_agent_orchestrator.services.mailbox_service import (
+            get_mailbox_authority_lock,
+            is_supervisor_mailbox_pull_terminal,
+        )
+        from cli_agent_orchestrator.services.teammate_push_service import (
+            NativeInboxWriteResult,
+            write_supervisor_callback_notification,
+        )
+
+        MAX_ROWS_PER_RUN = 50
+        MAX_SECONDS_PER_RUN = 0.200
+
+        # Resolve mailbox for this terminal
+        from cli_agent_orchestrator.clients.database import (
+            MailboxIncarnationModel,
+            MailboxModel,
+            SessionLocal,
+        )
+
+        with SessionLocal() as db:
+            inc = db.query(MailboxIncarnationModel).filter_by(terminal_id=terminal_id).one_or_none()
+            if inc is None:
+                return CallbackRunOutcome(reason="no_incarnation")
+            mailbox = db.query(MailboxModel).filter_by(id=inc.mailbox_id).one_or_none()
+            if mailbox is None:
+                return CallbackRunOutcome(reason="no_mailbox")
+            mailbox_id = str(mailbox.id)
+            generation = int(mailbox.generation)
+            session_name = str(mailbox.session_name)
+            role = str(mailbox.role)
+
+        # D10: acquire delivery_lock then authority lock
+        delivery_lock = get_delivery_lock(terminal_id)
+        if not delivery_lock.acquire(timeout=0.5):
+            return CallbackRunOutcome(reason="delivery_lock_contention")
+
+        authority_lock = get_mailbox_authority_lock(session_name, role)
+        if not authority_lock.acquire(timeout=0.5):
+            delivery_lock.release()
+            return CallbackRunOutcome(reason="authority_lock_contention")
+
+        try:
+            deadline_mono = time.monotonic() + MAX_SECONDS_PER_RUN
+
+            # D9: Get batch
+            batch = get_supervisor_callback_batch(
+                mailbox_id=mailbox_id,
+                terminal_id=terminal_id,
+                generation=generation,
+                limit=MAX_ROWS_PER_RUN,
+            )
+
+            if batch.kind == "stale_authority":
+                return CallbackRunOutcome(reason=f"stale: {batch.reason}")
+            if batch.kind == "retryable_failure":
+                return CallbackRunOutcome(
+                    retryable_failure_count=1,
+                    reason=batch.reason,
+                    retry_delay_s=_get_backoff_delay(terminal_id),
+                )
+            if batch.kind == "no_path":
+                return CallbackRunOutcome(
+                    cursor_before=batch.cursor,
+                    reason="no_path",
+                    retry_delay_s=_get_backoff_delay(terminal_id),
+                    retryable_failure_count=1,
+                )
+            if not batch.rows:
+                # Empty scan: reset failure streak
+                _failure_streaks.pop(terminal_id, None)
+                return CallbackRunOutcome(
+                    cursor_before=batch.cursor,
+                    cursor_after=batch.cursor,
+                    bootstrap_mode=batch.bootstrap_mode,
+                    reason="empty",
+                )
+
+            inbox_path = Path(os.path.expanduser(batch.inbox_path))
+            cursor_before = batch.cursor
+            new_cursor = batch.cursor or 0
+            successful_replay_ids: list[int] = []
+            written = 0
+            already_present = 0
+            retryable_failures = 0
+            identity_conflicts = 0
+            processed = 0
+
+            # D13: Process replay rows first, then forward rows
+            for row in batch.rows:
+                if time.monotonic() >= deadline_mono:
+                    break
+
+                msg = InboxMessage(
+                    id=row.inbox_row_id,
+                    sender_id=row.sender_id,
+                    receiver_id=terminal_id,
+                    message=row.message,
+                    orchestration_type=OrchestrationType.SEND_MESSAGE,
+                    status=MessageStatus.PENDING,
+                    created_at=row.created_at,
+                )
+                result = write_supervisor_callback_notification(
+                    inbox_path=inbox_path,
+                    mailbox_id=mailbox_id,
+                    message=msg,
+                    deadline_mono=deadline_mono,
+                )
+                processed += 1
+
+                if result.kind == "written":
+                    written += 1
+                elif result.kind == "already_present":
+                    already_present += 1
+                elif result.kind == "retryable_failure":
+                    retryable_failures += 1
+                    break  # Stop at first failure
+                elif result.kind == "identity_conflict":
+                    identity_conflicts += 1
+                    logger.error(
+                        "f136_identity_conflict mailbox=%s row=%s reason=%s",
+                        mailbox_id, row.inbox_row_id, result.reason,
+                    )
+                    break  # Stop at conflict
+
+                # Track progress
+                if result.kind in ("written", "already_present"):
+                    if row.tag == "replay":
+                        successful_replay_ids.append(row.inbox_row_id)
+                    elif row.tag == "forward":
+                        # Forward rows are batch-ordered ascending; all are eligible.
+                        # Advance cursor through every successfully written row.
+                        new_cursor = row.inbox_row_id
+
+            # D13 step 5: commit progress once
+            if successful_replay_ids or new_cursor > (cursor_before or 0):
+                progress = commit_supervisor_callback_progress(
+                    mailbox_id=mailbox_id,
+                    terminal_id=terminal_id,
+                    generation=generation,
+                    expected_cursor=cursor_before or 0,
+                    new_cursor=new_cursor,
+                    expected_path_version=batch.path_version,
+                    replay_row_ids=tuple(successful_replay_ids),
+                )
+                if progress.kind == "advanced":
+                    _failure_streaks.pop(terminal_id, None)
+                elif progress.kind == "path_changed":
+                    return CallbackRunOutcome(
+                        selected=len(batch.rows), processed=processed,
+                        cursor_before=cursor_before, cursor_after=cursor_before,
+                        written=written, already_present=already_present,
+                        reason="path_changed_during_run",
+                        needs_immediate_wake=True,
+                    )
+                else:
+                    retryable_failures += 1
+            else:
+                _failure_streaks.pop(terminal_id, None)
+
+            replay_selected = sum(1 for r in batch.rows if r.tag == "replay")
+            needs_wake = batch.has_more or (retryable_failures == 0 and processed < len(batch.rows))
+
+            return CallbackRunOutcome(
+                selected=len(batch.rows),
+                processed=processed,
+                cursor_before=cursor_before,
+                cursor_after=new_cursor if new_cursor > (cursor_before or 0) else cursor_before,
+                replay_selected=replay_selected,
+                replay_drained=len(successful_replay_ids),
+                written=written,
+                already_present=already_present,
+                retryable_failure_count=retryable_failures,
+                identity_conflict_count=identity_conflicts,
+                bootstrap_mode=batch.bootstrap_mode,
+                needs_immediate_wake=needs_wake,
+                retry_delay_s=_get_backoff_delay(terminal_id) if retryable_failures else None,
+                reason="ok",
+            )
+        except Exception as exc:
+            logger.exception("f136_delivery_run_error terminal=%s", terminal_id)
+            return CallbackRunOutcome(
+                retryable_failure_count=1,
+                reason=f"exception: {exc}",
+                retry_delay_s=_get_backoff_delay(terminal_id),
+            )
+        finally:
+            authority_lock.release()
+            delivery_lock.release()
+
+    def _f136_post_delivery(self, terminal_id: str, outcome: "CallbackRunOutcome") -> None:
+        """D15: After delivery, decide: immediate rerun, delayed retry, or idle."""
+        post_immediate = False
+        arm_delayed: float | None = None
+
+        with _delivery_seq_guard:
+            state = _wake_states.get(terminal_id)
+            if state is None:
+                return
+
+            if outcome.needs_immediate_wake:
+                # More work available — rerun immediately
+                state.holder_epoch = state.dirty_epoch
+                post_immediate = True
+            elif outcome.retry_delay_s is not None:
+                # Failure — arm delayed retry
+                state.immediate_admitted = False
+                if state.dirty_epoch > state.holder_epoch:
+                    # New work arrived during run — immediate instead
+                    state.immediate_admitted = True
+                    post_immediate = True
+                else:
+                    arm_delayed = outcome.retry_delay_s
+            elif state.dirty_epoch > state.holder_epoch:
+                # New work arrived during our run — one more immediate
+                state.holder_epoch = state.dirty_epoch
+                post_immediate = True
+            else:
+                # Idle
+                state.immediate_admitted = False
+
+        loop = self._delivery_loop
+        if loop is None or loop.is_closed():
+            return
+
+        if post_immediate:
+            try:
+                loop.call_soon_threadsafe(self._f136_start_delivery_wake, terminal_id)
+            except RuntimeError:
+                with _delivery_seq_guard:
+                    st = _wake_states.get(terminal_id)
+                    if st:
+                        st.immediate_admitted = False
+        elif arm_delayed is not None:
+            try:
+                loop.call_soon_threadsafe(
+                    self._f136_arm_delayed, terminal_id, arm_delayed
+                )
+            except RuntimeError:
+                pass
+
+    def _f136_arm_delayed(self, terminal_id: str, delay: float) -> None:
+        """Arm a delayed delivery wake on the event loop."""
+        with _delivery_seq_guard:
+            state = _wake_states.get(terminal_id)
+            if state is None:
+                return
+            token = state.delayed_token
+            state.delayed_handle = asyncio.get_event_loop().call_later(
+                delay, self._f136_delayed_fire, terminal_id, token
+            )
+
+    def _f136_delayed_fire(self, terminal_id: str, token: int) -> None:
+        """Fire a delayed wake if the token is still valid."""
+        with _delivery_seq_guard:
+            state = _wake_states.get(terminal_id)
+            if state is None:
+                return
+            if state.delayed_token != token:
+                return  # Superseded
+            state.delayed_handle = None
+            if not state.immediate_admitted:
+                state.immediate_admitted = True
+            else:
+                return  # Already running
+
+        self._f136_start_delivery_wake(terminal_id)
 
     def _clear_identity_authority(self, terminal_id: str) -> None:
         with self._identity_lock:
