@@ -632,7 +632,7 @@ def _configure_failing_sync_create(
     monkeypatch.setattr(
         terminal_service.fifo_manager,
         "create_reader",
-        lambda _terminal: events.append("fifo-create"),
+        lambda *_args, **_kwargs: events.append("fifo-create"),
     )
     monkeypatch.setattr(
         terminal_service.fifo_manager,
@@ -659,6 +659,10 @@ def _configure_failing_sync_create(
         terminal_service.provider_manager, "cleanup_provider", lambda _terminal: None
     )
     monkeypatch.setattr(terminal_service.status_monitor, "clear_terminal", lambda _terminal: None)
+    # F138: bypass process-liveness check in unit tests
+    monkeypatch.setattr(
+        terminal_service, "_confirm_launch_health", AsyncMock()
+    )
     return events
 
 

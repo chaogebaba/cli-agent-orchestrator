@@ -86,7 +86,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 99;
+const COMMAND_COUNT: usize = 100;
 
 /// What the TUI does with a command.
 ///
@@ -199,6 +199,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::ConfigList,
     CommandId::ConfigPath,
     CommandId::ConfigSet,
+    CommandId::ConfigPreflight,
     CommandId::EnvGet,
     CommandId::EnvList,
     CommandId::EnvSet,
@@ -327,6 +328,8 @@ pub enum CommandId {
     ConfigPath,
     /// `cao config set`
     ConfigSet,
+    /// `cao config preflight`
+    ConfigPreflight,
 
     // `cao env *`
     /// `cao env get`
@@ -684,6 +687,17 @@ fn entry(id: CommandId) -> Command {
             params: &[Param { name: "key", required: true, kind: ParamKind::Text }, Param { name: "value", required: true, kind: ParamKind::Text }],
             handoff_reason: None,
             // HIDE: human ruled: wrong CLI surface to drive from a TUI
+        },
+
+        CommandId::ConfigPreflight => Command {
+            id: CommandId::ConfigPreflight,
+            parent: Some("config"),
+            leaf_name: "preflight",
+            summary: "Validate configuration health before server start.",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: operational-only, not user-facing
         },
 
         CommandId::EnvGet => Command {
@@ -1812,6 +1826,7 @@ mod tests {
                     CommandId::ConfigList => CommandId::ConfigList,
                     CommandId::ConfigPath => CommandId::ConfigPath,
                     CommandId::ConfigSet => CommandId::ConfigSet,
+                    CommandId::ConfigPreflight => CommandId::ConfigPreflight,
                     CommandId::EnvGet => CommandId::EnvGet,
                     CommandId::EnvList => CommandId::EnvList,
                     CommandId::EnvSet => CommandId::EnvSet,
@@ -1915,6 +1930,7 @@ mod tests {
                 CommandId::ConfigList,
                 CommandId::ConfigPath,
                 CommandId::ConfigSet,
+    CommandId::ConfigPreflight,
                 CommandId::EnvGet,
                 CommandId::EnvList,
                 CommandId::EnvSet,

@@ -797,10 +797,10 @@ def test_notify_due_sends_only_to_caller():
 
     with (
         patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog.create_inbox_message"
+            "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message"
         ) as mock_create,
         patch(
-            "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending"
+            "cli_agent_orchestrator.services.inbox_service.request_delivery"
         ) as mock_deliver,
         patch(
             "cli_agent_orchestrator.services.stalled_callback_watchdog."
@@ -813,7 +813,7 @@ def test_notify_due_sends_only_to_caller():
         svc.notify_due()
 
     mock_create.assert_called_once_with("watchdog:worker1", "caller1", "notice")
-    mock_deliver.assert_called_once_with("caller1", registry=None)
+    mock_deliver.assert_called_once_with("caller1")
 
 
 @contextmanager
@@ -853,10 +853,10 @@ def _waiting_inbox_fakes(
             return_value=gate,
         ) as mock_gate,
         patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog." "create_inbox_message"
+            "cli_agent_orchestrator.services.mailbox_service." "create_routed_inbox_message"
         ) as mock_create,
         patch(
-            "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending"
+            "cli_agent_orchestrator.services.inbox_service.request_delivery"
         ) as mock_deliver,
         patch(
             "cli_agent_orchestrator.services.stalled_callback_watchdog."
@@ -897,7 +897,7 @@ class TestWaitingInboxAlert:
         assert caller_id == "caller1"
         assert "[waiting-inbox watchdog] terminal worker1 (unknown)" in message
         assert "for 10s" in message
-        fakes["deliver"].assert_called_once_with("caller1", registry=None)
+        # Delivery is implicit via inbox insertion (F136-D17)
 
     def test_c_fired_episode_does_not_push_twice(self):
         svc = StalledCallbackWatchdog()
@@ -1338,13 +1338,13 @@ def test_notify_due_trigger_a_is_deduped_and_coalesces_trigger_b():
     with (
         _relational_watchdog_fakes({"W", "T", "C"}),
         patch.object(svc, "_persist_notice", side_effect=rows.append),
-        patch("cli_agent_orchestrator.services.inbox_service.inbox_service") as inbox,
+        patch("cli_agent_orchestrator.services.inbox_service.request_delivery") as mock_request_delivery,
     ):
         svc.notify_due()
         svc.notify_due()
     assert [notice.kind for notice in rows] == ["stall", "chain"]
     assert rows[1].terminal_id == "W" and "sub-worker T" in rows[1].message
-    assert inbox.deliver_pending.call_count == 2
+    assert mock_request_delivery.call_count == 2
 
 
 def test_trigger_a_rollover_is_stale_and_insert_failure_rolls_back_reservation():
@@ -1387,7 +1387,7 @@ def test_trigger_a_rollover_is_stale_and_insert_failure_rolls_back_reservation()
         _relational_watchdog_fakes({"W", "T", "C"}),
         patch.object(svc, "_persist_notice", side_effect=persisted.append),
         patch(
-            "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",
+            "cli_agent_orchestrator.services.inbox_service.request_delivery",
             side_effect=RuntimeError("delivery"),
         ),
     ):

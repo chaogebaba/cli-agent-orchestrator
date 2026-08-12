@@ -156,27 +156,35 @@ class TestHerdrInboxServiceRegisterReconnect:
 class TestHerdrInboxServiceDelivery:
     """Test message delivery callback invocation."""
 
-    def test_deliver_calls_callback(self):
-        """_deliver should invoke the delivery_callback with terminal_id."""
-        callback = MagicMock()
-        service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
-
-        service._deliver("tid1")
-
-        callback.assert_called_once_with("tid1")
-
-    def test_deliver_handles_callback_error(self):
-        """_deliver should log and not raise if callback fails."""
-        callback = MagicMock(side_effect=RuntimeError("delivery failed"))
-        service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
-
-        # Should not raise
-        service._deliver("tid1")
-
-    def test_deliver_without_callback(self):
-        """_deliver with no callback should be a no-op."""
+    def test_deliver_calls_request_delivery(self):
+        """_deliver signals via request_delivery (F136 contract)."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._deliver("tid1")  # Should not raise
+
+        with patch(
+            "cli_agent_orchestrator.services.inbox_service.request_delivery"
+        ) as mock_rd:
+            service._deliver("tid1")
+
+        mock_rd.assert_called_once_with("tid1")
+
+    def test_deliver_handles_request_delivery_error(self):
+        """_deliver should log and not raise if request_delivery fails."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+
+        with patch(
+            "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            side_effect=RuntimeError("delivery failed"),
+        ):
+            # Should not raise
+            service._deliver("tid1")
+
+    def test_deliver_without_callback_still_signals(self):
+        """_deliver with no callback still calls request_delivery."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        with patch(
+            "cli_agent_orchestrator.services.inbox_service.request_delivery"
+        ):
+            service._deliver("tid1")  # Should not raise
 
 
 class TestHerdrInboxServiceSubscription:
@@ -222,8 +230,7 @@ class TestHerdrInboxServiceEventParsing:
         pane object under data.pane), not the retired top-level
         pane.agent_status_changed shape.
         """
-        callback = MagicMock()
-        service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
 
         # Register a pane
         service.register_terminal("tid1", "pane-x", is_kiro=False)
@@ -268,22 +275,25 @@ class TestHerdrInboxServiceEventParsing:
             + b"\n"
         )
 
-        async def run():
-            reader = asyncio.StreamReader()
-            service._reader = reader
-            # Write events then close to end the loop
-            reader.feed_data(idle_event + done_event + working_event + other_event)
-            reader.feed_eof()
-            try:
-                await service._event_loop()
-            except ConnectionError:
-                pass  # EOF raises ConnectionError — expected
+        with patch(
+            "cli_agent_orchestrator.services.inbox_service.request_delivery"
+        ) as mock_rd:
+            async def run():
+                reader = asyncio.StreamReader()
+                service._reader = reader
+                # Write events then close to end the loop
+                reader.feed_data(idle_event + done_event + working_event + other_event)
+                reader.feed_eof()
+                try:
+                    await service._event_loop()
+                except ConnectionError:
+                    pass  # EOF raises ConnectionError — expected
 
-        _run_async(run())
+            _run_async(run())
 
         # Only idle and done events on managed pane should trigger delivery
-        assert callback.call_count == 2
-        callback.assert_any_call("tid1")
+        assert mock_rd.call_count == 2
+        mock_rd.assert_any_call("tid1")
 
     def test_event_loop_ignores_flat_format_without_data_wrapper(self):
         """Events without 'data' wrapper (old flat format) are silently ignored."""
@@ -321,8 +331,6 @@ class TestHerdrInboxServiceEventParsing:
         """pane.updated wraps the pane object under data.pane; extraction must
         read pane_id/agent_status from there and deliver for a managed pane."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        callback = MagicMock()
-        service._delivery_callback = callback
         service._pane_to_terminal = {"w1:p1": "tid1"}
 
         frame = {
@@ -335,12 +343,15 @@ class TestHerdrInboxServiceEventParsing:
             b"",  # EOF ends the loop
         ]
         service._reader = reader
-        try:
-            _run_async(service._event_loop())
-        except ConnectionError:
-            pass  # EOF raises ConnectionError("Socket closed") — expected
+        with patch(
+            "cli_agent_orchestrator.services.inbox_service.request_delivery"
+        ) as mock_rd:
+            try:
+                _run_async(service._event_loop())
+            except ConnectionError:
+                pass  # EOF raises ConnectionError("Socket closed") — expected
 
-        callback.assert_called_once_with("tid1")
+        mock_rd.assert_called_once_with("tid1")
 
     def test_event_loop_ignores_pane_updated_for_unmanaged_pane(self):
         """Broadcast now delivers events for ALL panes; the managed-pane filter
@@ -422,8 +433,7 @@ class TestHerdrInboxServiceKiroSupplement:
     @patch("subprocess.run")
     def test_kiro_supplement_delivers_on_permission_prompt(self, mock_run):
         """Should deliver when pane read reveals permission prompt after 30s working."""
-        callback = MagicMock()
-        service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
 
         # Register kiro terminal that's been working for 35s
         service.register_terminal("tid_kiro", "w1-5", is_kiro=True)
@@ -438,10 +448,12 @@ class TestHerdrInboxServiceKiroSupplement:
         with patch(
             "cli_agent_orchestrator.services.herdr_inbox_service.re.search",
             return_value=True,
-        ):
+        ), patch(
+            "cli_agent_orchestrator.services.inbox_service.request_delivery"
+        ) as mock_rd:
             _run_async(service.check_kiro_supplements())
 
-        callback.assert_called_once_with("tid_kiro")
+        mock_rd.assert_called_once_with("tid_kiro")
 
     @patch("subprocess.run")
     def test_kiro_supplement_skips_under_threshold(self, mock_run):
@@ -1125,8 +1137,7 @@ class TestHerdrInboxServiceLifecycleEvents:
 
     def test_event_loop_agent_status_real_shape_delivers(self):
         """A real-shape broadcast pane_updated (event key, nested data.pane) triggers delivery."""
-        callback = MagicMock()
-        service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.register_terminal("tid-a", "pane-a", is_kiro=False)
 
         idle_event = (
@@ -1146,19 +1157,22 @@ class TestHerdrInboxServiceLifecycleEvents:
             + b"\n"
         )
 
-        async def run():
-            reader = asyncio.StreamReader()
-            service._reader = reader
-            reader.feed_data(idle_event)
-            reader.feed_eof()
-            try:
-                await service._event_loop()
-            except ConnectionError:
-                pass
+        with patch(
+            "cli_agent_orchestrator.services.inbox_service.request_delivery"
+        ) as mock_rd:
+            async def run():
+                reader = asyncio.StreamReader()
+                service._reader = reader
+                reader.feed_data(idle_event)
+                reader.feed_eof()
+                try:
+                    await service._event_loop()
+                except ConnectionError:
+                    pass
 
-        _run_async(run())
+            _run_async(run())
 
-        callback.assert_called_once_with("tid-a")
+        mock_rd.assert_called_once_with("tid-a")
 
 
 class TestHerdrInboxServiceReconcileLiveTerminal:

@@ -294,7 +294,9 @@ class TestCreateTerminalHerdrRegistration:
 
         assert epoch_recovery_service._normalize_creation_error(caught.value) == code
         if post_publish:
-            get_metadata.assert_called_once_with(TERMINAL_ID)
+            # F138: cleanup path adds a second get_terminal_metadata call for snapshot
+            assert get_metadata.call_count == 2
+            get_metadata.assert_called_with(TERMINAL_ID)
             delete_row.assert_called_once_with(TERMINAL_ID, preserve_warm_intent=False)
         else:
             delete_row.assert_not_called()
@@ -343,7 +345,7 @@ class TestCreateTerminalHerdrRegistration:
             }
 
         m.db_create_terminal.assert_called_once()
-        get_metadata.assert_called_once_with(TERMINAL_ID)
+        get_metadata.assert_called_with(TERMINAL_ID)
         quarantine.assert_called_once_with(TERMINAL_ID, None, "rollback_kill_uncertain")
         assert (
             m.provider_manager.get_provider(TERMINAL_ID)

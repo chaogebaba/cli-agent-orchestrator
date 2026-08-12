@@ -662,7 +662,7 @@ def test_mcp_supervisor_barrier_path_remains_functional_end_to_end(barrier_db, m
     post = MagicMock()
     deliver = MagicMock()
     monkeypatch.setattr(mcp_server.cao_http, "post", post)
-    monkeypatch.setattr(inbox_module.inbox_service, "deliver_pending", deliver)
+    monkeypatch.setattr(inbox_module, "request_delivery", deliver)
 
     result = mcp_server._send_message_impl(
         "worker-a",

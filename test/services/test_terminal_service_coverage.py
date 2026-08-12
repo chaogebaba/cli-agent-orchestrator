@@ -75,7 +75,12 @@ class TestPersonaPlanningSeam:
                     working_directory=str(tmp_path),
                 )
         compose.assert_not_called()
-        bind.assert_called_once_with(None, "persona-terminal", plan=None)
+        # F138: bind_pane_identity(env_vars, terminal_id, plan=None, incarnation_token=<token>)
+        bind.assert_called_once()
+        args, kwargs = bind.call_args
+        assert args == (None, "persona-terminal")
+        assert kwargs["plan"] is None
+        assert "incarnation_token" in kwargs and isinstance(kwargs["incarnation_token"], str)
         warnings = [record for record in caplog.records if "shared-auth" in record.message]
         assert len(warnings) == 1
 

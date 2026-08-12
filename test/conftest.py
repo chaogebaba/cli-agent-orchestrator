@@ -221,6 +221,22 @@ def _hermetic_cao_env(monkeypatch):
     monkeypatch.delenv("CAO_INSTANCE_ID", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _clean_f138_incarnations():
+    """F138: clear process_incarnations between tests to prevent UNIQUE violations."""
+    yield
+    try:
+        from cli_agent_orchestrator.clients.database import SessionLocal
+        from sqlalchemy import text
+
+        with SessionLocal() as db:
+            db.execute(text("DELETE FROM process_incarnations"))
+            db.execute(text("DELETE FROM orphan_reconcile_jobs"))
+            db.commit()
+    except Exception:
+        pass
+
+
 @pytest.fixture
 def isolated_memory_db(tmp_path, monkeypatch):
     """Route default memory sessions to an initialized per-test SQLite database."""

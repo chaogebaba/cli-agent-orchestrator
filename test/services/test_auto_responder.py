@@ -282,7 +282,7 @@ def test_retry_cap_surfaces_waiting_and_pushes(monkeypatch, _reset_engine):
     pushed = []
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.create_inbox_message",
-        lambda sender, receiver, msg: pushed.append((sender, receiver, msg)),
+        lambda sender, receiver, msg, **kwargs: pushed.append((sender, receiver, msg)),
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",
@@ -313,7 +313,7 @@ def test_retry_exhausted_respects_self_push_guard(monkeypatch, _reset_engine):
     pushed = []
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.create_inbox_message",
-        lambda sender, receiver, msg: pushed.append((sender, receiver, msg)),
+        lambda sender, receiver, msg, **kwargs: pushed.append((sender, receiver, msg)),
     )
 
     _reset_engine._surface_retry_exhausted(
@@ -604,7 +604,7 @@ def test_supervisor_terminal_is_excluded_from_unknown_detection(monkeypatch, _re
     pushed = []
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.create_inbox_message",
-        lambda sender, receiver, msg: pushed.append((sender, receiver, msg)),
+        lambda sender, receiver, msg, **kwargs: pushed.append((sender, receiver, msg)),
     )
 
     result = _reset_engine.on_screen(
@@ -627,7 +627,7 @@ def test_push_refuses_to_send_to_source_terminal(monkeypatch, _reset_engine):
     delivered = []
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.create_inbox_message",
-        lambda sender, receiver, msg: pushed.append((sender, receiver, msg)),
+        lambda sender, receiver, msg, **kwargs: pushed.append((sender, receiver, msg)),
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",
