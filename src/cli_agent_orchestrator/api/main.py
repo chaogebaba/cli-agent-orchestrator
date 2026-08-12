@@ -1250,6 +1250,66 @@ def _sweep_workflow_runs_at_startup() -> None:
         logger.warning("workflow retention sweep failed at startup: %s", e)
 
 
+async def _f150_reconcile_supervisor_inbox_paths_at_startup() -> None:
+    """F150: Re-populate cc_inbox_path for all live supervisor mailboxes at startup.
+
+    After a server restart, resumed sessions may have NULL cc_inbox_path because
+    the publication path only runs on create_session. This ensures the delivery
+    runner has a valid path without waiting for an explicit /mailbox/path call.
+    """
+    import asyncio
+
+    from cli_agent_orchestrator.clients.database import (
+        MailboxModel,
+        SessionLocal,
+        TerminalModel,
+        get_terminal_metadata,
+    )
+    from cli_agent_orchestrator.services.mailbox_service import (
+        set_supervisor_callback_inbox_path,
+    )
+
+    with SessionLocal() as db:
+        live_mailboxes = (
+            db.query(MailboxModel)
+            .filter(
+                MailboxModel.role == "supervisor",
+                MailboxModel.current_terminal_id.isnot(None),
+            )
+            .join(
+                TerminalModel,
+                TerminalModel.id == MailboxModel.current_terminal_id,
+            )
+            .all()
+        )
+
+    for mbox in live_mailboxes:
+        if mbox.cc_inbox_path:
+            continue  # Already populated
+        terminal_id = str(mbox.current_terminal_id)
+        mailbox_id = str(mbox.id)
+        generation = int(mbox.generation)
+        meta_record = get_terminal_metadata(terminal_id)
+        if not meta_record:
+            continue
+        md = meta_record.get("metadata") or {}
+        candidate_path = md.get("cc_team_inbox_path")
+        if not candidate_path:
+            continue
+        await asyncio.to_thread(
+            set_supervisor_callback_inbox_path,
+            mailbox_id=mailbox_id,
+            terminal_id=terminal_id,
+            generation=generation,
+            path=candidate_path,
+        )
+        logger.info(
+            "F150: reconciled cc_inbox_path for mailbox %s terminal %s",
+            mailbox_id,
+            terminal_id,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -1296,6 +1356,12 @@ async def lifespan(app: FastAPI):
     _reconcile_memory_at_startup()
     inbox_service.recover_stale_deliveries()
     adopt_mailbox_rows_at_startup()
+    # F150: reconcile cc_inbox_path for all live supervisor mailboxes at startup.
+    # Ensures inbox path is populated after server restart + session resume.
+    try:
+        await _f150_reconcile_supervisor_inbox_paths_at_startup()
+    except Exception:
+        logger.warning("F150 startup inbox-path reconciliation failed; continuing", exc_info=True)
     # F123: reconcile supervisor-pending sentinel at startup.
     try:
         from cli_agent_orchestrator.clients.database import (
@@ -1303,12 +1369,36 @@ async def lifespan(app: FastAPI):
             MailboxModel,
             MessageStatus,
             SessionLocal,
+            TerminalModel,
             _remove_supervisor_pending_flag_if_drained,
             _touch_supervisor_pending_flag,
         )
 
         with SessionLocal() as db:
-            sup_mbox = db.query(MailboxModel).filter_by(role="supervisor").first()
+            sup_mbox = (
+                db.query(MailboxModel)
+                .filter(
+                    MailboxModel.role == "supervisor",
+                    MailboxModel.current_terminal_id.isnot(None),
+                )
+                .join(
+                    TerminalModel,
+                    TerminalModel.id == MailboxModel.current_terminal_id,
+                )
+                .order_by(MailboxModel.updated_at.desc())
+                .first()
+            )
+            if sup_mbox is None:
+                # Fallback without terminal-existence join
+                sup_mbox = (
+                    db.query(MailboxModel)
+                    .filter(
+                        MailboxModel.role == "supervisor",
+                        MailboxModel.current_terminal_id.isnot(None),
+                    )
+                    .order_by(MailboxModel.updated_at.desc())
+                    .first()
+                )
             if sup_mbox:
                 has_pending = db.query(
                     db.query(InboxModel)

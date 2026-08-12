@@ -127,11 +127,39 @@ def is_supervisor_mailbox_pull_terminal(terminal_id: str) -> bool:
 
 
 def get_current_supervisor_terminal_id() -> str | None:
-    """F138: Return the terminal_id of the current live supervisor mailbox, or None."""
+    """F138: Return the terminal_id of the current live supervisor mailbox, or None.
+
+    Handles multiple historical supervisor rows by selecting the most recently
+    updated mailbox whose current_terminal_id refers to an existing terminal.
+    Falls back to most-recently-updated with a non-null current_terminal_id if
+    no terminal row match is found (defensive: DB may lag).
+    """
     with SessionLocal() as db:
+        # Prefer the supervisor mailbox whose terminal still exists in the DB
         mailbox: Any = (
-            db.query(MailboxModel).filter_by(role="supervisor").one_or_none()
+            db.query(MailboxModel)
+            .filter(
+                MailboxModel.role == "supervisor",
+                MailboxModel.current_terminal_id.isnot(None),
+            )
+            .join(
+                TerminalModel,
+                TerminalModel.id == MailboxModel.current_terminal_id,
+            )
+            .order_by(MailboxModel.updated_at.desc())
+            .first()
         )
+        if mailbox is None:
+            # Fallback: most recently updated with non-null terminal_id
+            mailbox = (
+                db.query(MailboxModel)
+                .filter(
+                    MailboxModel.role == "supervisor",
+                    MailboxModel.current_terminal_id.isnot(None),
+                )
+                .order_by(MailboxModel.updated_at.desc())
+                .first()
+            )
         if mailbox is None:
             return None
         current_terminal_id = getattr(mailbox, "current_terminal_id", None)

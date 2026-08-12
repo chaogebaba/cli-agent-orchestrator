@@ -806,12 +806,36 @@ class InboxService:
                     retry_delay_s=_get_backoff_delay(terminal_id),
                 )
             if batch.kind == "no_path":
-                return CallbackRunOutcome(
-                    cursor_before=batch.cursor,
-                    reason="no_path",
-                    retry_delay_s=_get_backoff_delay(terminal_id),
-                    retryable_failure_count=1,
+                # F150: Self-heal — attempt to re-discover inbox path from
+                # terminal metadata before giving up.
+                healed = self._f150_self_heal_inbox_path(
+                    mailbox_id=mailbox_id,
+                    terminal_id=terminal_id,
+                    generation=generation,
                 )
+                if healed:
+                    # Re-fetch batch now that path is populated
+                    batch = get_supervisor_callback_batch(
+                        mailbox_id=mailbox_id,
+                        terminal_id=terminal_id,
+                        generation=generation,
+                        limit=MAX_ROWS_PER_RUN,
+                    )
+                    if batch.kind == "no_path":
+                        # Self-heal wrote a path but it didn't stick — give up
+                        return CallbackRunOutcome(
+                            cursor_before=batch.cursor,
+                            reason="no_path",
+                            retry_delay_s=_get_backoff_delay(terminal_id),
+                            retryable_failure_count=1,
+                        )
+                else:
+                    return CallbackRunOutcome(
+                        cursor_before=batch.cursor,
+                        reason="no_path",
+                        retry_delay_s=_get_backoff_delay(terminal_id),
+                        retryable_failure_count=1,
+                    )
             if not batch.rows:
                 # Empty scan: reset failure streak
                 _failure_streaks.pop(terminal_id, None)
@@ -933,6 +957,37 @@ class InboxService:
         finally:
             authority_lock.release()
             delivery_lock.release()
+
+    def _f150_self_heal_inbox_path(
+        self, *, mailbox_id: str, terminal_id: str, generation: int
+    ) -> bool:
+        """F150: Attempt to re-discover and populate cc_inbox_path from terminal metadata.
+
+        Returns True if a path was found and set, False otherwise.
+        """
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+        from cli_agent_orchestrator.services.mailbox_service import (
+            set_supervisor_callback_inbox_path,
+        )
+
+        try:
+            meta_record = get_terminal_metadata(terminal_id)
+            if not meta_record:
+                return False
+            md = meta_record.get("metadata") or {}
+            candidate_path = md.get("cc_team_inbox_path")
+            if not candidate_path:
+                return False
+            result = set_supervisor_callback_inbox_path(
+                mailbox_id=mailbox_id,
+                terminal_id=terminal_id,
+                generation=generation,
+                path=candidate_path,
+            )
+            return result.kind in ("updated", "unchanged")
+        except Exception as exc:
+            logger.debug("F150 self-heal inbox path failed: %s", exc)
+            return False
 
     def _f136_post_delivery(self, terminal_id: str, outcome: "CallbackRunOutcome") -> None:
         """D15: After delivery, decide: immediate rerun, delayed retry, or idle."""

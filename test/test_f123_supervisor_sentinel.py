@@ -69,7 +69,10 @@ class TestSupervisorPendingSentinel:
         flag.touch()
 
         mock_db = MagicMock()
-        mock_db.query.return_value.filter_by.return_value.first.return_value = None
+        # New query pattern: .filter(...).join(...).order_by(...).first()
+        mock_db.query.return_value.filter.return_value.join.return_value.order_by.return_value.first.return_value = None
+        # Fallback path: .filter(...).order_by(...).first()
+        mock_db.query.return_value.filter.return_value.order_by.return_value.first.return_value = None
 
         with (
             patch("cli_agent_orchestrator.constants.CAO_HOME_DIR", tmp_path),

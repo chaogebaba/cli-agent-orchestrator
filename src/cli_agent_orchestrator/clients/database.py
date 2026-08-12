@@ -5008,7 +5008,30 @@ def _remove_supervisor_pending_flag_if_drained() -> None:
         return
     try:
         with SessionLocal() as db:
-            sup_mbox = db.query(MailboxModel).filter_by(role="supervisor").first()
+            sup_mbox = (
+                db.query(MailboxModel)
+                .filter(
+                    MailboxModel.role == "supervisor",
+                    MailboxModel.current_terminal_id.isnot(None),
+                )
+                .join(
+                    TerminalModel,
+                    TerminalModel.id == MailboxModel.current_terminal_id,
+                )
+                .order_by(MailboxModel.updated_at.desc())
+                .first()
+            )
+            if sup_mbox is None:
+                # Fallback without terminal-existence join
+                sup_mbox = (
+                    db.query(MailboxModel)
+                    .filter(
+                        MailboxModel.role == "supervisor",
+                        MailboxModel.current_terminal_id.isnot(None),
+                    )
+                    .order_by(MailboxModel.updated_at.desc())
+                    .first()
+                )
             if sup_mbox is None:
                 flag.unlink(missing_ok=True)
                 return
