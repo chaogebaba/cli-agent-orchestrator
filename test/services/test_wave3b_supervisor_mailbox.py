@@ -592,7 +592,7 @@ def test_probe_04_two_generation_replay_me_and_digest_crash_retry_exclusion(
     with scratch_db.begin() as db:
         delivered_two = inbox(db, "22222222", "delivered", logical="mb_aaaaaaaa")
     second = publish_supervisor_incarnation(claim_mailbox("cao-wave3b"), "33333333")
-    page = list_messages("mb_aaaaaaaa")
+    page = list_messages("mb_aaaaaaaa", audit_browse=True)
     ids = {item["id"] for item in page["items"]}
     assert {delivered_one.id, delivered_two.id}.issubset(ids)
     assert second["digest_message_id"] is None

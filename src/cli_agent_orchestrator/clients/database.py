@@ -2290,6 +2290,23 @@ def get_current_mailbox_generation(mailbox_id: str) -> int | None:
         return cast(int | None, value)
 
 
+def get_mailbox_consumption_cursor(terminal_id: str) -> int | None:
+    """Best-effort: return consumed_through_id for the mailbox owning terminal_id.
+
+    Returns None (fail-open) when no mailbox exists or on any DB error.
+    """
+    try:
+        with SessionLocal() as db:
+            value = (
+                db.query(MailboxModel.consumed_through_id)
+                .filter(MailboxModel.current_terminal_id == terminal_id)
+                .scalar()
+            )
+            return int(value) if value is not None else None
+    except Exception:
+        return None
+
+
 def _receiver_is_terminal_or_mailbox_address(db: Any, receiver_id: str | None) -> bool:
     if not receiver_id:
         return False

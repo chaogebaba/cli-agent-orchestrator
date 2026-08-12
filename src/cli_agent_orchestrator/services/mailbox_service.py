@@ -888,6 +888,11 @@ def list_messages(
             )
         else:
             query = query.filter(InboxModel.receiver_id == receiver)
+        # D1 (fx157): clamp the default lower bound to the consumption cursor
+        if receiver.startswith("mb_") and after_id is None and not audit_browse:
+            query = query.filter(
+                InboxModel.id > int(mailbox.consumed_through_id)
+            )
         if since is not None:
             # Normalize since to aware-UTC unconditionally.
             if since.tzinfo is None:

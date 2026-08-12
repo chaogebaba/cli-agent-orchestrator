@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from cli_agent_orchestrator.clients.database import get_terminal_metadata, update_terminal_metadata
+from cli_agent_orchestrator.clients.database import get_mailbox_consumption_cursor, get_terminal_metadata, update_terminal_metadata
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.services.config_service import ConfigService
 
@@ -457,6 +457,12 @@ def attempt_teammate_push(terminal_id: str, messages: List[InboxMessage]) -> boo
     new_messages = [m for m in messages if m.id > last_notified_id]
     if not new_messages:
         return False
+    # D3 (fx157): send-time recount against consumption cursor
+    cursor = get_mailbox_consumption_cursor(terminal_id)
+    if cursor is not None:
+        new_messages = [m for m in new_messages if m.id > cursor]
+        if not new_messages:
+            return False
     first_msg = new_messages[0]
     worker_name = first_msg.sender_id
     message_preview = first_msg.message.split("\n", 1)[0] if first_msg.message else ""
