@@ -660,7 +660,7 @@ def test_managed_create_mode_matrix_before_and_after_publication(monkeypatch, mo
         ),
     )
     monkeypatch.setattr(terminal_service, "generate_terminal_id", lambda: "deadbeef")
-    monkeypatch.setattr(terminal_service, "generate_window_name", lambda _profile: "worker")
+    monkeypatch.setattr(terminal_service, "generate_window_name", lambda *_a: "worker")
     monkeypatch.setattr(terminal_service, "get_session_env", lambda _session: {})
     monkeypatch.setattr(terminal_service, "list_terminals_by_provider_session_id", lambda _u: [])
     monkeypatch.setattr(
@@ -760,7 +760,7 @@ def test_managed_create_prepublication_failure_releases_local_authority(monkeypa
         ),
     )
     monkeypatch.setattr(terminal_service, "generate_terminal_id", lambda: "deadbeef")
-    monkeypatch.setattr(terminal_service, "generate_window_name", lambda _profile: "worker")
+    monkeypatch.setattr(terminal_service, "generate_window_name", lambda *_a: "worker")
     monkeypatch.setattr(terminal_service, "get_session_env", lambda _session: {})
     monkeypatch.setattr(terminal_service, "list_terminals_by_provider_session_id", lambda _u: [])
     monkeypatch.setattr(

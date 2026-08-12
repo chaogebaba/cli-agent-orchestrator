@@ -275,7 +275,7 @@ def test_resume_publication_and_identity_confirmation(monkeypatch):
     monkeypatch.setattr(terminal_service, "load_agent_profile", MagicMock(side_effect=FileNotFoundError))
     monkeypatch.setattr(terminal_service, "generate_terminal_id", lambda: "new")
     monkeypatch.setattr(terminal_service, "generate_session_name", lambda: "cao-s")
-    monkeypatch.setattr(terminal_service, "generate_window_name", lambda _p: "w")
+    monkeypatch.setattr(terminal_service, "generate_window_name", lambda *_a: "w")
     monkeypatch.setattr(terminal_service, "db_create_terminal",
                         lambda *_a, **kw: published.append(kw.get("provider_session_id")))
     monkeypatch.setattr(terminal_service, "list_terminals_by_provider_session_id", lambda _u: [])
@@ -664,7 +664,7 @@ def test_sync_failure_racing_public_teardown_holder_retries_and_releases_uuid(mo
     monkeypatch.setattr(terminal_service, "load_agent_profile", MagicMock(side_effect=FileNotFoundError))
     monkeypatch.setattr(terminal_service, "generate_terminal_id", lambda: terminal_id)
     monkeypatch.setattr(terminal_service, "generate_session_name", lambda: "cao-s")
-    monkeypatch.setattr(terminal_service, "generate_window_name", lambda _p: "w")
+    monkeypatch.setattr(terminal_service, "generate_window_name", lambda *_a: "w")
     monkeypatch.setattr(terminal_service, "db_create_terminal", lambda *_a, **_k: None)
     monkeypatch.setattr(terminal_service, "list_terminals_by_provider_session_id", lambda _u: [])
     monkeypatch.setattr(terminal_service.provider_manager, "create_provider", lambda *_a, **_k: provider)
