@@ -2731,9 +2731,7 @@ async def _quiesce_before_watchdog_settle(terminal_id: str) -> bool:
     try:
         await quiesce_deferred_terminal(terminal_id)
     except Exception as exc:
-        logger.error(
-            "deferred_init_watchdog_quiesce_failed terminal=%s code=%s", terminal_id, exc
-        )
+        logger.error("deferred_init_watchdog_quiesce_failed terminal=%s code=%s", terminal_id, exc)
         return False
     # A record whose task has finished is spent; the scheduler's done-callback
     # normally pops it, but the watchdog must not depend on callback ordering.
@@ -3339,18 +3337,41 @@ async def _provider_child_alive(terminal_id: str, provider) -> bool | None:
 
 
 async def _confirm_launch_health(terminal_id: str, provider) -> None:
-    """F124 S6: confirm provider is alive after initialize(); raise on confirmed death."""
+    """F124 S6 + F163-a: confirm provider is alive after initialize(); raise on confirmed death.
+
+    Polls _provider_child_alive every ~0.5s for up to ~5s total to tolerate
+    slow shell forks (e.g. large command lines in zsh). Returns immediately
+    on True or None (inconclusive stays non-fatal). Raises ProviderLaunchFailed
+    only if the final probe at deadline still returns False.
+    """
     import asyncio as _asyncio
 
     grace = max(0.0, float(getattr(provider, "launch_health_grace_s", 0.0)))
     if grace:
         await _asyncio.sleep(grace)
 
-    alive = await _provider_child_alive(terminal_id, provider)
-    if alive is False:
-        raise ProviderLaunchFailed(
-            f"provider process tree is empty/dead for terminal {terminal_id}"
-        )
+    _POLL_INTERVAL = 0.5  # seconds between probes
+    _DEADLINE = 5.0  # total wall-clock budget for retry loop
+
+    import time as _time
+
+    deadline = _time.monotonic() + _DEADLINE
+
+    while True:
+        alive = await _provider_child_alive(terminal_id, provider)
+        if alive is not False:
+            # True (alive) or None (inconclusive) — non-fatal, return immediately
+            return
+
+        # alive is False — check if we still have budget to retry
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            break
+
+        await _asyncio.sleep(min(_POLL_INTERVAL, remaining))
+
+    # Final probe returned False and deadline exhausted
+    raise ProviderLaunchFailed(f"provider process tree is empty/dead for terminal {terminal_id}")
 
 
 def _schedule_deferred_init(

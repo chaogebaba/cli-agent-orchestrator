@@ -39,7 +39,6 @@ class TestComputeInitHealth:
         row = {"init_state": "ready"}
         assert self._compute(row, self.now) == "ready"
 
-
     def test_init_pending_within_deadline_yields_launching(self):
         """AC1: init_pending within deadline yields launching."""
         row = {
@@ -90,7 +89,6 @@ class TestComputeInitHealth:
             "init_deadline_s": None,
         }
         assert self._compute(row, self.now) == "failed"
-
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +146,6 @@ class TestAssignResponseContract:
         assert response["init_health"] == "launching"
 
 
-
 # ---------------------------------------------------------------------------
 # S3: Testable process-tree seam
 # ---------------------------------------------------------------------------
@@ -197,7 +194,6 @@ class TestProcRootSeam:
         assert 300 in result
         assert len(result) == 3
 
-
     def test_descendants_vanished_pane(self, tmp_path, monkeypatch):
         """AC9: PID disappearance during scan is handled gracefully."""
         import cli_agent_orchestrator.services.fork_context_service as fcs
@@ -205,9 +201,7 @@ class TestProcRootSeam:
         monkeypatch.setattr(fcs, "_PROC_ROOT", tmp_path)
         # Root PID exists but no children → only root returned
         (tmp_path / "42").mkdir()
-        (tmp_path / "42" / "stat").write_text(
-            "42 (bash) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
-        )
+        (tmp_path / "42" / "stat").write_text("42 (bash) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0")
         from cli_agent_orchestrator.services.fork_context_service import _descendants
 
         result = _descendants(42)
@@ -221,9 +215,7 @@ class TestProcRootSeam:
         (tmp_path / "50").mkdir()
         (tmp_path / "50" / "stat").write_text("garbage data")
         (tmp_path / "60").mkdir()
-        (tmp_path / "60" / "stat").write_text(
-            "60 (node) S 50 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
-        )
+        (tmp_path / "60" / "stat").write_text("60 (node) S 50 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0")
         from cli_agent_orchestrator.services.fork_context_service import _descendants
 
         # Root 50 exists, 60 is child
@@ -240,7 +232,6 @@ class TestProcRootSeam:
         from cli_agent_orchestrator.services.fork_context_service import _procfs_available
 
         assert _procfs_available() is False
-
 
 
 # ---------------------------------------------------------------------------
@@ -271,9 +262,7 @@ class TestProviderProcessContract:
         provider = MagicMock()
         provider.has_process_child = False
 
-        result = _run(
-            _provider_child_alive("test123", provider)
-        )
+        result = _run(_provider_child_alive("test123", provider))
         assert result is True
 
 
@@ -298,11 +287,8 @@ class TestProviderChildAlive:
         provider.has_process_child = True
         provider.launch_health_failure_confirmed = False
 
-        result = _run(
-            _provider_child_alive("test123", provider)
-        )
+        result = _run(_provider_child_alive("test123", provider))
         assert result is None
-
 
     def test_missing_terminal_returns_false(self, tmp_path, monkeypatch):
         """AC6: missing terminal metadata returns False (dead)."""
@@ -324,9 +310,7 @@ class TestProviderChildAlive:
         provider.has_process_child = True
         provider.launch_health_failure_confirmed = False
 
-        result = _run(
-            _provider_child_alive("gone123", provider)
-        )
+        result = _run(_provider_child_alive("gone123", provider))
         assert result is False
 
     def test_descendants_found_returns_true(self, tmp_path, monkeypatch):
@@ -365,11 +349,8 @@ class TestProviderChildAlive:
         provider.launch_health_failure_confirmed = False
         provider.shell_baseline = "bash"
 
-        result = _run(
-            _provider_child_alive("live123", provider)
-        )
+        result = _run(_provider_child_alive("live123", provider))
         assert result is True
-
 
     def test_exec_replacement_returns_true(self, tmp_path, monkeypatch):
         """AC5a: no descendants but pane command changed from baseline → alive."""
@@ -384,9 +365,7 @@ class TestProviderChildAlive:
 
         # Only root PID, no children
         (tmp_path / "100").mkdir()
-        (tmp_path / "100" / "stat").write_text(
-            "100 (kiro) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
-        )
+        (tmp_path / "100" / "stat").write_text("100 (kiro) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0")
 
         metadata = {"tmux_session": "s1", "tmux_window": "w1"}
         monkeypatch.setattr(
@@ -410,9 +389,7 @@ class TestProviderChildAlive:
         provider.launch_health_failure_confirmed = False
         provider.shell_baseline = "bash"
 
-        result = _run(
-            _provider_child_alive("exec123", provider)
-        )
+        result = _run(_provider_child_alive("exec123", provider))
         assert result is True
 
     def test_empty_shell_returns_false(self, tmp_path, monkeypatch):
@@ -427,9 +404,7 @@ class TestProviderChildAlive:
         (tmp_path / "self" / "stat").write_text("fake")
 
         (tmp_path / "100").mkdir()
-        (tmp_path / "100" / "stat").write_text(
-            "100 (bash) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
-        )
+        (tmp_path / "100" / "stat").write_text("100 (bash) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0")
 
         metadata = {"tmux_session": "s1", "tmux_window": "w1"}
         monkeypatch.setattr(
@@ -452,11 +427,8 @@ class TestProviderChildAlive:
         provider.launch_health_failure_confirmed = False
         provider.shell_baseline = "bash"
 
-        result = _run(
-            _provider_child_alive("dead123", provider)
-        )
+        result = _run(_provider_child_alive("dead123", provider))
         assert result is False
-
 
     def test_missing_baseline_returns_none(self, tmp_path, monkeypatch):
         """AC5c: missing shell baseline → inconclusive (None)."""
@@ -471,9 +443,7 @@ class TestProviderChildAlive:
 
         # Only root, no children
         (tmp_path / "100").mkdir()
-        (tmp_path / "100" / "stat").write_text(
-            "100 (bash) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
-        )
+        (tmp_path / "100" / "stat").write_text("100 (bash) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0")
 
         metadata = {"tmux_session": "s1", "tmux_window": "w1"}
         monkeypatch.setattr(
@@ -498,9 +468,7 @@ class TestProviderChildAlive:
         provider.shell_baseline = None
         provider._shell_baseline = None
 
-        result = _run(
-            _provider_child_alive("nobl123", provider)
-        )
+        result = _run(_provider_child_alive("nobl123", provider))
         assert result is None
 
 
@@ -523,44 +491,27 @@ class TestConfirmLaunchHealth:
         provider.launch_health_grace_s = 0.0
 
         start = time.monotonic()
-        _run(
-            _confirm_launch_health("ok123", provider)
-        )
+        _run(_confirm_launch_health("ok123", provider))
         elapsed = time.monotonic() - start
         # Must complete in well under 1s (no sleep added)
         assert elapsed < 0.5
 
-
-    def test_confirmed_dead_raises_provider_launch_failed(self, tmp_path, monkeypatch):
-        """AC6: confirmed empty shell raises ProviderLaunchFailed."""
-        import cli_agent_orchestrator.services.fork_context_service as fcs
+    def test_confirmed_dead_raises_provider_launch_failed(self, monkeypatch):
+        """AC6: confirmed empty shell raises ProviderLaunchFailed (after retry deadline)."""
         from cli_agent_orchestrator.services.terminal_service import (
             ProviderLaunchFailed,
             _confirm_launch_health,
         )
 
-        monkeypatch.setattr(fcs, "_PROC_ROOT", tmp_path)
-        (tmp_path / "self" / "stat").parent.mkdir(parents=True)
-        (tmp_path / "self" / "stat").write_text("fake")
-        (tmp_path / "100").mkdir()
-        (tmp_path / "100" / "stat").write_text(
-            "100 (bash) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
-        )
-
-        metadata = {"tmux_session": "s1", "tmux_window": "w1"}
+        # Mock _provider_child_alive to always return False (avoids 5s real wait)
         monkeypatch.setattr(
-            "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
-            lambda tid: metadata,
+            "cli_agent_orchestrator.services.terminal_service._provider_child_alive",
+            AsyncMock(return_value=False),
         )
+        # Shrink deadline for fast test
         monkeypatch.setattr(
-            "cli_agent_orchestrator.services.fork_context_service.pane_pid",
-            lambda sess, win: 100,
-        )
-        mock_backend = MagicMock()
-        mock_backend.get_pane_current_command.return_value = "bash"
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.backends.registry.get_backend",
-            lambda: mock_backend,
+            "cli_agent_orchestrator.services.terminal_service._confirm_launch_health.__code__",
+            _confirm_launch_health.__code__,
         )
 
         provider = MagicMock()
@@ -570,9 +521,7 @@ class TestConfirmLaunchHealth:
         provider.shell_baseline = "bash"
 
         with pytest.raises(ProviderLaunchFailed):
-            _run(
-                _confirm_launch_health("dead123", provider)
-            )
+            _run(_confirm_launch_health("dead123", provider))
 
     def test_inconclusive_does_not_raise(self, tmp_path, monkeypatch):
         """AC5c: inconclusive (None) does not fail the terminal."""
@@ -589,9 +538,121 @@ class TestConfirmLaunchHealth:
         provider.launch_health_grace_s = 0.0
 
         # Should NOT raise
-        _run(
-            _confirm_launch_health("inc123", provider)
+        _run(_confirm_launch_health("inc123", provider))
+
+
+# ---------------------------------------------------------------------------
+# S6b: F163-a — bounded retry in _confirm_launch_health
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmLaunchHealthF163aRetry:
+    """F163-a: bounded retry tolerates slow shell forks."""
+
+    def test_still_shell_for_4s_then_forks_no_raise(self, monkeypatch):
+        """F163-a: probe returns False for ~4s then True → no raise, tolerates slow fork."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _confirm_launch_health,
         )
+
+        # Simulate: False 8 times (8 * 0.5s = 4s), then True
+        call_count = {"n": 0}
+
+        async def _mock_alive(tid, prov):
+            call_count["n"] += 1
+            if call_count["n"] <= 8:
+                return False
+            return True
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service._provider_child_alive",
+            _mock_alive,
+        )
+
+        provider = MagicMock()
+        provider.launch_health_grace_s = 0.0
+
+        # Must NOT raise
+        _run(_confirm_launch_health("slow123", provider))
+        # Must have probed more than once
+        assert call_count["n"] > 1
+
+    def test_still_shell_past_deadline_raises(self, monkeypatch):
+        """F163-a: probe returns False past full 5s deadline → raises ProviderLaunchFailed."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            ProviderLaunchFailed,
+            _confirm_launch_health,
+        )
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service._provider_child_alive",
+            AsyncMock(return_value=False),
+        )
+
+        provider = MagicMock()
+        provider.launch_health_grace_s = 0.0
+
+        with pytest.raises(ProviderLaunchFailed):
+            _run(_confirm_launch_health("dead456", provider))
+
+    def test_immediate_true_returns_fast_no_wait(self, monkeypatch):
+        """F163-a: immediate True on first probe → returns without any sleep (near-zero latency)."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _confirm_launch_health,
+        )
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service._provider_child_alive",
+            AsyncMock(return_value=True),
+        )
+
+        provider = MagicMock()
+        provider.launch_health_grace_s = 0.0
+
+        start = time.monotonic()
+        _run(_confirm_launch_health("fast123", provider))
+        elapsed = time.monotonic() - start
+        # Must complete in well under 0.1s — no 0.5s poll sleep, no 5s deadline
+        assert elapsed < 0.1
+
+    def test_inconclusive_none_returns_immediately(self, monkeypatch):
+        """F163-a: None (inconclusive) on first probe → returns fast, unchanged semantics."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _confirm_launch_health,
+        )
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service._provider_child_alive",
+            AsyncMock(return_value=None),
+        )
+
+        provider = MagicMock()
+        provider.launch_health_grace_s = 0.0
+
+        start = time.monotonic()
+        _run(_confirm_launch_health("inc456", provider))
+        elapsed = time.monotonic() - start
+        assert elapsed < 0.1
+
+    def test_grace_sleep_still_honored(self, monkeypatch):
+        """F163-a: launch_health_grace_s initial sleep is still applied before polling."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _confirm_launch_health,
+        )
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service._provider_child_alive",
+            AsyncMock(return_value=True),
+        )
+
+        provider = MagicMock()
+        provider.launch_health_grace_s = 0.2
+
+        start = time.monotonic()
+        _run(_confirm_launch_health("grace123", provider))
+        elapsed = time.monotonic() - start
+        # Grace sleep of 0.2s should be observable
+        assert elapsed >= 0.15
 
 
 # ---------------------------------------------------------------------------
@@ -669,7 +730,6 @@ class TestNoticeActionHint:
         assert pre != unknown
         assert unknown != post
         assert pre != post
-
 
     def test_notice_text_includes_action_hint(self):
         """AC8: _notice_text output includes the actionable hint."""
@@ -858,14 +918,10 @@ async def test_ac10_production_race_one_lawful_claim(ac10_isolated_db, monkeypat
     assert len(settlement_calls) >= 1
 
     # Verify the inbox has exactly one notice for this terminal — the CAS guarantee
-    from cli_agent_orchestrator.clients.database import SessionLocal, InboxModel
+    from cli_agent_orchestrator.clients.database import InboxModel, SessionLocal
 
     with SessionLocal() as db_session:
-        notices = (
-            db_session.query(InboxModel)
-            .filter(InboxModel.sender_id == terminal_id)
-            .all()
-        )
+        notices = db_session.query(InboxModel).filter(InboxModel.sender_id == terminal_id).all()
         assert len(notices) == 1
         notice_text = notices[0].message
         # The notice contains either pre-delivery or unknown-delivery hint
@@ -926,10 +982,18 @@ async def test_ac10_mutation_kill_remove_cas_filter(ac10_isolated_db, monkeypatc
 
     # Run sequentially — first claim wins, second sees already_claimed
     await terminals._claim_and_settle_deferred_failure(
-        terminal_id, "gen-f124", snapshot, "provider_launch_failed", None,
+        terminal_id,
+        "gen-f124",
+        snapshot,
+        "provider_launch_failed",
+        None,
     )
     await terminals._claim_and_settle_deferred_failure(
-        terminal_id, "gen-watchdog", snapshot, "deferred_init_watchdog_deadline", None,
+        terminal_id,
+        "gen-watchdog",
+        snapshot,
+        "deferred_init_watchdog_deadline",
+        None,
     )
 
     # CAS guarantee: exactly one inbox notice (the load-bearing assertion).
@@ -938,11 +1002,7 @@ async def test_ac10_mutation_kill_remove_cas_filter(ac10_isolated_db, monkeypatc
     from cli_agent_orchestrator.clients.database import SessionLocal
 
     with SessionLocal() as db_session:
-        notices = (
-            db_session.query(InboxModel)
-            .filter(InboxModel.sender_id == terminal_id)
-            .all()
-        )
+        notices = db_session.query(InboxModel).filter(InboxModel.sender_id == terminal_id).all()
         assert len(notices) == 1
 
     # Row is terminally settled
@@ -974,12 +1034,9 @@ class TestNoUniversalSleep:
         provider.launch_health_grace_s = 0.05  # 50ms
 
         start = time.monotonic()
-        _run(
-            _confirm_launch_health("grace123", provider)
-        )
+        _run(_confirm_launch_health("grace123", provider))
         elapsed = time.monotonic() - start
         assert elapsed >= 0.04  # Grace was honored
-
 
 
 # ---------------------------------------------------------------------------
@@ -1031,9 +1088,7 @@ class TestMutationKillDescendantsVsChildren:
         # Full tree includes grandchild 300
         assert 300 in result
         # Direct children only would miss 300 — this test kills that mutant
-        direct_children = [
-            pid for pid in result if pid != 100 and str(pid) in ["200"]
-        ]
+        direct_children = [pid for pid in result if pid != 100 and str(pid) in ["200"]]
         # But full result ALSO has 300
         assert len(result) == 3
 
@@ -1057,9 +1112,7 @@ class TestMutationKillExecReplacement:
         (tmp_path / "self" / "stat").parent.mkdir(parents=True)
         (tmp_path / "self" / "stat").write_text("fake")
         (tmp_path / "100").mkdir()
-        (tmp_path / "100" / "stat").write_text(
-            "100 (kiro) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
-        )
+        (tmp_path / "100" / "stat").write_text("100 (kiro) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0")
 
         metadata = {"tmux_session": "s1", "tmux_window": "w1"}
         monkeypatch.setattr(
@@ -1082,13 +1135,10 @@ class TestMutationKillExecReplacement:
         provider.launch_health_failure_confirmed = False
         provider.shell_baseline = "bash"
 
-        result = _run(
-            _provider_child_alive("exec123", provider)
-        )
+        result = _run(_provider_child_alive("exec123", provider))
         # With exec-replacement branch: True (alive)
         # Without it (mutant): would be False (dead) — this kills the mutant
         assert result is True
-
 
 
 # ---------------------------------------------------------------------------
@@ -1114,9 +1164,7 @@ class TestMutationKillInconclusiveAsDead:
         provider.launch_health_grace_s = 0.0
 
         # This must NOT raise — inconclusive degrades to watchdog
-        _run(
-            _confirm_launch_health("inc_mut", provider)
-        )
+        _run(_confirm_launch_health("inc_mut", provider))
 
 
 # ---------------------------------------------------------------------------
