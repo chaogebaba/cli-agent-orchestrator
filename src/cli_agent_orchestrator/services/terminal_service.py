@@ -204,6 +204,12 @@ _deferred_init_tasks: set = set()
 _deferred_reconciler_tasks: set[asyncio.Task] = set()
 _deferred_tasks_lock = threading.Lock()
 
+# F160-a: terminals whose deferred init has already been granted its one
+# watchdog re-arm. In-memory by design — a server restart settles every
+# surviving init_pending row through the H5 startup sweep, so no row can
+# outlive this set and collect a second retry.
+_f160_retried_terminals: set[str] = set()
+
 POLL_INTERVAL = 2.0
 DEFERRED_TASK_QUIESCE_S = 10.0
 FORK_REFRESH_WAIT_BUDGET = 120.0
@@ -2647,10 +2653,102 @@ async def recover_deferred_inits(
                 logger.exception("deferred_init_settlement_failed terminal=%s", terminal_id)
 
 
+def _f160_retry_once(row: dict) -> bool:
+    """F160-a: grant one extra deadline window to a still-running deferred init.
+
+    Returns True when the row was re-armed and must NOT be settled by this
+    sweep. The retry fires at most once per terminal and only when *no partial
+    delivery can have occurred*, because ``deferred_init_watchdog_deadline`` is
+    a `_UNKNOWN_DELIVERY_CODES` member — the row alone cannot tell us whether
+    the initial message went out. Three conditions establish that:
+
+    1. ``shell_command`` is still unset. The deferred path leaves it NULL at
+       create and only persists it after ``provider.initialize()`` returns, so
+       NULL means initialize() never completed — delivery is strictly later.
+    2. F138 exposure has not crossed: no incarnation row for this lifecycle
+       generation, or one still in ``launching`` (``f138_strict_activate`` runs
+       immediately after initialize()/launch health, so ``active`` means the
+       process-bearing pane is live and re-arming could shadow real work).
+    3. The background init task is still alive. A dead task cannot make
+       progress, so extending its deadline would only delay the notice; and
+       re-scheduling a fresh init over a pane whose task may merely have been
+       abandoned (quiesce timeout) is the respawn problem, not this one.
+    """
+    tid = row["id"]
+    if tid in _f160_retried_terminals:
+        return False
+    if row.get("shell_command"):
+        return False
+
+    from cli_agent_orchestrator.clients.database import (
+        f138_get_incarnation_by_terminal_generation,
+        f160_rearm_deferred_init,
+    )
+
+    try:
+        incarnation = f138_get_incarnation_by_terminal_generation(
+            tid, int(row.get("lifecycle_generation") or 0)
+        )
+    except Exception:
+        logger.exception("f160_incarnation_lookup_failed terminal=%s", tid)
+        return False
+    if incarnation is not None and incarnation.get("state") != "launching":
+        return False
+
+    with _deferred_tasks_lock:
+        record = _deferred_tasks_by_terminal.get(tid)
+    if record is None or record.task.done() or record.abandoned:
+        return False
+
+    if not f160_rearm_deferred_init(tid, row.get("init_started_at")):
+        return False
+    _f160_retried_terminals.add(tid)
+    logger.info(
+        "f160_deferred_init_retry terminal=%s retry 1/1 deadline_s=%s",
+        tid,
+        row.get("init_deadline_s"),
+    )
+    return True
+
+
+async def _quiesce_before_watchdog_settle(terminal_id: str) -> bool:
+    """F160-a: stand the live deferred-init task down before the watchdog settles it.
+
+    The watchdog settles out of band, under its own ``watchdog-<epoch>``
+    claimant, so every ``_tracked_blocking`` call it makes is refused while a
+    live ``_DeferredTaskRecord`` for another generation is registered. That
+    guard is correct — a stale claimant must not mutate a terminal whose init
+    task is still driving it — so the fix is to end the init task first, the
+    same order the creation-rollback path uses (quiesce, then settle, and
+    retain rather than settle if quiescence fails).
+
+    Returns True when settlement may proceed.
+    """
+    with _deferred_tasks_lock:
+        record = _deferred_tasks_by_terminal.get(terminal_id)
+    if record is None:
+        return True
+    try:
+        await quiesce_deferred_terminal(terminal_id)
+    except Exception as exc:
+        logger.error(
+            "deferred_init_watchdog_quiesce_failed terminal=%s code=%s", terminal_id, exc
+        )
+        return False
+    # A record whose task has finished is spent; the scheduler's done-callback
+    # normally pops it, but the watchdog must not depend on callback ordering.
+    with _deferred_tasks_lock:
+        record = _deferred_tasks_by_terminal.get(terminal_id)
+        if record is not None and record.task.done():
+            _deferred_tasks_by_terminal.pop(terminal_id, None)
+    return True
+
+
 async def sweep_overdue_deferred_inits(registry: PluginRegistry | None = None) -> int:
     """Settle init_pending rows whose deadline has elapsed (runtime watchdog body).
 
-    Returns the number of rows for which settlement was attempted.
+    Returns the number of rows for which settlement was attempted. Rows granted
+    the F160-a one-shot re-arm are not counted — they were not settled.
     """
     from datetime import datetime, timezone
 
@@ -2659,9 +2757,13 @@ async def sweep_overdue_deferred_inits(registry: PluginRegistry | None = None) -
     if not overdue:
         return 0
 
-    async def _settle_overdue(row: dict) -> None:
+    async def _settle_overdue(row: dict) -> bool:
         tid = row["id"]
         try:
+            if _f160_retry_once(row):
+                return False
+            if not await _quiesce_before_watchdog_settle(tid):
+                return True
             await _claim_and_settle_deferred_failure(
                 tid,
                 f"watchdog-{SERVER_INIT_OWNER_EPOCH}",
@@ -2674,9 +2776,10 @@ async def sweep_overdue_deferred_inits(registry: PluginRegistry | None = None) -
             raise
         except Exception:
             logger.exception("deferred_init_watchdog_settle_failed terminal=%s", tid)
+        return True
 
-    await asyncio.gather(*[_settle_overdue(row) for row in overdue])
-    return len(overdue)
+    results = await asyncio.gather(*[_settle_overdue(row) for row in overdue])
+    return sum(1 for settled in results if settled)
 
 
 def _fork_refresh_lock(base_name: str) -> asyncio.Lock:
@@ -3672,6 +3775,7 @@ def _schedule_deferred_init(
 
     def _done(completed):
         _deferred_init_tasks.discard(completed)
+        _f160_retried_terminals.discard(terminal_id)
         with _deferred_tasks_lock:
             record = _deferred_tasks_by_terminal.get(terminal_id)
             if (

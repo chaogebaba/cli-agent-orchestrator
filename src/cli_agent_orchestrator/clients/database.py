@@ -4202,6 +4202,28 @@ def list_deferred_init_overdue_pending_rows(now: datetime) -> List[Dict[str, Any
         ]
 
 
+def f160_rearm_deferred_init(terminal_id: str, expected_started_at: datetime | None) -> bool:
+    """F160-a: grant an overdue init_pending row one more deadline window.
+
+    Restamps ``init_started_at`` to now, keeping ``init_deadline_s``. The write
+    is conditional on the row still being ``init_pending`` with the exact
+    ``init_started_at`` the caller observed, so a concurrent settle (or a second
+    sweep) can never re-arm a row that has already moved on.
+    """
+    with SessionLocal.begin() as db:
+        row = db.get(TerminalModel, terminal_id)
+        if row is None or row.init_state != "init_pending":
+            return False
+        current = _as_utc(row.init_started_at)
+        expected = _as_utc(expected_started_at)
+        if current is None or expected is None:
+            return False
+        if abs((current - expected).total_seconds()) > 0.001:
+            return False
+        row.init_started_at = _utcnow()
+        return True
+
+
 def begin_teardown_intent(workspace_id: str, session_name: str) -> Dict[str, Any]:
     """Create or supersede the single active close authority for a workspace."""
     now = _utcnow()
