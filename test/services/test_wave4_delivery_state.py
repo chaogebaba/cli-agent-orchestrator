@@ -1152,10 +1152,11 @@ def test_livefix_p2_fresh_capture_failure_fails_closed(wave4_db, capture_result)
     assert screen.display == incremental_rows
 
 
+@pytest.mark.local_fixture(str(Path(__file__).parent.parent / "fixtures/drain-wave4/p17-pane-final.txt"))
 def test_livefix_p3_grok_live_shape_completes_and_delivery_opens(wave4_db):
-    root = Path(__file__).parents[3]
+    fixture_dir = Path(__file__).parent.parent / "fixtures/drain-wave4"
     screen = (
-        (root / "tmp/orch/drain-2026-07-16-wave4/p17-pane-final.txt")
+        (fixture_dir / "p17-pane-final.txt")
         .read_text(encoding="utf-8")
         .splitlines()
     )
@@ -1215,10 +1216,11 @@ def test_livefix_p3_grok_live_shape_completes_and_delivery_opens(wave4_db):
     assert incremental_screen.display == screen
 
 
+@pytest.mark.local_fixture(str(Path(__file__).parent.parent / "fixtures/drain-wave4/f16-tmux-tail.txt"))
 def test_livefix_p4_f16_live_pane_remains_processing():
-    root = Path(__file__).parents[3]
+    fixture_dir = Path(__file__).parent.parent / "fixtures/drain-wave4"
     screen = (
-        (root / "tmp/orch/drain-2026-07-16-wave4/f16-tmux-tail.txt")
+        (fixture_dir / "f16-tmux-tail.txt")
         .read_text(encoding="utf-8")
         .splitlines()
     )

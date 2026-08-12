@@ -308,6 +308,8 @@ dev = [
     "opentelemetry-api>=1.27.0",
     "opentelemetry-sdk>=1.27.0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.27.0",
+    "pytest-timeout>=2.3.1",
+    "pytest-repeat>=0.9.3",
 ]
 
 [tool.black]
@@ -337,12 +339,36 @@ markers = [
     "e2e: marks end-to-end tests",
     "live: marks tests that require live external services or authenticated CLIs",
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
-    "pty: marks tests that require a real PTY (fail under nested tmux/pty envs)"
+    "pty: marks tests that require a real PTY (fail under nested tmux/pty envs)",
+    "smoke: marks fast smoke tests (< 200 ms solo, core happy-path coverage)",
+    "local_fixture: marks tests depending on machine-local fixture files (xfail when absent)",
 ]
 asyncio_mode = "strict"
 testpaths = ["test"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
+# ---------------------------------------------------------------------------
+# Tier invocations (fx147):
+#   smoke:   uv run pytest -m smoke            (< 5 s, ~15-25 tests)
+#   default: uv run pytest                     (existing filter, < 60 s)
+#   full:    uv run pytest -m ""               (everything, unbounded)
+# ---------------------------------------------------------------------------
 # Local/default: skip e2e + slow real-binary tests. CI passes --cov explicitly.
 addopts = "-n 4 -m 'not e2e and not slow and not live and not pty'"
+timeout = 30
+timeout_method = "thread"
+faulthandler_timeout = 35
+filterwarnings = [
+    "error",
+    "ignore::pydantic.warnings.PydanticDeprecatedSince20",
+    "ignore::starlette.exceptions.StarletteDeprecationWarning",
+    "ignore::DeprecationWarning:frontmatter",
+    "ignore::DeprecationWarning:nest_asyncio",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+    "ignore:The default datetime adapter:DeprecationWarning",
+    "ignore:datetime.datetime.utcnow:DeprecationWarning",
+    "ignore::ResourceWarning",
+    "ignore:'asyncio.iscoroutinefunction':DeprecationWarning",
+    "ignore::pytest_mock.plugin.PytestMockWarning",
+]

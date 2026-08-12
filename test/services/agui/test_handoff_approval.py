@@ -612,7 +612,7 @@ class TestDeliveryFailureRetryable:
     async def test_slow_delivery_completes_and_commits(self, monkeypatch):
         """A slow delivery runs to completion and commits (no hard timeout, so
         no orphaned worker); the slow-path warning threshold is exercised."""
-        import time as _time
+        import threading as _threading
 
         from cli_agent_orchestrator.services.agui import handoff_approval as _mod
 
@@ -621,10 +621,10 @@ class TestDeliveryFailureRetryable:
 
         class _SlowDelivery:
             def send_input(self, terminal_id, text, **kwargs):
-                _time.sleep(0.05)
+                _threading.Event().wait(0.05)
 
             def send_special_key(self, terminal_id, key):
-                _time.sleep(0.05)
+                _threading.Event().wait(0.05)
 
         construct = AgentHandoffWithApproval(
             emitter=RecordingUiEmitter(), answer_delivery=_SlowDelivery()
@@ -1055,7 +1055,7 @@ class TestInFlightWatchdog:
         """The watchdog fires but delivery then completes normally — outcome
         still commits correctly (watchdog is observability-only)."""
         import logging
-        import time as _time
+        import threading as _threading
 
         from cli_agent_orchestrator.services.agui import handoff_approval as _mod
 
@@ -1063,10 +1063,10 @@ class TestInFlightWatchdog:
 
         class _SlowButSucceeds:
             def send_input(self, terminal_id, text, **kwargs):
-                _time.sleep(0.05)
+                _threading.Event().wait(0.05)
 
             def send_special_key(self, terminal_id, key):
-                _time.sleep(0.05)
+                _threading.Event().wait(0.05)
                 return True
 
         construct = AgentHandoffWithApproval(

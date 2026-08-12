@@ -16,3 +16,12 @@ refresh-ext-apps-skills:
 # Exit 0 = in sync, 1 = drift, 2 = network-gated (could not verify).
 check-ext-apps-skills:
 	uv run python scripts/vendor_ext_apps_skills.py --check
+
+
+.PHONY: test-smoke test-full
+
+test-smoke:
+	uv run pytest -m smoke
+
+test-full:
+	uv run pytest -m ""
