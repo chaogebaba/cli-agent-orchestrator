@@ -666,7 +666,7 @@ def f138_notify_confirmed_gone_report_failed(
         create_inbox_message(
             sender_id=terminal_id,
             receiver_id=supervisor_id,
-            content=message,
+            message=message,
         )
     except Exception:
         logger.warning(
@@ -865,7 +865,7 @@ class OrphanReconcileService:
             create_inbox_message(
                 sender_id=terminal_id,
                 receiver_id=supervisor_id,
-                content=message,
+                message=message,
             )
         except Exception:
             logger.exception(

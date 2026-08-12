@@ -677,7 +677,7 @@ class FifoManager:
             create_inbox_message(
                 sender_id=terminal_id,
                 receiver_id=supervisor_id,
-                content=message,
+                message=message,
             )
         except Exception:
             logger.exception(
