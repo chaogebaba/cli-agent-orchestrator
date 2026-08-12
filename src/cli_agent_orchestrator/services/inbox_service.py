@@ -14,7 +14,7 @@ import secrets
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from itertools import groupby
 from pathlib import Path
 from typing import Any, Callable, Literal, Sequence
@@ -3075,6 +3075,8 @@ class InboxService:
             except Exception as e:
                 logger.debug(f"Inbox reconciliation failed for {terminal_id}: {e}")
         self.recover_stale_deliveries(recurring=True)
+        # fx158 D1/D2: pull-mode pending-push reconciler (bypasses deliver_pending).
+        self.reconcile_pull_mode_notifications()
         # WP-MAILBOX-CHANNEL: quarantine malformed mailbox rows on daemon heartbeat.
         from cli_agent_orchestrator.services.config_service import ConfigService
         from cli_agent_orchestrator.services.mailbox_service import (
@@ -3092,6 +3094,140 @@ class InboxService:
                         quarantine_malformed_mailbox_rows(mb.id)
                     except Exception as e:
                         logger.debug(f"Mailbox quarantine sweep failed for {mb.id}: {e}")
+
+    def reconcile_pull_mode_notifications(self) -> None:
+        """fx158 D1: Push notifications for pull-mode supervisor mailboxes.
+
+        Bypasses deliver_pending entirely — routes directly to the push path.
+        D3 selection: mailbox-driven, cursor-aware, grace-windowed.
+        D9: per-mailbox failure isolation.
+        """
+        import hashlib
+
+        from cli_agent_orchestrator.clients.database import (
+            InboxModel as _InboxModel,
+        )
+        from cli_agent_orchestrator.clients.database import (
+            MailboxModel as _MBModel,
+        )
+        from cli_agent_orchestrator.clients.database import (
+            SessionLocal as _SL,
+        )
+        from cli_agent_orchestrator.clients.database import (
+            TerminalModel as _TModel,
+        )
+        from cli_agent_orchestrator.clients.database import (
+            begin_delivery_attempt,
+            settle_delivery_attempt,
+        )
+        from cli_agent_orchestrator.services.config_service import ConfigService
+        from cli_agent_orchestrator.services.mailbox_service import (
+            is_supervisor_mailbox_pull_terminal,
+        )
+        from cli_agent_orchestrator.services.teammate_push_service import (
+            PushOutcome,
+            _should_teammate_push,
+            attempt_teammate_push_reported,
+        )
+
+        # D3 condition 1: flag must be on
+        if not ConfigService.get("supervisor.mailbox_pull"):
+            return
+
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=INBOX_RECONCILE_GRACE_SECONDS)
+
+        with _SL() as db:
+            supervisor_mailboxes = db.query(_MBModel).filter_by(role="supervisor").all()
+
+        for mb in supervisor_mailboxes:
+            try:
+                # D3 condition 2: current_terminal_id non-empty and pull-mode
+                if not mb.current_terminal_id:
+                    continue
+                if not is_supervisor_mailbox_pull_terminal(mb.current_terminal_id):
+                    continue
+
+                # D3 condition 3: live terminals row exists
+                with _SL() as db:
+                    terminal_row = db.query(_TModel).filter_by(id=mb.current_terminal_id).one_or_none()
+                if terminal_row is None:
+                    continue
+
+                # D3 condition 5: teammate_push flag gate
+                if not _should_teammate_push(mb.current_terminal_id):
+                    continue
+
+                # D3 condition 4: pending rows older than grace, above consumed_through_id
+                with _SL() as db:
+                    pending_rows = (
+                        db.query(_InboxModel)
+                        .filter(
+                            _InboxModel.logical_receiver_id == mb.id,
+                            _InboxModel.status == MessageStatus.PENDING.value,
+                            _InboxModel.id > mb.consumed_through_id,
+                            _InboxModel.created_at < cutoff,
+                        )
+                        .order_by(_InboxModel.id)
+                        .limit(100)
+                        .all()
+                    )
+
+                if not pending_rows:
+                    continue
+
+                # Convert to InboxMessage for the push function
+                messages = [
+                    InboxMessage(
+                        id=row.id,
+                        sender_id=row.sender_id,
+                        receiver_id=row.receiver_id,
+                        message=row.message,
+                        orchestration_type=OrchestrationType(row.orchestration_type),
+                        status=MessageStatus(row.status),
+                        created_at=row.created_at,
+                        logical_receiver_id=getattr(row, "logical_receiver_id", None),
+                    )
+                    for row in pending_rows
+                ]
+
+                # D4: call the reported form directly
+                outcome: PushOutcome = attempt_teammate_push_reported(
+                    mb.current_terminal_id, messages
+                )
+
+                # D5: instrumentation — record attempt row
+                if outcome.reason == "pushed":
+                    db_outcome = "push_written"
+                elif outcome.reason in ("no_inbox_path", "write_failed"):
+                    db_outcome = "push_failed"
+                else:
+                    db_outcome = "push_suppressed"
+
+                # S2: deterministic payload hash from sorted message ids
+                payload_hash = hashlib.sha256(
+                    json.dumps(sorted(m.id for m in messages)).encode()
+                ).hexdigest()
+
+                try:
+                    attempt_uuid = begin_delivery_attempt(
+                        messages,
+                        mb.current_terminal_id,
+                        provider="reconciler",
+                        payload_hash=payload_hash,
+                        payload_length=len(messages),
+                    )
+                    settle_delivery_attempt(
+                        attempt_uuid,
+                        MessageStatus.PENDING,  # rows stay PENDING (pull-mode)
+                        outcome=db_outcome,
+                        reason=outcome.reason,
+                    )
+                except Exception as e:
+                    logger.debug(f"fx158 instrumentation write failed for {mb.id}: {e}")
+
+            except Exception as e:
+                # D9: per-mailbox failure isolation
+                logger.exception(f"fx158 reconcile_pull_mode_notifications failed for mailbox {mb.id}: {e}")
 
     def reconcile_pending_orphans(self) -> OrphanReconcileResult:
         """Settle one bounded batch of PENDING rows with absent receivers."""

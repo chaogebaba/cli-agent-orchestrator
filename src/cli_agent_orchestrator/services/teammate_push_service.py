@@ -442,27 +442,42 @@ def _acquire_lockfile(lock_path: Path, deadline_mono: float | None = None) -> Op
 _backoff = lambda: _backoff_deadline(None)
 
 
-def attempt_teammate_push(terminal_id: str, messages: List[InboxMessage]) -> bool:
-    """Legacy: push a notification entry to the CC native inbox.
+# ---------------------------------------------------------------------------
+# fx158 D4: Reporting push outcome
+# ---------------------------------------------------------------------------
 
-    Retained for backward compat with inbox_service pull-gate path.
-    F136 callback runner replaces this for the main notification flow.
+
+@dataclass(frozen=True)
+class PushOutcome:
+    """Structured result of a teammate push attempt (fx158 D4)."""
+
+    pushed: bool
+    reason: str  # closed set: empty_batch, no_inbox_path, already_notified, consumed, write_failed, pushed
+    message_ids: tuple  # diagnostic only (N1)
+
+
+def attempt_teammate_push_reported(terminal_id: str, messages: List[InboxMessage]) -> PushOutcome:
+    """Push a notification entry to the CC native inbox with structured outcome.
+
+    Contains the body formerly in attempt_teammate_push, with each early return
+    labelled by a reason from a closed set (fx158 D4).
     """
+    ids = tuple(m.id for m in messages)
     if not messages:
-        return False
+        return PushOutcome(pushed=False, reason="empty_batch", message_ids=ids)
     inbox_path = _resolve_inbox_path(terminal_id)
     if inbox_path is None:
-        return False
+        return PushOutcome(pushed=False, reason="no_inbox_path", message_ids=ids)
     last_notified_id = _get_last_notified_id(terminal_id)
     new_messages = [m for m in messages if m.id > last_notified_id]
     if not new_messages:
-        return False
+        return PushOutcome(pushed=False, reason="already_notified", message_ids=ids)
     # D3 (fx157): send-time recount against consumption cursor
     cursor = get_mailbox_consumption_cursor(terminal_id)
     if cursor is not None:
         new_messages = [m for m in new_messages if m.id > cursor]
         if not new_messages:
-            return False
+            return PushOutcome(pushed=False, reason="consumed", message_ids=ids)
     first_msg = new_messages[0]
     worker_name = first_msg.sender_id
     message_preview = first_msg.message.split("\n", 1)[0] if first_msg.message else ""
@@ -471,7 +486,17 @@ def attempt_teammate_push(terminal_id: str, messages: List[InboxMessage]) -> boo
     if success:
         max_id = max(m.id for m in new_messages)
         _persist_last_notified_id(terminal_id, max_id)
-    return success
+        return PushOutcome(pushed=True, reason="pushed", message_ids=tuple(m.id for m in new_messages))
+    return PushOutcome(pushed=False, reason="write_failed", message_ids=ids)
+
+
+def attempt_teammate_push(terminal_id: str, messages: List[InboxMessage]) -> bool:
+    """Legacy: push a notification entry to the CC native inbox.
+
+    Retained for backward compat with inbox_service pull-gate path.
+    F136 callback runner replaces this for the main notification flow.
+    """
+    return attempt_teammate_push_reported(terminal_id, messages).pushed
 
 
 def attempt_teammate_push_on_insert(terminal_id: str, messages: List[InboxMessage]) -> bool:
