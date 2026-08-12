@@ -1114,7 +1114,7 @@ async def create_terminal(
             env_vars, terminal_id, plan=persona_plan, incarnation_token=_f138_token
         )
 
-        window_name = generate_window_name(agent_profile)
+        window_name = generate_window_name(agent_profile, terminal_id)
 
         # Step 1b: Provision an isolated git worktree (issue #100, Phase 1) before
         # the tmux session/window below consumes `working_directory` -- the

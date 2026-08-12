@@ -54,7 +54,7 @@ from cli_agent_orchestrator.utils.session_lookup import (
 )
 
 cao_http = CAOHttpClient(lambda: requests)
-from cli_agent_orchestrator.utils.terminal import generate_session_name
+from cli_agent_orchestrator.utils.terminal import generate_session_name, generate_window_name
 from cli_agent_orchestrator.utils.workflow_events import parse_sse_frames
 
 logger = logging.getLogger(__name__)
@@ -1173,6 +1173,7 @@ async def _handoff_impl(
             + _get_cleanup_nudge(),
             output=output,
             terminal_id=terminal_id,
+            window_name=data.get("window_name"),
         )
 
     except Exception as e:
@@ -1518,13 +1519,16 @@ def _assign_impl(
             **create_kwargs,
         )
 
+        window_name = generate_window_name(agent_profile, terminal_id)
         return {
             "success": True,
             "terminal_id": terminal_id,
+            "window_name": window_name,
             "forked_from": forked_from_info,
             "init_health": "launching",
             "message": (
-                f"Task assigned to {agent_profile} (terminal: {terminal_id}). "
+                f"Task assigned to {agent_profile} (terminal: {terminal_id}, "
+                f"window: {window_name}). "
                 f"Worker is initializing in the background; your task will be "
                 f"delivered once it is ready. "
                 f"Call delete_terminal('{terminal_id}') when you no longer need this terminal."

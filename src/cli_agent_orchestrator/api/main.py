@@ -189,7 +189,7 @@ from cli_agent_orchestrator.utils.skills import (
     load_skill_content,
     validate_skill_name,
 )
-from cli_agent_orchestrator.utils.terminal import validate_tmux_name
+from cli_agent_orchestrator.utils.terminal import generate_window_name, validate_tmux_name
 from cli_agent_orchestrator.utils.tmux_command import tmux_argv
 
 logger = logging.getLogger(__name__)
@@ -647,6 +647,7 @@ class RunStepResponse(BaseModel):
     terminal_id: str
     last_message: str
     status: str
+    window_name: Optional[str] = None
 
 
 class WorkflowValidateRequest(BaseModel):
@@ -4175,10 +4176,23 @@ async def run_step(
         # non-script callers). Before building the response so a settle failure
         # is logged, not raised.
         _settle_step(result.terminal_id, None)
+        # fx155: window_name sourcing split.
+        # - Fresh terminal (no reuse): compute from profile + terminal_id.
+        #   The terminal may already be torn down (teardown=True default), so
+        #   a DB read would return None. The formula is authoritative for fresh
+        #   terminals.
+        # - Reused terminal: may predate fx155 and carry a legacy name; source
+        #   from DB defensively (the row survives since teardown is skipped).
+        if body.reuse_terminal_id:
+            meta = get_terminal_metadata(result.terminal_id)
+            _window_name = meta.get("tmux_window") if meta else None
+        else:
+            _window_name = generate_window_name(body.agent, result.terminal_id)
         return RunStepResponse(
             terminal_id=result.terminal_id,
             last_message=result.last_message,
             status=(result.status.value if hasattr(result.status, "value") else str(result.status)),
+            window_name=_window_name,
         )
     except StepExecutionError as e:
         # The step did not complete successfully. Distinguish a worker that

@@ -75,8 +75,32 @@ def generate_terminal_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
-def generate_window_name(agent_profile: str) -> str:
-    """Generate window name from agent profile with unique suffix."""
+def generate_window_name(agent_profile: str, terminal_id: str | None = None) -> str:
+    """Generate window name from agent profile with unique suffix.
+
+    When *terminal_id* is provided the window name is
+    ``{agent_profile}-{terminal_id}`` (fx155 — the visible suffix *is* the
+    terminal id). If the composed name would exceed 64 chars the **profile**
+    is truncated; the id is never shortened.
+
+    Without a *terminal_id* the legacy ``{agent_profile}-{uuid4_hex[:4]}``
+    format is used (backwards-compatible default for callers that don't yet
+    pass the id).
+
+    Raises:
+        ValueError: If *agent_profile* is empty (either on entry or after
+            truncation for the terminal_id path).
+    """
+    if not agent_profile:
+        raise ValueError("agent_profile must not be empty")
+
+    if terminal_id is not None:
+        max_profile_len = 64 - 1 - len(terminal_id)
+        truncated_profile = agent_profile[:max_profile_len]
+        if not truncated_profile:
+            raise ValueError("agent_profile must not be empty")
+        return validate_tmux_name(f"{truncated_profile}-{terminal_id}", "window_name")
+
     return validate_tmux_name(f"{agent_profile}-{uuid.uuid4().hex[:4]}", "window_name")
 
 
