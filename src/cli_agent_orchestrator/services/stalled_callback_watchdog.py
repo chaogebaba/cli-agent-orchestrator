@@ -482,7 +482,11 @@ class StalledCallbackWatchdog:
                 if terminal_id not in self._paused
                 and not episode.callback_seen
                 and not episode.fired
-                and episode.idle_since is not None
+                # FX181 S1: an episode is fingerprint-tracked when EITHER clock is
+                # armed. ERROR members carry quiet_since only (idle_since stays
+                # None so notify_due keeps its pre-FX181 semantics, AC3), and
+                # without this they had no anti-false-idle protection at all.
+                and (episode.idle_since is not None or episode.quiet_since is not None)
             ]
 
         if not terminal_ids:
@@ -524,16 +528,21 @@ class StalledCallbackWatchdog:
                     episode is None
                     or episode.callback_seen
                     or episode.fired
-                    or episode.idle_since is None
+                    or (episode.idle_since is None and episode.quiet_since is None)
                 ):
                     continue
                 if episode.last_screen_fp is None:
                     episode.last_screen_fp = fingerprint
                 elif episode.last_screen_fp != fingerprint:
-                    episode.idle_since = now
-                    # FX181 B1: a visibly-changing pane restarts the quiescence
-                    # clock too (AC7's anti-false-idle inheritance)
-                    episode.quiet_since = now
+                    # A visibly-changing pane restarts whichever clocks are armed.
+                    # idle_since is only restarted, never started: an ERROR pane
+                    # must not become idle-notifiable (AC3).
+                    if episode.idle_since is not None:
+                        episode.idle_since = now
+                    # FX181 B1: the quiescence clock inherits the same
+                    # anti-false-idle reset (AC7)
+                    if episode.quiet_since is not None:
+                        episode.quiet_since = now
                     episode.last_screen_fp = fingerprint
 
     def _fresh_frame_decides_running(self, terminal_id: str) -> tuple[bool, str | None]:
@@ -783,6 +792,13 @@ class StalledCallbackWatchdog:
                     continue
                 if suppress:
                     current_episode.idle_since = now
+                    # FX181 B1: the fresh frame that proved this pane running is a
+                    # liveness proof for the quiescence clock too. Resetting only
+                    # idle_since let the aggregate predicate ring off a stale
+                    # quiet_since immediately after this very tick suppressed its
+                    # own per-worker notice.
+                    if current_episode.quiet_since is not None:
+                        current_episode.quiet_since = now
                     continue
                 if current_episode.auto_resumed:
                     current_episode.fired = True
@@ -954,6 +970,10 @@ class StalledCallbackWatchdog:
                         episode.auto_resumed = True
                         episode.auto_resume_attempted_at = attempted_at
                         episode.idle_since = enqueue_monotonic
+                        # FX181 B1: an accepted auto-resume nudge is a liveness
+                        # proof — the quiescence clock restarts with idle_since.
+                        if episode.quiet_since is not None:
+                            episode.quiet_since = enqueue_monotonic
                         should_deliver = True
                     else:
                         episode.fired = True
@@ -1453,7 +1473,7 @@ class StalledCallbackWatchdog:
                         ep = self._episodes.get(terminal_id)
                         if ep is not None:
                             ep.callback_seen = True
-                        self._quiescence_last_fired.pop(caller_id, None)
+                            self._quiescence_last_fired.pop(caller_id, None)
                     settled.add(terminal_id)
 
             if settled:
