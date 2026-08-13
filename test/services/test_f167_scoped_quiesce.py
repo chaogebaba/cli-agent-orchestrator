@@ -251,3 +251,87 @@ class TestF167SiblingAndSubtreeQuiesce:
         import inspect
         source = inspect.getsource(delete_terminal)
         assert "quiesce_deferred_session_sync" not in source
+
+
+
+    def test_ac4_late_child_replan(self, monkeypatch):
+        """AC4 (S1): A child created between pre-plan and leased snapshot is
+        quiesced by the re-plan round.
+
+        Simulates: has_deferred_init returns True for 'latechld' only on the
+        SECOND call to list_terminals_by_session (the leased snapshot), meaning
+        the child appeared after the pre-plan. Assert that child IS quiesced.
+        """
+        parent = _fake_terminal("parentaa", caller_id=None)
+        # Initially only parent exists
+        terminals_pre = [parent]
+        # After lease, a late child appears
+        late_child = _fake_terminal("latechld", caller_id="parentaa")
+        terminals_post = [parent, late_child]
+
+        # Track which snapshot call we're on
+        list_call_count = [0]
+
+        def mock_list_terminals(session_name):
+            list_call_count[0] += 1
+            if list_call_count[0] <= 1:
+                return terminals_pre  # pre-plan: no child
+            return terminals_post  # leased snapshot: child appeared
+
+        quiesced_ids: list[str] = []
+
+        def mock_quiesce_terminal(tid, **kw):
+            quiesced_ids.append(tid)
+
+        monkeypatch.setattr(terminal_service, "quiesce_deferred_terminal_sync", mock_quiesce_terminal)
+        monkeypatch.setattr(terminal_service, "list_terminals_by_session", mock_list_terminals)
+        monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda tid: {
+            "parentaa": parent, "latechld": late_child,
+        }.get(tid))
+
+        # has_deferred_init: True only for latechld (simulates it still initializing)
+        # After first quiesce of latechld, it becomes False (settled)
+        deferred_settled = set()
+
+        def mock_has_deferred_init(tid):
+            if tid == "latechld" and tid not in deferred_settled:
+                deferred_settled.add(tid)
+                return True
+            return False
+
+        from cli_agent_orchestrator.services.terminal_guard_service import DeletionClassification
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_guard_service.classify_deletion",
+            lambda tid, force=False: DeletionClassification(True),
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_guard_service.require_delete_allowed",
+            lambda tid, force=False: None,
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.session_lifecycle_lease.acquire_session_lifecycle_exclusive",
+            lambda _s: "lease",
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.session_lifecycle_lease.release_session_lifecycle_lease",
+            lambda _l: None,
+        )
+        monkeypatch.setattr(terminal_service, "has_deferred_init", mock_has_deferred_init)
+        monkeypatch.setattr(terminal_service, "_delete_terminal_under_lease",
+                            lambda tid, token, **kw: {"terminal_deleted": True})
+        monkeypatch.setattr(terminal_service, "status_monitor",
+                            MagicMock(get_boundary_observation=MagicMock(
+                                return_value=MagicMock(status=MagicMock(value="idle")))))
+        monkeypatch.setattr("cli_agent_orchestrator.services.rebind_lease.acquire_rebind_lease",
+                            lambda tid: MagicMock(terminal_id=tid))
+        monkeypatch.setattr("cli_agent_orchestrator.services.rebind_lease.release_rebind_lease",
+                            lambda _t: None)
+        monkeypatch.setattr(terminal_service, "get_backend", lambda: MagicMock())
+
+        delete_terminal("parentaa")
+
+        # The late child MUST have been quiesced by the re-plan round
+        assert "latechld" in quiesced_ids, (
+            f"Late child not quiesced. quiesced_ids={quiesced_ids}. "
+            "AC4: re-plan round must catch children appearing after pre-plan."
+        )

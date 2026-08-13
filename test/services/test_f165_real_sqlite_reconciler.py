@@ -20,6 +20,7 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.mark.xdist_group("real_sqlite")
 class TestF165RealSqliteReconciler:
     """End-to-end: reconcile_orphaned_messages -> push written via real ORM."""
 
