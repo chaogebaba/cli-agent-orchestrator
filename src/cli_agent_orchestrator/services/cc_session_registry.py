@@ -96,6 +96,39 @@ def _parse_version(ver_str: str) -> Optional[tuple[int, ...]]:
         return None
 
 
+def _parse_registry_timestamp(value) -> str:
+    """Normalize a registry timestamp to ISO8601 string.
+
+    Claude Code writes updatedAt/statusUpdatedAt as either:
+      - ISO8601 string (e.g. "2026-08-13T12:00:00+00:00")
+      - Epoch-milliseconds integer (e.g. 1786649639899)
+      - Epoch-milliseconds as numeric string (e.g. "1786649639899")
+
+    Returns an ISO8601 string suitable for datetime.fromisoformat().
+    Returns "" on unparseable input (fail-closed: empty → treated as stale).
+    """
+    from datetime import datetime, timezone
+
+    if isinstance(value, str):
+        # Try numeric string first (epoch-ms)
+        stripped = value.strip()
+        if stripped.isdigit() and len(stripped) >= 10:
+            try:
+                epoch_s = int(stripped) / 1000.0
+                return datetime.fromtimestamp(epoch_s, tz=timezone.utc).isoformat()
+            except (ValueError, OSError, OverflowError):
+                pass
+        # Otherwise treat as ISO8601 — return as-is (validated downstream)
+        return value if value else ""
+    elif isinstance(value, (int, float)):
+        try:
+            epoch_s = value / 1000.0
+            return datetime.fromtimestamp(epoch_s, tz=timezone.utc).isoformat()
+        except (ValueError, OSError, OverflowError):
+            return ""
+    return ""
+
+
 def _read_proc_start(pid: int) -> Optional[int]:
     """Read field 22 (starttime) from /proc/<pid>/stat. Returns None on failure."""
     from cli_agent_orchestrator.services.fork_context_service import _PROC_ROOT as proc_root
@@ -145,6 +178,12 @@ def read_registry(sessions_dir: Optional[Path] = None) -> list[RegistryRecord]:
         except (ValueError, TypeError):
             peer_protocol = 0
 
+        # FX179: coerce timestamp fields at parse time.
+        # Claude Code may write updatedAt/statusUpdatedAt as epoch-ms integers.
+        # Normalize to ISO8601 string for consistent downstream handling.
+        updated_at = _parse_registry_timestamp(data.get("updatedAt", ""))
+        status_updated_at = _parse_registry_timestamp(data.get("statusUpdatedAt", ""))
+
         records.append(RegistryRecord(
             pid=int(stem),
             session_id=data.get("sessionId", ""),
@@ -155,8 +194,8 @@ def read_registry(sessions_dir: Optional[Path] = None) -> list[RegistryRecord]:
             messaging_socket_path=data.get("messagingSocketPath", ""),
             proc_start=proc_start,
             status=data.get("status", ""),
-            status_updated_at=data.get("statusUpdatedAt", ""),
-            updated_at=data.get("updatedAt", ""),
+            status_updated_at=status_updated_at,
+            updated_at=updated_at,
             raw=data,
         ))
     return records
@@ -401,7 +440,8 @@ def verify_wake(
     while time.monotonic() < deadline:
         try:
             data = json.loads(record_path.read_text())
-            current_status_updated = data.get("statusUpdatedAt", "")
+            # FX179: normalize — raw JSON may contain epoch-ms int
+            current_status_updated = _parse_registry_timestamp(data.get("statusUpdatedAt", ""))
             if current_status_updated and current_status_updated != pre_status_updated_at:
                 return True
         except (OSError, json.JSONDecodeError):
