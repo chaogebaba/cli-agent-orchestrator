@@ -229,6 +229,71 @@ class TestAC6ReplayRowRings:
         result = ring_supervisor_doorbell("term-01", 5, written_count=1)
         assert result == "rang"
 
+    def test_post_delivery_replay_only_outcome_rings(self, mock_gates):
+        """B1/Mutant-5 kill: _f136_post_delivery with replay-only outcome (cursor unchanged) rings.
+
+        A replay-only run has written=1 (a replay row produced a new file entry)
+        but cursor_after == cursor_before (replay rows do NOT advance the forward cursor).
+        The call-site predicate must key on outcome.written, NOT on cursor advance.
+        This test exercises the CALL SITE in inbox_service._f136_post_delivery.
+        """
+        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+        from cli_agent_orchestrator.services.inbox_service import (
+            CallbackRunOutcome,
+            InboxService,
+            _wake_states,
+            _delivery_seq_guard,
+        )
+
+        # Track doorbell calls
+        doorbell_calls = []
+        original_ring = ring_supervisor_doorbell.__wrapped__ if hasattr(ring_supervisor_doorbell, '__wrapped__') else None
+
+        def tracking_ring(tid, max_row_id, *, written_count=0):
+            doorbell_calls.append((tid, max_row_id, written_count))
+            return "rang"
+
+        # Replay-only outcome: written=1, cursor unchanged, max_written_row_id set
+        replay_outcome = CallbackRunOutcome(
+            selected=1,
+            processed=1,
+            cursor_before=100,
+            cursor_after=100,  # cursor NOT advanced (replay row)
+            replay_selected=1,
+            replay_drained=1,
+            written=1,  # but a new entry WAS written
+            already_present=0,
+            max_written_row_id=42,  # the replay row id
+            reason="ok",
+        )
+
+        # Set up minimal _wake_states so _f136_post_delivery doesn't early-return
+        from cli_agent_orchestrator.services.inbox_service import _WakeState
+        with _delivery_seq_guard:
+            _wake_states["term-replay"] = _WakeState()
+
+        svc = InboxService()
+
+        with patch(
+            "cli_agent_orchestrator.services.doorbell_service.ring_supervisor_doorbell",
+            tracking_ring,
+        ):
+            # Patch at the import site inside _f136_post_delivery
+            with patch(
+                "cli_agent_orchestrator.services.inbox_service.ring_supervisor_doorbell",
+                tracking_ring,
+                create=True,
+            ):
+                svc._f136_post_delivery("term-replay", replay_outcome)
+
+        # Clean up
+        with _delivery_seq_guard:
+            _wake_states.pop("term-replay", None)
+
+        # Assert doorbell was called with correct args
+        assert len(doorbell_calls) == 1, f"Expected 1 doorbell call, got {len(doorbell_calls)}"
+        assert doorbell_calls[0] == ("term-replay", 42, 1)
+
 
 # ===========================================================================
 # V1 — AC7: Gate refusal reasons cause skip with correct log

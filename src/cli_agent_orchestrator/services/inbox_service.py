@@ -2113,6 +2113,8 @@ class InboxService:
                     try:
                         push_result = attempt_teammate_push(terminal_id, messages)
                         # F168 D9: ring doorbell after push write.
+                        # N1: written_count=1 may over-count; D4 last_doorbell_row_id
+                        # dedup in ring_supervisor_doorbell is the dedup boundary.
                         if push_result and messages:
                             try:
                                 from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
