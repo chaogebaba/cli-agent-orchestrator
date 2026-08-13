@@ -1,22 +1,11 @@
-"""F168 — Idle supervisor doorbell service.
+"""F168/FX170 — Supervisor doorbell service.
 
-Ring a supervisor's pane after a callback write, through the existing
-eight-gate safety wall. One nudge per delivery run, cursor-deduped by
-highest written row id (D4). File-write-first + best-effort isolation (D3).
+FX170 (native wake): resolve → version guard → socket write → verify wake.
+Any refusal/failure falls back to the existing fx168 _attempt_gated_ring.
+Single dedup cursor, never double-ring, never fail silent.
 
-D1:  The doorbell is a pane nudge through the existing gate wall.
-D2:  Fires from _f136_post_delivery (lock-free).
-D3:  Write commits first; nudge is best-effort, may never affect delivery.
-D4:  One nudge per run, deduped by last_doorbell_row_id.
-D5:  Refused gate = silent skip, never retry/queue.
-D6:  Fixed instruction text (channel-neutral, provokes tool call).
-D7:  Draft present => skip; never stashes.
-D8:  Registered path only (_should_teammate_push gate).
-D9:  Single helper, three call sites.
-D10: supervisor.doorbell config flag, default on, subordinate to teammate_push.
-D11: Attributed to cao-bridge, no attempt row.
-D12: One log line per decision, rate-limited WARN.
-D13: Rebind window excluded by G1/G2; gate wall refusal is structurally correct.
+fx168 D1-D13 retained for the fallback path (pane nudge through the gate wall).
+fx170 D1-D11: socket write to CC's per-session UDS, no pane touch.
 """
 
 from __future__ import annotations
@@ -91,25 +80,16 @@ def ring_supervisor_doorbell(
     *,
     written_count: int = 0,
 ) -> str:
-    """Ring the supervisor's pane after a callback write (D1-D13).
+    """Ring the supervisor after a callback write.
 
-    Returns the decision string: rang, skipped_gate, skipped_dedup,
-    skipped_disabled, or error.
+    FX170 order: resolve → version guard → socket write → verify wake.
+    ANY refusal/failure falls back to fx168 _attempt_gated_ring (D4).
+    Returns: rang, fallback, skipped_dedup, skipped_disabled, error.
     """
-    # D10: config flag check, subordinate to teammate_push (D8).
+    # D10 (fx168): outer switch — off means no bell of any kind.
     if not ConfigService.get("supervisor.doorbell", default=True):
         logger.info(
-            "f168_doorbell terminal=%s decision=skipped_disabled reason=flag_off row=%s",
-            terminal_id, max_written_row_id,
-        )
-        return "skipped_disabled"
-
-    # D8: registered path only — same gate as teammate_push.
-    from cli_agent_orchestrator.services.teammate_push_service import _should_teammate_push
-
-    if not _should_teammate_push(terminal_id):
-        logger.info(
-            "f168_doorbell terminal=%s decision=skipped_disabled reason=not_registered row=%s",
+            "f170_doorbell terminal=%s decision=skipped_disabled reason=flag_off row=%s",
             terminal_id, max_written_row_id,
         )
         return "skipped_disabled"
@@ -117,7 +97,7 @@ def ring_supervisor_doorbell(
     # D4: cursor dedup — skip if already rang for this or higher row.
     if written_count <= 0:
         logger.info(
-            "f168_doorbell terminal=%s decision=skipped_dedup reason=no_written row=%s",
+            "f170_doorbell terminal=%s decision=skipped_dedup reason=no_written row=%s",
             terminal_id, max_written_row_id,
         )
         return "skipped_dedup"
@@ -125,24 +105,145 @@ def ring_supervisor_doorbell(
     last_row = _get_last_doorbell_row_id(terminal_id)
     if max_written_row_id <= last_row:
         logger.info(
-            "f168_doorbell terminal=%s decision=skipped_dedup reason=row_not_higher row=%s",
+            "f170_doorbell terminal=%s decision=skipped_dedup reason=row_not_higher row=%s",
             terminal_id, max_written_row_id,
         )
         return "skipped_dedup"
 
-    # D1/D13: attempt ring through the existing gate wall.
+    # FX170 D1: attempt native socket ring first (D2: no _should_teammate_push gate).
+    native_enabled = ConfigService.get("supervisor.wake.native", default=True)
+    if native_enabled:
+        try:
+            decision = _attempt_native_ring(terminal_id, max_written_row_id)
+        except Exception as exc:
+            logger.debug("f170_doorbell native exception: %s", exc)
+            decision = None
+
+        if decision == "rang":
+            _persist_last_doorbell_row_id(terminal_id, max_written_row_id)
+            return "rang"
+        # decision is None or a refusal reason — fall through to fx168
+        native_refusal = decision
+    else:
+        native_refusal = None
+
+    # D4 fallback: fx168 pane nudge.
+    # D8 (fx168): the fallback path gates on _should_teammate_push because the
+    # pane nudge content lives in the file — meaningless if file was never written.
+    from cli_agent_orchestrator.services.teammate_push_service import _should_teammate_push
+
+    if not _should_teammate_push(terminal_id):
+        logger.info(
+            "f170_doorbell terminal=%s decision=skipped_disabled "
+            "reason=not_registered_fallback row=%s",
+            terminal_id, max_written_row_id,
+        )
+        return "skipped_disabled"
+
     try:
-        decision = _attempt_gated_ring(terminal_id, max_written_row_id)
+        fallback_decision = _attempt_gated_ring(terminal_id, max_written_row_id)
     except Exception as exc:
-        # D3: isolation — any exception is caught and logged.
         _rate_limited_warn(terminal_id, str(exc)[:120], max_written_row_id)
         return "error"
 
-    # D4: advance high-water only on successful ring.
-    if decision == "rang":
+    if fallback_decision == "rang":
         _persist_last_doorbell_row_id(terminal_id, max_written_row_id)
+        if native_refusal is not None:
+            # Native was attempted but failed — this is a true fallback
+            logger.info(
+                "f170_doorbell terminal=%s decision=fallback transport=nudge "
+                "reason=%s row=%s",
+                terminal_id, native_refusal, max_written_row_id,
+            )
+            return "fallback"
+        # Native was disabled — gated ring is the primary path
+        return "rang"
 
-    return decision
+    return fallback_decision
+
+
+def _attempt_native_ring(terminal_id: str, max_written_row_id: int) -> Optional[str]:
+    """FX170 D1: resolve → version guard → socket write → verify.
+
+    Returns "rang" on success, a refusal reason string on failure, or None
+    if resolution cannot proceed (triggers fallback).
+    """
+    from cli_agent_orchestrator.services.cc_session_registry import (
+        ResolveResult,
+        build_wake_payload,
+        check_version_guard,
+        resolve_target,
+        verify_wake,
+        write_to_socket,
+    )
+
+    # Get terminal's tmux coordinates
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata:
+        return "no_terminal_metadata"
+
+    tmux_session = metadata.get("tmux_session", "")
+    tmux_window = metadata.get("tmux_window", "")
+    if not tmux_session or not tmux_window:
+        return "no_tmux_coordinates"
+
+    # D3: resolve target
+    result: ResolveResult = resolve_target(terminal_id, tmux_session, tmux_window)
+    if result.refusal_reason:
+        logger.info(
+            "f170_doorbell terminal=%s decision=fallback transport=socket "
+            "reason=%s row=%s",
+            terminal_id, result.refusal_reason, max_written_row_id,
+        )
+        return result.refusal_reason
+
+    record = result.record
+    assert record is not None  # guaranteed by no refusal_reason
+
+    # D6: version guard
+    ver_refusal = check_version_guard(record)
+    if ver_refusal:
+        logger.info(
+            "f170_doorbell terminal=%s decision=fallback transport=socket "
+            "reason=%s ver=%s row=%s",
+            terminal_id, ver_refusal, record.version, max_written_row_id,
+        )
+        return ver_refusal
+
+    # D5: build payload
+    # Worker name: use the terminal_id as the sender name
+    payload = build_wake_payload(terminal_id, max_written_row_id)
+
+    # D8: sample pre-write status for verification
+    pre_status_updated_at = record.status_updated_at
+
+    # D5: socket write
+    write_err = write_to_socket(record.messaging_socket_path, payload)
+    if write_err:
+        logger.info(
+            "f170_doorbell terminal=%s decision=fallback transport=socket "
+            "reason=%s pid=%s ver=%s row=%s",
+            terminal_id, write_err, record.pid, record.version, max_written_row_id,
+        )
+        return write_err
+
+    # D8: verify wake
+    woke = verify_wake(record, pre_status_updated_at)
+    if not woke:
+        logger.info(
+            "f170_doorbell terminal=%s decision=fallback transport=socket "
+            "reason=wake_unverified pid=%s ver=%s row=%s",
+            terminal_id, record.pid, record.version, max_written_row_id,
+        )
+        return "wake_unverified"
+
+    # Success
+    logger.info(
+        "f170_doorbell terminal=%s decision=rang transport=socket "
+        "pid=%s ver=%s row=%s",
+        terminal_id, record.pid, record.version, max_written_row_id,
+    )
+    return "rang"
 
 
 def _attempt_gated_ring(terminal_id: str, max_written_row_id: int) -> str:

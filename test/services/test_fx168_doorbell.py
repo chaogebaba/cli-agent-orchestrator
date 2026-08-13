@@ -76,7 +76,20 @@ def mock_gates():
         patch("cli_agent_orchestrator.services.terminal_service.send_prepared_input") as mock_send,
     ):
         # Default: all gates pass
-        mock_config.get.return_value = True  # doorbell flag on + any other flag
+        # FX170: disable native wake so fx168 tests exercise the gated path only.
+        # Use a mutable dict so individual tests can override specific paths.
+        _cfg_overrides: dict = {}
+
+        def _cfg_side_effect(path, default=None, override=None):
+            if path in _cfg_overrides:
+                return _cfg_overrides[path]
+            if path == "supervisor.wake.native":
+                return False
+            if path == "supervisor.doorbell":
+                return True
+            return True
+        mock_config.get.side_effect = _cfg_side_effect
+        mock_config._cfg_overrides = _cfg_overrides
         mock_should.return_value = True  # registered
         mock_meta.return_value = {"metadata": {"cc_team_inbox_path": "/tmp/inbox.json"}}
         mock_update.return_value = None
@@ -477,7 +490,7 @@ class TestAC14ConfigFlags:
 
     def test_doorbell_off_no_ring(self, mock_gates):
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
-        mock_gates["config"].get.return_value = False
+        mock_gates["config"]._cfg_overrides["supervisor.doorbell"] = False
         result = ring_supervisor_doorbell("term-01", 100, written_count=1)
         assert result == "skipped_disabled"
         mock_gates["send"].assert_not_called()
@@ -910,7 +923,7 @@ class TestFix5TmuxFallback:
             patch("cli_agent_orchestrator.providers.manager.provider_manager.get_provider") as mock_get_prov,
             patch("cli_agent_orchestrator.services.terminal_service.send_prepared_input") as mock_send,
         ):
-            mock_config.get.return_value = True
+            mock_config.get.side_effect = lambda p, default=None, override=None: False if p == "supervisor.wake.native" else True
             mock_should.return_value = True
             mock_meta.return_value = {"metadata": {"cc_team_inbox_path": "/tmp/inbox.json"}}
             mock_update.return_value = None
@@ -953,7 +966,7 @@ class TestFix5TmuxFallback:
             patch("cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status") as mock_tmux_probe,
             patch("cli_agent_orchestrator.services.terminal_service.send_prepared_input") as mock_send,
         ):
-            mock_config.get.return_value = True
+            mock_config.get.side_effect = lambda p, default=None, override=None: False if p == "supervisor.wake.native" else True
             mock_should.return_value = True
             mock_meta.return_value = {"metadata": {"cc_team_inbox_path": "/tmp/inbox.json"}}
 
@@ -994,7 +1007,7 @@ class TestFix5TmuxFallback:
             patch("cli_agent_orchestrator.providers.manager.provider_manager.get_provider") as mock_get_prov,
             patch("cli_agent_orchestrator.services.terminal_service.send_prepared_input") as mock_send,
         ):
-            mock_config.get.return_value = True
+            mock_config.get.side_effect = lambda p, default=None, override=None: False if p == "supervisor.wake.native" else True
             mock_should.return_value = True
             mock_meta.return_value = {"metadata": {"cc_team_inbox_path": "/tmp/inbox.json"}}
 
