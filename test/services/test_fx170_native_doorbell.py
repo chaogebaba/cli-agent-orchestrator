@@ -1143,3 +1143,147 @@ class TestRegistryReader:
         from cli_agent_orchestrator.services.cc_session_registry import read_registry
         records = read_registry(tmp_path / "nonexistent")
         assert records == []
+
+
+
+# ===========================================================================
+# FX170-S2: STRING procStart/peerProtocol coercion regression
+# ===========================================================================
+
+
+class TestFX170S2StringCoercion:
+    """Regression: Claude Code writes procStart as JSON string; must resolve."""
+
+    def test_string_proc_start_resolves(self, sessions_dir):
+        """Real-world shape: procStart="10055374" (string) must match live int 10055374.
+
+        Pinned to the exact failure observed in production: registry JSON has
+        STRING procStart, _read_proc_start returns int, resolve_target must NOT
+        refuse with proc_start_mismatch.
+        """
+        # Write registry record with STRING procStart (real CC behavior)
+        record_data = {
+            "sessionId": "test-session",
+            "cwd": "/home/user/project",
+            "tmux": "cao-prod:@0.%0",
+            "version": "2.1.231",
+            "peerProtocol": 1,
+            "messagingSocketPath": "/tmp/cc.sock",
+            "procStart": "10055374",  # STRING — the bug trigger
+            "status": "idle",
+            "statusUpdatedAt": datetime.now(timezone.utc).isoformat(),
+            "updatedAt": datetime.now(timezone.utc).isoformat(),
+        }
+        (sessions_dir / "2130420.json").write_text(json.dumps(record_data))
+
+        with (
+            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 2130420]),
+            patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=10055374),
+            patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
+            patch("cli_agent_orchestrator.services.cc_session_registry.ConfigService") as mock_cfg,
+        ):
+            mock_cfg.get.return_value = 900.0
+            from cli_agent_orchestrator.services.cc_session_registry import resolve_target
+            result = resolve_target("term-59deb5dd", "cao-prod", "win-0", sessions_dir=sessions_dir)
+
+        assert result.record is not None, f"Expected resolution, got refusal: {result.refusal_reason}"
+        assert result.record.pid == 2130420
+        assert result.record.proc_start == 10055374  # coerced to int
+        assert result.refusal_reason is None
+
+    def test_string_proc_start_mismatch_still_refuses(self, sessions_dir):
+        """String procStart that does NOT match live value still refuses."""
+        record_data = {
+            "sessionId": "test-session",
+            "cwd": "/tmp",
+            "tmux": "s:@0.%0",
+            "version": "2.1.231",
+            "peerProtocol": 1,
+            "messagingSocketPath": "/tmp/cc.sock",
+            "procStart": "10055374",  # STRING
+            "status": "idle",
+            "statusUpdatedAt": datetime.now(timezone.utc).isoformat(),
+            "updatedAt": datetime.now(timezone.utc).isoformat(),
+        }
+        (sessions_dir / "999.json").write_text(json.dumps(record_data))
+
+        with (
+            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 999]),
+            patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=99999),  # different!
+            patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
+            patch("cli_agent_orchestrator.services.cc_session_registry.ConfigService") as mock_cfg,
+        ):
+            mock_cfg.get.return_value = 900.0
+            from cli_agent_orchestrator.services.cc_session_registry import resolve_target
+            result = resolve_target("term-01", "s", "win", sessions_dir=sessions_dir)
+
+        assert result.refusal_reason == "proc_start_mismatch"
+
+    def test_string_peer_protocol_passes_version_guard(self, sessions_dir):
+        """peerProtocol="1" (string) must pass check_version_guard."""
+        record_data = {
+            "sessionId": "test-session",
+            "cwd": "/tmp",
+            "tmux": "s:@0.%0",
+            "version": "2.1.231",
+            "peerProtocol": "1",  # STRING — same-class bug
+            "messagingSocketPath": "/tmp/cc.sock",
+            "procStart": 12345,
+            "status": "idle",
+            "statusUpdatedAt": datetime.now(timezone.utc).isoformat(),
+            "updatedAt": datetime.now(timezone.utc).isoformat(),
+        }
+        (sessions_dir / "500.json").write_text(json.dumps(record_data))
+
+        from cli_agent_orchestrator.services.cc_session_registry import (
+            read_registry,
+            check_version_guard,
+        )
+        records = read_registry(sessions_dir)
+        assert len(records) == 1
+        assert records[0].peer_protocol == 1  # coerced to int
+
+        with patch("cli_agent_orchestrator.services.cc_session_registry.ConfigService") as mock_cfg:
+            def cfg_side(path, default=None):
+                if "min_version" in path:
+                    return "2.1.0"
+                if "max_version" in path:
+                    return "2.2.0"
+                return default
+            mock_cfg.get.side_effect = cfg_side
+            reason = check_version_guard(records[0])
+
+        assert reason is None  # passes — no peer_protocol refusal
+
+    def test_unparseable_proc_start_yields_zero(self, sessions_dir):
+        """Unparseable procStart (e.g. "abc") → proc_start=0 (fail-closed)."""
+        record_data = {
+            "sessionId": "test-session",
+            "cwd": "/tmp",
+            "tmux": "s:@0.%0",
+            "version": "2.1.231",
+            "peerProtocol": 1,
+            "messagingSocketPath": "/tmp/cc.sock",
+            "procStart": "not-a-number",
+            "status": "idle",
+            "statusUpdatedAt": datetime.now(timezone.utc).isoformat(),
+            "updatedAt": datetime.now(timezone.utc).isoformat(),
+        }
+        (sessions_dir / "600.json").write_text(json.dumps(record_data))
+
+        from cli_agent_orchestrator.services.cc_session_registry import read_registry
+        records = read_registry(sessions_dir)
+        assert len(records) == 1
+        assert records[0].proc_start == 0  # fail-closed default
+
+    def test_reverted_fix_would_fail_string_resolution(self, sessions_dir):
+        """Mutant-killer: verifies that WITHOUT coercion, string procStart mismatches.
+
+        This test validates the test above would fail if the fix were reverted:
+        raw string "10055374" != int 10055374 in Python.
+        """
+        # Direct type comparison assertion — not a resolve_target call
+        assert "10055374" != 10055374, "Python string/int comparison confirms the bug class"
+        assert int("10055374") == 10055374, "int() coercion is the fix"

@@ -133,15 +133,27 @@ def read_registry(sessions_dir: Optional[Path] = None) -> list[RegistryRecord]:
         # Require minimum fields
         if not all(k in data for k in ("sessionId", "messagingSocketPath", "procStart")):
             continue
+        # FX170-S2: coerce numeric fields to int at parse time.
+        # Claude Code may write procStart/peerProtocol as JSON strings.
+        # Fail-closed: unparseable → 0 (guaranteed mismatch against live values).
+        try:
+            proc_start = int(data.get("procStart", 0))
+        except (ValueError, TypeError):
+            proc_start = 0
+        try:
+            peer_protocol = int(data.get("peerProtocol", 0))
+        except (ValueError, TypeError):
+            peer_protocol = 0
+
         records.append(RegistryRecord(
             pid=int(stem),
             session_id=data.get("sessionId", ""),
             cwd=data.get("cwd", ""),
             tmux=data.get("tmux", ""),
             version=data.get("version", ""),
-            peer_protocol=data.get("peerProtocol", 0),
+            peer_protocol=peer_protocol,
             messaging_socket_path=data.get("messagingSocketPath", ""),
-            proc_start=data.get("procStart", 0),
+            proc_start=proc_start,
             status=data.get("status", ""),
             status_updated_at=data.get("statusUpdatedAt", ""),
             updated_at=data.get("updatedAt", ""),
