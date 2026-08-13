@@ -3379,7 +3379,8 @@ class InboxService:
                 # F165-F1: distinguish transient errors (network/DB) from
                 # programming errors (ORM detachment, type errors) that indicate
                 # broken code and would silently kill every tick forever.
-                _D9_TRANSIENT_TYPES = (OSError, OperationalError, TimeoutError)
+                from sqlalchemy.exc import InterfaceError as _SAInterfaceError
+                _D9_TRANSIENT_TYPES = (OSError, OperationalError, TimeoutError, _SAInterfaceError)
                 if isinstance(e, _D9_TRANSIENT_TYPES):
                     logger.warning(
                         "fx158_reconciler_transient mailbox=%s: %s", mb.id, e,

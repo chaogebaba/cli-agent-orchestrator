@@ -178,11 +178,20 @@ class TestF165F1D9ProgrammingErrorSurface:
                 f"Expected DetachedInstanceError in reason, got: {attempt.reason}"
             )
 
+    @pytest.mark.parametrize("error_factory,label", [
+        (lambda: OSError("Connection reset by peer"), "OSError"),
+        (lambda: __import__("sqlalchemy.exc", fromlist=["InterfaceError"]).InterfaceError(
+            "connection closed", None, None
+        ), "InterfaceError"),
+    ], ids=["OSError", "InterfaceError"])
     def test_transient_error_does_not_record_programming_error(
-        self, real_sqlite_env, monkeypatch
+        self, real_sqlite_env, monkeypatch, error_factory, label
     ):
-        """Transient errors (OSError, OperationalError) do NOT produce a
-        programming_error row — D9 isolation still swallows them gracefully."""
+        """Transient errors (OSError, OperationalError, InterfaceError) do NOT
+        produce a programming_error row — D9 isolation still swallows them gracefully.
+
+        S1: InterfaceError (network dropout mid-query) was mislabelled as
+        programming_error before the fold."""
         env = real_sqlite_env
         TestSession = env["TestSession"]
         tmp_path = env["tmp_path"]
@@ -248,9 +257,9 @@ class TestF165F1D9ProgrammingErrorSurface:
             lambda tid: True,
         )
 
-        # Inject a transient OSError
+        # Inject a transient error (parametrized: OSError or InterfaceError)
         def _raise_transient(terminal_id, messages):
-            raise OSError("Connection reset by peer")
+            raise error_factory()
 
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.teammate_push_service.attempt_teammate_push_reported",
