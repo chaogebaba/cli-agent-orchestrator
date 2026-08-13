@@ -187,7 +187,26 @@ def _attempt_gated_ring(terminal_id: str, max_written_row_id: int) -> str:
             return "skipped_gate"
 
         # G4: native probe — require fresh, max_age_s=2.0.
+        # fx168 FIX-5: tmux-compatible fallback. native_probe returns None when
+        # native_status_source != "herdr" (i.e. on the default tmux backend).
+        # Fall back to probe_screen_status — the same idle-evidence mechanism
+        # deliver_pending uses daily on tmux — preserving the gate's safety intent.
         probe_result = native_probe(terminal_id, status_monitor)
+        _evidence_source = "native"
+        if probe_result is None:
+            # Tmux fallback: use screen-classification probe (proven daily in deliver_pending)
+            try:
+                tmux_probe = status_monitor.probe_screen_status(terminal_id)
+                if tmux_probe is not None and hasattr(tmux_probe, "status"):
+                    _evidence_source = "tmux"
+                    # Adapt ProbeResult to the shape _attempt_gated_ring expects
+                    probe_result = type("_TmuxProbe", (), {
+                        "status": tmux_probe.status,
+                        "meta": tmux_probe.meta,
+                    })()
+            except Exception:
+                pass
+
         if probe_result is None:
             logger.info(
                 "f168_doorbell terminal=%s decision=skipped_gate reason=probe_failed row=%s",
@@ -246,8 +265,8 @@ def _attempt_gated_ring(terminal_id: str, max_written_row_id: int) -> str:
             return "skipped_gate"
 
         logger.info(
-            "f168_doorbell terminal=%s decision=rang row=%s",
-            terminal_id, max_written_row_id,
+            "f168_doorbell terminal=%s decision=rang source=%s row=%s",
+            terminal_id, _evidence_source, max_written_row_id,
         )
         return "rang"
     finally:

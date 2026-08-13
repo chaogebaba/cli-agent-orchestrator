@@ -881,3 +881,139 @@ class TestMaxWrittenRowIdField:
             reason="ok",
         )
         assert o.max_written_row_id == 0  # default
+
+
+
+# ===========================================================================
+# fx168 FIX-5: G4 tmux-compatible fallback
+# ===========================================================================
+
+
+class TestFix5TmuxFallback:
+    """G4 tmux fallback uses probe_screen_status when native_probe returns None."""
+
+    def test_tmux_idle_rings_with_source_tmux(self):
+        """When native_probe=None + tmux probe IDLE → decision=rang, source=tmux."""
+        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+        from cli_agent_orchestrator.services.status_monitor import TerminalStatus
+        from cli_agent_orchestrator.services.inbox_service import InjectSafetyResult
+
+        with (
+            patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_config,
+            patch("cli_agent_orchestrator.services.teammate_push_service._should_teammate_push") as mock_should,
+            patch("cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata") as mock_meta,
+            patch("cli_agent_orchestrator.services.doorbell_service.update_terminal_metadata") as mock_update,
+            patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_lock_fn,
+            patch("cli_agent_orchestrator.services.receiver_state_view.native_probe") as mock_native,
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status") as mock_tmux_probe,
+            patch("cli_agent_orchestrator.services.inbox_service.inbox_service._inject_safe") as mock_inject_safe,
+            patch("cli_agent_orchestrator.providers.manager.provider_manager.get_provider") as mock_get_prov,
+            patch("cli_agent_orchestrator.services.terminal_service.send_prepared_input") as mock_send,
+        ):
+            mock_config.get.return_value = True
+            mock_should.return_value = True
+            mock_meta.return_value = {"metadata": {"cc_team_inbox_path": "/tmp/inbox.json"}}
+            mock_update.return_value = None
+
+            mock_lock = MagicMock()
+            mock_lock.acquire.return_value = True
+            mock_lock_fn.return_value = mock_lock
+
+            # Native probe unavailable (tmux backend)
+            mock_native.return_value = None
+
+            # Tmux probe returns IDLE
+            tmux_result = MagicMock()
+            tmux_result.status = TerminalStatus.IDLE
+            tmux_result.meta = {"result_status": "idle", "frame_source": "screen"}
+            mock_tmux_probe.return_value = tmux_result
+
+            mock_inject_safe.return_value = InjectSafetyResult("safe")
+            mock_get_prov.return_value = MagicMock()
+            mock_send.return_value = None
+
+            decision = ring_supervisor_doorbell("term-001", 100, written_count=1)
+
+            assert decision == "rang"
+            mock_tmux_probe.assert_called_once_with("term-001")
+            mock_send.assert_called_once()
+
+    def test_tmux_busy_pane_skips_gate(self):
+        """When native_probe=None + tmux probe PROCESSING → decision=skipped_gate."""
+        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+        from cli_agent_orchestrator.services.status_monitor import TerminalStatus
+
+        with (
+            patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_config,
+            patch("cli_agent_orchestrator.services.teammate_push_service._should_teammate_push") as mock_should,
+            patch("cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata") as mock_meta,
+            patch("cli_agent_orchestrator.services.doorbell_service.update_terminal_metadata"),
+            patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_lock_fn,
+            patch("cli_agent_orchestrator.services.receiver_state_view.native_probe") as mock_native,
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status") as mock_tmux_probe,
+            patch("cli_agent_orchestrator.services.terminal_service.send_prepared_input") as mock_send,
+        ):
+            mock_config.get.return_value = True
+            mock_should.return_value = True
+            mock_meta.return_value = {"metadata": {"cc_team_inbox_path": "/tmp/inbox.json"}}
+
+            mock_lock = MagicMock()
+            mock_lock.acquire.return_value = True
+            mock_lock_fn.return_value = mock_lock
+
+            # Native unavailable
+            mock_native.return_value = None
+
+            # Tmux probe returns PROCESSING (busy)
+            tmux_result = MagicMock()
+            tmux_result.status = TerminalStatus.PROCESSING
+            tmux_result.meta = {"result_status": "processing", "frame_source": "screen"}
+            mock_tmux_probe.return_value = tmux_result
+
+            decision = ring_supervisor_doorbell("term-001", 100, written_count=1)
+
+            assert decision == "skipped_gate"
+            # send_prepared_input NOT called — pane is busy
+            mock_send.assert_not_called()
+
+    def test_herdr_native_preferred_over_tmux(self):
+        """When native_probe returns a result, tmux fallback is NOT used."""
+        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+        from cli_agent_orchestrator.services.status_monitor import TerminalStatus
+        from cli_agent_orchestrator.services.inbox_service import InjectSafetyResult
+
+        with (
+            patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_config,
+            patch("cli_agent_orchestrator.services.teammate_push_service._should_teammate_push") as mock_should,
+            patch("cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata") as mock_meta,
+            patch("cli_agent_orchestrator.services.doorbell_service.update_terminal_metadata"),
+            patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_lock_fn,
+            patch("cli_agent_orchestrator.services.receiver_state_view.native_probe") as mock_native,
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status") as mock_tmux_probe,
+            patch("cli_agent_orchestrator.services.inbox_service.inbox_service._inject_safe") as mock_inject_safe,
+            patch("cli_agent_orchestrator.providers.manager.provider_manager.get_provider") as mock_get_prov,
+            patch("cli_agent_orchestrator.services.terminal_service.send_prepared_input") as mock_send,
+        ):
+            mock_config.get.return_value = True
+            mock_should.return_value = True
+            mock_meta.return_value = {"metadata": {"cc_team_inbox_path": "/tmp/inbox.json"}}
+
+            mock_lock = MagicMock()
+            mock_lock.acquire.return_value = True
+            mock_lock_fn.return_value = mock_lock
+
+            # Native probe available (herdr backend) — returns IDLE
+            native_result = MagicMock()
+            native_result.status = TerminalStatus.IDLE
+            native_result.meta = {"result_status": "idle", "frame_source": "native"}
+            mock_native.return_value = native_result
+
+            mock_inject_safe.return_value = InjectSafetyResult("safe")
+            mock_get_prov.return_value = MagicMock()
+            mock_send.return_value = None
+
+            decision = ring_supervisor_doorbell("term-001", 100, written_count=1)
+
+            assert decision == "rang"
+            # Tmux probe NOT called — native was available
+            mock_tmux_probe.assert_not_called()
