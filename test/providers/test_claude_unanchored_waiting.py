@@ -57,6 +57,54 @@ def test_byte_exact_pipe_pane_replay_uses_recorded_geometry(fixture, waiting, us
 
 
 @pytest.mark.parametrize(
+    "stale",
+    [
+        "Yes, I accept your proposal.\n",
+        "Yes, I trust this folder now.\n",
+    ],
+)
+def test_stale_trust_bypass_text_does_not_suppress_live_dialog_on_screen_path(stale):
+    """Trust/bypass exclusion must read a bounded tail, not the whole rolling buffer.
+
+    The trust dialog is dismissed at startup but its text lingers in the ~8192-char
+    buffer, and "Yes, I accept" is ordinary English; an unbounded exclusion turns a
+    live, unanswered dialog into IDLE/COMPLETED for that whole buffer window.
+    """
+    dialog = _read("01-askuserquestion-2.1.209.plain.txt")
+    with patch(
+        "cli_agent_orchestrator.services.status_monitor.status_monitor.get_rendered_screen",
+        return_value=dialog.splitlines(),
+    ):
+        status = _provider().get_status(stale + dialog)
+
+    assert status == TerminalStatus.WAITING_USER_ANSWER
+
+
+@pytest.mark.parametrize("stale_fixture", ["04-trust-prompt.raw", "05-bypass-prompt.raw"])
+@pytest.mark.parametrize("live_fixture", ["01-askuser-single.raw", "03-plan-approval.raw"])
+def test_stale_trust_bypass_frame_does_not_suppress_live_dialog_on_geometry_path(
+    stale_fixture, live_fixture
+):
+    def _raw(name: str) -> str:
+        return (RAW_FIXTURES / name).read_bytes().decode("utf-8", errors="surrogateescape")
+
+    # The CLI clears the screen when the startup dialog is dismissed, so the stale
+    # frame survives only in the rolling buffer, never on the composited screen.
+    combined = _raw(stale_fixture) + "\x1b[2J\x1b[H" + _raw(live_fixture)
+    with (
+        patch(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor.get_rendered_screen",
+            return_value=None,
+        ),
+        patch("cli_agent_orchestrator.providers.claude_code.get_backend") as backend,
+    ):
+        backend.return_value.get_pane_size.return_value = (134, 49)
+        status = _provider().get_status(combined)
+
+    assert status == TerminalStatus.WAITING_USER_ANSWER
+
+
+@pytest.mark.parametrize(
     ("fixture", "expected"),
     [
         ("00-askuserquestion-2.1.205-incident.plain.txt", TerminalStatus.WAITING_USER_ANSWER),

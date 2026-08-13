@@ -2744,3 +2744,39 @@ class TestDeferredInitWaitingUserAnswerSurvival:
             "unknown", "worker99", "do the task", OrchestrationType.ASSIGN
         )
         mock_settle.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._claim_and_settle_deferred_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service._confirm_worker_started_or_resubmit")
+    @patch("cli_agent_orchestrator.services.terminal_service.send_input")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    async def test_resubmit_path_keeps_the_assign_default_orchestration_type(
+        self, mock_meta, mock_send_input, mock_confirm, mock_settle
+    ):
+        """The resubmit seam must carry the same guard-eligible ASSIGN default as the
+        initial send_input. Passing the raw orchestration_type=None here would reopen
+        the POST /sessions guard hole on every resubmit: send_input's
+        WAITING_USER_ANSWER guard only fires for ASSIGN/HANDOFF, so an unstated type
+        would paste the task into a live choice widget on the retry.
+        """
+        from cli_agent_orchestrator.services.terminal_service import (
+            _deferred_init_tasks,
+            _schedule_deferred_init,
+        )
+
+        mock_meta.return_value = {"caller_id": None}
+        mock_send_input.return_value = None
+        mock_confirm.return_value = True
+
+        provider_instance = AsyncMock()
+        provider_instance.initialize.return_value = True
+        provider_instance.shell_baseline = None
+
+        before_tasks = set(_deferred_init_tasks)
+        _schedule_deferred_init(provider_instance, "worker99", "do the task", None, None)
+        (task,) = set(_deferred_init_tasks) - before_tasks
+        await task
+
+        mock_confirm.assert_called_once()
+        assert mock_confirm.call_args.args[4] == OrchestrationType.ASSIGN
+        mock_settle.assert_not_called()

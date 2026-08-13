@@ -163,10 +163,9 @@ IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" pro
 # deliberately generic CHROME text, not any one prompt's own wording -- the point is to classify a
 # FUTURE, still-unrecognized choice-type prompt as WAITING_USER_ANSWER too, not just the specific
 # prompts this file happens to already special-case by name below. Confirmed this does not
-# overlap PLAN_APPROVAL_PATTERN's own dialog below: that dialog's real footer is "shift+tab to
+# overlap the plan-approval dialog: that dialog's real footer is "shift+tab to
 # approve with feedback" (see test_plan_approval_active_with_option_markers_is_waiting), not this
-# text, and PLAN_APPROVAL_PATTERN's own bottom_region check only runs once this check has already
-# missed. TRUST_PROMPT_PATTERN/BYPASS_PROMPT_PATTERN are explicitly excluded below so the
+# text. TRUST_PROMPT_PATTERN/BYPASS_PROMPT_PATTERN are explicitly excluded below so the
 # trust/bypass dialogs -- which this file DOES actively dismiss, in _handle_startup_prompts -- are
 # never reported as WAITING_USER_ANSWER while still unaccepted.
 #
@@ -185,7 +184,6 @@ IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" pro
 # out of scope for this fix, which only addresses the "Enter to confirm" case flagged in review.
 # The "Tab/Arrow keys to navigate" arm is our fork's own footer variant, unioned in here.
 WAITING_USER_ANSWER_PATTERN = r"(?:↑/↓|Tab/Arrow keys) to navigate|Enter to confirm[ \t]*·"
-PLAN_APPROVAL_PATTERN = r"Would you like to proceed\?"
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
 EXTERNAL_IMPORT_PROMPT_PATTERN = r"Allow external CLAUDE\.md file imports\?"
@@ -1220,10 +1218,18 @@ class ClaudeCodeProvider(BaseProvider):
         # composite-and-reject path on every poll. _is_ink_selection_waiting
         # rejects them anyway, so the outcome is unchanged either way; skipping
         # the composite keeps them on the cheap path.
+        #
+        # The exclusion reads only a bounded tail, mirroring upstream's
+        # 15-line bottom_region: BYPASS_PROMPT_PATTERN ("Yes, I accept") is
+        # ordinary English and the trust dialog stays in the rolling buffer
+        # after _handle_startup_prompts dismisses it, so an unbounded scan lets
+        # stale scrollback suppress a live dialog's WAITING classification.
+        _exclusion_tail = "\n".join(output.splitlines()[-15:])
         waiting_candidate = (
             re.search(WAITING_USER_ANSWER_PATTERN, output) or _INK_PLAN_HEAD_PATTERN.search(output)
         ) and not (
-            re.search(TRUST_PROMPT_PATTERN, output) or re.search(BYPASS_PROMPT_PATTERN, output)
+            re.search(TRUST_PROMPT_PATTERN, _exclusion_tail)
+            or re.search(BYPASS_PROMPT_PATTERN, _exclusion_tail)
         )
         if waiting_candidate:
             # Prefer StatusMonitor's incremental screen; replaying the rolling
