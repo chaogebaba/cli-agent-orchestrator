@@ -16,10 +16,21 @@ from cli_agent_orchestrator.services.session_service import (
 
 
 def test_canonical_session_env_uses_working_directory(tmp_path):
+    """Legacy layout: no orchestrator/ subdir -> tmp/orch at repo root."""
     result = canonical_session_env(str(tmp_path), {"KEEP": "yes"})
     assert result == {
         "KEEP": "yes",
         "CAO_ARTIFACTS_DIR": str(tmp_path.resolve() / "tmp" / "orch"),
+    }
+
+
+def test_canonical_session_env_prefers_orchestrator_layout(tmp_path):
+    """New layout: when orchestrator/ exists, default to orchestrator/tmp/orch."""
+    (tmp_path / "orchestrator").mkdir()
+    result = canonical_session_env(str(tmp_path), {"OTHER": "val"})
+    assert result == {
+        "OTHER": "val",
+        "CAO_ARTIFACTS_DIR": str(tmp_path.resolve() / "orchestrator" / "tmp" / "orch"),
     }
 
 

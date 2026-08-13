@@ -65,7 +65,12 @@ def canonical_session_env(
             )
         artifact_root = Path(override).resolve()
     else:
-        artifact_root = Path(working_directory or os.getcwd()).resolve() / "tmp" / "orch"
+        base = Path(working_directory or os.getcwd()).resolve()
+        orch_sub = base / "orchestrator"
+        if orch_sub.is_dir():
+            artifact_root = orch_sub / "tmp" / "orch"
+        else:
+            artifact_root = base / "tmp" / "orch"
     result[ARTIFACTS_DIR_ENV] = str(artifact_root)
     return result
 
