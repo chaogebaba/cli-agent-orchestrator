@@ -42,6 +42,12 @@ def _setup_owed_idle(svc, terminal_id="worker1", caller_id="sup1", profile="grok
         svc._episodes[terminal_id].last_screen_fp = "sampled"
 
 
+def _setup_owed_error(svc, terminal_id="worker1", caller_id="sup1", profile="grok_dev", error_at=10.0):
+    """Record an assign and drive the worker into ERROR (B1 / D2 row 1)."""
+    svc.record_inbound_task(terminal_id, caller_id, profile)
+    svc.record_status(terminal_id, TerminalStatus.ERROR, now=error_at)
+
+
 def _config_on(path, default=None, override=None):
     """ConfigService.get mock that enables quiescence with grace=3."""
     mapping = {
@@ -83,9 +89,15 @@ class TestSetMembership:
             assert "w1" not in svc._episodes
 
     def test_ac2_callback_removes_member(self):
-        """A delivered callback removes the member (callback_seen=True)."""
-        svc = _make_watchdog()
+        """A delivered callback removes the member (callback_seen=True) — and no ring follows.
+
+        S3 mutant kill: dropping `if episode.callback_seen: continue` from the owed-set
+        build would leave the settled member in the set and ring on a fully settled
+        supervisor. The second half of this test is what notices.
+        """
+        svc = _make_watchdog(grace=3)
         svc.record_inbound_task("w1", "sup1", "developer")
+        svc.record_status("w1", TerminalStatus.IDLE, now=10.0)
         with patch(
             "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
             return_value={"caller_id": "sup1", "caller_mailbox_id": None},
@@ -93,6 +105,40 @@ class TestSetMembership:
             svc.record_callback_if_to_caller("w1", "sup1")
         with svc._lock:
             assert svc._episodes["w1"].callback_seen is True
+
+        # Full settlement: the owed set is empty, so no tick may ever ring.
+        def meta_side_effect(tid):
+            if tid == "sup1":
+                return _meta("sup1")
+            return _meta(tid, "sup1")
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+                side_effect=meta_side_effect,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
+                return_value=TerminalStatus.IDLE,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.config_service.ConfigService.get",
+                side_effect=_config_on,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
+            ) as mock_persist,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            ) as mock_deliver,
+        ):
+            svc.tick_quiescence(now=100.0)
+        mock_persist.assert_not_called()
+        mock_deliver.assert_not_called()
 
     def test_ac2_clear_terminal_removes_from_both_stores(self):
         """delete_terminal (clear_terminal) removes from _episodes AND _dead_owed."""
@@ -405,13 +451,38 @@ class TestRingPredicate:
         mock_persist.assert_called_once()
 
     def test_ac7_fingerprint_reset_restarts_clock(self):
-        """Screen fingerprint change resets idle_since — the quiet clock restarts."""
+        """Screen fingerprint change resets the quiet clock — driven through the real path.
+
+        Mutant 6 (compare quiet-age against a clock the fingerprint reset does not
+        touch) is killed here: the reset is produced by refresh_screen_fingerprints,
+        not by poking the episode fields.
+        """
         svc = _make_watchdog(grace=3)
         _setup_owed_idle(svc, "w1", "sup1", "dev", idle_at=10.0)
-        # Simulate fingerprint change at t=12 (resets idle_since to 12)
+
+        backend = MagicMock()
+        backend.get_history.return_value = "pane changed since last sample"
+        with (
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+                return_value=_meta("w1", "sup1"),
+            ),
+            patch(
+                "cli_agent_orchestrator.backends.registry.get_backend",
+                return_value=backend,
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
+                return_value=None,
+            ),
+        ):
+            # Fingerprint differs from the "sampled" placeholder -> clock restarts at 12.0
+            svc.refresh_screen_fingerprints(now=12.0)
+
         with svc._lock:
-            svc._episodes["w1"].idle_since = 12.0
-            svc._episodes["w1"].last_screen_fp = "new_fp"
+            assert svc._episodes["w1"].idle_since == 12.0
+            assert svc._episodes["w1"].quiet_since == 12.0
+
         # At t=14, quiet = 2s < 3 grace -> no ring
         mock_persist, _ = self._tick_with_mocks(svc, now=14.0)
         mock_persist.assert_not_called()
@@ -915,3 +986,440 @@ class TestExistingBehaviorUnchanged:
         ):
             notices = svc.collect_due_notifications(now=13.0)
         assert notices == []
+
+    def test_error_status_does_not_arm_per_worker_notice(self):
+        """B1 regression: ERROR feeds the quiescence clock only — notify_due is untouched.
+
+        idle_since stays None on ERROR (so no per-worker stall notice), while the
+        quiescence-scoped quiet_since runs.
+        """
+        svc = _make_watchdog(grace=3)
+        _setup_owed_error(svc, "w1", "sup1", "developer", error_at=10.0)
+        with svc._lock:
+            assert svc._episodes["w1"].idle_since is None
+            assert svc._episodes["w1"].quiet_since == 10.0
+
+        with patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+            return_value=_meta("w1", "sup1"),
+        ):
+            notices = svc.collect_due_notifications(now=100.0)
+        assert notices == []
+
+
+# ---------------------------------------------------------------------------
+# B1 — ERROR is a TERMINAL state whose quiet clock runs (D2 row 1)
+# ---------------------------------------------------------------------------
+
+class TestErrorMemberQuietClock:
+    """B1: a live ERROR member must contribute a running quiet clock, not veto the caller."""
+
+    def _tick(self, svc, now, *, status_return=TerminalStatus.ERROR, callback_status=None):
+        def meta_side_effect(tid):
+            if tid == "sup1":
+                return _meta("sup1")
+            return _meta(tid, "sup1")
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+                side_effect=meta_side_effect,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
+                return_value=status_return,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+                return_value=callback_status,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.config_service.ConfigService.get",
+                side_effect=_config_on,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
+            ) as mock_persist,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            ) as mock_deliver,
+        ):
+            svc.tick_quiescence(now=now)
+            return mock_persist, mock_deliver
+
+    def test_single_error_member_rings_after_grace(self):
+        """One live ERROR member, quiet >= G: the caller rings (pre-fix: never rang)."""
+        svc = _make_watchdog(grace=3)
+        _setup_owed_error(svc, "w1", "sup1", "grok_dev", error_at=10.0)
+
+        # Inside grace: silent
+        mock_persist, _ = self._tick(svc, now=12.0)
+        mock_persist.assert_not_called()
+
+        # At grace: rings, labelled last=error
+        mock_persist, _ = self._tick(svc, now=13.0)
+        mock_persist.assert_called_once()
+        msg = mock_persist.call_args[0][2]
+        assert "grok_dev-w1 last=error quiet=3s gen=1" in msg
+        assert "1 lane(s)" in msg
+
+    def test_error_member_does_not_veto_whole_caller(self):
+        """Mixed ERROR + dead members ring together — one ERROR must not zero the caller."""
+        svc = _make_watchdog(grace=3)
+        _setup_owed_error(svc, "w1", "sup1", "grok_dev", error_at=10.0)
+        with svc._lock:
+            svc._dead_owed.setdefault("sup1", {})["w2"] = _RetiredMember(
+                terminal_id="w2", caller_id="sup1", generation=2,
+                profile="codex_dev", retired_at=10.0,
+            )
+
+        mock_persist, mock_deliver = self._tick(svc, now=14.0)
+        mock_persist.assert_called_once()
+        msg = mock_persist.call_args[0][2]
+        assert "2 lane(s)" in msg
+        assert "grok_dev-w1 last=error" in msg
+        assert "codex_dev-w2 last=dead" in msg
+        mock_deliver.assert_called_once_with("sup1")
+
+    def test_error_then_processing_rearms(self):
+        """ERROR -> PROCESSING clears the quiet clock and the dedup key; re-erroring rings again."""
+        svc = _make_watchdog(grace=3)
+        _setup_owed_error(svc, "w1", "sup1", "grok_dev", error_at=10.0)
+
+        mock_persist, _ = self._tick(svc, now=14.0)
+        assert mock_persist.call_count == 1
+
+        # Same state held: no second ring
+        mock_persist, _ = self._tick(svc, now=15.0)
+        mock_persist.assert_not_called()
+
+        # Worker resumes...
+        svc.record_status("w1", TerminalStatus.PROCESSING, now=16.0)
+        with svc._lock:
+            assert svc._episodes["w1"].quiet_since is None
+            assert "sup1" not in svc._quiescence_last_fired
+        # ...and errors again
+        svc.record_status("w1", TerminalStatus.ERROR, now=17.0)
+
+        # Inside the new grace window: silent
+        mock_persist, _ = self._tick(svc, now=19.0)
+        mock_persist.assert_not_called()
+        # Past it: second ring
+        mock_persist, _ = self._tick(svc, now=20.0)
+        assert mock_persist.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# S2 — clear_terminal's dedup clear is caller-scoped
+# ---------------------------------------------------------------------------
+
+class TestDedupClearIsCallerScoped:
+    """S2: an unrelated delete must not re-arm an unchanged set (AC8)."""
+
+    def _tick(self, svc, now):
+        def meta_side_effect(tid):
+            if tid.startswith("sup"):
+                return _meta(tid)
+            return _meta(tid, "sup1")
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+                side_effect=meta_side_effect,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
+                return_value=TerminalStatus.IDLE,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.config_service.ConfigService.get",
+                side_effect=_config_on,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
+            ) as mock_persist,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            ),
+        ):
+            svc.tick_quiescence(now=now)
+            return mock_persist
+
+    def test_unrelated_delete_does_not_rearm(self):
+        """sup1's set is unchanged by deleting sup2's worker — sup1 must stay silent."""
+        svc = _make_watchdog(grace=3)
+        _setup_owed_idle(svc, "w1", "sup1", "dev_a", idle_at=10.0)
+        _setup_owed_idle(svc, "w2", "sup2", "dev_b", idle_at=10.0)
+
+        # Both ring once
+        mock_persist = self._tick(svc, now=14.0)
+        assert mock_persist.call_count == 2
+
+        # Unrelated delete: sup2's worker is reaped
+        svc.clear_terminal("w2")
+        with svc._lock:
+            assert "sup1" in svc._quiescence_last_fired
+            assert "sup2" not in svc._quiescence_last_fired
+
+        # sup1's set never changed -> no second ring for anyone
+        mock_persist = self._tick(svc, now=15.0)
+        mock_persist.assert_not_called()
+
+    def test_unknown_terminal_delete_touches_nothing(self):
+        """A delete of a terminal no caller owed leaves every dedup key intact."""
+        svc = _make_watchdog(grace=3)
+        _setup_owed_idle(svc, "w1", "sup1", "dev_a", idle_at=10.0)
+        mock_persist = self._tick(svc, now=14.0)
+        assert mock_persist.call_count == 1
+
+        svc.clear_terminal("stranger")
+        with svc._lock:
+            assert "sup1" in svc._quiescence_last_fired
+
+        mock_persist = self._tick(svc, now=15.0)
+        mock_persist.assert_not_called()
+
+    def test_owning_caller_delete_does_rearm(self):
+        """The affected caller IS re-armed — scoping must not become inertness."""
+        svc = _make_watchdog(grace=3)
+        _setup_owed_idle(svc, "w1", "sup1", "dev_a", idle_at=10.0)
+        _setup_owed_idle(svc, "w2", "sup1", "dev_b", idle_at=10.0)
+        mock_persist = self._tick(svc, now=14.0)
+        assert mock_persist.call_count == 1
+
+        svc.clear_terminal("w2")
+        with svc._lock:
+            assert "sup1" not in svc._quiescence_last_fired
+
+        mock_persist = self._tick(svc, now=15.0)
+        assert mock_persist.call_count == 1
+        assert "1 lane(s)" in mock_persist.call_args[0][2]
+
+    def test_dead_owed_delete_rearms_its_caller_only(self):
+        """The _dead_owed removal path also scopes its re-arm to the owning caller."""
+        svc = _make_watchdog(grace=3)
+        _setup_owed_idle(svc, "w1", "sup1", "dev_a", idle_at=10.0)
+        with svc._lock:
+            svc._quiescence_last_fired["sup1"] = (("w1", 1),)
+            svc._quiescence_last_fired["sup2"] = (("wX", 1),)
+            svc._dead_owed["sup2"] = {"wX": _RetiredMember(
+                terminal_id="wX", caller_id="sup2", generation=1,
+                profile="dev_b", retired_at=10.0,
+            )}
+
+        svc.clear_terminal("wX")
+        with svc._lock:
+            assert "sup2" not in svc._quiescence_last_fired
+            assert "sup1" in svc._quiescence_last_fired
+
+
+# ---------------------------------------------------------------------------
+# S4 — D9 needs BOTH halves before dropping a caller's stores
+# ---------------------------------------------------------------------------
+
+class TestD9MailboxHalf:
+    """S4: metadata-None alone is not death; a mailbox may route to a live successor."""
+
+    def _tick(self, svc, now, *, successor):
+        def meta_side_effect(tid):
+            if tid == "sup1":
+                return None  # the old supervisor pane is gone
+            if tid == "sup1b":
+                return _meta("sup1b")
+            return _meta(tid, "sup1")
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+                side_effect=meta_side_effect,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog."
+                "_supervisor_mailbox_live_terminal",
+                return_value=successor,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
+                return_value=TerminalStatus.IDLE,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.config_service.ConfigService.get",
+                side_effect=_config_on,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
+            ) as mock_persist,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            ) as mock_deliver,
+        ):
+            svc.tick_quiescence(now=now)
+            return mock_persist, mock_deliver
+
+    def _seed_dead_lane(self, svc):
+        with svc._lock:
+            svc._dead_owed.setdefault("sup1", {})["w2"] = _RetiredMember(
+                terminal_id="w2", caller_id="sup1", generation=2,
+                profile="codex_dev", retired_at=10.0,
+            )
+
+    def test_mailbox_successor_retains_stores_and_rings_successor(self):
+        """metadata None + mailbox routing to a live successor: keep stores, ring successor."""
+        svc = _make_watchdog(grace=3)
+        _setup_owed_idle(svc, "w1", "sup1", "grok_dev", idle_at=10.0)
+        self._seed_dead_lane(svc)
+
+        mock_persist, mock_deliver = self._tick(svc, now=14.0, successor="sup1b")
+
+        mock_persist.assert_called_once()
+        sender, receiver, msg = mock_persist.call_args[0][:3]
+        # Sender still names the debt owner; the row is addressed to the successor
+        assert sender == "watchdog:quiescence:sup1"
+        assert receiver == "sup1b"
+        mock_deliver.assert_called_once_with("sup1b")
+        assert "grok_dev-w1" in msg
+        assert "codex_dev-w2" in msg
+
+        # Stores retained — the dead-lane ledger survives the rebind
+        with svc._lock:
+            assert "w2" in svc._dead_owed.get("sup1", {})
+            assert "w1" in svc._episodes
+
+    def test_no_successor_drops_stores_and_stays_silent(self):
+        """Both halves fail: no ring, and the caller's FX181 stores are dropped."""
+        svc = _make_watchdog(grace=3)
+        _setup_owed_idle(svc, "w1", "sup1", "grok_dev", idle_at=10.0)
+        self._seed_dead_lane(svc)
+        with svc._lock:
+            svc._quiescence_last_fired["sup1"] = (("w1", 1),)
+
+        mock_persist, mock_deliver = self._tick(svc, now=14.0, successor=None)
+
+        mock_persist.assert_not_called()
+        mock_deliver.assert_not_called()
+        with svc._lock:
+            assert "sup1" not in svc._dead_owed
+            assert "sup1" not in svc._quiescence_last_fired
+
+    def test_helper_returns_none_without_mailbox(self):
+        """The resolver itself is conservative: no supervisor mailbox -> no successor."""
+        from cli_agent_orchestrator.services.stalled_callback_watchdog import (
+            _supervisor_mailbox_live_terminal,
+        )
+
+        assert _supervisor_mailbox_live_terminal("no-such-supervisor-terminal") is None
+
+
+# ---------------------------------------------------------------------------
+# N5/N7 — same-tick re-evaluation and predicate-time status
+# ---------------------------------------------------------------------------
+
+class TestSameTickReevalAndStatusCarry:
+    """AC6/D4: the shrunken set is re-evaluated in the SAME tick; status is sampled once."""
+
+    def _tick(self, svc, now, *, callback_side_effect=None, snapshot):
+        def meta_side_effect(tid):
+            if tid == "sup1":
+                return _meta("sup1")
+            return _meta(tid, "sup1")
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+                side_effect=meta_side_effect,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
+                snapshot,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+                side_effect=callback_side_effect,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.config_service.ConfigService.get",
+                side_effect=_config_on,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
+            ) as mock_persist,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            ) as mock_deliver,
+        ):
+            svc.tick_quiescence(now=now)
+            return mock_persist, mock_deliver
+
+    def test_settled_member_shrinks_set_and_rings_same_tick(self):
+        """N5: w1 settles via the DB probe; the remaining w2 rings in the SAME tick."""
+        svc = _make_watchdog(grace=3)
+        _setup_owed_idle(svc, "w1", "sup1", "dev_a", idle_at=10.0)
+        _setup_owed_idle(svc, "w2", "sup1", "dev_b", idle_at=10.0)
+
+        def cb(terminal_id, caller_id, since):
+            return MessageStatus.DELIVERED if terminal_id == "w1" else None
+
+        mock_persist, _ = self._tick(
+            svc, now=14.0,
+            callback_side_effect=cb,
+            snapshot=MagicMock(return_value=TerminalStatus.IDLE),
+        )
+
+        mock_persist.assert_called_once()
+        msg = mock_persist.call_args[0][2]
+        assert "1 lane(s)" in msg
+        assert "dev_b-w2" in msg
+        assert "dev_a-w1" not in msg
+        with svc._lock:
+            assert svc._episodes["w1"].callback_seen is True
+
+    def test_last_member_settling_leaves_empty_set_silent(self):
+        """The same-tick re-eval of an emptied set still never rings."""
+        svc = _make_watchdog(grace=3)
+        _setup_owed_idle(svc, "w1", "sup1", "dev_a", idle_at=10.0)
+
+        mock_persist, mock_deliver = self._tick(
+            svc, now=14.0,
+            callback_side_effect=lambda *a: MessageStatus.DELIVERED,
+            snapshot=MagicMock(return_value=TerminalStatus.IDLE),
+        )
+        mock_persist.assert_not_called()
+        mock_deliver.assert_not_called()
+
+    def test_status_sampled_once_per_member(self):
+        """N7: the predicate-time status is carried into the message, not re-sampled."""
+        svc = _make_watchdog(grace=3)
+        _setup_owed_error(svc, "w1", "sup1", "dev_a", error_at=10.0)
+        snapshot = MagicMock(return_value=TerminalStatus.ERROR)
+
+        mock_persist, _ = self._tick(
+            svc, now=14.0,
+            callback_side_effect=lambda *a: None,
+            snapshot=snapshot,
+        )
+        mock_persist.assert_called_once()
+        assert "last=error" in mock_persist.call_args[0][2]
+        # One member, one tick, one status observation
+        assert snapshot.call_count == 1
+
+    def test_completed_status_labelled_completed(self):
+        """N7 regression: a COMPLETED member is labelled `completed`, never defaulted to `idle`."""
+        svc = _make_watchdog(grace=3)
+        svc.record_inbound_task("w1", "sup1", "dev_a")
+        svc.record_status("w1", TerminalStatus.COMPLETED, now=10.0)
+
+        mock_persist, _ = self._tick(
+            svc, now=14.0,
+            callback_side_effect=lambda *a: None,
+            snapshot=MagicMock(return_value=TerminalStatus.COMPLETED),
+        )
+        mock_persist.assert_called_once()
+        assert "last=completed" in mock_persist.call_args[0][2]

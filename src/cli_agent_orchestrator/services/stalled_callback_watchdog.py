@@ -48,6 +48,63 @@ AUTO_RESUME_BODY = (
     "Continue your assigned task from where you left off; do not redo work that already "
     "completed; the original callback contract stands."
 )
+# FX181 D2 row 1: the TERMINAL statuses for the aggregate quiescence predicate,
+# mapped to their message labels. Membership here IS the classification — a status
+# absent from this map is indeterminate and can never contribute to a ring.
+_QUIESCENT_STATUS_LABELS = {
+    TerminalStatus.IDLE: "idle",
+    TerminalStatus.COMPLETED: "completed",
+    TerminalStatus.ERROR: "error",
+}
+
+
+def _supervisor_mailbox_live_terminal(caller_id: str) -> str | None:
+    """FX181 D9 second half: the live terminal a supervisor mailbox routes to.
+
+    Returns the successor terminal id when a supervisor mailbox owned by
+    ``caller_id`` (either the mailbox id itself, or a mailbox this terminal is an
+    incarnation of) currently points at a terminal that still resolves. Returns
+    ``None`` when there is no such mailbox or its current terminal is gone too —
+    only then is the caller genuinely unreachable and its stores droppable.
+
+    Non-raising by contract: any DB fault degrades to "no successor", which keeps
+    the caller's stores only if its own metadata resolved.
+    """
+    try:
+        from cli_agent_orchestrator.clients.database import (
+            MailboxIncarnationModel,
+            MailboxModel,
+            SessionLocal,
+        )
+
+        with SessionLocal() as db:
+            mailbox = (
+                db.query(MailboxModel).filter_by(id=caller_id, role="supervisor").one_or_none()
+            )
+            if mailbox is None:
+                incarnation = (
+                    db.query(MailboxIncarnationModel)
+                    .filter_by(terminal_id=caller_id)
+                    .one_or_none()
+                )
+                if incarnation is not None:
+                    mailbox = (
+                        db.query(MailboxModel)
+                        .filter_by(id=incarnation.mailbox_id, role="supervisor")
+                        .one_or_none()
+                    )
+            if mailbox is None:
+                return None
+            successor = mailbox.current_terminal_id
+    except Exception:
+        logger.debug(
+            "quiescence: supervisor mailbox lookup failed for %s", caller_id, exc_info=True
+        )
+        return None
+
+    if not successor or successor == caller_id:
+        return None
+    return successor if get_terminal_metadata(successor) is not None else None
 
 
 def _filtered_liveness_tail(tail: str, patterns: list[str]) -> str:
@@ -76,6 +133,14 @@ class _Episode:
     # state (observed live: pyte screen divergence latched COMPLETED through
     # a whole busy codex turn).
     last_screen_fp: str | None = None
+    # FX181 B1: quiescence-scoped quiet clock. Deliberately SEPARATE from
+    # idle_since: idle_since drives the per-worker stall notice (notify_due),
+    # whose semantics must stay byte-unchanged (AC3), and which treats ERROR as
+    # not-idle. D2 row 1 makes ERROR a TERMINAL state for the aggregate
+    # quiescence predicate, so the quiescence clock runs on IDLE/COMPLETED/ERROR
+    # and is cleared by every other status. Widening idle_since itself would
+    # have made the per-worker notifier fire on ERROR panes.
+    quiet_since: float | None = None
     generation: int = 1
     revision: int = 0
     auto_resumed: bool = False
@@ -205,6 +270,9 @@ class StalledCallbackWatchdog:
         with self._lock:
             if episode is not None and episode.idle_since is not None:
                 episode.idle_since += elapsed
+            # FX181 B1: the quiescence clock is shifted by the same pause span
+            if episode is not None and episode.quiet_since is not None:
+                episode.quiet_since += elapsed
             if episode is not None:
                 self._episodes[terminal_id] = episode
             self._paused.discard(terminal_id)
@@ -219,6 +287,8 @@ class StalledCallbackWatchdog:
         with self._lock:
             if episode is not None and episode.idle_since is not None:
                 episode.idle_since += elapsed
+            if episode is not None and episode.quiet_since is not None:
+                episode.quiet_since += elapsed
             if episode is not None:
                 self._episodes[terminal_id] = episode
             self._paused.discard(terminal_id)
@@ -260,7 +330,13 @@ class StalledCallbackWatchdog:
 
     def clear_terminal(self, terminal_id: str) -> None:
         with self._lock:
-            self._episodes.pop(terminal_id, None)
+            # FX181 S2: collect the callers whose owed set this delete actually
+            # changes, so the dedup clear below is caller-scoped. A blanket
+            # .clear() re-armed every unrelated supervisor (AC8 violation).
+            affected_callers: set[str] = set()
+            popped_episode = self._episodes.pop(terminal_id, None)
+            if popped_episode is not None:
+                affected_callers.add(popped_episode.caller_id)
             self._waiting_inbox_episodes.pop(terminal_id, None)
             self._waiting_inbox_last_push.pop(terminal_id, None)
             self._ready_backlog_episodes.pop(terminal_id, None)
@@ -272,17 +348,17 @@ class StalledCallbackWatchdog:
                 if key[0] != terminal_id and key[2] != terminal_id
             }
             # FX181 D3: remove from _dead_owed in every caller's bucket
-            for caller_bucket in self._dead_owed.values():
-                caller_bucket.pop(terminal_id, None)
+            for caller_id, caller_bucket in self._dead_owed.items():
+                if caller_bucket.pop(terminal_id, None) is not None:
+                    affected_callers.add(caller_id)
             # Purge empty caller buckets
             self._dead_owed = {
                 cid: bucket for cid, bucket in self._dead_owed.items() if bucket
             }
-            # FX181 D5: composition changed — clear dedup keys for affected callers
-            # (clear_terminal changes the owed set for any caller that had this terminal)
-            # We already removed from _dead_owed above; the episode we popped tells us caller
-            # but conservatively clear all since the terminal could appear in multiple sets.
-            self._quiescence_last_fired.clear()
+            # FX181 D5 re-arm, caller-scoped: only the callers that actually owned
+            # this terminal saw their set composition change.
+            for caller_id in affected_callers:
+                self._quiescence_last_fired.pop(caller_id, None)
 
     def _blockers_locked(self, worker_id: str) -> list[tuple[str, _Episode]]:
         return [
@@ -339,6 +415,19 @@ class StalledCallbackWatchdog:
                 # FX181 D5 re-arm: member back to PROCESSING clears dedup key
                 if status == TerminalStatus.PROCESSING:
                     self._quiescence_last_fired.pop(episode.caller_id, None)
+            # FX181 B1 / D2 row 1: the quiescence quiet clock runs on every
+            # TERMINAL status — IDLE, COMPLETED **and ERROR** — and is cleared by
+            # anything else. Maintained alongside idle_since so notify_due keeps
+            # its exact pre-FX181 semantics (AC3).
+            if status in {
+                TerminalStatus.IDLE,
+                TerminalStatus.COMPLETED,
+                TerminalStatus.ERROR,
+            }:
+                if episode.quiet_since is None:
+                    episode.quiet_since = now
+            else:
+                episode.quiet_since = None
             # F97: garbage-collect completed episodes
             self._gc_fired_episodes()
 
@@ -442,6 +531,9 @@ class StalledCallbackWatchdog:
                     episode.last_screen_fp = fingerprint
                 elif episode.last_screen_fp != fingerprint:
                     episode.idle_since = now
+                    # FX181 B1: a visibly-changing pane restarts the quiescence
+                    # clock too (AC7's anti-false-idle inheritance)
+                    episode.quiet_since = now
                     episode.last_screen_fp = fingerprint
 
     def _fresh_frame_decides_running(self, terminal_id: str) -> tuple[bool, str | None]:
@@ -1215,13 +1307,20 @@ class StalledCallbackWatchdog:
                 if episode.callback_seen:
                     continue
                 if terminal_id in self._paused:
+                    # N6: paused terminals are deliberately excluded. A paused
+                    # episode's clocks are frozen mid-quarantine (pause_terminal /
+                    # resume_terminal), so its quiet age is not a real observation;
+                    # counting it would let a quarantine window masquerade as
+                    # quiescence. It rejoins the owed set on resume.
                     continue
                 cid = episode.caller_id
                 callers.setdefault(cid, []).append((
                     terminal_id,
                     episode.generation,
                     episode.profile,
-                    episode.idle_since,
+                    # B1: the quiescence-scoped clock (IDLE/COMPLETED/ERROR), not
+                    # idle_since — see _Episode.quiet_since.
+                    episode.quiet_since,
                     "live",
                 ))
             # Dead members from _dead_owed
@@ -1260,113 +1359,132 @@ class StalledCallbackWatchdog:
         last_fired_key: tuple[tuple[str, int], ...] | None,
     ) -> None:
         """D4: evaluate the RING predicate for a single caller."""
-        from cli_agent_orchestrator.services.config_service import ConfigService
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         if not members:
             return  # D4: empty set never rings
 
-        # D9: check supervisor is resolvable
-        supervisor_meta = get_terminal_metadata(caller_id)
-        if supervisor_meta is None:
-            # Dead supervisor — drop entries from stores (D9)
-            with self._lock:
-                self._dead_owed.pop(caller_id, None)
-                self._quiescence_last_fired.pop(caller_id, None)
-            return
+        # D9: the ring target. BOTH halves are required before a caller's stores
+        # are dropped: the terminal row must be gone AND no supervisor mailbox may
+        # route to a live terminal. A supervisor mid-rebind has metadata None while
+        # its mailbox already points at the successor — dropping there would lose
+        # the dead-lane ledger and silence the ring the successor is owed.
+        ring_target = caller_id
+        if get_terminal_metadata(caller_id) is None:
+            successor = _supervisor_mailbox_live_terminal(caller_id)
+            if successor is None:
+                # Dead supervisor, no mailbox successor — drop stores (D9)
+                # N8 divergence, deliberate: only the FX181-owned stores are
+                # dropped here. The live `_episodes` rows are left to the
+                # per-worker notifier, which owns their lifecycle and retires
+                # them on its own metadata-None path — touching them from the
+                # quiescence tick would change existing notifier behavior, which
+                # AC3 forbids.
+                with self._lock:
+                    self._dead_owed.pop(caller_id, None)
+                    self._quiescence_last_fired.pop(caller_id, None)
+                return
+            # The debt follows the mailbox, not the dead pane: stores are retained
+            # and the ring is addressed to the live successor terminal.
+            ring_target = successor
 
-        # D4 step 1: every member must be terminal and quiet >= grace
-        for terminal_id, generation, profile, idle_since, kind in members:
-            if kind == "live":
-                # Check status for live members
-                status = receiver_state_view.snapshot_view(
-                    "watchdog.cached_status",
-                    terminal_id,
-                    max_age_s=30.0,
-                    none_behavior="watchdog",
-                    monitor=status_monitor,
-                )
-                if status is None:
-                    return  # indeterminate — no ring
-                if status == TerminalStatus.PROCESSING:
-                    return  # busy — not quiescent
-                if status == TerminalStatus.WAITING_USER_ANSWER:
-                    return  # not terminal — no ring
-                if status in {TerminalStatus.UNKNOWN, TerminalStatus.RENDER_UNCERTAIN}:
-                    return  # indeterminate — no ring
-                # Terminal statuses: IDLE, COMPLETED, ERROR
-                if idle_since is None:
+        # AC6/D4: a settlement discovered by the probe shrinks the set, and the
+        # shrunken set is re-evaluated in the SAME tick (loop until stable or ring).
+        remaining = list(members)
+        while True:
+            # D4 step 1: every member must be terminal (D2) and quiet >= grace.
+            # The status resolved here is carried forward to the message build
+            # (N7) — re-sampling it after the predicate passed could report a
+            # different status than the one the predicate accepted.
+            classified: list[tuple[str, int, str, float | None, str, str]] = []
+            for terminal_id, generation, profile, quiet_since, kind in remaining:
+                if kind == "live":
+                    status = receiver_state_view.snapshot_view(
+                        "watchdog.cached_status",
+                        terminal_id,
+                        max_age_s=30.0,
+                        none_behavior="watchdog",
+                        monitor=status_monitor,
+                    )
+                    if status is None:
+                        return  # indeterminate — no ring
+                    if status == TerminalStatus.PROCESSING:
+                        return  # busy — not quiescent
+                    if status == TerminalStatus.WAITING_USER_ANSWER:
+                        return  # not terminal — no ring
+                    # D2: IDLE, COMPLETED and ERROR are the terminal statuses;
+                    # everything else (UNKNOWN, RENDER_UNCERTAIN, anything the
+                    # enum grows later) is indeterminate — fail toward silence.
+                    last_status = _QUIESCENT_STATUS_LABELS.get(status)
+                    if last_status is None:
+                        return  # indeterminate — no ring
+                else:
+                    last_status = "dead"  # quiet clock runs from retired_at
+                if quiet_since is None:
                     return  # no quiet clock
-                quiet_age = now - idle_since
-                if quiet_age < grace:
+                if now - quiet_since < grace:
                     return  # inside grace
-            else:
-                # Dead member: quiet = now - retired_at
-                if idle_since is None:
-                    return
-                quiet_age = now - idle_since
-                if quiet_age < grace:
-                    return
+                classified.append(
+                    (terminal_id, generation, profile, quiet_since, kind, last_status)
+                )
 
-        # D4 step 2: no member has an undelivered queued callback
-        for terminal_id, generation, profile, idle_since, kind in members:
-            if kind == "dead":
-                continue  # dead members have no pending rows by definition
-            # Find episode_started_wall_at for this member
-            with self._lock:
-                ep = self._episodes.get(terminal_id)
-                if ep is None:
-                    continue
-                episode_started_wall_at = ep.episode_started_wall_at
-            cb_status = get_callback_status_since(
-                terminal_id, caller_id, episode_started_wall_at
-            )
-            if cb_status in {MessageStatus.PENDING, MessageStatus.HELD, MessageStatus.DELIVERING}:
-                return  # queued callback exists — suppress
-            if cb_status in {MessageStatus.DELIVERED, MessageStatus.DIGESTED}:
-                # Settlement: mark callback_seen, shrink set
+            # D4 step 2: no member has an undelivered queued callback
+            settled: set[str] = set()
+            for terminal_id, generation, profile, quiet_since, kind, last_status in classified:
+                if kind == "dead":
+                    continue  # dead members have no pending rows by definition
                 with self._lock:
                     ep = self._episodes.get(terminal_id)
-                    if ep is not None:
-                        ep.callback_seen = True
+                    if ep is None:
+                        continue
+                    episode_started_wall_at = ep.episode_started_wall_at
+                cb_status = get_callback_status_since(
+                    terminal_id, caller_id, episode_started_wall_at
+                )
+                if cb_status in {
+                    MessageStatus.PENDING,
+                    MessageStatus.HELD,
+                    MessageStatus.DELIVERING,
+                }:
+                    return  # queued callback exists — suppress the whole set
+                if cb_status in {MessageStatus.DELIVERED, MessageStatus.DIGESTED}:
+                    # Settlement: mark callback_seen, shrink set
+                    with self._lock:
+                        ep = self._episodes.get(terminal_id)
+                        if ep is not None:
+                            ep.callback_seen = True
                         self._quiescence_last_fired.pop(caller_id, None)
-                return  # set changed — re-evaluate next tick
+                    settled.add(terminal_id)
+
+            if settled:
+                remaining = [m for m in remaining if m[0] not in settled]
+                # The settlement above cleared the dedup key, so the re-evaluated
+                # (smaller) set is compared against an empty key.
+                last_fired_key = None
+                if not remaining:
+                    return  # D4: empty set never rings
+                continue
+            break
 
         # D5 step 3: dedup key check
         current_key = tuple(sorted(
-            (tid, gen) for tid, gen, _, _, _ in members
+            (tid, gen) for tid, gen, _, _, _, _ in classified
         ))
         if current_key == last_fired_key:
             return  # unchanged key — at-most-once
 
         # All predicates pass — RING (D6)
-        # Build aggregated message
+        # Build aggregated message from the predicate-time observations
         lines = []
-        for terminal_id, generation, profile, idle_since, kind in sorted(members, key=lambda m: m[0]):
-            if kind == "dead":
-                last_status = "dead"
-            else:
-                status = receiver_state_view.snapshot_view(
-                    "watchdog.cached_status",
-                    terminal_id,
-                    max_age_s=30.0,
-                    none_behavior="watchdog",
-                    monitor=status_monitor,
-                )
-                if status == TerminalStatus.IDLE:
-                    last_status = "idle"
-                elif status == TerminalStatus.COMPLETED:
-                    last_status = "completed"
-                elif status == TerminalStatus.ERROR:
-                    last_status = "error"
-                else:
-                    last_status = "idle"
-            quiet_s = int(now - idle_since) if idle_since is not None else 0
+        for terminal_id, generation, profile, quiet_since, kind, last_status in sorted(
+            classified, key=lambda m: m[0]
+        ):
+            quiet_s = int(now - quiet_since) if quiet_since is not None else 0
             lines.append(
                 f"  - {profile}-{terminal_id} last={last_status} quiet={quiet_s}s gen={generation}"
             )
 
-        n = len(members)
+        n = len(classified)
         message = (
             f"[quiescence watchdog] All {n} lane(s) you assigned have gone quiet "
             f"without a delivered callback:\n"
@@ -1380,7 +1498,7 @@ class StalledCallbackWatchdog:
         try:
             from cli_agent_orchestrator.services.mailbox_service import create_routed_inbox_message
             create_routed_inbox_message(
-                f"watchdog:quiescence:{caller_id}", caller_id, message
+                f"watchdog:quiescence:{caller_id}", ring_target, message
             )
         except Exception:
             # D5 ordering: key NOT set on persist failure — next tick retries
@@ -1396,11 +1514,11 @@ class StalledCallbackWatchdog:
         # Request delivery (F136-D17: never synchronous on loop)
         try:
             from cli_agent_orchestrator.services.inbox_service import request_delivery
-            request_delivery(caller_id)
+            request_delivery(ring_target)
         except Exception:
             logger.warning(
                 "Failed to request delivery for quiescence ring to %s",
-                caller_id,
+                ring_target,
                 exc_info=True,
             )
 
