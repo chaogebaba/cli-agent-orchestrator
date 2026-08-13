@@ -466,3 +466,61 @@ def test_p10_corpus_invocation_and_exact_four_line_summary(
 def test_p10_corpus_usage_contract(args: list[str]) -> None:
     result = CliRunner().invoke(cli, args)
     assert result.exit_code == 2
+
+
+
+def test_p10_corpus_prefers_orchestrator_blueprints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """New layout: orchestrator/blueprints/ is preferred over root blueprints/."""
+    from cli_agent_orchestrator.services.fold_service import _p10_corpus_paths
+
+    orch_bp = tmp_path / "orchestrator" / "blueprints"
+    orch_bp.mkdir(parents=True)
+    (orch_bp / "new-layout.md").write_text(_document(), encoding="utf-8")
+    (tmp_path / "orchestrator" / "GOLDEN-TIPS.md").write_text("# Tips\n", encoding="utf-8")
+    # Also create a legacy blueprints/ to confirm it's NOT used
+    legacy_bp = tmp_path / "blueprints"
+    legacy_bp.mkdir()
+    (legacy_bp / "legacy.md").write_text(_document(), encoding="utf-8")
+
+    paths = _p10_corpus_paths(tmp_path)
+    path_strs = [str(p) for p in paths]
+    # orchestrator/blueprints wins — new-layout.md present, legacy.md absent
+    assert any("new-layout.md" in s for s in path_strs)
+    assert not any("legacy.md" in s for s in path_strs)
+
+
+def test_p10_corpus_falls_back_to_legacy_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Legacy layout still works when no orchestrator/ dir exists."""
+    (tmp_path / "blueprints").mkdir()
+    (tmp_path / "blueprints" / "eligible.md").write_text(_document(), encoding="utf-8")
+    (tmp_path / "GOLDEN-TIPS.md").write_text("# Tips\n", encoding="utf-8")
+
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(cli, ["fold", "--check", "--corpus"])
+    assert result.exit_code == 0, result.output
+    assert "P10 POPULATION: 1" in result.output
+
+
+def test_p10_corpus_prefers_orchestrator_golden_tips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """orchestrator/GOLDEN-TIPS.md is preferred over root GOLDEN-TIPS.md."""
+    from cli_agent_orchestrator.services.fold_service import _p10_corpus_paths
+
+    (tmp_path / "blueprints").mkdir()
+    (tmp_path / "blueprints" / "doc.md").write_text(_document(), encoding="utf-8")
+    # Both GOLDEN-TIPS exist
+    (tmp_path / "GOLDEN-TIPS.md").write_text("# Legacy tips\n", encoding="utf-8")
+    orch = tmp_path / "orchestrator"
+    orch.mkdir()
+    (orch / "GOLDEN-TIPS.md").write_text("# New tips\n", encoding="utf-8")
+
+    paths = _p10_corpus_paths(tmp_path)
+    path_strs = [str(p) for p in paths]
+    # orchestrator/GOLDEN-TIPS.md chosen, NOT root GOLDEN-TIPS.md
+    assert any("orchestrator/GOLDEN-TIPS.md" in s for s in path_strs)
+    assert not any(s.endswith("/GOLDEN-TIPS.md") and "orchestrator" not in s for s in path_strs)

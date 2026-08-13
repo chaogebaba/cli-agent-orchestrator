@@ -16,9 +16,14 @@ def ledger() -> None:
 @ledger.command("check")
 def check() -> None:
     """Warn about stale re-entry text and count pending ledger rows."""
-    path = find_workspace_file(Path.cwd(), "HANDOFF.md")
+    path = find_workspace_file(Path.cwd(), "orchestrator/HANDOFF.md")
     if path is None:
-        raise click.ClickException("HANDOFF.md not found in cwd or any parent")
+        path = find_workspace_file(Path.cwd(), "HANDOFF.md")
+    if path is None:
+        raise click.ClickException(
+            "HANDOFF.md not found in cwd or any parent "
+            "(checked orchestrator/HANDOFF.md and HANDOFF.md)"
+        )
     text = path.read_text(encoding="utf-8")
     match = re.search(r"^## POST-RESTART RE-ENTRY.*?(?=^## )", text, re.M | re.S)
     header = match.group(0) if match else ""

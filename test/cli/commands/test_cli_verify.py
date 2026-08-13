@@ -490,3 +490,51 @@ def test_ledger_check_missing_file(tmp_path, monkeypatch):
     result = CliRunner().invoke(cli, ["ledger", "check"])
     assert result.exit_code != 0
     assert "HANDOFF.md not found" in result.output
+    assert "orchestrator/HANDOFF.md" in result.output
+
+
+
+def test_ledger_check_finds_orchestrator_layout(tmp_path, monkeypatch):
+    """New layout: orchestrator/HANDOFF.md is preferred over root HANDOFF.md."""
+    orch = tmp_path / "orchestrator"
+    orch.mkdir()
+    handoff = orch / "HANDOFF.md"
+    handoff.write_text(
+        "## POST-RESTART RE-ENTRY\nFeature Gamma needs work\n\n"
+        "## Live ledger\n"
+        "| feature | assertion | commit | probe | status | notes |\n"
+        "|---|---|---|---|---|---|\n"
+        "| Feature Gamma | x | c | p | pending | n |\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(cli, ["ledger", "check"])
+    assert result.exit_code == 0
+    assert "pending-row count: 1" in result.output
+
+
+def test_ledger_check_prefers_orchestrator_over_legacy(tmp_path, monkeypatch):
+    """When both exist, orchestrator/HANDOFF.md wins."""
+    # Legacy at root
+    (tmp_path / "HANDOFF.md").write_text(
+        "## POST-RESTART RE-ENTRY\n\n"
+        "## Live ledger\n"
+        "| feature | assertion | commit | probe | status | notes |\n"
+        "|---|---|---|---|---|---|\n"
+        "| Legacy | x | c | p | pending | n |\n"
+        "| Legacy2 | x | c | p | pending | n |\n"
+    )
+    # New layout
+    orch = tmp_path / "orchestrator"
+    orch.mkdir()
+    (orch / "HANDOFF.md").write_text(
+        "## POST-RESTART RE-ENTRY\n\n"
+        "## Live ledger\n"
+        "| feature | assertion | commit | probe | status | notes |\n"
+        "|---|---|---|---|---|---|\n"
+        "| NewLayout | x | c | p | pending | n |\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(cli, ["ledger", "check"])
+    assert result.exit_code == 0
+    # Should read from orchestrator/ (1 pending), not legacy (2 pending)
+    assert "pending-row count: 1" in result.output

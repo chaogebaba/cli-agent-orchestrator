@@ -445,7 +445,8 @@ def check_corpus(root: Path, repos: Sequence[RepoMapping] = ()) -> FoldCorpusRes
     paths = _p10_corpus_paths(root)
     if not paths:
         raise FoldUsageError(
-            f"{root}: corpus is empty; expected blueprints/, doctrine/, and GOLDEN-TIPS.md"
+            f"{root}: corpus is empty; expected orchestrator/blueprints/ (or blueprints/), "
+            "doctrine/, and orchestrator/GOLDEN-TIPS.md (or GOLDEN-TIPS.md)"
         )
     violations: list[str] = []
     p9_reports: list[P9Report] = []
@@ -462,9 +463,15 @@ def check_corpus(root: Path, repos: Sequence[RepoMapping] = ()) -> FoldCorpusRes
 
 
 def _p10_corpus_paths(root: Path) -> tuple[Path, ...]:
-    candidates = list((root / "blueprints").glob("*.md"))
+    # Prefer orchestrator/ sub-layout, fall back to legacy root locations.
+    bp_dir = root / "orchestrator" / "blueprints"
+    if not bp_dir.is_dir():
+        bp_dir = root / "blueprints"
+    candidates = list(bp_dir.glob("*.md")) if bp_dir.is_dir() else []
     candidates.extend((root / "doctrine").rglob("*.md"))
-    tips = root / "GOLDEN-TIPS.md"
+    tips = root / "orchestrator" / "GOLDEN-TIPS.md"
+    if not tips.is_file():
+        tips = root / "GOLDEN-TIPS.md"
     if tips.is_file():
         candidates.append(tips)
     return tuple(sorted({path.resolve() for path in candidates}, key=lambda path: str(path)))
