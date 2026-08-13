@@ -97,6 +97,8 @@ def write_supervisor_callback_notification(
     deadline, reads/validates JSON, deduplicates by deterministic msg_id, and
     performs atomic durable write.
     """
+    # F178-S1: resolve symlinks so os.replace targets the real file, not the link.
+    inbox_path = inbox_path.resolve()
     msg_id = callback_notification_id(mailbox_id, message.id)
 
     # Shape immutable entry content
@@ -409,6 +411,8 @@ def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> bool:
     F175: deduplicates by msg_id — if an entry with the same msg_id already
     exists in the file, returns True (idempotent success) without appending.
     """
+    # F178-S1: resolve symlinks so os.replace targets the real file, not the link.
+    inbox_path = inbox_path.resolve()
     lock_path = Path(str(inbox_path) + ".lock")
     try:
         inbox_path.parent.mkdir(parents=True, exist_ok=True)
@@ -564,6 +568,9 @@ def mark_cc_inbox_entries_read(
     """
     if not acked_row_ids:
         return 0
+
+    # F178-S1: resolve symlinks so os.replace targets the real file, not the link.
+    inbox_path = inbox_path.resolve()
 
     # Build set of msg_ids to mark read
     target_msg_ids = {

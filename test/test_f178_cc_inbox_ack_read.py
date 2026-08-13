@@ -360,3 +360,74 @@ def test_msg_id_correlation_correct(tmp_path: Path) -> None:
     assert marked == 1
     result = _read_entries(inbox_path)
     assert result[0]["read"] is True
+
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Symlinked inbox path — resolve preserves symlink + targets real file
+# ---------------------------------------------------------------------------
+
+
+def test_symlinked_inbox_path_resolves(tmp_path: Path) -> None:
+    """When inbox_path is a symlink, mark_cc_inbox_entries_read should:
+    1. Resolve the symlink before operating
+    2. After marking, the path is STILL a symlink
+    3. The TARGET file carries the read flags
+    """
+    # Create the real file in a subdirectory
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    real_file = real_dir / "team-lead.json"
+    entry = _make_cao_entry(MAILBOX_ID, 500)
+    _write_entries(real_file, [entry])
+
+    # Create a symlink pointing to the real file
+    link_path = tmp_path / "link" / "team-lead.json"
+    link_path.parent.mkdir()
+    link_path.symlink_to(real_file)
+
+    assert link_path.is_symlink()
+
+    # Call mark_cc_inbox_entries_read with the SYMLINK path
+    marked = mark_cc_inbox_entries_read(
+        inbox_path=link_path,
+        mailbox_id=MAILBOX_ID,
+        acked_row_ids=[500],
+    )
+
+    assert marked == 1
+    # The symlink is STILL a symlink (not replaced by a regular file)
+    assert link_path.is_symlink()
+    # The TARGET file carries the read flag
+    target_entries = _read_entries(real_file)
+    assert target_entries[0]["read"] is True
+    # Reading through the symlink also shows read=True
+    link_entries = _read_entries(link_path)
+    assert link_entries[0]["read"] is True
+
+
+def test_symlinked_inbox_write_entry_resolves(tmp_path: Path) -> None:
+    """_write_inbox_entry with a symlinked path should preserve the symlink."""
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    real_file = real_dir / "team-lead.json"
+    _write_entries(real_file, [])
+
+    link_path = tmp_path / "link" / "team-lead.json"
+    link_path.parent.mkdir()
+    link_path.symlink_to(real_file)
+
+    assert link_path.is_symlink()
+
+    from cli_agent_orchestrator.services.teammate_push_service import _build_entry
+
+    entry = _build_entry("worker-sym", "symlink test", 1, mailbox_id=MAILBOX_ID, first_row_id=600)
+    success = _write_inbox_entry(link_path, entry)
+
+    assert success is True
+    # Symlink preserved
+    assert link_path.is_symlink()
+    # Real file has the entry
+    target_entries = _read_entries(real_file)
+    assert len(target_entries) == 1
+    assert target_entries[0]["from"] == _TEAMMATE_FROM
