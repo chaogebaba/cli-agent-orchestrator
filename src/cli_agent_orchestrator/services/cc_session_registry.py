@@ -102,30 +102,42 @@ def _parse_registry_timestamp(value) -> str:
     Claude Code writes updatedAt/statusUpdatedAt as either:
       - ISO8601 string (e.g. "2026-08-13T12:00:00+00:00")
       - Epoch-milliseconds integer (e.g. 1786649639899)
-      - Epoch-milliseconds as numeric string (e.g. "1786649639899")
+      - Epoch-seconds integer (e.g. 1786649639)
+      - Numeric string variants of the above
+
+    Threshold heuristic: numeric values >= 1e12 (1_000_000_000_000) are treated
+    as epoch-milliseconds; values < 1e12 are treated as epoch-seconds. This
+    threshold corresponds to 2001-09-09T01:46:40Z in epoch-ms (well before any
+    plausible CC session) and 33658-09-27 in epoch-seconds (well beyond any
+    plausible session), so there is no ambiguity for real-world timestamps.
 
     Returns an ISO8601 string suitable for datetime.fromisoformat().
     Returns "" on unparseable input (fail-closed: empty → treated as stale).
     """
     from datetime import datetime, timezone
 
-    if isinstance(value, str):
-        # Try numeric string first (epoch-ms)
-        stripped = value.strip()
-        if stripped.isdigit() and len(stripped) >= 10:
-            try:
-                epoch_s = int(stripped) / 1000.0
-                return datetime.fromtimestamp(epoch_s, tz=timezone.utc).isoformat()
-            except (ValueError, OSError, OverflowError):
-                pass
-        # Otherwise treat as ISO8601 — return as-is (validated downstream)
-        return value if value else ""
-    elif isinstance(value, (int, float)):
+    def _numeric_to_iso(num: float) -> str:
+        """Convert a numeric timestamp to ISO8601 using the 1e12 threshold."""
         try:
-            epoch_s = value / 1000.0
+            if num >= 1e12:
+                # Epoch-milliseconds
+                epoch_s = num / 1000.0
+            else:
+                # Epoch-seconds
+                epoch_s = num
             return datetime.fromtimestamp(epoch_s, tz=timezone.utc).isoformat()
         except (ValueError, OSError, OverflowError):
             return ""
+
+    if isinstance(value, str):
+        # Try numeric string first
+        stripped = value.strip()
+        if stripped.isdigit() and len(stripped) >= 10:
+            return _numeric_to_iso(int(stripped)) or ""
+        # Otherwise treat as ISO8601 — return as-is (validated downstream)
+        return value if value else ""
+    elif isinstance(value, (int, float)):
+        return _numeric_to_iso(value) or ""
     return ""
 
 

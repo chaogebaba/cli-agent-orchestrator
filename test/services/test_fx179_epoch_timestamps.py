@@ -134,6 +134,61 @@ class TestParseRegistryTimestamp:
         # Returned as-is since < 10 digits
         assert result == "12345"
 
+    def test_epoch_seconds_int_10_digits(self):
+        """10-digit int (epoch-seconds) is correctly interpreted, not as epoch-ms.
+
+        S1 fold: values < 1e12 are epoch-seconds, >= 1e12 are epoch-ms.
+        1786622400 = 2026-08-13T12:00:00Z in epoch-seconds.
+        Without the heuristic, dividing by 1000 gives 1970-01-21 → always stale.
+        """
+        from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+        result = _parse_registry_timestamp(1786622400)
+        dt = datetime.fromisoformat(result)
+        assert dt.year == 2026
+        assert dt.month == 8
+        assert dt.day == 13
+
+    def test_epoch_seconds_numeric_string_10_digits(self):
+        """10-digit numeric string (epoch-seconds) is correctly interpreted."""
+        from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+        result = _parse_registry_timestamp("1786622400")
+        dt = datetime.fromisoformat(result)
+        assert dt.year == 2026
+        assert dt.month == 8
+
+    def test_epoch_ms_13_digits_still_correct(self):
+        """13-digit epoch-ms (>= 1e12) still handled as milliseconds."""
+        from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+        # 1786622400000 ms = 2026-08-13T12:00:00Z
+        result = _parse_registry_timestamp(1786622400000)
+        dt = datetime.fromisoformat(result)
+        assert dt.year == 2026
+        assert dt.month == 8
+        assert dt.day == 13
+
+    def test_epoch_ms_13_digit_numeric_string_still_correct(self):
+        """13-digit numeric string epoch-ms still handled as milliseconds."""
+        from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+        result = _parse_registry_timestamp("1786622400000")
+        dt = datetime.fromisoformat(result)
+        assert dt.year == 2026
+
+    def test_threshold_boundary_below(self):
+        """Value just below 1e12 is treated as epoch-seconds."""
+        from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+        # 1_786_622_400 seconds = 2026-08-13T12:00:00Z (10-digit, < 1e12)
+        result = _parse_registry_timestamp(1_786_622_400)
+        dt = datetime.fromisoformat(result)
+        assert dt.year == 2026
+
+    def test_threshold_boundary_at(self):
+        """Value exactly at 1e12 is treated as epoch-milliseconds."""
+        from cli_agent_orchestrator.services.cc_session_registry import _parse_registry_timestamp
+        # 1_000_000_000_000 ms = 2001-09-09T01:46:40Z
+        result = _parse_registry_timestamp(1_000_000_000_000)
+        dt = datetime.fromisoformat(result)
+        assert dt.year == 2001
+
 
 # ===========================================================================
 # Test: read_registry coerces epoch-ms at parse time
