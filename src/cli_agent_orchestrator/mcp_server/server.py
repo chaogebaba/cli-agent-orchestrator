@@ -1164,21 +1164,22 @@ async def _handoff_impl(
             # N-second timeout. The structured `kind` is authoritative; the
             # status code is only the fallback when an older server omits it
             # (504 -> timeout, 502 -> error).
+            _dn = display_name(tid, agent_profile) if tid else "unknown"
             if kind == "input_blocked":
                 msg = (
-                    f"Handoff blocked: terminal {tid or 'unknown'} is waiting on a dialog "
+                    f"Handoff blocked: {_dn} is waiting on a dialog "
                     f"({structured_detail})"
                 )
             elif kind == "waiting_user_input":
                 msg = (
                     f"Handoff blocked: worker is waiting for user input "
-                    f"(terminal {tid or 'unknown'}; {structured_detail})"
+                    f"({_dn}; {structured_detail})"
                 )
             elif kind == "error" or (kind is None and response.status_code == 502):
                 msg = f"Handoff failed: worker errored ({structured_detail})"
             elif kind == "timeout" or (kind is None and response.status_code == 504):
                 msg = (
-                    f"Handoff timed out after {timeout} seconds; terminal {tid or 'unknown'} "
+                    f"Handoff timed out after {timeout} seconds; {_dn} "
                     "remains live and must be deleted"
                 )
             else:
@@ -1206,6 +1207,7 @@ async def _handoff_impl(
             + _get_cleanup_nudge(),
             output=output,
             terminal_id=terminal_id,
+            display_name=dn,
             window_name=data.get("window_name"),
         )
 

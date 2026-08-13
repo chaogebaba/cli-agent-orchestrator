@@ -193,3 +193,128 @@ class TestSendMessageInjection:
         # Check the message passed to _send_to_inbox
         sent_message = mock_send.call_args[0][1]
         assert "[Message from kiro_dev-a1b2c3d4 (a1b2c3d4)." in sent_message
+
+
+
+# ─── S1: Handoff error messages use display_name ─────────────────────────────
+
+
+class TestHandoffErrorDisplayName:
+    """S1: handoff error messages show display_name instead of bare tid."""
+
+    def _make_error_response(self, status_code, body):
+        mock_resp = MagicMock()
+        mock_resp.status_code = status_code
+        mock_resp.raise_for_status.side_effect = Exception("error")
+        mock_resp.json.return_value = body
+        return mock_resp
+
+    @patch(f"{_SERVER}._get_cleanup_nudge", return_value="")
+    @patch(f"{_SERVER}.strict_supervisor_cwd", return_value="/repo")
+    def test_input_blocked_uses_display_name(self, _cwd, _nudge, monkeypatch):
+        from cli_agent_orchestrator.mcp_server.server import _handoff_impl
+
+        monkeypatch.setenv("CAO_TERMINAL_ID", "00000000")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 409
+        mock_resp.json.return_value = {
+            "detail": {
+                "kind": "input_blocked",
+                "message": "approval pending",
+                "terminal_id": "a1b2c3d4",
+            }
+        }
+        mock_resp.raise_for_status.side_effect = Exception("conflict")
+        with patch(f"{_SERVER}.cao_http") as mock_http:
+            mock_http.post.return_value = mock_resp
+            result = asyncio.run(_handoff_impl("developer", "task", timeout=60))
+        assert "developer-a1b2c3d4" in result.message
+        assert "terminal a1b2c3d4" not in result.message
+
+    @patch(f"{_SERVER}._get_cleanup_nudge", return_value="")
+    @patch(f"{_SERVER}.strict_supervisor_cwd", return_value="/repo")
+    def test_timeout_uses_display_name(self, _cwd, _nudge, monkeypatch):
+        from cli_agent_orchestrator.mcp_server.server import _handoff_impl
+
+        monkeypatch.setenv("CAO_TERMINAL_ID", "00000000")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 504
+        mock_resp.json.return_value = {
+            "detail": {
+                "kind": "timeout",
+                "message": "exceeded",
+                "terminal_id": "b2c3d4e5",
+            }
+        }
+        mock_resp.raise_for_status.side_effect = Exception("timeout")
+        with patch(f"{_SERVER}.cao_http") as mock_http:
+            mock_http.post.return_value = mock_resp
+            result = asyncio.run(_handoff_impl("kiro_dev", "task", timeout=300))
+        assert "kiro_dev-b2c3d4e5" in result.message
+        assert "terminal b2c3d4e5" not in result.message
+
+    @patch(f"{_SERVER}._get_cleanup_nudge", return_value="")
+    @patch(f"{_SERVER}.strict_supervisor_cwd", return_value="/repo")
+    def test_waiting_user_input_uses_display_name(self, _cwd, _nudge, monkeypatch):
+        from cli_agent_orchestrator.mcp_server.server import _handoff_impl
+
+        monkeypatch.setenv("CAO_TERMINAL_ID", "00000000")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 409
+        mock_resp.json.return_value = {
+            "detail": {
+                "kind": "waiting_user_input",
+                "message": "needs approval",
+                "terminal_id": "c3d4e5f6",
+            }
+        }
+        mock_resp.raise_for_status.side_effect = Exception("conflict")
+        with patch(f"{_SERVER}.cao_http") as mock_http:
+            mock_http.post.return_value = mock_resp
+            result = asyncio.run(_handoff_impl("reviewer", "task", timeout=60))
+        assert "reviewer-c3d4e5f6" in result.message
+        assert "terminal c3d4e5f6" not in result.message
+
+
+# ─── S2: HandoffResult has display_name field ────────────────────────────────
+
+
+class TestHandoffResultDisplayName:
+    """S2: HandoffResult model exposes display_name field."""
+
+    def test_model_has_display_name_field(self):
+        from cli_agent_orchestrator.mcp_server.models import HandoffResult
+
+        result = HandoffResult(
+            success=True,
+            message="ok",
+            terminal_id="a1b2c3d4",
+            display_name="developer-a1b2c3d4",
+        )
+        assert result.display_name == "developer-a1b2c3d4"
+
+    def test_model_display_name_optional_default_none(self):
+        from cli_agent_orchestrator.mcp_server.models import HandoffResult
+
+        result = HandoffResult(success=False, message="failed")
+        assert result.display_name is None
+
+    @patch(f"{_SERVER}._get_cleanup_nudge", return_value="")
+    @patch(f"{_SERVER}.strict_supervisor_cwd", return_value="/repo")
+    def test_success_handoff_populates_display_name(self, _cwd, _nudge, monkeypatch):
+        from cli_agent_orchestrator.mcp_server.server import _handoff_impl
+
+        monkeypatch.setenv("CAO_TERMINAL_ID", "00000000")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "terminal_id": "a1b2c3d4",
+            "last_message": "done",
+            "window_name": "w1",
+        }
+        mock_resp.raise_for_status = MagicMock()
+        with patch(f"{_SERVER}.cao_http") as mock_http:
+            mock_http.post.return_value = mock_resp
+            result = asyncio.run(_handoff_impl("kiro_dev", "task", timeout=60))
+        assert result.success is True
+        assert result.display_name == "kiro_dev-a1b2c3d4"
