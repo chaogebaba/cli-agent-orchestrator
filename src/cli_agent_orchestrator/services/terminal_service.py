@@ -3336,10 +3336,17 @@ async def _provider_child_alive(terminal_id: str, provider) -> bool | None:
     return False
 
 
+# F163-a: module-level constants for _confirm_launch_health retry loop.
+# Tests override these to avoid burning ~5s per deadline test.
+CONFIRM_LAUNCH_HEALTH_POLL_INTERVAL = 0.5  # seconds between probes
+CONFIRM_LAUNCH_HEALTH_DEADLINE = 5.0  # total wall-clock budget for retry loop
+
+
 async def _confirm_launch_health(terminal_id: str, provider) -> None:
     """F124 S6 + F163-a: confirm provider is alive after initialize(); raise on confirmed death.
 
-    Polls _provider_child_alive every ~0.5s for up to ~5s total to tolerate
+    Polls _provider_child_alive every ~CONFIRM_LAUNCH_HEALTH_POLL_INTERVAL s
+    for up to ~CONFIRM_LAUNCH_HEALTH_DEADLINE s total to tolerate
     slow shell forks (e.g. large command lines in zsh). Returns immediately
     on True or None (inconclusive stays non-fatal). Raises ProviderLaunchFailed
     only if the final probe at deadline still returns False.
@@ -3350,12 +3357,9 @@ async def _confirm_launch_health(terminal_id: str, provider) -> None:
     if grace:
         await _asyncio.sleep(grace)
 
-    _POLL_INTERVAL = 0.5  # seconds between probes
-    _DEADLINE = 5.0  # total wall-clock budget for retry loop
-
     import time as _time
 
-    deadline = _time.monotonic() + _DEADLINE
+    deadline = _time.monotonic() + CONFIRM_LAUNCH_HEALTH_DEADLINE
 
     while True:
         alive = await _provider_child_alive(terminal_id, provider)
@@ -3368,7 +3372,7 @@ async def _confirm_launch_health(terminal_id: str, provider) -> None:
         if remaining <= 0:
             break
 
-        await _asyncio.sleep(min(_POLL_INTERVAL, remaining))
+        await _asyncio.sleep(min(CONFIRM_LAUNCH_HEALTH_POLL_INTERVAL, remaining))
 
     # Final probe returned False and deadline exhausted
     raise ProviderLaunchFailed(f"provider process tree is empty/dead for terminal {terminal_id}")

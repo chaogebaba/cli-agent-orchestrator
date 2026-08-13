@@ -503,15 +503,20 @@ class TestConfirmLaunchHealth:
             _confirm_launch_health,
         )
 
+        # F163-a: shrink deadline so this test doesn't burn 5s
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.CONFIRM_LAUNCH_HEALTH_DEADLINE",
+            0.2,
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.CONFIRM_LAUNCH_HEALTH_POLL_INTERVAL",
+            0.05,
+        )
+
         # Mock _provider_child_alive to always return False (avoids 5s real wait)
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.terminal_service._provider_child_alive",
             AsyncMock(return_value=False),
-        )
-        # Shrink deadline for fast test
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.terminal_service._confirm_launch_health.__code__",
-            _confirm_launch_health.__code__,
         )
 
         provider = MagicMock()
@@ -582,6 +587,16 @@ class TestConfirmLaunchHealthF163aRetry:
         from cli_agent_orchestrator.services.terminal_service import (
             ProviderLaunchFailed,
             _confirm_launch_health,
+        )
+
+        # F163-a: shrink deadline so this test doesn't burn 5s
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.CONFIRM_LAUNCH_HEALTH_DEADLINE",
+            0.2,
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.CONFIRM_LAUNCH_HEALTH_POLL_INTERVAL",
+            0.05,
         )
 
         monkeypatch.setattr(

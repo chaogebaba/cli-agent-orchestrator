@@ -3158,6 +3158,8 @@ class InboxService:
                     continue
 
                 # D3 condition 4: pending rows older than grace, above consumed_through_id
+                # F165-a: copy all needed scalars INSIDE the session to avoid
+                # DetachedInstanceError on deferred columns (logical_receiver_id).
                 with _SL() as db:
                     pending_rows = (
                         db.query(_InboxModel)
@@ -3171,23 +3173,39 @@ class InboxService:
                         .limit(100)
                         .all()
                     )
+                    # Materialise scalars while session is open (deferred cols
+                    # like logical_receiver_id trigger DetachedInstanceError
+                    # after session close).
+                    pending_scalars = [
+                        {
+                            "id": row.id,
+                            "sender_id": row.sender_id,
+                            "receiver_id": row.receiver_id,
+                            "message": row.message,
+                            "orchestration_type": row.orchestration_type,
+                            "status": row.status,
+                            "created_at": row.created_at,
+                            "logical_receiver_id": getattr(row, "logical_receiver_id", None),
+                        }
+                        for row in pending_rows
+                    ]
 
-                if not pending_rows:
+                if not pending_scalars:
                     continue
 
                 # Convert to InboxMessage for the push function
                 messages = [
                     InboxMessage(
-                        id=row.id,
-                        sender_id=row.sender_id,
-                        receiver_id=row.receiver_id,
-                        message=row.message,
-                        orchestration_type=OrchestrationType(row.orchestration_type),
-                        status=MessageStatus(row.status),
-                        created_at=row.created_at,
-                        logical_receiver_id=getattr(row, "logical_receiver_id", None),
+                        id=s["id"],
+                        sender_id=s["sender_id"],
+                        receiver_id=s["receiver_id"],
+                        message=s["message"],
+                        orchestration_type=OrchestrationType(s["orchestration_type"]),
+                        status=MessageStatus(s["status"]),
+                        created_at=s["created_at"],
+                        logical_receiver_id=s["logical_receiver_id"],
                     )
-                    for row in pending_rows
+                    for s in pending_scalars
                 ]
 
                 # D4: call the reported form directly
