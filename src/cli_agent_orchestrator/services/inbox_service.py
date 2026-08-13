@@ -3375,8 +3375,52 @@ class InboxService:
                     logger.debug(f"fx158 instrumentation write failed for {mb.id}: {e}")
 
             except Exception as e:
-                # D9: per-mailbox failure isolation
-                logger.exception(f"fx158 reconcile_pull_mode_notifications failed for mailbox {mb.id}: {e}")
+                # D9: per-mailbox failure isolation.
+                # F165-F1: distinguish transient errors (network/DB) from
+                # programming errors (ORM detachment, type errors) that indicate
+                # broken code and would silently kill every tick forever.
+                _D9_TRANSIENT_TYPES = (OSError, OperationalError, TimeoutError)
+                if isinstance(e, _D9_TRANSIENT_TYPES):
+                    logger.warning(
+                        "fx158_reconciler_transient mailbox=%s: %s", mb.id, e,
+                    )
+                else:
+                    # Programming error — surface loudly so it is not invisible.
+                    logger.error(
+                        "fx158_reconciler_programming_error mailbox=%s: %s",
+                        mb.id, e, exc_info=True,
+                    )
+                    # Record a durable marker so the failure is observable in
+                    # delivery_attempts even if logs rotate.
+                    try:
+                        import uuid as _uuid
+
+                        from cli_agent_orchestrator.clients.database import (
+                            InboxDeliveryAttemptModel as _AttemptModel,
+                        )
+                        from cli_agent_orchestrator.clients.database import (
+                            SessionLocal as _ErrSL,
+                        )
+
+                        _now = datetime.now(timezone.utc)
+                        _err_row = _AttemptModel(
+                            attempt_uuid=str(_uuid.uuid4()),
+                            receiver_terminal_id=mb.current_terminal_id or "unknown",
+                            provider="reconciler",
+                            started_at=_now,
+                            settled_at=_now,
+                            outcome="programming_error",
+                            reason=f"{type(e).__name__}: {e}"[:200],
+                            payload_hash="error",
+                            payload_length=0,
+                            sender_id="system",
+                            orchestration_type="reconciler_error",
+                            evidence="{}",
+                        )
+                        with _ErrSL.begin() as _err_db:
+                            _err_db.add(_err_row)
+                    except Exception:
+                        pass  # best-effort instrumentation
 
     def reconcile_pending_orphans(self) -> OrphanReconcileResult:
         """Settle one bounded batch of PENDING rows with absent receivers."""
