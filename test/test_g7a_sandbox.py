@@ -402,6 +402,71 @@ def test_foreign_tmux_socket_collision_is_neither_adopted_nor_killed(
             capture_output=True,
             text=True,
         )
+        bootstrap._unlink_dead_tmux_socket(socket_name, settle=5.0)
+
+
+def test_dead_tmux_socket_is_reaped_and_live_one_is_refused() -> None:
+    socket_name = f"cao-sbx-{uuid.uuid4().hex[:8]}"
+    socket_path = bootstrap._tmux_socket_path(socket_name)
+    assert bootstrap._unlink_dead_tmux_socket(socket_name) is False
+    subprocess.run(
+        ["tmux", "-L", socket_name, "new-session", "-d", "-s", "owner"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        assert socket_path.is_socket()
+        with pytest.raises(bootstrap.SandboxError, match="live tmux socket"):
+            bootstrap._unlink_dead_tmux_socket(socket_name)
+        assert socket_path.is_socket()
+    finally:
+        subprocess.run(
+            ["tmux", "-L", socket_name, "kill-server"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    assert socket_path.exists(), "F182: tmux leaves the socket inode behind after kill-server"
+    assert bootstrap._unlink_dead_tmux_socket(socket_name, settle=5.0) is True
+    assert not socket_path.exists()
+    assert bootstrap._unlink_dead_tmux_socket(socket_name) is False
+
+
+def test_up_reclaims_a_dead_socket_of_the_same_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance_id = uuid.uuid4().hex[:8]
+    socket_name = f"cao-sbx-{instance_id}"
+    socket_path = bootstrap._tmux_socket_path(socket_name)
+    monkeypatch.setattr(
+        bootstrap.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex=f"{instance_id}{'0' * 24}"),
+    )
+    subprocess.run(
+        ["tmux", "-L", socket_name, "new-session", "-d", "-s", "stale"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["tmux", "-L", socket_name, "kill-server"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert socket_path.exists()
+    dead_inode = socket_path.stat().st_ino
+    root = tmp_path / "reclaim"
+    try:
+        assert bootstrap.command_up(argparse.Namespace(root=str(root), port=_free_port())) == 0
+        assert socket_path.stat().st_ino != dead_inode
+        assert bootstrap._sentinel_owned(bootstrap._load_owned(root)[0])
+    finally:
+        bootstrap.command_down(argparse.Namespace(root=str(root), purge=True))
+    assert not socket_path.exists(), "F182: down must unlink the socket inode"
+    assert not root.exists()
 
 
 @pytest.mark.parametrize(

@@ -496,6 +496,40 @@ def _tmux_lifecycle(
     )
 
 
+def _tmux_socket_path(socket_name: str) -> Path:
+    """Resolve where tmux places the ``-L <name>`` socket, the way tmux resolves it."""
+    return Path(os.environ.get("TMUX_TMPDIR") or "/tmp") / f"tmux-{os.getuid()}" / socket_name
+
+
+def _tmux_server_live(socket_name: str) -> bool:
+    return _tmux_lifecycle(socket_name, "list-sessions", check=False).returncode == 0
+
+
+def _unlink_dead_tmux_socket(socket_name: str, *, settle: float = 0.0) -> bool:
+    """F182: unlink the socket inode a dead tmux server leaves behind.
+
+    A live server keeps its socket: liveness is re-probed here, so no caller can
+    unlink a socket out from under a running sandbox.
+    """
+    deadline = time.monotonic() + settle
+    while _tmux_server_live(socket_name):
+        if time.monotonic() >= deadline:
+            raise SandboxError(f"refusing to unlink a live tmux socket: {socket_name}")
+        time.sleep(0.1)
+    path = _tmux_socket_path(socket_name)
+    try:
+        info = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    if not stat.S_ISSOCK(info.st_mode):
+        raise SandboxError(f"tmux socket path is not a socket: {path}")
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def _seed_sandbox_db(manifest: dict[str, Any]) -> None:
     db_path = Path(manifest["db_path"])
     db_path.parent.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -732,15 +766,9 @@ def command_up(args: argparse.Namespace) -> int:
         _initialize_claude_native_home(manifest)
         _seed_sandbox_db(manifest)
         sentinel = f"cao-sbx-{manifest['instance_id']}-owner"
-        existing = _tmux_lifecycle(
-            str(manifest["tmux_socket"]),
-            "list-sessions",
-            "-F",
-            "#{session_name}",
-            check=False,
-        )
-        if existing.returncode == 0:
+        if _tmux_server_live(str(manifest["tmux_socket"])):
             raise SandboxError("sandbox tmux socket is already live")
+        _unlink_dead_tmux_socket(str(manifest["tmux_socket"]))
         _tmux_lifecycle(
             str(manifest["tmux_socket"]),
             "new-session",
@@ -806,6 +834,10 @@ def command_up(args: argparse.Namespace) -> int:
                 pass
         if manifest is not None and sentinel_created:
             _tmux_lifecycle(str(manifest["tmux_socket"]), "kill-server", check=False)
+            try:
+                _unlink_dead_tmux_socket(str(manifest["tmux_socket"]), settle=5.0)
+            except (SandboxError, OSError):
+                pass
         if manifest is not None:
             shutil.rmtree(manifest["root"], ignore_errors=True)
         raise
@@ -880,6 +912,7 @@ def command_down(args: argparse.Namespace) -> int:
     else:
         os.killpg(pid, signal.SIGKILL)
     _tmux_lifecycle(str(manifest["tmux_socket"]), "kill-server")
+    _unlink_dead_tmux_socket(str(manifest["tmux_socket"]), settle=5.0)
     Path(manifest["pidfile"]).unlink(missing_ok=True)
     if args.purge:
         current = validate_manifest(
