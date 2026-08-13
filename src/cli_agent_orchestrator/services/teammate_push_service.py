@@ -537,3 +537,96 @@ def attempt_teammate_push_on_insert(terminal_id: str, messages: List[InboxMessag
     # D1: No other service imports a private file primitive. Insert path
     # now signals request_delivery instead of appending directly.
     return False
+
+
+# ---------------------------------------------------------------------------
+# F178: Mark CC inbox entries as read on CAO-side ack
+# ---------------------------------------------------------------------------
+
+
+def mark_cc_inbox_entries_read(
+    *,
+    inbox_path: Path,
+    mailbox_id: str,
+    acked_row_ids: List[int],
+) -> int:
+    """Mark CC inbox entries corresponding to acked CAO rows as read.
+
+    Correlates via deterministic msg_id = callback_notification_id(mailbox_id, row_id).
+    Fail-safe: never truncates or rewrites entries it did not author (shared file).
+    Returns the number of entries marked read.
+
+    Safety invariants:
+    - Entry absent: no-op (count unaffected).
+    - File locked: uses existing lockfile discipline with deadline.
+    - Malformed file: returns 0 (fail-safe, never loses data).
+    - Only matches on msg_id from _TEAMMATE_FROM; foreign entries untouched.
+    """
+    if not acked_row_ids:
+        return 0
+
+    # Build set of msg_ids to mark read
+    target_msg_ids = {
+        callback_notification_id(mailbox_id, row_id)
+        for row_id in acked_row_ids
+    }
+
+    lock_path = Path(str(inbox_path) + ".lock")
+    fd = _acquire_lockfile_deadline(lock_path, time.monotonic() + 2.0)
+    if fd is None:
+        logger.debug("f178: lock timeout marking cc inbox entries read")
+        return 0
+
+    try:
+        if not inbox_path.exists():
+            return 0
+
+        try:
+            raw = inbox_path.read_text(encoding="utf-8")
+            if not raw.strip():
+                return 0
+            entries: List[Dict[str, Any]] = json.loads(raw)
+            if not isinstance(entries, list):
+                return 0
+        except (json.JSONDecodeError, OSError) as e:
+            logger.debug("f178: malformed cc inbox file, skipping: %s", e)
+            return 0
+
+        # Mark matching entries as read
+        marked = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            entry_msg_id = entry.get("msg_id")
+            if entry_msg_id and entry_msg_id in target_msg_ids:
+                if entry.get("from") == _TEAMMATE_FROM and not entry.get("read"):
+                    entry["read"] = True
+                    marked += 1
+
+        if marked == 0:
+            return 0
+
+        # Atomic durable write (same discipline as _write_inbox_entry)
+        tmp_path = inbox_path.with_suffix(".tmp")
+        try:
+            tmp_fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            try:
+                data = json.dumps(entries, indent=2).encode("utf-8")
+                os.write(tmp_fd, data)
+                os.fsync(tmp_fd)
+            finally:
+                os.close(tmp_fd)
+            os.replace(str(tmp_path), str(inbox_path))
+            _fsync_dir(inbox_path.parent)
+        except OSError as e:
+            logger.debug("f178: write failed marking entries read: %s", e)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return 0
+
+        logger.debug("f178: marked %d cc inbox entries read for mailbox %s", marked, mailbox_id)
+        return marked
+    finally:
+        _release_lockfile(fd, lock_path)
