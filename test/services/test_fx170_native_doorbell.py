@@ -1038,6 +1038,40 @@ class TestAC15ConfigMatrix:
         assert result == "rang"
         mock_native.assert_not_called()
 
+    def test_wake_native_false_logs_f170_transport_nudge(self, caplog):
+        """S1: native disabled path emits f170_doorbell transport=nudge log line."""
+        import logging
+
+        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
+        with (
+            patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_cfg,
+            patch("cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata") as mock_meta,
+            patch("cli_agent_orchestrator.services.doorbell_service.update_terminal_metadata"),
+            patch("cli_agent_orchestrator.services.doorbell_service._attempt_native_ring") as mock_native,
+            patch("cli_agent_orchestrator.services.doorbell_service._attempt_gated_ring", return_value="rang"),
+            patch("cli_agent_orchestrator.services.teammate_push_service._should_teammate_push", return_value=True),
+        ):
+            def cfg_side(path, default=None):
+                if path == "supervisor.doorbell":
+                    return True
+                if path == "supervisor.wake.native":
+                    return False
+                return default
+            mock_cfg.get.side_effect = cfg_side
+            mock_meta.return_value = {"metadata": {}}
+
+            with caplog.at_level(logging.INFO, logger="cli_agent_orchestrator.services.doorbell_service"):
+                result = ring_supervisor_doorbell("term-01", 100, written_count=1)
+
+        assert result == "rang"
+        mock_native.assert_not_called()
+        # S1: must emit f170_doorbell with transport=nudge and reason=native_disabled
+        f170_lines = [r.message for r in caplog.records if "f170_doorbell" in r.message]
+        assert any("transport=nudge" in line and "reason=native_disabled" in line for line in f170_lines), (
+            f"Expected f170_doorbell transport=nudge reason=native_disabled, got: {f170_lines}"
+        )
+
     def test_doorbell_false_no_transport(self):
         """supervisor.doorbell=false => neither transport fires."""
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell

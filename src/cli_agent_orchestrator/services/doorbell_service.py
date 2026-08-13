@@ -157,6 +157,10 @@ def ring_supervisor_doorbell(
             )
             return "fallback"
         # Native was disabled — gated ring is the primary path
+        logger.info(
+            "f170_doorbell terminal=%s decision=rang transport=nudge reason=native_disabled row=%s",
+            terminal_id, max_written_row_id,
+        )
         return "rang"
 
     return fallback_decision
