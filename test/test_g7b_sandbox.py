@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shlex
 import shutil
@@ -205,7 +206,7 @@ def test_native_home_guard_and_every_roster_consumer_is_injected() -> None:
 
 
 def test_cc_session_registry_reads_the_injected_plane_and_fails_closed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """F184: the registry must resolve its base per call from the injected plane.
 
@@ -229,17 +230,50 @@ def test_cc_session_registry_reads_the_injected_plane_and_fails_closed(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(cc_session_registry, "provider_home", lambda _provider: plane)
+    requested: list[str] = []
+
+    def injected(provider: str) -> ProviderHome:
+        requested.append(provider)
+        return plane
+
+    monkeypatch.setattr(cc_session_registry, "provider_home", injected)
     records = cc_session_registry.read_registry()
     assert [record.pid for record in records] == [4242]
     assert cc_session_registry.verify_wake(records[0], "2026-08-13T12:00:00+00:00", timeout_s=1)
+    assert set(requested) == {"claude_code"}
+
+    # A native home holding a record that WOULD verify: any fallback read returns True,
+    # so False below can only mean the native home was never consulted.
+    native_sessions = tmp_path / "native-home" / ".claude" / "sessions"
+    native_sessions.mkdir(parents=True)
+    (native_sessions / "4242.json").write_text(
+        json.dumps(
+            {
+                "sessionId": "s-1",
+                "messagingSocketPath": "/tmp/sock",
+                "procStart": 7,
+                "statusUpdatedAt": "2026-08-13T12:00:09+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(native_sessions.parents[1]))
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: native_sessions.parents[1]))
+    assert cc_session_registry.verify_wake(
+        records[0], "2026-08-13T12:00:00+00:00", sessions_dir=native_sessions, timeout_s=1
+    )
 
     def unsafe(_provider: str) -> ProviderHome:
         raise SandboxProviderUnsafe("sandbox_provider_unsafe:claude_code")
 
     monkeypatch.setattr(cc_session_registry, "provider_home", unsafe)
-    assert cc_session_registry.read_registry() == []
-    assert not cc_session_registry.verify_wake(records[0], "2026-08-13T12:00:00+00:00", timeout_s=1)
+    with caplog.at_level(logging.WARNING, logger=cc_session_registry.__name__):
+        assert cc_session_registry.read_registry() == []
+        assert (
+            cc_session_registry.verify_wake(records[0], "2026-08-13T12:00:00+00:00", timeout_s=1)
+            is False
+        )
+    assert "registry_plane_unusable" in caplog.text
 
 
 def test_every_native_home_consumer_reads_the_injected_plane(
