@@ -37,6 +37,9 @@ _RETRY_DELAYS: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
 _PROC_ROOT = Path("/proc")
 _EMPTY_SCAN_CONFIRM_COUNT: int = 2
 
+# F166 D7: bounded daemon notification
+MAX_NOTIFICATIONS_PER_JOB: int = 3
+
 # Safety: never signal these
 _PROTECTED_PIDS: frozenset[int] = frozenset({0, 1})
 
@@ -628,8 +631,74 @@ def record_confirmed_gone_observation(
     return JobRequestResult(created=created, job_id=fr.job_id, detail=fr.detail)
 
 
+def _f166_notify_once(
+    *,
+    job_id: str,
+    failure_code: str,
+    message_builder: "callable",
+) -> bool:
+    """F166 D7: Key-agnostic notify-once helper with (job_id, failure_code) dedup + cap.
+
+    Returns True if a notification was emitted, False if suppressed.
+    Dedup: skips when notified_failure_code already equals failure_code.
+    Cap: notify_count >= MAX_NOTIFICATIONS_PER_JOB suppresses with a WARN log.
+    Counter increments ONLY on a successful create_inbox_message.
+    """
+    from cli_agent_orchestrator.clients.database import (
+        OrphanReconcileJobModel,
+        SessionLocal,
+    )
+    from cli_agent_orchestrator.services.mailbox_service import (
+        get_current_supervisor_terminal_id,
+    )
+
+    supervisor_id = get_current_supervisor_terminal_id()
+    if supervisor_id is None:
+        logger.warning("f166_notify_no_supervisor: job=%s failure=%s", job_id, failure_code)
+        return False
+
+    with SessionLocal() as db:
+        job = db.query(OrphanReconcileJobModel).filter_by(id=job_id).one_or_none()
+        if job is None:
+            return False
+        current_code = job.notified_failure_code
+        current_count = job.notify_count or 0
+
+    if current_code == failure_code:
+        return False
+
+    if current_count >= MAX_NOTIFICATIONS_PER_JOB:
+        logger.warning(
+            "f166_notify_cap_exceeded: job=%s count=%d cap=%d failure=%s",
+            job_id, current_count, MAX_NOTIFICATIONS_PER_JOB, failure_code,
+        )
+        return False
+
+    message = message_builder(supervisor_id)
+    try:
+        from cli_agent_orchestrator.clients.database import create_inbox_message
+
+        create_inbox_message(
+            sender_id="system",
+            receiver_id=supervisor_id,
+            message=message,
+        )
+    except Exception:
+        logger.exception("f166_notify_send_failed: job=%s failure=%s", job_id, failure_code)
+        return False
+
+    with SessionLocal.begin() as db:
+        job = db.query(OrphanReconcileJobModel).filter_by(id=job_id).one_or_none()
+        if job is not None:
+            job.notified_failure_code = failure_code
+            job.notify_count = (job.notify_count or 0) + 1
+
+    return True
+
+
 def f138_notify_confirmed_gone_report_failed(
     *,
+    job_id: str,
     terminal_id: str,
     terminal_generation: int | None,
     source: str,
@@ -640,39 +709,23 @@ def f138_notify_confirmed_gone_report_failed(
 
     Callable from the watchdog thread (no async, no lock held across slow work).
     Payload carries terminal ID/generation/source/detail and a safe hash/reference,
-    never the raw token. Notification failure logs and does not create false durability.
+    never the raw token. Routes through F166 _f166_notify_once for dedup + cap.
     """
-    try:
-        from cli_agent_orchestrator.services.mailbox_service import (
-            get_current_supervisor_terminal_id,
-        )
+    failure_code = f"confirmed_gone_report_failed:{detail}"
 
-        supervisor_id = get_current_supervisor_terminal_id()
-        if supervisor_id is None:
-            logger.warning(
-                "f138_confirmed_gone_report_failed_no_supervisor: terminal=%s ref=%s",
-                terminal_id, safe_reference,
-            )
-            return
-
-        from cli_agent_orchestrator.clients.database import create_inbox_message
-
-        message = (
+    def build_message(supervisor_id: str) -> str:
+        return (
             f"[F138] confirmed_gone_report_failed: terminal={terminal_id} "
             f"gen={terminal_generation} source={source} detail={detail} "
             f"ref={safe_reference}. Enrollment retained; bounded retries continue. "
             f"Manual investigation may be needed."
         )
-        create_inbox_message(
-            sender_id=terminal_id,
-            receiver_id=supervisor_id,
-            message=message,
-        )
-    except Exception:
-        logger.warning(
-            "f138_confirmed_gone_report_failed_notify_error: terminal=%s",
-            terminal_id, exc_info=True,
-        )
+
+    _f166_notify_once(
+        job_id=job_id,
+        failure_code=failure_code,
+        message_builder=build_message,
+    )
 
 
 # --- OrphanReconcileService (dispatcher) --------------------------------------
@@ -824,6 +877,7 @@ class OrphanReconcileService:
                 # Max retries exhausted — attention required
                 f138_mark_attention_required(job_id, result.code)
                 await self._notify_attention_required(
+                    job_id,
                     incarnation["terminal_id"],
                     token_hash_val,
                     result.code,
@@ -834,45 +888,28 @@ class OrphanReconcileService:
 
     async def _notify_attention_required(
         self,
+        job_id: str,
         terminal_id: str,
         token_hash_val: str,
         failure_code: str,
         detail: str | None,
     ) -> None:
-        """Notify current live supervisor about attention-required failure."""
-        try:
-            from cli_agent_orchestrator.services.mailbox_service import (
-                get_current_supervisor_terminal_id,
-            )
+        """Notify current live supervisor about attention-required failure.
 
-            supervisor_id = get_current_supervisor_terminal_id()
-            if supervisor_id is None:
-                logger.warning(
-                    "f138_notify_no_supervisor: token_hash=%s failure=%s — "
-                    "durable job retained for successor",
-                    token_hash_val,
-                    failure_code,
-                )
-                return
-
-            from cli_agent_orchestrator.clients.database import create_inbox_message
-
-            message = (
+        Routes through _f166_notify_once for (job_id, failure_code) dedup + cap.
+        """
+        def build_message(supervisor_id: str) -> str:
+            return (
                 f"[F138] Orphan reconciliation attention required for terminal {terminal_id}. "
                 f"Failure: {failure_code}. Detail: {detail or 'none'}. "
                 f"Token hash: {token_hash_val}. Manual intervention may be needed."
             )
-            create_inbox_message(
-                sender_id=terminal_id,
-                receiver_id=supervisor_id,
-                message=message,
-            )
-        except Exception:
-            logger.exception(
-                "f138_notify_failed: token_hash=%s failure=%s",
-                token_hash_val,
-                failure_code,
-            )
+
+        _f166_notify_once(
+            job_id=job_id,
+            failure_code=failure_code,
+            message_builder=build_message,
+        )
 
     def stop(self) -> None:
         self._stop = True

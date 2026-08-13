@@ -1585,7 +1585,7 @@ class TestM33AttentionRequired:
         svc = OrphanReconcileService()
         notification_calls = []
 
-        async def mock_notify(self_inner, terminal_id, token_hash_val, failure_code, detail):
+        async def mock_notify(self_inner, job_id, terminal_id, token_hash_val, failure_code, detail):
             notification_calls.append((terminal_id, failure_code))
 
         with patch.object(
@@ -1613,7 +1613,10 @@ class TestM33AttentionRequired:
                 .one()
             )
             assert job.state == "attention_required"
-            assert job.notified_failure_code == "scan_incomplete"
+            # F166: notified_failure_code is set by the notify helper on successful
+            # send, not by f138_mark_attention_required. Since _notify_attention_required
+            # is mocked here, it remains None.
+            assert job.notified_failure_code is None
 
         # Verify notification was attempted
         assert len(notification_calls) == 1

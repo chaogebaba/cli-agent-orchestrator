@@ -61,3 +61,40 @@ def _clean_f138_incarnations():
             db.commit()
     except Exception:
         pass
+
+
+
+# --- F165: Shared real-sqlite fixture for daemon end-to-end tests -------------
+
+
+@pytest.fixture()
+def real_sqlite_env(tmp_path, monkeypatch):
+    """F165 D11: Create a real sqlite DB, wire SessionLocal to it.
+
+    Wires a real engine and SessionLocal, creates the schema from Base.metadata,
+    and seeds only what each test declares. No production code changes for this
+    fixture — a shared fixture plus tests only.
+    """
+    import cli_agent_orchestrator.clients.database as db_mod
+    from cli_agent_orchestrator.clients.database import Base
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    db_file = tmp_path / "test_real_sqlite.db"
+    test_url = f"sqlite:///{db_file}"
+    test_engine = create_engine(test_url, connect_args={"check_same_thread": False})
+    TestSession = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+
+    # Patch module-level engine + SessionLocal so all lazy imports get ours
+    monkeypatch.setattr(db_mod, "engine", test_engine)
+    monkeypatch.setattr(db_mod, "SessionLocal", TestSession)
+
+    # Create all tables
+    Base.metadata.create_all(bind=test_engine)
+
+    return {
+        "tmp_path": tmp_path,
+        "TestSession": TestSession,
+        "engine": test_engine,
+        "db_file": db_file,
+    }

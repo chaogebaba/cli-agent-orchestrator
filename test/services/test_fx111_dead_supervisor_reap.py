@@ -154,7 +154,7 @@ def test_force_delete_dead_owner_succeeds() -> None:
             return_value=terminals,
         ),
         patch(
-            "cli_agent_orchestrator.services.terminal_service.quiesce_deferred_session_sync",
+            "cli_agent_orchestrator.services.terminal_service._quiesce_cascade_subtree_pre_plan",
         ),
         patch(
             "cli_agent_orchestrator.services.session_lifecycle_lease.acquire_session_lifecycle_exclusive",
@@ -225,7 +225,7 @@ def test_force_delete_live_owner_409s() -> None:
             return_value=terminals,
         ),
         patch(
-            "cli_agent_orchestrator.services.terminal_service.quiesce_deferred_session_sync",
+            "cli_agent_orchestrator.services.terminal_service._quiesce_cascade_subtree_pre_plan",
         ),
         patch(
             "cli_agent_orchestrator.services.session_lifecycle_lease.acquire_session_lifecycle_exclusive",
@@ -274,7 +274,7 @@ def test_dead_owner_bypass_denied_without_force() -> None:
             return_value=terminals,
         ),
         patch(
-            "cli_agent_orchestrator.services.terminal_service.quiesce_deferred_session_sync",
+            "cli_agent_orchestrator.services.terminal_service._quiesce_cascade_subtree_pre_plan",
         ),
         patch(
             "cli_agent_orchestrator.services.session_lifecycle_lease.acquire_session_lifecycle_exclusive",

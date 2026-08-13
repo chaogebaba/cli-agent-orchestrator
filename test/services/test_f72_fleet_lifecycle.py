@@ -801,13 +801,13 @@ def test_fork_create_started_after_quiesce_snapshot_is_blocked(f72_env, monkeypa
     add_terminal(backend, "11111111")
     add_terminal(backend, "22222222", "11111111")
     events: list[str] = []
-    real_quiesce = terminal_service.quiesce_deferred_session_sync
+    real_quiesce = terminal_service._quiesce_cascade_subtree_pre_plan
 
-    def quiesce(session_name: str) -> None:
-        real_quiesce(session_name)
+    def quiesce(session_name, terminal_id, *, orphan=False, force=False):
+        real_quiesce(session_name, terminal_id, orphan=orphan, force=force)
         events.append("snapshot_complete")
 
-    monkeypatch.setattr(terminal_service, "quiesce_deferred_session_sync", quiesce)
+    monkeypatch.setattr(terminal_service, "_quiesce_cascade_subtree_pre_plan", quiesce)
     monkeypatch.setattr(
         terminal_service,
         "load_agent_profile",
@@ -852,7 +852,7 @@ def test_collision_quiesces_first_refuses_once_and_deletes_nothing(f72_env, monk
     calls = 0
     real_acquire = acquire_session_lifecycle_exclusive
 
-    def quiesce(session_name: str) -> None:
+    def quiesce(session_name, terminal_id, *, orphan=False, force=False):
         assert session_name == "cao-f72"
         events.append("quiesce")
 
@@ -862,7 +862,7 @@ def test_collision_quiesces_first_refuses_once_and_deletes_nothing(f72_env, monk
         events.append("acquire")
         return real_acquire(session_name)
 
-    monkeypatch.setattr(terminal_service, "quiesce_deferred_session_sync", quiesce)
+    monkeypatch.setattr(terminal_service, "_quiesce_cascade_subtree_pre_plan", quiesce)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.session_lifecycle_lease.acquire_session_lifecycle_exclusive",
         acquire,

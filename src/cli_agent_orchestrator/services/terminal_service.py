@@ -4923,7 +4923,9 @@ def delete_terminal(
     require_delete_allowed(terminal_id, force=force)
     session_name = root["tmux_session"]
 
-    quiesce_deferred_session_sync(session_name)
+    # F167 D2 step 1: Pre-lease, unleased pre-plan quiesce (subtree only).
+    _quiesce_cascade_subtree_pre_plan(session_name, terminal_id, orphan=orphan, force=force)
+
     lifecycle_lease = acquire_session_lifecycle_exclusive(session_name)
     if lifecycle_lease is None:
         raise RuntimeError("resume_in_progress")
@@ -4941,6 +4943,26 @@ def delete_terminal(
             orphan=orphan,
             force=force,
         )
+
+        # F167 D2 steps 3-4: Bounded fixed-point re-plan under lease.
+        CASCADE_QUIESCE_ROUNDS = 3
+        for _round in range(CASCADE_QUIESCE_ROUNDS):
+            deferred_in_plan = [nid for nid in order if has_deferred_init(nid)]
+            if not deferred_in_plan:
+                break
+            for nid in deferred_in_plan:
+                quiesce_deferred_terminal_sync(nid)
+            order, skipped = _cascade_plan(
+                terminals,
+                terminal_id,
+                orphan=orphan,
+                force=force,
+            )
+        else:
+            # After all rounds, check if any deferred-bearing node remains.
+            deferred_in_plan = [nid for nid in order if has_deferred_init(nid)]
+            if deferred_in_plan:
+                raise RuntimeError("cascade_quiesce_unstable")
         by_id = {row["id"]: row for row in terminals}
         reap_set = set(order)
         reaped: list[dict[str, str]] = []
@@ -4984,6 +5006,59 @@ def delete_terminal(
         }
     finally:
         release_session_lifecycle_lease(lifecycle_lease)
+
+
+def _quiesce_cascade_subtree_pre_plan(
+    session_name: str,
+    terminal_id: str,
+    *,
+    orphan: bool,
+    force: bool,
+) -> None:
+    """F167 D2 step 1: Quiesce the provisional cascade subtree before the lease.
+
+    Reads the session's terminals and computes the subtree that delete_terminal
+    would cascade into (using the same orphan/force arguments). Quiesces only
+    those IDs — non-subtree siblings are never cancelled.
+
+    The pre-plan is used ONLY to cancel tasks; it never authorizes a deletion.
+    A too-small pre-plan is corrected by the re-plan under the lease (D2 step 3).
+    A too-large pre-plan cannot occur because caller_id is write-once.
+    """
+    from cli_agent_orchestrator.services.terminal_guard_service import classify_deletion
+
+    terminals = list_terminals_by_session(session_name)
+    children: dict[str, list[str]] = {}
+    by_id = {row["id"]: row for row in terminals}
+    for row in terminals:
+        parent = row.get("caller_id")
+        if parent:
+            children.setdefault(parent, []).append(row["id"])
+    for child_ids in children.values():
+        child_ids.sort()
+
+    subtree_ids: list[str] = []
+
+    def collect(node_id: str, depth: int) -> None:
+        if depth >= 32:
+            return
+        classification = classify_deletion(node_id, force=force)
+        if not classification.allowed:
+            return
+        for child_id in children.get(node_id, []):
+            if child_id in by_id:
+                collect(child_id, depth + 1)
+        subtree_ids.append(node_id)
+
+    if orphan:
+        subtree_ids.append(terminal_id)
+    else:
+        for child_id in children.get(terminal_id, []):
+            collect(child_id, 1)
+        subtree_ids.append(terminal_id)
+
+    for nid in subtree_ids:
+        quiesce_deferred_terminal_sync(nid)
 
 
 def quiesce_deferred_terminals_sync(terminals: list[dict]) -> None:

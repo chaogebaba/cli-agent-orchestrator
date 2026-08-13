@@ -887,6 +887,7 @@ class OrphanReconcileJobModel(Base):
     source = Column(String, nullable=False)
     last_result_json = Column(Text, nullable=True)
     notified_failure_code = Column(String, nullable=True)
+    notify_count = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False)
     updated_at = Column(DateTime(timezone=True), nullable=False)
     __table_args__ = (
@@ -8457,6 +8458,8 @@ def _migrate_f138_orphan_reconciliation() -> None:
             )
         # D17: Issuance context columns (idempotent ALTER)
         _migrate_f138_issuance_context(connection)
+        # F166: notify_count column (idempotent ALTER)
+        _migrate_f166_notify_count(connection)
 
 
 def _migrate_f138_issuance_context(connection) -> None:
@@ -8474,6 +8477,20 @@ def _migrate_f138_issuance_context(connection) -> None:
     if "issuance_boot_id" not in existing_cols:
         connection.execute(
             text("ALTER TABLE process_incarnations ADD COLUMN issuance_boot_id TEXT")
+        )
+
+
+def _migrate_f166_notify_count(connection) -> None:
+    """F166 D7: Add notify_count to orphan_reconcile_jobs if missing (idempotent)."""
+    existing_cols = {
+        row[1]
+        for row in connection.execute(
+            text("PRAGMA table_info('orphan_reconcile_jobs')")
+        ).fetchall()
+    }
+    if "notify_count" not in existing_cols:
+        connection.execute(
+            text("ALTER TABLE orphan_reconcile_jobs ADD COLUMN notify_count INTEGER")
         )
 
 
@@ -8604,7 +8621,7 @@ def f138_claim_jobs(*, limit: int, lease_duration_s: float) -> list[dict[str, st
         due_jobs = (
             db.query(OrphanReconcileJobModel)
             .filter(
-                OrphanReconcileJobModel.state.in_(("pending", "retry_wait", "attention_required")),
+                OrphanReconcileJobModel.state.in_(("pending", "retry_wait")),
                 or_(
                     OrphanReconcileJobModel.next_attempt_at.is_(None),
                     OrphanReconcileJobModel.next_attempt_at <= now,
@@ -8693,14 +8710,11 @@ def f138_mark_attention_required(job_id: str, failure_code: str) -> None:
         if job is None:
             return
         job.state = "attention_required"
-        job.notified_failure_code = failure_code
+        # F166: notified_failure_code is set by the notify helper on successful send,
+        # not here — setting it here would dedup the first notification.
         job.updated_at = now
         job.lease_owner = None
         job.lease_expires_at = None
-        # Allow periodic retry at 30s cap
-        import datetime as _dt
-
-        job.next_attempt_at = now + _dt.timedelta(seconds=30.0)
 
 
 def f138_renew_lease(job_id: str, duration_s: float) -> None:
@@ -8983,7 +8997,8 @@ def f138_force_reconcile_incarnation(incarnation_id: str, source: str) -> ForceR
            reconciled row WITHOUT succeeded job → non_durable_invariant |
            succeeded job (repairs row) → reconciled_proven |
            known due job states (pending/leased/retry_wait) → job_already_exists |
-           attention_required job → job_already_exists |
+           attention_required job → reset to pending, attempt=0, clear notification
+               counters (F166 D6 re-arm; a genuine new event re-arms cleanup) |
            unknown job state → non_durable_invariant |
            no existing job → normalize state + create.
     DB errors propagate. Wakes dispatcher after commit when a job is created or pending.
@@ -9048,13 +9063,22 @@ def f138_force_reconcile_incarnation(incarnation_id: str, source: str) -> ForceR
                     detail=f"state={existing.state}",
                 )
             elif existing.state == "attention_required":
-                # Normalize incarnation state
+                # F166 D6: Re-arm — reset to pending with cleared counters.
+                existing.state = "pending"
+                existing.attempt = 0
+                existing.notified_failure_code = None
+                existing.notify_count = None
+                existing.next_attempt_at = None
+                existing.lease_owner = None
+                existing.lease_expires_at = None
+                existing.updated_at = now
                 if inc.state in ("active", "launching", "abandoned"):
                     inc.state = "reconcile_pending"
+                wake_dispatcher = True
                 result = ForceReconcileResult(
-                    outcome="job_already_exists",
+                    outcome="created",
                     job_id=existing.id,
-                    detail="attention_required",
+                    detail="reset_from_attention_required",
                 )
             else:
                 # Unknown job state = non-durable invariant

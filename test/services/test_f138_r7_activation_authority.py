@@ -257,7 +257,7 @@ class TestD22ForceReconcile:
         assert "pending" in (r2.detail or "")
 
     def test_attention_required_job_returns_already_exists(self, db_session):
-        """M13: attention_required job → job_already_exists with detail."""
+        """M13 (amended F166 D6): attention_required job → reset to pending."""
         inc_id = self._make_active(terminal_id="d22-attn", gen=1)
         r1 = f138_force_reconcile_incarnation(inc_id, source="first")
         # Manually move to attention_required
@@ -265,8 +265,8 @@ class TestD22ForceReconcile:
             job = db.query(OrphanReconcileJobModel).filter_by(id=r1.job_id).one()
             job.state = "attention_required"
         r2 = f138_force_reconcile_incarnation(inc_id, source="retry")
-        assert r2.outcome == "job_already_exists"
-        assert r2.detail == "attention_required"
+        assert r2.outcome == "created"
+        assert r2.detail == "reset_from_attention_required"
 
     def test_missing_incarnation_non_durable(self):
         """M14: Nonexistent incarnation → non_durable_missing."""

@@ -112,6 +112,10 @@ from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
 
+# F162 D10: rate-limited gate5 WARN state — {terminal_id: last_warn_time}
+_fx158_gate5_last_warn: dict[str, float] = {}
+_FX158_GATE5_WARN_INTERVAL_S: float = 60.0
+
 IDLE_STALL_AGE = 30 * 60
 ABS_STALLED_NOTICE_AGE = 4 * 60 * 60
 WPM2_STALE_OPEN_AGE_SECONDS = 60
@@ -3155,6 +3159,27 @@ class InboxService:
 
                 # D3 condition 5: teammate_push flag gate
                 if not _should_teammate_push(mb.current_terminal_id):
+                    # F162 D10: rate-limited WARN when unregistered
+                    tid = mb.current_terminal_id
+                    now_ts = time.monotonic()
+                    last = _fx158_gate5_last_warn.get(tid)
+                    if last is None or (now_ts - last) >= _FX158_GATE5_WARN_INTERVAL_S:
+                        with _SL() as db:
+                            pending_count = (
+                                db.query(_InboxModel)
+                                .filter(
+                                    _InboxModel.logical_receiver_id == mb.id,
+                                    _InboxModel.status == MessageStatus.PENDING.value,
+                                    _InboxModel.id > mb.consumed_through_id,
+                                )
+                                .count()
+                            )
+                        if pending_count > 0:
+                            logger.warning(
+                                "fx158_gate5_unregistered terminal=%s pending=%d",
+                                tid, pending_count,
+                            )
+                            _fx158_gate5_last_warn[tid] = now_ts
                     continue
 
                 # D3 condition 4: pending rows older than grace, above consumed_through_id
