@@ -465,6 +465,8 @@ class CallbackRunOutcome:
     retry_delay_s: float | None = None
     reason: str = ""
     max_written_row_id: int = 0  # F168 D4: highest row id written this run
+    # fx168 FIX-2: stale path heal data (mailbox_id, terminal_id, generation, new_path)
+    _fx168_stale_heal: tuple[str, str, int, str] | None = None
 
 
 def _get_backoff_delay(terminal_id: str) -> float:
@@ -851,6 +853,34 @@ class InboxService:
                     reason="empty",
                 )
 
+            # fx168 FIX-2: Staleness-aware self-heal — if the batch's canonical
+            # inbox_path differs from the CURRENT terminal metadata cc_team_inbox_path,
+            # exit the lock scope and reconcile via set_supervisor_callback_inbox_path
+            # (which acquires its own locks, bumps version, re-kicks request_delivery).
+            # One attempt per run; the re-wake handles the actual write.
+            _fx168_stale_heal_needed: tuple[str, str] | None = None
+            if batch.inbox_path:
+                try:
+                    from cli_agent_orchestrator.clients.database import get_terminal_metadata as _get_meta
+                    _meta = _get_meta(terminal_id)
+                    _current_path = ((_meta.get("metadata") or {}).get("cc_team_inbox_path") if _meta else None)
+                    if _current_path and _current_path != batch.inbox_path:
+                        _fx168_stale_heal_needed = (batch.inbox_path, _current_path)
+                except Exception as _heal_exc:
+                    logger.debug("fx168_stale_path_check_failed terminal=%s: %s", terminal_id, _heal_exc)
+
+            if _fx168_stale_heal_needed is not None:
+                # Cannot reconcile while holding locks (set_supervisor_callback_inbox_path
+                # acquires the same locks). Signal stale_path_detected; the reconcile
+                # happens in _f136_post_delivery after lock release.
+                _old_path, _new_path = _fx168_stale_heal_needed
+                return CallbackRunOutcome(
+                    cursor_before=batch.cursor,
+                    needs_immediate_wake=True,
+                    reason="stale_path_detected",
+                    _fx168_stale_heal=(mailbox_id, terminal_id, generation, _new_path),
+                )
+
             inbox_path = Path(os.path.expanduser(batch.inbox_path))
             cursor_before = batch.cursor
             new_cursor = batch.cursor or 0
@@ -1000,6 +1030,29 @@ class InboxService:
 
     def _f136_post_delivery(self, terminal_id: str, outcome: "CallbackRunOutcome") -> None:
         """D15: After delivery, decide: immediate rerun, delayed retry, or idle."""
+        # fx168 FIX-2: Perform stale-path reconcile outside the runner's lock scope.
+        # set_supervisor_callback_inbox_path acquires its own locks and signals
+        # request_delivery internally; the needs_immediate_wake flag re-arms the runner.
+        if outcome._fx168_stale_heal is not None:
+            try:
+                _mb_id, _term_id, _gen, _new_path = outcome._fx168_stale_heal
+                from cli_agent_orchestrator.services.mailbox_service import (
+                    set_supervisor_callback_inbox_path,
+                )
+                _heal_result = set_supervisor_callback_inbox_path(
+                    mailbox_id=_mb_id,
+                    terminal_id=_term_id,
+                    generation=_gen,
+                    path=_new_path,
+                )
+                if _heal_result.kind in ("updated", "unchanged"):
+                    logger.info(
+                        "fx168_stale_path_healed mailbox=%s terminal=%s new_path=%s",
+                        _mb_id, _term_id, _new_path,
+                    )
+            except Exception as _heal_exc:
+                logger.debug("fx168_stale_path_heal_post_delivery_failed terminal=%s: %s", terminal_id, _heal_exc)
+
         # F168 D2: ring the doorbell before entering _delivery_seq_guard.
         # D3: best-effort, isolated — exceptions never propagate.
         if outcome.written > 0 and outcome.max_written_row_id > 0:
@@ -2111,19 +2164,12 @@ class InboxService:
 
                 if _should_teammate_push(terminal_id):
                     try:
-                        push_result = attempt_teammate_push(terminal_id, messages)
-                        # F168 D9: ring doorbell after push write.
-                        # N1: written_count=1 may over-count; D4 last_doorbell_row_id
-                        # dedup in ring_supervisor_doorbell is the dedup boundary.
-                        if push_result and messages:
-                            try:
-                                from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
-                                max_id = max(m.id for m in messages)
-                                ring_supervisor_doorbell(
-                                    terminal_id, max_id, written_count=1,
-                                )
-                            except Exception:
-                                pass
+                        attempt_teammate_push(terminal_id, messages)
+                        # fx168 FIX-4: Removed dead D9 doorbell call. deliver_pending
+                        # holds delivery_lock here; ring_supervisor_doorbell's G1 gate
+                        # tries the same non-reentrant lock → always "skipped_gate".
+                        # The F136 runner's doorbell in _f136_post_delivery (armed by
+                        # FIX-1's request_delivery signal) is the correct path.
                     except Exception as _push_exc:
                         logger.debug(f"teammate_push side-effect failed: {_push_exc}")
                 return

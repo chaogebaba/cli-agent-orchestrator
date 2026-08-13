@@ -513,17 +513,22 @@ class TestAC15CallSiteInventory:
     """ring_supervisor_doorbell has exactly its three callers."""
 
     def test_three_call_sites_in_inbox_service(self):
-        """Verify that inbox_service.py imports ring_supervisor_doorbell at exactly 3 sites."""
+        """Verify that inbox_service.py imports ring_supervisor_doorbell at exactly 2 sites.
+
+        fx168 FIX-4: The D9 call site in deliver_pending was removed (lock reentrance
+        made it structurally dead). Remaining sites: _f136_post_delivery and the
+        fx158 pull-mode reconciler.
+        """
         import inspect
         import cli_agent_orchestrator.services.inbox_service as mod
         source = inspect.getsource(mod)
         # Count the number of 'ring_supervisor_doorbell' calls (not imports)
         import_count = source.count("from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell")
         call_count = source.count("ring_supervisor_doorbell(")
-        # 3 import sites (one per call site, lazy imports)
-        assert import_count == 3, f"Expected 3 import sites, got {import_count}"
-        # 3 call sites
-        assert call_count == 3, f"Expected 3 call sites, got {call_count}"
+        # 2 import sites (fx168 FIX-4: removed the dead D9 site in deliver_pending)
+        assert import_count == 2, f"Expected 2 import sites, got {import_count}"
+        # 2 call sites
+        assert call_count == 2, f"Expected 2 call sites, got {call_count}"
 
 
 # ===========================================================================

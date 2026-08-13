@@ -1285,8 +1285,6 @@ async def _f150_reconcile_supervisor_inbox_paths_at_startup() -> None:
         )
 
     for mbox in live_mailboxes:
-        if mbox.cc_inbox_path:
-            continue  # Already populated
         terminal_id = str(mbox.current_terminal_id)
         mailbox_id = str(mbox.id)
         generation = int(mbox.generation)
@@ -1297,6 +1295,11 @@ async def _f150_reconcile_supervisor_inbox_paths_at_startup() -> None:
         candidate_path = md.get("cc_team_inbox_path")
         if not candidate_path:
             continue
+        # fx168 FIX-3: Staleness-aware — reconcile when metadata path differs from
+        # mailbox row, not only when cc_inbox_path is NULL. Defense-in-depth for
+        # post-restart stale path scenarios.
+        if mbox.cc_inbox_path and mbox.cc_inbox_path == candidate_path:
+            continue  # Already correct
         await asyncio.to_thread(
             set_supervisor_callback_inbox_path,
             mailbox_id=mailbox_id,
@@ -6568,6 +6571,17 @@ async def create_inbox_message_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create inbox message: {str(e)}",
         )
+
+    # fx168 FIX-1: Signal the F136 callback runner for mailbox-pull supervisor
+    # receivers. create_inbox_message (raw insert) does not call request_delivery;
+    # without this, the F136 runner is never woken for messages arriving via the
+    # direct-terminal POST path (mirrors create_routed_inbox_message behaviour).
+    try:
+        from cli_agent_orchestrator.services.inbox_service import request_delivery
+
+        request_delivery(inbox_msg.receiver_id)
+    except Exception:
+        pass  # best-effort; deliver_pending below is the fallback
 
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.
