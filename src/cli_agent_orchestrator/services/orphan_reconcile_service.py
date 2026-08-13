@@ -40,8 +40,35 @@ _EMPTY_SCAN_CONFIRM_COUNT: int = 2
 # F166 D7: bounded daemon notification
 MAX_NOTIFICATIONS_PER_JOB: int = 3
 
+# F166-F1: failure codes known to be permanent (condition cannot resolve without
+# external intervention). Fast-track to attention_required on first observation
+# instead of burning through all retry delays.
+_PERMANENT_FAILURE_PREFIXES: frozenset[str] = frozenset({
+    "permission_denied_server_ancestor",
+    "permission_denied_uid_unknown",
+})
+
 # Safety: never signal these
 _PROTECTED_PIDS: frozenset[int] = frozenset({0, 1})
+
+
+def _is_permanent_failure(detail: str | None) -> bool:
+    """F166-F1: Return True if ALL errors in the scan detail are known-permanent.
+
+    A scan_incomplete whose errors are exclusively from _PERMANENT_FAILURE_PREFIXES
+    will never resolve without external intervention (e.g., rebooting, changing
+    permissions). Retrying is wasteful and delays the attention notification.
+    """
+    if not detail:
+        return False
+    # detail is a semicolon-separated list of error annotations (up to 3)
+    errors = [e.strip() for e in detail.split(";") if e.strip()]
+    if not errors:
+        return False
+    return all(
+        any(err.startswith(prefix) for prefix in _PERMANENT_FAILURE_PREFIXES)
+        for err in errors
+    )
 
 
 # --- Data classes -------------------------------------------------------------
@@ -873,8 +900,11 @@ class OrphanReconcileService:
         else:
             # Determine if attention_required
             delay = _RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)]
-            if attempt >= len(_RETRY_DELAYS) - 1:
-                # Max retries exhausted — attention required
+            # F166-F1: fast-track permanently-unprovable scans — don't waste
+            # all 8 retry delays on a condition that cannot resolve.
+            is_permanent = _is_permanent_failure(result.detail)
+            if attempt >= len(_RETRY_DELAYS) - 1 or is_permanent:
+                # Max retries exhausted OR known-permanent failure
                 f138_mark_attention_required(job_id, result.code)
                 await self._notify_attention_required(
                     job_id,
@@ -883,6 +913,11 @@ class OrphanReconcileService:
                     result.code,
                     result.detail,
                 )
+                if is_permanent:
+                    logger.info(
+                        "f166_permanent_fast_track job=%s code=%s detail=%s attempt=%d",
+                        job_id, result.code, result.detail, attempt,
+                    )
             else:
                 f138_retry_job(job_id, delay)
 
