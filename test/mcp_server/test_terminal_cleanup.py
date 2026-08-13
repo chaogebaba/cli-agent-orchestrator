@@ -248,6 +248,7 @@ class TestPeekTerminal:
         assert result == {
             "success": True,
             "terminal_id": "t1",
+            "display_name": "t1",
             "lines": 200,
             "output": "pane tail",
         }

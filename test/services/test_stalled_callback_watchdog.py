@@ -120,7 +120,7 @@ def test_watchdog_pushes_exactly_one_due_notification():
     ):
         assert svc.collect_due_notifications(now=12.0) == []
         assert svc.collect_due_notifications(now=13.0) == [
-            _notice("[watchdog] worker worker1 (developer) idle 3s without callback")
+            _notice("[watchdog] worker developer-worker1 idle 3s without callback")
         ]
         assert svc.collect_due_notifications(now=14.0) == []
 
@@ -144,7 +144,7 @@ def test_watchdog_polls_idle_status_when_no_post_task_status_event():
     ):
         assert svc.collect_due_notifications(now=12.0) == []
         assert svc.collect_due_notifications(now=13.0) == [
-            _notice("[watchdog] worker worker1 (developer) idle 3s without callback")
+            _notice("[watchdog] worker developer-worker1 idle 3s without callback")
         ]
         assert svc.collect_due_notifications(now=14.0) == []
 
@@ -197,7 +197,7 @@ def test_watchdog_screen_fingerprint_change_resets_idle_timer_then_static_fires(
         assert svc.collect_due_notifications(now=14.0) == []
         svc.refresh_screen_fingerprints(now=14.0)
         assert svc.collect_due_notifications(now=15.0) == [
-            _notice("[watchdog] worker worker1 (developer) idle 3s without callback")
+            _notice("[watchdog] worker developer-worker1 idle 3s without callback")
         ]
 
     backend.get_history.assert_any_call(
@@ -251,7 +251,7 @@ def test_watchdog_excludes_rotating_codex_prompt_from_liveness_fingerprint():
         svc.refresh_screen_fingerprints(now=10.5)
         svc.refresh_screen_fingerprints(now=12.0)
         assert svc.collect_due_notifications(now=13.0) == [
-            _notice("[watchdog] worker worker1 (developer) idle 3s without callback")
+            _notice("[watchdog] worker developer-worker1 idle 3s without callback")
         ]
 
 
@@ -350,7 +350,7 @@ def test_f92_fix_does_not_silence_the_genuine_hang_push():
         return_value={"id": "worker1"},
     ):
         assert svc.collect_due_notifications(now=13.0) == [
-            _notice("[watchdog] worker worker1 (developer) idle 3s without callback")
+            _notice("[watchdog] worker developer-worker1 idle 3s without callback")
         ]
 
 
@@ -377,7 +377,7 @@ def test_f92_callback_from_an_unrelated_third_party_still_does_not_clear():
         return_value={"id": "worker1"},
     ):
         assert svc.collect_due_notifications(now=13.0) == [
-            _notice("[watchdog] worker worker1 (developer) idle 3s without callback")
+            _notice("[watchdog] worker developer-worker1 idle 3s without callback")
         ]
 
 
@@ -404,7 +404,7 @@ def test_f92_callback_to_new_current_caller_does_not_clear_older_episode():
     ):
         notices = svc.collect_due_notifications(now=13.0)
 
-    assert notices == [_notice("[watchdog] worker worker1 (developer) idle 3s without callback")]
+    assert notices == [_notice("[watchdog] worker developer-worker1 idle 3s without callback")]
     assert notices[0].caller_id == "caller1"
 
 
@@ -491,7 +491,7 @@ def test_watchdog_resets_on_new_task_after_firing():
 
         assert svc.collect_due_notifications(now=23.0) == [
             _notice(
-                "[watchdog] worker worker1 (developer) idle 3s without callback",
+                "[watchdog] worker developer-worker1 idle 3s without callback",
                 source_generation=2,
             )
         ]
@@ -659,7 +659,7 @@ def test_watchdog_due_t10_newer_completion_emits_notice():
 
     with _watchdog_guard_fakes(_WPQ4_T10_FRAME) as (backend, callback_status):
         assert svc.collect_due_notifications(now=13.0) == [
-            _notice("[watchdog] worker worker1 (developer) idle 3s without callback")
+            _notice("[watchdog] worker developer-worker1 idle 3s without callback")
         ]
 
     backend.capture_viewport.assert_called_once_with("cao-test", "worker1")
@@ -895,7 +895,7 @@ class TestWaitingInboxAlert:
         sender_id, caller_id, message = fakes["create"].call_args.args
         assert sender_id == "watchdog:worker1"
         assert caller_id == "caller1"
-        assert "[waiting-inbox watchdog] terminal worker1 (unknown)" in message
+        assert "[waiting-inbox watchdog] worker1" in message
         assert "for 10s" in message
         # Delivery is implicit via inbox insertion (F136-D17)
 
@@ -1319,7 +1319,7 @@ def test_positive_grok_sample_keeps_existing_alarm_class():
         ),
     ):
         notices = svc.collect_due_notifications(now=13)
-    assert notices[0].message == "[watchdog] worker worker1 (developer) idle 3s without callback"
+    assert notices[0].message == "[watchdog] worker developer-worker1 idle 3s without callback"
     backend.capture_viewport.assert_called_once_with("cao-test", "worker1")
 
 
@@ -1343,7 +1343,7 @@ def test_notify_due_trigger_a_is_deduped_and_coalesces_trigger_b():
         svc.notify_due()
         svc.notify_due()
     assert [notice.kind for notice in rows] == ["stall", "chain"]
-    assert rows[1].terminal_id == "W" and "sub-worker T" in rows[1].message
+    assert rows[1].terminal_id == "W" and "sub-worker developer-T" in rows[1].message
     assert mock_request_delivery.call_count == 2
 
 

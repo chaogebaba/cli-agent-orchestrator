@@ -39,6 +39,14 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 logger = logging.getLogger(__name__)
 
+
+def _ar_display_name(terminal_id: str, metadata: Dict[str, Any]) -> str:
+    """F172: Return display form for auto-responder messages."""
+    profile = metadata.get("agent_profile") or metadata.get("profile")
+    if profile:
+        return f"{profile}-{terminal_id}"
+    return terminal_id
+
 AUTO_ANSWER_DIR = CAO_HOME_DIR / "auto-answers"
 AUTO_ANSWER_LOG_DIR = CAO_HOME_DIR / "logs" / "auto-answers"
 
@@ -574,8 +582,8 @@ class AutoResponder:
         self._push(
             terminal_id,
             metadata,
-            f"[auto-responder] rule '{rule.name}' fired {RETRY_MAX}x on terminal "
-            f"{terminal_id} but the dialog persists. Manual attention needed.",
+            f"[auto-responder] rule '{rule.name}' fired {RETRY_MAX}x on "
+            f"{_ar_display_name(terminal_id, metadata)} but the dialog persists. Manual attention needed.",
             incarnation,
         )
 
@@ -664,8 +672,8 @@ class AutoResponder:
             self._push(
                 terminal_id,
                 metadata,
-                "[auto-responder] unknown blocking dialog on terminal "
-                f"{terminal_id} (provider={provider_name}); no rule matched, the "
+                f"[auto-responder] unknown blocking dialog on "
+                f"{_ar_display_name(terminal_id, metadata)} (provider={provider_name}); no rule matched, the "
                 "worker is stalled. Ask the user how to answer it (auto-answer "
                 "default / other keys / always wait), then append a rule to "
                 f"~/.aws/cli-agent-orchestrator/auto-answers/{provider_name}.yaml.\n\n"

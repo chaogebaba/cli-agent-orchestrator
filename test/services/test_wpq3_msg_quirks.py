@@ -454,7 +454,7 @@ def test_d5_kill_switch_preserves_ordinary_push(monkeypatch, disabled):
     )
     due = service.collect_due_notifications(now=13.0)
     assert due == [
-        _watchdog_notice("[watchdog] worker worker (developer) idle 3s without callback")
+        _watchdog_notice("[watchdog] worker developer-worker idle 3s without callback")
     ]
 
 
@@ -673,7 +673,7 @@ def test_d5_failed_before_commit_pushes_without_marking_auto_resumed(monkeypatch
 
     assert service.collect_due_notifications(now=13.0) == [
         _watchdog_notice(
-            "[watchdog] worker worker (developer) idle 3s without callback "
+            "[watchdog] worker developer-worker idle 3s without callback "
             "[reason: transient_api_error]",
             "transient_api_error",
         )
@@ -738,7 +738,7 @@ def test_wpq6_a_g_capacity_auto_resumes_then_pushes_composed_reason(monkeypatch)
     attempted_at = service._episodes["worker"].auto_resume_attempted_at
     assert service.collect_due_notifications(now=16.0) == [
         _watchdog_notice(
-            "[watchdog] worker worker (developer) idle 3s without callback "
+            "[watchdog] worker developer-worker idle 3s without callback "
             f"[reason: transient_api_error] (auto-resume attempted at {attempted_at})",
             "transient_api_error",
         )
@@ -785,7 +785,7 @@ def test_wpq6_c_excluded_collision_pushes_reason_without_auto_resume(monkeypatch
 
     assert service.collect_due_notifications(now=13.0) == [
         _watchdog_notice(
-            "[watchdog] worker worker (developer) idle 3s without callback "
+            "[watchdog] worker developer-worker idle 3s without callback "
             "[reason: quota_or_auth]",
             "quota_or_auth",
         )
@@ -950,7 +950,7 @@ def test_wpq6_w_cropped_indented_capacity_never_auto_resumes(monkeypatch):
     )
 
     assert service.collect_due_notifications(now=13.0)[0].message == (
-        "[watchdog] worker worker (developer) idle 3s without callback"
+        "[watchdog] worker developer-worker idle 3s without callback"
     )
     insert.assert_not_called()
 

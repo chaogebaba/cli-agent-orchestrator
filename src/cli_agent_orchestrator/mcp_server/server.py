@@ -54,7 +54,12 @@ from cli_agent_orchestrator.utils.session_lookup import (
 )
 
 cao_http = CAOHttpClient(lambda: requests)
-from cli_agent_orchestrator.utils.terminal import generate_session_name, generate_window_name
+from cli_agent_orchestrator.utils.terminal import (
+    display_name,
+    generate_session_name,
+    generate_window_name,
+    resolve_terminal_id,
+)
 from cli_agent_orchestrator.utils.workflow_events import parse_sse_frames
 
 logger = logging.getLogger(__name__)
@@ -99,6 +104,16 @@ def _current_terminal_id() -> Optional[str]:
             "Invalid CAO_TERMINAL_ID: expected an 8-character lowercase hexadecimal terminal ID"
         )
     return terminal_id
+
+
+def _resolve_input_terminal_id(value: str) -> str:
+    """Resolve a user-supplied terminal identifier (F172 input leniency).
+
+    Accepts both raw hex ids and display-form ``<profile>-<id>`` strings.
+    Returns the canonical 8-char hex id or raises ValueError with a
+    descriptive message.
+    """
+    return resolve_terminal_id(value)
 
 
 def _get_cleanup_nudge() -> str:
@@ -968,6 +983,12 @@ async def session_manifest(
         response = cao_http.get(f"/sessions/{session_name}/manifest", timeout=_mcp_timeout())
         response.raise_for_status()
         manifest = response.json()
+        # F172: inject display_name into terminal entries.
+        for terminal in manifest.get("terminals", []):
+            tid = terminal.get("id")
+            profile = terminal.get("profile")
+            if tid:
+                terminal["display_name"] = display_name(tid, profile)
         if brief:
             from cli_agent_orchestrator.services.session_manifest_service import (
                 render_session_brief,
@@ -985,13 +1006,22 @@ async def fleet(session_name: Optional[str] = None) -> Dict[str, Any]:
         session_name = resolve_session_name(session_name, timeout=_mcp_timeout())
         response = cao_http.get(f"/sessions/{session_name}/fleet", timeout=_mcp_timeout())
         response.raise_for_status()
-        return {"success": True, "fleet": response.json()}
+        fleet_data = response.json()
+        # F172: inject display_name into each terminal entry.
+        for terminal in fleet_data.get("terminals", []):
+            tid = terminal.get("id")
+            profile = terminal.get("profile")
+            if tid:
+                terminal["display_name"] = display_name(tid, profile)
+        return {"success": True, "fleet": fleet_data}
     except Exception as exc:
         return {"success": False, "error": str(exc)}
 
 
 def _peek_terminal_impl(terminal_id: str, lines: int = 40) -> Dict[str, Any]:
     """Return a read-only terminal pane tail via cao-server."""
+    # F172 input leniency: accept display form.
+    terminal_id = _resolve_input_terminal_id(terminal_id)
     capped_lines = max(1, min(int(lines), 200))
     try:
         response = cao_http.get(
@@ -1001,9 +1031,11 @@ def _peek_terminal_impl(terminal_id: str, lines: int = 40) -> Dict[str, Any]:
         )
         response.raise_for_status()
         data = response.json()
+        dn = display_name(terminal_id)
         return {
             "success": True,
-            "terminal_id": data.get("terminal_id", terminal_id),
+            "terminal_id": terminal_id,
+            "display_name": dn,
             "lines": data.get("lines", capped_lines),
             "output": data.get("output", ""),
         }
@@ -1167,9 +1199,10 @@ async def _handoff_impl(
         output = data["last_message"]
 
         execution_time = time.time() - start_time
+        dn = display_name(terminal_id, agent_profile) if terminal_id else terminal_id
         return HandoffResult(
             success=True,
-            message=f"Successfully handed off to {agent_profile} ({provider}) in {execution_time:.2f}s"
+            message=f"Successfully handed off to {dn} ({provider}) in {execution_time:.2f}s"
             + _get_cleanup_nudge(),
             output=output,
             terminal_id=terminal_id,
@@ -1520,18 +1553,19 @@ def _assign_impl(
         )
 
         window_name = generate_window_name(agent_profile, terminal_id)
+        dn = display_name(terminal_id, agent_profile)
         return {
             "success": True,
             "terminal_id": terminal_id,
+            "display_name": dn,
             "window_name": window_name,
             "forked_from": forked_from_info,
             "init_health": "launching",
             "message": (
-                f"Task assigned to {agent_profile} (terminal: {terminal_id}, "
-                f"window: {window_name}). "
+                f"Task assigned to {dn} ({terminal_id}). "
                 f"Worker is initializing in the background; your task will be "
                 f"delivered once it is ready. "
-                f"Call delete_terminal('{terminal_id}') when you no longer need this terminal."
+                f"Call delete_terminal('{dn}') when you no longer need this terminal."
                 + _get_cleanup_nudge()
             ),
         }
@@ -1826,6 +1860,10 @@ def _send_message_impl(
     try:
         own_terminal_id = _current_terminal_id()
 
+        # F172 input leniency: resolve display form to raw id.
+        if receiver_id:
+            receiver_id = _resolve_input_terminal_id(receiver_id)
+
         # Default the receiver to the recorded caller (issue #284): handoff/
         # assign persist the creating terminal's ID on the worker's row, so a
         # worker can reply without parsing an ID out of the task message text.
@@ -1898,8 +1936,9 @@ def _send_message_impl(
         # address (issue #284); _send_to_inbox raises a clear error for that
         # case anyway.
         if ENABLE_SENDER_ID_INJECTION and own_terminal_id:
+            sender_dn = display_name(own_terminal_id)
             message += (
-                f"\n\n[Message from terminal {own_terminal_id}. "
+                f"\n\n[Message from {sender_dn} ({own_terminal_id}). "
                 "Use the cao-mcp-server send_message MCP tool for any follow-up work — "
                 "never a built-in collaboration.send_message.]"
             )
@@ -1988,7 +2027,13 @@ def _list_messages_impl(
             timeout=_mcp_timeout(),
         )
         response.raise_for_status()
-        return response.json()
+        data = response.json()
+        # F172: inject sender_display_name into each message item.
+        for item in data.get("items", []):
+            sid = item.get("sender_id")
+            if sid and re.fullmatch(r"[a-f0-9]{8}", sid):
+                item["sender_display_name"] = display_name(sid)
+        return data
     except requests.HTTPError as exc:
         try:
             return response.json()
@@ -2392,6 +2437,8 @@ async def answer_user_prompt(
     Use this only when the target terminal status is WAITING_USER_ANSWER. Normal
     task delivery should use assign, handoff, or send_message instead.
     """
+    # F172 input leniency.
+    terminal_id = _resolve_input_terminal_id(terminal_id)
     return _send_user_prompt_answer(terminal_id, answer)
 
 
@@ -2436,6 +2483,8 @@ def delete_terminal(
         Dict with success status and message
     """
     try:
+        # F172 input leniency: accept display form.
+        terminal_id = _resolve_input_terminal_id(terminal_id)
         params: dict[str, Any] = {"force": force is True, "orphan": orphan is True}
         caller_id = _current_terminal_id()
         if caller_id:
@@ -2447,6 +2496,8 @@ def delete_terminal(
         )
         response.raise_for_status()
         return response.json()
+    except ValueError as ve:
+        return {"success": False, "message": str(ve)}
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
             return {"success": False, "message": f"Terminal {terminal_id} not found"}

@@ -661,7 +661,7 @@ def test_wpm1_watchdog_pending_callback_failure_transition_fires_once(wpm1_db, f
         WatchdogNotice(
             terminal_id="sender",
             caller_id="receiver",
-            message="[watchdog] worker sender (developer) idle 4s without callback",
+            message="[watchdog] worker developer-sender idle 4s without callback",
             idle_reason=None,
             source_generation=1,
         )

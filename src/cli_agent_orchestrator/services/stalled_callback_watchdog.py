@@ -608,8 +608,8 @@ class StalledCallbackWatchdog:
                                 terminal_id=candidate.terminal_id,
                                 caller_id=candidate.caller_id,
                                 message=(
-                                    f"[watchdog] worker {candidate.terminal_id} "
-                                    f"({current_episode.profile}) lawfully waiting on delegated "
+                                    f"[watchdog] worker {current_episode.profile}-{candidate.terminal_id} "
+                                    f"lawfully waiting on delegated "
                                     f"sub-workers [{blocker_ids}], oldest outstanding "
                                     f"{int(now - oldest_inbound_at)}s — not stalled; chain may need "
                                     "a peek if this repeats."
@@ -725,7 +725,7 @@ class StalledCallbackWatchdog:
         return WatchdogNotice(
             terminal_id=candidate.terminal_id,
             caller_id=candidate.caller_id,
-            message=f"[watchdog] worker {candidate.terminal_id} ({episode.profile}) "
+            message=f"[watchdog] worker {episode.profile}-{candidate.terminal_id} "
             f"idle {idle_seconds}s without callback"
             f"{f' [reason: {idle_reason}]' if idle_reason is not None else ''}{suffix}",
             idle_reason=idle_reason,
@@ -879,12 +879,12 @@ class StalledCallbackWatchdog:
                 terminal_id=worker_id,
                 caller_id=worker_episode.caller_id,
                 message=(
-                    f"[watchdog] chain stalled: worker {worker_id} "
-                    f"({worker_episode.profile}) has been waiting "
+                    f"[watchdog] chain stalled: worker {worker_episode.profile}-{worker_id} "
+                    f"has been waiting "
                     f"{int(now - worker_episode.inbound_at)}s on its sub-worker "
-                    f"{notice.terminal_id} ({target_episode.profile}), which is now idle "
+                    f"{target_episode.profile}-{notice.terminal_id}, which is now idle "
                     f"{int(now - target_episode.inbound_at)}s without callback — "
-                    f"{worker_id} cannot return until this is resolved."
+                    f"{worker_episode.profile}-{worker_id} cannot return until this is resolved."
                 ),
                 idle_reason=None,
                 source_generation=worker_episode.generation,
@@ -1035,8 +1035,9 @@ class StalledCallbackWatchdog:
 
             age = int(now - episode.waiting_since)
             name = metadata.get("agent_profile") or "unknown"
+            dn = f"{name}-{terminal_id}" if name != "unknown" else terminal_id
             message = (
-                f"[waiting-inbox watchdog] terminal {terminal_id} ({name}) has had pending "
+                f"[waiting-inbox watchdog] {dn} has had pending "
                 f"inbox messages while status=waiting_user_answer for {age}s with no "
                 "auto-responder episode open — it may be stuck on an unrecognized dialog "
                 "or a false-WAITING parse. Peek it (peek_terminal / tmux attach) and nudge "
@@ -1114,8 +1115,10 @@ class StalledCallbackWatchdog:
 
             age = int(observation.oldest_pending_age_seconds)
             message_id = observation.oldest_message_id
+            profile = metadata.get("agent_profile") or ""
+            dn = f"{profile}-{terminal_id}" if profile else terminal_id
             message = (
-                f"[ready-backlog watchdog] terminal {terminal_id} has pending message "
+                f"[ready-backlog watchdog] {dn} has pending message "
                 f"{message_id} aged {age}s while status={status.value} with no open "
                 "delivery attempt or attempt progress; inspect "
                 f"`cao messages trace {message_id}`. Reconciliation remains the retry owner."

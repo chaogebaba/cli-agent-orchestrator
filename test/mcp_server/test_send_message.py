@@ -120,7 +120,8 @@ class TestSendMessageSenderIdInjection:
 
         sent_message = mock_inbox.call_args[0][1]
         assert sent_message.startswith("Here are the results")
-        assert "[Message from terminal deadbeef" in sent_message
+        assert "[Message from" in sent_message
+        assert "deadbeef" in sent_message
         assert (
             "Use the cao-mcp-server send_message MCP tool for any follow-up work — "
             "never a built-in collaboration.send_message.]" in sent_message
@@ -171,7 +172,7 @@ class TestSendMessageSenderIdInjection:
 
         sent_message = mock_inbox.call_args[0][1]
         assert sent_message.startswith(original)
-        assert sent_message.index("[Message from terminal") > len(original)
+        assert sent_message.index("[Message from") > len(original)
 
 
 class TestSendMessageCallerDefault:

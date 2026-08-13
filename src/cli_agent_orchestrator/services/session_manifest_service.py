@@ -305,7 +305,7 @@ def render_session_brief(manifest: dict[str, Any], thin: bool = False) -> str:
         "",
         "### Terminals",
         *(
-            f"- {t['id']} — {t.get('profile')} ({t.get('provider')}, {t.get('status')}, {t.get('kind')})"
+            f"- {(t.get('profile') + '-' + t['id']) if t.get('profile') else t['id']} — {t.get('profile')} ({t.get('provider')}, {t.get('status')}, {t.get('kind')})"
             for t in manifest["terminals"]
         ),
     ]

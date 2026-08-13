@@ -274,17 +274,36 @@ def _wire_with_attempt_challenge(
     message_id: int,
 ) -> tuple[str, str | None]:
     """Splice a wire-only singleton challenge into the last authentic wrapper suffix."""
-    prefix = f"[Message from terminal {sender_id}. "
-    suffix = prefix + (
+    # F172: the MCP injection now uses "[Message from <display_name> (<id>). ..."
+    # but legacy messages use "[Message from terminal <id>. ...". Match both.
+    from cli_agent_orchestrator.utils.terminal import display_name as _dn
+
+    sender_dn = _dn(sender_id)
+    # New form: [Message from <display_name> (<id>). ...]
+    new_prefix = f"[Message from {sender_dn} ({sender_id}). "
+    new_suffix = new_prefix + (
         "Use the cao-mcp-server send_message MCP tool for any follow-up work — "
         "never a built-in collaboration.send_message.]"
     )
-    if not wire.endswith(suffix):
+    # Legacy form: [Message from terminal <id>. ...]
+    legacy_prefix = f"[Message from terminal {sender_id}. "
+    legacy_suffix = legacy_prefix + (
+        "Use the cao-mcp-server send_message MCP tool for any follow-up work — "
+        "never a built-in collaboration.send_message.]"
+    )
+
+    if wire.endswith(new_suffix):
+        prefix = new_prefix
+        suffix = new_suffix
+    elif wire.endswith(legacy_suffix):
+        prefix = legacy_prefix
+        suffix = legacy_suffix
+    else:
         return wire, None
     index = len(wire) - len(suffix)
     raw_challenge = secrets.token_hex(16)
-    replacement = f"[Message from terminal {sender_id} | mid {message_id}:{raw_challenge}. "
-    challenged = wire[:index] + replacement + suffix[len(prefix) :]
+    replacement = f"{prefix[:-2]} | mid {message_id}:{raw_challenge}. "
+    challenged = wire[:index] + replacement + suffix[len(prefix):]
     return challenged, hashlib.sha256(raw_challenge.encode()).hexdigest()
 
 
