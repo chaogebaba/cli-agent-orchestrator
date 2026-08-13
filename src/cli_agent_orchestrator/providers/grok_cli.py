@@ -154,7 +154,7 @@ class GrokCliProvider(BaseProvider):
 
     def _build_grok_command(self) -> str:
         profile = self._load_profile()
-        command_parts = [GROK_BINARY, "--always-approve", "--minimal"]
+        command_parts = [GROK_BINARY, "--always-approve", "--permission-mode", "bypassPermissions", "--minimal"]
 
         if profile and profile.mcpServers:
             ensure_grok_mcp_servers(profile.mcpServers, terminal_id=self.terminal_id)
