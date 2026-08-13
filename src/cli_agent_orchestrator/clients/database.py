@@ -8212,7 +8212,11 @@ def get_supervisor_callback_batch(
                 adopted_ids.append(row_id)
 
             # D8: Bootstrap if cursor is NULL
-            cursor = mailbox.callback_notified_through_id
+            # F157 hotfix: also respect consumed_through_id so acked messages
+            # are never re-pushed by the callback runner.
+            notified_cursor = mailbox.callback_notified_through_id
+            consumption_cursor = int(mailbox.consumed_through_id) if mailbox.consumed_through_id else 0
+            cursor = notified_cursor
             if cursor is None:
                 min_id_row = (
                     db.query(func.min(InboxModel.id))
@@ -8227,6 +8231,10 @@ def get_supervisor_callback_batch(
                 cursor = max(0, (min_id_row or 1) - 1)
                 mailbox.callback_notified_through_id = cursor
                 bootstrap_mode = "current_generation_pending_replay"
+
+            # F157 hotfix: effective cursor is max(notified, consumed) so that
+            # messages the supervisor already acked are never re-pushed.
+            cursor = max(cursor, consumption_cursor)
 
             # Enqueue adopted rows below cursor into replay
             for row_id in adopted_ids:

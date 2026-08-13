@@ -696,3 +696,72 @@ class TestM27:
             assert outcome.processed < 10
         finally:
             inbox_service._delivery_loop = old_loop
+
+
+# ===========================================================================
+# F157 hotfix — callback batch respects consumption cursor
+# ===========================================================================
+
+
+class TestF157ConsumptionCursorRespected:
+    """Regression: if consumed_through_id > callback_notified_through_id,
+    the batch must NOT return rows that are already acked (consumed).
+    Root cause: BUGS.md:518 recurrence — duplicate-delivery."""
+
+    def test_acked_message_excluded_from_forward_batch(self, f136_sessions):
+        """consumed_through_id=5, callback_notified_through_id=2 → rows 3,4,5
+        are already acked and must NOT appear in the batch."""
+        sessions, eng = f136_sessions
+
+        mailbox_id = "mb_f157"
+        terminal_id = "t_f157"
+        generation = 1
+
+        # Seed mailbox with notified cursor behind consumption cursor
+        with sessions.begin() as db:
+            db.add(TerminalModel(
+                id=terminal_id, tmux_session="test", tmux_window=terminal_id,
+                provider="claude_code", agent_profile="supervisor",
+                lifecycle_generation=generation,
+            ))
+            db.add(MailboxModel(
+                id=mailbox_id, session_name="test_f157", role="supervisor",
+                current_terminal_id=terminal_id, generation=generation,
+                consumed_through_id=5,  # Supervisor already acked through 5
+                schema_version=1,
+                callback_notified_through_id=2,  # Callback runner is behind
+                cc_inbox_path="/tmp/f157_inbox.json",
+                cc_inbox_path_version=0,
+                created_at=_NOW, updated_at=_NOW,
+            ))
+            db.add(MailboxIncarnationModel(
+                mailbox_id=mailbox_id, generation=generation,
+                terminal_id=terminal_id, published_at=_NOW,
+            ))
+
+        # Seed inbox rows 3, 4, 5 (already consumed) and 6, 7 (not consumed)
+        for row_id in (3, 4, 5, 6, 7):
+            _inbox_row(sessions, row_id, mailbox_id=mailbox_id,
+                       terminal_id=terminal_id, generation=generation)
+
+        # Call the batch function
+        result = get_supervisor_callback_batch(
+            mailbox_id=mailbox_id,
+            terminal_id=terminal_id,
+            generation=generation,
+            limit=50,
+        )
+
+        assert result.kind == "ok"
+        returned_ids = [r.inbox_row_id for r in result.rows]
+
+        # Rows 3, 4, 5 are already consumed — must NOT be in the batch
+        for acked_id in (3, 4, 5):
+            assert acked_id not in returned_ids, (
+                f"Row {acked_id} was already acked (consumed_through_id=5) "
+                f"but appeared in callback batch — duplicate delivery bug"
+            )
+
+        # Rows 6, 7 should be present (above both cursors)
+        assert 6 in returned_ids
+        assert 7 in returned_ids
