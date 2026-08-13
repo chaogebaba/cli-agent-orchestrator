@@ -15,7 +15,11 @@ import time
 import threading
 from typing import Optional
 
-from cli_agent_orchestrator.clients.database import get_terminal_metadata, update_terminal_metadata
+from cli_agent_orchestrator.clients.database import (
+    get_terminal_last_doorbell_row_id,
+    get_terminal_metadata,
+    set_terminal_last_doorbell_row_id,
+)
 from cli_agent_orchestrator.services.config_service import ConfigService
 
 logger = logging.getLogger(__name__)
@@ -33,14 +37,11 @@ _WARN_INTERVAL_S = 60.0
 
 
 def _get_last_doorbell_row_id(terminal_id: str) -> int:
-    """Read last_doorbell_row_id from terminal metadata, fallback to in-process dict."""
+    """Read last_doorbell_row_id from dedicated DB column (F175: clobber-proof)."""
     try:
-        metadata = get_terminal_metadata(terminal_id)
-        if metadata:
-            md = metadata.get("metadata") or {}
-            stored = md.get("last_doorbell_row_id")
-            if stored is not None:
-                return int(stored)
+        stored = get_terminal_last_doorbell_row_id(terminal_id)
+        if stored > 0:
+            return stored
     except Exception:
         pass
     with _last_doorbell_lock:
@@ -48,15 +49,11 @@ def _get_last_doorbell_row_id(terminal_id: str) -> int:
 
 
 def _persist_last_doorbell_row_id(terminal_id: str, row_id: int) -> None:
-    """Persist last_doorbell_row_id in terminal metadata (best-effort)."""
+    """Persist last_doorbell_row_id in dedicated DB column (F175: clobber-proof)."""
     with _last_doorbell_lock:
         _last_doorbell_row_id[terminal_id] = row_id
     try:
-        metadata = get_terminal_metadata(terminal_id)
-        if metadata:
-            md = metadata.get("metadata") or {}
-            md["last_doorbell_row_id"] = row_id
-            update_terminal_metadata(terminal_id, md)
+        set_terminal_last_doorbell_row_id(terminal_id, row_id)
     except Exception as e:
         logger.debug("f168_doorbell persist failed for %s: %s", terminal_id, e)
 

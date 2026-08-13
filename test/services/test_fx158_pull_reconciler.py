@@ -250,7 +250,7 @@ class TestAC1ReconcilerBypassesDeliverPending:
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata",
             ) as mock_meta,
             patch(
-                "cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata",
+                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id",
             ),
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
@@ -417,7 +417,7 @@ class TestAC2GraceWindow:
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata",
             ) as mock_meta,
             patch(
-                "cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata",
+                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id",
             ),
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
@@ -504,7 +504,7 @@ class TestAC3CursorConsumed:
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata",
             ) as mock_meta,
             patch(
-                "cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata",
+                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id",
             ),
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
@@ -693,7 +693,7 @@ class TestAC8NotifyCursorSemantics:
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata",
             ) as mock_meta,
             patch(
-                "cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata",
+                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id",
             ) as mock_update,
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
@@ -717,7 +717,7 @@ class TestAC8NotifyCursorSemantics:
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata",
             ) as mock_meta,
             patch(
-                "cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata",
+                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id",
             ) as mock_update,
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
@@ -891,7 +891,7 @@ class TestAC14SingleCursorRead:
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata",
             ) as mock_meta,
             patch(
-                "cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata",
+                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id",
             ),
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",

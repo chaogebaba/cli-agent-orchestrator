@@ -568,7 +568,7 @@ class TestAC7NativeRingIndependentOfTeammatePush:
         with (
             patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_cfg,
             patch("cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata") as mock_meta,
-            patch("cli_agent_orchestrator.services.doorbell_service.update_terminal_metadata"),
+            patch("cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"),
             patch("cli_agent_orchestrator.services.doorbell_service._attempt_native_ring", return_value="rang") as mock_native,
         ):
             # doorbell on, native on
@@ -846,7 +846,7 @@ class TestAC12FallbackFanIn:
         with (
             patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_cfg,
             patch("cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata") as mock_meta,
-            patch("cli_agent_orchestrator.services.doorbell_service.update_terminal_metadata"),
+            patch("cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"),
             patch("cli_agent_orchestrator.services.doorbell_service._attempt_native_ring", return_value=native_reason),
             patch("cli_agent_orchestrator.services.doorbell_service._attempt_gated_ring", return_value="rang") as mock_gated,
             patch("cli_agent_orchestrator.services.teammate_push_service._should_teammate_push", return_value=True),
@@ -928,7 +928,7 @@ class TestAC14Dedup:
         with (
             patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_cfg,
             patch("cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata") as mock_meta,
-            patch("cli_agent_orchestrator.services.doorbell_service.update_terminal_metadata"),
+            patch("cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"),
             patch("cli_agent_orchestrator.services.doorbell_service._attempt_native_ring", return_value="rang"),
         ):
             def cfg_side(path, default=None):
@@ -947,7 +947,7 @@ class TestAC14Dedup:
         with (
             patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_cfg,
             patch("cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata") as mock_meta,
-            patch("cli_agent_orchestrator.services.doorbell_service.update_terminal_metadata"),
+            patch("cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"),
             patch("cli_agent_orchestrator.services.doorbell_service._attempt_native_ring") as mock_native,
         ):
             mock_cfg.get.side_effect = cfg_side
@@ -964,7 +964,7 @@ class TestAC14Dedup:
         with (
             patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_cfg,
             patch("cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata") as mock_meta,
-            patch("cli_agent_orchestrator.services.doorbell_service.update_terminal_metadata"),
+            patch("cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"),
             patch("cli_agent_orchestrator.services.doorbell_service._attempt_native_ring", return_value="version_out_of_band"),
             patch("cli_agent_orchestrator.services.doorbell_service._attempt_gated_ring", return_value="rang"),
             patch("cli_agent_orchestrator.services.teammate_push_service._should_teammate_push", return_value=True),
@@ -986,7 +986,7 @@ class TestAC14Dedup:
         with (
             patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_cfg,
             patch("cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata") as mock_meta,
-            patch("cli_agent_orchestrator.services.doorbell_service.update_terminal_metadata"),
+            patch("cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"),
             patch("cli_agent_orchestrator.services.doorbell_service._attempt_native_ring") as mock_native,
         ):
             def cfg_side2(path, default=None):
@@ -1018,7 +1018,7 @@ class TestAC15ConfigMatrix:
         with (
             patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_cfg,
             patch("cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata") as mock_meta,
-            patch("cli_agent_orchestrator.services.doorbell_service.update_terminal_metadata"),
+            patch("cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"),
             patch("cli_agent_orchestrator.services.doorbell_service._attempt_native_ring") as mock_native,
             patch("cli_agent_orchestrator.services.doorbell_service._attempt_gated_ring", return_value="rang"),
             patch("cli_agent_orchestrator.services.teammate_push_service._should_teammate_push", return_value=True),
@@ -1047,7 +1047,7 @@ class TestAC15ConfigMatrix:
         with (
             patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_cfg,
             patch("cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata") as mock_meta,
-            patch("cli_agent_orchestrator.services.doorbell_service.update_terminal_metadata"),
+            patch("cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"),
             patch("cli_agent_orchestrator.services.doorbell_service._attempt_native_ring") as mock_native,
             patch("cli_agent_orchestrator.services.doorbell_service._attempt_gated_ring", return_value="rang"),
             patch("cli_agent_orchestrator.services.teammate_push_service._should_teammate_push", return_value=True),

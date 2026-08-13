@@ -21,7 +21,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from cli_agent_orchestrator.clients.database import get_mailbox_consumption_cursor, get_terminal_metadata, update_terminal_metadata
+from cli_agent_orchestrator.clients.database import (
+    get_mailbox_consumption_cursor,
+    get_terminal_last_notified_inbox_id,
+    get_terminal_metadata,
+    set_terminal_last_notified_inbox_id,
+)
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.services.config_service import ConfigService
 
@@ -339,40 +344,48 @@ def _resolve_inbox_path(terminal_id: str) -> Optional[Path]:
 
 
 def _get_last_notified_id(terminal_id: str) -> int:
-    """Read last_notified_inbox_id from terminal metadata (legacy SHOULD-2)."""
+    """Read last_notified_inbox_id from dedicated DB column (F175: clobber-proof).
+
+    Falls back to in-memory dict for hot-path speed when DB has no value yet.
+    """
     try:
-        metadata = get_terminal_metadata(terminal_id)
-        if metadata:
-            md = metadata.get("metadata") or {}
-            stored = md.get("last_notified_inbox_id")
-            if stored is not None:
-                return int(stored)
+        stored = get_terminal_last_notified_inbox_id(terminal_id)
+        if stored > 0:
+            return stored
     except Exception:
         pass
     return _last_notified.get(terminal_id, 0)
 
 
 def _persist_last_notified_id(terminal_id: str, message_id: int) -> None:
-    """Persist last_notified_inbox_id in terminal metadata (best-effort)."""
+    """Persist last_notified_inbox_id in dedicated DB column (F175: clobber-proof)."""
     _last_notified[terminal_id] = message_id
     try:
-        metadata = get_terminal_metadata(terminal_id)
-        if metadata:
-            md = metadata.get("metadata") or {}
-            md["last_notified_inbox_id"] = message_id
-            update_terminal_metadata(terminal_id, md)
+        set_terminal_last_notified_inbox_id(terminal_id, message_id)
     except Exception as e:
         logger.debug(f"teammate_push: best-effort persist failed for {terminal_id}: {e}")
 
 
-def _build_entry(worker_name: str, message_preview: str, msg_count: int) -> Dict[str, Any]:
-    """Build a CC inbox entry per the pinned schema (msgV:1)."""
+def _build_entry(worker_name: str, message_preview: str, msg_count: int, *, mailbox_id: str = "", first_row_id: int = 0) -> Dict[str, Any]:
+    """Build a CC inbox entry per the pinned schema (msgV:1).
+
+    F175: msg_id is deterministic from (mailbox_id, first_row_id) when provided,
+    so duplicate appends for the same logical notification become already_present
+    at the file level even when the high-water was clobbered.
+    """
     text_body = (
         f"[CAO:{worker_name}] {message_preview[:_TEXT_PREVIEW_CHARS]}\n\n"
         f"---\n{msg_count} message(s) ready. Drain: list_messages -> ack_messages"
     )
     summary_raw = f"{worker_name}: {message_preview[:80]}"
     summary = summary_raw[:_SUMMARY_MAX_CHARS]
+
+    # F175: deterministic msg_id when mailbox context is available
+    if mailbox_id and first_row_id > 0:
+        msg_id = callback_notification_id(mailbox_id, first_row_id)
+    else:
+        msg_id = str(uuid.uuid4())
+
     return {
         "type": "message",
         "from": _TEAMMATE_FROM,
@@ -381,7 +394,7 @@ def _build_entry(worker_name: str, message_preview: str, msg_count: int) -> Dict
         "summary": summary,
         "read": False,
         "msgV": 1,
-        "msg_id": str(uuid.uuid4()),
+        "msg_id": msg_id,
     }
 
 
@@ -391,7 +404,11 @@ def _iso_now() -> str:
 
 
 def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> bool:
-    """Write an entry to the CC inbox file under lockfile protection (legacy)."""
+    """Write an entry to the CC inbox file under lockfile protection (legacy).
+
+    F175: deduplicates by msg_id — if an entry with the same msg_id already
+    exists in the file, returns True (idempotent success) without appending.
+    """
     lock_path = Path(str(inbox_path) + ".lock")
     try:
         inbox_path.parent.mkdir(parents=True, exist_ok=True)
@@ -414,6 +431,15 @@ def _write_inbox_entry(inbox_path: Path, entry: Dict[str, Any]) -> bool:
                     entries_list = parsed
             except (json.JSONDecodeError, OSError):
                 return False
+
+        # F175: file-level dedup by msg_id — prevent duplicate appends
+        entry_msg_id = entry.get("msg_id")
+        if entry_msg_id:
+            for existing in entries_list:
+                if existing.get("msg_id") == entry_msg_id:
+                    # Already present — idempotent success
+                    return True
+
         entries_list.append(entry)
         tmp_path = inbox_path.with_suffix(".tmp")
         try:
@@ -456,7 +482,7 @@ class PushOutcome:
     message_ids: tuple  # diagnostic only (N1)
 
 
-def attempt_teammate_push_reported(terminal_id: str, messages: List[InboxMessage]) -> PushOutcome:
+def attempt_teammate_push_reported(terminal_id: str, messages: List[InboxMessage], *, mailbox_id: str = "") -> PushOutcome:
     """Push a notification entry to the CC native inbox with structured outcome.
 
     Contains the body formerly in attempt_teammate_push, with each early return
@@ -481,7 +507,10 @@ def attempt_teammate_push_reported(terminal_id: str, messages: List[InboxMessage
     first_msg = new_messages[0]
     worker_name = first_msg.sender_id
     message_preview = first_msg.message.split("\n", 1)[0] if first_msg.message else ""
-    entry = _build_entry(worker_name, message_preview, len(new_messages))
+    # F175: derive mailbox_id for deterministic msg_id when not explicitly passed
+    _mbid = mailbox_id or getattr(first_msg, "logical_receiver_id", "") or ""
+    entry = _build_entry(worker_name, message_preview, len(new_messages),
+                         mailbox_id=_mbid, first_row_id=first_msg.id)
     success = _write_inbox_entry(inbox_path, entry)
     if success:
         max_id = max(m.id for m in new_messages)

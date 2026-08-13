@@ -151,7 +151,7 @@ class TestM1:
             },
         )
         monkeypatch.setattr(
-            "cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata",
+            "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id",
             lambda *a, **k: None,
         )
         msg = InboxMessage(

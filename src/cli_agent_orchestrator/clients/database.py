@@ -156,6 +156,11 @@ class TerminalModel(Base):
     # accessors; never exposed through the worker-reachable metadata API.
     # Protected by a SQLite BEFORE UPDATE trigger (immutable once non-NULL).
     worktree_info = Column("worktree_info", Text, nullable=True)
+    # F175: Dedicated high-water columns for server-internal dedup state.
+    # Stored outside metadata_json so supervisor update_metadata (whole-dict
+    # REPLACE) cannot clobber them.
+    last_notified_inbox_id = Column(Integer, nullable=True)
+    last_doorbell_row_id = Column(Integer, nullable=True)
     last_active = Column(DateTime(timezone=True), default=_utcnow)
     __table_args__ = (
         CheckConstraint(
@@ -966,6 +971,26 @@ def init_db() -> None:
     _migrate_mailbox_schema_version()
     _migrate_f136_callback_delivery()
     _migrate_f138_orphan_reconciliation()
+    _migrate_f175_dedup_columns()
+
+
+def _migrate_f175_dedup_columns() -> None:
+    """F175: Add dedicated dedup high-water columns to terminals table.
+
+    These live outside metadata_json so supervisor update_metadata (whole-dict
+    REPLACE) cannot clobber server-internal dedup state.
+    """
+    with engine.begin() as connection:
+        columns = connection.execute(text("PRAGMA table_info(terminals)")).mappings().all()
+        col_names = {col["name"] for col in columns}
+        if "last_notified_inbox_id" not in col_names:
+            connection.execute(
+                text("ALTER TABLE terminals ADD COLUMN last_notified_inbox_id INTEGER")
+            )
+        if "last_doorbell_row_id" not in col_names:
+            connection.execute(
+                text("ALTER TABLE terminals ADD COLUMN last_doorbell_row_id INTEGER")
+            )
 
 
 def _migrate_f136_callback_delivery() -> None:
@@ -2633,6 +2658,55 @@ def update_terminal_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]
             return False
         terminal.metadata_json = _json.dumps(metadata) if metadata else None
         db.commit()
+        return True
+
+
+# ---------------------------------------------------------------------------
+# F175: Dedicated dedup high-water accessors (clobber-proof)
+# ---------------------------------------------------------------------------
+
+
+def get_terminal_last_notified_inbox_id(terminal_id: str) -> int:
+    """Read the dedicated last_notified_inbox_id column (0 if NULL/missing)."""
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal and terminal.last_notified_inbox_id is not None:
+            return int(terminal.last_notified_inbox_id)
+    return 0
+
+
+def set_terminal_last_notified_inbox_id(terminal_id: str, message_id: int) -> bool:
+    """Atomically set last_notified_inbox_id (monotonic — only advances)."""
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return False
+        current = terminal.last_notified_inbox_id or 0
+        if message_id > current:
+            terminal.last_notified_inbox_id = message_id
+            db.commit()
+        return True
+
+
+def get_terminal_last_doorbell_row_id(terminal_id: str) -> int:
+    """Read the dedicated last_doorbell_row_id column (0 if NULL/missing)."""
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal and terminal.last_doorbell_row_id is not None:
+            return int(terminal.last_doorbell_row_id)
+    return 0
+
+
+def set_terminal_last_doorbell_row_id(terminal_id: str, row_id: int) -> bool:
+    """Atomically set last_doorbell_row_id (monotonic — only advances)."""
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return False
+        current = terminal.last_doorbell_row_id or 0
+        if row_id > current:
+            terminal.last_doorbell_row_id = row_id
+            db.commit()
         return True
 
 

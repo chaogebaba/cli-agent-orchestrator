@@ -131,7 +131,7 @@ class TestAC2FlagOnWellFormedEntry:
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
             patch(
-                "cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata"
+                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"
             ) as mock_update,
         ):
             mock_cfg.get.return_value = True
@@ -167,7 +167,7 @@ class TestAC2FlagOnWellFormedEntry:
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch("cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata"),
+            patch("cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"),
         ):
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
             messages = [_make_message(msg_id=1, sender_id="grok_dev")]
@@ -190,7 +190,7 @@ class TestAC3WriteFailureGracefulFallback:
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch("cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata"),
+            patch("cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"),
         ):
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
             messages = [_make_message(msg_id=1)]
@@ -209,7 +209,7 @@ class TestAC3WriteFailureGracefulFallback:
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch("cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata"),
+            patch("cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"),
         ):
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
             messages = [_make_message(msg_id=1)]
@@ -227,7 +227,7 @@ class TestAC3WriteFailureGracefulFallback:
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch("cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata"),
+            patch("cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"),
         ):
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
             messages = [_make_message(msg_id=1)]
@@ -251,7 +251,7 @@ class TestAC3WriteFailureGracefulFallback:
                     "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
                 ) as mock_meta,
                 patch(
-                    "cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata"
+                    "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"
                 ),
             ):
                 mock_meta.return_value = _metadata_with_path(str(inbox_path))
@@ -339,7 +339,7 @@ class TestAC5StaleInboxPath:
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch("cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata"),
+            patch("cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"),
         ):
             mock_meta.return_value = _metadata_with_path("/proc/no_such_cao_path/inbox.json")
             messages = [_make_message(msg_id=1)]
@@ -392,7 +392,7 @@ class TestAC7PullSettlementUnchanged:
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch("cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata"),
+            patch("cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"),
         ):
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
             result = attempt_teammate_push("sup-001", messages)
@@ -417,7 +417,7 @@ class TestSHOULD2DedupPersistence:
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch("cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata"),
+            patch("cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"),
         ):
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
             result = attempt_teammate_push("sup-001", messages)
@@ -438,7 +438,7 @@ class TestSHOULD2DedupPersistence:
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
-            patch("cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata"),
+            patch("cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"),
         ):
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
             result = attempt_teammate_push("sup-001", messages)
@@ -457,7 +457,7 @@ class TestSHOULD2DedupPersistence:
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
             patch(
-                "cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata"
+                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"
             ) as mock_update,
         ):
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
@@ -466,11 +466,8 @@ class TestSHOULD2DedupPersistence:
 
         # In-memory state should be updated.
         assert _last_notified["sup-001"] == 9
-        # Metadata update should have been called with id=9.
-        mock_update.assert_called_once()
-        call_args = mock_update.call_args[0]
-        assert call_args[0] == "sup-001"
-        assert call_args[1]["last_notified_inbox_id"] == 9
+        # Dedicated column setter should have been called with id=9.
+        mock_update.assert_called_once_with("sup-001", 9)
 
 
 class TestWriteInboxAppend:
@@ -566,7 +563,7 @@ class TestOnInsertConfigGateBypass:
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
             patch(
-                "cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata"
+                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"
             ),
         ):
             mock_cfg.get.return_value = False
@@ -592,7 +589,7 @@ class TestOnInsertConfigGateBypass:
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
             patch(
-                "cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata"
+                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"
             ),
         ):
             mock_meta.return_value = _metadata_without_path()
@@ -614,7 +611,7 @@ class TestOnInsertConfigGateBypass:
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata"
             ) as mock_meta,
             patch(
-                "cli_agent_orchestrator.services.teammate_push_service.update_terminal_metadata"
+                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id"
             ),
         ):
             mock_meta.return_value = _metadata_with_path(str(inbox_path))
