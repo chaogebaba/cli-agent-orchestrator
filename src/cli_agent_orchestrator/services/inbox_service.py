@@ -464,6 +464,7 @@ class CallbackRunOutcome:
     needs_immediate_wake: bool = False
     retry_delay_s: float | None = None
     reason: str = ""
+    max_written_row_id: int = 0  # F168 D4: highest row id written this run
 
 
 def _get_backoff_delay(terminal_id: str) -> float:
@@ -859,6 +860,7 @@ class InboxService:
             retryable_failures = 0
             identity_conflicts = 0
             processed = 0
+            _max_written_row_id = 0  # F168 D4: track highest row id written
 
             # D13: Process replay rows first, then forward rows
             for row in batch.rows:
@@ -884,6 +886,8 @@ class InboxService:
 
                 if result.kind == "written":
                     written += 1
+                    if row.inbox_row_id > _max_written_row_id:
+                        _max_written_row_id = row.inbox_row_id
                 elif result.kind == "already_present":
                     already_present += 1
                 elif result.kind == "retryable_failure":
@@ -950,6 +954,7 @@ class InboxService:
                 needs_immediate_wake=needs_wake,
                 retry_delay_s=_get_backoff_delay(terminal_id) if retryable_failures else None,
                 reason="ok",
+                max_written_row_id=_max_written_row_id,
             )
         except Exception as exc:
             logger.exception("f136_delivery_run_error terminal=%s", terminal_id)
@@ -995,6 +1000,19 @@ class InboxService:
 
     def _f136_post_delivery(self, terminal_id: str, outcome: "CallbackRunOutcome") -> None:
         """D15: After delivery, decide: immediate rerun, delayed retry, or idle."""
+        # F168 D2: ring the doorbell before entering _delivery_seq_guard.
+        # D3: best-effort, isolated — exceptions never propagate.
+        if outcome.written > 0 and outcome.max_written_row_id > 0:
+            try:
+                from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+                ring_supervisor_doorbell(
+                    terminal_id,
+                    outcome.max_written_row_id,
+                    written_count=outcome.written,
+                )
+            except Exception as _bell_exc:
+                logger.debug("f168_doorbell_post_delivery_error terminal=%s: %s", terminal_id, _bell_exc)
+
         post_immediate = False
         arm_delayed: float | None = None
 
@@ -2093,7 +2111,17 @@ class InboxService:
 
                 if _should_teammate_push(terminal_id):
                     try:
-                        attempt_teammate_push(terminal_id, messages)
+                        push_result = attempt_teammate_push(terminal_id, messages)
+                        # F168 D9: ring doorbell after push write.
+                        if push_result and messages:
+                            try:
+                                from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+                                max_id = max(m.id for m in messages)
+                                ring_supervisor_doorbell(
+                                    terminal_id, max_id, written_count=1,
+                                )
+                            except Exception:
+                                pass
                     except Exception as _push_exc:
                         logger.debug(f"teammate_push side-effect failed: {_push_exc}")
                 return
@@ -3237,6 +3265,17 @@ class InboxService:
                 outcome: PushOutcome = attempt_teammate_push_reported(
                     mb.current_terminal_id, messages
                 )
+
+                # F168 D9: ring doorbell after reconciler push write.
+                if outcome.pushed and outcome.message_ids:
+                    try:
+                        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+                        max_id = max(outcome.message_ids)
+                        ring_supervisor_doorbell(
+                            mb.current_terminal_id, max_id, written_count=1,
+                        )
+                    except Exception:
+                        pass
 
                 # D5: instrumentation — record attempt row
                 if outcome.reason == "pushed":
