@@ -499,14 +499,14 @@ def test_view_reads_incremental_slot_only(monkeypatch) -> None:
     )
 
 
-def test_trace_manifest_is_byte_exact_and_has_35_hits() -> None:
+def test_trace_manifest_is_byte_exact_and_has_37_hits() -> None:
     manifest_path = (
         Path(__file__).parents[2]
         / "src/cli_agent_orchestrator/kernel/receiver_state/trace_manifest.txt"
     )
     expected = manifest_path.read_text(encoding="utf-8")
     _assert_trace_manifest_current(Path(__file__).parents[2], expected)
-    assert len([line for line in expected.splitlines() if line]) == 35
+    assert len([line for line in expected.splitlines() if line]) == 37
 
 
 def test_trace_manifest_failure_names_regen_command(tmp_path: Path) -> None:

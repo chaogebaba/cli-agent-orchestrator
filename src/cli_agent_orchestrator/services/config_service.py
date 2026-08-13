@@ -204,6 +204,13 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_SUPERVISOR_WAKE_PRIORITY": ("supervisor.wake.priority", "str", "next"),
     "CAO_SUPERVISOR_WAKE_VERIFY_TIMEOUT_S": ("supervisor.wake.verify_timeout_s", "float", 5.0),
     "CAO_SUPERVISOR_WAKE_MAX_RECORD_AGE_S": ("supervisor.wake.max_record_age_s", "float", 900.0),
+    # FX181: quiescence watchdog config paths (D7)
+    "CAO_SUPERVISOR_WATCHDOG_QUIESCENCE": ("supervisor.watchdog.quiescence", "bool", False),
+    "CAO_SUPERVISOR_WATCHDOG_QUIESCENCE_GRACE_S": (
+        "supervisor.watchdog.quiescence_grace_s",
+        "float",
+        120.0,
+    ),
 }
 
 # Reverse index: dotted path -> env var name, for get()'s env-precedence lookup.
@@ -473,6 +480,8 @@ _ALL_PATHS = sorted(
         "supervisor.mailbox_pull",
         "supervisor.teammate_push",
         "supervisor.doorbell",
+        "supervisor.watchdog.quiescence",
+        "supervisor.watchdog.quiescence_grace_s",
     }
 )
 
