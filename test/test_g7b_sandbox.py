@@ -197,10 +197,49 @@ def test_native_home_guard_and_every_roster_consumer_is_injected() -> None:
         "services/fork_context_service.py",
         "services/epoch_recovery_service.py",
         "services/message_trace_service.py",
+        "services/cc_session_registry.py",
         "api/main.py",
     }
     for relative in roster:
         assert "provider_home(" in (SOURCE / relative).read_text(encoding="utf-8")
+
+
+def test_cc_session_registry_reads_the_injected_plane_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F184: the registry must resolve its base per call from the injected plane.
+
+    A literal Path.home()/".claude"/"sessions" would read the operator's live records
+    from cao-server (which runs outside the worker's bwrap), so the read must follow
+    the plane, and must fail closed — not fall back to the native home — when the
+    plane is unsafe.
+    """
+    from cli_agent_orchestrator.services import cc_session_registry
+
+    plane = _plane(tmp_path, "claude_code")
+    plane.sessions.mkdir(parents=True)
+    (plane.sessions / "4242.json").write_text(
+        json.dumps(
+            {
+                "sessionId": "s-1",
+                "messagingSocketPath": "/tmp/sock",
+                "procStart": 7,
+                "statusUpdatedAt": "2026-08-13T12:00:01+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cc_session_registry, "provider_home", lambda _provider: plane)
+    records = cc_session_registry.read_registry()
+    assert [record.pid for record in records] == [4242]
+    assert cc_session_registry.verify_wake(records[0], "2026-08-13T12:00:00+00:00", timeout_s=1)
+
+    def unsafe(_provider: str) -> ProviderHome:
+        raise SandboxProviderUnsafe("sandbox_provider_unsafe:claude_code")
+
+    monkeypatch.setattr(cc_session_registry, "provider_home", unsafe)
+    assert cc_session_registry.read_registry() == []
+    assert not cc_session_registry.verify_wake(records[0], "2026-08-13T12:00:00+00:00", timeout_s=1)
 
 
 def test_every_native_home_consumer_reads_the_injected_plane(

@@ -33,6 +33,8 @@ from cli_agent_orchestrator.services.fork_context_service import (
     _descendants,
     pane_pid,
 )
+from cli_agent_orchestrator.utils.provider_plane import provider_home
+from cli_agent_orchestrator.utils.sandbox_guard import SandboxProviderUnsafe
 from cli_agent_orchestrator.utils.tmux_command import tmux_argv
 
 logger = logging.getLogger(__name__)
@@ -51,8 +53,20 @@ _DEFAULT_MAX_RECORD_AGE_S = 900.0
 # D8: default verify timeout
 _DEFAULT_VERIFY_TIMEOUT_S = 5.0
 
-# Registry base path
-_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
+
+# Registry base path — resolved per call through the injected provider plane, never
+# from Path.home() directly: cao-server runs OUTSIDE the worker's bwrap, so a literal
+# ~/.claude would make a sandboxed instance read the operator's real session registry
+# and write to the operator's live Claude Code sockets (g7b native-home guard).
+def _sessions_dir() -> Optional[Path]:
+    """Injected ~/.claude/sessions equivalent, or None when the plane is unusable."""
+    try:
+        return provider_home("claude_code").sessions
+    except SandboxProviderUnsafe as exc:
+        # Fail closed: callers degrade to the nudge transport. Log so the operator can
+        # tell an unusable plane apart from a genuinely empty registry / unverified wake.
+        logger.warning("f170_doorbell registry_plane_unusable reason=%s", exc)
+        return None
 
 
 @dataclass
@@ -157,9 +171,9 @@ def _read_proc_start(pid: int) -> Optional[int]:
 
 def read_registry(sessions_dir: Optional[Path] = None) -> list[RegistryRecord]:
     """Read all valid session records from ~/.claude/sessions/."""
-    base = sessions_dir or _SESSIONS_DIR
+    base = sessions_dir or _sessions_dir()
     records: list[RegistryRecord] = []
-    if not base.is_dir():
+    if base is None or not base.is_dir():
         return records
     for entry in base.iterdir():
         if not entry.name.endswith(".json"):
@@ -444,7 +458,9 @@ def verify_wake(
             ConfigService.get("supervisor.wake.verify_timeout_s", default=_DEFAULT_VERIFY_TIMEOUT_S)
         )
 
-    base = sessions_dir or _SESSIONS_DIR
+    base = sessions_dir or _sessions_dir()
+    if base is None:
+        return False
     record_path = base / f"{record.pid}.json"
     deadline = time.monotonic() + timeout_s
     poll_interval = 0.5
