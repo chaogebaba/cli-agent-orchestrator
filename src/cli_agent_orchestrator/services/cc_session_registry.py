@@ -322,7 +322,7 @@ def resolve_target(
         from datetime import datetime, timezone
         updated = datetime.fromisoformat(record.updated_at.replace("Z", "+00:00"))
         age_s = (datetime.now(timezone.utc) - updated).total_seconds()
-        if age_s > max_record_age_s:
+        if age_s < 0 or age_s > max_record_age_s:
             return ResolveResult(refusal_reason="record_stale")
     except (ValueError, TypeError, AttributeError):
         # If updatedAt is unparseable, treat as stale

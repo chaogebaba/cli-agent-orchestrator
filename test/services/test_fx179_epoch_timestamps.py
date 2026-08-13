@@ -478,3 +478,89 @@ class TestFailClosedPreserved:
             result = resolve_target("term-01", "s", "win", sessions_dir=sessions_dir)
 
         assert result.refusal_reason == "record_stale"
+
+
+
+# ===========================================================================
+# Test: S2 fold — negative-age (far-future timestamps) fail-closed
+# ===========================================================================
+
+
+class TestNegativeAgeFarFutureStale:
+    """Far-future timestamps (negative age_s) are rejected as stale."""
+
+    def test_far_future_epoch_seconds_int_is_stale(self, sessions_dir):
+        """11-digit epoch-seconds (year 2286+) → negative age → record_stale."""
+        from cli_agent_orchestrator.services.cc_session_registry import resolve_target
+
+        # 10_000_000_000 seconds = year 2286 — far future, negative age
+        far_future_s = 10_000_000_000
+        _make_epoch_registry_record(
+            sessions_dir, 300,
+            tmux="s:@0.%0",
+            proc_start=3000,
+            updated_at=far_future_s,
+        )
+
+        with (
+            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 300]),
+            patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=3000),
+            patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
+            patch("cli_agent_orchestrator.services.cc_session_registry.ConfigService") as mock_cfg,
+        ):
+            mock_cfg.get.return_value = 900.0
+            result = resolve_target("term-01", "s", "win", sessions_dir=sessions_dir)
+
+        assert result.refusal_reason == "record_stale"
+
+    def test_far_future_numeric_string_is_stale(self, sessions_dir):
+        """12-digit epoch-seconds numeric string (far future) → record_stale."""
+        from cli_agent_orchestrator.services.cc_session_registry import resolve_target
+
+        # 100_000_000_000 seconds ≈ year 5138
+        _make_epoch_registry_record(
+            sessions_dir, 300,
+            tmux="s:@0.%0",
+            proc_start=3000,
+            updated_at="100000000000",
+        )
+
+        with (
+            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 300]),
+            patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=3000),
+            patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
+            patch("cli_agent_orchestrator.services.cc_session_registry.ConfigService") as mock_cfg,
+        ):
+            mock_cfg.get.return_value = 900.0
+            result = resolve_target("term-01", "s", "win", sessions_dir=sessions_dir)
+
+        assert result.refusal_reason == "record_stale"
+
+    def test_just_under_now_stays_fresh(self, sessions_dir):
+        """A timestamp 1 second ago is still fresh (positive age < max)."""
+        from cli_agent_orchestrator.services.cc_session_registry import resolve_target
+
+        # 1 second ago in epoch-seconds
+        just_now_s = int(time.time()) - 1
+        _make_epoch_registry_record(
+            sessions_dir, 300,
+            tmux="s:@0.%0",
+            proc_start=3000,
+            updated_at=just_now_s,
+        )
+
+        with (
+            patch("cli_agent_orchestrator.services.cc_session_registry.pane_pid", return_value=100),
+            patch("cli_agent_orchestrator.services.cc_session_registry._descendants", return_value=[100, 300]),
+            patch("cli_agent_orchestrator.services.cc_session_registry._read_proc_start", return_value=3000),
+            patch("cli_agent_orchestrator.services.cc_session_registry._resolve_tmux_window_id", return_value="@0"),
+            patch("cli_agent_orchestrator.services.cc_session_registry.ConfigService") as mock_cfg,
+        ):
+            mock_cfg.get.return_value = 900.0
+            result = resolve_target("term-01", "s", "win", sessions_dir=sessions_dir)
+
+        assert result.refusal_reason is None
+        assert result.record is not None
+        assert result.record.pid == 300
