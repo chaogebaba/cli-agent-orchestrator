@@ -75,7 +75,12 @@ from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.native_publish import DispatchTxn, NativePublishRequest
 from cli_agent_orchestrator.models.provider import ProviderType
-from cli_agent_orchestrator.models.terminal import RecoveryState, Terminal, TerminalStatus
+from cli_agent_orchestrator.models.terminal import (
+    RecoveryState,
+    Terminal,
+    TerminalInputBlockedError,
+    TerminalStatus,
+)
 from cli_agent_orchestrator.plugins import (
     PluginRegistry,
     PostCreateTerminalEvent,
@@ -229,10 +234,6 @@ class _DeferredTaskRecord:
 
 _deferred_tasks_by_terminal: dict[str, _DeferredTaskRecord] = {}
 _fork_refresh_locks: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock] = {}
-
-
-class TerminalInputBlockedError(Exception):
-    """Raised when orchestrated input would answer an active interactive prompt."""
 
 
 def _preflight_disk_space(path: str, floor_gb: float = DISK_SPACE_FLOOR_GB) -> None:
@@ -3499,10 +3500,22 @@ def _schedule_deferred_init(
                 terminal_id,
                 settlement_form=settlement_form,
             )
+            # Round-3 review fix (upstream PR #539, call-me-ram): a raw POST /sessions
+            # caller that supplies initial_message with no orchestration_type previously
+            # sailed straight past send_input's WAITING_USER_ANSWER guard entirely -- the
+            # guard only fires for OrchestrationType.ASSIGN/HANDOFF, so an unstated type
+            # meant no protection at all against pasting the initial task into a live
+            # choice prompt. Every call that reaches THIS function is by construction an
+            # unattended initial-task delivery (never an interactive human answer -- those
+            # go through answer_user_prompt's own separate /terminals/{id}/input call,
+            # which never routes through _schedule_deferred_init), so defaulting an
+            # unstated orchestration_type to ASSIGN here is always correct and cannot
+            # affect answer_user_prompt. Applies to the resubmit path below too.
+            effective_orchestration_type = orchestration_type or OrchestrationType.ASSIGN
             send_kwargs = {
                 "registry": registry,
                 "sender_id": snapshot.get("caller_id"),
-                "orchestration_type": orchestration_type,
+                "orchestration_type": effective_orchestration_type,
             }
             if park_warm:
                 send_kwargs["expect_callback"] = False
@@ -3536,9 +3549,11 @@ def _schedule_deferred_init(
                 )
             if prepared_message:
                 # For assign/handoff the sender is the CALLER (the supervisor),
-                # not this MCP server. But the deferred path is used only via
-                # /assign, and _assign_impl on the MCP-server side already
-                # embedded the callback instructions into initial_message.
+                # not this MCP server; _assign_impl on the MCP-server side already
+                # embedded the callback instructions into initial_message. The
+                # deferred path is also reached from POST /sessions?initial_message=
+                # (session_service.create_session), which has no supervisor and no
+                # orchestration_type requirement on its caller.
                 # We still pass sender_id=caller_id if present in DB metadata
                 # so plugin events see it.
                 _DEFERRED_DELIVERY_MAX_RETRIES = 3
@@ -3571,7 +3586,10 @@ def _schedule_deferred_init(
                     prepared_message,
                     registry,
                     snapshot.get("caller_id"),
-                    orchestration_type,
+                    # Same guard-eligible default as the initial send_input above --
+                    # a resubmit is still an unattended initial-task delivery, so it
+                    # must not silently drop back to the unguarded original type.
+                    effective_orchestration_type,
                     provider=provider_instance,
                     generation=generation,
                     park_warm=park_warm,

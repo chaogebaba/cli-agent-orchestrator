@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError, TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.screen_classification import (
     ScreenClassificationResult,
@@ -154,7 +154,38 @@ THINKING_BEFORE_SEPARATOR_PATTERN = re.compile(
     re.MULTILINE,
 )
 IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" prompt styles
-WAITING_USER_ANSWER_PATTERN = r"(?:↑/↓|Tab/Arrow keys) to navigate"
+# Broadened beyond the original arrow-key-navigate footer to also catch the "Enter to confirm ·
+# Esc to cancel" footer Ink's Select component renders for a plain numbered/lettered choice --
+# confirmed live via a real, deterministic repro (CLAUDE_CODE_FORCE_FULLSCREEN_UPSELL=1, the CLI's
+# own env var for forcing its "Try the new fullscreen renderer?" first-run upsell, found via
+# `strings` on the installed binary) that this exact footer text is what a brand-new,
+# never-before-seen CLI prompt used, distinct wording from the arrow-navigable case. This is
+# deliberately generic CHROME text, not any one prompt's own wording -- the point is to classify a
+# FUTURE, still-unrecognized choice-type prompt as WAITING_USER_ANSWER too, not just the specific
+# prompts this file happens to already special-case by name below. Confirmed this does not
+# overlap PLAN_APPROVAL_PATTERN's own dialog below: that dialog's real footer is "shift+tab to
+# approve with feedback" (see test_plan_approval_active_with_option_markers_is_waiting), not this
+# text, and PLAN_APPROVAL_PATTERN's own bottom_region check only runs once this check has already
+# missed. TRUST_PROMPT_PATTERN/BYPASS_PROMPT_PATTERN are explicitly excluded below so the
+# trust/bypass dialogs -- which this file DOES actively dismiss, in _handle_startup_prompts -- are
+# never reported as WAITING_USER_ANSWER while still unaccepted.
+#
+# "Enter to confirm" is anchored to the "[ \t]*·" that follows it in both live-captured footers
+# (e.g. "Enter to confirm · Esc to cancel") rather than matching the bare prose. A settled/completed
+# turn whose response TEXT happens to contain "...press Enter to confirm your changes..." within
+# the bottom_chrome window (get_status's last-6-lines anchor) is not followed by that chrome
+# separator, so it no longer false-matches as WAITING_USER_ANSWER (see
+# test_get_status_completed_response_mentioning_enter_to_confirm_is_not_waiting). Anchored to
+# same-line whitespace only (round-3 review nit, gutosantos82) -- a bare "\s*" also matches
+# newlines, so a completed turn whose bottom-chrome window happens to end "...Enter to confirm"
+# with the next line starting "·" would still false-match; real footers always render the
+# separator on the same line, so "[ \t]*" is strictly tighter with no loss of real-footer coverage.
+# The "↑/↓ to navigate" arm has the same class of false-positive risk from agent prose (see the
+# existing xfail test_agent_prose_with_nav_text_in_footer_false_waiting) but is left as-is here --
+# out of scope for this fix, which only addresses the "Enter to confirm" case flagged in review.
+# The "Tab/Arrow keys to navigate" arm is our fork's own footer variant, unioned in here.
+WAITING_USER_ANSWER_PATTERN = r"(?:↑/↓|Tab/Arrow keys) to navigate|Enter to confirm[ \t]*·"
+PLAN_APPROVAL_PATTERN = r"Would you like to proceed\?"
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
 EXTERNAL_IMPORT_PROMPT_PATTERN = r"Allow external CLAUDE\.md file imports\?"
@@ -954,15 +985,27 @@ class ClaudeCodeProvider(BaseProvider):
             await _startup
 
         # Wait for Claude Code prompt to be ready.
-        # Accept both IDLE and COMPLETED — some CLI versions show a startup
+        # Accept IDLE, COMPLETED, and WAITING_USER_ANSWER — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
         # The StatusMonitor push pipeline (FifoReader -> get_status(buffer))
         # drives wait_until_status; it only fires once the provider's own
         # get_status returns IDLE/COMPLETED on Claude-rendered content, so the
         # old stale-zsh-prompt false-IDLE guard is no longer needed.
+        #
+        # WAITING_USER_ANSWER added to this accept-set on purpose. Before this change, ANY
+        # interactive choice-type prompt this file doesn't explicitly dismiss (bypass/trust above)
+        # was structurally indistinguishable from a genuinely hung/broken launch: both left the
+        # terminal sitting outside {IDLE, COMPLETED} until init_timeout, at which point
+        # `create_terminal`'s own except-block tore the whole session down (kill_session, FIFO
+        # stop, DB row deleted) -- so the operator never even got a CHANCE to see and answer it.
+        # Confirmed live and 100% reproducible on an unpatched build via
+        # CLAUDE_CODE_FORCE_FULLSCREEN_UPSELL=1. WAITING_USER_ANSWER is CAO's own existing,
+        # positive-evidence-only status (never a default/fallback -- see get_status()'s own
+        # WAITING_USER_ANSWER_PATTERN check above), so accepting it here cannot make initialize()
+        # return early on a blank/still-launching terminal the way accepting UNKNOWN would.
         if not await wait_until_status(
             self.terminal_id,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.WAITING_USER_ANSWER},
             timeout=init_timeout,
             polling_interval=1.0,
         ):
@@ -971,6 +1014,17 @@ class ClaudeCodeProvider(BaseProvider):
             )
             if auth_state is not None:
                 raise ProviderAuthRefreshFailed(auth_state)
+            # Bare TimeoutError here, not TerminalInputBlockedError (round-3 review fix,
+            # call-me-ram): this is the genuine "never reached any recognized status" case --
+            # IDLE/COMPLETED/WAITING_USER_ANSWER all missed within the timeout window. The
+            # keep-worker-alive signal for a *recognized* WAITING_USER_ANSWER prompt no longer
+            # needs to flow through this raise site as of the round-2 fix -- it now comes from
+            # send_input's own guard (ClaudeCodeProvider.blocks_orchestrated_input_while_waiting_user_answer),
+            # which fires independently of what exception initialize() raises. Keeping this
+            # fallback a TimeoutError instead restores main's clean teardown for a genuinely
+            # broken/unrecognized launch, rather than leaving an unreapable worker alive in
+            # UNKNOWN status that answer_user_prompt would hard-refuse to touch (it only accepts
+            # WAITING_USER_ANSWER) and that no watchdog reaps.
             raise TimeoutError(f"Claude Code initialization timed out after {init_timeout}s")
 
         # The status wait fires as soon as the input box RENDERS, but the Ink
@@ -1158,9 +1212,19 @@ class ClaudeCodeProvider(BaseProvider):
         # WAITING is the only raw-path status that requires a composited view.
         # The raw patterns are candidate selectors only; they never classify a
         # dialog. This preserves every non-WAITING raw status arm unchanged.
-        waiting_candidate = re.search(
-            WAITING_USER_ANSWER_PATTERN, output
-        ) or _INK_PLAN_HEAD_PATTERN.search(output)
+        #
+        # Trust/bypass frames are excluded here, not just inside
+        # _is_ink_selection_waiting: the "Enter to confirm ·" arm added to
+        # WAITING_USER_ANSWER_PATTERN by upstream PR #539 is chrome those two
+        # dialogs also render, so without this they would newly take the
+        # composite-and-reject path on every poll. _is_ink_selection_waiting
+        # rejects them anyway, so the outcome is unchanged either way; skipping
+        # the composite keeps them on the cheap path.
+        waiting_candidate = (
+            re.search(WAITING_USER_ANSWER_PATTERN, output) or _INK_PLAN_HEAD_PATTERN.search(output)
+        ) and not (
+            re.search(TRUST_PROMPT_PATTERN, output) or re.search(BYPASS_PROMPT_PATTERN, output)
+        )
         if waiting_candidate:
             # Prefer StatusMonitor's incremental screen; replaying the rolling
             # 8192-character buffer is only a fallback and uses live geometry.

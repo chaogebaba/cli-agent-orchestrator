@@ -392,7 +392,10 @@ class TestCreateTerminal:
         await create_terminal("kiro_cli", "developer", new_session=True)
 
         # kiro resolves model eagerly — profile.model flows through when no toml/override
-        assert mock_provider_manager.create_provider.call_args.kwargs["model"] == "profile-default-model"
+        assert (
+            mock_provider_manager.create_provider.call_args.kwargs["model"]
+            == "profile-default-model"
+        )
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
@@ -2287,7 +2290,6 @@ class TestDeleteTerminal:
         assert result is True
 
 
-
 class TestDeleteTerminalWorktree:
     """issue #100 Phase 1: worktree teardown lives on _delete_terminal_under_lease
     (fork cascade delete_terminal is a different surface)."""
@@ -2340,14 +2342,15 @@ class TestDeleteTerminalWorktree:
             "intent_retain_reason": None,
         }
 
-        with patch(
-            "cli_agent_orchestrator.services.inbox_service.get_delivery_lock"
-        ) as mock_lock:
+        with patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_lock:
             lock = MagicMock()
             mock_lock.return_value = lock
             result = self._run_under_lease("test1234")
 
-        assert result.get("terminal_deleted") is True or result.get("rollback_kill_uncertain") is not True
+        assert (
+            result.get("terminal_deleted") is True
+            or result.get("rollback_kill_uncertain") is not True
+        )
         mock_worktree_service.remove_worktree.assert_called_once_with("/repo", "test1234")
 
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent")
@@ -2390,9 +2393,7 @@ class TestDeleteTerminalWorktree:
             "intent_retain_reason": None,
         }
 
-        with patch(
-            "cli_agent_orchestrator.services.inbox_service.get_delivery_lock"
-        ) as mock_lock:
+        with patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_lock:
             mock_lock.return_value = MagicMock()
             self._run_under_lease("terminalB")
 
@@ -2438,9 +2439,7 @@ class TestDeleteTerminalWorktree:
             "intent_retain_reason": None,
         }
 
-        with patch(
-            "cli_agent_orchestrator.services.inbox_service.get_delivery_lock"
-        ) as mock_lock:
+        with patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_lock:
             mock_lock.return_value = MagicMock()
             self._run_under_lease("test1234")
 
@@ -2485,17 +2484,16 @@ class TestDeleteTerminalWorktree:
             "intent_retain_reason": None,
         }
 
-        with patch(
-            "cli_agent_orchestrator.services.inbox_service.get_delivery_lock"
-        ) as mock_lock:
+        with patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_lock:
             mock_lock.return_value = MagicMock()
             self._run_under_lease("test1234")  # must not raise
 
         mock_worktree_service.remove_worktree.assert_not_called()
 
 
-
-@pytest.mark.skip(reason="upstream-only _notify_caller_of_deferred_failure; fork uses claim/settle path")
+@pytest.mark.skip(
+    reason="upstream-only _notify_caller_of_deferred_failure; fork uses claim/settle path"
+)
 class TestDeferredInitFailureNotification:
     """PR #390 must-fixes #1/#3: a deferred-init failure must be OBSERVABLE to
     the supervisor (assign already returned success=True), teardown must pass
@@ -2585,3 +2583,164 @@ class TestDeferredInitFailureNotification:
 
         mock_create_inbox.assert_not_called()
         mock_delete.assert_called_once()
+
+
+class TestDeferredInitWaitingUserAnswerSurvival:
+    """Upstream PR #539 review (gutosantos82), BLOCKING test gap: "no test stubs
+    initialize() to raise it and asserts _schedule_deferred_init leaves the
+    worker alive".
+
+    Adapted to this fork's blocked-deferred-assign behavior: where upstream
+    notifies the caller that the task was NOT delivered and leaves the worker
+    alive (``_notify_caller_of_deferred_failure(delete_worker=False)``), this
+    fork queues the task verbatim to the worker's inbox so it delivers once the
+    dialog clears, then notifies the caller. Both share the invariant these
+    tests exist to pin: the worker is never torn down, and the task is never
+    pasted into the live prompt. ``_notify_caller_of_deferred_failure`` does not
+    exist here, so the assertions target the queue path
+    (``create_inbox_message``) plus the absence of any teardown
+    (``_claim_and_settle_deferred_failure``).
+    """
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._claim_and_settle_deferred_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    async def test_initialize_raising_it_directly_leaves_worker_alive(
+        self, mock_meta, mock_create_inbox, mock_settle
+    ):
+        """Baseline: initialize() itself raising TerminalInputBlockedError must not
+        tear the worker down -- it is alive and answerable via answer_user_prompt."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _deferred_init_tasks,
+            _schedule_deferred_init,
+        )
+
+        mock_meta.return_value = {"caller_id": "super123"}
+        provider_instance = AsyncMock()
+        provider_instance.initialize.side_effect = TerminalInputBlockedError(
+            "Claude Code initialization timed out after 30s"
+        )
+        provider_instance.shell_baseline = None
+
+        before_tasks = set(_deferred_init_tasks)
+        _schedule_deferred_init(
+            provider_instance, "worker99", "do the task", OrchestrationType.ASSIGN, None
+        )
+        (task,) = set(_deferred_init_tasks) - before_tasks
+        await task
+
+        # Task queued for later delivery, caller notified, worker NOT torn down.
+        mock_create_inbox.assert_any_call(
+            "super123", "worker99", "do the task", OrchestrationType.ASSIGN
+        )
+        mock_settle.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._claim_and_settle_deferred_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_waiting_user_answer_on_send_input_leaves_worker_alive_undelivered(
+        self, mock_tmux, mock_pm, mock_status_monitor, mock_meta, mock_create_inbox, mock_settle
+    ):
+        """The regression upstream PR #539 (round 2) fixes: initialize() SUCCEEDS
+        (startup landed on a recognized WAITING_USER_ANSWER choice-prompt), so
+        _schedule_deferred_init proceeds to send_input(initial_message) exactly as
+        for any other successful init. With
+        ClaudeCodeProvider.blocks_orchestrated_input_while_waiting_user_answer
+        True, send_input's own guard raises TerminalInputBlockedError instead of
+        pasting the assigned task into the live Ink Select widget and
+        auto-confirming whichever option is highlighted.
+
+        The REAL provider is used (not a mock) so the actual property value is what
+        is exercised. Nothing may be pasted; the worker must survive.
+        """
+        from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+        from cli_agent_orchestrator.services.terminal_service import (
+            _deferred_init_tasks,
+            _schedule_deferred_init,
+        )
+
+        mock_meta.return_value = {
+            "caller_id": "super123",
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        real_provider = ClaudeCodeProvider("worker99", "cao-session", "developer-abcd")
+        mock_pm.get_provider.return_value = real_provider
+
+        provider_instance = AsyncMock()
+        provider_instance.initialize.return_value = True  # succeeded: WAITING_USER_ANSWER reached
+        provider_instance.shell_baseline = None
+
+        before_tasks = set(_deferred_init_tasks)
+        _schedule_deferred_init(
+            provider_instance, "worker99", "do the task", OrchestrationType.ASSIGN, None
+        )
+        (task,) = set(_deferred_init_tasks) - before_tasks
+        await task
+
+        # Nothing was ever pasted into the live terminal.
+        mock_tmux.send_keys.assert_not_called()
+        # Task queued instead of dropped; worker left alive.
+        mock_create_inbox.assert_any_call(
+            "super123", "worker99", "do the task", OrchestrationType.ASSIGN
+        )
+        mock_settle.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._claim_and_settle_deferred_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_no_orchestration_type_still_blocked_post_sessions_bypass(
+        self, mock_tmux, mock_pm, mock_status_monitor, mock_meta, mock_create_inbox, mock_settle
+    ):
+        """Round-3 review fix (upstream, call-me-ram): a raw POST /sessions caller
+        supplying initial_message with NO initial_message_orchestration_type reaches
+        _schedule_deferred_init with orchestration_type=None. Before this fix,
+        send_input's WAITING_USER_ANSWER guard only fired for ASSIGN/HANDOFF, so a
+        None type sailed straight past it and the task text would be pasted into a
+        live choice widget.
+
+        _schedule_deferred_init now defaults an unstated orchestration_type to ASSIGN
+        for guard purposes. Without the fix, send_keys IS called.
+        """
+        from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+        from cli_agent_orchestrator.services.terminal_service import (
+            _deferred_init_tasks,
+            _schedule_deferred_init,
+        )
+
+        mock_meta.return_value = {
+            "caller_id": None,  # POST /sessions has no supervisor caller
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        real_provider = ClaudeCodeProvider("worker99", "cao-session", "developer-abcd")
+        mock_pm.get_provider.return_value = real_provider
+
+        provider_instance = AsyncMock()
+        provider_instance.initialize.return_value = True
+        provider_instance.shell_baseline = None
+
+        before_tasks = set(_deferred_init_tasks)
+        # orchestration_type=None -- exactly what session_service.create_session passes
+        # when the caller doesn't set initial_message_orchestration_type.
+        _schedule_deferred_init(provider_instance, "worker99", "do the task", None, None)
+        (task,) = set(_deferred_init_tasks) - before_tasks
+        await task
+
+        mock_tmux.send_keys.assert_not_called()
+        # Queued under the ASSIGN default, with no caller_id to notify.
+        mock_create_inbox.assert_any_call(
+            "unknown", "worker99", "do the task", OrchestrationType.ASSIGN
+        )
+        mock_settle.assert_not_called()
