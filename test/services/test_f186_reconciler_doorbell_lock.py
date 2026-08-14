@@ -443,3 +443,166 @@ class TestF186ReconcilerPassesFlag:
         )
 
         real_lock.release()
+
+
+
+# ===========================================================================
+# F186 Gate-Fold: Mutation-Killing Tests (S1/M2 + S2/M4)
+# ===========================================================================
+
+
+class TestF186GateFoldS1M2:
+    """S1/M2: G2 recovery_state check remains active even when
+    caller_holds_no_delivery_lock=True.
+
+    Mutant M2 wraps G2 in `if not caller_holds_no_delivery_lock`, letting the
+    True path skip recovery_state gating. This test proves G2 fires on the
+    True path: recovery_state="rebinding" → skipped_gate.
+
+    All gates downstream of G2 (G4-G8) are mocked to succeed, so the ONLY
+    reason the function can return 'skipped_gate' is the G2 recovery_state
+    check. If M2 is applied (G2 wrapped), the function returns 'rang' instead.
+    """
+
+    def test_g2_gates_rebinding_even_with_lock_bypass_flag(self):
+        """With caller_holds_no_delivery_lock=True and
+        recovery_state='rebinding', the ring MUST return 'skipped_gate'
+        — proving G2+ stays active under the flag.
+        """
+        with (
+            patch(
+                "cli_agent_orchestrator.services.doorbell_service.ConfigService"
+            ) as mock_config,
+            patch(
+                "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata",
+                return_value={"metadata": {"recovery_state": "rebinding"}},
+            ),
+            patch(
+                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.receiver_state_view.native_probe",
+            ) as mock_probe,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.inbox_service._inject_safe",
+            ) as mock_inject,
+            patch(
+                "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.send_prepared_input",
+            ),
+        ):
+            # Config: native wake OFF to exercise gated fallback; doorbell ON
+            def _cfg(path, default=None, override=None):
+                if path == "supervisor.wake.native":
+                    return False
+                if path == "supervisor.doorbell":
+                    return True
+                return True
+            mock_config.get.side_effect = _cfg
+
+            # G4-G6: Probe returns IDLE (would pass if G2 didn't stop it)
+            from cli_agent_orchestrator.services.status_monitor import TerminalStatus
+            probe = MagicMock()
+            probe.status = TerminalStatus.IDLE
+            probe.meta = {}
+            mock_probe.return_value = probe
+
+            # G5: inject_safe returns safe (would pass if G2 didn't stop it)
+            from cli_agent_orchestrator.services.inbox_service import InjectSafetyResult
+            mock_inject.return_value = InjectSafetyResult("safe")
+
+            result = ring_supervisor_doorbell(
+                "sup-001", 42, written_count=1,
+                caller_holds_no_delivery_lock=True,
+            )
+
+            assert result == "skipped_gate", (
+                f"Expected 'skipped_gate' from G2 (recovery_state=rebinding) "
+                f"but got '{result}' — M2 mutant alive: flag bypasses G2"
+            )
+
+
+class TestF186GateFoldS2M4:
+    """S2/M4: delivery_lock.release() is called exactly once in the finally
+    path after a ring attempt when caller_holds_no_delivery_lock=False.
+
+    Mutant M4 deletes the `if _owns_lock: delivery_lock.release()` block.
+    This test proves the lock is released after the ring completes.
+    """
+
+    def test_lock_released_in_finally_after_ring(self):
+        """With caller_holds_no_delivery_lock=False and a mock delivery lock
+        whose acquire succeeds, assert release() is called exactly once in
+        the finally path after a ring attempt.
+        """
+        mock_lock = MagicMock()
+        mock_lock.acquire.return_value = True  # lock acquired successfully
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.doorbell_service.ConfigService"
+            ) as mock_config,
+            patch(
+                "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata",
+                return_value={"metadata": {}},
+            ),
+            patch(
+                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_delivery_lock",
+                return_value=mock_lock,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.receiver_state_view.native_probe",
+            ) as mock_probe,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.inbox_service._inject_safe",
+            ) as mock_inject,
+            patch(
+                "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.send_prepared_input",
+            ),
+        ):
+            def _cfg(path, default=None, override=None):
+                if path == "supervisor.wake.native":
+                    return False
+                if path == "supervisor.doorbell":
+                    return True
+                return True
+            mock_config.get.side_effect = _cfg
+
+            # Probe returns IDLE
+            from cli_agent_orchestrator.services.status_monitor import TerminalStatus
+            probe = MagicMock()
+            probe.status = TerminalStatus.IDLE
+            probe.meta = {}
+            mock_probe.return_value = probe
+
+            from cli_agent_orchestrator.services.inbox_service import InjectSafetyResult
+            mock_inject.return_value = InjectSafetyResult("safe")
+
+            result = ring_supervisor_doorbell(
+                "sup-001", 42, written_count=1,
+                caller_holds_no_delivery_lock=False,
+            )
+
+            # The ring should succeed
+            assert result == "rang", f"Expected 'rang' but got '{result}'"
+
+            # M4 kill: release() MUST be called exactly once in finally
+            mock_lock.release.assert_called_once()
