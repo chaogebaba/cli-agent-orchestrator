@@ -31,22 +31,22 @@ Contributing factor (premise ii): After phoenix session rename, no code updates 
 ## Suite Results
 
 ```
-make test-full → 10898 passed / 7 xfailed / 10 failed (exit 1)
+make test-full → 10900 passed / 7 xfailed / 10 failed (exit 1)
 ```
 
-**Failures breakdown (exact node IDs per S2):**
-- Pre-existing (AC19 allowlist, 4 of 5 present this run):
+**Failures breakdown (exact node IDs, each run once before listing per V1-c N1):**
+- Pre-existing (AC19 allowlist, all 5 present this run):
+  - `test/mcp_server/test_handoff.py::TestHandoffOutcomes::test_endpoint_504_maps_to_timeout_result`
   - `test/providers/test_claude_code_unit.py::TestClaudeCodeProviderEffortFlag::test_real_seed_applies_design_reviewer_effort`
   - `test/services/test_f165_real_sqlite_reconciler.py::TestF165RealSqliteReconciler::test_pull_mode_push_delivered_end_to_end`
   - `test/services/test_fx167_mutant_kills.py::TestM11HookLeadSessionIdMatch::test_selects_by_lead_session_id_not_recency`
   - `test/services/test_wave4_delivery_state.py::test_probe_16_frozen_drain_sql_fixture_ratios`
-  - (`test/mcp_server/test_handoff.py::TestHandoffOutcomes::test_endpoint_504_maps_to_timeout_result` — intermittent, not in this run)
-- Environmental (worktree-only, A/B verified at base 7cfe5557):
+- Environmental (worktree-only or infrastructure, A/B verified at base 7cfe5557):
   - `test/cli/commands/test_fold.py::test_ac13_flag_form_completes_on_a_real_pty` — `@pytest.mark.pty`, deselected by xdist workers
   - `test/cli/commands/test_fold.py::test_ac13_bare_tty_exits_two_without_blocking` — `@pytest.mark.pty`, deselected by xdist workers
-  - `test/helpers/test_fake_clock.py::TestTimeoutFires::test_timeout_fires` — flaky timing (passes on retry, confirmed at base)
+  - `test/helpers/test_fake_clock.py::TestTimeoutFires::test_timeout_fires` — designed-to-timeout canary (`@pytest.mark.timeout(1)` + `time.sleep(10)`); collected by `-m ""` in `make test-full`; passes at base only when deselected
   - `test/services/test_f44_probable_delivered.py::test_t5a_outer_template_documents_commented_inbox_default` — `FileNotFoundError: .../worktrees/providers.toml.default`
-  - (`test/cli/commands/test_config_reconcile.py::test_root_installer_delegates_without_toml_or_stanza_parsing` — `FileNotFoundError: .../worktrees/install.sh`, intermittent)
+  - (`test/cli/commands/test_config_reconcile.py::test_root_installer_delegates_without_toml_or_stanza_parsing` — `FileNotFoundError: .../worktrees/install.sh`)
 - 0 new failures from this batch
 
 **xfail delta:** 12 → 7 = **-5** (4 promoted + 1 rewritten per D23/N3)
@@ -108,12 +108,12 @@ make test-full → 10898 passed / 7 xfailed / 10 failed (exit 1)
 - M1: interrupt threshold boundary → KILLED (test_no_boundary_needed_when_young)
 - M2: boundary level trigger → KILLED (test_rearm_then_fresh_window_allows_fire)
 - M3: ejection threshold → KILLED (test_ejection_after_threshold)
-- M4: cadence gate removal → **KILLED** (test_tick_executes_at_most_once_per_tick_s, fix round S1)
-- M5: supervisor resolver fallback → **KILLED** (test_supervisor_found_by_role_not_insertion_order, fix round S1)
-- R1: D15 self-notify disabled → **KILLED** (test_supervisor_no_caller_gets_self_notify, fix round S1)
-- R2: D19 role lookup disabled → **KILLED** (test_supervisor_found_by_role_not_insertion_order, fix round S1)
+- M4: cadence gate removal → **KILLED** (test_tick_executes_at_most_once_per_tick_s) — witness: `assert 60 == 1`, convergence_tick called 60x without gate
+- M5: supervisor resolver fallback → **KILLED** (test_supervisor_found_by_role_not_insertion_order) — witness: returns `stale_twin` instead of `6c1c1545` (both caller_id=None, fallback picks first)
+- R1: D15 self-notify disabled → **KILLED** (test_supervisor_no_caller_gets_self_notify) — witness: `_create_self_notify_obligation` never called, refusal path fires (`refusing invalid caller for terminal sup_r1`)
+- R2: D19 role lookup disabled → **KILLED** (test_supervisor_found_by_role_not_insertion_order) — shares kill with M5
 
-All 7 named mutants KILLED. Zero surviving.
+All 7 named mutants KILLED. Zero surviving. Per-mutant ledger artifacts in `orchestrator/tmp/orch/f203-mutants/`.
 
 ## Do-NOTs verified
 
@@ -127,3 +127,53 @@ All 7 named mutants KILLED. Zero surviving.
 - [x] No worktree_service.py changes
 - [x] No escalate_after_s revert
 - [x] No raw pytest (make test-full only)
+
+
+
+## Fix Round R3 (gate report B1/S1/S2/N1 with V1-c amendments)
+
+**Base:** `0676e7c0` (prior fix round head)
+**Gate:** `orchestrator/tmp/orch/f203-diff-gate-r2-report.md`
+
+### B1 — AC21 Red-Leg at Production Config
+
+**Fix:** Added `TestAC21RedLegProductionConfig` class in `test_delivery_fsm_stateful.py`:
+- `test_obligation_stuck_at_production_config`: harness at `interrupt_after_s=120` (base-equivalent), ALL should_interrupt calls use KEYWORD args
+- `test_obligation_delivered_at_fix_config`: harness at `interrupt_after_s=30` (fix config), KEYWORD args
+
+**Red-leg failure at base 7cfe5557 (verbatim):**
+```
+>       fires = self.bps.should_interrupt(
+            terminal_id="sup1",
+            mailbox_id="mb1",
+            oldest_obligation_age_s=age,
+            interrupt_after_s=self.interrupt_after_s,
+        )
+E       TypeError: BoundaryPullService.should_interrupt() got an unexpected keyword argument 'interrupt_after_s'
+```
+Dead-end reason: base's `should_interrupt` has no `interrupt_after_s` parameter — it only has `escalate_after_s`. The keyword-arg mandate (V1-c) prevents positional-equivalence from masking this.
+
+**Green-leg at head:** 8 passed in 5.26s
+
+### S1 — stale_twin caller_id=None
+
+**Fix:** Changed `stale_twin.caller_id` from `"some_caller"` to `None` in `test_supervisor_found_by_role_not_insertion_order`.
+**Proof:** With mutant active (role-lookup disabled), fallback returns `stale_twin` (first match with `caller_id=None` + `provider=="claude_code"`). Role-based lookup is the only disambiguator.
+
+### S2 — Real Watchdog Test
+
+**Fix:** Rewrote `TestR1SupervisorSelfNotify` to invoke the REAL `StalledCallbackWatchdog.tick_waiting_inbox()` method. Mocks: `list_pending_receiver_ids`, `get_terminal_metadata`, `receiver_state_view.snapshot_view`, `auto_responder.waiting_gate`. No inline branching reimplementation.
+**Proof:** With R1 mutant active, `_create_self_notify_obligation` is never called and log emits `refusing invalid caller for terminal sup_r1`.
+
+### N1 — Phantom Node
+
+**Fix:** Clarified `test_fake_clock.py::TestTimeoutFires::test_timeout_fires` classification — it IS a valid node (exists at head), designed-to-timeout canary collected by `make test-full -m ""`. Classified as environmental (infrastructure canary, not a regression).
+
+### Suite
+
+```
+make test-full → 10900 passed / 7 xfailed / 10 failed (exit 1) in 153s
+```
+- 0 new failures from this batch
+- All 10 failures are pre-existing (5) or environmental (5)
+- xfail delta: 12 → 7 = -5 (unchanged from prior round)

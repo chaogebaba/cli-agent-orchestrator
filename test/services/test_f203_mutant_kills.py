@@ -100,12 +100,14 @@ class TestAC16TwoTerminalOrdering:
 
         # Mock list_terminals_by_session to return TWO claude_code terminals
         # where the supervisor (6c1c1545) is SECOND in query order
+        # S1/V1-c: BOTH terminals have caller_id=None so the fallback
+        # (caller_id is None and provider == "claude_code") CANNOT disambiguate
         terminals = [
             {
                 "id": "stale_twin",  # First in query order (lower rowid)
                 "provider": "claude_code",
                 "agent_profile": "developer",  # NOT a supervisor
-                "caller_id": "some_caller",
+                "caller_id": None,  # S1 fix: None (both terminals None)
                 "tmux_session": "cao-orch5",
             },
             {
@@ -156,62 +158,111 @@ class TestAC16TwoTerminalOrdering:
 
 
 class TestR1SupervisorSelfNotify:
-    """R1 (D15): supervisor self-notify replaces invalid-caller refusal."""
+    """R1 (D15): supervisor self-notify replaces invalid-caller refusal.
+
+    V1-c: invokes the REAL stalled_callback_watchdog.tick_waiting_inbox method
+    with a supervisor fixture — no inline branching reimplementation.
+    """
 
     def test_supervisor_no_caller_gets_self_notify(self):
-        """R1 KILL: supervisor terminal with no caller_id triggers self-notify,
-        not 'refusing invalid caller' + fired=True latch.
+        """R1 KILL: supervisor terminal with no caller_id triggers self-notify
+        via the real tick_waiting_inbox path.
 
-        Verifies the D15 branching logic directly.
+        Mocks external dependencies but calls the REAL watchdog method that
+        contains the D15 branching logic at stalled_callback_watchdog.py:1236.
         """
-        from cli_agent_orchestrator.services.delivery_service import (
-            _create_self_notify_obligation,
+        from cli_agent_orchestrator.services.stalled_callback_watchdog import (
+            StalledCallbackWatchdog,
+            WaitingInboxEpisode,
         )
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
 
-        terminal_id = "sup_r1"
-        metadata = {
+        watchdog = StalledCallbackWatchdog(grace_seconds=30)
+
+        # Pre-seed a waiting episode that has exceeded grace period
+        episode = WaitingInboxEpisode(waiting_since=0.0)  # ancient
+        watchdog._waiting_inbox_episodes["sup_r1"] = episode
+
+        supervisor_metadata = {
             "caller_id": None,  # Supervisor has no caller
             "agent_profile": "supervisor",
+            "tmux_session": "cao-test",
         }
 
-        # Simulate the D15 decision logic from stalled_callback_watchdog.py
-        caller_id = metadata.get("caller_id")
-        agent_profile = metadata.get("agent_profile", "")
-        supervisor_profiles = {"supervisor", "code_supervisor", "chao_supervisor"}
+        mock_self_notify = MagicMock()
 
-        if not caller_id and agent_profile in supervisor_profiles:
-            action = "self_notify"
-        elif not caller_id or caller_id == terminal_id:
-            action = "refuse"
-        else:
-            action = "deliver"
+        with patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.list_pending_receiver_ids",
+            return_value={"sup_r1"},
+        ), patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+            return_value=supervisor_metadata,
+        ), patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
+            return_value=TerminalStatus.WAITING_USER_ANSWER,
+        ), patch(
+            "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
+            return_value=None,
+        ), patch(
+            "cli_agent_orchestrator.services.delivery_service._create_self_notify_obligation",
+            mock_self_notify,
+        ), patch("time.monotonic", return_value=99999.0):
+            watchdog.tick_waiting_inbox(registry=None, now=99999.0)
 
-        assert action == "self_notify", (
-            f"R1 KILL: supervisor terminal got action='{action}' "
-            "instead of 'self_notify'. D15 self-notify path is broken."
+        # The REAL D15 code at :1236 must have called _create_self_notify_obligation
+        mock_self_notify.assert_called_once_with("sup_r1")
+
+        # Episode must NOT be latched fired=True (that's the refusal path)
+        assert episode.fired is not True, (
+            "R1 KILL: episode.fired was latched True — supervisor hit the "
+            "refusal path instead of self-notify"
         )
 
-        # Also verify the function exists and is callable
-        assert callable(_create_self_notify_obligation)
-
     def test_worker_still_refused(self):
-        """R1 negative: worker terminal with caller_id==terminal_id still gets refused."""
-        metadata = {
-            "caller_id": "worker1",  # Self-referential
+        """R1 negative: worker terminal with caller_id==terminal_id still gets
+        refused via the REAL tick_waiting_inbox path."""
+        from cli_agent_orchestrator.services.stalled_callback_watchdog import (
+            StalledCallbackWatchdog,
+            WaitingInboxEpisode,
+        )
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+        watchdog = StalledCallbackWatchdog(grace_seconds=30)
+
+        # Pre-seed episode
+        episode = WaitingInboxEpisode(waiting_since=0.0)
+        watchdog._waiting_inbox_episodes["worker1"] = episode
+
+        worker_metadata = {
+            "caller_id": "worker1",  # Self-referential (corrupt)
             "agent_profile": "developer",
+            "tmux_session": "cao-test",
         }
-        caller_id = metadata.get("caller_id")
-        agent_profile = metadata.get("agent_profile", "")
-        supervisor_profiles = {"supervisor", "code_supervisor", "chao_supervisor"}
 
-        # Worker path: not a supervisor, caller_id == terminal_id
-        if not caller_id and agent_profile in supervisor_profiles:
-            action = "self_notify"
-        elif not caller_id or caller_id == "worker1":
-            action = "refuse"
-        else:
-            action = "deliver"
+        mock_self_notify = MagicMock()
 
-        assert action == "refuse", (
-            "Worker with self-referential caller_id must still be refused"
+        with patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.list_pending_receiver_ids",
+            return_value={"worker1"},
+        ), patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+            return_value=worker_metadata,
+        ), patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
+            return_value=TerminalStatus.WAITING_USER_ANSWER,
+        ), patch(
+            "cli_agent_orchestrator.services.auto_responder.auto_responder.waiting_gate",
+            return_value=None,
+        ), patch(
+            "cli_agent_orchestrator.services.delivery_service._create_self_notify_obligation",
+            mock_self_notify,
+        ), patch("time.monotonic", return_value=99999.0):
+            watchdog.tick_waiting_inbox(registry=None, now=99999.0)
+
+        # Worker must NOT trigger self-notify
+        mock_self_notify.assert_not_called()
+
+        # Episode must be latched fired=True (refusal path)
+        assert episode.fired is True, (
+            "Worker with corrupt caller_id must hit the refusal path (fired=True)"
         )

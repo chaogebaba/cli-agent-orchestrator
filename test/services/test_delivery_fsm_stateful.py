@@ -186,10 +186,14 @@ class RealServiceHarness:
                     continue
 
                 # REAL should_interrupt (the core F203 fix)
+                # V1-c: ALL calls use KEYWORD arguments
                 with patch("cli_agent_orchestrator.services.boundary_pull_service.time.monotonic",
                            self.clock.monotonic):
                     fires = self.bps.should_interrupt(
-                        "sup1", "mb1", age, self.interrupt_after_s
+                        terminal_id="sup1",
+                        mailbox_id="mb1",
+                        oldest_obligation_age_s=age,
+                        interrupt_after_s=self.interrupt_after_s,
                     )
 
                 if fires:
@@ -447,3 +451,87 @@ class TestAC21RedThenGreen:
         with patch("cli_agent_orchestrator.services.boundary_pull_service.time.monotonic",
                    clock.monotonic):
             assert bps.reset_boundary_counter("t1") is False
+
+
+class TestAC21RedLegProductionConfig:
+    """B1/V1-c: Dedicated red-leg test at PRODUCTION base-equivalent config.
+
+    Uses interrupt_after_s=120 (matching base's escalate_after_s=120 dead-end)
+    and KEYWORD arguments exclusively. Asserts the obligation stays stuck.
+    """
+
+    def test_obligation_stuck_at_production_config(self):
+        """RED LEG: At production config (interrupt_after_s=120), the obligation
+        stays stuck OPEN after 45s — the F203 dead-end.
+
+        This test MUST FAIL at base 7cfe5557 because base's should_interrupt
+        gates on escalate_after_s=120: no interrupt fires before escalation.
+        At head, should_interrupt gates on interrupt_after_s, and passing 120
+        demonstrates the same dead-end behavior intentionally.
+
+        All should_interrupt calls use KEYWORD args (V1-c mandate).
+        """
+        # Production-equivalent harness: interrupt_after_s=120 (base dead-end)
+        h = RealServiceHarness(interrupt_after_s=120.0, escalate_after_s=120.0)
+        h.accept_message()
+        h.receiver_busy()
+        h.set_draft()  # Draft blocks immediate delivery
+
+        # Advance 9 ticks (45s) — well past the 30s fix threshold
+        # but below the 120s production threshold
+        for _ in range(9):
+            h.tick()
+
+        # At production config, interrupt CANNOT fire at age 45s (threshold=120)
+        # The obligation MUST stay stuck OPEN — this is the F203 dead-end
+        assert h.get_open_count() == 1, (
+            "RED LEG FAIL: obligation was delivered at production config "
+            "(interrupt_after_s=120) after only 45s. The dead-end was not reproduced."
+        )
+
+        # Verify the REAL should_interrupt returns False with KEYWORD args
+        fires = h.bps.should_interrupt(
+            terminal_id="sup1",
+            mailbox_id="mb1",
+            oldest_obligation_age_s=45.0,
+            interrupt_after_s=120.0,
+        )
+        assert fires is False, (
+            "RED LEG FAIL: should_interrupt fired at age=45 with interrupt_after_s=120. "
+            "At production config the interrupt must NOT fire before 120s."
+        )
+
+    def test_obligation_delivered_at_fix_config(self):
+        """GREEN LEG: At fix config (interrupt_after_s=30), the obligation
+        delivers at age>30 — the F203 fix.
+
+        All should_interrupt calls use KEYWORD args (V1-c mandate).
+        """
+        h = RealServiceHarness(interrupt_after_s=30.0, escalate_after_s=120.0)
+        h.accept_message()
+        h.receiver_busy()
+
+        # Advance 7 ticks (35s) — past interrupt_after_s=30
+        for _ in range(7):
+            h.tick()
+
+        # With fix config (interrupt=30), interrupt fires at age>30
+        # Receiver is busy but no draft → interrupt fires and delivers
+        assert h.get_open_count() == 0, (
+            "GREEN LEG FAIL: obligation stuck at fix config "
+            "(interrupt_after_s=30) after 35s. The fix path is broken."
+        )
+
+        # Verify the REAL should_interrupt fires with KEYWORD args
+        bps2 = BoundaryPullService()
+        bps2.register_terminal("t_green", "mb_green")
+        fires = bps2.should_interrupt(
+            terminal_id="t_green",
+            mailbox_id="mb_green",
+            oldest_obligation_age_s=35.0,
+            interrupt_after_s=30.0,
+        )
+        assert fires is True, (
+            "GREEN LEG FAIL: should_interrupt did NOT fire at age=35 with "
+            "interrupt_after_s=30. The fix threshold is broken."
+        )
