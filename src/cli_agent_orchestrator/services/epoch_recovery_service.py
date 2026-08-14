@@ -64,7 +64,7 @@ def _artifact_exists(row) -> bool:
         )
     if row["provider"] == "grok_cli":
         return (
-            Path.home() / ".grok" / "sessions" / quote(row["cwd"], safe="") / row["session_uuid"]
+            provider_home("grok_cli").home / "sessions" / quote(row["cwd"], safe="") / row["session_uuid"]
         ).exists()
     return False
 

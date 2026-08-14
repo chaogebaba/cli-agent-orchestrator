@@ -98,6 +98,12 @@ SHARED_AUTH_PROVIDERS = {
         "credential_name": ".credentials.json",
         "home_env": "CLAUDE_CONFIG_DIR",
     },
+    "grok_cli": {
+        "home_relative": "provider-homes/grok",
+        "credential_source": Path.home() / ".grok" / "auth.json",
+        "credential_name": "auth.json",
+        "home_env": "GROK_HOME",
+    },
 }
 
 

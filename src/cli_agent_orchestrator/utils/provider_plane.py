@@ -70,6 +70,8 @@ def _production_home(provider: str) -> Path:
         return Path.home() / ".codex"
     if provider == "claude_code":
         return Path.home() / ".claude"
+    if provider == "grok_cli":
+        return Path.home() / ".grok"
     raise ValueError(f"provider has no native-home object: {provider}")
 
 
@@ -214,7 +216,7 @@ def provider_plane_environment() -> dict[str, str]:
     if not os.environ.get("CAO_INSTANCE_ID", "").strip():
         return {}
     result: dict[str, str] = {}
-    for provider in ("codex", "claude_code"):
+    for provider in ("codex", "claude_code", "grok_cli"):
         plane = provider_home(provider)
         if plane.home_env is not None:
             result[plane.home_env] = str(plane.home)
@@ -382,7 +384,7 @@ def admit_provider(provider: str) -> None:
     if provider == "mock_cli":
         load_active_fixture_provider("mock_cli")
         return
-    if provider not in {"codex", "claude_code"}:
+    if provider not in {"codex", "claude_code", "grok_cli"}:
         raise SandboxProviderUnsafe(f"sandbox_provider_unsafe:{provider}")
     plane = provider_home(provider)
     seed_provider_credential(plane)

@@ -37,6 +37,11 @@ def _resolved_codex_home(terminal_id: str | None) -> Path:
     return resolved
 
 
+def _resolved_grok_sessions() -> Path:
+    """Return the grok sessions root via the provider plane (F189)."""
+    return provider_home("grok_cli").home / "sessions"
+
+
 class ForkContextError(ValueError):
     def __init__(self, code: str):
         self.code = code
@@ -540,7 +545,7 @@ def _registration_error(code: str, message: str) -> NoReturn:
 
 def _grok_artifact_mismatch(session_uuid: str, cwd: str) -> str | None:
     """Classify a missing expected Grok artifact against artifacts in other cwd roots."""
-    root = Path.home() / ".grok" / "sessions"
+    root = _resolved_grok_sessions()
     expected = root / quote(cwd, safe="") / session_uuid / "chat_history.jsonl"
     matches = [
         path
@@ -582,7 +587,7 @@ def validate_base_source(
             )
         else:
             found = (
-                Path.home() / ".grok" / "sessions" / quote(cwd, safe="") / session_uuid
+                _resolved_grok_sessions() / quote(cwd, safe="") / session_uuid
             ).exists()
         if not found:
             raise ForkContextError("session_file_missing")

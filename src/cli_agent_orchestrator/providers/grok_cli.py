@@ -35,6 +35,7 @@ from cli_agent_orchestrator.services.settings_service import (
 )
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.grok_config import ensure_grok_mcp_servers
+from cli_agent_orchestrator.utils.provider_plane import provider_home
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -213,7 +214,7 @@ class GrokCliProvider(BaseProvider):
             )
         except Exception:
             cwd = os.getcwd()
-        root = Path.home() / ".grok" / "sessions" / quote(cwd, safe="")
+        root = provider_home("grok_cli").home / "sessions" / quote(cwd, safe="")
         for _ in range(2):
             value = str(uuid.uuid4())
             if not (root / value).exists():

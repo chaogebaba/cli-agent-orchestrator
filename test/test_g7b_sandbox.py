@@ -185,12 +185,26 @@ def test_dead_initializer_partial_is_removed_and_reseeded(
 
 def test_native_home_guard_and_every_roster_consumer_is_injected() -> None:
     allowed = {"sandbox_bootstrap.py", "utils/provider_plane.py"}
+    # Files that reference provider-home paths for binary/config lookups (not session data)
+    # are permitted — they access read-only production paths even in sandbox.
+    grok_binary_config_allowed = {
+        "providers/grok_cli.py",
+        "utils/grok_config.py",
+        "cli/commands/doctor.py",
+    }
     for path in SOURCE.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
         assert '"/.codex/sessions/"' not in text
-        if 'Path.home() / ".codex"' not in text and 'Path.home() / ".claude"' not in text:
+        if (
+            'Path.home() / ".codex"' not in text
+            and 'Path.home() / ".claude"' not in text
+            and 'Path.home() / ".grok"' not in text
+        ):
             continue
-        assert path.relative_to(SOURCE).as_posix() in allowed
+        relative = path.relative_to(SOURCE).as_posix()
+        assert relative in allowed | grok_binary_config_allowed, (
+            f"{relative} has a native-home literal but is not in the allowed set"
+        )
 
     roster = {
         "providers/codex.py",
