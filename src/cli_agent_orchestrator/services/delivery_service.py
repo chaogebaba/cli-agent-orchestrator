@@ -59,9 +59,7 @@ def resolve_supervisor_target(mailbox_id: str, db: Session | None = None) -> Del
                 cc_inbox_path=None,
             )
         terminal = (
-            session.query(TerminalModel)
-            .filter_by(id=mailbox.current_terminal_id)
-            .one_or_none()
+            session.query(TerminalModel).filter_by(id=mailbox.current_terminal_id).one_or_none()
         )
         if terminal is None:
             return DeliveryTarget(
@@ -76,6 +74,7 @@ def resolve_supervisor_target(mailbox_id: str, db: Session | None = None) -> Del
             from cli_agent_orchestrator.services.cc_session_registry import (
                 resolve_target,
             )
+
             result = resolve_target(terminal.id, terminal.tmux_session, terminal.tmux_window)
             has_registry = result.refusal_reason != "no_registry_records"
         except Exception:
@@ -391,6 +390,7 @@ def _check_safety_gates(target: DeliveryTarget, *, is_escalation: bool = False) 
     # Draft guard / dialog hazard / _inject_safe vetoes — check via terminal status
     # D4: only safety gates, never deliverability gates
     try:
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
         from cli_agent_orchestrator.services.stalled_callback_watchdog import (
             stalled_callback_watchdog,
         )
@@ -398,11 +398,12 @@ def _check_safety_gates(target: DeliveryTarget, *, is_escalation: bool = False) 
         with stalled_callback_watchdog._lock:
             episode = stalled_callback_watchdog._episodes.get(target.terminal_id)
             if episode is not None:
-                status_val = episode.status.value if hasattr(episode, "status") else ""
+                # FX193 D2: episode.status is now live (was dead code pre-fx193)
+                status_val = episode.status
                 # D4: busy is caller-side policy, NOT a safety gate for escalation
-                if not is_escalation and status_val == "PROCESSING":
+                if not is_escalation and status_val == TerminalStatus.PROCESSING:
                     return "not_idle"
-                if status_val == "WAITING_USER_ANSWER":
+                if status_val == TerminalStatus.WAITING_USER_ANSWER:
                     return "waiting_user_answer"
     except Exception:
         pass
@@ -448,6 +449,83 @@ def convergence_tick() -> None:
 
     # D8: stranded detector
     _check_stranded(escalate_after_s)
+
+    # FX193: Fire any due nudges (after all obligations have been driven/coalesced)
+    _fire_due_nudges()
+
+
+def _get_consumption_cursor(mailbox_id: str) -> int | None:
+    """D1 helper: read the durable consumption cursor for a mailbox."""
+    try:
+        with SessionLocal() as db:
+            cursor = db.query(MailboxModel.consumed_through_id).filter_by(id=mailbox_id).scalar()
+            return int(cursor) if cursor is not None else None
+    except Exception:
+        return None
+
+
+def _get_pending_oldest(mailbox_id: str) -> tuple[int, int] | None:
+    """D1 helper: return (count, oldest_id) of pending messages for a mailbox."""
+    try:
+        with SessionLocal() as db:
+            from sqlalchemy import func
+
+            row = (
+                db.query(func.count(InboxModel.id), func.min(InboxModel.id))
+                .filter(
+                    InboxModel.logical_receiver_id == mailbox_id,
+                    InboxModel.status.in_(["pending", "held"]),
+                )
+                .one()
+            )
+            count, oldest = row
+            if count and oldest:
+                return (int(count), int(oldest))
+            return None
+    except Exception:
+        return None
+
+
+def _fire_due_nudges() -> None:
+    """FX193: Collect and fire nudges that passed D1/D2/D4 gates."""
+    from cli_agent_orchestrator.services.nudge_discipline import nudge_discipline
+
+    intents = nudge_discipline.collect_due(
+        get_consumption_cursor=_get_consumption_cursor,
+        get_pending_oldest=_get_pending_oldest,
+    )
+
+    for intent in intents:
+        target = resolve_supervisor_target(intent.mailbox_id)
+        if target.terminal_id is None or target.tmux_session is None:
+            continue
+
+        # Compute age from the oldest pending message
+        oldest_age_s = 0.0
+        try:
+            with SessionLocal() as db:
+                msg = db.query(InboxModel).filter_by(id=intent.oldest_inbox_row_id).one_or_none()
+                if msg is not None and msg.created_at is not None:
+                    created = msg.created_at
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
+                    oldest_age_s = (_utcnow() - created).total_seconds()
+        except Exception:
+            pass
+
+        r2 = attempt_rung2(
+            target,
+            intent.oldest_inbox_row_id,
+            message_count=intent.message_count,
+            oldest_age_s=oldest_age_s,
+        )
+        if r2.delivered:
+            logger.debug(
+                "fx193 nudge fired terminal=%s count=%d oldest=%d",
+                intent.terminal_id,
+                intent.message_count,
+                intent.oldest_inbox_row_id,
+            )
 
 
 def _drive_one_obligation(
@@ -514,8 +592,38 @@ def _drive_one_obligation(
         return
 
     # Rung 2: the floor (D16 — permanently armed, zero preconditions)
-    r2 = attempt_rung2(target, obl.inbox_row_id, oldest_age_s=msg_age_s)
-    emit_trace_or_collapse(obl.inbox_row_id, r2.phase, r2.decision, r2.reason, db)
+    # FX193: Instead of firing rung2 directly, arm/coalesce in nudge_discipline.
+    # The actual pane injection happens in fire_due_nudges() after all obligations
+    # have been driven — this is the coalescing seam (D3).
+    from cli_agent_orchestrator.services.nudge_discipline import nudge_discipline
+
+    # Count all pending messages for this mailbox for the coalesced payload
+    pending_count = (
+        db.query(InboxModel)
+        .filter(
+            InboxModel.logical_receiver_id == obl.mailbox_id,
+            InboxModel.status.in_(["pending", "held"]),
+        )
+        .count()
+    )
+    oldest_pending = (
+        db.query(InboxModel.id)
+        .filter(
+            InboxModel.logical_receiver_id == obl.mailbox_id,
+            InboxModel.status.in_(["pending", "held"]),
+        )
+        .order_by(InboxModel.id.asc())
+        .limit(1)
+        .scalar()
+    )
+    if pending_count > 0 and oldest_pending is not None and target.terminal_id is not None:
+        nudge_discipline.arm_or_coalesce(
+            terminal_id=target.terminal_id,
+            mailbox_id=obl.mailbox_id,
+            message_count=pending_count,
+            oldest_inbox_row_id=oldest_pending,
+        )
+    emit_trace_or_collapse(obl.inbox_row_id, "surface", "defer", "fx193_armed", db)
 
     from datetime import timedelta
 
@@ -625,9 +733,7 @@ def backfill_obligations() -> None:
     """D11: At first startup, create obligations for existing pending supervisor messages."""
     with SessionLocal() as db:
         # Find supervisor mailboxes
-        supervisor_mailboxes = (
-            db.query(MailboxModel).filter_by(role="supervisor").all()
-        )
+        supervisor_mailboxes = db.query(MailboxModel).filter_by(role="supervisor").all()
         for mailbox in supervisor_mailboxes:
             # Find pending messages without obligations
             from sqlalchemy import exists

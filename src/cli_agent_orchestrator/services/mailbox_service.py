@@ -29,8 +29,8 @@ from cli_agent_orchestrator.clients.database import (
     _inbox_message_from_row,
     _insert_routed_inbox_row,
     _stamp_enqueue_generation,
-    resolve_inbox_receiver,
     _utcnow,
+    resolve_inbox_receiver,
 )
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 
@@ -623,6 +623,7 @@ def create_logical_inbox_message(
     # D7: signal after commit and lock release
     if signal_terminal and result.status == MessageStatus.PENDING:
         from cli_agent_orchestrator.services.inbox_service import request_delivery
+
         request_delivery(signal_terminal)
     return result
 
@@ -675,12 +676,15 @@ def create_routed_inbox_message(
 
     # Non-supervisor terminal: raw insert then request_delivery
     result = create_inbox_message(
-        sender_id, receiver_terminal_id, message,
+        sender_id,
+        receiver_terminal_id,
+        message,
         orchestration_type=orchestration_type,
         park_warm=park_warm,
         dispatch_barrier=dispatch_barrier,
     )
     from cli_agent_orchestrator.services.inbox_service import request_delivery
+
     request_delivery(receiver_terminal_id)
     return result
 
@@ -714,21 +718,27 @@ def set_supervisor_callback_inbox_path(
 
     delivery_lock = get_delivery_lock(terminal_id)
     if not delivery_lock.acquire(timeout=30.0):
-        return PathUpdateResult(kind="retryable_failure", path_version=0, reason="delivery_lock_timeout")
+        return PathUpdateResult(
+            kind="retryable_failure", path_version=0, reason="delivery_lock_timeout"
+        )
 
     # Resolve authority lock
     with SessionLocal() as db:
         mailbox: Any = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
         if mailbox is None:
             delivery_lock.release()
-            return PathUpdateResult(kind="stale_authority", path_version=0, reason="unknown_mailbox")
+            return PathUpdateResult(
+                kind="stale_authority", path_version=0, reason="unknown_mailbox"
+            )
         session_name = str(mailbox.session_name)
         role = str(mailbox.role)
 
     authority_lock = get_mailbox_authority_lock(session_name, role)
     if not authority_lock.acquire(timeout=30.0):
         delivery_lock.release()
-        return PathUpdateResult(kind="retryable_failure", path_version=0, reason="authority_lock_timeout")
+        return PathUpdateResult(
+            kind="retryable_failure", path_version=0, reason="authority_lock_timeout"
+        )
 
     try:
         from sqlalchemy import text as sa_text
@@ -738,12 +748,11 @@ def set_supervisor_callback_inbox_path(
 
             mailbox = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
             if mailbox is None:
-                return PathUpdateResult(kind="stale_authority", path_version=0, reason="unknown_mailbox")
+                return PathUpdateResult(
+                    kind="stale_authority", path_version=0, reason="unknown_mailbox"
+                )
 
-            if (
-                mailbox.current_terminal_id != terminal_id
-                or int(mailbox.generation) != generation
-            ):
+            if mailbox.current_terminal_id != terminal_id or int(mailbox.generation) != generation:
                 return PathUpdateResult(
                     kind="stale_authority",
                     path_version=int(mailbox.cc_inbox_path_version),
@@ -768,8 +777,8 @@ def set_supervisor_callback_inbox_path(
             cursor = mailbox.callback_notified_through_id
             if cursor is not None and path is not None:
                 below_cursor_ids = [
-                    row_id for (row_id,) in
-                    db.query(InboxModel.id)
+                    row_id
+                    for (row_id,) in db.query(InboxModel.id)
                     .filter(
                         InboxModel.logical_receiver_id == mailbox_id,
                         InboxModel.receiver_id == terminal_id,
@@ -780,7 +789,9 @@ def set_supervisor_callback_inbox_path(
                     .all()
                 ]
                 if below_cursor_ids:
-                    enqueue_callback_replay(db, mailbox_id=mailbox_id, inbox_row_ids=below_cursor_ids)
+                    enqueue_callback_replay(
+                        db, mailbox_id=mailbox_id, inbox_row_ids=below_cursor_ids
+                    )
 
             mailbox.updated_at = _utcnow()
             db.commit()
@@ -793,6 +804,7 @@ def set_supervisor_callback_inbox_path(
         # D5 step 6: signal delivery after release
         if path is not None:
             from cli_agent_orchestrator.services.inbox_service import request_delivery
+
             try:
                 request_delivery(terminal_id)
             except Exception:
@@ -895,9 +907,7 @@ def list_messages(
             query = query.filter(InboxModel.receiver_id == receiver)
         # D1 (fx157): clamp the default lower bound to the consumption cursor
         if receiver.startswith("mb_") and after_id is None and not audit_browse:
-            query = query.filter(
-                InboxModel.id > int(mailbox.consumed_through_id)
-            )
+            query = query.filter(InboxModel.id > int(mailbox.consumed_through_id))
         if since is not None:
             # Normalize since to aware-UTC unconditionally.
             if since.tzinfo is None:
@@ -1083,8 +1093,8 @@ def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
             _f178_acked_row_ids: list[int] = []
             if _f178_cc_inbox_path and up_to_id > _f178_prior:
                 _f178_acked_row_ids = [
-                    row_id for (row_id,) in
-                    db.query(InboxModel.id)
+                    row_id
+                    for (row_id,) in db.query(InboxModel.id)
                     .filter(
                         InboxModel.id <= up_to_id,
                         InboxModel.id > _f178_prior,
@@ -1108,15 +1118,26 @@ def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
                 synchronize_session=False,
             )
             db.commit()
+            # FX193: disarm nudge on cursor advance (eager cancellation)
+            try:
+                from cli_agent_orchestrator.services.nudge_discipline import nudge_discipline
+
+                nudge_discipline.on_cursor_advance(terminal_id, _f178_mailbox_id)
+            except Exception:
+                pass
             # F123: re-evaluate supervisor-pending sentinel after ack settlement.
             if settled_count > 0:
-                from cli_agent_orchestrator.clients.database import _remove_supervisor_pending_flag_if_drained
+                from cli_agent_orchestrator.clients.database import (
+                    _remove_supervisor_pending_flag_if_drained,
+                )
+
                 _remove_supervisor_pending_flag_if_drained()
             # F178: mark correlated CC inbox entries as read (post-commit, best-effort)
             if _f178_cc_inbox_path and _f178_acked_row_ids:
                 from cli_agent_orchestrator.services.teammate_push_service import (
                     mark_cc_inbox_entries_read,
                 )
+
                 try:
                     mark_cc_inbox_entries_read(
                         inbox_path=Path(_f178_cc_inbox_path),
@@ -1169,7 +1190,10 @@ def quarantine_malformed_mailbox_rows(mailbox_id: str) -> int:
         db.commit()
     # F123: re-evaluate supervisor-pending sentinel after quarantine settlement.
     if quarantined > 0:
-        from cli_agent_orchestrator.clients.database import _remove_supervisor_pending_flag_if_drained
+        from cli_agent_orchestrator.clients.database import (
+            _remove_supervisor_pending_flag_if_drained,
+        )
+
         _remove_supervisor_pending_flag_if_drained()
     return quarantined
 

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from cli_agent_orchestrator.clients.database import (
+    _utcnow,
     cancel_pending_watchdog_message,
     create_inbox_message,
     get_callback_status_since,
@@ -24,7 +25,6 @@ from cli_agent_orchestrator.clients.database import (
     list_pending_receiver_ids,
     list_ready_backlog_observations,
     terminal_exists,
-    _utcnow,
 )
 from cli_agent_orchestrator.constants import (
     CAO_WAITING_INBOX_GRACE_SECONDS,
@@ -83,9 +83,7 @@ def _supervisor_mailbox_live_terminal(caller_id: str) -> str | None:
             )
             if mailbox is None:
                 incarnation = (
-                    db.query(MailboxIncarnationModel)
-                    .filter_by(terminal_id=caller_id)
-                    .one_or_none()
+                    db.query(MailboxIncarnationModel).filter_by(terminal_id=caller_id).one_or_none()
                 )
                 if incarnation is not None:
                     mailbox = (
@@ -126,6 +124,9 @@ class _Episode:
     callback_seen: bool = False
     fired: bool = False
     idle_since: float | None = None
+    # FX193 D2: Live terminal status for busy-gating nudge repeats.
+    # Written by record_status(); read by delivery_service._check_safety_gates().
+    status: TerminalStatus = TerminalStatus.UNKNOWN
     # Fingerprint of the pane's rendered tail, used as a status-independent
     # liveness signal: a worker whose screen is still changing (spinner ticks,
     # streaming output) is NOT idle, whatever the status pipeline claims.
@@ -352,9 +353,7 @@ class StalledCallbackWatchdog:
                 if caller_bucket.pop(terminal_id, None) is not None:
                     affected_callers.add(caller_id)
             # Purge empty caller buckets
-            self._dead_owed = {
-                cid: bucket for cid, bucket in self._dead_owed.items() if bucket
-            }
+            self._dead_owed = {cid: bucket for cid, bucket in self._dead_owed.items() if bucket}
             # FX181 D5 re-arm, caller-scoped: only the callers that actually owned
             # this terminal saw their set composition change.
             for caller_id in affected_callers:
@@ -405,6 +404,8 @@ class StalledCallbackWatchdog:
             episode = self._episodes.get(terminal_id)
             if episode is None:
                 return
+            # FX193 D2: persist status on the episode for safety-gate reads
+            episode.status = status
             if status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}:
                 if episode.idle_since is None:
                     episode.idle_since = now
@@ -430,13 +431,17 @@ class StalledCallbackWatchdog:
                 episode.quiet_since = None
             # F97: garbage-collect completed episodes
             self._gc_fired_episodes()
+        # FX193 D2: notify nudge discipline of status change (outside lock)
+        try:
+            from cli_agent_orchestrator.services.nudge_discipline import nudge_discipline
+
+            nudge_discipline.record_status(terminal_id, status)
+        except Exception:
+            pass
 
     def _gc_fired_episodes(self) -> None:
         """Remove episodes that have both fired and seen their callback (F97)."""
-        dead = [
-            tid for tid, ep in self._episodes.items()
-            if ep.callback_seen and ep.fired
-        ]
+        dead = [tid for tid, ep in self._episodes.items() if ep.callback_seen and ep.fired]
         for tid in dead:
             del self._episodes[tid]
 
@@ -1012,6 +1017,7 @@ class StalledCallbackWatchdog:
             try:
                 # F136-D17: use request_delivery, never synchronous on loop
                 from cli_agent_orchestrator.services.inbox_service import request_delivery
+
                 request_delivery(action.terminal_id)
             except Exception:
                 logger.exception("Failed to deliver auto-resume for %s", action.terminal_id)
@@ -1078,6 +1084,7 @@ class StalledCallbackWatchdog:
         )
         if handled is None:
             from cli_agent_orchestrator.services.mailbox_service import create_routed_inbox_message
+
             create_routed_inbox_message(
                 f"watchdog:{notice.terminal_id}",
                 notice.caller_id,
@@ -1122,12 +1129,16 @@ class StalledCallbackWatchdog:
             try:
                 # F136-D17: request_delivery, never synchronous delivery on loop
                 from cli_agent_orchestrator.services.inbox_service import request_delivery
+
                 request_delivery(notice.caller_id)
             except Exception:
                 logger.exception("Failed to deliver stalled-callback watchdog notification")
             if chain_persisted and reservation is not None:
                 try:
-                    from cli_agent_orchestrator.services.inbox_service import request_delivery as _rd
+                    from cli_agent_orchestrator.services.inbox_service import (
+                        request_delivery as _rd,
+                    )
+
                     _rd(reservation.notice.caller_id)
                 except Exception:
                     logger.exception("Failed to deliver watchdog chain notification")
@@ -1217,7 +1228,10 @@ class StalledCallbackWatchdog:
                 "(floor 300s)."
             )
             try:
-                from cli_agent_orchestrator.services.mailbox_service import create_routed_inbox_message
+                from cli_agent_orchestrator.services.mailbox_service import (
+                    create_routed_inbox_message,
+                )
+
                 create_routed_inbox_message(f"watchdog:{terminal_id}", caller_id, message)
             except Exception:
                 logger.warning(
@@ -1296,7 +1310,10 @@ class StalledCallbackWatchdog:
                 f"`cao messages trace {message_id}`. Reconciliation remains the retry owner."
             )
             try:
-                from cli_agent_orchestrator.services.mailbox_service import create_routed_inbox_message
+                from cli_agent_orchestrator.services.mailbox_service import (
+                    create_routed_inbox_message,
+                )
+
                 create_routed_inbox_message(f"watchdog:{terminal_id}", caller_id, message)
             except Exception:
                 logger.warning(
@@ -1330,9 +1347,7 @@ class StalledCallbackWatchdog:
             candidates = [
                 tid
                 for tid, ep in self._episodes.items()
-                if tid not in self._paused
-                and not ep.callback_seen
-                and not ep.fired
+                if tid not in self._paused and not ep.callback_seen and not ep.fired
             ]
 
         dead_ids: list[str] = []
@@ -1373,9 +1388,7 @@ class StalledCallbackWatchdog:
             return
 
         now = now if now is not None else time.monotonic()
-        grace = float(
-            ConfigService.get("supervisor.watchdog.quiescence_grace_s", 120.0)
-        )
+        grace = float(ConfigService.get("supervisor.watchdog.quiescence_grace_s", 120.0))
 
         # F185: retire dead workers immediately so they enter the quiescence
         # clock on the quiescence grace, not the notifier grace.
@@ -1396,25 +1409,29 @@ class StalledCallbackWatchdog:
                     # quiescence. It rejoins the owed set on resume.
                     continue
                 cid = episode.caller_id
-                callers.setdefault(cid, []).append((
-                    terminal_id,
-                    episode.generation,
-                    episode.profile,
-                    # B1: the quiescence-scoped clock (IDLE/COMPLETED/ERROR), not
-                    # idle_since — see _Episode.quiet_since.
-                    episode.quiet_since,
-                    "live",
-                ))
+                callers.setdefault(cid, []).append(
+                    (
+                        terminal_id,
+                        episode.generation,
+                        episode.profile,
+                        # B1: the quiescence-scoped clock (IDLE/COMPLETED/ERROR), not
+                        # idle_since — see _Episode.quiet_since.
+                        episode.quiet_since,
+                        "live",
+                    )
+                )
             # Dead members from _dead_owed
             for cid, bucket in self._dead_owed.items():
                 for terminal_id, member in bucket.items():
-                    callers.setdefault(cid, []).append((
-                        terminal_id,
-                        member.generation,
-                        member.profile,
-                        member.retired_at,
-                        "dead",
-                    ))
+                    callers.setdefault(cid, []).append(
+                        (
+                            terminal_id,
+                            member.generation,
+                            member.profile,
+                            member.retired_at,
+                            "dead",
+                        )
+                    )
             # Snapshot dedup keys
             last_fired_snapshot = dict(self._quiescence_last_fired)
 
@@ -1549,9 +1566,7 @@ class StalledCallbackWatchdog:
             break
 
         # D5 step 3: dedup key check
-        current_key = tuple(sorted(
-            (tid, gen) for tid, gen, _, _, _, _ in classified
-        ))
+        current_key = tuple(sorted((tid, gen) for tid, gen, _, _, _, _ in classified))
         if current_key == last_fired_key:
             return  # unchanged key — at-most-once
 
@@ -1579,9 +1594,8 @@ class StalledCallbackWatchdog:
         # D6: persist via create_routed_inbox_message, then request_delivery
         try:
             from cli_agent_orchestrator.services.mailbox_service import create_routed_inbox_message
-            create_routed_inbox_message(
-                f"watchdog:quiescence:{caller_id}", ring_target, message
-            )
+
+            create_routed_inbox_message(f"watchdog:quiescence:{caller_id}", ring_target, message)
         except Exception:
             # D5 ordering: key NOT set on persist failure — next tick retries
             logger.warning(
@@ -1596,6 +1610,7 @@ class StalledCallbackWatchdog:
         # Request delivery (F136-D17: never synchronous on loop)
         try:
             from cli_agent_orchestrator.services.inbox_service import request_delivery
+
             request_delivery(ring_target)
         except Exception:
             logger.warning(

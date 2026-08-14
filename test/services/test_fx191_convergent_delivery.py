@@ -110,11 +110,7 @@ class TestAC1ObligationAtomic:
             db.commit()
 
             # Verify obligation exists
-            obl = (
-                db.query(DeliveryObligationModel)
-                .filter_by(inbox_row_id=msg.id)
-                .one()
-            )
+            obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
             assert obl.state == "OPEN"
             assert obl.mailbox_id == "mb_test_sup"
             assert obl.attempts == 0
@@ -122,7 +118,7 @@ class TestAC1ObligationAtomic:
 
     def test_no_obligation_without_message(self, supervisor_setup):
         """An obligation cannot exist for a nonexistent message (FK constraint).
-        
+
         Note: SQLite enforces FKs only with PRAGMA foreign_keys=ON. The model
         defines the FK; the constraint is enforced in production.
         """
@@ -130,12 +126,9 @@ class TestAC1ObligationAtomic:
         with db_factory() as db:
             # Verify the model declares the FK relationship
             from sqlalchemy import inspect as sa_inspect
+
             mapper = sa_inspect(DeliveryObligationModel)
-            fks = [
-                fk
-                for col in mapper.columns
-                for fk in col.foreign_keys
-            ]
+            fks = [fk for col in mapper.columns for fk in col.foreign_keys]
             fk_targets = [str(fk.target_fullname) for fk in fks]
             assert "inbox.id" in fk_targets
 
@@ -301,16 +294,22 @@ class TestAC3SafetyGateEscalation:
             obl.accepted_at = _utcnow() - timedelta(seconds=200)
             db.commit()
 
-            from cli_agent_orchestrator.services.delivery_service import _drive_one_obligation, LadderResult
+            from cli_agent_orchestrator.services.delivery_service import (
+                LadderResult,
+                _drive_one_obligation,
+            )
 
             obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
             # Even with safety gate deferring, escalation fires
-            with patch(
-                "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
-                return_value="waiting_user_answer",
-            ), patch(
-                "cli_agent_orchestrator.services.delivery_service.attempt_rung2",
-            ) as mock_rung2:
+            with (
+                patch(
+                    "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
+                    return_value="waiting_user_answer",
+                ),
+                patch(
+                    "cli_agent_orchestrator.services.delivery_service.attempt_rung2",
+                ) as mock_rung2,
+            ):
                 mock_rung2.return_value = LadderResult(
                     delivered=False, phase="surface", decision="defer", reason="waiting_user_answer"
                 )
@@ -407,11 +406,14 @@ class TestAC6NoRegistry:
             cc_inbox_path=None,
             has_registry=False,
         )
-        with patch(
-            "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
-            return_value=None,
-        ), patch(
-            "cli_agent_orchestrator.clients.tmux.tmux_client.send_keys",
+        with (
+            patch(
+                "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.tmux.tmux_client.send_keys",
+            ),
         ):
             result = attempt_rung2(target, 42, oldest_age_s=10.0)
         assert result.decision == "proceed"
@@ -439,11 +441,14 @@ class TestAC7Rung2NoPreconditions:
             cc_inbox_path=None,
             has_registry=False,
         )
-        with patch(
-            "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
-            return_value=None,
-        ), patch(
-            "cli_agent_orchestrator.clients.tmux.tmux_client.send_keys",
+        with (
+            patch(
+                "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.tmux.tmux_client.send_keys",
+            ),
         ):
             result = attempt_rung2(target, 1, oldest_age_s=5.0)
         assert result.delivered is True
@@ -472,12 +477,15 @@ class TestAC8NudgeTextSafe:
             has_registry=False,
         )
         sent_text = []
-        with patch(
-            "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
-            return_value=None,
-        ), patch(
-            "cli_agent_orchestrator.clients.tmux.tmux_client.send_keys",
-            side_effect=lambda sess, win, text: sent_text.append(text),
+        with (
+            patch(
+                "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.tmux.tmux_client.send_keys",
+                side_effect=lambda sess, win, text: sent_text.append(text),
+            ),
         ):
             attempt_rung2(target, 42, oldest_age_s=7.0)
 
@@ -524,6 +532,7 @@ class TestAC9SafetyGatesDefer:
 
     def test_waiting_user_answer_defers(self, supervisor_setup):
         """waiting_user_answer safety gate defers even at escalation."""
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
         from cli_agent_orchestrator.services.delivery_service import (
             DeliveryTarget,
             _check_safety_gates,
@@ -540,7 +549,8 @@ class TestAC9SafetyGatesDefer:
             "cli_agent_orchestrator.services.stalled_callback_watchdog.stalled_callback_watchdog"
         ) as mock_wdog:
             mock_episode = MagicMock()
-            mock_episode.status = MagicMock(value="WAITING_USER_ANSWER")
+            # FX193: episode.status is now compared directly against TerminalStatus enum
+            mock_episode.status = TerminalStatus.WAITING_USER_ANSWER
             mock_wdog._lock = MagicMock()
             mock_wdog._lock.__enter__ = MagicMock(return_value=None)
             mock_wdog._lock.__exit__ = MagicMock(return_value=False)
@@ -581,8 +591,8 @@ class TestAC10EscalationOnceOnly:
 
             # First tick: escalate
             from cli_agent_orchestrator.services.delivery_service import (
-                _drive_one_obligation,
                 LadderResult,
+                _drive_one_obligation,
             )
 
             obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
@@ -631,8 +641,8 @@ class TestAC10EscalationOnceOnly:
             db.commit()
 
             from cli_agent_orchestrator.services.delivery_service import (
-                _drive_one_obligation,
                 LadderResult,
+                _drive_one_obligation,
             )
 
             obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
@@ -794,14 +804,12 @@ class TestAC13TraceEmitCount:
             db.commit()
 
             from cli_agent_orchestrator.services.delivery_service import (
-                _drive_one_obligation,
                 LadderResult,
+                _drive_one_obligation,
             )
 
             obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
-            with patch(
-                "cli_agent_orchestrator.services.delivery_service.attempt_rung2"
-            ) as mock:
+            with patch("cli_agent_orchestrator.services.delivery_service.attempt_rung2") as mock:
                 mock.return_value = LadderResult(
                     delivered=True, phase="surface", decision="proceed", reason=None
                 )
@@ -885,17 +893,20 @@ class TestAC14PropertyTest:
             db.commit()
 
             from cli_agent_orchestrator.services.delivery_service import (
-                _drive_one_obligation,
                 LadderResult,
+                _drive_one_obligation,
             )
 
             obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
-            with patch(
-                "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
-                return_value=safety_gate,
-            ), patch(
-                "cli_agent_orchestrator.services.delivery_service.attempt_rung2"
-            ) as mock_rung2:
+            with (
+                patch(
+                    "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
+                    return_value=safety_gate,
+                ),
+                patch(
+                    "cli_agent_orchestrator.services.delivery_service.attempt_rung2"
+                ) as mock_rung2,
+            ):
                 if safety_gate:
                     mock_rung2.return_value = LadderResult(
                         delivered=False,
@@ -1055,12 +1066,14 @@ class TestAC17AlarmDiscipline:
             db.commit()
 
             from cli_agent_orchestrator.services.delivery_service import (
-                _drive_one_obligation,
                 LadderResult,
+                _drive_one_obligation,
             )
 
             obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
-            with caplog.at_level(logging.ERROR, logger="cli_agent_orchestrator.services.delivery_service"):
+            with caplog.at_level(
+                logging.ERROR, logger="cli_agent_orchestrator.services.delivery_service"
+            ):
                 with patch(
                     "cli_agent_orchestrator.services.delivery_service.attempt_rung2"
                 ) as mock:
@@ -1071,7 +1084,8 @@ class TestAC17AlarmDiscipline:
                     db.commit()
 
             error_records = [
-                r for r in caplog.records
+                r
+                for r in caplog.records
                 if r.levelno == logging.ERROR and "fx191_escalated" in r.message
             ]
             assert len(error_records) == 1
@@ -1092,13 +1106,16 @@ class TestAC17AlarmDiscipline:
             db.flush()
             from cli_agent_orchestrator.services.delivery_service import emit_trace
 
-            with caplog.at_level(logging.DEBUG, logger="cli_agent_orchestrator.services.delivery_service"):
+            with caplog.at_level(
+                logging.DEBUG, logger="cli_agent_orchestrator.services.delivery_service"
+            ):
                 emit_trace(msg.id, "fx191.resolve", "resolve", "proceed", db=db)
             db.commit()
 
             # emit_trace itself should produce no log
             trace_logs = [
-                r for r in caplog.records
+                r
+                for r in caplog.records
                 if "fx191" in r.message
                 and r.name == "cli_agent_orchestrator.services.delivery_service"
                 and r.levelno >= logging.INFO
@@ -1130,18 +1147,19 @@ class TestAC18ConfigCannotBreakDelivery:
         )
 
         # All config disabled — rung 2 doesn't read any of them
-        with patch(
-            "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
-            return_value=None,
-        ), patch(
-            "cli_agent_orchestrator.clients.tmux.tmux_client.send_keys",
+        with (
+            patch(
+                "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.tmux.tmux_client.send_keys",
+            ),
         ):
             result = attempt_rung2(target, 1, oldest_age_s=5.0)
 
         assert result.delivered is True
         assert result.decision == "proceed"
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -1158,8 +1176,9 @@ class TestS1Rung2FloorInvocation:
     """
 
     def test_rung2_send_keys_called_when_rung1_demotes(self, supervisor_setup):
-        """When rung1 demotes (no registry), _drive_one_obligation calls rung2
-        which invokes tmux send_keys — proving the floor rung is wired."""
+        """When rung1 demotes (no registry), _drive_one_obligation arms
+        nudge_discipline and _fire_due_nudges calls rung2 which invokes
+        tmux send_keys — proving the floor rung is wired (fx193 path)."""
         db_factory = supervisor_setup
         with db_factory() as db:
             # Remove registry so rung1 demotes with "no_registry_records"
@@ -1185,22 +1204,30 @@ class TestS1Rung2FloorInvocation:
 
             obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
 
-            from cli_agent_orchestrator.services.delivery_service import _drive_one_obligation
+            from cli_agent_orchestrator.services.delivery_service import (
+                _drive_one_obligation,
+                _fire_due_nudges,
+            )
 
             # Mock ONLY the tmux boundary (send_keys) — everything else is real
-            with patch(
-                "cli_agent_orchestrator.clients.tmux.tmux_client.send_keys"
-            ) as mock_send_keys, patch(
-                "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
-                return_value=None,
+            with (
+                patch(
+                    "cli_agent_orchestrator.clients.tmux.tmux_client.send_keys"
+                ) as mock_send_keys,
+                patch(
+                    "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
+                    return_value=None,
+                ),
             ):
                 _drive_one_obligation(db, obl, _utcnow(), 120.0, "shadow")
                 db.commit()
+                # FX193: nudge fires in the separate _fire_due_nudges pass
+                _fire_due_nudges()
 
             # THE ASSERTION: send_keys was called — proves rung2 was invoked
             assert mock_send_keys.called, (
                 "M5 kill: tmux send_keys must be called by rung2 floor "
-                "when rung1 demotes in _drive_one_obligation"
+                "when rung1 demotes in _drive_one_obligation (via fx193 nudge discipline)"
             )
             # Verify the nudge text contains the message id
             call_args = mock_send_keys.call_args
@@ -1229,9 +1256,7 @@ class TestS2AC14MultiTickConvergence:
         "safety_gate",
         ["not_idle", "recovery_state", "waiting_user_answer"],
     )
-    def test_safety_gate_obligations_escalate_within_bound(
-        self, supervisor_setup, safety_gate
-    ):
+    def test_safety_gate_obligations_escalate_within_bound(self, supervisor_setup, safety_gate):
         """An obligation with a perpetually-deferring safety gate must reach
         ESCALATED after the escalation bound — never silently stuck OPEN."""
         db_factory = supervisor_setup
@@ -1265,28 +1290,21 @@ class TestS2AC14MultiTickConvergence:
             # Phase A: drive N ticks WITHIN the escalation bound.
             # Each tick must advance attempts (proves gate defers, not terminates).
             n_pre_ticks = 5  # well within bound (5*5s = 25s < 60s)
-            with patch(
-                "cli_agent_orchestrator.clients.tmux.tmux_client.send_keys"
-            ), patch(
-                "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
-                return_value=safety_gate,
+            with (
+                patch("cli_agent_orchestrator.clients.tmux.tmux_client.send_keys"),
+                patch(
+                    "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
+                    return_value=safety_gate,
+                ),
             ):
                 for i in range(n_pre_ticks):
-                    obl = (
-                        db.query(DeliveryObligationModel)
-                        .filter_by(inbox_row_id=msg.id)
-                        .one()
-                    )
+                    obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
                     prev_attempts = obl.attempts
                     tick_now = start_time + timedelta(seconds=tick_s * (i + 1))
                     _drive_one_obligation(db, obl, tick_now, escalate_after_s, "shadow")
                     db.commit()
 
-                    obl = (
-                        db.query(DeliveryObligationModel)
-                        .filter_by(inbox_row_id=msg.id)
-                        .one()
-                    )
+                    obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
                     assert obl.state == "OPEN", (
                         f"M3 kill: obligation must stay OPEN during pre-escalation ticks "
                         f"(tick {i+1}), got state={obl.state!r}"
@@ -1298,17 +1316,14 @@ class TestS2AC14MultiTickConvergence:
                     )
 
             # Phase B: drive one tick PAST the escalation bound → ESCALATED
-            with patch(
-                "cli_agent_orchestrator.clients.tmux.tmux_client.send_keys"
-            ), patch(
-                "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
-                return_value=safety_gate,
+            with (
+                patch("cli_agent_orchestrator.clients.tmux.tmux_client.send_keys"),
+                patch(
+                    "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
+                    return_value=safety_gate,
+                ),
             ):
-                obl = (
-                    db.query(DeliveryObligationModel)
-                    .filter_by(inbox_row_id=msg.id)
-                    .one()
-                )
+                obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
                 escalation_time = start_time + timedelta(seconds=escalate_after_s + 1)
                 _drive_one_obligation(db, obl, escalation_time, escalate_after_s, "shadow")
                 db.commit()
