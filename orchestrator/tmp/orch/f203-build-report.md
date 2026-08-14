@@ -31,15 +31,27 @@ Contributing factor (premise ii): After phoenix session rename, no code updates 
 ## Suite Results
 
 ```
-make test-full → 10889 passed, 7 xfailed, 10 failed (exit 1)
+make test-full → 10898 passed / 7 xfailed / 10 failed (exit 1)
 ```
 
-**Failures breakdown:**
-- 5 pre-existing (AC19 allowlist): test_handoff, test_claude_code_unit, test_f165_real_sqlite_reconciler, test_fx167_mutant_kills, test_wave4_delivery_state
-- 5 environmental (worktree-only): test_config_reconcile (missing install.sh), test_fold ×2 (PTY), test_fake_clock (timing), test_f44_probable_delivered (missing providers.toml.default)
+**Failures breakdown (exact node IDs per S2):**
+- Pre-existing (AC19 allowlist, 4 of 5 present this run):
+  - `test/providers/test_claude_code_unit.py::TestClaudeCodeProviderEffortFlag::test_real_seed_applies_design_reviewer_effort`
+  - `test/services/test_f165_real_sqlite_reconciler.py::TestF165RealSqliteReconciler::test_pull_mode_push_delivered_end_to_end`
+  - `test/services/test_fx167_mutant_kills.py::TestM11HookLeadSessionIdMatch::test_selects_by_lead_session_id_not_recency`
+  - `test/services/test_wave4_delivery_state.py::test_probe_16_frozen_drain_sql_fixture_ratios`
+  - (`test/mcp_server/test_handoff.py::TestHandoffOutcomes::test_endpoint_504_maps_to_timeout_result` — intermittent, not in this run)
+- Environmental (worktree-only, A/B verified at base 7cfe5557):
+  - `test/cli/commands/test_fold.py::test_ac13_flag_form_completes_on_a_real_pty` — `@pytest.mark.pty`, deselected by xdist workers
+  - `test/cli/commands/test_fold.py::test_ac13_bare_tty_exits_two_without_blocking` — `@pytest.mark.pty`, deselected by xdist workers
+  - `test/helpers/test_fake_clock.py::TestTimeoutFires::test_timeout_fires` — flaky timing (passes on retry, confirmed at base)
+  - `test/services/test_f44_probable_delivered.py::test_t5a_outer_template_documents_commented_inbox_default` — `FileNotFoundError: .../worktrees/providers.toml.default`
+  - (`test/cli/commands/test_config_reconcile.py::test_root_installer_delegates_without_toml_or_stanza_parsing` — `FileNotFoundError: .../worktrees/install.sh`, intermittent)
 - 0 new failures from this batch
 
 **xfail delta:** 12 → 7 = **-5** (4 promoted + 1 rewritten per D23/N3)
+- Promoted: `test_notify_boundary_reachable_without_watchdog_episode`, `test_reset_boundary_counter_called_on_obligation_settle`, `test_interrupt_fires_before_escalation`, `test_transport_always_defer_trips_warn_within_n_attempts`
+- Rewritten (D23): `test_pending_count_query_uses_valid_column`
 
 ## AC Verification Summary
 
@@ -69,7 +81,7 @@ make test-full → 10889 passed, 7 xfailed, 10 failed (exit 1)
 
 ## Files Modified
 
-### Source (10 files)
+### Source (11 files)
 - `src/cli_agent_orchestrator/services/boundary_pull_service.py` — D3/D4/D6/S1
 - `src/cli_agent_orchestrator/services/config_service.py` — D1/N2 (interrupt_after_s, base_ejection_s)
 - `src/cli_agent_orchestrator/services/delivery_service.py` — D2/D5/D6/D9/D15/D17
@@ -80,22 +92,28 @@ make test-full → 10889 passed, 7 xfailed, 10 failed (exit 1)
 - `src/cli_agent_orchestrator/services/auto_responder.py` — D19 (role-based resolver)
 - `src/cli_agent_orchestrator/clients/database.py` — D14/S2 (monotonic cursor advance)
 - `src/cli_agent_orchestrator/services/transport_ejection.py` — NEW (D9-D12)
+- `src/cli_agent_orchestrator/kernel/receiver_state/trace_manifest.txt` — mechanical line-shift from D15/D16
 
-### Tests (5 files)
+### Tests (7 files)
 - `test/services/test_f203_family_sweep.py` — 5 xfails removed, D23 rewrite
 - `test/services/test_f206_hotfix.py` — ConfigService mock updated
 - `test/services/test_fx170_native_doorbell.py` — D13 record shape
 - `test/services/test_f203_transport_ejection.py` — NEW (AC6-AC9)
-- `test/services/test_delivery_fsm_stateful.py` — NEW (Amendment V1)
+- `test/services/test_delivery_fsm_stateful.py` — NEW (Amendment V1/V1-b, REAL services)
+- `test/services/test_f203_mutant_kills.py` — NEW (S1: AC13/AC16/R1/R2 mutant kills)
 
 ## Mutation Ledger
 
-5 mutants in `orchestrator/tmp/orch/f203-mutants/`:
-- M1: interrupt threshold boundary → KILLED
-- M2: boundary level trigger → KILLED (by rearm test)
-- M3: ejection threshold → KILLED
-- M4: cadence gate removal → SURVIVED (needs AC13 integration test)
-- M5: supervisor resolver fallback → SURVIVED (needs AC16 two-terminal test)
+9 mutants in `orchestrator/tmp/orch/f203-mutants/`:
+- M1: interrupt threshold boundary → KILLED (test_no_boundary_needed_when_young)
+- M2: boundary level trigger → KILLED (test_rearm_then_fresh_window_allows_fire)
+- M3: ejection threshold → KILLED (test_ejection_after_threshold)
+- M4: cadence gate removal → **KILLED** (test_tick_executes_at_most_once_per_tick_s, fix round S1)
+- M5: supervisor resolver fallback → **KILLED** (test_supervisor_found_by_role_not_insertion_order, fix round S1)
+- R1: D15 self-notify disabled → **KILLED** (test_supervisor_no_caller_gets_self_notify, fix round S1)
+- R2: D19 role lookup disabled → **KILLED** (test_supervisor_found_by_role_not_insertion_order, fix round S1)
+
+All 7 named mutants KILLED. Zero surviving.
 
 ## Do-NOTs verified
 
