@@ -40,7 +40,9 @@ SOURCE = REPO / "src" / "cli_agent_orchestrator"
 def _plane(tmp_path: Path, provider: str = "codex") -> ProviderHome:
     native = tmp_path / "native"
     native.mkdir(parents=True)
-    credential_name = "auth.json" if provider == "codex" else ".credentials.json"
+    _cred_names = {"codex": "auth.json", "claude_code": ".credentials.json", "grok_cli": "auth.json"}
+    _home_envs = {"codex": "CODEX_HOME", "claude_code": "CLAUDE_CONFIG_DIR", "grok_cli": "GROK_HOME"}
+    credential_name = _cred_names[provider]
     source = native / credential_name
     source.write_text('{"token":"seed"}', encoding="utf-8")
     source.chmod(0o600)
@@ -51,7 +53,7 @@ def _plane(tmp_path: Path, provider: str = "codex") -> ProviderHome:
         home,
         source,
         home / credential_name,
-        "CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR",
+        _home_envs[provider],
         home / "native-home" if provider == "claude_code" else None,
     )
 
@@ -78,7 +80,7 @@ def _activate_plane(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, provider: s
     return plane
 
 
-@pytest.mark.parametrize("provider", ["codex", "claude_code"])
+@pytest.mark.parametrize("provider", ["codex", "claude_code", "grok_cli"])
 @pytest.mark.asyncio
 async def test_supported_planes_admit_through_real_public_entry_points(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
