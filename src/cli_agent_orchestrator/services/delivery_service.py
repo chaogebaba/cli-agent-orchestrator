@@ -974,11 +974,23 @@ def _reresolve_escalated(escalate_after_s: float) -> None:
 
             except Exception:
                 db.rollback()
-                logger.debug(
+                logger.warning(
                     "f206a reresolve exception inbox=%s",
                     obl.inbox_row_id,
                     exc_info=True,
                 )
+                # Gate S1: rollback undid the cadence bump — re-apply it in a
+                # separate mini-transaction so a persistently-throwing obligation
+                # retries per escalate_after_s, not every tick.
+                try:
+                    db.query(DeliveryObligationModel).filter_by(
+                        inbox_row_id=obl.inbox_row_id
+                    ).update(
+                        {"next_attempt_at": now + timedelta(seconds=escalate_after_s)}
+                    )
+                    db.commit()
+                except Exception:
+                    db.rollback()
 
 
 # ---------------------------------------------------------------------------
