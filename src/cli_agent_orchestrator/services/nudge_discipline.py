@@ -7,27 +7,82 @@ escalation path.
 
 Decision wall: D1 (fire-time revalidation), D2 (first-nudge-immediate + busy-gate),
 D3 (single-armed coalescing), D4 (30/60/120 capped backoff), D5 (escalation untouched).
+
+Amendment A1 (fx193-A1-D2): The obligation scheduler is named after the SQS shape —
+visibility_timeout_at (per-message next_attempt_at), receive_count (attempts),
+escalation/DLQ (ESCALATED state). The repeat backoff uses floor-clamped Full Jitter:
+    sleep = random_between(base=30, min(cap=120, base * 2^n))
+where n is the 0-indexed repeat index (n=0 degenerates to exactly 30s). The floor
+preserves D4's minimum spacing; the cap aligns with the fx191 E-bound (120s).
+Config knob delivery.jitter=off restores the deterministic 30/60/120 ladder verbatim.
 """
 
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 logger = logging.getLogger(__name__)
 
-# D4: Backoff sequence (seconds), capped at 120
+# ---------------------------------------------------------------------------
+# fx193-A1-D2: SQS vocabulary mapping (constraint on the code, not commentary)
+#
+# CAO obligation field       | SQS analog
+# ---------------------------|-----------------------------------------
+# next_attempt_at            | visibility_timeout_at — per-message timer
+#                            |   controlling when the message becomes
+#                            |   visible (eligible for redelivery) again
+# attempts (obl.attempts)    | receive_count — how many times the message
+#                            |   has been received/delivered
+# state=ESCALATED            | redrive to DLQ — message moved to the
+#                            |   dead-letter queue after maxReceiveCount
+#                            |   exceeded
+# state=ACKED                | DeleteMessage — consumer confirms processing
+# E-bound (escalate_after_s) | maxReceiveCount-based redrive threshold
+#                            |   (time-based rather than count-based in CAO
+#                            |   because a single obligation = one logical
+#                            |   delivery, not per-attempt counting)
+# ---------------------------------------------------------------------------
+
+# D4 / A1-D1: Backoff parameters
+BACKOFF_BASE: int = 30  # seconds — minimum repeat spacing
+BACKOFF_CAP: int = 120  # seconds — aligns with fx191 E-bound
+
+# Legacy deterministic ladder (delivery.jitter=off)
 BACKOFF_SEQUENCE: tuple[int, ...] = (30, 60, 120)
-BACKOFF_CAP: int = 120
+
+
+class JitterRNG(Protocol):
+    """Protocol for injectable RNG — tests pass a seeded generator."""
+
+    def randint(self, a: int, b: int) -> int: ...
+
+
+class _DefaultRNG:
+    """Production RNG — delegates to stdlib random."""
+
+    def randint(self, a: int, b: int) -> int:
+        return random.randint(a, b)
+
+
+_default_rng = _DefaultRNG()
 
 
 @dataclass
 class _NudgeState:
-    """Per-terminal nudge state. At most one armed nudge per terminal (D3)."""
+    """Per-terminal nudge state. At most one armed nudge per terminal (D3).
+
+    Field naming follows the SQS vocabulary constraint (fx193-A1-D2):
+    - receive_count: how many times this nudge has fired (SQS receiveCount)
+    - visibility_timeout_at: monotonic time when the nudge becomes eligible
+      for the next fire (SQS per-message visibility timeout)
+    """
 
     # The terminal_id this nudge targets (the supervisor terminal)
     terminal_id: str
@@ -38,10 +93,13 @@ class _NudgeState:
     oldest_inbox_row_id: int = 0
     # Has the first nudge for this obligation set fired? (D2)
     first_fired: bool = False
-    # Current backoff step index (D4)
+    # Current backoff step index (D4 / A1-D1: 0-indexed repeat number)
     backoff_step: int = 0
-    # Monotonic time when next repeat may fire (None = not scheduled)
-    next_fire_at: float | None = None
+    # SQS: receive_count — total fires for this armed nudge set
+    receive_count: int = 0
+    # SQS: visibility_timeout_at — monotonic time when next repeat may fire
+    # (None = not scheduled)
+    visibility_timeout_at: float | None = None
     # Last known terminal status for busy-gating (D2)
     last_status: TerminalStatus = TerminalStatus.UNKNOWN
     # Whether the repeat is currently parked due to busy terminal
@@ -49,17 +107,31 @@ class _NudgeState:
     # Monotonic time of last successful nudge fire
     last_fired_at: float | None = None
 
+    # Legacy compat property so existing code referencing next_fire_at still works
+    @property
+    def next_fire_at(self) -> float | None:
+        return self.visibility_timeout_at
+
+    @next_fire_at.setter
+    def next_fire_at(self, value: float | None) -> None:
+        self.visibility_timeout_at = value
+
 
 class NudgeDiscipline:
     """FX193: Manages nudge gating, coalescing, and backoff.
 
     Thread-safe — called from the convergence tick (watchdog run loop thread).
+
+    A1: Injectable RNG for jittered backoff. Tests pass a seeded generator;
+    production uses stdlib random. Config knob delivery.jitter=off restores
+    the deterministic 30/60/120 ladder.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, rng: JitterRNG | None = None) -> None:
         self._lock = threading.Lock()
         # Keyed by terminal_id (the supervisor terminal receiving nudges)
         self._states: dict[str, _NudgeState] = {}
+        self._rng: JitterRNG = rng or _default_rng
 
     # ------------------------------------------------------------------
     # D3: Coalescing — arm or update the single nudge for a terminal
@@ -89,7 +161,7 @@ class NudgeDiscipline:
                     message_count=message_count,
                     oldest_inbox_row_id=oldest_inbox_row_id,
                     first_fired=False,
-                    next_fire_at=now,  # immediate
+                    visibility_timeout_at=now,  # immediate
                 )
                 return True
             else:
@@ -98,7 +170,7 @@ class NudgeDiscipline:
                 state.oldest_inbox_row_id = oldest_inbox_row_id
                 state.mailbox_id = mailbox_id
                 # D3 amended: merge fires immediately + backoff reset on merge
-                state.next_fire_at = now
+                state.visibility_timeout_at = now
                 state.backoff_step = 0
                 state.parked = False
                 return False
@@ -126,7 +198,7 @@ class NudgeDiscipline:
                 and status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
             ):
                 state.parked = False
-                state.next_fire_at = time.monotonic()
+                state.visibility_timeout_at = time.monotonic()
 
     # ------------------------------------------------------------------
     # D1 + D2 + D4: Determine which nudges should fire this tick
@@ -160,14 +232,14 @@ class NudgeDiscipline:
 
         with self._lock:
             for terminal_id, state in list(self._states.items()):
-                # Not yet due
-                if state.next_fire_at is None or now < state.next_fire_at:
+                # Not yet due (SQS: visibility timeout not yet expired)
+                if state.visibility_timeout_at is None or now < state.visibility_timeout_at:
                     continue
 
                 # D2: Repeats (not first) park while terminal is PROCESSING
                 if state.first_fired and state.last_status == TerminalStatus.PROCESSING:
                     state.parked = True
-                    state.next_fire_at = None  # will be re-armed on idle transition
+                    state.visibility_timeout_at = None  # will be re-armed on idle transition
                     continue
 
                 # D1: Fire-time revalidation — re-read cursor + pending set
@@ -201,22 +273,53 @@ class NudgeDiscipline:
                     )
                 )
 
-                # Mark first as fired, schedule next repeat with backoff (D4)
+                # Mark first as fired, schedule next repeat with backoff (D4 / A1-D1)
                 state.first_fired = True
                 state.last_fired_at = now
+                state.receive_count += 1
+
+                # A1-D1: Floor-clamped Full Jitter backoff
+                # sleep = random_between(base=30, min(cap=120, base * 2^n))
+                # Config knob delivery.jitter=off restores deterministic ladder.
                 step = state.backoff_step
-                if step < len(BACKOFF_SEQUENCE):
-                    delay = BACKOFF_SEQUENCE[step]
-                else:
-                    delay = BACKOFF_CAP
+                delay = self._compute_backoff_delay(step)
                 state.backoff_step = step + 1
-                state.next_fire_at = now + delay
+                state.visibility_timeout_at = now + delay
 
             # Disarm cancelled nudges
             for terminal_id in to_disarm:
                 del self._states[terminal_id]
 
         return intents
+
+    def _compute_backoff_delay(self, step: int) -> float:
+        """Compute the backoff delay for repeat `step` (0-indexed).
+
+        A1-D1: Full Jitter with floor clamp:
+            sleep = random_between(30, min(120, 30 * 2^step))
+
+        When delivery.jitter=off, returns the deterministic ladder 30/60/120/120.
+        n=0 degenerates to exactly 30s (floor == ceiling at step 0).
+        """
+        from cli_agent_orchestrator.services.config_service import ConfigService
+
+        jitter_mode = ConfigService.get("delivery.jitter", "on")
+
+        if jitter_mode == "off":
+            # Deterministic ladder: 30/60/120/120...
+            if step < len(BACKOFF_SEQUENCE):
+                return float(BACKOFF_SEQUENCE[step])
+            return float(BACKOFF_CAP)
+
+        # A1-D1: Floor-clamped Full Jitter
+        # ceiling = min(cap, base * 2^step)
+        ceiling = min(BACKOFF_CAP, BACKOFF_BASE * (2 ** step))
+        # floor = base (always 30s minimum spacing)
+        floor = BACKOFF_BASE
+        # n=0: ceiling = min(120, 30*1) = 30, floor = 30 → exactly 30s
+        if floor >= ceiling:
+            return float(floor)
+        return float(self._rng.randint(floor, ceiling))
 
     # ------------------------------------------------------------------
     # Consumption acknowledgment: disarm on cursor advance
@@ -257,7 +360,8 @@ class NudgeDiscipline:
                 oldest_inbox_row_id=state.oldest_inbox_row_id,
                 first_fired=state.first_fired,
                 backoff_step=state.backoff_step,
-                next_fire_at=state.next_fire_at,
+                receive_count=state.receive_count,
+                visibility_timeout_at=state.visibility_timeout_at,
                 last_status=state.last_status,
                 parked=state.parked,
                 last_fired_at=state.last_fired_at,

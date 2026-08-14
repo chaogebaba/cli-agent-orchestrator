@@ -216,6 +216,8 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_DELIVERY_TICK_S": ("delivery.tick_s", "float", 5.0),
     "CAO_DELIVERY_ESCALATE_AFTER_S": ("delivery.escalate_after_s", "float", 120.0),
     "CAO_DELIVERY_TRACE_RETENTION_H": ("delivery.trace_retention_h", "float", 168.0),
+    # FX193-A1: jitter config (delivery.jitter=off restores deterministic ladder)
+    "CAO_DELIVERY_JITTER": ("delivery.jitter", "str", "on"),
 }
 
 # Reverse index: dotted path -> env var name, for get()'s env-precedence lookup.
@@ -491,6 +493,7 @@ _ALL_PATHS = sorted(
         "delivery.tick_s",
         "delivery.escalate_after_s",
         "delivery.trace_retention_h",
+        "delivery.jitter",
     }
 )
 
