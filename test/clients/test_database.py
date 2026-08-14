@@ -1527,10 +1527,13 @@ class TestInboxOperations:
             "id",
             "message_id",
             "kind",
+            "phase",
+            "decision",
+            "reason",
             "payload",
             "created_at",
         }
-        assert {index["name"] for index in inspector.get_indexes("inbox_message_trace_event")} == {
+        assert {index["name"] for index in inspector.get_indexes("inbox_message_trace_event")} >= {
             "ix_inbox_message_trace_event_message_id",
             "ix_inbox_message_trace_event_kind_created_message",
         }

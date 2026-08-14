@@ -211,6 +211,11 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
         "float",
         120.0,
     ),
+    # FX191: convergent delivery config paths (D12)
+    "CAO_DELIVERY_PHASE": ("delivery.phase", "str", "shadow"),
+    "CAO_DELIVERY_TICK_S": ("delivery.tick_s", "float", 5.0),
+    "CAO_DELIVERY_ESCALATE_AFTER_S": ("delivery.escalate_after_s", "float", 120.0),
+    "CAO_DELIVERY_TRACE_RETENTION_H": ("delivery.trace_retention_h", "float", 168.0),
 }
 
 # Reverse index: dotted path -> env var name, for get()'s env-precedence lookup.
@@ -482,6 +487,10 @@ _ALL_PATHS = sorted(
         "supervisor.doorbell",
         "supervisor.watchdog.quiescence",
         "supervisor.watchdog.quiescence_grace_s",
+        "delivery.phase",
+        "delivery.tick_s",
+        "delivery.escalate_after_s",
+        "delivery.trace_retention_h",
     }
 )
 

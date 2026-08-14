@@ -492,6 +492,10 @@ class InboxMessageTraceEventModel(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     message_id = Column(Integer, ForeignKey("inbox.id"), nullable=False)
     kind = Column(String, nullable=False)
+    # FX191 D7: three nullable indexed columns for convergent-delivery trace
+    phase = Column(String, nullable=True)
+    decision = Column(String, nullable=True)
+    reason = Column(String, nullable=True)
     payload = Column(JSON, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
     __table_args__ = (
@@ -502,6 +506,41 @@ class InboxMessageTraceEventModel(Base):
             "created_at",
             "message_id",
         ),
+        Index(
+            "ix_inbox_message_trace_event_fx191_phase_decision",
+            "phase",
+            "decision",
+            sqlite_where=text("phase IS NOT NULL"),
+        ),
+    )
+
+
+class DeliveryObligationModel(Base):
+    """FX191 D1: one delivery obligation per supervisor-directed message."""
+
+    __tablename__ = "delivery_obligation"
+
+    inbox_row_id = Column(Integer, ForeignKey("inbox.id"), primary_key=True)
+    mailbox_id = Column(String, ForeignKey("mailboxes.id"), nullable=False)
+    state = Column(String, nullable=False, default="OPEN", server_default="OPEN")
+    accepted_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    first_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    terminal_at = Column(DateTime(timezone=True), nullable=True)
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    next_attempt_at = Column(DateTime(timezone=True), nullable=True, default=_utcnow)
+    terminal_reason = Column(String, nullable=True)
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('OPEN','ACKED','ESCALATED')",
+            name="ck_delivery_obligation_state",
+        ),
+        Index(
+            "ix_delivery_obligation_open_next",
+            "state",
+            "next_attempt_at",
+            sqlite_where=text("state = 'OPEN'"),
+        ),
+        Index("ix_delivery_obligation_mailbox", "mailbox_id"),
     )
 
 
@@ -972,6 +1011,38 @@ def init_db() -> None:
     _migrate_f136_callback_delivery()
     _migrate_f138_orphan_reconciliation()
     _migrate_f175_dedup_columns()
+    _migrate_fx191_trace_extension()
+
+
+def _migrate_fx191_trace_extension() -> None:
+    """FX191 D7: Add phase/decision/reason columns to inbox_message_trace_event."""
+    with engine.begin() as connection:
+        columns = connection.execute(
+            text("PRAGMA table_info(inbox_message_trace_event)")
+        ).mappings().all()
+        col_names = {col["name"] for col in columns}
+        if "phase" not in col_names:
+            connection.execute(
+                text("ALTER TABLE inbox_message_trace_event ADD COLUMN phase TEXT")
+            )
+        if "decision" not in col_names:
+            connection.execute(
+                text("ALTER TABLE inbox_message_trace_event ADD COLUMN decision TEXT")
+            )
+        if "reason" not in col_names:
+            connection.execute(
+                text("ALTER TABLE inbox_message_trace_event ADD COLUMN reason TEXT")
+            )
+        # Add the partial index for fx191 phase/decision if not present
+        indexes = connection.execute(
+            text("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='inbox_message_trace_event'")
+        ).fetchall()
+        idx_names = {r[0] for r in indexes}
+        if "ix_inbox_message_trace_event_fx191_phase_decision" not in idx_names:
+            connection.execute(text(
+                "CREATE INDEX ix_inbox_message_trace_event_fx191_phase_decision "
+                "ON inbox_message_trace_event(phase, decision) WHERE phase IS NOT NULL"
+            ))
 
 
 def _migrate_f175_dedup_columns() -> None:

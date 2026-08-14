@@ -440,6 +440,15 @@ class StalledCallbackWatchdog:
         for tid in dead:
             del self._episodes[tid]
 
+    def _fx191_convergence_tick(self) -> None:
+        """FX191 D5: convergence loop — first sibling tick in the run loop."""
+        try:
+            from cli_agent_orchestrator.services.delivery_service import convergence_tick
+
+            convergence_tick()
+        except Exception:
+            logger.debug("fx191 convergence_tick error", exc_info=True)
+
     def poll_unarmed_statuses(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
         with self._lock:
@@ -1614,6 +1623,7 @@ class StalledCallbackWatchdog:
                         terminal_id,
                         TerminalStatus(event["data"]["status"]),
                     )
+                await asyncio.to_thread(self._fx191_convergence_tick)
                 await asyncio.to_thread(self.poll_unarmed_statuses)
                 await asyncio.to_thread(self.refresh_screen_fingerprints)
                 await asyncio.to_thread(self.notify_due, registry)

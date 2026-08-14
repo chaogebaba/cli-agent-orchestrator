@@ -575,6 +575,13 @@ def _create_logical_inbox_message_inner(
                     dispatch_barrier=dispatch_barrier,
                     park_warm=park_warm,
                 )
+                db.flush()  # ensure row.id is assigned before obligation
+                # FX191 D1: create obligation atomically with the message
+                from cli_agent_orchestrator.services.delivery_service import (
+                    create_obligation,
+                )
+
+                create_obligation(row.id, logical_receiver_id or mailbox_id, db)
                 db.commit()
                 db.refresh(row)
                 result = _inbox_message_from_row(row)
@@ -1088,6 +1095,21 @@ def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
                     )
                     .all()
                 ]
+            # FX191: settle delivery obligations for acked messages
+            from cli_agent_orchestrator.clients.database import DeliveryObligationModel as _DObl
+
+            db.query(_DObl).filter(
+                _DObl.inbox_row_id <= up_to_id,
+                _DObl.state == "OPEN",
+                _DObl.mailbox_id == _f178_mailbox_id,
+            ).update(
+                {
+                    _DObl.state: "ACKED",
+                    _DObl.terminal_at: datetime.now(timezone.utc),
+                    _DObl.terminal_reason: "consumed",
+                },
+                synchronize_session=False,
+            )
             db.commit()
             # F123: re-evaluate supervisor-pending sentinel after ack settlement.
             if settled_count > 0:
