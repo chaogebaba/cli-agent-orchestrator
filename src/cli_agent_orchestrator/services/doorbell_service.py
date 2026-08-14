@@ -76,12 +76,19 @@ def ring_supervisor_doorbell(
     max_written_row_id: int,
     *,
     written_count: int = 0,
+    caller_holds_no_delivery_lock: bool = False,
 ) -> str:
     """Ring the supervisor after a callback write.
 
     FX170 order: resolve → version guard → socket write → verify wake.
     ANY refusal/failure falls back to fx168 _attempt_gated_ring (D4).
     Returns: rang, fallback, skipped_dedup, skipped_disabled, error.
+
+    F186: caller_holds_no_delivery_lock=True skips G1 in the fallback path.
+    Use from call sites that provably do NOT hold the terminal's delivery lock
+    (e.g. the fx158 reconciler ride-along). The G1 gate exists to exclude the
+    rebind window; callers outside that window pass True to avoid the systematic
+    lock-contention skip that fx168 FIX-4 identified.
     """
     # D10 (fx168): outer switch — off means no bell of any kind.
     if not ConfigService.get("supervisor.doorbell", default=True):
@@ -138,7 +145,10 @@ def ring_supervisor_doorbell(
         return "skipped_disabled"
 
     try:
-        fallback_decision = _attempt_gated_ring(terminal_id, max_written_row_id)
+        fallback_decision = _attempt_gated_ring(
+            terminal_id, max_written_row_id,
+            caller_holds_no_delivery_lock=caller_holds_no_delivery_lock,
+        )
     except Exception as exc:
         _rate_limited_warn(terminal_id, str(exc)[:120], max_written_row_id)
         return "error"
@@ -247,11 +257,15 @@ def _attempt_native_ring(terminal_id: str, max_written_row_id: int) -> Optional[
     return "rang"
 
 
-def _attempt_gated_ring(terminal_id: str, max_written_row_id: int) -> str:
+def _attempt_gated_ring(terminal_id: str, max_written_row_id: int, *, caller_holds_no_delivery_lock: bool = False) -> str:
     """Run through the gate wall and ring if safe.
 
     D13: G1 (delivery_lock) and G2 (recovery_state) exclude the rebind window.
     G4-G8 are checked via probe + _inject_safe + send_prepared_input.
+
+    F186: when caller_holds_no_delivery_lock=True, G1 is skipped — the caller
+    is provably outside the delivery-lock scope so the rebind-exclusion concern
+    does not apply.
     """
     from cli_agent_orchestrator.services.inbox_service import (
         InjectSafetyResult,
@@ -262,13 +276,18 @@ def _attempt_gated_ring(terminal_id: str, max_written_row_id: int) -> str:
     from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 
     # G1: delivery-lock non-blocking acquire (rebind exclusion, D13).
-    delivery_lock = get_delivery_lock(terminal_id)
-    if not delivery_lock.acquire(blocking=False):
-        logger.info(
-            "f168_doorbell terminal=%s decision=skipped_gate reason=delivery_lock row=%s",
-            terminal_id, max_written_row_id,
-        )
-        return "skipped_gate"
+    # F186: skip G1 when caller provably holds no delivery lock (reconciler path).
+    if caller_holds_no_delivery_lock:
+        _owns_lock = False
+    else:
+        delivery_lock = get_delivery_lock(terminal_id)
+        if not delivery_lock.acquire(blocking=False):
+            logger.info(
+                "f168_doorbell terminal=%s decision=skipped_gate reason=delivery_lock row=%s",
+                terminal_id, max_written_row_id,
+            )
+            return "skipped_gate"
+        _owns_lock = True
     try:
         # G2: recovery_state check.
         metadata = get_terminal_metadata(terminal_id)
@@ -372,4 +391,5 @@ def _attempt_gated_ring(terminal_id: str, max_written_row_id: int) -> str:
         )
         return "rang"
     finally:
-        delivery_lock.release()
+        if _owns_lock:
+            delivery_lock.release()

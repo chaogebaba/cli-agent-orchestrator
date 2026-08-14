@@ -686,7 +686,7 @@ class TestFx168ReconcilerRealSqlite:
         # Patch dependencies
         doorbell_calls = []
 
-        def mock_ring(tid, max_id, *, written_count=0):
+        def mock_ring(tid, max_id, *, written_count=0, caller_holds_no_delivery_lock=False):
             doorbell_calls.append((tid, max_id, written_count))
             return "rang"
 
@@ -802,7 +802,7 @@ class TestFx168ReconcilerRealSqlite:
 
         doorbell_calls = []
 
-        def mock_ring(tid, max_id, *, written_count=0):
+        def mock_ring(tid, max_id, *, written_count=0, caller_holds_no_delivery_lock=False):
             doorbell_calls.append((tid, max_id, written_count))
             return "rang"
 

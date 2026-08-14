@@ -863,7 +863,7 @@ class TestAC12FallbackFanIn:
             result = ring_supervisor_doorbell("term-01", 100, written_count=1)
 
         assert result == "fallback"
-        mock_gated.assert_called_once_with("term-01", 100)
+        mock_gated.assert_called_once_with("term-01", 100, caller_holds_no_delivery_lock=False)
 
 
 # ===========================================================================

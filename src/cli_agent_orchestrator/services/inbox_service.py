@@ -3334,12 +3334,16 @@ class InboxService:
                 )
 
                 # F168 D9: ring doorbell after reconciler push write.
+                # F186: pass caller_holds_no_delivery_lock=True — the reconciler
+                # does NOT hold delivery_lock, so G1 must be skipped to avoid the
+                # systematic contention that fx168 FIX-4 identified at the primary site.
                 if outcome.pushed and outcome.message_ids:
                     try:
                         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
                         max_id = max(outcome.message_ids)
                         ring_supervisor_doorbell(
                             mb.current_terminal_id, max_id, written_count=1,
+                            caller_holds_no_delivery_lock=True,
                         )
                     except Exception:
                         pass
