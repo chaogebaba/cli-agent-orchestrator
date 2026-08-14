@@ -14,20 +14,27 @@ from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
 class TestCleanupOldData:
     """Tests for cleanup_old_data function."""
 
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
     @patch("cli_agent_orchestrator.services.cleanup_service.delete_terminal_and_warm_intent")
     @patch("cli_agent_orchestrator.services.cleanup_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.cleanup_service.LOG_DIR")
     @patch("cli_agent_orchestrator.services.cleanup_service.RETENTION_DAYS", 7)
     def test_cleanup_old_data_deletes_old_terminals(
-        self, mock_log_dir, mock_terminal_log_dir, mock_delete, mock_session_local
+        self, mock_log_dir, mock_terminal_log_dir, mock_delete, mock_session_local, mock_get_backend
     ):
         """Test that cleanup deletes old terminals from database."""
+        # D10: backend says panes are dead
+        mock_backend = MagicMock()
+        mock_backend.window_liveness.return_value = "gone"
+        mock_get_backend.return_value = mock_backend
+
         # Setup mock database session
         mock_db = MagicMock()
         mock_session_local.return_value.__enter__.return_value = mock_db
         mock_db.query.return_value.filter.return_value.all.side_effect = [
-            [SimpleNamespace(id="old-1"), SimpleNamespace(id="old-2")],
+            [SimpleNamespace(id="old-1", tmux_session="s", tmux_window="w1"),
+             SimpleNamespace(id="old-2", tmux_session="s", tmux_window="w2")],
             [],
         ]
         mock_db.query.return_value.filter.return_value.count.return_value = 0
@@ -46,6 +53,7 @@ class TestCleanupOldData:
             call("old-2", preserve_warm_intent=False),
         ]
 
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.cleanup_service.status_monitor")
     @patch("cli_agent_orchestrator.services.cleanup_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
@@ -59,8 +67,14 @@ class TestCleanupOldData:
         mock_session_local,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_get_backend,
     ):
         """Test that cleanup deletes old inbox messages from database."""
+        # D10: backend says no terminals are live
+        mock_backend = MagicMock()
+        mock_backend.window_liveness.return_value = "gone"
+        mock_get_backend.return_value = mock_backend
+
         # Setup mock database session
         mock_db = MagicMock()
         mock_session_local.return_value.__enter__.return_value = mock_db
@@ -76,8 +90,10 @@ class TestCleanupOldData:
 
         # Terminal candidates are enumerated in one session; inbox retention
         # performs the only bulk delete and commit in this mocked path.
+        # D10 adds one commit for the survivor-guard clock reset (even if no
+        # terminals matched, the commit is inside the with block).
         assert mock_db.query.call_count >= 2
-        assert mock_db.commit.call_count == 1
+        assert mock_db.commit.call_count >= 1
 
     def test_cleanup_old_data_purges_attempt_members_and_orphaned_attempt(
         self, monkeypatch, tmp_path

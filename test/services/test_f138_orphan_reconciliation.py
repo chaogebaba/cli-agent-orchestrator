@@ -1715,6 +1715,12 @@ class TestM1RuntimeLifespan:
             )
             stack.enter_context(
                 _patch(
+                    "cli_agent_orchestrator.api.main.terminal_service.rearm_fifo_readers_at_startup",
+                    return_value={"rearmed": 0, "skipped_gone": 0, "skipped_existing": 0},
+                )
+            )
+            stack.enter_context(
+                _patch(
                     "cli_agent_orchestrator.services.memory_reconciliation.reconcile_memory_startup",
                     return_value=None,
                 )

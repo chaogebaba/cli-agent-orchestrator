@@ -311,6 +311,9 @@ def test_ac14_no_identity_readback_skips_gone_row_without_scanning(
 def test_ac15_duplicate_identity_is_ambiguous_before_first_match_pick(
     monkeypatch, purge_effects, caplog
 ) -> None:
+    """D11 (F202): duplicate identity now raises IdentityAmbiguousError instead of logging."""
+    from cli_agent_orchestrator.services.terminal_service import IdentityAmbiguousError
+
     backend = _identity_backend()
     backend.window_liveness.return_value = "gone"
     backend.enumerate_windows.return_value = (
@@ -329,12 +332,15 @@ def test_ac15_duplicate_identity_is_ambiguous_before_first_match_pick(
     monkeypatch.setattr(terminal_service, "update_terminal_tmux_window", update)
     caplog.set_level(logging.WARNING)
 
-    assert terminal_service.purge_stale_terminal_records() == 0
+    with pytest.raises(IdentityAmbiguousError) as exc_info:
+        terminal_service.purge_stale_terminal_records()
+
+    err = exc_info.value
+    assert err.terminal_id == "terminal-a"
+    assert err.session == "cao-session"
+    assert set(err.incarnations) == {"clone-one", "clone-two"}
     assert purge_effects.deleted == []
     update.assert_not_called()
-    assert "purge_identity_ambiguous terminal=terminal-a" in caplog.text
-    assert "clone-one" in caplog.text
-    assert "clone-two" in caplog.text
 
 
 # --- §1.8 amendment: enumerate_windows subprocess-only discrimination ---
