@@ -7,6 +7,7 @@ escalation (D6), stranded detector (D8), trace emitter (D7).
 from __future__ import annotations
 
 import logging
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -494,6 +495,10 @@ def convergence_tick() -> None:
     # FX194 D1b: Check health warnings for obligations crossing E
     _check_health_warnings(escalate_after_s)
 
+    # F206a/H3: Re-resolve ESCALATED obligations whose inbox message is still
+    # undelivered, at a bounded cadence (once per escalate_after_s).
+    _reresolve_escalated(escalate_after_s)
+
 
 def _get_consumption_cursor(mailbox_id: str) -> int | None:
     """D1 helper: read the durable consumption cursor for a mailbox."""
@@ -723,6 +728,12 @@ def _escalate(
             age_s,
             obl.attempts,
         )
+        # F206a/H3: Arm re-resolve cadence
+        from cli_agent_orchestrator.services.config_service import ConfigService
+        from datetime import timedelta
+
+        eas = float(ConfigService.get("delivery.escalate_after_s", 120.0))
+        obl.next_attempt_at = now + timedelta(seconds=eas)
         return
 
     # Attempt escalation injection (D6 step 1: force past busy, not past hazard)
@@ -748,6 +759,59 @@ def _escalate(
         age_s,
         obl.attempts,
     )
+
+    # F206b: Visible floor — if injection failed, fire tmux display-message
+    # unconditionally (bypasses draft guard — display-message does not touch
+    # the pane input line).
+    if not r2.delivered:
+        _fire_escalation_display_message(target, obl.inbox_row_id)
+
+    # F206a/H3: Arm next_attempt_at for bounded re-resolve cadence
+    from cli_agent_orchestrator.services.config_service import ConfigService
+    from datetime import timedelta
+
+    eas = float(ConfigService.get("delivery.escalate_after_s", 120.0))
+    obl.next_attempt_at = now + timedelta(seconds=eas)
+
+
+def _fire_escalation_display_message(
+    target: DeliveryTarget, inbox_row_id: int, undelivered_count: int = 1
+) -> None:
+    """F206b: Draft-guard-independent visible floor via tmux display-message.
+
+    display-message renders in the status line and does NOT touch the pane
+    input, so the D2b draft guard rationale does not apply.
+    """
+    from cli_agent_orchestrator.utils.tmux_command import tmux_argv
+
+    # Use provided count or try to get aggregate (best-effort, no nested session
+    # to avoid SQLite locking issues when called within an active transaction).
+    if undelivered_count <= 0:
+        undelivered_count = 1
+
+    msg = f"[cao] {undelivered_count} undelivered — run list_messages"
+    try:
+        result = subprocess.run(
+            tmux_argv("display-message", "-t", target.tmux_session, msg),
+            capture_output=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "f206b display-message rc=%d session=%s stderr=%s",
+                result.returncode,
+                target.tmux_session,
+                result.stderr[:200] if result.stderr else b"",
+            )
+        else:
+            logger.info(
+                "f206b escalation_display_message inbox=%d session=%s count=%d",
+                inbox_row_id,
+                target.tmux_session,
+                undelivered_count,
+            )
+    except Exception as e:
+        logger.warning("f206b display-message exception session=%s: %s", target.tmux_session, e)
 
 
 def _check_stranded(escalate_after_s: float) -> None:
@@ -796,6 +860,128 @@ def _check_stranded(escalate_after_s: float) -> None:
 
 
 # ---------------------------------------------------------------------------
+# F206a/H3: Re-resolve ESCALATED obligations at bounded cadence
+# ---------------------------------------------------------------------------
+
+
+def _reresolve_escalated(escalate_after_s: float) -> None:
+    """F206a: Pick up ESCALATED obligations whose inbox message is still undelivered.
+
+    Re-resolve at a slow cadence (once per escalate_after_s) using the existing
+    next_attempt_at machinery — no new config key. On re-resolve:
+    - If the draft guard no longer vetoes, perform the normal escalation injection.
+    - If it still vetoes, re-fire the H2 display-message floor at most once per cadence.
+    - If consumed in the meantime, settle to ACKED.
+    """
+    from datetime import timedelta
+
+    now = _utcnow()
+
+    with SessionLocal() as db:
+        # Pick ESCALATED obligations that are due for re-resolve AND whose inbox
+        # message is still not delivered.
+        escalated_due = (
+            db.query(DeliveryObligationModel)
+            .filter(
+                DeliveryObligationModel.state == "ESCALATED",
+                DeliveryObligationModel.next_attempt_at <= now,
+            )
+            .all()
+        )
+
+        for obl in escalated_due:
+            try:
+                # Check if already consumed (race with MCP pull)
+                mailbox = db.query(MailboxModel).filter_by(id=obl.mailbox_id).one_or_none()
+                if mailbox is not None and mailbox.consumed_through_id >= obl.inbox_row_id:
+                    obl.state = "ACKED"
+                    obl.terminal_at = now
+                    obl.terminal_reason = "consumed"
+                    emit_trace_or_collapse(
+                        obl.inbox_row_id, "f206_reresolve", "settle", "consumed", db
+                    )
+                    db.commit()
+                    continue
+
+                # Check inbox row status
+                inbox_row = db.query(InboxModel).filter_by(id=obl.inbox_row_id).one_or_none()
+                if inbox_row is None or inbox_row.status == "delivered":
+                    obl.state = "ACKED"
+                    obl.terminal_at = now
+                    obl.terminal_reason = "consumed"
+                    emit_trace_or_collapse(
+                        obl.inbox_row_id, "f206_reresolve", "settle", "consumed", db
+                    )
+                    db.commit()
+                    continue
+
+                # Still undelivered — attempt re-injection
+                target = resolve_supervisor_target(obl.mailbox_id, db)
+                if target.terminal_id is None or target.tmux_session is None:
+                    # No live target — keep ESCALATED, bump next_attempt_at
+                    obl.next_attempt_at = now + timedelta(seconds=escalate_after_s)
+                    db.commit()
+                    continue
+
+                # Try escalation injection (goes through safety gates incl. draft guard)
+                r2 = attempt_rung2(
+                    target,
+                    obl.inbox_row_id,
+                    oldest_age_s=(now - (obl.accepted_at.replace(tzinfo=timezone.utc)
+                                         if obl.accepted_at and obl.accepted_at.tzinfo is None
+                                         else obl.accepted_at)).total_seconds()
+                    if obl.accepted_at
+                    else 0.0,
+                    is_escalation=True,
+                )
+
+                if r2.delivered:
+                    # Injection succeeded — settle as delivered-late
+                    obl.state = "ACKED"
+                    obl.terminal_at = now
+                    obl.terminal_reason = "f206_reresolve_delivered"
+                    emit_trace_or_collapse(
+                        obl.inbox_row_id, "f206_reresolve", "settle", "delivered", db
+                    )
+                    logger.info(
+                        "f206a reresolve_delivered inbox=%d", obl.inbox_row_id
+                    )
+                else:
+                    # Still vetoed — fire H2 floor (display-message) at cadence
+                    # Count escalated obligations for this mailbox for the message
+                    from sqlalchemy import func as _func
+
+                    esc_count = (
+                        db.query(_func.count(DeliveryObligationModel.inbox_row_id))
+                        .filter(
+                            DeliveryObligationModel.state == "ESCALATED",
+                            DeliveryObligationModel.mailbox_id == obl.mailbox_id,
+                        )
+                        .scalar()
+                    ) or 1
+                    _fire_escalation_display_message(target, obl.inbox_row_id, esc_count)
+                    emit_trace_or_collapse(
+                        obl.inbox_row_id,
+                        "f206_reresolve",
+                        "defer",
+                        r2.reason or "still_vetoed",
+                        db,
+                    )
+
+                # Bump next_attempt_at for cadence control
+                obl.next_attempt_at = now + timedelta(seconds=escalate_after_s)
+                db.commit()
+
+            except Exception:
+                db.rollback()
+                logger.debug(
+                    "f206a reresolve exception inbox=%s",
+                    obl.inbox_row_id,
+                    exc_info=True,
+                )
+
+
+# ---------------------------------------------------------------------------
 # FX194 D4: Update @cao_pending tmux user variable
 # ---------------------------------------------------------------------------
 
@@ -815,7 +1001,7 @@ def _update_pending_indicators() -> None:
             pending_counts = (
                 db.query(
                     DeliveryObligationModel.mailbox_id,
-                    func.count(DeliveryObligationModel.id),
+                    func.count(DeliveryObligationModel.inbox_row_id),
                 )
                 .filter(DeliveryObligationModel.state == "OPEN")
                 .group_by(DeliveryObligationModel.mailbox_id)
@@ -849,7 +1035,7 @@ def _update_pending_indicators() -> None:
                             0,
                         )
     except Exception:
-        logger.debug("fx194 _update_pending_indicators error", exc_info=True)
+        logger.warning("fx194 _update_pending_indicators error", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
