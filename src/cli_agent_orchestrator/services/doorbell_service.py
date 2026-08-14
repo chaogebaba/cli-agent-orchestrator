@@ -137,6 +137,13 @@ def ring_supervisor_doorbell(
     from cli_agent_orchestrator.services.teammate_push_service import _should_teammate_push
 
     if not _should_teammate_push(terminal_id):
+        # F203 D9/AC9: counted ejection for fallback ring
+        from cli_agent_orchestrator.services.transport_ejection import (
+            transport_ejection_service,
+        )
+        transport_ejection_service.record_refusal(
+            terminal_id, "fallback", "not_registered_fallback"
+        )
         logger.info(
             "f170_doorbell terminal=%s decision=skipped_disabled "
             "reason=not_registered_fallback row=%s",

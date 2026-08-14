@@ -27,6 +27,9 @@ from cli_agent_orchestrator.clients.database import (
 
 logger = logging.getLogger(__name__)
 
+# F203 D17: Health-warning dedup state — (terminal_id, inbox_row_id, diagnosis) → last emit time
+_health_warning_dedup: dict[tuple[str, int, str], "datetime"] = {}
+
 # ---------------------------------------------------------------------------
 # D2: Delivery target resolution
 # ---------------------------------------------------------------------------
@@ -80,6 +83,19 @@ def resolve_supervisor_target(mailbox_id: str, db: Session | None = None) -> Del
             has_registry = result.refusal_reason != "no_registry_records"
         except Exception:
             pass
+
+        # D11: Active re-probe readmits — if registry now has a record,
+        # un-eject rung1 (self-heal on CC upgrade/restart).
+        if has_registry:
+            try:
+                from cli_agent_orchestrator.services.transport_ejection import (
+                    transport_ejection_service,
+                )
+
+                if transport_ejection_service.is_ejected(terminal.id, "rung1"):
+                    transport_ejection_service.readmit(terminal.id, "rung1")
+            except Exception:
+                pass
 
         return DeliveryTarget(
             terminal_id=terminal.id,
@@ -224,6 +240,61 @@ def settle_obligation_acked(inbox_row_id: int, db: Session | None = None) -> Non
             session.commit()
 
 
+def _create_self_notify_obligation(terminal_id: str) -> None:
+    """F203 D15: Create a delivery obligation targeting the supervisor's own mailbox.
+
+    Called when the watchdog detects a supervisor terminal with pending messages
+    but no caller_id. Routes delivery to the supervisor's own mailbox instead of
+    permanently latching fired=True.
+    """
+    try:
+        with SessionLocal() as db:
+            mailbox = (
+                db.query(MailboxModel)
+                .filter_by(current_terminal_id=terminal_id)
+                .first()
+            )
+            if mailbox is None:
+                return
+
+            # Check if there's already an OPEN obligation for this mailbox
+            existing = (
+                db.query(DeliveryObligationModel)
+                .filter_by(mailbox_id=mailbox.id, state="OPEN")
+                .first()
+            )
+            if existing is not None:
+                return  # Already has an obligation
+
+            # Find the oldest pending message for this mailbox
+            oldest = (
+                db.query(InboxModel)
+                .filter(
+                    InboxModel.logical_receiver_id == mailbox.id,
+                    InboxModel.status.in_(["pending", "held"]),
+                )
+                .order_by(InboxModel.id)
+                .first()
+            )
+            if oldest is None:
+                return  # No pending messages
+
+            now = _utcnow()
+            obl = DeliveryObligationModel(
+                inbox_row_id=oldest.id,
+                mailbox_id=mailbox.id,
+                state="OPEN",
+                accepted_at=now,
+                first_attempt_at=now,
+                next_attempt_at=now,
+                attempts=0,
+            )
+            db.add(obl)
+            db.commit()
+    except Exception:
+        logger.debug("f203 self-notify obligation failed for %s", terminal_id, exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # D3: Ladder — rung 1 (native) and rung 2 (nudge/floor)
 # ---------------------------------------------------------------------------
@@ -248,10 +319,19 @@ def attempt_rung1(
     """Rung 1: native CC socket ring + cc_inbox_path write. Best-effort.
 
     At S0 (shadow), this is purely additive — old transports still run.
+    F203 D9: no_registry_records is a counted refusal → ejection after N.
     """
     import os
 
+    from cli_agent_orchestrator.services.transport_ejection import (
+        transport_ejection_service,
+    )
+
     if not target.has_registry:
+        # D9: Record the refusal for ejection counting
+        transport_ejection_service.record_refusal(
+            target.terminal_id, "rung1", "no_registry_records"
+        )
         return LadderResult(
             delivered=False,
             phase="transport_attempt",
@@ -489,6 +569,11 @@ def convergence_tick() -> None:
     # (boundaries handle primary delivery)
     _fire_due_nudges()
 
+    # F203 D6: Oneshot re-arm — call reset_boundary_counter on every pull-cycle
+    # exit for all terminals with OPEN obligations.  If it returns True (work
+    # arrived since last reset), re-poll by repeating _fire_due_nudges.
+    _oneshot_rearm_boundaries()
+
     # FX194 D4: Update @cao_pending for all terminals with OPEN obligations
     _update_pending_indicators()
 
@@ -498,6 +583,31 @@ def convergence_tick() -> None:
     # F206a/H3: Re-resolve ESCALATED obligations whose inbox message is still
     # undelivered, at a bounded cadence (once per escalate_after_s).
     _reresolve_escalated(escalate_after_s)
+
+
+def _oneshot_rearm_boundaries() -> None:
+    """F203 D6: Oneshot re-arm for all terminals with tracked boundary state.
+
+    Called unconditionally on every pull-cycle exit (both the delivered path and
+    the no-work exit).  If reset_boundary_counter returns True for any terminal
+    (work arrived since last_boundary_at), re-poll via _fire_due_nudges.
+    D7: No dedup on re-arm — duplicate wakes are noise; a missed wake is a hang.
+    """
+    from cli_agent_orchestrator.services.boundary_pull_service import boundary_pull_service
+
+    # Get all tracked terminal IDs
+    with boundary_pull_service._lock:
+        terminal_ids = list(boundary_pull_service._states.keys())
+
+    needs_repoll = False
+    for terminal_id in terminal_ids:
+        if boundary_pull_service.reset_boundary_counter(terminal_id):
+            needs_repoll = True
+
+    if needs_repoll:
+        # Work arrived during the cycle — re-poll (D6: caller re-polls instead
+        # of arming into a lost notify)
+        _fire_due_nudges()
 
 
 def _get_consumption_cursor(mailbox_id: str) -> int | None:
@@ -538,12 +648,26 @@ def _fire_due_nudges() -> None:
     FX194 D2: The nudge is now a masked interrupt — it fires ONLY when no
     consumption boundary has occurred for the E-window. After firing, it is
     MASKED and re-arms on the first subsequent consumption boundary.
+
+    F203 D1/D3: Uses delivery.interrupt_after_s (clamped to < escalate_after_s)
+    instead of sharing the escalation threshold.
     """
     from cli_agent_orchestrator.services.boundary_pull_service import boundary_pull_service
     from cli_agent_orchestrator.services.config_service import ConfigService
     from cli_agent_orchestrator.services.nudge_discipline import nudge_discipline
 
     escalate_after_s = float(ConfigService.get("delivery.escalate_after_s", 120.0))
+    tick_s = float(ConfigService.get("delivery.tick_s", 5.0))
+    raw_interrupt = float(ConfigService.get("delivery.interrupt_after_s", 30.0))
+
+    # D2: Clamp interrupt_after_s to strictly less than escalate_after_s
+    effective_interrupt = min(raw_interrupt, escalate_after_s - tick_s)
+    if effective_interrupt != raw_interrupt:
+        logger.warning(
+            "f203 delivery.interrupt_after_s clamped: configured=%.1f effective=%.1f "
+            "(escalate_after_s=%.1f tick_s=%.1f)",
+            raw_interrupt, effective_interrupt, escalate_after_s, tick_s,
+        )
 
     intents = nudge_discipline.collect_due(
         get_consumption_cursor=_get_consumption_cursor,
@@ -574,7 +698,7 @@ def _fire_due_nudges() -> None:
             target.terminal_id,
             intent.mailbox_id,
             oldest_age_s,
-            escalate_after_s,
+            effective_interrupt,
         ):
             # Boundary deliveries are handling it — no composer injection needed
             continue
@@ -1061,6 +1185,9 @@ def _check_health_warnings(escalate_after_s: float) -> None:
     Logs a warning distinguishing:
     - stuck_thinking: expected case, D2 interrupt will handle
     - harness_contract_broken: H1/H2 regression, boundaries not being surfaced
+
+    F203 D17: Dedup — at most one WARN per (terminal_id, inbox_row_id, diagnosis)
+    per escalate_after_s window. A diagnosis CHANGE emits a new one.
     """
     from cli_agent_orchestrator.services.boundary_pull_service import boundary_pull_service
 
@@ -1095,6 +1222,16 @@ def _check_health_warnings(escalate_after_s: float) -> None:
                     target.terminal_id, age_s, escalate_after_s
                 )
                 if warning:
+                    # D17: Dedup — only emit if (terminal, inbox_row, diagnosis)
+                    # not already emitted within this window
+                    dedup_key = (target.terminal_id, obl.inbox_row_id, warning)
+                    last_emitted = _health_warning_dedup.get(dedup_key)
+                    if last_emitted is not None:
+                        elapsed = (now - last_emitted).total_seconds()
+                        if elapsed < escalate_after_s:
+                            continue  # suppress duplicate
+                    _health_warning_dedup[dedup_key] = now
+
                     logger.warning(
                         "fx194_health_warning terminal=%s inbox=%d age=%.0fs "
                         "diagnosis=%s boundary_deliveries=0",

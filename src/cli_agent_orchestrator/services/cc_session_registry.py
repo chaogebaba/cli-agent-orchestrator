@@ -189,8 +189,9 @@ def read_registry(sessions_dir: Optional[Path] = None) -> list[RegistryRecord]:
             data = json.loads(entry.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        # Require minimum fields
-        if not all(k in data for k in ("sessionId", "messagingSocketPath", "procStart")):
+        # D13: Require minimum fields — messagingSocketPath is optional
+        # (CC 2.1.232 dropped the field); sessionId + procStart suffice.
+        if not all(k in data for k in ("sessionId", "procStart")):
             continue
         # FX170-S2: coerce numeric fields to int at parse time.
         # Claude Code may write procStart/peerProtocol as JSON strings.

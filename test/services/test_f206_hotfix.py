@@ -195,7 +195,12 @@ class TestH2EscalationDisplayMessage:
             ),
             patch(
                 "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda key, *a, **kw: 30.0 if "escalate_after_s" in key else None,
+                side_effect=lambda key, *a, **kw: (
+                    30.0 if "escalate_after_s" in key else
+                    30.0 if "interrupt_after_s" in key else
+                    5.0 if "tick_s" in key else
+                    None
+                ),
             ),
         ):
             mock_resolve.return_value = DeliveryTarget(
