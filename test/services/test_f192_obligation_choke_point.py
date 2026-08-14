@@ -345,3 +345,134 @@ class TestProducerSweepObligationCreation:
             assert obligation is None, (
                 "Obligation should NOT be created for non-supervisor targets"
             )
+
+
+# ---------------------------------------------------------------------------
+# TEST 3: M-B mutant killer — non-supervisor MAILBOX receiver gets no obligation
+# ---------------------------------------------------------------------------
+
+
+class TestNonSupervisorMailboxNoObligation:
+    """Kill mutant M-B: dropping _is_supervisor_mailbox_id gate must fail.
+
+    These tests exercise receivers that HAVE a mailbox (so logical_receiver_id
+    is non-None) but whose mailbox role is NOT 'supervisor'.  Under the mutant
+    (gate removed), _create_obligation_inline fires for every receiver with a
+    mailbox — these tests catch that.
+    """
+
+    @pytest.fixture
+    def worker_mailbox_db(self, scratch_db):
+        """Create a worker terminal WITH a mailbox (role='worker') + sender."""
+        with scratch_db.begin() as db:
+            # Worker terminal with its own mailbox
+            db.add(
+                TerminalModel(
+                    id="wrkr0001",
+                    tmux_session="cao-test",
+                    tmux_window="worker-mb",
+                    provider="kiro_cli",
+                    agent_profile="developer",
+                    init_state="ready",
+                )
+            )
+            db.add(
+                MailboxModel(
+                    id="mb_wrkr0001",
+                    session_name="cao-test",
+                    role="worker",
+                    current_terminal_id="wrkr0001",
+                    generation=1,
+                    consumed_through_id=0,
+                    cc_inbox_path="/tmp/test-worker-inbox.json",
+                )
+            )
+            db.add(
+                MailboxIncarnationModel(
+                    mailbox_id="mb_wrkr0001",
+                    generation=1,
+                    terminal_id="wrkr0001",
+                )
+            )
+            # Sender terminal
+            db.add(
+                TerminalModel(
+                    id="sndr0001",
+                    tmux_session="cao-test",
+                    tmux_window="sender",
+                    provider="kiro_cli",
+                    agent_profile="developer",
+                    init_state="ready",
+                )
+            )
+        return scratch_db
+
+    def test_worker_mailbox_receiver_no_obligation_via_create_inbox_message(
+        self, worker_mailbox_db
+    ):
+        """M-B KILLER: create_inbox_message to a worker-mailbox terminal must
+        NOT create an obligation row — the _is_supervisor_mailbox_id gate
+        rejects it.
+
+        Under mutant M-B (gate removed), this fails because
+        _create_obligation_inline fires for any non-None logical_receiver_id.
+        """
+        db_factory = worker_mailbox_db
+
+        msg = create_inbox_message(
+            sender_id="sndr0001",
+            receiver_id="wrkr0001",
+            message="task for worker — no obligation expected",
+        )
+
+        with db_factory() as db:
+            obligation = (
+                db.query(DeliveryObligationModel)
+                .filter_by(inbox_row_id=msg.id)
+                .one_or_none()
+            )
+            assert obligation is None, (
+                "M-B KILL: obligation must NOT be created for non-supervisor "
+                f"mailbox receiver (role='worker'), but got obligation "
+                f"state={obligation.state if obligation else '?'} "
+                f"mailbox_id={obligation.mailbox_id if obligation else '?'}"
+            )
+
+    def test_worker_mailbox_receiver_no_obligation_via_logical_path(
+        self, worker_mailbox_db, monkeypatch
+    ):
+        """M-B KILLER (logical path): mailbox_service.create_logical_inbox_message
+        to a worker mailbox must NOT create an obligation row.
+
+        This exercises the raw-producer path that bypasses
+        _create_inbox_message_unfenced and calls _insert_routed_inbox_row directly.
+        """
+        db_factory = worker_mailbox_db
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            lambda *a, **kw: None,
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_guard_service.require_input_allowed",
+            lambda *a, **kw: None,
+        )
+
+        msg = mailbox_service.create_logical_inbox_message(
+            sender_id="sndr0001",
+            mailbox_id="mb_wrkr0001",
+            message="logical message to worker mailbox — no obligation expected",
+        )
+
+        with db_factory() as db:
+            obligation = (
+                db.query(DeliveryObligationModel)
+                .filter_by(inbox_row_id=msg.id)
+                .one_or_none()
+            )
+            assert obligation is None, (
+                "M-B KILL: obligation must NOT be created for non-supervisor "
+                f"mailbox via logical path (role='worker'), but got obligation "
+                f"state={obligation.state if obligation else '?'} "
+                f"mailbox_id={obligation.mailbox_id if obligation else '?'}"
+            )
