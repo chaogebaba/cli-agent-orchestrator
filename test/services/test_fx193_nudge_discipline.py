@@ -604,3 +604,229 @@ class TestAC6EBoundEscalation:
             # Escalation: should return None (bypasses busy gate, D5)
             result = _check_safety_gates(target, is_escalation=True)
             assert result is None
+
+
+# ---------------------------------------------------------------------------
+# AC-D2b: Draft-guard veto on injection
+# ---------------------------------------------------------------------------
+
+
+class TestACDraftGuardVeto:
+    """D2b: Non-empty composer draft defers injection; empty composer injects."""
+
+    def test_non_empty_composer_defers(self):
+        """Non-empty composer draft → _check_safety_gates returns 'user_draft_present'."""
+        from unittest.mock import MagicMock, patch
+
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients.database import (
+            Base,
+            TerminalModel,
+        )
+        from cli_agent_orchestrator.services.delivery_service import (
+            DeliveryTarget,
+            _check_safety_gates,
+        )
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(bind=engine)
+        TestSession = sessionmaker(bind=engine)
+
+        with TestSession() as db:
+            db.add(
+                TerminalModel(
+                    id="sup1",
+                    tmux_session="cao-test",
+                    tmux_window="supervisor",
+                    provider="kiro_cli",
+                    agent_profile="supervisor",
+                )
+            )
+            db.commit()
+
+        target = DeliveryTarget(
+            terminal_id="sup1",
+            tmux_session="cao-test",
+            tmux_window="supervisor",
+            cc_inbox_path=None,
+        )
+
+        # Mock provider with a non-empty draft
+        mock_provider = MagicMock()
+        mock_provider.read_composer_draft.return_value = "half-typed user text"
+
+        mock_backend = MagicMock()
+        mock_backend.get_history.return_value = "line1\nline2\nhalf-typed user text"
+
+        mock_provider_manager = MagicMock()
+        mock_provider_manager.get_provider.return_value = mock_provider
+
+        with (
+            patch("cli_agent_orchestrator.services.delivery_service.SessionLocal", TestSession),
+            patch(
+                "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+                return_value={
+                    "tmux_session": "cao-test",
+                    "tmux_window": "supervisor",
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.manager.provider_manager",
+                mock_provider_manager,
+            ),
+            patch(
+                "cli_agent_orchestrator.backends.registry.get_backend",
+                return_value=mock_backend,
+            ),
+        ):
+            # Non-escalation: deferred
+            result = _check_safety_gates(target, is_escalation=False)
+            assert result == "user_draft_present"
+
+            # Escalation: ALSO deferred (D2b carve-out: corrupted prompt > late nudge)
+            result = _check_safety_gates(target, is_escalation=True)
+            assert result == "user_draft_present"
+
+    def test_empty_composer_allows_injection(self):
+        """Empty composer draft → _check_safety_gates returns None (injection proceeds)."""
+        from unittest.mock import MagicMock, patch
+
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients.database import (
+            Base,
+            TerminalModel,
+        )
+        from cli_agent_orchestrator.services.delivery_service import (
+            DeliveryTarget,
+            _check_safety_gates,
+        )
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(bind=engine)
+        TestSession = sessionmaker(bind=engine)
+
+        with TestSession() as db:
+            db.add(
+                TerminalModel(
+                    id="sup1",
+                    tmux_session="cao-test",
+                    tmux_window="supervisor",
+                    provider="kiro_cli",
+                    agent_profile="supervisor",
+                )
+            )
+            db.commit()
+
+        target = DeliveryTarget(
+            terminal_id="sup1",
+            tmux_session="cao-test",
+            tmux_window="supervisor",
+            cc_inbox_path=None,
+        )
+
+        # Mock provider with empty draft
+        mock_provider = MagicMock()
+        mock_provider.read_composer_draft.return_value = ""
+
+        mock_backend = MagicMock()
+        mock_backend.get_history.return_value = "line1\nline2\n"
+
+        mock_provider_manager = MagicMock()
+        mock_provider_manager.get_provider.return_value = mock_provider
+
+        with (
+            patch("cli_agent_orchestrator.services.delivery_service.SessionLocal", TestSession),
+            patch(
+                "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+                return_value={
+                    "tmux_session": "cao-test",
+                    "tmux_window": "supervisor",
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.manager.provider_manager",
+                mock_provider_manager,
+            ),
+            patch(
+                "cli_agent_orchestrator.backends.registry.get_backend",
+                return_value=mock_backend,
+            ),
+        ):
+            # Empty draft → injection allowed
+            result = _check_safety_gates(target, is_escalation=False)
+            assert result is None
+
+    def test_none_draft_allows_injection(self):
+        """Provider returns None (no draft capability) → injection proceeds."""
+        from unittest.mock import MagicMock, patch
+
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients.database import (
+            Base,
+            TerminalModel,
+        )
+        from cli_agent_orchestrator.services.delivery_service import (
+            DeliveryTarget,
+            _check_safety_gates,
+        )
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(bind=engine)
+        TestSession = sessionmaker(bind=engine)
+
+        with TestSession() as db:
+            db.add(
+                TerminalModel(
+                    id="sup1",
+                    tmux_session="cao-test",
+                    tmux_window="supervisor",
+                    provider="kiro_cli",
+                    agent_profile="supervisor",
+                )
+            )
+            db.commit()
+
+        target = DeliveryTarget(
+            terminal_id="sup1",
+            tmux_session="cao-test",
+            tmux_window="supervisor",
+            cc_inbox_path=None,
+        )
+
+        # Mock provider that returns None (no draft detected)
+        mock_provider = MagicMock()
+        mock_provider.read_composer_draft.return_value = None
+
+        mock_backend = MagicMock()
+        mock_backend.get_history.return_value = "line1\nline2\n"
+
+        mock_provider_manager = MagicMock()
+        mock_provider_manager.get_provider.return_value = mock_provider
+
+        with (
+            patch("cli_agent_orchestrator.services.delivery_service.SessionLocal", TestSession),
+            patch(
+                "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+                return_value={
+                    "tmux_session": "cao-test",
+                    "tmux_window": "supervisor",
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.manager.provider_manager",
+                mock_provider_manager,
+            ),
+            patch(
+                "cli_agent_orchestrator.backends.registry.get_backend",
+                return_value=mock_backend,
+            ),
+        ):
+            # None draft → injection allowed (no draft to corrupt)
+            result = _check_safety_gates(target, is_escalation=False)
+            assert result is None

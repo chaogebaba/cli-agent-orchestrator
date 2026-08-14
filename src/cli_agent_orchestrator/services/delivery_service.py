@@ -408,6 +408,34 @@ def _check_safety_gates(target: DeliveryTarget, *, is_escalation: bool = False) 
     except Exception:
         pass
 
+    # FX193 D2b: Draft-guard veto — non-empty composer draft defers injection
+    # for ALL rung2 calls (first, repeats, AND escalation). A submitted corrupted
+    # prompt is worse than a late nudge; the E-bound escalation clock still runs.
+    try:
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+        from cli_agent_orchestrator.providers.manager import provider_manager
+
+        metadata = get_terminal_metadata(target.terminal_id)
+        if metadata is not None:
+            provider = provider_manager.get_provider(target.terminal_id)
+            if provider is not None and callable(getattr(provider, "read_composer_draft", None)):
+                from cli_agent_orchestrator.backends.registry import get_backend
+
+                try:
+                    captured = get_backend().get_history(
+                        metadata["tmux_session"],
+                        metadata["tmux_window"],
+                        tail_lines=45,
+                        strip_escapes=True,
+                    )
+                    draft = provider.read_composer_draft(captured.splitlines())
+                    if draft:
+                        return "user_draft_present"
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     return None
 
 
