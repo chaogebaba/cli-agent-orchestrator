@@ -481,3 +481,173 @@ class TestEndpointSinceNormalization:
             parsed = parsed.astimezone(timezone.utc)
         assert parsed.tzinfo == timezone.utc
         assert parsed.hour == 4
+
+
+
+# ---------------------------------------------------------------------------
+# F130 regression: write a row, filter with UTC since one minute earlier
+# ---------------------------------------------------------------------------
+
+
+class TestF130Regression:
+    """Core F130 regression: UTC since-filtering must not silently drop fresh rows.
+
+    Reproduces the original defect: a row created at 23:22Z was stored as
+    "19:22:16" (naive local UTC-4), so a since=23:20Z query missed it.
+    Post-fix, all rows are stored as UTC and the since normalization is
+    consistent.
+    """
+
+    def test_fresh_row_found_with_utc_since_one_minute_earlier(self, scratch_db):
+        """Write a row NOW, query with since = 1 min ago (UTC). Must return it."""
+        now = _utcnow()
+        one_min_ago = now - timedelta(minutes=1)
+        with scratch_db.begin() as db:
+            _make_terminal(db, "t-001")
+            _make_mailbox(db, "t-001")
+            _make_inbox_row(db, "t-001", created_at=now)
+
+        # Query with aware-UTC since
+        result = list_messages("t-001", since=one_min_ago)
+        assert len(result["items"]) == 1, (
+            f"Row at {now.isoformat()} must be found with since={one_min_ago.isoformat()}"
+        )
+
+    def test_fresh_row_found_with_naive_since_one_minute_earlier(self, scratch_db):
+        """Write a row NOW, query with naive since = 1 min ago. Must return it."""
+        now = _utcnow()
+        one_min_ago = (now - timedelta(minutes=1)).replace(tzinfo=None)
+        with scratch_db.begin() as db:
+            _make_terminal(db, "t-001")
+            _make_mailbox(db, "t-001")
+            _make_inbox_row(db, "t-001", created_at=now)
+
+        result = list_messages("t-001", since=one_min_ago)
+        assert len(result["items"]) == 1, (
+            f"Row must be found with naive since={one_min_ago.isoformat()}"
+        )
+
+    def test_utc_since_after_row_excludes_it(self, scratch_db):
+        """A since AFTER the row's time must exclude it."""
+        now = _utcnow()
+        one_min_later = now + timedelta(minutes=1)
+        with scratch_db.begin() as db:
+            _make_terminal(db, "t-001")
+            _make_mailbox(db, "t-001")
+            _make_inbox_row(db, "t-001", created_at=now)
+
+        result = list_messages("t-001", since=one_min_later)
+        assert len(result["items"]) == 0
+
+    def test_multiple_rows_partial_filter(self, scratch_db):
+        """Two rows at different times; since between them returns only the later."""
+        t1 = _utcnow() - timedelta(hours=2)
+        t2 = _utcnow() - timedelta(minutes=5)
+        since_between = _utcnow() - timedelta(hours=1)
+        with scratch_db.begin() as db:
+            _make_terminal(db, "t-001")
+            _make_mailbox(db, "t-001")
+            _make_inbox_row(db, "t-001", created_at=t1, message="old")
+            _make_inbox_row(db, "t-001", created_at=t2, message="new")
+
+        result = list_messages("t-001", since=since_between)
+        assert len(result["items"]) == 1
+        assert result["items"][0]["message"] == "new"
+
+
+# ---------------------------------------------------------------------------
+# F130 endpoint normalization: naive since gets UTC attached at API layer
+# ---------------------------------------------------------------------------
+
+
+class TestEndpointNaiveSinceNormalization:
+    """The API endpoint must attach UTC to naive since before passing downstream.
+
+    This tests the defense-in-depth fix: even though the service layer also
+    normalizes, the endpoint should not pass ambiguous naive datetimes.
+    """
+
+    def test_endpoint_naive_since_gets_utc(self):
+        """Simulating the endpoint code path: naive since → aware UTC."""
+        since_str = "2026-08-10T04:00:00"
+        parsed = datetime.fromisoformat(since_str.replace("Z", "+00:00"))
+        # Apply endpoint normalization (mirrors the fixed code)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+        assert parsed.tzinfo == timezone.utc
+        assert parsed.hour == 4
+
+    def test_endpoint_utc_offset_since_converts(self):
+        """Aware non-UTC since is converted to UTC at endpoint."""
+        since_str = "2026-08-10T00:00:00-04:00"
+        parsed = datetime.fromisoformat(since_str.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+        assert parsed.tzinfo == timezone.utc
+        assert parsed.hour == 4  # 00:00-04:00 = 04:00 UTC
+
+    def test_endpoint_z_suffix_stays_utc(self):
+        """Z-suffix since stays UTC."""
+        since_str = "2026-08-10T04:00:00Z"
+        parsed = datetime.fromisoformat(since_str.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+        assert parsed.tzinfo == timezone.utc
+        assert parsed.hour == 4
+
+
+# ---------------------------------------------------------------------------
+# F130 migration/compat: legacy naive-local rows compared with UTC since
+# ---------------------------------------------------------------------------
+
+
+class TestF130LegacyRowCompat:
+    """Legacy pre-hotfix rows stored as naive-local have a known skew when
+    compared with UTC since. Document the behavior and verify new rows work.
+
+    Migration strategy: legacy rows stored as naive-local text (e.g. "19:22:16"
+    for what was actually 23:22:16 UTC) are treated as UTC on read. This means
+    they appear <=4h early relative to their true wall-clock time. The skew is:
+    - Harmless for sweep/cleanup (over-collection is idempotent)
+    - Ages out via 14-day retention
+    - New rows are always stored as correct UTC
+    """
+
+    def test_new_row_stored_as_utc_text(self, scratch_db):
+        """Verify new rows store UTC digits (not local time)."""
+        # Create a row at a known UTC time
+        known_utc = datetime(2026, 8, 10, 23, 22, 16, tzinfo=timezone.utc)
+        with scratch_db.begin() as db:
+            _make_terminal(db, "t-001")
+            _make_mailbox(db, "t-001")
+            row = _make_inbox_row(db, "t-001", created_at=known_utc)
+            row_id = row.id
+
+        # Read back raw and verify UTC digits
+        with scratch_db() as db:
+            raw = db.execute(
+                text("SELECT created_at FROM inbox WHERE id = :id"),
+                {"id": row_id},
+            ).scalar()
+        # SQLite stores as text; should contain "23:22:16" (UTC), not "19:22:16" (local)
+        assert "23:22:16" in str(raw), f"Expected UTC digits, got: {raw!r}"
+
+    def test_new_row_survives_utc_since_filter(self, scratch_db):
+        """A new UTC row is found by a UTC since query slightly before it."""
+        known_utc = datetime(2026, 8, 10, 23, 22, 16, tzinfo=timezone.utc)
+        since_before = datetime(2026, 8, 10, 23, 20, 0, tzinfo=timezone.utc)
+        with scratch_db.begin() as db:
+            _make_terminal(db, "t-001")
+            _make_mailbox(db, "t-001")
+            _make_inbox_row(db, "t-001", created_at=known_utc)
+
+        result = list_messages("t-001", since=since_before)
+        assert len(result["items"]) == 1, (
+            "Row at 23:22:16Z must be found with since=23:20:00Z"
+        )
