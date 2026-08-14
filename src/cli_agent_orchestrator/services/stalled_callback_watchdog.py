@@ -1307,6 +1307,55 @@ class StalledCallbackWatchdog:
         except Exception:
             logger.exception("tick_quiescence outer fault (fail-silent D8)")
 
+    def _retire_dead_episodes(self, now: float) -> None:
+        """F185: fast-path retirement of dead workers into _dead_owed.
+
+        Death is already a terminal signal — waiting out the per-worker notifier
+        grace (self.grace_seconds) is only meaningful for live-but-quiet workers.
+        This method probes each tracked episode for terminal death (metadata gone)
+        and retires it immediately so the quiescence clock starts from death, not
+        from notifier-grace expiry.
+        """
+        # Collect candidates under lock (IDs only), probe metadata outside lock.
+        with self._lock:
+            candidates = [
+                tid
+                for tid, ep in self._episodes.items()
+                if tid not in self._paused
+                and not ep.callback_seen
+                and not ep.fired
+            ]
+
+        dead_ids: list[str] = []
+        for tid in candidates:
+            if get_terminal_metadata(tid) is None:
+                dead_ids.append(tid)
+
+        if not dead_ids:
+            return
+
+        with self._lock:
+            for tid in dead_ids:
+                episode = self._episodes.pop(tid, None)
+                if episode is None:
+                    continue  # already removed by another path
+                if episode.callback_seen:
+                    # Callback arrived between the probe and the lock — restore.
+                    self._episodes[tid] = episode
+                    continue
+                caller = episode.caller_id
+                bucket = self._dead_owed.setdefault(caller, {})
+                bucket[tid] = _RetiredMember(
+                    terminal_id=tid,
+                    caller_id=caller,
+                    generation=episode.generation,
+                    profile=episode.profile,
+                    retired_at=now,
+                    last_status="dead",
+                )
+                # D5 re-arm: composition changed
+                self._quiescence_last_fired.pop(caller, None)
+
     def _tick_quiescence_inner(self, now: float | None = None) -> None:
         from cli_agent_orchestrator.services.config_service import ConfigService
 
@@ -1318,6 +1367,10 @@ class StalledCallbackWatchdog:
         grace = float(
             ConfigService.get("supervisor.watchdog.quiescence_grace_s", 120.0)
         )
+
+        # F185: retire dead workers immediately so they enter the quiescence
+        # clock on the quiescence grace, not the notifier grace.
+        self._retire_dead_episodes(now)
 
         # Build per-caller owed sets (live + dead members)
         with self._lock:

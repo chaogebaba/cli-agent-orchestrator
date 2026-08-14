@@ -212,7 +212,7 @@ class TestRingPredicate:
     """AC4-AC7: ring fires / no-ring conditions / grace boundary."""
 
     def _tick_with_mocks(self, svc, now, *, status_return=TerminalStatus.IDLE,
-                         sup_meta=None, callback_status=None):
+                         sup_meta=None, callback_status=None, workers_dead=False):
         """Run tick_quiescence with standard mocks."""
         if sup_meta is None:
             sup_meta = _meta("sup1")
@@ -220,7 +220,9 @@ class TestRingPredicate:
         def meta_side_effect(tid):
             if tid == "sup1":
                 return sup_meta
-            return None  # workers are dead by default in this helper
+            if workers_dead:
+                return None
+            return _meta(tid, "sup1")  # workers are alive by default
 
         with (
             patch(
@@ -1936,3 +1938,248 @@ class TestPauseResumeQuietShift:
             message.split("quiet=")[1].split("s")[0]
         )
         assert 3 <= quiet_reported <= 6
+
+
+
+# ---------------------------------------------------------------------------
+# F185 — dead-lane ring latency pinned to quiescence grace (not notifier grace)
+# ---------------------------------------------------------------------------
+
+class TestF185DeadLaneRingLatency:
+    """F185: a dead worker enters the quiescence-quiet set on the quiescence grace
+    path immediately — death is already a terminal signal; the notifier grace
+    exists for live-but-quiet workers only.
+
+    These tests prove that a worker whose terminal row disappears (death) rings
+    within quiescence_grace + tick, NOT notifier_grace + quiescence_grace.
+    """
+
+    def _tick(self, svc, now, *, sup_meta=None):
+        """Run tick_quiescence with mocks suitable for a dead-worker scenario."""
+        if sup_meta is None:
+            sup_meta = _meta("sup1")
+
+        def meta_side_effect(tid):
+            if tid == "sup1":
+                return sup_meta
+            return None  # all workers are dead
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+                side_effect=meta_side_effect,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
+                return_value=TerminalStatus.IDLE,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.config_service.ConfigService.get",
+                side_effect=_config_on,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
+            ) as mock_persist,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            ) as mock_deliver,
+        ):
+            svc.tick_quiescence(now=now)
+            return mock_persist, mock_deliver
+
+    def test_dead_lane_rings_within_quiescence_grace(self):
+        """A dead worker rings after quiescence grace, NOT after the notifier grace.
+
+        Setup: notifier grace = 120s, quiescence grace = 3s.
+        Worker goes idle at t=10, dies (metadata=None) at the next tick.
+        The ring MUST fire at t <= death_time + quiescence_grace (i.e. ~16s or less),
+        and MUST NOT require waiting until t=10+120=130 (notifier grace).
+        """
+        # Large notifier grace to prove we bypass it.
+        svc = _make_watchdog(grace=120)
+        svc.record_inbound_task("w1", "sup1", "developer")
+        svc.record_status("w1", TerminalStatus.IDLE, now=10.0)
+        with svc._lock:
+            svc._episodes["w1"].last_screen_fp = "sampled"
+
+        # At t=13 the worker has been idle 3s (well below notifier grace=120).
+        # Under the old code, collect_due_notifications would NOT have reached
+        # the metadata check yet. With F185, tick_quiescence probes death first.
+        death_time = 13.0
+        mock_persist, _ = self._tick(svc, now=death_time)
+        # At death_time itself, the worker just entered _dead_owed with retired_at=13.
+        # quiescence grace=3 means we need now >= retired_at + 3 = 16.
+        mock_persist.assert_not_called()
+
+        # At t=15.9, still inside quiescence grace (< 3s from retired_at=13)
+        mock_persist, _ = self._tick(svc, now=15.9)
+        mock_persist.assert_not_called()
+
+        # At t=16.0, exactly at grace boundary — ring fires.
+        mock_persist, _ = self._tick(svc, now=16.0)
+        mock_persist.assert_called_once()
+        msg = mock_persist.call_args[0][2]
+        assert "developer-w1" in msg
+        assert "last=dead" in msg
+        assert "[quiescence watchdog]" in msg
+
+    def test_dead_lane_does_not_wait_for_notifier_grace(self):
+        """The ring fires WELL BEFORE the notifier grace would have elapsed.
+
+        Explicitly tests that at t = idle_start + notifier_grace - 1 the ring
+        has ALREADY fired (it fired at idle_start + 3 + quiescence_grace).
+        """
+        svc = _make_watchdog(grace=120)
+        svc.record_inbound_task("w1", "sup1", "developer")
+        svc.record_status("w1", TerminalStatus.IDLE, now=10.0)
+        with svc._lock:
+            svc._episodes["w1"].last_screen_fp = "sampled"
+
+        # Tick at t=11 — worker dies immediately after idle.
+        mock_persist, _ = self._tick(svc, now=11.0)
+        mock_persist.assert_not_called()
+
+        # The worker is now in _dead_owed with retired_at=11.
+        with svc._lock:
+            assert "w1" in svc._dead_owed.get("sup1", {})
+            assert "w1" not in svc._episodes
+
+        # t=14 = retired_at(11) + quiescence_grace(3) — ring fires.
+        mock_persist, _ = self._tick(svc, now=14.0)
+        mock_persist.assert_called_once()
+
+        # Confirm this is well below the notifier grace boundary (10 + 120 = 130).
+        assert 14.0 < 10.0 + 120.0
+
+    def test_dead_lane_retirement_preserves_identity(self):
+        """Fast-path retirement preserves profile, generation, caller_id."""
+        svc = _make_watchdog(grace=120)
+        svc.record_inbound_task("w1", "sup1", "kiro_dev")
+        svc.record_status("w1", TerminalStatus.IDLE, now=10.0)
+        with svc._lock:
+            svc._episodes["w1"].last_screen_fp = "fp"
+            svc._episodes["w1"].generation = 7
+
+        # Worker dead, supervisor alive — retirement happens without the ring
+        # consuming the stores (ring won't fire yet, quiescence grace=3).
+        def meta_side_effect(tid):
+            if tid == "sup1":
+                return _meta("sup1")
+            return None  # worker is dead
+
+        with patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+            side_effect=meta_side_effect,
+        ), patch(
+            "cli_agent_orchestrator.services.config_service.ConfigService.get",
+            side_effect=_config_on,
+        ), patch(
+            "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
+        ), patch(
+            "cli_agent_orchestrator.services.inbox_service.request_delivery",
+        ):
+            svc.tick_quiescence(now=11.0)
+
+        with svc._lock:
+            member = svc._dead_owed["sup1"]["w1"]
+            assert member.profile == "kiro_dev"
+            assert member.generation == 7
+            assert member.caller_id == "sup1"
+            assert member.last_status == "dead"
+            assert member.retired_at == 11.0
+
+    def test_dead_lane_callback_seen_not_retired(self):
+        """A worker that has already delivered a callback is NOT retired to _dead_owed."""
+        svc = _make_watchdog(grace=120)
+        svc.record_inbound_task("w1", "sup1", "developer")
+        svc.record_status("w1", TerminalStatus.IDLE, now=10.0)
+        with svc._lock:
+            svc._episodes["w1"].last_screen_fp = "fp"
+            svc._episodes["w1"].callback_seen = True
+
+        with patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+            return_value=None,
+        ), patch(
+            "cli_agent_orchestrator.services.config_service.ConfigService.get",
+            side_effect=_config_on,
+        ), patch(
+            "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
+        ) as mock_persist, patch(
+            "cli_agent_orchestrator.services.inbox_service.request_delivery",
+        ):
+            svc.tick_quiescence(now=200.0)
+
+        with svc._lock:
+            assert "w1" not in svc._dead_owed.get("sup1", {})
+        mock_persist.assert_not_called()
+
+    def test_dead_lane_anti_spam_no_double_ring(self):
+        """After the ring fires once for a dead lane, it does not fire again (D5 dedup)."""
+        svc = _make_watchdog(grace=120)
+        svc.record_inbound_task("w1", "sup1", "developer")
+        svc.record_status("w1", TerminalStatus.IDLE, now=10.0)
+        with svc._lock:
+            svc._episodes["w1"].last_screen_fp = "sampled"
+
+        # First tick: death + retirement.
+        mock_persist, _ = self._tick(svc, now=11.0)
+        mock_persist.assert_not_called()
+
+        # Second tick: ring fires.
+        mock_persist, _ = self._tick(svc, now=14.0)
+        mock_persist.assert_called_once()
+
+        # Third tick: no second ring (D5).
+        mock_persist, _ = self._tick(svc, now=100.0)
+        mock_persist.assert_not_called()
+
+    def test_live_worker_still_waits_notifier_grace(self):
+        """Live workers are NOT affected by the F185 fast-path — they still need
+        the notifier grace to elapse before per-worker notice fires."""
+        svc = _make_watchdog(grace=120)
+        svc.record_inbound_task("w1", "sup1", "developer")
+        svc.record_status("w1", TerminalStatus.IDLE, now=10.0)
+        with svc._lock:
+            svc._episodes["w1"].last_screen_fp = "sampled"
+
+        # Worker is alive (metadata != None), so no retirement should happen.
+        def meta_side_effect(tid):
+            if tid == "sup1":
+                return _meta("sup1")
+            return _meta(tid, "sup1")  # worker is alive
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+                side_effect=meta_side_effect,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.config_service.ConfigService.get",
+                side_effect=_config_on,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            ),
+        ):
+            svc.tick_quiescence(now=15.0)
+
+        # Worker must still be in _episodes, NOT retired.
+        with svc._lock:
+            assert "w1" in svc._episodes
+            assert "w1" not in svc._dead_owed.get("sup1", {})
+
+        # The per-worker notifier hasn't fired either (idle_seconds=5 < grace=120).
+        with patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+            side_effect=meta_side_effect,
+        ):
+            notices = svc.collect_due_notifications(now=15.0)
+        assert notices == []
