@@ -1439,6 +1439,19 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("purged %d stale terminals", purged)
 
+    # D9 (F202): re-create FIFO readers and re-arm pipe-pane for surviving terminals.
+    try:
+        rearm_result = terminal_service.rearm_fifo_readers_at_startup()
+    except Exception:
+        logger.exception("Startup FIFO re-arm failed; deferring to next boot")
+    else:
+        logger.info(
+            "startup_fifo_rearm rearmed=%d skipped_gone=%d skipped_existing=%d",
+            rearm_result["rearmed"],
+            rearm_result["skipped_gone"],
+            rearm_result["skipped_existing"],
+        )
+
     # F77: repair orphaned lifecycle pointers (idempotent)
     try:
         from cli_agent_orchestrator.clients.database import _migrate_f77_lifecycle_pointers

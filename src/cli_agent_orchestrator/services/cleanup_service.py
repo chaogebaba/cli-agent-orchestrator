@@ -50,7 +50,30 @@ def cleanup_old_data():
                 )
                 .all()
             )
+
+            # D10+D14 (F202): pane liveness RESETS the idle clock — a live pane
+            # is never reclaimed by idle-age retention alone, but a dead one still is.
+            from cli_agent_orchestrator.backends.registry import get_backend
+
+            backend = get_backend()
+            reclaimable = []
             for terminal in old_terminals:
+                liveness = backend.window_liveness(terminal.tmux_session, terminal.tmux_window)
+                if liveness == "live":
+                    # D14: reset idle clock so it doesn't re-appear until another
+                    # RETENTION_DAYS pass without activity.
+                    terminal.last_active = _utcnow()
+                    logger.info(
+                        "retention_survivor_reset terminal=%s session=%s window=%s",
+                        terminal.id,
+                        terminal.tmux_session,
+                        terminal.tmux_window,
+                    )
+                else:
+                    reclaimable.append(terminal)
+            db.commit()
+
+            for terminal in reclaimable:
                 fifo_manager.stop_reader(terminal.id)
                 status_monitor.clear_terminal(terminal.id)
             skipped = (
@@ -66,7 +89,7 @@ def cleanup_old_data():
                 terminal.id,
                 preserve_warm_intent=False,
             )["terminal_deleted"]
-            for terminal in old_terminals
+            for terminal in reclaimable
         )
         logger.info(f"Deleted {deleted_terminals} old terminals from database")
         if skipped:
