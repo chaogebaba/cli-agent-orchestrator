@@ -843,7 +843,9 @@ def command_up(args: argparse.Namespace) -> int:
         raise
 
 
-def _load_owned(root: Path) -> tuple[dict[str, Any], Path, dict[str, Any]]:
+def _load_owned(
+    root: Path, *, allow_dead_pid: bool = False
+) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     _assert_clean_components(root)
     root = _canonical(root)
     manifest_path = root / MANIFEST_NAME
@@ -855,7 +857,14 @@ def _load_owned(root: Path) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     if pid_record.get("owner_nonce") != manifest["owner_nonce"]:
         raise SandboxError("sandbox pidfile owner mismatch")
     pid = int(pid_record.get("pid", 0))
-    if _process_start_time(pid) != int(pid_record.get("start_time", -1)):
+    try:
+        start_time = _process_start_time(pid)
+    except SandboxError:
+        if allow_dead_pid:
+            pid_record["_dead"] = True
+            return manifest, manifest_path, pid_record
+        raise
+    if start_time != int(pid_record.get("start_time", -1)):
         raise SandboxError("sandbox pid identity mismatch")
     return manifest, manifest_path, pid_record
 
@@ -897,21 +906,22 @@ def _sentinel_owned(manifest: dict[str, Any]) -> bool:
 
 
 def command_down(args: argparse.Namespace) -> int:
-    manifest, _, pid_record = _load_owned(Path(args.root))
+    manifest, _, pid_record = _load_owned(Path(args.root), allow_dead_pid=args.purge)
     if not _sentinel_owned(manifest):
         raise SandboxError("tmux ownership sentinel missing")
     pid = int(pid_record["pid"])
-    os.killpg(pid, signal.SIGTERM)
-    deadline = time.monotonic() + 15.0
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.1)
-    else:
-        os.killpg(pid, signal.SIGKILL)
-    _tmux_lifecycle(str(manifest["tmux_socket"]), "kill-server")
+    if not pid_record.get("_dead"):
+        os.killpg(pid, signal.SIGTERM)
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.killpg(pid, signal.SIGKILL)
+    _tmux_lifecycle(str(manifest["tmux_socket"]), "kill-server", check=False)
     _unlink_dead_tmux_socket(str(manifest["tmux_socket"]), settle=5.0)
     Path(manifest["pidfile"]).unlink(missing_ok=True)
     if args.purge:
