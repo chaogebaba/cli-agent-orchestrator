@@ -2183,3 +2183,328 @@ class TestF185DeadLaneRingLatency:
         ):
             notices = svc.collect_due_notifications(now=15.0)
         assert notices == []
+
+
+
+class TestF185MutantKillers:
+    """Tests that kill surviving mutants M2 and M3 from the F185 gate report.
+
+    M2: the callback_seen race guard (lines 1342-1344) that restores an episode
+        when callback_seen becomes True between the metadata probe and the lock
+        re-acquire.
+    M3: the D5 dedup key clear (_quiescence_last_fired.pop) that re-arms the
+        ring when composition changes due to a second dead member retiring.
+    """
+
+    def _tick(self, svc, now, *, meta_side_effect=None, sup_meta=None):
+        """Run tick_quiescence with standard dead-worker mocks."""
+        if sup_meta is None:
+            sup_meta = _meta("sup1")
+        if meta_side_effect is None:
+            def meta_side_effect(tid):
+                if tid == "sup1":
+                    return sup_meta
+                return None  # all workers dead
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+                side_effect=meta_side_effect,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
+                return_value=TerminalStatus.IDLE,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.config_service.ConfigService.get",
+                side_effect=_config_on,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
+            ) as mock_persist,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            ) as mock_deliver,
+        ):
+            svc.tick_quiescence(now=now)
+            return mock_persist, mock_deliver
+
+    # ------------------------------------------------------------------
+    # M2 killer: callback_seen flips True between probe and lock re-acquire
+    # ------------------------------------------------------------------
+
+    def test_callback_seen_race_restores_episode(self):
+        """M2: callback_seen set True between metadata probe and lock re-acquire
+        prevents retirement — the episode is restored to _episodes, never
+        placed in _dead_owed.
+
+        The race window: _retire_dead_episodes releases the lock after collecting
+        candidate IDs (line ~1327), probes metadata (lines 1329-1332), then
+        re-acquires the lock (line 1337). If a concurrent callback delivery sets
+        callback_seen=True on the episode during that window, the guard at line
+        1342-1344 must detect it and restore the episode.
+        """
+        svc = _make_watchdog(grace=120)
+        svc.record_inbound_task("w1", "sup1", "developer")
+        svc.record_status("w1", TerminalStatus.IDLE, now=10.0)
+        with svc._lock:
+            svc._episodes["w1"].last_screen_fp = "sampled"
+
+        # We need to interpose: after get_terminal_metadata returns None for w1
+        # (marking it as dead) but BEFORE the second lock acquire, flip
+        # callback_seen=True. We achieve this by patching get_terminal_metadata
+        # with a side effect that also sets callback_seen on the episode.
+        original_metadata_calls = []
+
+        def meta_with_race(tid):
+            if tid == "sup1":
+                return _meta("sup1")
+            # For the worker: return None (dead), but also simulate a
+            # concurrent callback arrival by setting callback_seen=True.
+            # This simulates the race: between releasing the first lock and
+            # acquiring the second lock, a delivery thread marked callback_seen.
+            original_metadata_calls.append(tid)
+            with svc._lock:
+                ep = svc._episodes.get(tid)
+                if ep is not None:
+                    ep.callback_seen = True
+            return None  # worker appears dead to the probe
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+                side_effect=meta_with_race,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
+                return_value=TerminalStatus.IDLE,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.config_service.ConfigService.get",
+                side_effect=_config_on,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
+            ) as mock_persist,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            ),
+        ):
+            svc.tick_quiescence(now=200.0)
+
+        # The metadata probe was called for w1.
+        assert "w1" in original_metadata_calls
+
+        # The episode must be RESTORED in _episodes (not retired to _dead_owed).
+        with svc._lock:
+            assert "w1" in svc._episodes, (
+                "M2 guard failed: episode was not restored after callback_seen race"
+            )
+            assert svc._episodes["w1"].callback_seen is True
+            assert "w1" not in svc._dead_owed.get("sup1", {})
+
+        # No ring should fire (the worker got a callback).
+        mock_persist.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # M3 killer: D5 dedup key cleared when second dead member retires
+    # ------------------------------------------------------------------
+
+    def test_second_dead_member_clears_dedup_and_re_rings(self):
+        """M3: a second dead member retiring AFTER the caller's first quiescence
+        ring clears the D5 dedup key, allowing the ring to fire again.
+
+        Setup:
+        - w1 is assigned to sup1, goes idle, dies. Ring fires after grace.
+        - w2 is assigned to sup1, goes idle, dies AFTER the first ring.
+        - Because _retire_dead_episodes pops _quiescence_last_fired[caller]
+          when composition changes, the dedup key is cleared.
+        - The next tick sees the new composition key != last_fired_key (None),
+          so the ring fires again.
+        """
+        svc = _make_watchdog(grace=120)
+
+        # Worker 1: assign, idle, will die.
+        svc.record_inbound_task("w1", "sup1", "developer")
+        svc.record_status("w1", TerminalStatus.IDLE, now=10.0)
+        with svc._lock:
+            svc._episodes["w1"].last_screen_fp = "sampled"
+
+        # Worker 2: assign, idle — but stays alive initially.
+        svc.record_inbound_task("w2", "sup1", "developer")
+        svc.record_status("w2", TerminalStatus.IDLE, now=10.0)
+        with svc._lock:
+            svc._episodes["w2"].last_screen_fp = "sampled"
+
+        # Phase 1: w1 dies, w2 is alive.
+        def meta_phase1(tid):
+            if tid == "sup1":
+                return _meta("sup1")
+            if tid == "w2":
+                return _meta("w2", "sup1")
+            return None  # w1 is dead
+
+        # Tick at t=11: w1 dies, enters _dead_owed.
+        with (
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+                side_effect=meta_phase1,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
+                return_value=TerminalStatus.IDLE,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.config_service.ConfigService.get",
+                side_effect=_config_on,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
+            ) as mock_persist_p1,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            ),
+        ):
+            svc.tick_quiescence(now=11.0)
+
+        # w1 is now in _dead_owed; w2 is still live in _episodes.
+        with svc._lock:
+            assert "w1" in svc._dead_owed.get("sup1", {})
+            assert "w2" in svc._episodes
+
+        # No ring yet (w2 is still alive and inside grace).
+        mock_persist_p1.assert_not_called()
+
+        # Phase 1b: Grace elapses for both, but w2 is still alive.
+        # The ring fires because w1 (dead, quiet > 3s) + w2 (idle, quiet > 3s).
+        # Actually, for the ring to fire, ALL members must be past grace.
+        # w1 retired_at=11, grace=3 → needs now >= 14.
+        # w2 idle_at=10, grace=3 → needs now >= 13 for quiescence.
+        # The ring predicate checks all members together.
+        with (
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+                side_effect=meta_phase1,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
+                return_value=TerminalStatus.IDLE,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.config_service.ConfigService.get",
+                side_effect=_config_on,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
+            ) as mock_persist_ring1,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            ),
+        ):
+            svc.tick_quiescence(now=15.0)
+
+        # First ring fires (w1 dead + w2 idle, both past grace).
+        mock_persist_ring1.assert_called_once()
+
+        # Confirm dedup key is set.
+        with svc._lock:
+            assert "sup1" in svc._quiescence_last_fired
+            first_key = svc._quiescence_last_fired["sup1"]
+
+        # Phase 2: w2 now dies. _retire_dead_episodes should pop the dedup key.
+        def meta_phase2(tid):
+            if tid == "sup1":
+                return _meta("sup1")
+            return None  # both w1 and w2 are dead
+
+        # First tick at t=20: w2 dies, enters _dead_owed with retired_at=20.
+        with (
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+                side_effect=meta_phase2,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
+                return_value=TerminalStatus.IDLE,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.config_service.ConfigService.get",
+                side_effect=_config_on,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
+            ) as mock_persist_retire,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            ),
+        ):
+            svc.tick_quiescence(now=20.0)
+
+        # w2 retired to _dead_owed (retired_at=20), dedup key cleared.
+        with svc._lock:
+            assert "w2" in svc._dead_owed.get("sup1", {})
+            # The dedup key must have been cleared by _retire_dead_episodes.
+            assert "sup1" not in svc._quiescence_last_fired, (
+                "M3: dedup key should be cleared when composition changes"
+            )
+
+        # Ring may or may not fire at t=20 depending on w2's grace (retired_at=20,
+        # grace=3 → needs now >= 23). The key assertion is that it WILL fire once
+        # w2's grace elapses.
+
+        # Phase 2b: t=23 — w2's grace elapsed, new composition ring fires.
+        with (
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
+                side_effect=meta_phase2,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view",
+                return_value=TerminalStatus.IDLE,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.config_service.ConfigService.get",
+                side_effect=_config_on,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
+            ) as mock_persist_ring2,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.request_delivery",
+            ),
+        ):
+            svc.tick_quiescence(now=23.0)
+
+        # The ring fires again with the new composition (w1+w2 both dead).
+        # Without M3's _quiescence_last_fired.pop, this would be suppressed by
+        # the dedup key since (w1,1)+(w2,1) == the first-ring key. The pop
+        # cleared it, so the ring fires despite identical composition tuples.
+        mock_persist_ring2.assert_called_once()
+
+        # Sanity: the dedup key is now set again.
+        with svc._lock:
+            assert "sup1" in svc._quiescence_last_fired

@@ -22,7 +22,7 @@ src/cli_agent_orchestrator/services/inbox_service.py:2611:snapshot_view
 src/cli_agent_orchestrator/services/inbox_service.py:392:get_status
 src/cli_agent_orchestrator/services/stalled_callback_watchdog.py:1148:snapshot_view
 src/cli_agent_orchestrator/services/stalled_callback_watchdog.py:1241:snapshot_view
-src/cli_agent_orchestrator/services/stalled_callback_watchdog.py:1422:snapshot_view
+src/cli_agent_orchestrator/services/stalled_callback_watchdog.py:1475:snapshot_view
 src/cli_agent_orchestrator/services/stalled_callback_watchdog.py:461:snapshot_view
 src/cli_agent_orchestrator/services/stalled_callback_watchdog.py:572:emit_screen_signals
 src/cli_agent_orchestrator/services/stalled_callback_watchdog.py:579:get_status_from_screen
