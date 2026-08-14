@@ -1218,6 +1218,11 @@ class TestS1Rung2FloorInvocation:
                     "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
                     return_value=None,
                 ),
+                patch(
+                    "cli_agent_orchestrator.services.boundary_pull_service"
+                    ".BoundaryPullService.should_interrupt",
+                    return_value=True,
+                ),
             ):
                 _drive_one_obligation(db, obl, _utcnow(), 120.0, "shadow")
                 db.commit()

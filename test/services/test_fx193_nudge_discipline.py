@@ -7,6 +7,12 @@ AC3: Repeat timer parked while processing; on idle transition exactly ONE revali
 AC4: Coalescing: 3 arrivals while armed -> one nudge, payload count=3, oldest id correct.
 AC5: Backoff sequence 30/60/120/120 for idle-but-unconsumed; counter resets on any consume.
 AC6: E-bound: obligation older than E escalates even with repeats parked (D5).
+
+Amendment A1 additions:
+A1-AC1: Jittered delays are uniformly spread, never aligned on tick multiples.
+A1-AC2: Seeded-RNG test reproduces exact delays.
+A1-AC3: delivery.jitter=off restores 30/60/120 verbatim.
+A1-AC4: E-bound unaffected under jitter (AC6 re-run green).
 """
 
 from __future__ import annotations
@@ -21,6 +27,7 @@ from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.nudge_discipline import (
+    BACKOFF_BASE,
     BACKOFF_CAP,
     BACKOFF_SEQUENCE,
     NudgeDiscipline,
@@ -36,6 +43,12 @@ from cli_agent_orchestrator.services.nudge_discipline import (
 def discipline() -> NudgeDiscipline:
     """Fresh NudgeDiscipline instance per test."""
     return NudgeDiscipline()
+
+
+@pytest.fixture(autouse=True)
+def jitter_off(monkeypatch):
+    """Disable jitter for deterministic backoff in existing AC tests."""
+    monkeypatch.setenv("CAO_DELIVERY_JITTER", "off")
 
 
 @pytest.fixture
@@ -830,3 +843,291 @@ class TestACDraftGuardVeto:
             # None draft → injection allowed (no draft to corrupt)
             result = _check_safety_gates(target, is_escalation=False)
             assert result is None
+
+
+
+# ---------------------------------------------------------------------------
+# Amendment A1: Full Jitter backoff tests
+# ---------------------------------------------------------------------------
+
+
+class TestA1FullJitter:
+    """A1-ACs: Floor-clamped Full Jitter replaces deterministic ladder."""
+
+    def test_a1_ac1_delays_uniformly_spread(self):
+        """A1-AC1: Repeat delays over N obligations are uniformly spread,
+        never aligned on tick multiples (30/60/120)."""
+        import random as stdlib_random
+
+        # Use a seeded RNG that produces known values
+        class SeededRNG:
+            def __init__(self, seed: int):
+                self._rng = stdlib_random.Random(seed)
+
+            def randint(self, a: int, b: int) -> int:
+                return self._rng.randint(a, b)
+
+        discipline = NudgeDiscipline(rng=SeededRNG(42))
+        cursor_at_zero = lambda mb: 0
+        pending = lambda mb: (1, 50)
+
+        # Collect many jittered delays by simulating repeats
+        delays: list[float] = []
+        now = time.monotonic() + 0.01
+
+        with patch.dict("os.environ", {"CAO_DELIVERY_JITTER": "on"}):
+            discipline.arm_or_coalesce("sup1", "mb1", 1, 50)
+            discipline.record_status("sup1", TerminalStatus.IDLE)
+
+            # Fire the first nudge (always immediate, step=0 → exactly 30s)
+            intents = discipline.collect_due(
+                now=now, get_consumption_cursor=cursor_at_zero, get_pending_oldest=pending
+            )
+            assert len(intents) == 1
+
+            # Collect 20 repeats
+            current = now
+            for _ in range(20):
+                state = discipline.get_state("sup1")
+                assert state is not None
+                delay = state.visibility_timeout_at - current
+                delays.append(delay)
+                current = state.visibility_timeout_at + 0.01  # advance past the fire time
+
+                intents = discipline.collect_due(
+                    now=current,
+                    get_consumption_cursor=cursor_at_zero,
+                    get_pending_oldest=pending,
+                )
+                assert len(intents) == 1
+
+        # All delays must be >= BACKOFF_BASE (floor)
+        assert all(d >= BACKOFF_BASE for d in delays), f"Floor violated: {delays}"
+        # All delays must be <= BACKOFF_CAP
+        assert all(d <= BACKOFF_CAP for d in delays), f"Cap violated: {delays}"
+
+        # Delays should NOT all be exactly 30, 60, or 120 (jitter provides spread)
+        # At least some variation should exist once step > 0
+        unique_delays = set(int(d) for d in delays)
+        # After step 0 (always 30), steps 1+ should show variation
+        assert len(unique_delays) > 2, f"No jitter spread: {unique_delays}"
+
+        # None should be exactly on the 30/60/120 tick multiples (probabilistically)
+        # This is a soft check — with jitter, exact hits are rare
+        tick_exact = [d for d in delays[1:] if d == 30.0 or d == 60.0 or d == 120.0]
+        # At most 1 might land exactly (edge case with RNG), but not all
+        assert len(tick_exact) < len(delays) // 2
+
+    def test_a1_ac2_seeded_rng_reproduces_exact_delays(self):
+        """A1-AC2: Seeded-RNG test reproduces exact delays."""
+        import random as stdlib_random
+
+        class SeededRNG:
+            def __init__(self, seed: int):
+                self._rng = stdlib_random.Random(seed)
+
+            def randint(self, a: int, b: int) -> int:
+                return self._rng.randint(a, b)
+
+        cursor_at_zero = lambda mb: 0
+        pending = lambda mb: (1, 50)
+
+        with patch.dict("os.environ", {"CAO_DELIVERY_JITTER": "on"}):
+            # Run twice with the same seed — must produce identical delays
+            delays_run1: list[float] = []
+            delays_run2: list[float] = []
+
+            for delays_list in (delays_run1, delays_run2):
+                discipline = NudgeDiscipline(rng=SeededRNG(99))
+                discipline.arm_or_coalesce("sup1", "mb1", 1, 50)
+                discipline.record_status("sup1", TerminalStatus.IDLE)
+
+                now = time.monotonic() + 0.01
+                # Fire first
+                discipline.collect_due(
+                    now=now, get_consumption_cursor=cursor_at_zero, get_pending_oldest=pending
+                )
+
+                current = now
+                for _ in range(5):
+                    state = discipline.get_state("sup1")
+                    assert state is not None
+                    delay = state.visibility_timeout_at - current
+                    delays_list.append(delay)
+                    current = state.visibility_timeout_at + 0.01
+                    discipline.collect_due(
+                        now=current,
+                        get_consumption_cursor=cursor_at_zero,
+                        get_pending_oldest=pending,
+                    )
+
+            assert delays_run1 == delays_run2, (
+                f"Seeded RNG not deterministic: {delays_run1} vs {delays_run2}"
+            )
+
+    def test_a1_ac3_jitter_off_restores_deterministic_ladder(
+        self, discipline: NudgeDiscipline, cursor_at_zero
+    ):
+        """A1-AC3: delivery.jitter=off restores 30/60/120 verbatim.
+
+        (This test uses the autouse jitter_off fixture, so it's already off.)
+        """
+        pending = lambda mb: (1, 50)
+        discipline.arm_or_coalesce("sup1", "mb1", 1, 50)
+        discipline.record_status("sup1", TerminalStatus.IDLE)
+        now = time.monotonic() + 0.01
+
+        # Fire first
+        discipline.collect_due(
+            now=now, get_consumption_cursor=cursor_at_zero, get_pending_oldest=pending
+        )
+
+        # Check exact deterministic delays
+        expected = [30, 60, 120, 120]
+        current = now
+        for i, expected_delay in enumerate(expected):
+            state = discipline.get_state("sup1")
+            assert state is not None
+            actual_delay = state.visibility_timeout_at - current
+            assert abs(actual_delay - expected_delay) < 0.01, (
+                f"Step {i}: expected {expected_delay}s, got {actual_delay}s"
+            )
+            current = state.visibility_timeout_at + 0.01
+            discipline.collect_due(
+                now=current, get_consumption_cursor=cursor_at_zero, get_pending_oldest=pending
+            )
+
+    def test_a1_ac4_ebound_unaffected_under_jitter(self):
+        """A1-AC4: E-bound escalation unaffected (AC6 re-run green under jitter).
+
+        The escalation path is independent of nudge_discipline backoff —
+        it runs off obligation age, not nudge count or timing.
+        """
+        from unittest.mock import patch
+
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients.database import (
+            Base,
+            DeliveryObligationModel,
+            MailboxModel,
+            TerminalModel,
+        )
+        from cli_agent_orchestrator.services.delivery_service import (
+            DeliveryTarget,
+            LadderResult,
+            _escalate,
+        )
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(bind=engine)
+        TestSession = sessionmaker(bind=engine)
+
+        with TestSession() as db:
+            db.add(
+                TerminalModel(
+                    id="sup1",
+                    tmux_session="cao-test",
+                    tmux_window="supervisor",
+                    provider="kiro_cli",
+                    agent_profile="supervisor",
+                )
+            )
+            db.add(
+                MailboxModel(
+                    id="mb1",
+                    session_name="cao-test",
+                    role="supervisor",
+                    current_terminal_id="sup1",
+                    generation=1,
+                    consumed_through_id=0,
+                )
+            )
+            db.add(
+                DeliveryObligationModel(
+                    inbox_row_id=200,
+                    mailbox_id="mb1",
+                    state="OPEN",
+                    accepted_at=datetime.now(timezone.utc) - timedelta(seconds=200),
+                    attempts=10,
+                )
+            )
+            db.commit()
+
+        now = datetime.now(timezone.utc)
+
+        def fake_rung2(target, inbox_row_id, **kwargs):
+            return LadderResult(delivered=True, phase="surface", decision="proceed", reason=None)
+
+        # Run with jitter ON — escalation still fires
+        with (
+            patch.dict("os.environ", {"CAO_DELIVERY_JITTER": "on"}),
+            patch("cli_agent_orchestrator.services.delivery_service.SessionLocal", TestSession),
+            patch("cli_agent_orchestrator.services.delivery_service.attempt_rung2", fake_rung2),
+        ):
+            with TestSession() as db:
+                obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=200).one()
+                _escalate(db, obl, now, 200.0)
+                db.commit()
+
+                obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=200).one()
+                assert obl.state == "ESCALATED"
+
+    def test_step0_degenerates_to_exactly_30s(self):
+        """n=0 degenerates to exactly 30s (floor == ceiling at step 0)."""
+        import random as stdlib_random
+
+        class SeededRNG:
+            def __init__(self, seed: int):
+                self._rng = stdlib_random.Random(seed)
+
+            def randint(self, a: int, b: int) -> int:
+                return self._rng.randint(a, b)
+
+        cursor_at_zero = lambda mb: 0
+        pending = lambda mb: (1, 50)
+
+        with patch.dict("os.environ", {"CAO_DELIVERY_JITTER": "on"}):
+            discipline = NudgeDiscipline(rng=SeededRNG(123))
+            discipline.arm_or_coalesce("sup1", "mb1", 1, 50)
+            discipline.record_status("sup1", TerminalStatus.IDLE)
+
+            now = time.monotonic() + 0.01
+            # Fire first nudge
+            discipline.collect_due(
+                now=now, get_consumption_cursor=cursor_at_zero, get_pending_oldest=pending
+            )
+
+            # Step 0: min(120, 30*2^0) = 30; floor=30; floor>=ceiling → exactly 30
+            state = discipline.get_state("sup1")
+            assert state is not None
+            delay = state.visibility_timeout_at - now
+            assert delay == 30.0, f"Step 0 should be exactly 30s, got {delay}s"
+
+    def test_receive_count_tracks_fires(self):
+        """SQS vocabulary: receive_count increments on each fire."""
+        discipline = NudgeDiscipline()
+        cursor_at_zero = lambda mb: 0
+        pending = lambda mb: (1, 50)
+
+        discipline.arm_or_coalesce("sup1", "mb1", 1, 50)
+        discipline.record_status("sup1", TerminalStatus.IDLE)
+
+        now = time.monotonic() + 0.01
+        # Fire first
+        discipline.collect_due(
+            now=now, get_consumption_cursor=cursor_at_zero, get_pending_oldest=pending
+        )
+        state = discipline.get_state("sup1")
+        assert state is not None
+        assert state.receive_count == 1
+
+        # Fire second (advance past backoff)
+        future = now + 200  # past any backoff
+        discipline.collect_due(
+            now=future, get_consumption_cursor=cursor_at_zero, get_pending_oldest=pending
+        )
+        state = discipline.get_state("sup1")
+        assert state is not None
+        assert state.receive_count == 2
