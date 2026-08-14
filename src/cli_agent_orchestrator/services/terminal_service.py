@@ -148,6 +148,23 @@ from cli_agent_orchestrator.utils.terminal import (
 logger = logging.getLogger(__name__)
 
 
+class IdentityAmbiguousError(RuntimeError):
+    """Raised when purge_stale_terminal_records finds multiple windows claiming the same terminal ID.
+
+    D11 (F202): this is a loud structured error — the sane path (D6 explicit kill)
+    makes this state unreachable, so reaching it means an invariant broke.
+    """
+
+    def __init__(self, terminal_id: str, session: str, incarnations: List[str]) -> None:
+        self.terminal_id = terminal_id
+        self.session = session
+        self.incarnations = incarnations
+        super().__init__(
+            f"purge_identity_ambiguous: terminal {terminal_id} in session {session!r} "
+            f"has {len(incarnations)} incarnations: {incarnations}"
+        )
+
+
 class _LegacyCreateTerminalPublisher(Protocol):
     def __call__(
         self,
@@ -375,6 +392,97 @@ def _persist_provider_runtime_identity(
     _commit_provider_runtime_identity(terminal_id, prepared)
 
 
+def rearm_fifo_readers_at_startup() -> dict:
+    """D9 (F202): re-create FIFO readers and re-arm pipe-pane for surviving terminals.
+
+    Called at lifespan startup after purge_stale_terminal_records. For each DB
+    terminal row with init_state='ready' whose backend window is still live,
+    creates a FIFO reader and re-arms pipe-pane — reusing the same arming
+    pattern as creation-time (terminal_service.py:1251-1284).
+
+    Idempotent: if a reader already exists for a terminal (early return inside
+    fifo_manager.create_reader), it is not duplicated. Rows whose window is
+    gone get nothing.
+
+    Returns a dict with counts: {rearmed: int, skipped_gone: int, skipped_existing: int}.
+    """
+    backend = get_backend()
+    if backend.supports_event_inbox():
+        # Event-inbox backends (herdr) deliver via their own socket; no FIFO needed.
+        return {"rearmed": 0, "skipped_gone": 0, "skipped_existing": 0}
+
+    rearmed = 0
+    skipped_gone = 0
+    skipped_existing = 0
+
+    for metadata in db_list_all_terminals():
+        terminal_id = metadata["id"]
+        if metadata.get("init_state") != "ready":
+            continue
+
+        session_name = metadata["tmux_session"]
+        window_name = metadata["tmux_window"]
+
+        # Check if the pane is still alive
+        state = backend.window_liveness(session_name, window_name)
+        if state != "live":
+            skipped_gone += 1
+            continue
+
+        # Already has a reader? Idempotent — skip.
+        if fifo_manager.has_reader(terminal_id):
+            skipped_existing += 1
+            continue
+
+        fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+
+        def _probe_pane(s=session_name, w=window_name) -> str:
+            return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+
+        def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
+            get_backend().stop_pipe_pane(s, w)
+            get_backend().pipe_pane(s, w, p)
+
+        try:
+            fifo_manager.create_reader(
+                terminal_id,
+                pane_probe=_probe_pane,
+                rearm=_rearm_pipe,
+                terminal_generation=None,
+                incarnation_id=None,
+            )
+        except Exception:
+            logger.warning(
+                "startup_rearm_fifo_failed terminal=%s", terminal_id, exc_info=True
+            )
+            continue
+
+        # Re-arm pipe-pane so tmux streams output into the FIFO again.
+        try:
+            backend.pipe_pane(session_name, window_name, str(fifo_path))
+        except Exception:
+            logger.warning(
+                "startup_rearm_pipe_pane_failed terminal=%s", terminal_id, exc_info=True
+            )
+            continue
+
+        rearmed += 1
+        logger.info(
+            "startup_rearm_fifo terminal=%s session=%s window=%s",
+            terminal_id,
+            session_name,
+            window_name,
+        )
+
+    logger.info(
+        "startup_rearm_fifo_complete rearmed=%d skipped_gone=%d skipped_existing=%d",
+        rearmed,
+        skipped_gone,
+        skipped_existing,
+    )
+    return {"rearmed": rearmed, "skipped_gone": skipped_gone, "skipped_existing": skipped_existing}
+
+
 def purge_stale_terminal_records() -> int:
     """Delete DB terminal records whose backend window no longer exists."""
     backend = get_backend()
@@ -419,10 +527,11 @@ def purge_stale_terminal_records() -> int:
                 if result.identity == terminal_id:
                     matches.append(name)
             if len(matches) > 1:
-                logger.warning(
-                    "purge_identity_ambiguous terminal=%s windows=%s", terminal_id, matches
+                raise IdentityAmbiguousError(
+                    terminal_id=terminal_id,
+                    session=tmux_session,
+                    incarnations=matches,
                 )
-                continue
             match = matches[0] if matches else None
             if match is not None:
                 if not update_terminal_tmux_window(terminal_id, match):
@@ -459,6 +568,8 @@ def purge_stale_terminal_records() -> int:
                     metadata["tmux_session"],
                     metadata["tmux_window"],
                 )
+        except IdentityAmbiguousError:
+            raise
         except Exception:
             logger.exception("purge_row_failed terminal=%s", terminal_id)
             continue

@@ -1379,7 +1379,11 @@ class TestLifespan:
     # added to the with-list below -- CPython caps statically nested blocks at 20
     # and that parenthesized context-manager list is already at the limit.
     @patch("cli_agent_orchestrator.api.main._seed_default_skills_at_startup")
-    async def test_lifespan_startup_and_shutdown(self, mock_seed, caplog):
+    @patch(
+        "cli_agent_orchestrator.api.main.terminal_service.rearm_fifo_readers_at_startup",
+        return_value={"rearmed": 0, "skipped_gone": 0, "skipped_existing": 0},
+    )
+    async def test_lifespan_startup_and_shutdown(self, mock_rearm, mock_seed, caplog):
         """lifespan starts the event-bus consumers on entry, cleans up on exit.
 
         The watchdog PollingObserver inbox watcher was replaced by event-bus
@@ -1478,6 +1482,7 @@ class TestLifespan:
                     assert loop_arg is asyncio.get_running_loop()
                     mock_seed.assert_called_once_with()
                     mock_purge.assert_called_once_with()
+                    mock_rearm.assert_called_once_with()
                     mock_recover.assert_called_once_with()
                     mock_orphan_reconcile.assert_called_once_with()
                     assert startup_order == [
@@ -1537,6 +1542,10 @@ class TestLifespan:
             patch(
                 "cli_agent_orchestrator.api.main.terminal_service.purge_stale_terminal_records",
                 return_value=0,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.terminal_service.rearm_fifo_readers_at_startup",
+                return_value={"rearmed": 0, "skipped_gone": 0, "skipped_existing": 0},
             ),
             patch(
                 "cli_agent_orchestrator.services.memory_reconciliation.reconcile_memory_startup",
