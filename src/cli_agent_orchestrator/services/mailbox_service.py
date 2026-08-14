@@ -576,12 +576,9 @@ def _create_logical_inbox_message_inner(
                     park_warm=park_warm,
                 )
                 db.flush()  # ensure row.id is assigned before obligation
-                # FX191 D1: create obligation atomically with the message
-                from cli_agent_orchestrator.services.delivery_service import (
-                    create_obligation,
-                )
-
-                create_obligation(row.id, logical_receiver_id or mailbox_id, db)
+                # F192: obligation creation moved to the choke point
+                # (_create_inbox_message_unfenced in database.py) — removed
+                # from here to guarantee exactly one creation site.
                 db.commit()
                 db.refresh(row)
                 result = _inbox_message_from_row(row)

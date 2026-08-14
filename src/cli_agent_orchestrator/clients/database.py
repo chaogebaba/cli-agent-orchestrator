@@ -5169,6 +5169,35 @@ def _is_supervisor_mailbox_id(db: Any, mailbox_id: str) -> bool:
     return row is not None
 
 
+def _create_obligation_inline(db: Any, inbox_row_id: int, mailbox_id: str) -> None:
+    """F192: create delivery obligation in the same transaction as the inbox row.
+
+    This is the single-site obligation creation — called from the choke point
+    (_create_inbox_message_unfenced) so every producer gets the obligation
+    atomically.  No external imports needed — both models live in this module.
+    """
+    now = _utcnow()
+    db.add(
+        DeliveryObligationModel(
+            inbox_row_id=inbox_row_id,
+            mailbox_id=mailbox_id,
+            state="OPEN",
+            accepted_at=now,
+            next_attempt_at=now,
+        )
+    )
+    db.add(
+        InboxMessageTraceEventModel(
+            message_id=inbox_row_id,
+            kind="fx191.accept",
+            phase="accept",
+            decision="proceed",
+            reason=None,
+            payload={},
+        )
+    )
+
+
 def _touch_supervisor_pending_flag() -> None:
     """Create the supervisor-pending sentinel for the PostToolUse hook fast-path (F123)."""
     from cli_agent_orchestrator.constants import CAO_HOME_DIR
@@ -5317,6 +5346,11 @@ def _insert_routed_inbox_row(
         and _is_supervisor_mailbox_id(db, logical_receiver_id)
     ):
         _touch_supervisor_pending_flag()
+        # FX191 D1 / F192: create delivery obligation atomically in the same
+        # transaction as the inbox row.  This is the SINGLE choke-point —
+        # every producer (MCP route, fifo_reader, callback_barrier,
+        # mailbox_service, orphan_reconcile, etc.) gets the obligation here.
+        _create_obligation_inline(db, int(row.id), logical_receiver_id)
     return row
 
 
