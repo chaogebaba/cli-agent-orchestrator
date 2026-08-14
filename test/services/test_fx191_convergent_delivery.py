@@ -1140,3 +1140,182 @@ class TestAC18ConfigCannotBreakDelivery:
 
         assert result.delivered is True
         assert result.decision == "proceed"
+
+
+
+
+# ---------------------------------------------------------------------------
+# S1 FOLD: Mutant M5 kill — rung2 floor actually invoked from _drive_one_obligation
+# ---------------------------------------------------------------------------
+
+
+class TestS1Rung2FloorInvocation:
+    """S1: Integration proof that rung2 (pane-nudge floor) is invoked from
+    _drive_one_obligation when rung1 demotes.
+
+    Real delivery_service objects — only the tmux send_keys boundary is mocked.
+    Kills mutant M5 (drop floor rung call).
+    """
+
+    def test_rung2_send_keys_called_when_rung1_demotes(self, supervisor_setup):
+        """When rung1 demotes (no registry), _drive_one_obligation calls rung2
+        which invokes tmux send_keys — proving the floor rung is wired."""
+        db_factory = supervisor_setup
+        with db_factory() as db:
+            # Remove registry so rung1 demotes with "no_registry_records"
+            # (cc_inbox_path stays valid but doorbell won't fire without registry)
+            mailbox = db.query(MailboxModel).filter_by(id="mb_test_sup").one()
+            mailbox.cc_inbox_path = None  # also nullify path to ensure rung1 demotes
+            db.commit()
+
+            msg = InboxModel(
+                sender_id="worker01",
+                receiver_id="sup12345",
+                logical_receiver_id="mb_test_sup",
+                message="rung2 integration proof",
+                status=MessageStatus.PENDING.value,
+                orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+            )
+            db.add(msg)
+            db.flush()
+            from cli_agent_orchestrator.services.delivery_service import create_obligation
+
+            create_obligation(msg.id, "mb_test_sup", db)
+            db.commit()
+
+            obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
+
+            from cli_agent_orchestrator.services.delivery_service import _drive_one_obligation
+
+            # Mock ONLY the tmux boundary (send_keys) — everything else is real
+            with patch(
+                "cli_agent_orchestrator.clients.tmux.tmux_client.send_keys"
+            ) as mock_send_keys, patch(
+                "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
+                return_value=None,
+            ):
+                _drive_one_obligation(db, obl, _utcnow(), 120.0, "shadow")
+                db.commit()
+
+            # THE ASSERTION: send_keys was called — proves rung2 was invoked
+            assert mock_send_keys.called, (
+                "M5 kill: tmux send_keys must be called by rung2 floor "
+                "when rung1 demotes in _drive_one_obligation"
+            )
+            # Verify the nudge text contains the message id
+            call_args = mock_send_keys.call_args
+            nudge_text = call_args[0][2] if call_args[0] else call_args[1].get("keys", "")
+            assert str(msg.id) in nudge_text
+
+
+# ---------------------------------------------------------------------------
+# S2 FOLD: Mutant M3 kill — AC14 multi-tick convergence
+# ---------------------------------------------------------------------------
+
+
+class TestS2AC14MultiTickConvergence:
+    """S2: Multi-tick variant of AC14 property test that catches a silently-
+    abandoned obligation (gate terminates instead of defers).
+
+    Drives MULTIPLE convergence ticks per safety-gate permutation:
+    - Phase A (N ticks within escalation bound): obligation stays OPEN with
+      bumped next_attempt_at each tick (proves deferral, not silent abandon).
+    - Phase B (tick past escalation bound): obligation reaches ESCALATED.
+
+    Kills mutant M3 (gate-terminates-silently).
+    """
+
+    @pytest.mark.parametrize(
+        "safety_gate",
+        ["not_idle", "recovery_state", "waiting_user_answer"],
+    )
+    def test_safety_gate_obligations_escalate_within_bound(
+        self, supervisor_setup, safety_gate
+    ):
+        """An obligation with a perpetually-deferring safety gate must reach
+        ESCALATED after the escalation bound — never silently stuck OPEN."""
+        db_factory = supervisor_setup
+        escalate_after_s = 60.0
+        tick_s = 5.0
+
+        with db_factory() as db:
+            msg = InboxModel(
+                sender_id="worker01",
+                receiver_id="sup12345",
+                logical_receiver_id="mb_test_sup",
+                message="multi-tick convergence proof",
+                status=MessageStatus.PENDING.value,
+                orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+            )
+            db.add(msg)
+            db.flush()
+            from cli_agent_orchestrator.services.delivery_service import create_obligation
+
+            create_obligation(msg.id, "mb_test_sup", db)
+            db.commit()
+
+            obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
+            start_time = obl.accepted_at
+            if start_time is not None and start_time.tzinfo is None:
+                start_time = start_time.replace(tzinfo=timezone.utc)
+            db.commit()
+
+            from cli_agent_orchestrator.services.delivery_service import _drive_one_obligation
+
+            # Phase A: drive N ticks WITHIN the escalation bound.
+            # Each tick must advance attempts (proves gate defers, not terminates).
+            n_pre_ticks = 5  # well within bound (5*5s = 25s < 60s)
+            with patch(
+                "cli_agent_orchestrator.clients.tmux.tmux_client.send_keys"
+            ), patch(
+                "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
+                return_value=safety_gate,
+            ):
+                for i in range(n_pre_ticks):
+                    obl = (
+                        db.query(DeliveryObligationModel)
+                        .filter_by(inbox_row_id=msg.id)
+                        .one()
+                    )
+                    prev_attempts = obl.attempts
+                    tick_now = start_time + timedelta(seconds=tick_s * (i + 1))
+                    _drive_one_obligation(db, obl, tick_now, escalate_after_s, "shadow")
+                    db.commit()
+
+                    obl = (
+                        db.query(DeliveryObligationModel)
+                        .filter_by(inbox_row_id=msg.id)
+                        .one()
+                    )
+                    assert obl.state == "OPEN", (
+                        f"M3 kill: obligation must stay OPEN during pre-escalation ticks "
+                        f"(tick {i+1}), got state={obl.state!r}"
+                    )
+                    assert obl.attempts > prev_attempts, (
+                        f"M3 kill: attempts must advance each tick (proves deferral, "
+                        f"not silent termination). tick={i+1}, "
+                        f"attempts stuck at {obl.attempts}"
+                    )
+
+            # Phase B: drive one tick PAST the escalation bound → ESCALATED
+            with patch(
+                "cli_agent_orchestrator.clients.tmux.tmux_client.send_keys"
+            ), patch(
+                "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
+                return_value=safety_gate,
+            ):
+                obl = (
+                    db.query(DeliveryObligationModel)
+                    .filter_by(inbox_row_id=msg.id)
+                    .one()
+                )
+                escalation_time = start_time + timedelta(seconds=escalate_after_s + 1)
+                _drive_one_obligation(db, obl, escalation_time, escalate_after_s, "shadow")
+                db.commit()
+
+            obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
+            assert obl.state == "ESCALATED", (
+                f"M3 kill: obligation must reach ESCALATED past the escalation bound "
+                f"with safety_gate={safety_gate!r}, but stuck in state={obl.state!r}. "
+                f"A silently-terminating gate leaves obligations stranded OPEN."
+            )
