@@ -46,12 +46,6 @@ def boundary_service() -> BoundaryPullService:
 class TestF203ClassA_SwallowedFailures:
     """Class (a): bare except blocks that eat delivery-critical errors."""
 
-    @pytest.mark.xfail(
-        reason="F203-a: _update_pending_indicators uses DeliveryObligationModel.id "
-        "which does not exist (PK is inbox_row_id); the AttributeError is swallowed "
-        "by except Exception + logger.debug — never surfaces at INFO/WARNING",
-        strict=True,
-    )
     def test_update_pending_indicators_logs_warning_on_exception(self):
         """_update_pending_indicators must emit at WARNING or higher when the
         DB query fails, not silently swallow via debug-level logging."""
@@ -251,11 +245,6 @@ class TestF203ClassC_ThresholdAliasing:
 class TestF203ClassD_UncheckedSideEffects:
     """Class (d): subprocess return codes ignored on delivery paths."""
 
-    @pytest.mark.xfail(
-        reason="F203-d: _write_tmux_pending ignores subprocess.run return code; "
-        "a failed tmux set-option produces no observable signal",
-        strict=True,
-    )
     def test_tmux_set_option_failure_is_observable(
         self, boundary_service: BoundaryPullService
     ):
@@ -292,18 +281,10 @@ class TestF203ClassD_UncheckedSideEffects:
 class TestF203ClassE_SilentForeverDeferral:
     """Class (e): retry/defer loops that can stall indefinitely."""
 
-    @pytest.mark.xfail(
-        reason="F203-e: after ESCALATED settle with user_draft_present, no further "
-        "delivery attempt or notification occurs; the obligation is terminal and "
-        "the message sits undelivered until external intervention (mailbox_pull)",
-        strict=True,
-    )
     def test_escalated_obligation_produces_observable_escalation_attempt(self):
         """Every delivery obligation that reaches ESCALATED state must have
         produced at least one observable escalation attempt (banner injection
-        or equivalent). An obligation that escalates with reason=user_draft_present
-        means the draft guard vetoed even the escalation injection — the message
-        is stuck with NO user-visible signal."""
+        or equivalent). F206b: display-message fires as visible floor."""
         from cli_agent_orchestrator.services.delivery_service import (
             _escalate,
             resolve_supervisor_target,
@@ -349,16 +330,26 @@ class TestF203ClassE_SilentForeverDeferral:
                 with patch(
                     "cli_agent_orchestrator.services.delivery_service.emit_trace_or_collapse"
                 ):
-                    _escalate(mock_db, mock_obl, now, 34.0)
+                    with patch(
+                        "cli_agent_orchestrator.services.delivery_service.subprocess.run"
+                    ) as mock_subprocess:
+                        mock_subprocess.return_value.returncode = 0
+                        _escalate(mock_db, mock_obl, now, 34.0)
 
-        # After escalation: obligation should NOT be in a terminal state if
-        # no user-visible signal was produced. The invariant is:
-        # ESCALATED + user_draft_present + no banner = message is LOST
-        # (no retry, no further attempt, no notification)
-        assert mock_obl.state != "ESCALATED" or mock_obl.terminal_reason != "user_draft_present", (
-            "Obligation escalated with user_draft_present but NO banner was injected — "
-            "the message is permanently stuck with no user-visible signal. "
-            "Escalation must either succeed in notifying OR remain OPEN for retry."
+        # F206b invariant: even when injection fails (user_draft_present),
+        # a visible signal (display-message) must fire as a floor.
+        # subprocess.run must have been called with display-message.
+        assert mock_subprocess.called, (
+            "Obligation escalated with user_draft_present but NO visible signal "
+            "was produced — _fire_escalation_display_message must fire as H2 floor"
+        )
+        display_calls = [
+            c for c in mock_subprocess.call_args_list
+            if any("display-message" in str(arg) for arg in c[0])
+        ]
+        assert len(display_calls) >= 1, (
+            "tmux display-message was not called — escalation with no injection "
+            "must produce a visible floor signal"
         )
 
     @pytest.mark.xfail(
@@ -399,69 +390,98 @@ class TestF203ClassE_SilentForeverDeferral:
                 "WARNING — operator has no visibility into a permanently broken transport"
             )
 
-    @pytest.mark.xfail(
-        reason="F203-e/F206: after escalation settles, ESCALATED is terminal — "
-        "no ticker touches it, no re-notify occurs. With mailbox_pull=false and "
-        "fallback=not_registered_fallback, the message sits forever.",
-        strict=True,
-    )
     def test_escalated_obligation_has_followup_delivery_path(self):
         """An ESCALATED obligation with no successful banner injection must have
-        at least one follow-up delivery mechanism (re-notify timer, fallback poll,
-        or equivalent). ESCALATED must not be a permanent dead end when all
-        injection paths failed."""
+        at least one follow-up delivery mechanism. F206a/H3: _reresolve_escalated
+        picks up ESCALATED obligations in the convergence tick."""
         from cli_agent_orchestrator.services.delivery_service import (
-            convergence_tick,
+            _reresolve_escalated,
+            DeliveryTarget,
+            LadderResult,
         )
-        from cli_agent_orchestrator.clients.database import DeliveryObligationModel
+        from cli_agent_orchestrator.clients.database import (
+            Base,
+            DeliveryObligationModel,
+            InboxModel,
+            MailboxModel,
+            MailboxIncarnationModel,
+            TerminalModel,
+            _utcnow,
+        )
+        from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
 
-        # Mock an ESCALATED obligation in the DB
-        mock_obl = MagicMock()
-        mock_obl.state = "ESCALATED"
-        mock_obl.inbox_row_id = 5521
-        mock_obl.terminal_reason = "user_draft_present"
-        mock_obl.accepted_at = datetime(2026, 8, 14, 19, 57, 51, tzinfo=timezone.utc)
-        mock_obl.terminal_at = datetime(2026, 8, 14, 19, 58, 25, tzinfo=timezone.utc)
+        # Set up in-memory DB
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(bind=engine)
+        TestSession = sessionmaker(bind=engine)
 
+        now = _utcnow()
+
+        with TestSession() as db:
+            db.add(TerminalModel(
+                id="sup_h3", tmux_session="cao-h3",
+                tmux_window="supervisor", provider="claude_code",
+                agent_profile="supervisor",
+            ))
+            db.add(MailboxModel(
+                id="mb_h3", session_name="cao-h3", role="supervisor",
+                current_terminal_id="sup_h3", generation=1,
+                consumed_through_id=0,
+                cc_inbox_path="/tmp/test.json",
+            ))
+            db.add(MailboxIncarnationModel(
+                mailbox_id="mb_h3", generation=1, terminal_id="sup_h3",
+            ))
+            msg = InboxModel(
+                sender_id="w1", receiver_id="sup_h3",
+                logical_receiver_id="mb_h3",
+                message="test followup", status=MessageStatus.PENDING.value,
+                orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+            )
+            db.add(msg)
+            db.flush()
+            db.add(DeliveryObligationModel(
+                inbox_row_id=msg.id, mailbox_id="mb_h3",
+                state="ESCALATED",
+                accepted_at=now - timedelta(seconds=90),
+                first_attempt_at=now - timedelta(seconds=89),
+                terminal_at=now - timedelta(seconds=60),
+                terminal_reason="user_draft_present",
+                next_attempt_at=now - timedelta(seconds=1),  # due now
+                attempts=6,
+            ))
+            db.commit()
+            msg_id = msg.id
+
+        # Patch SessionLocal to use our test DB, then run _reresolve_escalated
         with patch(
-            "cli_agent_orchestrator.services.delivery_service.SessionLocal"
-        ) as mock_sl:
-            mock_db = MagicMock()
-            mock_sl.return_value.__enter__ = MagicMock(return_value=mock_db)
-            mock_sl.return_value.__exit__ = MagicMock(return_value=False)
-
-            # The convergence tick query filters state == "OPEN" — ESCALATED is skipped
-            mock_db.query.return_value.filter.return_value.all.return_value = []
-
+            "cli_agent_orchestrator.services.delivery_service.SessionLocal", TestSession
+        ):
             with patch(
-                "cli_agent_orchestrator.services.delivery_service._check_stranded"
-            ):
+                "cli_agent_orchestrator.services.delivery_service.attempt_rung2"
+            ) as mock_rung2:
                 with patch(
-                    "cli_agent_orchestrator.services.delivery_service._fire_due_nudges"
-                ):
-                    with patch(
-                        "cli_agent_orchestrator.services.delivery_service._update_pending_indicators"
-                    ):
-                        with patch(
-                            "cli_agent_orchestrator.services.delivery_service._check_health_warnings"
-                        ):
-                            with patch(
-                                "cli_agent_orchestrator.services.delivery_service.ConfigService"
-                            ) as mock_cfg:
-                                mock_cfg.get.side_effect = lambda k, d=None: {
-                                    "delivery.phase": "shadow",
-                                    "delivery.tick_s": 5.0,
-                                    "delivery.escalate_after_s": 30.0,
-                                }.get(k, d)
+                    "cli_agent_orchestrator.services.delivery_service.resolve_supervisor_target"
+                ) as mock_resolve:
+                    mock_resolve.return_value = DeliveryTarget(
+                        terminal_id="sup_h3", tmux_session="cao-h3",
+                        tmux_window="supervisor", cc_inbox_path=None,
+                    )
+                    # Simulate draft cleared — injection succeeds
+                    mock_rung2.return_value = LadderResult(
+                        delivered=True, phase="surface",
+                        decision="proceed", reason=None,
+                    )
+                    _reresolve_escalated(30.0)
 
-                                convergence_tick()
-
-        # The invariant: ESCALATED obligations must have at least one re-delivery
-        # path that will eventually surface the message. Currently they don't —
-        # the tick only processes state=="OPEN".
-        # This test documents the gap: once ESCALATED, the obligation is dead.
-        assert False, (
-            "ESCALATED obligations have NO re-delivery path: convergence_tick only "
-            "processes OPEN obligations. With mailbox_pull=false, a user_draft_present "
-            "escalation means the message sits forever with no follow-up attempt."
-        )
+        # The invariant: ESCALATED obligation must have been picked up and
+        # re-resolved — it should now be ACKED (delivered via re-resolve).
+        with TestSession() as db:
+            obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg_id).one()
+            assert obl.state == "ACKED", (
+                f"ESCALATED obligation was not re-resolved — state is still {obl.state}. "
+                "H3 guarantees ESCALATED obligations get a follow-up delivery path."
+            )
+            assert obl.terminal_reason == "f206_reresolve_delivered"

@@ -282,18 +282,30 @@ class BoundaryPullService:
             from cli_agent_orchestrator.utils.tmux_command import tmux_argv
 
             if count > 0:
-                subprocess.run(
+                result = subprocess.run(
                     tmux_argv("set-option", "-t", tmux_session, "@cao_pending", str(count)),
                     capture_output=True,
                     timeout=5,
                 )
+                if result.returncode != 0:
+                    logger.warning(
+                        "fx194 tmux @cao_pending set rc=%d stderr=%s",
+                        result.returncode,
+                        result.stderr[:200] if result.stderr else b"",
+                    )
             else:
                 # Unset on drain
-                subprocess.run(
+                result = subprocess.run(
                     tmux_argv("set-option", "-t", tmux_session, "-u", "@cao_pending"),
                     capture_output=True,
                     timeout=5,
                 )
+                if result.returncode != 0:
+                    logger.warning(
+                        "fx194 tmux @cao_pending unset rc=%d stderr=%s",
+                        result.returncode,
+                        result.stderr[:200] if result.stderr else b"",
+                    )
         except Exception as e:
             logger.debug("fx194 tmux @cao_pending write failed: %s", e)
 
