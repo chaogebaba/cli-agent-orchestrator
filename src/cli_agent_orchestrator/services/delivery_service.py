@@ -445,7 +445,13 @@ def _check_safety_gates(target: DeliveryTarget, *, is_escalation: bool = False) 
 
 
 def convergence_tick() -> None:
-    """Drive all OPEN obligations one step. Called as first sibling tick (D5/D8)."""
+    """Drive all OPEN obligations one step. Called as first sibling tick (D5/D8).
+
+    FX194: The tick loop no longer drives delivery at boundaries — it only
+    tracks obligation age, fires the masked interrupt (D2) when no boundary
+    has occurred for the E-window, updates the @cao_pending indicator (D4),
+    and handles escalation (D6).
+    """
     from cli_agent_orchestrator.services.config_service import ConfigService
 
     phase = ConfigService.get("delivery.phase", "shadow")
@@ -478,8 +484,15 @@ def convergence_tick() -> None:
     # D8: stranded detector
     _check_stranded(escalate_after_s)
 
-    # FX193: Fire any due nudges (after all obligations have been driven/coalesced)
+    # FX193/FX194: Fire any due nudges — now the D2 masked interrupt path only
+    # (boundaries handle primary delivery)
     _fire_due_nudges()
+
+    # FX194 D4: Update @cao_pending for all terminals with OPEN obligations
+    _update_pending_indicators()
+
+    # FX194 D1b: Check health warnings for obligations crossing E
+    _check_health_warnings(escalate_after_s)
 
 
 def _get_consumption_cursor(mailbox_id: str) -> int | None:
@@ -515,8 +528,17 @@ def _get_pending_oldest(mailbox_id: str) -> tuple[int, int] | None:
 
 
 def _fire_due_nudges() -> None:
-    """FX193: Collect and fire nudges that passed D1/D2/D4 gates."""
+    """FX193/FX194: Collect and fire nudges that passed D1/D2/D4 gates.
+
+    FX194 D2: The nudge is now a masked interrupt — it fires ONLY when no
+    consumption boundary has occurred for the E-window. After firing, it is
+    MASKED and re-arms on the first subsequent consumption boundary.
+    """
+    from cli_agent_orchestrator.services.boundary_pull_service import boundary_pull_service
+    from cli_agent_orchestrator.services.config_service import ConfigService
     from cli_agent_orchestrator.services.nudge_discipline import nudge_discipline
+
+    escalate_after_s = float(ConfigService.get("delivery.escalate_after_s", 120.0))
 
     intents = nudge_discipline.collect_due(
         get_consumption_cursor=_get_consumption_cursor,
@@ -528,7 +550,8 @@ def _fire_due_nudges() -> None:
         if target.terminal_id is None or target.tmux_session is None:
             continue
 
-        # Compute age from the oldest pending message
+        # FX194 D2: Check if interrupt is allowed (not masked)
+        # Compute oldest obligation age for this terminal
         oldest_age_s = 0.0
         try:
             with SessionLocal() as db:
@@ -541,6 +564,24 @@ def _fire_due_nudges() -> None:
         except Exception:
             pass
 
+        # D2: Only fire the interrupt if boundary pull hasn't delivered
+        if not boundary_pull_service.should_interrupt(
+            target.terminal_id,
+            intent.mailbox_id,
+            oldest_age_s,
+            escalate_after_s,
+        ):
+            # Boundary deliveries are handling it — no composer injection needed
+            continue
+
+        # D3: Single coalesced signal carrying count
+        # "[cao] N waiting, oldest <id> <age>"
+        age_s = int(oldest_age_s)
+        nudge_text = (
+            f"[cao] {intent.message_count} waiting, "
+            f"oldest {intent.oldest_inbox_row_id} {age_s}s"
+        )
+
         r2 = attempt_rung2(
             target,
             intent.oldest_inbox_row_id,
@@ -548,9 +589,11 @@ def _fire_due_nudges() -> None:
             oldest_age_s=oldest_age_s,
         )
         if r2.delivered:
+            # D2: Mark interrupt as fired → MASKED
+            boundary_pull_service.mark_interrupt_fired(target.terminal_id)
             logger.debug(
-                "fx193 nudge fired terminal=%s count=%d oldest=%d",
-                intent.terminal_id,
+                "fx194 interrupt fired terminal=%s count=%d oldest=%d",
+                target.terminal_id,
                 intent.message_count,
                 intent.oldest_inbox_row_id,
             )
@@ -750,6 +793,120 @@ def _check_stranded(escalate_after_s: float) -> None:
                     accepted = accepted.replace(tzinfo=timezone.utc)
                 _escalate(db, obl, now, (now - accepted).total_seconds() if accepted else 0.0)
                 db.commit()
+
+
+# ---------------------------------------------------------------------------
+# FX194 D4: Update @cao_pending tmux user variable
+# ---------------------------------------------------------------------------
+
+
+def _update_pending_indicators() -> None:
+    """FX194 D4: Update @cao_pending for all terminals with OPEN obligations.
+
+    Piggybacks on the existing tick loop. Write-through only on count change.
+    """
+    from cli_agent_orchestrator.services.boundary_pull_service import boundary_pull_service
+
+    try:
+        with SessionLocal() as db:
+            from sqlalchemy import func
+
+            # Get pending counts per mailbox
+            pending_counts = (
+                db.query(
+                    DeliveryObligationModel.mailbox_id,
+                    func.count(DeliveryObligationModel.id),
+                )
+                .filter(DeliveryObligationModel.state == "OPEN")
+                .group_by(DeliveryObligationModel.mailbox_id)
+                .all()
+            )
+
+            # Get all mailboxes with their terminals and sessions
+            active_mailboxes = set()
+            for mailbox_id, count in pending_counts:
+                active_mailboxes.add(mailbox_id)
+                target = resolve_supervisor_target(mailbox_id, db)
+                if target.terminal_id and target.tmux_session:
+                    boundary_pull_service.update_pending_count(
+                        target.terminal_id,
+                        target.tmux_session,
+                        count,
+                    )
+
+            # Clear indicators for mailboxes with no OPEN obligations
+            # (get all mailboxes that HAD state but now have count=0)
+            all_supervisor_mailboxes = (
+                db.query(MailboxModel).filter_by(role="supervisor").all()
+            )
+            for mailbox in all_supervisor_mailboxes:
+                if mailbox.id not in active_mailboxes:
+                    target = resolve_supervisor_target(mailbox.id, db)
+                    if target.terminal_id and target.tmux_session:
+                        boundary_pull_service.update_pending_count(
+                            target.terminal_id,
+                            target.tmux_session,
+                            0,
+                        )
+    except Exception:
+        logger.debug("fx194 _update_pending_indicators error", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# FX194 D1b: Health warning — harness contract monitoring
+# ---------------------------------------------------------------------------
+
+
+def _check_health_warnings(escalate_after_s: float) -> None:
+    """FX194 D1b: Emit health warnings for obligations crossing E without boundaries.
+
+    Logs a warning distinguishing:
+    - stuck_thinking: expected case, D2 interrupt will handle
+    - harness_contract_broken: H1/H2 regression, boundaries not being surfaced
+    """
+    from cli_agent_orchestrator.services.boundary_pull_service import boundary_pull_service
+
+    now = _utcnow()
+
+    try:
+        with SessionLocal() as db:
+            # Find obligations crossing E
+            from datetime import timedelta
+
+            e_cutoff = now - timedelta(seconds=escalate_after_s)
+            aging_obligations = (
+                db.query(DeliveryObligationModel)
+                .filter(
+                    DeliveryObligationModel.state == "OPEN",
+                    DeliveryObligationModel.accepted_at <= e_cutoff,
+                )
+                .all()
+            )
+
+            for obl in aging_obligations:
+                target = resolve_supervisor_target(obl.mailbox_id, db)
+                if target.terminal_id is None:
+                    continue
+
+                accepted = obl.accepted_at
+                if accepted is not None and accepted.tzinfo is None:
+                    accepted = accepted.replace(tzinfo=timezone.utc)
+                age_s = (now - accepted).total_seconds() if accepted else 0.0
+
+                warning = boundary_pull_service.check_health_warning(
+                    target.terminal_id, age_s, escalate_after_s
+                )
+                if warning:
+                    logger.warning(
+                        "fx194_health_warning terminal=%s inbox=%d age=%.0fs "
+                        "diagnosis=%s boundary_deliveries=0",
+                        target.terminal_id,
+                        obl.inbox_row_id,
+                        age_s,
+                        warning,
+                    )
+    except Exception:
+        logger.debug("fx194 _check_health_warnings error", exc_info=True)
 
 
 # ---------------------------------------------------------------------------

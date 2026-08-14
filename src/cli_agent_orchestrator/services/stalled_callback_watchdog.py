@@ -439,6 +439,28 @@ class StalledCallbackWatchdog:
         except Exception:
             pass
 
+        # FX194 D1: notify boundary pull service on consumption boundaries
+        # (idle transition = a consumption boundary where pull can deliver)
+        if status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
+            try:
+                from cli_agent_orchestrator.services.boundary_pull_service import (
+                    boundary_pull_service,
+                )
+
+                # Look up the mailbox for this terminal
+                from cli_agent_orchestrator.clients.database import SessionLocal, MailboxModel
+
+                with SessionLocal() as db:
+                    mailbox = (
+                        db.query(MailboxModel)
+                        .filter_by(current_terminal_id=terminal_id)
+                        .first()
+                    )
+                    if mailbox:
+                        boundary_pull_service.notify_boundary(terminal_id, mailbox.id)
+            except Exception:
+                pass
+
     def _gc_fired_episodes(self) -> None:
         """Remove episodes that have both fired and seen their callback (F97)."""
         dead = [tid for tid, ep in self._episodes.items() if ep.callback_seen and ep.fired]
