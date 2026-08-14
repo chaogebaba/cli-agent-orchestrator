@@ -700,6 +700,11 @@ def _initialize_claude_native_home(manifest: dict[str, Any]) -> Path:
 
 def command_up(args: argparse.Namespace) -> int:
     root = Path(args.root)
+    # F188: ensure root's parent exists (mkdir -p semantics) before disk-space check
+    try:
+        root.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SandboxError(f"cannot create sandbox root parent {root.parent}: {exc}") from exc
     # F119: disk-space pre-flight guard
     usage = shutil.disk_usage(str(root.parent if not root.exists() else root))
     free_gb = usage.free / (1024**3)
