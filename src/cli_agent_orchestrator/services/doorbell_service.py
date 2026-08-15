@@ -235,6 +235,16 @@ def _attempt_native_ring(terminal_id: str, max_written_row_id: int) -> Optional[
     # D8: sample pre-write status for verification
     pre_status_updated_at = record.status_updated_at
 
+    # F216: gate — refuse BEFORE any connect attempt when socket path is empty.
+    # CC cross-session gate may be remotely off → messagingSocketPath:null in JSON.
+    if not record.messaging_socket_path:
+        logger.info(
+            "f170_doorbell terminal=%s decision=fallback transport=socket "
+            "reason=socket_unpublished pid=%s ver=%s row=%s",
+            terminal_id, record.pid, record.version, max_written_row_id,
+        )
+        return "socket_unpublished"
+
     # D5: socket write
     write_err = write_to_socket(record.messaging_socket_path, payload)
     if write_err:

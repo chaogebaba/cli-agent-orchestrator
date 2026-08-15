@@ -80,6 +80,28 @@ def real_sqlite_env(tmp_path, monkeypatch):
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
 
+    # A fresh DB is only half of a fresh environment: several services keep
+    # process-global high-water/dedup caches that shadow DB columns and are
+    # keyed by terminal id. Tests here reuse ids like "sup00001", so a cache
+    # left behind by an earlier test in the same worker suppresses this test's
+    # delivery ("already_notified") even though its DB is empty. Clear them.
+    from cli_agent_orchestrator.services import (
+        delivery_service,
+        doorbell_service,
+        inbox_service,
+        teammate_push_service,
+    )
+
+    _shadow_caches = (
+        teammate_push_service._last_notified,
+        doorbell_service._last_doorbell_row_id,
+        doorbell_service._last_warn_time,
+        inbox_service._failure_streaks,
+        delivery_service._health_warning_dedup,
+    )
+    for cache in _shadow_caches:
+        cache.clear()
+
     db_file = tmp_path / "test_real_sqlite.db"
     test_url = f"sqlite:///{db_file}"
     test_engine = create_engine(test_url, connect_args={"check_same_thread": False})
@@ -92,9 +114,12 @@ def real_sqlite_env(tmp_path, monkeypatch):
     # Create all tables
     Base.metadata.create_all(bind=test_engine)
 
-    return {
+    yield {
         "tmp_path": tmp_path,
         "TestSession": TestSession,
         "engine": test_engine,
         "db_file": db_file,
     }
+
+    for cache in _shadow_caches:
+        cache.clear()

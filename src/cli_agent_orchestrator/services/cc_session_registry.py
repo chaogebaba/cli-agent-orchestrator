@@ -211,16 +211,19 @@ def read_registry(sessions_dir: Optional[Path] = None) -> list[RegistryRecord]:
         updated_at = _parse_registry_timestamp(data.get("updatedAt", ""))
         status_updated_at = _parse_registry_timestamp(data.get("statusUpdatedAt", ""))
 
+        # F216: coerce explicit JSON null → "" for all string fields.
+        # dict.get(key, default) returns None when the key IS present with value
+        # null; the `or ""` pattern normalizes that to empty-string at parse time.
         records.append(RegistryRecord(
             pid=int(stem),
-            session_id=data.get("sessionId", ""),
-            cwd=data.get("cwd", ""),
-            tmux=data.get("tmux", ""),
-            version=data.get("version", ""),
+            session_id=data.get("sessionId", "") or "",
+            cwd=data.get("cwd", "") or "",
+            tmux=data.get("tmux", "") or "",
+            version=data.get("version", "") or "",
             peer_protocol=peer_protocol,
-            messaging_socket_path=data.get("messagingSocketPath", ""),
+            messaging_socket_path=data.get("messagingSocketPath", "") or "",
             proc_start=proc_start,
-            status=data.get("status", ""),
+            status=data.get("status", "") or "",
             status_updated_at=status_updated_at,
             updated_at=updated_at,
             raw=data,
