@@ -29,6 +29,9 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.services.config_service import ConfigService
+from cli_agent_orchestrator.services.nudge_discipline import JitterRNG, _DefaultRNG
+
+_push_rng: JitterRNG = _DefaultRNG()
 
 logger = logging.getLogger(__name__)
 
@@ -294,9 +297,9 @@ def _backoff_deadline(deadline_mono: float | None) -> None:
         max_ms = min(_LOCK_BACKOFF_MAX_MS, int(remaining * 1000))
         if max_ms < _LOCK_BACKOFF_MIN_MS:
             return
-        ms = random.randint(_LOCK_BACKOFF_MIN_MS, max_ms)
+        ms = _push_rng.randint(_LOCK_BACKOFF_MIN_MS, max_ms)
     else:
-        ms = random.randint(_LOCK_BACKOFF_MIN_MS, _LOCK_BACKOFF_MAX_MS)
+        ms = _push_rng.randint(_LOCK_BACKOFF_MIN_MS, _LOCK_BACKOFF_MAX_MS)
     time.sleep(ms / 1000.0)
 
 

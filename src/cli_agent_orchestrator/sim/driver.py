@@ -1,0 +1,198 @@
+"""Deterministic tick driver for the DST liveness harness (D10/D13).
+
+The sim is single-threaded and drives the tick functions directly. The harness
+never starts StalledCallbackWatchdog.run(); it substitutes the run loop and
+calls the ticks inline, in a seeded order.
+
+Virtual time advances by jump-to-next-deadline (D13), not fixed increment.
+Wall-clock cost of a 10-minute virtual scenario stays milliseconds.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
+
+from cli_agent_orchestrator.sim.clock import SimClock
+from cli_agent_orchestrator.sim.faults import FaultKind, FaultSet
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.services.stalled_callback_watchdog import StalledCallbackWatchdog
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class EventTrace:
+    """Records simulation events for replay verification (AC3)."""
+
+    events: list[dict[str, object]] = field(default_factory=list)
+
+    def record(self, event_type: str, **kwargs: object) -> None:
+        self.events.append({"type": event_type, **kwargs})
+
+
+class SimDriver:
+    """Drives the convergence ticks in deterministic order under simulated time.
+
+    D10: The roster is the full run-loop fan-out — all seven ticks.
+    D13: Time advances by jump-to-next-deadline.
+    """
+
+    def __init__(
+        self,
+        clock: SimClock,
+        watchdog: "StalledCallbackWatchdog",
+        fault_set: FaultSet,
+        trace: EventTrace | None = None,
+    ) -> None:
+        self.clock = clock
+        self.watchdog = watchdog
+        self.fault_set = fault_set
+        self.trace = trace or EventTrace()
+        self._tick_cadence: float = 5.0  # delivery.tick_s default
+        self._escalate_after_s: float = 120.0
+        self._iteration_count = 0
+        self._deadlines: list[float] = []
+
+    @property
+    def iteration_count(self) -> int:
+        return self._iteration_count
+
+    def configure(self, tick_s: float = 5.0, escalate_after_s: float = 120.0) -> None:
+        """Set timing configuration (reads from ConfigService in production)."""
+        self._tick_cadence = tick_s
+        self._escalate_after_s = escalate_after_s
+
+    def add_deadline(self, at: float) -> None:
+        """Register an external deadline (fault expiry, workload arrival, etc.)."""
+        if at not in self._deadlines:
+            self._deadlines.append(at)
+            self._deadlines.sort()
+
+    def _collect_next_deadline(self) -> float | None:
+        """Find the earliest pending deadline across all sources.
+
+        Sources: tick cadence, registered external deadlines.
+        """
+        now = self.clock.monotonic()
+        candidates: list[float] = []
+
+        # Next tick cadence
+        next_tick = now + self._tick_cadence
+        candidates.append(next_tick)
+
+        # External deadlines that are in the future
+        for d in self._deadlines:
+            if d > now:
+                candidates.append(d)
+                break  # sorted, so first future one is earliest
+
+        return min(candidates) if candidates else None
+
+    def step(self) -> bool:
+        """Advance to next deadline and run one driver iteration.
+
+        Returns True if progress was made (time advanced or ticks ran).
+        Returns False if there are no pending deadlines (potential livelock).
+        """
+        next_deadline = self._collect_next_deadline()
+        if next_deadline is None:
+            return False
+
+        # Jump time to deadline (D13)
+        current = self.clock.monotonic()
+        if next_deadline > current:
+            self.clock.jump_to(next_deadline)
+            self.trace.record(
+                "time_advance",
+                from_t=current,
+                to_t=next_deadline,
+                delta=next_deadline - current,
+            )
+
+        # Remove consumed deadlines
+        self._deadlines = [d for d in self._deadlines if d > self.clock.monotonic()]
+
+        # Run the seven ticks in order (D10 roster)
+        now = self.clock.monotonic()
+        self._run_ticks(now)
+        self._iteration_count += 1
+        return True
+
+    def _run_ticks(self, now: float) -> None:
+        """Run all seven ticks from the D10 roster."""
+        self.trace.record("tick_iteration", now=now, iteration=self._iteration_count)
+
+        # 1. _fx191_convergence_tick — calls convergence_tick() from delivery_service
+        #    We call it via the delivery_service directly since we bypass the watchdog's run loop
+        try:
+            from cli_agent_orchestrator.services.delivery_service import convergence_tick
+
+            convergence_tick()
+            self.trace.record("tick", name="_fx191_convergence_tick", now=now)
+        except Exception as e:
+            self.trace.record("tick_error", name="_fx191_convergence_tick", error=str(e))
+            logger.debug("convergence_tick error in sim", exc_info=True)
+
+        # 2. poll_unarmed_statuses
+        try:
+            self.watchdog.poll_unarmed_statuses(now=now)
+            self.trace.record("tick", name="poll_unarmed_statuses", now=now)
+        except Exception as e:
+            self.trace.record("tick_error", name="poll_unarmed_statuses", error=str(e))
+
+        # 3. refresh_screen_fingerprints
+        try:
+            self.watchdog.refresh_screen_fingerprints(now=now)
+            self.trace.record("tick", name="refresh_screen_fingerprints", now=now)
+        except Exception as e:
+            self.trace.record("tick_error", name="refresh_screen_fingerprints", error=str(e))
+
+        # 4. notify_due
+        try:
+            self.watchdog.notify_due()
+            self.trace.record("tick", name="notify_due", now=now)
+        except Exception as e:
+            self.trace.record("tick_error", name="notify_due", error=str(e))
+
+        # 5. tick_waiting_inbox
+        try:
+            self.watchdog.tick_waiting_inbox(now=now)
+            self.trace.record("tick", name="tick_waiting_inbox", now=now)
+        except Exception as e:
+            self.trace.record("tick_error", name="tick_waiting_inbox", error=str(e))
+
+        # 6. tick_ready_backlog
+        try:
+            self.watchdog.tick_ready_backlog(now=now)
+            self.trace.record("tick", name="tick_ready_backlog", now=now)
+        except Exception as e:
+            self.trace.record("tick_error", name="tick_ready_backlog", error=str(e))
+
+        # 7. tick_quiescence
+        try:
+            self.watchdog.tick_quiescence(now=now)
+            self.trace.record("tick", name="tick_quiescence", now=now)
+        except Exception as e:
+            self.trace.record("tick_error", name="tick_quiescence", error=str(e))
+
+    def run_until(
+        self,
+        *,
+        max_virtual_seconds: float,
+        max_iterations: int = 10000,
+    ) -> None:
+        """Run the driver until a time bound or iteration cap is reached."""
+        start = self.clock.monotonic()
+        bound = start + max_virtual_seconds
+        iterations = 0
+
+        while self.clock.monotonic() < bound and iterations < max_iterations:
+            if not self.step():
+                # No deadline available — add the tick cadence as a fallback
+                self.add_deadline(self.clock.monotonic() + self._tick_cadence)
+            iterations += 1

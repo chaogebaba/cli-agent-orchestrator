@@ -10,6 +10,7 @@ import os
 import re
 import threading
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -221,8 +222,13 @@ class ReadyBacklogEpisode:
 
 
 class StalledCallbackWatchdog:
-    def __init__(self, grace_seconds: int = STALLED_CALLBACK_GRACE_SECONDS) -> None:
+    def __init__(
+        self,
+        grace_seconds: int = STALLED_CALLBACK_GRACE_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.grace_seconds = grace_seconds
+        self._clock = clock
         self._lock = threading.RLock()
         self._episodes: dict[str, _Episode] = {}
         self._waiting_inbox_episodes: dict[str, WaitingInboxEpisode] = {}
@@ -232,7 +238,7 @@ class StalledCallbackWatchdog:
         self._generation_by_terminal: dict[str, int] = {}
         self._callback_fences: dict[str, int] = {}
         self._chain_notified: set[tuple[str, int, str, int]] = set()
-        self._parity_clock = time.monotonic
+        self._parity_clock = clock
         # FX181 D3: dead members still owed, keyed by caller_id -> terminal_id -> _RetiredMember
         self._dead_owed: dict[str, dict[str, _RetiredMember]] = {}
         # FX181 D5: dedup key per caller, set only after successful persist

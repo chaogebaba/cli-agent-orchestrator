@@ -89,6 +89,11 @@ SEAM_ACTIVATION_CONSUMER_OPS = (
 
 
 def _utcnow() -> datetime:
+    from cli_agent_orchestrator.sim.clock import active as _sim_clock_active
+
+    clock = _sim_clock_active()
+    if clock is not None:
+        return clock.utcnow()
     return datetime.now(timezone.utc)
 
 

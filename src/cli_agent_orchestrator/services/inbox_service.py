@@ -70,6 +70,7 @@ from cli_agent_orchestrator.clients.database import (
     transition_pending_to_delivery_failed,
     transition_pending_to_inferred_delivered,
     update_message_status,
+    _utcnow,
 )
 
 _PRODUCTION_BEGIN_DELIVERY_ATTEMPT = begin_delivery_attempt
@@ -1666,7 +1667,7 @@ class InboxService:
             return "normal", resolution
 
         newest = ambiguous[-1]
-        now = datetime.now(timezone.utc)
+        now = _utcnow()
         now_z = now.isoformat().replace("+00:00", "Z")
 
         lookup_result = "unresolved"
@@ -3233,7 +3234,7 @@ class InboxService:
         if not ConfigService.get("supervisor.mailbox_pull"):
             return
 
-        cutoff = datetime.now(timezone.utc) - timedelta(seconds=INBOX_RECONCILE_GRACE_SECONDS)
+        cutoff = _utcnow() - timedelta(seconds=INBOX_RECONCILE_GRACE_SECONDS)
 
         with _SL() as db:
             supervisor_mailboxes = db.query(_MBModel).filter_by(role="supervisor").all()
@@ -3407,7 +3408,7 @@ class InboxService:
                             SessionLocal as _ErrSL,
                         )
 
-                        _now = datetime.now(timezone.utc)
+                        _now = _utcnow()
                         _err_row = _AttemptModel(
                             attempt_uuid=str(_uuid.uuid4()),
                             receiver_terminal_id=mb.current_terminal_id or "unknown",
@@ -3563,7 +3564,7 @@ class InboxService:
                         get_park_warm_for_message_ids(message_ids),
                     )
                 return
-            recovered_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            recovered_at = _utcnow().isoformat().replace("+00:00", "Z")
             recovery_evidence = {
                 **lookup_evidence,
                 "crash_recovery": {

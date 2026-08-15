@@ -321,7 +321,7 @@ def publish_supervisor_incarnation(claim: MailboxClaim, terminal_id: str) -> dic
                     return result
                 raise MailboxDomainError("mailbox_conflict", "mailbox publication conflict")
 
-            now = datetime.now(timezone.utc)
+            now = _utcnow()
             if claim.mailbox_id is None:
                 mailbox = MailboxModel(
                     id=f"mb_{uuid.uuid4().hex[:8]}",
@@ -1032,7 +1032,7 @@ def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
                 .update(
                     {
                         MailboxModel.consumed_through_id: up_to_id,
-                        MailboxModel.updated_at: datetime.now(timezone.utc),
+                        MailboxModel.updated_at: _utcnow(),
                     },
                     synchronize_session=False,
                 )
@@ -1078,7 +1078,7 @@ def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
                 )
                 .all()
             )
-            now = datetime.now(timezone.utc)
+            now = _utcnow()
             for attempt in open_attempts:
                 attempt.outcome = "confirmed"
                 attempt.reason = "mailbox_pull_acked"
@@ -1112,7 +1112,7 @@ def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
             ).update(
                 {
                     _DObl.state: "ACKED",
-                    _DObl.terminal_at: datetime.now(timezone.utc),
+                    _DObl.terminal_at: _utcnow(),
                     _DObl.terminal_reason: "consumed",
                 },
                 synchronize_session=False,
