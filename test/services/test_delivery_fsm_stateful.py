@@ -348,12 +348,18 @@ class TestAC21RedThenGreen:
         bps.register_terminal("t1", "mb1")
 
         # At age 45s with interrupt_after_s=30: fires
-        assert bps.should_interrupt("t1", "mb1", 45.0, 30.0) is True
+        assert bps.should_interrupt(
+            terminal_id="t1", mailbox_id="mb1",
+            oldest_obligation_age_s=45.0, interrupt_after_s=30.0,
+        ) is True
 
         # At age 45s with interrupt_after_s=120 (base behavior): does NOT fire
         bps2 = BoundaryPullService()
         bps2.register_terminal("t2", "mb2")
-        assert bps2.should_interrupt("t2", "mb2", 45.0, 120.0) is False
+        assert bps2.should_interrupt(
+            terminal_id="t2", mailbox_id="mb2",
+            oldest_obligation_age_s=45.0, interrupt_after_s=120.0,
+        ) is False
 
     def test_f206e_schedule_real_services(self):
         """F206e schedule: msg → busy → draft → 35s → clear → boundary → deliver.
@@ -405,7 +411,10 @@ class TestAC21RedThenGreen:
         bps_state = h.bps.get_state("sup1")
         assert bps_state.interrupt_state == InterruptState.ARMED
         # Calling real should_interrupt: age=45 < interrupt_after_s=120 → False
-        assert h.bps.should_interrupt("sup1", "mb1", 45.0, 120.0) is False
+        assert h.bps.should_interrupt(
+            terminal_id="sup1", mailbox_id="mb1",
+            oldest_obligation_age_s=45.0, interrupt_after_s=120.0,
+        ) is False
 
     def test_transport_ejection_real_service(self):
         """REAL TransportEjectionService counts refusals and ejects."""
