@@ -12,6 +12,11 @@ This test constructs the ack-with-open-obligation shape and asserts:
 Vacuous-green law: the verdict fields (obligation.state, settled_count)
 are COMPUTED from the database state after ack_messages returns — never
 assigned to expected values before the call.
+
+Revert sensitivity: only test 2 (settled_count) fails when the 6-line fix
+is reverted — the bulk .update() still executes, so tests 1 and 3 pass on
+base too; they guard the stronger regression of obligation settlement
+being removed entirely (diff-gate S1, 2026-08-15).
 """
 
 from __future__ import annotations
