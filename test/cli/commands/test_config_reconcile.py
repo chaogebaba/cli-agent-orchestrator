@@ -238,7 +238,10 @@ def test_sandbox_guard_runs_before_reconcile_or_mutation(reconcile_env, monkeypa
 
 
 def test_root_installer_delegates_without_toml_or_stanza_parsing():
-    install_script = Path(__file__).resolve().parents[4] / "install.sh"
+    from test.conftest import ROOT_REPO
+    if ROOT_REPO is None:
+        pytest.skip("root repo not found (worktree without .git context)")
+    install_script = ROOT_REPO / "install.sh"
     contents = install_script.read_text(encoding="utf-8")
 
     assert contents.count("cao config reconcile") == 1

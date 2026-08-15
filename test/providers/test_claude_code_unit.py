@@ -1868,29 +1868,12 @@ class TestClaudeCodeProviderEffortFlag:
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_real_seed_applies_design_reviewer_effort(self, mock_load, tmp_path, monkeypatch):
-        # Find providers.toml.default: walk ancestors, then try git-common-dir
-        outer_template = None
-        for parent in Path(__file__).resolve().parents:
-            candidate = parent / "providers.toml.default"
-            if candidate.exists():
-                outer_template = candidate
-                break
-        if outer_template is None:
-            # Worktree fallback: git-common-dir points to main checkout's .git
-            import subprocess as _sp
-            try:
-                common = Path(_sp.check_output(
-                    ["git", "rev-parse", "--git-common-dir"],
-                    cwd=Path(__file__).resolve().parent, text=True,
-                ).strip())
-                # common = <root-repo>/cli-agent-orchestrator/.git → root repo = common.parents[1]
-                candidate = common.parents[1] / "providers.toml.default"
-                if candidate.exists():
-                    outer_template = candidate
-            except Exception:
-                pass
-        if outer_template is None:
-            pytest.skip("providers.toml.default not found (worktree or ancestor)")
+        from test.conftest import ROOT_REPO
+        if ROOT_REPO is None:
+            pytest.skip("providers.toml.default not found (worktree without .git context)")
+        outer_template = ROOT_REPO / "providers.toml.default"
+        if not outer_template.exists():
+            pytest.skip("providers.toml.default not found in root repo")
         defaults = tmp_path / "providers.toml"
         shutil.copyfile(outer_template, defaults)
         monkeypatch.setattr(

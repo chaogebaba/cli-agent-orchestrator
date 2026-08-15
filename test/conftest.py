@@ -28,6 +28,53 @@ import pytest
 # test module can import the global database engine. This prevents tests from
 # depending on (or migrating) the installed production database.
 _TEST_CAO_HOME = Path(tempfile.mkdtemp(prefix="cao-pytest-"))
+
+
+# ---------------------------------------------------------------------------
+# F113: Worktree-safe root-repo derivation
+# ---------------------------------------------------------------------------
+# In a normal checkout, the subrepo lives at <root-repo>/cli-agent-orchestrator/
+# and tests can reach the root repo via parents[N]. In a git worktree (e.g.
+# /tmp/<name>/), parent indices shift, breaking any hard-coded depth. This
+# helper walks up first (covers normal checkouts), then falls back to
+# git-common-dir (covers worktrees) to reliably locate the root repo.
+
+def _derive_root_repo() -> "Path | None":
+    """Find the root repository that contains the cli-agent-orchestrator subrepo.
+
+    Returns None if the root repo cannot be located (e.g. running from an
+    extracted tarball with no .git context).
+    """
+    import subprocess as _sp
+
+    subrepo = Path(__file__).resolve().parent.parent  # test/ -> subrepo root
+
+    # Strategy 1: walk up from subrepo looking for root-repo markers
+    # (providers.toml.default or install.sh — both are root-repo-only files)
+    for parent in subrepo.parents:
+        if (parent / "providers.toml.default").exists() or (parent / "install.sh").exists():
+            return parent
+
+    # Strategy 2: git-common-dir fallback (worktree → main checkout's .git)
+    try:
+        common = Path(_sp.check_output(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=subrepo, text=True, stderr=_sp.DEVNULL,
+        ).strip())
+        # common = <root-repo>/cli-agent-orchestrator/.git → root repo = common.parents[1]
+        candidate = common.parents[1]
+        if candidate.exists() and (
+            (candidate / "providers.toml.default").exists()
+            or (candidate / "install.sh").exists()
+        ):
+            return candidate
+    except Exception:
+        pass
+
+    return None
+
+
+ROOT_REPO: "Path | None" = _derive_root_repo()
 os.environ["CAO_HOME_DIR"] = str(_TEST_CAO_HOME)
 
 from cli_agent_orchestrator.clients.database import engine, init_db  # noqa: E402

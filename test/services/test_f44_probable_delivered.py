@@ -630,7 +630,10 @@ def test_t5a_valid_missing_and_malformed_timeout_settings(monkeypatch, tmp_path,
 
 
 def test_t5a_outer_template_documents_commented_inbox_default():
-    template = Path(__file__).resolve().parents[3] / "providers.toml.default"
+    from test.conftest import ROOT_REPO
+    if ROOT_REPO is None:
+        pytest.skip("root repo not found (worktree without .git context)")
+    template = ROOT_REPO / "providers.toml.default"
     content = template.read_text(encoding="utf-8")
     assert "# [inbox]" in content
     assert "# confirmation_timeout_seconds = 10.0" in content

@@ -13,6 +13,20 @@ def _find_observer_script() -> Path:
         script = root / "probes" / "base-refresh-observer.py"
         if script.is_file():
             return script
+    # Worktree fallback: git-common-dir points to main checkout's .git
+    try:
+        import subprocess as _sp
+        common = Path(_sp.check_output(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=Path(__file__).resolve().parent, text=True,
+            stderr=_sp.DEVNULL,
+        ).strip())
+        # common = <root-repo>/cli-agent-orchestrator/.git → root repo = common.parents[1]
+        script = common.parents[1] / "probes" / "base-refresh-observer.py"
+        if script.is_file():
+            return script
+    except Exception:
+        pass
     raise RuntimeError("base-refresh-observer.py not found in repository ancestors")
 
 
