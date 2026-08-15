@@ -6465,18 +6465,46 @@ async def delete_terminal(
         )
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+        # D13: Already-absent terminal returns 200, not 404
+        detail_msg = str(e)
+        if "not found" in detail_msg.lower() or "does not exist" in detail_msg.lower():
+            return {
+                "success": True,
+                "deleted": False,
+                "already_absent": True,
+            }
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail_msg)
     except RuntimeError as e:
-        if str(e) == "resume_in_progress":
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        # D12: Typed, logged, structurally non-empty errors
+        detail_str = str(e)
+        code = detail_str if detail_str else "unknown_runtime_error"
+        if code in ("resume_in_progress", "rebind_in_progress",
+                    "cascade_quiesce_unstable", "cascade_outside_caller_subtree"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=code,
+            )
+        logger.exception(
+            "delete_terminal_error terminal_id=%s code=%s caller=%s",
+            terminal_id,
+            code,
+            caller_id,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete terminal: {str(e)}",
+            detail=f"{type(e).__name__}: {detail_str or 'unspecified'}",
         )
     except Exception as e:
+        # D12: Always log + always include class name (never empty)
+        logger.exception(
+            "delete_terminal_error terminal_id=%s error_type=%s caller=%s",
+            terminal_id,
+            type(e).__name__,
+            caller_id,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete terminal: {str(e)}",
+            detail=f"{type(e).__name__}: {str(e) or 'no detail'}",
         )
 
 

@@ -19,6 +19,7 @@ from cli_agent_orchestrator.clients.database import (
     DeliveryObligationModel,
     InboxMessageTraceEventModel,
     InboxModel,
+    MailboxIncarnationModel,
     MailboxModel,
     SessionLocal,
     TerminalModel,
@@ -44,6 +45,21 @@ class DeliveryTarget:
     tmux_window: str | None
     cc_inbox_path: str | None
     has_registry: bool = False  # CC session registry record exists
+    liveness: str = "presumed_live"  # D6: "presumed_live" | "confirmed_dead"
+
+
+def is_target_confirmed_dead(terminal_id: str, db: Session) -> bool:
+    """D6: DB-only deadness check. No tmux call. `db` is REQUIRED (S2 — no default)."""
+    from cli_agent_orchestrator.clients.database import PaneExitTombstoneModel
+
+    # A terminal is confirmed dead if a tombstone exists for its current generation
+    # and no newer activated incarnation exists.
+    tombstone = (
+        db.query(PaneExitTombstoneModel.id)
+        .filter(PaneExitTombstoneModel.terminal_id == terminal_id)
+        .first()
+    )
+    return tombstone is not None
 
 
 def resolve_supervisor_target(mailbox_id: str, db: Session | None = None) -> DeliveryTarget:
@@ -323,6 +339,15 @@ def attempt_rung1(
     """
     import os
 
+    # D7: Short-circuit on confirmed-dead target
+    if target.liveness == "confirmed_dead":
+        return LadderResult(
+            delivered=False,
+            phase="transport_attempt",
+            decision="settle",
+            reason="target_confirmed_dead",
+        )
+
     from cli_agent_orchestrator.services.transport_ejection import (
         transport_ejection_service,
     )
@@ -396,6 +421,15 @@ def attempt_rung2(
 
     Only safety gates can defer this rung (D4).
     """
+    # D7: Short-circuit on confirmed-dead target (ahead of its own no_live_target check)
+    if target.liveness == "confirmed_dead":
+        return LadderResult(
+            delivered=False,
+            phase="transport_attempt",
+            decision="settle",
+            reason="target_confirmed_dead",
+        )
+
     if target.tmux_session is None or target.tmux_window is None:
         return LadderResult(
             delivered=False,
@@ -648,6 +682,11 @@ def convergence_tick() -> None:
 
     # D8: stranded detector
     _check_stranded(escalate_after_s)
+
+    # F218-a D8: Settle obligations for confirmed-dead targets (S2: tick's session)
+    with SessionLocal() as db:
+        _settle_dead_target_obligations(db)
+        db.commit()
 
     # FX193/FX194: Fire any due nudges — now the D2 masked interrupt path only
     # (boundaries handle primary delivery)
@@ -939,6 +978,18 @@ def _escalate(
     """D6: Bounded escalation — exactly once per obligation."""
     target = resolve_supervisor_target(obl.mailbox_id, db)
 
+    # D7: Short-circuit on confirmed-dead target
+    if target.terminal_id and getattr(target, "liveness", "presumed_live") == "confirmed_dead":
+        obl.state = "SETTLED_TARGET_DEAD"
+        obl.terminal_at = now
+        obl.terminal_reason = "target_confirmed_dead"
+        emit_trace_or_collapse(obl.inbox_row_id, "escalate", "settle", "target_confirmed_dead", db)
+        logger.info(
+            "f219_dead_target terminal=%s transport=escalate action=settled",
+            target.terminal_id,
+        )
+        return
+
     if target.terminal_id is None or target.tmux_session is None:
         # No live target — escalate as no_live_target (D6)
         obl.state = "ESCALATED"
@@ -1005,6 +1056,14 @@ def _fire_escalation_display_message(
     display-message renders in the status line and does NOT touch the pane
     input, so the D2b draft guard rationale does not apply.
     """
+    # D7: Short-circuit on confirmed-dead target — zero tmux calls
+    if getattr(target, "liveness", "presumed_live") == "confirmed_dead":
+        logger.info(
+            "f219_dead_target terminal=%s transport=display action=settled",
+            target.terminal_id,
+        )
+        return
+
     from cli_agent_orchestrator.utils.tmux_command import tmux_argv
 
     # Use provided count or try to get aggregate (best-effort, no nested session
@@ -1035,6 +1094,198 @@ def _fire_escalation_display_message(
             )
     except Exception as e:
         logger.warning("f206b display-message exception session=%s: %s", target.tmux_session, e)
+
+
+def _settle_dead_target_obligations(db: Session) -> None:
+    """F218-a D8: Sweep OPEN/ESCALATED obligations for confirmed-dead targets.
+
+    Three-case settlement (D8 — CAS/incarnation-safe, never ACKED, never
+    deleted, zero transport to confirmed-dead terminals):
+
+    Case (i) — Mailbox with successor incarnation:
+        A newer or current generation exists in MailboxIncarnationModel whose
+        terminal_id is NOT confirmed dead.  The inbox message's receiver_id is
+        retargeted to that successor terminal; the obligation stays OPEN so the
+        normal delivery ladder picks it up on the next tick.  No settlement, no
+        parking — the message remains deliverable.
+
+    Case (ii) — Mailbox-owned, no live successor:
+        The logical_receiver_id exists (mailbox authority) but no live successor
+        terminal is available.  The inbox message is PARKED with
+        owner_receiver_id and owner_generation preserved for later reactivation
+        by a future incarnation publish.  Obligation → SETTLED_TARGET_DEAD.
+
+    Case (iii) — Direct terminal receiver, no mailbox authority:
+        The message's logical_receiver_id is NULL (a direct terminal-addressed
+        send with no mailbox backing).  Outcome: obligation →
+        SETTLED_TARGET_DEAD, terminal_reason = "receiver_gone".  One aggregate
+        notice per session is emitted (never per-message storm).
+
+    Invariants enforced:
+    - NEVER sets state = ACKED on any obligation.
+    - NEVER deletes any inbox message.
+    - NEVER dispatches transport (rung1/rung2) to a confirmed-dead terminal.
+    - CAS-safe: generation comparisons use the obligation's mailbox_id row as
+      the serialisation point; no ABA possible across incarnation publish.
+
+    Parameters:
+        db: The caller's active SQLAlchemy session (S2 — no nested SessionLocal;
+            passed from convergence_tick's own session scope).
+    """
+    from cli_agent_orchestrator.clients.database import PaneExitTombstoneModel
+
+    # N1: SQL join/subquery replaces O(N) Python scan — only fetch obligations
+    # whose mailbox current_terminal_id has a tombstone (confirmed dead).
+    dead_subq = (
+        db.query(PaneExitTombstoneModel.terminal_id)
+        .distinct()
+        .subquery()
+    )
+    dead_obls = (
+        db.query(DeliveryObligationModel)
+        .join(MailboxModel, MailboxModel.id == DeliveryObligationModel.mailbox_id)
+        .filter(
+            DeliveryObligationModel.state.in_(("OPEN", "ESCALATED")),
+            MailboxModel.current_terminal_id.isnot(None),
+            MailboxModel.current_terminal_id.in_(
+                db.query(dead_subq.c.terminal_id)
+            ),
+        )
+        .all()
+    )
+
+    settled_count = 0
+    rerouted_count = 0
+    parked_count = 0
+    # Track sessions that need aggregate notice (case iii)
+    noticed_sessions: set[str] = set()
+    now = _utcnow()
+
+    for obl in dead_obls:
+        try:
+            # Resolve the mailbox to find the terminal
+            mailbox = db.query(MailboxModel).filter_by(id=obl.mailbox_id).first()
+            if mailbox is None or mailbox.current_terminal_id is None:
+                continue
+
+            terminal_id = mailbox.current_terminal_id
+            # Double-check deadness (defensive; SQL join already filtered)
+            if not is_target_confirmed_dead(terminal_id, db):
+                continue
+
+            # Target is confirmed dead — determine which case applies
+            inbox_row = db.query(InboxModel).filter_by(id=obl.inbox_row_id).first()
+            if inbox_row is None:
+                continue
+
+            # ─── Case determination ───────────────────────────────
+            has_mailbox_authority = inbox_row.logical_receiver_id is not None
+
+            if has_mailbox_authority:
+                # Look for a live successor incarnation in this mailbox
+                successor_terminal_id = _find_live_successor(
+                    db, obl.mailbox_id, terminal_id
+                )
+
+                if successor_terminal_id is not None:
+                    # ═══ Case (i): Reroute to successor ═══
+                    inbox_row.receiver_id = successor_terminal_id
+                    # Update mailbox current_terminal_id cache if stale
+                    if mailbox.current_terminal_id != successor_terminal_id:
+                        mailbox.current_terminal_id = successor_terminal_id
+                    # Keep obligation OPEN — delivery ladder picks it up
+                    obl.next_attempt_at = now
+                    emit_trace_or_collapse(
+                        obl.inbox_row_id, "settle", "reroute",
+                        "successor_incarnation", db,
+                    )
+                    rerouted_count += 1
+                    continue
+
+                # ═══ Case (ii): Park — mailbox-owned, no live successor ═══
+                if inbox_row.owner_receiver_id is None:
+                    inbox_row.owner_receiver_id = inbox_row.receiver_id
+                if inbox_row.owner_generation is None:
+                    inbox_row.owner_generation = mailbox.generation
+                inbox_row.status = "parked"
+                obl.state = "SETTLED_TARGET_DEAD"
+                obl.terminal_at = now
+                obl.terminal_reason = "parked_no_successor"
+                emit_trace_or_collapse(
+                    obl.inbox_row_id, "settle", "park",
+                    "no_live_successor", db,
+                )
+                parked_count += 1
+
+            else:
+                # ═══ Case (iii): Direct terminal, no mailbox authority ═══
+                obl.state = "SETTLED_TARGET_DEAD"
+                obl.terminal_at = now
+                obl.terminal_reason = "receiver_gone"
+                emit_trace_or_collapse(
+                    obl.inbox_row_id, "settle", "settle",
+                    "receiver_gone", db,
+                )
+                settled_count += 1
+                # Track for aggregate session notice
+                noticed_sessions.add(mailbox.session_name)
+
+        except Exception:
+            logger.debug(
+                "f219_settle_exception inbox=%s", obl.inbox_row_id, exc_info=True
+            )
+            continue
+
+    dirty = settled_count + parked_count + rerouted_count
+    if dirty > 0:
+        # Emit one aggregate notice per session for case (iii)
+        for session_name in noticed_sessions:
+            db.add(
+                InboxMessageTraceEventModel(
+                    message_id=0,
+                    kind="f219.session_notice",
+                    phase="settle",
+                    decision="receiver_gone",
+                    reason=f"session={session_name} settled={settled_count}",
+                    payload={
+                        "session_name": session_name,
+                        "settled_count": settled_count,
+                    },
+                )
+            )
+        db.flush()
+        logger.info(
+            "f219_settle disposition=three_case rerouted=%d parked=%d "
+            "settled=%d sessions_notified=%d",
+            rerouted_count,
+            parked_count,
+            settled_count,
+            len(noticed_sessions),
+        )
+
+
+def _find_live_successor(
+    db: Session, mailbox_id: str, dead_terminal_id: str
+) -> str | None:
+    """Return the terminal_id of the newest live incarnation for mailbox_id.
+
+    Iterates incarnations from highest generation downward.  Returns the first
+    terminal_id that is NOT confirmed dead and differs from dead_terminal_id.
+    Returns None when no live successor exists (all incarnations dead or only
+    the dead terminal is registered).
+    """
+    incarnations = (
+        db.query(MailboxIncarnationModel.terminal_id)
+        .filter(MailboxIncarnationModel.mailbox_id == mailbox_id)
+        .order_by(MailboxIncarnationModel.generation.desc())
+        .all()
+    )
+    for (candidate_tid,) in incarnations:
+        if candidate_tid == dead_terminal_id:
+            continue
+        if not is_target_confirmed_dead(candidate_tid, db):
+            return candidate_tid
+    return None
 
 
 def _check_stranded(escalate_after_s: float) -> None:

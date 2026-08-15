@@ -224,6 +224,13 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_DELIVERY_JITTER": ("delivery.jitter", "str", "on"),
     # F210 D10: kill-switch for the whole rung2 send-keys nudge (hot-reloadable)
     "CAO_DELIVERY_NUDGE_SENDKEYS_ENABLED": ("delivery.nudge_sendkeys_enabled", "bool", True),
+    # F218-a: dead-supervisor safety config
+    "CAO_LIVENESS_SESSION_CONFIRM_SAMPLES": ("liveness.session_confirm_samples", "int", 2),
+    "CAO_LIVENESS_SCOPE_PROBE_TIMEOUT_S": ("liveness.scope_probe_timeout_s", "float", 5.0),
+    "CAO_FORENSICS_TOMBSTONE_ENABLED": ("forensics.tombstone_enabled", "bool", True),
+    "CAO_FORENSICS_TOMBSTONE_RETENTION_DAYS": ("forensics.tombstone_retention_days", "int", 30),
+    "CAO_ALARM_DEGRADED_DISPLAY_MESSAGE": ("alarm.degraded_display_message", "bool", True),
+    "CAO_TEARDOWN_INTENT_TTL_S": ("teardown.intent_ttl_s", "float", 300.0),
 }
 
 # Reverse index: dotted path -> env var name, for get()'s env-precedence lookup.
@@ -503,6 +510,13 @@ _ALL_PATHS = sorted(
         "delivery.base_ejection_s",
         "delivery.trace_retention_h",
         "delivery.jitter",
+        # F218-a: dead-supervisor safety config
+        "liveness.session_confirm_samples",
+        "liveness.scope_probe_timeout_s",
+        "forensics.tombstone_enabled",
+        "forensics.tombstone_retention_days",
+        "alarm.degraded_display_message",
+        "teardown.intent_ttl_s",
     }
 )
 

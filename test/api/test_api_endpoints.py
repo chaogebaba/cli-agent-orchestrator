@@ -1196,24 +1196,29 @@ class TestDeleteTerminal:
         mock_svc.delete_terminal.assert_called_once_with("abcd1234", registry=ANY)
 
     def test_delete_terminal_not_found(self, client):
-        """DELETE /terminals/{id} returns 404 for nonexistent terminal."""
+        """DELETE /terminals/{id} returns 200 with already_absent (D13)."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.delete_terminal.side_effect = ValueError("Terminal not found")
 
             response = client.delete("/terminals/deadbeef")
 
-        assert response.status_code == 404
-        assert "Terminal not found" in response.json()["detail"]
+        assert response.status_code == 200
+        body = response.json()
+        assert body["already_absent"] is True
+        assert body["success"] is True
 
     def test_delete_terminal_server_error(self, client):
-        """DELETE /terminals/{id} returns 500 on error."""
+        """DELETE /terminals/{id} returns 500 with typed detail (D12)."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.delete_terminal.side_effect = Exception("Cleanup failed")
 
             response = client.delete("/terminals/abcd1234")
 
         assert response.status_code == 500
-        assert "Failed to delete terminal" in response.json()["detail"]
+        # D12: detail is "{ClassName}: {message}", never empty
+        detail = response.json()["detail"]
+        assert "Exception" in detail
+        assert "Cleanup failed" in detail
 
 
 # ── flow_daemon ──────────────────────────────────────────────────────

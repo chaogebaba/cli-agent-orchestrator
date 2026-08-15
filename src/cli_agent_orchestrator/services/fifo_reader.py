@@ -4,6 +4,7 @@ Publisher: terminal.{id}.output
 """
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import logging
 import os
 import select
@@ -503,16 +504,29 @@ class FifoManager:
         if thread is not None:
             thread.join(timeout=2.0)
 
-    def _f138_definitive_absence(self, terminal_id: str) -> None:
+    def _f138_definitive_absence(self, terminal_id: str, scope_hint: str | None = None) -> None:
         """D15/D20: Handle a definitive session/window-not-found from probe().
 
         First hit increments and returns. Second consecutive hit on a later
         watchdog tick reports confirmed-gone and unenrolls (D20: report BEFORE
         unenroll; if result is retryable, retain enrollment).
+
+        F218-a §3: On the second tick, runs the full pipeline:
+        scope reprobe → T-1 tombstone → mark degradation/alarm → publish → reconcile.
         """
         count = self._f138_probe_gone_count.get(terminal_id, 0) + 1
         self._f138_probe_gone_count[terminal_id] = count
         if count >= 2:
+            # F218-a §3: Full pipeline BEFORE reconciliation.
+            # Best-effort: failures never block the reconciliation path (D11).
+            try:
+                self._f218_confirmed_gone_pipeline(terminal_id, scope_hint=scope_hint)
+            except Exception:
+                logger.warning(
+                    "f218_confirmed_gone_pipeline_outer_failed: terminal=%s",
+                    terminal_id, exc_info=True,
+                )
+
             # D20: Report BEFORE unenroll — uses pinned authority.
             should_unenroll = self._f138_report_confirmed_gone(
                 terminal_id, "fifo_window_gone_confirmed"
@@ -521,6 +535,126 @@ class FifoManager:
                 with self._lock:
                     self._unenroll(terminal_id)
         # First hit: just return (count stored, will fire on next tick if repeated).
+
+    def _f218_confirmed_gone_pipeline(
+        self, terminal_id: str, scope_hint: str | None = None
+    ) -> None:
+        """F218-a §3: scope reprobe → tombstone → degradation/alarm → publish confirmed_dead.
+
+        Runs BEFORE request_orphan_reconciliation. Best-effort: failures are
+        logged but never block the reconciliation path (D11).
+        """
+        try:
+            with self._lock:
+                authority = self._f138_authority.get(terminal_id)
+            if authority is None:
+                return
+
+            # Get session/window context from the terminal DB row
+            from cli_agent_orchestrator.clients.database import SessionLocal, TerminalModel
+
+            with SessionLocal() as db:
+                term_row = db.query(TerminalModel).filter_by(id=terminal_id).first()
+                if term_row is None:
+                    logger.debug("f218_pipeline: terminal %s not in DB — skipping", terminal_id)
+                    return
+
+                session_name = term_row.session_name
+                window_name = getattr(term_row, "window_name", None) or terminal_id
+
+                # Step 2: Classify scope via positive re-probe (D2)
+                from cli_agent_orchestrator.services.config_service import ConfigService
+
+                samples = int(ConfigService.get("liveness.session_confirm_samples", 2))
+                timeout_s = float(ConfigService.get("liveness.scope_probe_timeout_s", 5.0))
+
+                from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
+                from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+                backend = TmuxBackend()
+                scope_probe = backend.session_scope_probe(
+                    session_name, window_name=window_name,
+                    samples=samples, timeout_s=timeout_s,
+                )
+
+                logger.info(
+                    "f218_scope_probe terminal=%s session=%s hint=%s scope=%s samples=%d "
+                    "session_present=%s siblings=%s elapsed=n/a",
+                    terminal_id, session_name, scope_hint, scope_probe.scope,
+                    scope_probe.samples,
+                    scope_probe.session_present,
+                    len(scope_probe.sibling_windows) if scope_probe.sibling_windows else 0,
+                )
+
+                # Step 3: Write tombstone T-1 (D3) — last moment /proc exists
+                from cli_agent_orchestrator.services.pane_tombstone_service import record
+                from cli_agent_orchestrator.services.session_degradation_service import (
+                    resolve_session_incarnation,
+                    mark_degraded,
+                    raise_alarm,
+                )
+
+                forensics_enabled = bool(ConfigService.get("forensics.tombstone_enabled", True))
+                incarnation_id = authority.incarnation_id or f"processless:{terminal_id}:{authority.terminal_generation}"
+                token_hash = self._f138_get_token_hash(authority.incarnation_id) if authority.incarnation_id else None
+
+                # Resolve session incarnation (D15: total, never None)
+                try:
+                    session_incarnation = resolve_session_incarnation(session_name, db)
+                except (ValueError, Exception) as e:
+                    logger.warning("f218_incarnation_resolve_failed: %s", e)
+                    session_incarnation = f"epoch:{int(datetime.now(timezone.utc).timestamp())}"
+
+                tombstone_result = record(
+                    db=db,
+                    incarnation_id=incarnation_id,
+                    terminal_id=terminal_id,
+                    terminal_generation=authority.terminal_generation,
+                    token_hash=token_hash,
+                    session_name=session_name,
+                    session_incarnation=session_incarnation,
+                    scope_probe=scope_probe,
+                    scope_hint=scope_hint,
+                    writer="observation",
+                    window_name=window_name,
+                    pane_pid=getattr(authority, "pane_pid", None),
+                    forensics_enabled=forensics_enabled,
+                )
+                db.commit()
+
+                # Step 4: Mark degradation + alarm (D5/D9)
+                if scope_probe.scope == "window_gone":
+                    cause = "supervisor_window_gone"
+                elif scope_probe.scope == "session_gone":
+                    cause = "session_gone"
+                else:
+                    cause = "pane_unreachable_scope_unknown"
+
+                deg_result = mark_degraded(
+                    db=db,
+                    session_name=session_name,
+                    session_incarnation=session_incarnation,
+                    cause=cause,
+                    tombstone_id=tombstone_result.tombstone_id,
+                    terminal_id=terminal_id,
+                    detail={"scope_probe": list(scope_probe.evidence)},
+                )
+                db.commit()
+
+                # Fire alarm only for newly marked (exactly-once)
+                if deg_result.newly_marked and deg_result.degradation_id:
+                    raise_alarm(deg_result.degradation_id, db)
+                    db.commit()
+
+                # Step 5: confirmed_dead is now derived from tombstone existence (D6)
+                # — no separate write needed; is_target_confirmed_dead reads the tombstone.
+
+        except Exception:
+            # D11: pipeline failures never block reconciliation
+            logger.warning(
+                "f218_confirmed_gone_pipeline_failed: terminal=%s",
+                terminal_id, exc_info=True,
+            )
 
     def _f138_report_confirmed_gone(self, terminal_id: str, source: str) -> bool:
         """D19/D20: Report confirmed-gone using pinned enrollment authority.
@@ -772,7 +906,13 @@ class FifoManager:
                 or ("not found in session '" in msg and msg.startswith("Window '"))
             ):
                 # Definitive absence — session/window genuinely gone.
-                return self._f138_definitive_absence(terminal_id)
+                # D1: Derive hint from the string shape (stored, never acted on).
+                hint: str | None = None
+                if msg.startswith("Session '"):
+                    hint = "session"
+                elif msg.startswith("Window '"):
+                    hint = "window"
+                return self._f138_definitive_absence(terminal_id, scope_hint=hint)
             # Unknown ValueError shape: reset counter, re-raise to watchdog handler.
             self._f138_probe_gone_count.pop(terminal_id, None)
             raise

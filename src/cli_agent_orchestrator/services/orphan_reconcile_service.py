@@ -435,6 +435,85 @@ def run_reconciliation_attempt_sync(
         "issuance_boot_id": issuance_boot_id,
     }
 
+    # D4 barrier: No signal without a tombstone row. If no tombstone exists,
+    # write one from what we can still see (writer='job'); if even that fails,
+    # return tombstone_missing with a retry delay.
+    from cli_agent_orchestrator.services.pane_tombstone_service import (
+        require_tombstone,
+        record_degenerate,
+    )
+    from cli_agent_orchestrator.clients.database import SessionLocal
+
+    with SessionLocal() as db:
+        tombstone_id = require_tombstone(token_hash, db)
+        if tombstone_id is None:
+            # T-2: Try to write a degenerate tombstone from the job side
+            try:
+                from cli_agent_orchestrator.services.session_degradation_service import (
+                    resolve_session_incarnation,
+                )
+                from cli_agent_orchestrator.clients.database import (
+                    ProcessIncarnationModel,
+                    TerminalModel as _TerminalModel,
+                )
+
+                # N2: Resolve actual terminal_id from token_hash DB lookup
+                inc_row = (
+                    db.query(ProcessIncarnationModel)
+                    .filter_by(token_hash=token_hash)
+                    .one_or_none()
+                )
+                if inc_row is not None:
+                    resolved_terminal_id = inc_row.terminal_id
+                    resolved_generation = inc_row.terminal_generation
+                else:
+                    resolved_terminal_id = token_hash  # fallback: use hash as id
+                    resolved_generation = 0
+
+                # Resolve session_name from terminal if still in DB
+                term_row = (
+                    db.query(_TerminalModel.tmux_session)
+                    .filter_by(id=resolved_terminal_id)
+                    .one_or_none()
+                )
+                resolved_session = term_row[0] if term_row is not None else "orphan"
+
+                result = record_degenerate(
+                    db=db,
+                    incarnation_id=token_hash,
+                    terminal_id=resolved_terminal_id,
+                    terminal_generation=resolved_generation,
+                    session_name=resolved_session,
+                    session_incarnation="degenerate",
+                    scope="unknown",
+                    writer="job",
+                    incomplete_reason="evidence_age=post_restart",
+                )
+                db.commit()
+                if result.error and not result.already_existed:
+                    return ReconcileAttemptResult(
+                        code="tombstone_missing",
+                        complete_scan=False,
+                        scanned=0,
+                        term_signaled=0,
+                        kill_signaled=0,
+                        residual=0,
+                        retry_delay_s=_RETRY_DELAYS[0],
+                        detail="tombstone_write_failed",
+                    )
+            except Exception as e:
+                logger.warning("f218_tombstone_barrier_failed: %s", e)
+                return ReconcileAttemptResult(
+                    code="tombstone_missing",
+                    complete_scan=False,
+                    scanned=0,
+                    term_signaled=0,
+                    kill_signaled=0,
+                    residual=0,
+                    retry_delay_s=_RETRY_DELAYS[0],
+                    detail=f"tombstone_barrier_error: {type(e).__name__}",
+                )
+
     # Step 1: complete token scan
     scan = scan_incarnation_processes(token, owner_uid, **_scan_kw)
     if not scan.complete:

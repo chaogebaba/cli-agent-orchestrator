@@ -5052,6 +5052,72 @@ def delete_terminal(
     require_delete_allowed(terminal_id, force=force)
     session_name = root["tmux_session"]
 
+    # D16: Open teardown intent BEFORE any tmux call. Committed immediately.
+    from cli_agent_orchestrator.services.teardown_intent_service import (
+        open_intent as _f218_open_intent,
+        close_intent as _f218_close_intent,
+    )
+    from cli_agent_orchestrator.services.config_service import ConfigService
+    from cli_agent_orchestrator.clients.database import SessionLocal
+
+    ttl_s = float(ConfigService.get("teardown.intent_ttl_s", 300.0))
+    _f218_intent_id: str | None = None
+    try:
+        with SessionLocal() as _intent_db:
+            _f218_intent_id = _f218_open_intent(
+                scope_kind="terminal",
+                scope_key=terminal_id,
+                requested_by=caller_id,
+                ttl_s=ttl_s,
+                db=_intent_db,
+            )
+    except Exception as e:
+        logger.warning("f218_teardown_intent_open_failed terminal=%s: %s", terminal_id, e)
+
+    # F167 D2 step 1: Pre-lease, unleased pre-plan quiesce (subtree only).
+    try:
+        return _delete_terminal_inner(
+            terminal_id=terminal_id,
+            session_name=session_name,
+            root=root,
+            registry=registry,
+            force=force,
+            orphan=orphan,
+            caller_id=caller_id,
+        )
+    finally:
+        # D16: Close intent in finally — runs on success, failure, exception alike
+        if _f218_intent_id is not None:
+            try:
+                with SessionLocal() as _intent_db:
+                    _f218_close_intent(_f218_intent_id, _intent_db)
+            except Exception as e:
+                logger.warning("f218_teardown_intent_close_failed: %s", e)
+
+
+def _delete_terminal_inner(
+    terminal_id: str,
+    session_name: str,
+    root: dict,
+    registry: "PluginRegistry | None",
+    force: bool,
+    orphan: bool,
+    caller_id: str | None,
+) -> dict[str, Any]:
+    """Inner delete logic, called within D16 teardown intent bracketing."""
+    from cli_agent_orchestrator.services.rebind_lease import (
+        acquire_rebind_lease,
+        release_rebind_lease,
+    )
+    from cli_agent_orchestrator.services.session_lifecycle_lease import (
+        acquire_session_lifecycle_exclusive,
+        release_session_lifecycle_lease,
+    )
+    from cli_agent_orchestrator.services.terminal_guard_service import (
+        TerminalProtectionError,
+        require_delete_allowed,
+    )
+
     # F167 D2 step 1: Pre-lease, unleased pre-plan quiesce (subtree only).
     _quiesce_cascade_subtree_pre_plan(session_name, terminal_id, orphan=orphan, force=force)
 

@@ -1089,7 +1089,7 @@ class TestDeleteTerminalEndpoint:
         mock_svc.delete_terminal.assert_called_once_with("abcd1234", registry=ANY, orphan=True)
 
     def test_delete_terminal_not_found(self, client):
-        """DELETE /terminals/{terminal_id} returns 404 for missing terminal."""
+        """DELETE /terminals/{terminal_id} returns 200 with already_absent (D13)."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.delete_terminal.side_effect = ValueError("Terminal not found")
 
@@ -1097,10 +1097,11 @@ class TestDeleteTerminalEndpoint:
 
             response = client.delete("/terminals/deadbeef")
 
-            assert response.status_code == 404
+            assert response.status_code == 200
+            assert response.json()["already_absent"] is True
 
     def test_delete_terminal_server_error(self, client):
-        """DELETE /terminals/{terminal_id} returns 500 on internal error."""
+        """DELETE /terminals/{terminal_id} returns 500 with typed detail (D12)."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.delete_terminal.side_effect = Exception("TMux error")
 
@@ -1109,7 +1110,9 @@ class TestDeleteTerminalEndpoint:
             response = client.delete("/terminals/abcd1234")
 
             assert response.status_code == 500
-            assert "Failed to delete terminal" in response.json()["detail"]
+            detail = response.json()["detail"]
+            assert "Exception" in detail
+            assert "TMux error" in detail
 
 
 class TestFleetEndpoint:

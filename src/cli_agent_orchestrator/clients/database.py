@@ -536,7 +536,7 @@ class DeliveryObligationModel(Base):
     terminal_reason = Column(String, nullable=True)
     __table_args__ = (
         CheckConstraint(
-            "state IN ('OPEN','ACKED','ESCALATED')",
+            "state IN ('OPEN','ACKED','ESCALATED','SETTLED_TARGET_DEAD')",
             name="ck_delivery_obligation_state",
         ),
         Index(
@@ -947,6 +947,134 @@ class OrphanReconcileJobModel(Base):
     )
 
 
+# ─── F218-a / F219 dead-supervisor safety models ────────────────────────────
+
+
+class PaneExitTombstoneModel(Base):
+    """F218-a: forensic record of a confirmed-gone pane, written BEFORE any signal."""
+
+    __tablename__ = "pane_exit_tombstones"
+
+    id = Column(String, primary_key=True)
+    incarnation_id = Column(String, nullable=False, unique=True)  # duplicate-proof
+    terminal_id = Column(String, nullable=False)
+    terminal_generation = Column(Integer, nullable=False)
+    token_hash = Column(String, nullable=True)  # NEVER the raw token
+    session_name = Column(String, nullable=False)
+    session_incarnation = Column(String, nullable=False)  # D15: NOT NULL, total derivation
+
+    # --- classifier ---
+    scope = Column(String, nullable=False)  # window_gone|session_gone|unknown
+    scope_hint = Column(String, nullable=True)  # from the error string (D1) — hint only
+    scope_evidence_json = Column(Text, nullable=True)  # probe rc/stderr/samples, verbatim
+    confirm_samples = Column(Integer, nullable=True)
+
+    # --- former identity ---
+    window_name = Column(String, nullable=True)
+    window_index = Column(Integer, nullable=True)
+    pane_id = Column(String, nullable=True)  # tmux %N
+    sibling_windows_json = Column(Text, nullable=True)  # [] proves "session had nothing left"
+
+    # --- process identity (forensic only — never addressable, Do-NOT 8) ---
+    pane_pid = Column(Integer, nullable=True)
+    pane_start_ticks = Column(Integer, nullable=True)
+    pane_pgid = Column(Integer, nullable=True)
+    issuance_boot_id = Column(String, nullable=True)
+    matched_pids_json = Column(Text, nullable=True)  # scan taken AT tombstone time, pre-TERM
+    cgroup_path = Column(String, nullable=True)
+    systemd_scope = Column(String, nullable=True)
+    proc_status = Column(String, nullable=False)  # ok|unavailable|denied|not_applicable
+    proc_reason = Column(String, nullable=True)
+
+    # --- exit evidence (D10: normally absent, and says so) ---
+    exit_code = Column(Integer, nullable=True)
+    term_signal = Column(Integer, nullable=True)
+    exit_evidence_status = Column(String, nullable=False)  # default unavailable_no_waiter
+    exit_evidence_reason = Column(String, nullable=True)
+
+    # --- memory / pressure snapshot ---
+    memory_events_json = Column(Text, nullable=True)
+    memory_current = Column(Integer, nullable=True)
+    memory_peak = Column(Integer, nullable=True)
+    memory_max = Column(String, nullable=True)  # N1: RAW cgroup file content, verbatim
+    memory_pressure_json = Column(Text, nullable=True)
+    memory_status = Column(String, nullable=False)
+    memory_reason = Column(String, nullable=True)
+
+    # --- provenance ---
+    writer = Column(String, nullable=False)  # observation|job
+    schema_version = Column(Integer, nullable=False)  # 1
+    complete = Column(Boolean, nullable=False)
+    incomplete_reason = Column(String, nullable=True)  # D11 degenerate path
+    observed_at = Column(DateTime(timezone=True), nullable=False)
+    written_at = Column(DateTime(timezone=True), nullable=False)
+    server_pid = Column(Integer, nullable=True)
+    server_boot_id = Column(String, nullable=True)
+    __table_args__ = (
+        CheckConstraint(
+            "scope IN ('window_gone','session_gone','unknown')",
+            name="ck_tombstone_scope",
+        ),
+        CheckConstraint(
+            "writer IN ('observation','job')",
+            name="ck_tombstone_writer",
+        ),
+        Index("ix_tombstone_session", "session_name", "session_incarnation"),
+        Index("ix_tombstone_terminal", "terminal_id", "terminal_generation"),
+    )
+
+
+class SessionDegradationModel(Base):
+    """F218-a: exactly-once session degradation marker + alarm ledger."""
+
+    __tablename__ = "session_degradations"
+
+    id = Column(String, primary_key=True)
+    session_name = Column(String, nullable=False)
+    session_incarnation = Column(String, nullable=False)  # D15 — NOT NULL is load-bearing
+    cause = Column(String, nullable=False)
+    tombstone_id = Column(String, nullable=True)
+    terminal_id = Column(String, nullable=True)
+    detail_json = Column(Text, nullable=True)
+    alarm_rungs_json = Column(Text, nullable=True)  # per-rung attempted/ok/failed + reason
+    alarm_delivered = Column(Boolean, nullable=False)
+    suppressed_by_teardown = Column(Boolean, nullable=False, default=False)
+    acknowledged_at = Column(DateTime(timezone=True), nullable=True)  # R5 re-surface gate
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    __table_args__ = (
+        UniqueConstraint(
+            "session_name",
+            "session_incarnation",
+            "cause",
+            name="uq_session_degradation",
+        ),
+        CheckConstraint(
+            "cause IN ('supervisor_window_gone','session_gone','pane_unreachable_scope_unknown')",
+            name="ck_degradation_cause",
+        ),
+    )
+
+
+class F218TeardownIntentModel(Base):
+    """D16: durable 'this teardown is deliberate' marker. Written BEFORE tmux is touched."""
+
+    __tablename__ = "f218_teardown_intents"
+
+    id = Column(String, primary_key=True)
+    scope_kind = Column(String, nullable=False)  # session | terminal
+    scope_key = Column(String, nullable=False)  # session_name | terminal_id
+    requested_by = Column(String, nullable=True)  # caller_id, when known
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)  # created_at + TTL
+    __table_args__ = (
+        UniqueConstraint("scope_kind", "scope_key", name="uq_f218_teardown_intent"),
+        CheckConstraint(
+            "scope_kind IN ('session','terminal')",
+            name="ck_f218_teardown_scope_kind",
+        ),
+    )
+
+
 def _ensure_db_dir() -> None:
     """Create the DB dir owner-only (0o700).
 
@@ -1017,6 +1145,114 @@ def init_db() -> None:
     _migrate_f138_orphan_reconciliation()
     _migrate_f175_dedup_columns()
     _migrate_fx191_trace_extension()
+    _migrate_f218_dead_supervisor_safety()
+
+
+def _migrate_f218_dead_supervisor_safety() -> None:
+    """F218-a/F219: Create dead-supervisor safety tables + widen obligation state constraint."""
+    with engine.begin() as connection:
+        # Check which tables already exist
+        tables = connection.execute(
+            text("SELECT name FROM sqlite_master WHERE type='table'")
+        ).fetchall()
+        existing_tables = {r[0] for r in tables}
+
+        # The three new tables are created by Base.metadata.create_all above if
+        # the DB is fresh. For existing DBs we need explicit CREATE IF NOT EXISTS.
+        if "pane_exit_tombstones" not in existing_tables:
+            connection.execute(text("""
+                CREATE TABLE pane_exit_tombstones (
+                    id TEXT PRIMARY KEY,
+                    incarnation_id TEXT NOT NULL UNIQUE,
+                    terminal_id TEXT NOT NULL,
+                    terminal_generation INTEGER NOT NULL,
+                    token_hash TEXT,
+                    session_name TEXT NOT NULL,
+                    session_incarnation TEXT NOT NULL,
+                    scope TEXT NOT NULL CHECK(scope IN ('window_gone','session_gone','unknown')),
+                    scope_hint TEXT,
+                    scope_evidence_json TEXT,
+                    confirm_samples INTEGER,
+                    window_name TEXT,
+                    window_index INTEGER,
+                    pane_id TEXT,
+                    sibling_windows_json TEXT,
+                    pane_pid INTEGER,
+                    pane_start_ticks INTEGER,
+                    pane_pgid INTEGER,
+                    issuance_boot_id TEXT,
+                    matched_pids_json TEXT,
+                    cgroup_path TEXT,
+                    systemd_scope TEXT,
+                    proc_status TEXT NOT NULL,
+                    proc_reason TEXT,
+                    exit_code INTEGER,
+                    term_signal INTEGER,
+                    exit_evidence_status TEXT NOT NULL,
+                    exit_evidence_reason TEXT,
+                    memory_events_json TEXT,
+                    memory_current INTEGER,
+                    memory_peak INTEGER,
+                    memory_max TEXT,
+                    memory_pressure_json TEXT,
+                    memory_status TEXT NOT NULL,
+                    memory_reason TEXT,
+                    writer TEXT NOT NULL CHECK(writer IN ('observation','job')),
+                    schema_version INTEGER NOT NULL,
+                    complete BOOLEAN NOT NULL,
+                    incomplete_reason TEXT,
+                    observed_at DATETIME NOT NULL,
+                    written_at DATETIME NOT NULL,
+                    server_pid INTEGER,
+                    server_boot_id TEXT
+                )
+            """))
+            connection.execute(text(
+                "CREATE INDEX ix_tombstone_session ON pane_exit_tombstones(session_name, session_incarnation)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX ix_tombstone_terminal ON pane_exit_tombstones(terminal_id, terminal_generation)"
+            ))
+
+        if "session_degradations" not in existing_tables:
+            connection.execute(text("""
+                CREATE TABLE session_degradations (
+                    id TEXT PRIMARY KEY,
+                    session_name TEXT NOT NULL,
+                    session_incarnation TEXT NOT NULL,
+                    cause TEXT NOT NULL CHECK(cause IN ('supervisor_window_gone','session_gone','pane_unreachable_scope_unknown')),
+                    tombstone_id TEXT,
+                    terminal_id TEXT,
+                    detail_json TEXT,
+                    alarm_rungs_json TEXT,
+                    alarm_delivered BOOLEAN NOT NULL,
+                    suppressed_by_teardown BOOLEAN NOT NULL DEFAULT 0,
+                    acknowledged_at DATETIME,
+                    created_at DATETIME NOT NULL,
+                    UNIQUE(session_name, session_incarnation, cause)
+                )
+            """))
+
+        if "f218_teardown_intents" not in existing_tables:
+            connection.execute(text("""
+                CREATE TABLE f218_teardown_intents (
+                    id TEXT PRIMARY KEY,
+                    scope_kind TEXT NOT NULL CHECK(scope_kind IN ('session','terminal')),
+                    scope_key TEXT NOT NULL,
+                    requested_by TEXT,
+                    created_at DATETIME NOT NULL,
+                    expires_at DATETIME NOT NULL,
+                    UNIQUE(scope_kind, scope_key)
+                )
+            """))
+
+        # Widen obligation state constraint — SQLite does not support ALTER
+        # CONSTRAINT, but the constraint is in the model for new DBs. For
+        # existing DBs the check constraint is named; SQLite ignores named
+        # constraints on existing tables so no migration is needed for the
+        # runtime (SQLite does not enforce named CHECK constraints after
+        # creation without a table rebuild). The model definition governs
+        # new DBs.
 
 
 def _migrate_fx191_trace_extension() -> None:

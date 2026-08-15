@@ -11,6 +11,7 @@ from typing import Dict, List, Literal, Optional
 
 from cli_agent_orchestrator.backends.base import (
     PaneIdentityReadResult,
+    ScopeProbe,
     TerminalBackend,
     TerminalBackendError,
 )
@@ -128,6 +129,93 @@ class TmuxBackend(TerminalBackend):
             return ("error", None)
         except Exception:
             return ("error", None)
+
+    def session_scope_probe(
+        self,
+        session_name: str,
+        *,
+        window_name: str,
+        samples: int = 2,
+        timeout_s: float = 5.0,
+    ) -> ScopeProbe:
+        """F218-a D2: Classify scope via parse-free _has_session_via_cli + enumerate_windows.
+
+        Verdict table:
+        - session present AND enumeration ok → window_gone (with sibling list)
+        - has_session is False on ``samples`` consecutive probes → session_gone
+        - has_session is None, enumeration ("error", None), or disagreement → unknown
+        """
+        import time
+
+        evidence_lines: list[str] = []
+        false_count = 0
+
+        for i in range(samples):
+            if i > 0:
+                time.sleep(min(timeout_s / samples, 1.0))
+
+            has = self._client._has_session_via_cli(session_name)
+            evidence_lines.append(f"has_session[{i}]={has}")
+
+            if has is True:
+                # Session present — classify as window_gone via enumeration
+                status, windows = self.enumerate_windows(session_name)
+                if status == "ok":
+                    sibling_names = tuple(
+                        w.get("name", "") for w in (windows or [])
+                        if w.get("name") != window_name
+                    )
+                    evidence_lines.append(
+                        f"enumerate[{i}]=ok siblings={len(sibling_names)}"
+                    )
+                    return ScopeProbe(
+                        scope="window_gone",
+                        session_present=True,
+                        sibling_windows=sibling_names,
+                        samples=i + 1,
+                        evidence=tuple(evidence_lines),
+                    )
+                else:
+                    evidence_lines.append(f"enumerate[{i}]=error")
+                    # Disagreement: has_session=True but can't enumerate — unknown
+                    return ScopeProbe(
+                        scope="unknown",
+                        session_present=True,
+                        sibling_windows=None,
+                        samples=i + 1,
+                        evidence=tuple(evidence_lines),
+                    )
+            elif has is False:
+                false_count += 1
+            else:
+                # None = could not ask — unknown
+                evidence_lines.append(f"probe_unavailable[{i}]")
+                return ScopeProbe(
+                    scope="unknown",
+                    session_present=None,
+                    sibling_windows=None,
+                    samples=i + 1,
+                    evidence=tuple(evidence_lines),
+                )
+
+        # All samples returned False — session genuinely gone
+        if false_count >= samples:
+            return ScopeProbe(
+                scope="session_gone",
+                session_present=False,
+                sibling_windows=(),
+                samples=samples,
+                evidence=tuple(evidence_lines),
+            )
+
+        # Should not reach here, but safety fallback
+        return ScopeProbe(
+            scope="unknown",
+            session_present=None,
+            sibling_windows=None,
+            samples=samples,
+            evidence=tuple(evidence_lines),
+        )
 
     def get_session_windows(self, session_name: str) -> List[Dict[str, object]]:
         return self._client.get_session_windows(session_name)

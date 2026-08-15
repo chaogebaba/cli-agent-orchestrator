@@ -6,7 +6,18 @@ Core services depend only on this ABC, never on a concrete backend directly.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
+
+
+@dataclass(frozen=True)
+class ScopeProbe:
+    """F218-a D2: Result of a positive re-probe to classify loss scope."""
+
+    scope: Literal["window_gone", "session_gone", "unknown"]
+    session_present: bool | None  # None = could not ask (_has_session_via_cli semantics)
+    sibling_windows: tuple[str, ...] | None
+    samples: int
+    evidence: tuple[str, ...]  # verbatim rc/stderr, oldest→newest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
@@ -155,6 +166,30 @@ class TerminalBackend(ABC):
         genuinely absent, or ("error", None) when the read itself failed.
         """
         return ("error", None)
+
+    def session_scope_probe(
+        self,
+        session_name: str,
+        *,
+        window_name: str,
+        samples: int = 2,
+        timeout_s: float = 5.0,
+    ) -> ScopeProbe:
+        """F218-a D2: Classify scope of a confirmed-gone terminal.
+
+        Determines whether the window alone is gone (session still alive with
+        siblings) or the entire session is gone. Returns ``unknown`` when the
+        answer cannot be determined reliably.
+
+        The default implementation always returns ``unknown``.
+        """
+        return ScopeProbe(
+            scope="unknown",
+            session_present=None,
+            sibling_windows=None,
+            samples=0,
+            evidence=("default_backend_no_probe",),
+        )
 
     def get_session_windows(self, session_name: str) -> List[Dict[str, object]]:
         """Return the windows visible in a session, or an empty inventory."""
