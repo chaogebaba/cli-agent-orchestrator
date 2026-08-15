@@ -404,6 +404,29 @@ def attempt_rung2(
             reason="no_live_target",
         )
 
+    # F210 D1/D2: supervisor-role terminals NEVER receive composer injection.
+    # Enforced here, at the sole send_keys sink of the delivery ladder, so no
+    # present or future caller can bypass it. Unconditional: it outranks
+    # delivery.nudge_sendkeys_enabled in both knob states (D10).
+    if _is_supervisor_role_target(target):
+        return LadderResult(
+            delivered=False,
+            phase="transport_attempt",
+            decision="defer",
+            reason="supervisor_role_exempt",
+        )
+
+    # F210 D10: the knob gates the whole rung, ahead of any capture work.
+    from cli_agent_orchestrator.services.config_service import ConfigService
+
+    if not ConfigService.get("delivery.nudge_sendkeys_enabled", True):
+        return LadderResult(
+            delivered=False,
+            phase="transport_attempt",
+            decision="defer",
+            reason="sendkeys_disabled",
+        )
+
     # Safety gates (D4): check before injection
     safety_reason = _check_safety_gates(target, is_escalation=is_escalation)
     if safety_reason is not None:
@@ -427,11 +450,26 @@ def attempt_rung2(
             f"(oldest id {inbox_row_id}, {age_s}s). Run list_messages to surface them."
         )
 
+    # F210 D7/D8: fire-time draft re-verification. _check_safety_gates read the
+    # composer two full history captures ago; re-read at the sink so a draft
+    # that appeared meanwhile still vetoes.
+    refire_reason = _refire_draft_state(target)
+    if refire_reason is not None:
+        return LadderResult(
+            delivered=False,
+            phase="transport_attempt",
+            decision="defer",
+            reason=refire_reason,
+        )
+
     # Inject via tmux send-keys
     try:
         from cli_agent_orchestrator.clients.tmux import tmux_client
 
-        tmux_client.send_keys(target.tmux_session, target.tmux_window, nudge_text + "\n")
+        # F210 D9: no trailing "\n" — tmux_client.send_keys submits with its own
+        # send-keys Enter, and a newline inside the pasted buffer submits the
+        # pane's current input line by itself.
+        tmux_client.send_keys(target.tmux_session, target.tmux_window, nudge_text)
         return LadderResult(
             delivered=True,
             phase="surface",
@@ -446,6 +484,52 @@ def attempt_rung2(
             decision="defer",
             reason="send_keys_failed",
         )
+
+
+def _is_supervisor_role_target(target: DeliveryTarget) -> bool:
+    """F210 D1/D2: is this target the live incarnation of a supervisor mailbox?
+
+    Fails CLOSED — an unanswerable probe reports "supervisor", because the cost
+    of a wrong False is typing into the user's own pane.
+    """
+    if target.terminal_id is None:
+        return False
+    try:
+        from cli_agent_orchestrator.services.mailbox_service import is_supervisor_role_terminal
+
+        with SessionLocal() as db:
+            return is_supervisor_role_terminal(target.terminal_id, db)
+    except Exception:
+        logger.debug("f210 supervisor-role probe failed for %s", target.terminal_id, exc_info=True)
+        return True
+
+
+def _refire_draft_state(target: DeliveryTarget) -> str | None:
+    """F210 D7/D8: one fresh authority read at the sink. None = clear to inject.
+
+    Providers without ``read_composer_draft_authority`` keep today's single
+    capture-and-check gate — the probe degrades, it does not block delivery.
+    """
+    if target.terminal_id is None:
+        return None
+    try:
+        from cli_agent_orchestrator.providers.manager import provider_manager
+
+        provider = provider_manager.get_provider(target.terminal_id)
+    except Exception:
+        return None
+    authority_reader = getattr(provider, "read_composer_draft_authority", None)
+    if provider is None or not callable(authority_reader):
+        return None
+    try:
+        state, _chip_present = authority_reader()
+    except Exception:
+        return "draft_unresolved"
+    if state == "empty":
+        return None
+    if state == "nonempty":
+        return "user_draft_present"
+    return "draft_unresolved"
 
 
 def _check_safety_gates(target: DeliveryTarget, *, is_escalation: bool = False) -> str | None:
@@ -722,6 +806,21 @@ def _fire_due_nudges() -> None:
             boundary_pull_service.mark_interrupt_fired(target.terminal_id)
             logger.debug(
                 "fx194 interrupt fired terminal=%s count=%d oldest=%d",
+                target.terminal_id,
+                intent.message_count,
+                intent.oldest_inbox_row_id,
+            )
+        elif r2.reason == "supervisor_role_exempt":
+            # F210 D4: the interrupt rung's channel for exempt terminals. Without
+            # this the exemption would make the interrupt threshold silent for
+            # supervisors — only the escalation rung has the F206b floor.
+            # Masking still applies, so the status line is not rewritten per tick.
+            _fire_escalation_display_message(
+                target, intent.oldest_inbox_row_id, intent.message_count
+            )
+            boundary_pull_service.mark_interrupt_fired(target.terminal_id)
+            logger.debug(
+                "f210 interrupt display-message terminal=%s count=%d oldest=%d",
                 target.terminal_id,
                 intent.message_count,
                 intent.oldest_inbox_row_id,
@@ -1144,9 +1243,32 @@ def _update_pending_indicators() -> None:
                 .all()
             )
 
+            # F210 D16: an ESCALATED obligation whose message is still undelivered
+            # keeps the indicator up. Escalation is the moment the message is most
+            # urgent; counting OPEN alone unset @cao_pending exactly then.
+            escalated_counts = (
+                db.query(
+                    DeliveryObligationModel.mailbox_id,
+                    func.count(DeliveryObligationModel.inbox_row_id),
+                )
+                .join(InboxModel, InboxModel.id == DeliveryObligationModel.inbox_row_id)
+                .join(MailboxModel, MailboxModel.id == DeliveryObligationModel.mailbox_id)
+                .filter(
+                    DeliveryObligationModel.state == "ESCALATED",
+                    InboxModel.status != "delivered",
+                    MailboxModel.consumed_through_id < DeliveryObligationModel.inbox_row_id,
+                )
+                .group_by(DeliveryObligationModel.mailbox_id)
+                .all()
+            )
+
+            merged: dict[str, int] = {}
+            for mailbox_id, count in list(pending_counts) + list(escalated_counts):
+                merged[mailbox_id] = merged.get(mailbox_id, 0) + count
+
             # Get all mailboxes with their terminals and sessions
             active_mailboxes = set()
-            for mailbox_id, count in pending_counts:
+            for mailbox_id, count in merged.items():
                 active_mailboxes.add(mailbox_id)
                 target = resolve_supervisor_target(mailbox_id, db)
                 if target.terminal_id and target.tmux_session:
@@ -1156,7 +1278,7 @@ def _update_pending_indicators() -> None:
                         count,
                     )
 
-            # Clear indicators for mailboxes with no OPEN obligations
+            # Clear indicators for mailboxes with no undelivered obligations
             # (get all mailboxes that HAD state but now have count=0)
             all_supervisor_mailboxes = (
                 db.query(MailboxModel).filter_by(role="supervisor").all()

@@ -127,6 +127,29 @@ def is_supervisor_mailbox_pull_terminal(terminal_id: str) -> bool:
         return True
 
 
+def is_supervisor_role_terminal(terminal_id: str, db: Any | None = None) -> bool:
+    """F210 D2: True when terminal_id is the current incarnation of a supervisor mailbox.
+
+    Same query shape as :func:`is_supervisor_mailbox_pull_terminal`, minus every
+    precondition that could re-arm composer injection against a supervisor pane:
+    ``supervisor.mailbox_pull`` (a config flag must not defeat the exemption) and
+    ``schema_version`` (a schema-mismatched supervisor is still a supervisor).
+    """
+
+    def _check(session: Any) -> bool:
+        mailbox: Any = (
+            session.query(MailboxModel).filter_by(current_terminal_id=terminal_id).one_or_none()
+        )
+        if mailbox is None:
+            return False
+        return bool(mailbox.role == "supervisor")
+
+    if db is not None:
+        return _check(db)
+    with SessionLocal() as session:
+        return _check(session)
+
+
 def get_current_supervisor_terminal_id() -> str | None:
     """F138: Return the terminal_id of the current live supervisor mailbox, or None.
 

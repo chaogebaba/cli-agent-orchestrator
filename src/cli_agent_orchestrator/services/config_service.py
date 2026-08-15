@@ -222,6 +222,8 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_DELIVERY_BASE_EJECTION_S": ("delivery.base_ejection_s", "float", 30.0),
     # FX193-A1: jitter config (delivery.jitter=off restores deterministic ladder)
     "CAO_DELIVERY_JITTER": ("delivery.jitter", "str", "on"),
+    # F210 D10: kill-switch for the whole rung2 send-keys nudge (hot-reloadable)
+    "CAO_DELIVERY_NUDGE_SENDKEYS_ENABLED": ("delivery.nudge_sendkeys_enabled", "bool", True),
 }
 
 # Reverse index: dotted path -> env var name, for get()'s env-precedence lookup.
@@ -497,6 +499,7 @@ _ALL_PATHS = sorted(
         "delivery.tick_s",
         "delivery.escalate_after_s",
         "delivery.interrupt_after_s",
+        "delivery.nudge_sendkeys_enabled",
         "delivery.base_ejection_s",
         "delivery.trace_retention_h",
         "delivery.jitter",
