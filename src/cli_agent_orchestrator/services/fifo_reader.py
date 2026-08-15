@@ -89,6 +89,35 @@ _AUTHORITY_UNSET = object()
 # D20: Maximum consecutive non-launching report failures before attention notification.
 CONFIRMED_GONE_REPORT_ATTENTION_ATTEMPTS = 5
 
+# D20/F229: Exact durable detail values from request_orphan_reconciliation.
+# Legacy exact strings returned directly:
+_F138_DURABLE_EXACT = frozenset(("job_already_exists", "reconciled", "abandoned"))
+# Prefixed incarnation_state values that are durable (F229: real return shape):
+_F138_DURABLE_STATES = frozenset(("reconciled", "abandoned"))
+
+
+def _f138_is_durable_detail(detail: str) -> bool:
+    """F229/D20: Return True if detail indicates a durable reconciliation outcome.
+
+    Matches legacy exact values AND the real 'incarnation_state=<state>' shape
+    returned by request_orphan_reconciliation when the incarnation is already
+    reconciled or abandoned.
+    """
+    if detail in _F138_DURABLE_EXACT:
+        return True
+    # Parse "incarnation_state=<value>" exactly (no substring match).
+    if detail.startswith("incarnation_state="):
+        state_value = detail[len("incarnation_state="):]
+        return state_value in _F138_DURABLE_STATES
+    return False
+
+
+def _f138_is_launching_detail(detail: str) -> bool:
+    """F229/D20: Return True if detail indicates a launching/retryable state."""
+    if detail == "launching":
+        return True
+    return detail == "incarnation_state=launching"
+
 
 class FifoManager:
     """Manages FIFO lifecycle: create named pipe, start reader thread, stop and cleanup.
@@ -559,8 +588,8 @@ class FifoManager:
                     logger.debug("f218_pipeline: terminal %s not in DB — skipping", terminal_id)
                     return
 
-                session_name = term_row.session_name
-                window_name = getattr(term_row, "window_name", None) or terminal_id
+                session_name = term_row.tmux_session
+                window_name = term_row.tmux_window or terminal_id
 
                 # Step 2: Classify scope via positive re-probe (D2)
                 from cli_agent_orchestrator.services.config_service import ConfigService
@@ -704,14 +733,14 @@ class FifoManager:
             )
             detail = result.detail or ""
             # D20.2: Classify result.
-            if result.created or detail in ("job_already_exists", "reconciled", "abandoned"):
+            if result.created or _f138_is_durable_detail(detail):
                 # Durable outcome — proceed to unenroll.
                 # Reset failure tracking on success.
                 with self._lock:
                     self._f138_report_failures.pop(terminal_id, None)
                     self._f138_attention_sent.pop(terminal_id, None)
                 return True
-            elif detail.startswith("incarnation_state=launching"):
+            elif _f138_is_launching_detail(detail):
                 # Retryable — retain enrollment, cap confirmed count at 2.
                 self._f138_probe_gone_count[terminal_id] = min(
                     self._f138_probe_gone_count.get(terminal_id, 0), 2
