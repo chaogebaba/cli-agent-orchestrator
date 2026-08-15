@@ -127,24 +127,17 @@ class TestM10ConfirmedGoneDedup:
 
 
 def _find_hook_path() -> Path:
-    """Locate f162-register-inbox.sh via parents walk (worktree-safe)."""
-    anchor = Path(__file__).resolve()
-    for parent in anchor.parents:
+    """Locate f162-register-inbox.sh via ROOT_REPO conftest helper (worktree-safe)."""
+    from test.conftest import ROOT_REPO
+    if ROOT_REPO is not None:
+        candidate = ROOT_REPO / ".claude" / "hooks" / "f162-register-inbox.sh"
+        if candidate.exists():
+            return candidate
+    # Direct walk fallback
+    for parent in Path(__file__).resolve().parents:
         candidate = parent / ".claude" / "hooks" / "f162-register-inbox.sh"
         if candidate.exists():
             return candidate
-    # Worktree fallback: git-common-dir points to main checkout's .git
-    try:
-        common = Path(subprocess.check_output(
-            ["git", "rev-parse", "--git-common-dir"],
-            cwd=anchor.parent, text=True,
-        ).strip())
-        # common = <root-repo>/cli-agent-orchestrator/.git → root repo = common.parents[1]
-        candidate = common.parents[1] / ".claude" / "hooks" / "f162-register-inbox.sh"
-        if candidate.exists():
-            return candidate
-    except Exception:
-        pass
     pytest.skip("f162-register-inbox.sh not found in any ancestor")
 
 

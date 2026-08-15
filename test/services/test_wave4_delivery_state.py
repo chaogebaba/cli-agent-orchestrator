@@ -974,27 +974,12 @@ def test_probe_15_prior_hit_suppression_precedes_every_open_kind():
 
 
 def test_probe_16_frozen_drain_sql_fixture_ratios():
-    # Find root repo containing orchestrator/blueprints/ — walk ancestors, then git-common-dir
-    root = None
-    for parent in Path(__file__).resolve().parents:
-        if (parent / "orchestrator" / "blueprints" / "wave4-drain-metric-fixture.sql").exists():
-            root = parent
-            break
-    if root is None:
-        # Worktree fallback: git-common-dir points to main checkout's .git
-        try:
-            common = Path(subprocess.check_output(
-                ["git", "rev-parse", "--git-common-dir"],
-                cwd=Path(__file__).resolve().parent, text=True,
-            ).strip())
-            # common = <root-repo>/cli-agent-orchestrator/.git → root repo = common.parents[1]
-            candidate = common.parents[1]
-            if (candidate / "orchestrator" / "blueprints" / "wave4-drain-metric-fixture.sql").exists():
-                root = candidate
-        except Exception:
-            pass
-    if root is None:
-        pytest.skip("wave4-drain-metric-fixture.sql not found in any ancestor's orchestrator/blueprints/")
+    from test.conftest import ROOT_REPO
+    if ROOT_REPO is None:
+        pytest.skip("root repo not found (worktree without .git context)")
+    root = ROOT_REPO
+    if not (root / "orchestrator" / "blueprints" / "wave4-drain-metric-fixture.sql").exists():
+        pytest.skip("wave4-drain-metric-fixture.sql not found in root repo orchestrator/blueprints/")
     command = [
         "sqlite3",
         "-cmd",
