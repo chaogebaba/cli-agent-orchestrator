@@ -458,8 +458,13 @@ class TestAC9UnreadablePane:
     @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata")
     @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.receiver_state_view.snapshot_view")
     @patch("cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message")
-    def test_no_baseline_no_alert(self, mock_create, mock_snapshot, mock_meta, mock_config):
-        """Pane unreadable throughout -> no fingerprint -> stays AWAITING_BASELINE -> no alert."""
+    @patch("cli_agent_orchestrator.services.stalled_callback_watchdog.logger")
+    def test_no_baseline_no_alert(self, mock_logger, mock_create, mock_snapshot, mock_meta, mock_config):
+        """Pane unreadable throughout -> no fingerprint -> stays AWAITING_BASELINE -> no alert.
+
+        S1 amendment: also asserts ZERO logger.exception calls during tick,
+        proving the last_progress_at-is-None guard prevents the outer fault path.
+        """
         svc = _make_watchdog()
         _setup_processing_worker(svc, processing_at=0.0)
         # Never call _fingerprint_with_tail -> last_np_fp stays None, last_progress_at stays None
@@ -470,6 +475,9 @@ class TestAC9UnreadablePane:
         # Tick well past grace — but no baseline means no alert
         svc.tick_no_progress(now=600.0)
         mock_create.assert_not_called()
+
+        # S1: guard must prevent any exception logging (kills M7 mutant)
+        mock_logger.exception.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
