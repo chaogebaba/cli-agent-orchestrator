@@ -211,6 +211,13 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
         "float",
         120.0,
     ),
+    # F228-b: processing-no-progress watchdog config paths (D8)
+    "CAO_SUPERVISOR_WATCHDOG_NO_PROGRESS": ("supervisor.watchdog.no_progress", "bool", True),
+    "CAO_SUPERVISOR_WATCHDOG_NO_PROGRESS_GRACE_S": (
+        "supervisor.watchdog.no_progress_grace_s",
+        "float",
+        300.0,
+    ),
     # FX191: convergent delivery config paths (D12)
     "CAO_DELIVERY_PHASE": ("delivery.phase", "str", "shadow"),
     "CAO_DELIVERY_TICK_S": ("delivery.tick_s", "float", 5.0),
@@ -502,6 +509,8 @@ _ALL_PATHS = sorted(
         "supervisor.doorbell",
         "supervisor.watchdog.quiescence",
         "supervisor.watchdog.quiescence_grace_s",
+        "supervisor.watchdog.no_progress",
+        "supervisor.watchdog.no_progress_grace_s",
         "delivery.phase",
         "delivery.tick_s",
         "delivery.escalate_after_s",
