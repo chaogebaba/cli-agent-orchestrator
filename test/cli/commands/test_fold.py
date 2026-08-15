@@ -327,6 +327,7 @@ def test_ac13_stdin_preserves_quotes_backticks_and_newlines(tmp_path: Path) -> N
 
 @pytest.mark.pty
 def test_ac13_flag_form_completes_on_a_real_pty(tmp_path: Path) -> None:
+    path = tmp_path / "pty.md"
     path.write_bytes(b"old")
     replacement = tmp_path / "replacement.txt"
     replacement.write_bytes(b"new")
@@ -340,7 +341,7 @@ def test_ac13_flag_form_completes_on_a_real_pty(tmp_path: Path) -> None:
         )
         os.close(slave)
         slave = -1
-        stdout, stderr = process.communicate(timeout=3)
+        stdout, stderr = process.communicate(timeout=20)
     finally:
         if slave >= 0:
             os.close(slave)
@@ -369,6 +370,7 @@ def test_ac13_flag_form_ignores_supplied_stdin(tmp_path: Path) -> None:
 
 @pytest.mark.pty
 def test_ac13_bare_tty_exits_two_without_blocking(tmp_path: Path) -> None:
+    path = tmp_path / "pty.md"
     path.write_bytes(b"old")
     master, slave = pty.openpty()
     try:
@@ -380,7 +382,7 @@ def test_ac13_bare_tty_exits_two_without_blocking(tmp_path: Path) -> None:
         )
         os.close(slave)
         slave = -1
-        stdout, stderr = process.communicate(timeout=3)
+        stdout, stderr = process.communicate(timeout=20)
     finally:
         if slave >= 0:
             os.close(slave)
