@@ -1105,7 +1105,7 @@ def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
             # FX191: settle delivery obligations for acked messages
             from cli_agent_orchestrator.clients.database import DeliveryObligationModel as _DObl
 
-            db.query(_DObl).filter(
+            _obligations_settled = db.query(_DObl).filter(
                 _DObl.inbox_row_id <= up_to_id,
                 _DObl.state == "OPEN",
                 _DObl.mailbox_id == _f178_mailbox_id,
@@ -1117,6 +1117,10 @@ def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
                 },
                 synchronize_session=False,
             )
+            # F193(a): surface obligation rowcount so ack settles obligations
+            # synchronously — stops the floor from re-ringing a busy supervisor
+            # whose consumption cursor already advanced.
+            settled_count += _obligations_settled
             db.commit()
             # FX193: disarm nudge on cursor advance (eager cancellation)
             try:
