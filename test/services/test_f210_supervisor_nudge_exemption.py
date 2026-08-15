@@ -615,6 +615,33 @@ class TestAC11KnobCannotReArmSupervisors:
         assert result.reason == "supervisor_role_exempt"
 
 
+class TestAC11bRoleProbeFailureIsFailClosed:
+    """AC11b (D1/D2): an unanswerable role probe reports "supervisor", not "worker"."""
+
+    def test_raising_role_query_still_exempts_the_supervisor_pane(self, supervisor):
+        with (
+            patch("cli_agent_orchestrator.clients.tmux.tmux_client.send_keys") as mock_send_keys,
+            patch(
+                "cli_agent_orchestrator.services.mailbox_service.is_supervisor_role_terminal",
+                side_effect=RuntimeError("role query unavailable"),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
+                return_value=None,
+            ),
+            provider_patch(empty_composer_provider()),
+            config_patch(),
+        ):
+            result = attempt_rung2(supervisor_target(), 7, oldest_age_s=200.0, is_escalation=True)
+
+        # Fail-open here types into the user's own pane: the probe result is
+        # unknown, so the only safe reading of it is "supervisor".
+        assert mock_send_keys.call_count == 0
+        assert result.delivered is False
+        assert result.decision == "defer"
+        assert result.reason == "supervisor_role_exempt"
+
+
 # ---------------------------------------------------------------------------
 # AC12: the unregistered supervisor keeps a persistent indicator
 # ---------------------------------------------------------------------------
