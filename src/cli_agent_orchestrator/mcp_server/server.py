@@ -3657,7 +3657,7 @@ async def workflow_list(
     """
     params: Dict[str, Any] = {"limit": limit}
     if isinstance(state, str):
-        params["state"] = state
+        params["state"] = state.strip().lower()
     try:
         response = cao_http.get(
             "/workflows/runs",
