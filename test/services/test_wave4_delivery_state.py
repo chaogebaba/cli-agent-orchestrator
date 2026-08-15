@@ -974,11 +974,31 @@ def test_probe_15_prior_hit_suppression_precedes_every_open_kind():
 
 
 def test_probe_16_frozen_drain_sql_fixture_ratios():
-    root = Path(__file__).parents[3]
+    # Find root repo containing orchestrator/blueprints/ — walk ancestors, then git-common-dir
+    root = None
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "orchestrator" / "blueprints" / "wave4-drain-metric-fixture.sql").exists():
+            root = parent
+            break
+    if root is None:
+        # Worktree fallback: git-common-dir points to main checkout's .git
+        try:
+            common = Path(subprocess.check_output(
+                ["git", "rev-parse", "--git-common-dir"],
+                cwd=Path(__file__).resolve().parent, text=True,
+            ).strip())
+            # common = <root-repo>/cli-agent-orchestrator/.git → root repo = common.parents[1]
+            candidate = common.parents[1]
+            if (candidate / "orchestrator" / "blueprints" / "wave4-drain-metric-fixture.sql").exists():
+                root = candidate
+        except Exception:
+            pass
+    if root is None:
+        pytest.skip("wave4-drain-metric-fixture.sql not found in any ancestor's orchestrator/blueprints/")
     command = [
         "sqlite3",
         "-cmd",
-        ".read blueprints/wave4-drain-metric-fixture.sql",
+        ".read orchestrator/blueprints/wave4-drain-metric-fixture.sql",
         "-cmd",
         ".parameter init",
         "-cmd",
@@ -986,7 +1006,7 @@ def test_probe_16_frozen_drain_sql_fixture_ratios():
         "-cmd",
         ".parameter set :end '2026-07-16T00:00:00Z'",
         ":memory:",
-        ".read blueprints/wave4-drain-metric.sql",
+        ".read orchestrator/blueprints/wave4-drain-metric.sql",
     ]
     output = subprocess.run(command, cwd=root, check=True, text=True, capture_output=True).stdout
     assert "claude_code|2|1|1|1|0|0.5|0.5|0.5|0.0" in output

@@ -122,82 +122,89 @@ class TestM10ConfirmedGoneDedup:
 
 
 # ---------------------------------------------------------------------------
-# M11: f162-register-inbox.sh hook selects by exact leadSessionId match only
+# M11: f162-register-inbox.sh hook selects by exact teamName key match only
 # ---------------------------------------------------------------------------
 
 
+def _find_hook_path() -> Path:
+    """Locate f162-register-inbox.sh via parents walk (worktree-safe)."""
+    anchor = Path(__file__).resolve()
+    for parent in anchor.parents:
+        candidate = parent / ".claude" / "hooks" / "f162-register-inbox.sh"
+        if candidate.exists():
+            return candidate
+    # Worktree fallback: git-common-dir points to main checkout's .git
+    try:
+        common = Path(subprocess.check_output(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=anchor.parent, text=True,
+        ).strip())
+        # common = <root-repo>/cli-agent-orchestrator/.git → root repo = common.parents[1]
+        candidate = common.parents[1] / ".claude" / "hooks" / "f162-register-inbox.sh"
+        if candidate.exists():
+            return candidate
+    except Exception:
+        pass
+    pytest.skip("f162-register-inbox.sh not found in any ancestor")
+
+
 class TestM11HookLeadSessionIdMatch:
-    """M11: The hook scans config.json for leadSessionId == own session id
-    and selects ONLY by exact match. An enumerate-by-recency mutant (picks
-    newest session-* dir) must fail this test.
+    """M11: The D9 hook scans subagent meta.json files for exact teamName key
+    match on the OWN session_id. An enumerate-by-recency mutant (picks newest
+    team dir by mtime) must fail this test.
     """
 
     def test_selects_by_lead_session_id_not_recency(self, tmp_path):
-        """Set up multiple session-* dirs under a fake $HOME; only one has
-        leadSessionId matching the hook's session_id. Assert it picks that one,
-        NOT the newest dir.
+        """Set up multiple project session dirs under a fake $HOME; only one has
+        a meta.json with a teamName. Create teams dirs with varying mtime.
+        Assert the hook picks the dir whose teamName matches (exact key), NOT
+        the newest teams/ dir by mtime.
         """
         fake_home = tmp_path / "fakehome"
-        teams_dir = fake_home / ".claude" / "teams"
-        teams_dir.mkdir(parents=True)
-
-        # Create three session dirs:
-        # 1. session-aaaaaaaa: leadSessionId matches, OLDEST mtime
-        # 2. session-bbbbbbbb: leadSessionId does NOT match, NEWEST mtime
-        # 3. session-cccccccc: leadSessionId does NOT match, MIDDLE mtime
 
         target_session_id = "aaaaaaaa-1111-2222-3333-444444444444"
 
-        dir_a = teams_dir / "session-aaaaaaaa"
-        dir_a.mkdir()
-        (dir_a / "config.json").write_text(json.dumps({
-            "leadSessionId": target_session_id,
+        # D9 hook scans: ~/.claude/projects/*/SESSION_ID/subagents/*.meta.json
+        project_dir = fake_home / ".claude" / "projects" / "myproject" / target_session_id / "subagents"
+        project_dir.mkdir(parents=True)
+        (project_dir / "agent1.meta.json").write_text(json.dumps({
             "teamName": "correct-team",
         }))
-        (dir_a / "inboxes").mkdir()
-        (dir_a / "inboxes" / "team-lead.json").write_text("[]")
-        # Set old mtime
-        os.utime(dir_a, (1000000000, 1000000000))
 
-        dir_b = teams_dir / "session-bbbbbbbb"
-        dir_b.mkdir()
-        (dir_b / "config.json").write_text(json.dumps({
-            "leadSessionId": "bbbbbbbb-5555-6666-7777-888888888888",
-            "teamName": "wrong-team-newest",
+        # A second project dir for a DIFFERENT session (should NOT be scanned)
+        other_session = "bbbbbbbb-5555-6666-7777-888888888888"
+        other_dir = fake_home / ".claude" / "projects" / "myproject" / other_session / "subagents"
+        other_dir.mkdir(parents=True)
+        (other_dir / "agent2.meta.json").write_text(json.dumps({
+            "teamName": "wrong-team",
         }))
-        (dir_b / "inboxes").mkdir()
-        (dir_b / "inboxes" / "team-lead.json").write_text("[]")
-        # Set newest mtime
-        os.utime(dir_b, (2000000000, 2000000000))
 
-        dir_c = teams_dir / "session-cccccccc"
-        dir_c.mkdir()
-        (dir_c / "config.json").write_text(json.dumps({
-            "leadSessionId": "cccccccc-9999-aaaa-bbbb-cccccccccccc",
-            "teamName": "wrong-team-middle",
-        }))
-        (dir_c / "inboxes").mkdir()
-        (dir_c / "inboxes" / "team-lead.json").write_text("[]")
+        # Create the teams directories — the hook will register
+        # ~/.claude/teams/<teamName>/inboxes/team-lead.json
+        correct_team_dir = fake_home / ".claude" / "teams" / "correct-team"
+        correct_team_dir.mkdir(parents=True)
+        (correct_team_dir / "inboxes").mkdir()
+        (correct_team_dir / "inboxes" / "team-lead.json").write_text("[]")
+        # Set OLDEST mtime on the correct team dir
+        os.utime(correct_team_dir, (1000000000, 1000000000))
 
-        # Hook script path
-        hook_path = Path(__file__).resolve().parents[3] / ".claude" / "hooks" / "f162-register-inbox.sh"
-        if not hook_path.exists():
-            # Fallback: try root repo
-            hook_path = Path("/home/chao/VScode_projects/cli-subagents/.claude/hooks/f162-register-inbox.sh")
+        wrong_team_dir = fake_home / ".claude" / "teams" / "wrong-team"
+        wrong_team_dir.mkdir(parents=True)
+        (wrong_team_dir / "inboxes").mkdir()
+        (wrong_team_dir / "inboxes" / "team-lead.json").write_text("[]")
+        # Set NEWEST mtime — a recency mutant would pick this
+        os.utime(wrong_team_dir, (2000000000, 2000000000))
 
-        assert hook_path.exists(), f"Hook not found at {hook_path}"
+        hook_path = _find_hook_path()
 
-        # Provide the session_id as stdin JSON (as SessionStart hook does)
         stdin_json = json.dumps({"session_id": target_session_id})
 
-        # Mock the curl call by intercepting it — use a wrapper script
         wrapper_script = tmp_path / "run_hook.sh"
         wrapper_script.write_text(f"""#!/usr/bin/env bash
 set -euo pipefail
 export HOME="{fake_home}"
 export CAO_TERMINAL_ID="test_terminal"
 export CAO_PORT="19999"
-# Override curl to capture the payload instead of making a real request
 export PATH="{tmp_path / 'bin'}:$PATH"
 echo '{stdin_json}' | bash "{hook_path}"
 """)
@@ -235,37 +242,29 @@ exit 0
         payload = json.loads(curl_capture.read_text())
         registered_path = payload.get("metadata", {}).get("cc_team_inbox_path", "")
 
-        # M11 assertion: must be the dir_a inbox (matched by leadSessionId),
-        # NOT dir_b (newest) or dir_c.
-        expected_path = str(dir_a / "inboxes" / "team-lead.json")
+        # M11 assertion: must be the correct-team inbox (matched by exact
+        # teamName key from OWN session's meta.json), NOT wrong-team (newest
+        # mtime). A recency mutant would pick wrong-team.
+        expected_path = str(correct_team_dir / "inboxes" / "team-lead.json")
         assert registered_path == expected_path, (
             f"Hook registered wrong path: {registered_path}\n"
-            f"Expected (by leadSessionId match): {expected_path}\n"
-            "M11 mutant (enumerate-by-recency) would pick session-bbbbbbbb instead."
+            f"Expected (by exact teamName match): {expected_path}\n"
+            "M11 mutant (enumerate-by-recency) would pick wrong-team instead."
         )
 
     def test_zero_matches_registers_nothing(self, tmp_path):
-        """When no config.json has a matching leadSessionId, the hook registers
-        nothing and warns to stderr."""
+        """When no meta.json has a teamName for the given session, the hook
+        registers nothing and warns to stderr."""
         fake_home = tmp_path / "fakehome"
-        teams_dir = fake_home / ".claude" / "teams"
-        teams_dir.mkdir(parents=True)
 
-        # One dir that does NOT match
-        dir_a = teams_dir / "session-aaaaaaaa"
-        dir_a.mkdir()
-        (dir_a / "config.json").write_text(json.dumps({
-            "leadSessionId": "aaaaaaaa-1111-2222-3333-444444444444",
-        }))
-        (dir_a / "inboxes").mkdir()
-        (dir_a / "inboxes" / "team-lead.json").write_text("[]")
-
-        # Hook uses a DIFFERENT session_id that matches nothing
+        # Session with NO meta.json files at all
         target_session_id = "zzzzzzzz-0000-0000-0000-000000000000"
-        stdin_json = json.dumps({"session_id": target_session_id})
+        # Create the projects dir structure but no meta.json
+        project_dir = fake_home / ".claude" / "projects" / "myproject" / target_session_id / "subagents"
+        project_dir.mkdir(parents=True)
 
-        hook_path = Path("/home/chao/VScode_projects/cli-subagents/.claude/hooks/f162-register-inbox.sh")
-        assert hook_path.exists()
+        stdin_json = json.dumps({"session_id": target_session_id})
+        hook_path = _find_hook_path()
 
         wrapper_script = tmp_path / "run_hook.sh"
         wrapper_script.write_text(f"""#!/usr/bin/env bash
@@ -300,9 +299,9 @@ exit 0
         )
 
         assert result.returncode == 0, f"Hook failed: {result.stderr}"
-        # Should NOT have called curl (no match → register nothing)
+        # Should NOT have called curl (no teamName match → register nothing)
         assert not curl_capture.exists(), (
-            f"Hook called curl despite zero leadSessionId matches. "
+            f"Hook called curl despite zero teamName matches. "
             f"Payload: {curl_capture.read_text() if curl_capture.exists() else 'N/A'}"
         )
         # Should have warned to stderr
@@ -312,27 +311,32 @@ exit 0
         )
 
     def test_multiple_matches_registers_nothing(self, tmp_path):
-        """When multiple config.json files have the same leadSessionId, the hook
-        registers nothing (ambiguous → mute is safer than wrong-inbox)."""
+        """When multiple meta.json files yield distinct teamNames for the same
+        session, the hook registers nothing (ambiguous → mute is safer than
+        wrong-inbox)."""
         fake_home = tmp_path / "fakehome"
-        teams_dir = fake_home / ".claude" / "teams"
-        teams_dir.mkdir(parents=True)
 
         target_session_id = "aaaaaaaa-1111-2222-3333-444444444444"
 
-        # Two dirs BOTH matching
-        for name in ["session-aaaaaaaa", "session-dddddddd"]:
-            d = teams_dir / name
-            d.mkdir()
-            (d / "config.json").write_text(json.dumps({
-                "leadSessionId": target_session_id,
-            }))
-            (d / "inboxes").mkdir()
-            (d / "inboxes" / "team-lead.json").write_text("[]")
+        # Two meta.json files with DIFFERENT teamNames under the same session
+        project_dir = fake_home / ".claude" / "projects" / "myproject" / target_session_id / "subagents"
+        project_dir.mkdir(parents=True)
+        (project_dir / "agent1.meta.json").write_text(json.dumps({
+            "teamName": "team-alpha",
+        }))
+        (project_dir / "agent2.meta.json").write_text(json.dumps({
+            "teamName": "team-beta",
+        }))
+
+        # Create both team dirs
+        for tn in ["team-alpha", "team-beta"]:
+            td = fake_home / ".claude" / "teams" / tn
+            td.mkdir(parents=True)
+            (td / "inboxes").mkdir()
+            (td / "inboxes" / "team-lead.json").write_text("[]")
 
         stdin_json = json.dumps({"session_id": target_session_id})
-        hook_path = Path("/home/chao/VScode_projects/cli-subagents/.claude/hooks/f162-register-inbox.sh")
-        assert hook_path.exists()
+        hook_path = _find_hook_path()
 
         wrapper_script = tmp_path / "run_hook.sh"
         wrapper_script.write_text(f"""#!/usr/bin/env bash
@@ -367,9 +371,9 @@ exit 0
         )
 
         assert result.returncode == 0, f"Hook failed: {result.stderr}"
-        # Should NOT have called curl (multiple matches → register nothing)
+        # Should NOT have called curl (multiple distinct teamNames → ambiguous)
         assert not curl_capture.exists(), (
-            f"Hook called curl despite multiple leadSessionId matches (ambiguous). "
+            f"Hook called curl despite multiple distinct teamNames (ambiguous). "
             f"Payload: {curl_capture.read_text() if curl_capture.exists() else 'N/A'}"
         )
 
