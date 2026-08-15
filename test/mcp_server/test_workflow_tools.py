@@ -435,6 +435,74 @@ class TestWorkflowList:
         assert out["ok"] is False
         assert "could not reach cao-server" in out["error"]
 
+    # --- F231: state normalization at MCP boundary ---
+
+    def test_state_lowercase_forwarded_unchanged(self):
+        """Lowercase state passes through after normalization."""
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server.requests.get",
+            return_value=_resp(200, []),
+        ) as get:
+            asyncio.run(workflow_list(state="running"))
+        assert get.call_args.kwargs["params"]["state"] == "running"
+
+    def test_state_uppercase_normalized_to_lowercase(self):
+        """Kills remove-lower mutant: UPPER → lower before HTTP call."""
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server.requests.get",
+            return_value=_resp(200, []),
+        ) as get:
+            asyncio.run(workflow_list(state="RUNNING"))
+        assert get.call_args.kwargs["params"]["state"] == "running"
+
+    def test_state_mixed_case_normalized_to_lowercase(self):
+        """Kills remove-lower mutant: MiXeD → lower before HTTP call."""
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server.requests.get",
+            return_value=_resp(200, []),
+        ) as get:
+            asyncio.run(workflow_list(state="Completed"))
+        assert get.call_args.kwargs["params"]["state"] == "completed"
+
+    def test_state_whitespace_stripped(self):
+        """Kills remove-strip mutant: leading/trailing spaces removed."""
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server.requests.get",
+            return_value=_resp(200, []),
+        ) as get:
+            asyncio.run(workflow_list(state="  failed  "))
+        assert get.call_args.kwargs["params"]["state"] == "failed"
+
+    def test_state_whitespace_and_case_combined(self):
+        """Kills normalize-after-request mutant: normalization happens before
+        the HTTP request, not after."""
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server.requests.get",
+            return_value=_resp(200, []),
+        ) as get:
+            asyncio.run(workflow_list(state=" CANCELLED "))
+        assert get.call_args.kwargs["params"]["state"] == "cancelled"
+
+    def test_state_none_omitted_from_params(self):
+        """None state must NOT appear in params (preserves omission contract)."""
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server.requests.get",
+            return_value=_resp(200, []),
+        ) as get:
+            asyncio.run(workflow_list(state=None))
+        assert "state" not in get.call_args.kwargs["params"]
+
+    def test_invalid_normalized_state_still_returns_error_envelope(self):
+        """Kills invalid-swallow mutant: an invalid value after normalization
+        still reaches REST and the 400 error propagates as ok=False envelope."""
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server.requests.get",
+            return_value=_resp(400, {"detail": "illegal run state filter 'bogus'"}),
+        ):
+            out = asyncio.run(workflow_list(state="  BOGUS  "))
+        assert out["ok"] is False
+        assert "illegal run state" in out["error"]
+
 
 class TestWorkflowWait:
     def test_converges_to_terminal_then_result(self):
