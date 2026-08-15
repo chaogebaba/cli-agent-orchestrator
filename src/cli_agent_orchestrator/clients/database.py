@@ -4308,6 +4308,27 @@ class _ReadyCommitVeto(RuntimeError):
     pass
 
 
+def _clear_progress_fence(fence_fn, terminal_id: str) -> None:
+    """Clear a SQLite progress handler, tolerating an already-closed handle.
+
+    A closed DBAPI connection cannot retain a callback, so clearing is a
+    no-op when the handle is already gone.  Only sqlite3.ProgrammingError
+    whose message proves the database/connection is closed is suppressed;
+    any other cleanup failure is re-raised so it stays visible.
+    """
+    import sqlite3
+
+    try:
+        fence_fn(None, 0)
+    except sqlite3.ProgrammingError as pe:
+        if "closed" not in str(pe).lower():
+            raise
+        logger.debug(
+            "progress_fence_clear_benign_closed terminal=%s",
+            terminal_id,
+        )
+
+
 def mark_terminal_init_ready(
     terminal_id: str,
     *,
@@ -4350,7 +4371,8 @@ def mark_terminal_init_ready(
             )
             if should_commit is not None and not should_commit():
                 if progress_fence is not None:
-                    progress_fence(None, 0)
+                    _clear_progress_fence(progress_fence, terminal_id)
+                    progress_fence = None
                 db.rollback()
                 return False
 
@@ -4366,7 +4388,8 @@ def mark_terminal_init_ready(
         except _ReadyCommitVeto:
             db.info.pop(_READY_COMMIT_CALLBACK, None)
             if progress_fence is not None:
-                progress_fence(None, 0)
+                _clear_progress_fence(progress_fence, terminal_id)
+                progress_fence = None
             db.rollback()
             return False
         except Exception as exc:
@@ -4382,7 +4405,7 @@ def mark_terminal_init_ready(
             if progress_fence is not None:
                 if decided:
                     try:
-                        progress_fence(None, 0)
+                        _clear_progress_fence(progress_fence, terminal_id)
                     except Exception:
                         logger.error(
                             "ready_commit_fence_cleanup_failed terminal=%s",
@@ -4391,7 +4414,8 @@ def mark_terminal_init_ready(
                         )
                     progress_fence = None
                 else:
-                    progress_fence(None, 0)
+                    _clear_progress_fence(progress_fence, terminal_id)
+                    progress_fence = None
             if decided:
                 try:
                     db.rollback()
@@ -4412,7 +4436,8 @@ def mark_terminal_init_ready(
             raise
         finally:
             if progress_fence is not None:
-                progress_fence(None, 0)
+                _clear_progress_fence(progress_fence, terminal_id)
+                progress_fence = None
             db.info.pop(_READY_COMMIT_CALLBACK, None)
         return changed
 
