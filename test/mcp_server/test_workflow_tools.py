@@ -498,8 +498,9 @@ class TestWorkflowList:
         with patch(
             "cli_agent_orchestrator.mcp_server.server.requests.get",
             return_value=_resp(400, {"detail": "illegal run state filter 'bogus'"}),
-        ):
+        ) as get:
             out = asyncio.run(workflow_list(state="  BOGUS  "))
+        assert get.call_args.kwargs["params"]["state"] == "bogus"
         assert out["ok"] is False
         assert "illegal run state" in out["error"]
 
