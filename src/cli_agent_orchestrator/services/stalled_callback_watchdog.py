@@ -149,6 +149,12 @@ class _Episode:
     resume_reserved_at: float | None = None
     auto_resume_attempted_at: str | None = None
     waiting_last_push_at: float | None = None
+    # F228-b: processing-no-progress tracker
+    processing_since: float | None = None       # monotonic time PROCESSING was accepted
+    last_np_fp: str | None = None               # last fingerprint taken WHILE processing
+    last_progress_at: float | None = None       # monotonic time of last FP change while processing
+    np_fired_key: tuple[int, float] | None = None  # (generation, processing_since) dedup
+    last_np_hint: str | None = None             # sanitized bounded last-line hint from filtered tail
 
 
 @dataclass(frozen=True)
@@ -282,6 +288,11 @@ class StalledCallbackWatchdog:
             # FX181 B1: the quiescence clock is shifted by the same pause span
             if episode is not None and episode.quiet_since is not None:
                 episode.quiet_since += elapsed
+            # F228-b D4: shift NP clocks by pause duration
+            if episode is not None and episode.processing_since is not None:
+                episode.processing_since += elapsed
+            if episode is not None and episode.last_progress_at is not None:
+                episode.last_progress_at += elapsed
             if episode is not None:
                 self._episodes[terminal_id] = episode
             self._paused.discard(terminal_id)
@@ -298,6 +309,11 @@ class StalledCallbackWatchdog:
                 episode.idle_since += elapsed
             if episode is not None and episode.quiet_since is not None:
                 episode.quiet_since += elapsed
+            # F228-b D4: shift NP clocks by pause duration
+            if episode is not None and episode.processing_since is not None:
+                episode.processing_since += elapsed
+            if episode is not None and episode.last_progress_at is not None:
+                episode.last_progress_at += elapsed
             if episode is not None:
                 self._episodes[terminal_id] = episode
             self._paused.discard(terminal_id)
@@ -437,6 +453,23 @@ class StalledCallbackWatchdog:
                     episode.quiet_since = now
             else:
                 episode.quiet_since = None
+            # F228-b: track PROCESSING entry/exit for no-progress clock
+            if status == TerminalStatus.PROCESSING:
+                if episode.processing_since is None:
+                    # New uninterrupted processing episode begins
+                    episode.processing_since = now
+                    episode.last_np_fp = None
+                    episode.last_progress_at = None
+                    episode.np_fired_key = None
+                    episode.last_np_hint = None
+            else:
+                # Any non-PROCESSING status ends the uninterrupted processing episode
+                if episode.processing_since is not None:
+                    episode.processing_since = None
+                    episode.last_np_fp = None
+                    episode.last_progress_at = None
+                    episode.np_fired_key = None
+                    episode.last_np_hint = None
             # F97: garbage-collect completed episodes
             self._gc_fired_episodes()
         # FX193 D2: notify nudge discipline of status change (outside lock)
@@ -544,7 +577,9 @@ class StalledCallbackWatchdog:
                 # armed. ERROR members carry quiet_since only (idle_since stays
                 # None so notify_due keeps its pre-FX181 semantics, AC3), and
                 # without this they had no anti-false-idle protection at all.
-                and (episode.idle_since is not None or episode.quiet_since is not None)
+                # F228-b B1: PROCESSING terminals included for NP fingerprint tracking.
+                and (episode.idle_since is not None or episode.quiet_since is not None
+                     or episode.processing_since is not None)
             ]
 
         if not terminal_ids:
@@ -586,7 +621,8 @@ class StalledCallbackWatchdog:
                     episode is None
                     or episode.callback_seen
                     or episode.fired
-                    or (episode.idle_since is None and episode.quiet_since is None)
+                    or (episode.idle_since is None and episode.quiet_since is None
+                        and episode.processing_since is None)
                 ):
                     continue
                 if episode.last_screen_fp is None:
@@ -602,6 +638,28 @@ class StalledCallbackWatchdog:
                     if episode.quiet_since is not None:
                         episode.quiet_since = now
                     episode.last_screen_fp = fingerprint
+
+                # F228-b: update no-progress fingerprint for PROCESSING terminals
+                if episode.processing_since is not None and episode.np_fired_key is None:
+                    # Capture sanitized hint from the filtered tail (same read, no extra I/O)
+                    hint_lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+                    raw_hint = hint_lines[-1] if hint_lines else ""
+                    # Sanitize: terminal text is untrusted
+                    sanitized_hint = raw_hint.replace('"', "'").replace('\n', ' ').replace('\r', ' ')
+                    sanitized_hint = ''.join(c if c.isprintable() else '?' for c in sanitized_hint)
+                    if len(sanitized_hint) > 80:
+                        sanitized_hint = sanitized_hint[:77] + "..."
+                    episode.last_np_hint = sanitized_hint if sanitized_hint else None
+
+                    if episode.last_np_fp is None:
+                        # First baseline (AWAITING_BASELINE -> CLOCK_RUNNING)
+                        episode.last_np_fp = fingerprint
+                        episode.last_progress_at = now
+                    elif episode.last_np_fp != fingerprint:
+                        # Progress: screen changed — reset stall clock
+                        episode.last_np_fp = fingerprint
+                        episode.last_progress_at = now
+                    # else: same fingerprint — clock keeps running (no-op)
 
     def _fresh_frame_decides_running(self, terminal_id: str) -> tuple[bool, str | None]:
         from cli_agent_orchestrator.backends.registry import get_backend
@@ -1704,6 +1762,132 @@ class StalledCallbackWatchdog:
                 exc_info=True,
             )
 
+    # ------------------------------------------------------------------
+    # F228-b: processing-no-progress watchdog
+    # ------------------------------------------------------------------
+
+    def tick_no_progress(self, now: float | None = None) -> None:
+        """F228-b: heuristic advisory for workers stuck at PROCESSING with no screen change."""
+        try:
+            self._tick_no_progress_inner(now)
+        except Exception:
+            logger.exception("tick_no_progress outer fault (fail-silent)")
+
+    def _tick_no_progress_inner(self, now: float | None = None) -> None:
+        from cli_agent_orchestrator.services.config_service import ConfigService
+
+        if not ConfigService.get("supervisor.watchdog.no_progress", True):
+            return
+
+        now = now if now is not None else time.monotonic()
+        grace = float(ConfigService.get("supervisor.watchdog.no_progress_grace_s", 300.0))
+        grace = max(60.0, min(3600.0, grace))
+
+        # Collect candidates: PROCESSING, baseline taken, stall >= grace, not fired
+        candidates: list[tuple[str, _Episode]] = []
+        with self._lock:
+            for terminal_id, episode in self._episodes.items():
+                if terminal_id in self._paused:
+                    continue
+                if episode.processing_since is None:
+                    continue
+                if episode.last_progress_at is None:
+                    continue  # no baseline yet (AWAITING_BASELINE)
+                if episode.np_fired_key is not None:
+                    continue  # already fired this processing episode
+                if now - episode.last_progress_at < grace:
+                    continue
+                candidates.append((terminal_id, episode))
+
+        if not candidates:
+            return
+
+        for terminal_id, episode in candidates:
+            try:
+                self._evaluate_no_progress(terminal_id, episode, now, grace)
+            except Exception:
+                logger.exception(
+                    "tick_no_progress per-terminal fault for %s (fail-silent)", terminal_id
+                )
+
+    def _evaluate_no_progress(
+        self, terminal_id: str, episode: _Episode, now: float, grace: float
+    ) -> None:
+        """D5 recheck + publish for a single terminal."""
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        # D5: recheck status immediately before publish
+        status = receiver_state_view.snapshot_view(
+            "watchdog.np_recheck",
+            terminal_id,
+            max_age_s=5.0,
+            none_behavior="watchdog",
+            monitor=status_monitor,
+        )
+        if status != TerminalStatus.PROCESSING:
+            # Status transitioned — clear NP state, no alert
+            with self._lock:
+                ep = self._episodes.get(terminal_id)
+                if ep is episode:
+                    ep.processing_since = None
+                    ep.last_np_fp = None
+                    ep.last_progress_at = None
+                    ep.np_fired_key = None
+                    ep.last_np_hint = None
+            return
+
+        # Confirm generation hasn't changed and episode is still candidate
+        with self._lock:
+            ep = self._episodes.get(terminal_id)
+            if ep is not episode:
+                return  # episode replaced
+            if ep.np_fired_key is not None:
+                return  # fired between candidacy and recheck
+            if ep.processing_since is None or ep.last_progress_at is None:
+                return  # cleared between candidacy and recheck
+            stall_generation = ep.generation
+            processing_since = ep.processing_since
+            last_progress_at = ep.last_progress_at
+            caller_id = ep.caller_id
+            profile = ep.profile
+            hint = ep.last_np_hint or "<none>"
+
+        # D7: check caller is alive
+        if get_terminal_metadata(caller_id) is None:
+            return  # dead caller — no one to alert
+
+        # Compose alert (D6)
+        processing_age = int(now - processing_since)
+        stall_age = int(now - last_progress_at)
+
+        message = (
+            f"[no-progress advisory] worker {profile}-{terminal_id} has been processing "
+            f"for {processing_age}s with no visible output change for {stall_age}s "
+            f"(gen={stall_generation}, last_visible=\"{hint}\").\n"
+            f"This is a HEURISTIC — a silent legitimate tool can produce a static screen.\n"
+            f"Check: peek_terminal {terminal_id} | If confirmed stuck: Ctrl-C or delete_terminal."
+        )
+
+        # D7: persist via create_routed_inbox_message (persists + signals delivery internally)
+        try:
+            from cli_agent_orchestrator.services.mailbox_service import create_routed_inbox_message
+
+            create_routed_inbox_message(
+                f"watchdog:no_progress:{terminal_id}", caller_id, message
+            )
+        except Exception:
+            # D2 ordering: fired key NOT set on persist failure — next tick retries
+            logger.warning(
+                "Failed to persist no-progress alert for %s", terminal_id, exc_info=True
+            )
+            return
+
+        # D2: set fired key ONLY after successful persist
+        with self._lock:
+            ep = self._episodes.get(terminal_id)
+            if ep is episode and ep.generation == stall_generation:
+                ep.np_fired_key = (stall_generation, processing_since)
+
     async def run(self, registry: PluginRegistry | None = None) -> None:
         from cli_agent_orchestrator.services import seam_parity
 
@@ -1730,6 +1914,7 @@ class StalledCallbackWatchdog:
                 await asyncio.to_thread(self.tick_waiting_inbox, registry)
                 await asyncio.to_thread(self.tick_ready_backlog, registry)
                 await asyncio.to_thread(self.tick_quiescence)
+                await asyncio.to_thread(self.tick_no_progress)
                 parity_now = self._parity_clock()
                 if parity_now >= next_parity_sweep:
                     next_parity_sweep = parity_now + 60.0
