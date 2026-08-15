@@ -970,11 +970,37 @@ class AutoResponder:
 
     @staticmethod
     def _find_supervisor(session_name: str) -> Optional[str]:
+        """F203 D19: Role-based supervisor identity resolver.
+
+        Returns the terminal_id of the supervisor-role terminal in the session.
+        Uses agent_profile (role marker) instead of the fragile provider-first
+        heuristic that breaks with multiple claude_code terminals (F196/F205).
+
+        Falls back to provider == "claude_code" only if no role-marked terminal
+        exists (backward compat for sessions created before role tagging).
+        """
         from cli_agent_orchestrator.clients.database import list_terminals_by_session
 
-        for terminal in list_terminals_by_session(session_name):
+        terminals = list_terminals_by_session(session_name)
+
+        # Primary: role-based lookup
+        supervisor_profiles = {"supervisor", "code_supervisor", "chao_supervisor"}
+        for terminal in terminals:
+            profile = terminal.get("agent_profile", "")
+            if profile in supervisor_profiles:
+                return terminal["id"]
+
+        # Fallback: first terminal with no caller_id and provider claude_code
+        # (a supervisor has no caller; workers always have one)
+        for terminal in terminals:
+            if terminal.get("caller_id") is None and terminal["provider"] == "claude_code":
+                return terminal["id"]
+
+        # Legacy fallback: first claude_code terminal
+        for terminal in terminals:
             if terminal["provider"] == "claude_code":
                 return terminal["id"]
+
         return None
 
     def _push(

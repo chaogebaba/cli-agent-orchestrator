@@ -1126,13 +1126,19 @@ class TestRegistryReader:
         assert len(records) == 1
 
     def test_skips_incomplete_records(self, sessions_dir):
-        """Records missing required fields are skipped."""
+        """Records missing truly required fields (sessionId or procStart) are skipped."""
         _make_registry_record(sessions_dir, 1234)
-        # Write a record missing messagingSocketPath
+        # D13: messagingSocketPath is now optional; only sessionId+procStart are required.
+        # A record with both sessionId and procStart but no messagingSocketPath is VALID.
         (sessions_dir / "5555.json").write_text(json.dumps({"sessionId": "x", "procStart": 1}))
         from cli_agent_orchestrator.services.cc_session_registry import read_registry
         records = read_registry(sessions_dir)
-        assert len(records) == 1
+        assert len(records) == 2  # Both records are valid now
+
+        # But a record truly missing sessionId should still be skipped
+        (sessions_dir / "6666.json").write_text(json.dumps({"procStart": 1}))
+        records = read_registry(sessions_dir)
+        assert len(records) == 2  # 6666 skipped — no sessionId
 
     def test_empty_dir_returns_empty(self, sessions_dir):
         from cli_agent_orchestrator.services.cc_session_registry import read_registry

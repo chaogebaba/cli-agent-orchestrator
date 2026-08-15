@@ -79,6 +79,9 @@ class _TerminalPullState:
     # Monotonic time when the interrupt fired (for D2 one-fire-per-E-window)
     interrupt_fired_at: float | None = None
 
+    # D6/S1: Monotonic time of last reset_boundary_counter call (oneshot re-arm)
+    last_reset_at: float | None = None
+
     # D4: Last pending count written to tmux (avoid churn)
     last_pending_count_written: int = 0
 
@@ -132,19 +135,29 @@ class BoundaryPullService:
         terminal_id: str,
         mailbox_id: str,
         oldest_obligation_age_s: float,
-        escalate_after_s: float,
+        interrupt_after_s: float,
+        *,
+        oldest_obligation_accepted_at: float | None = None,
     ) -> bool:
         """Check if the masked interrupt should fire for this terminal.
 
         Returns True if ALL conditions are met:
         - Interrupt state is ARMED (not MASKED, not IDLE)
-        - No consumption boundary has occurred for the entire E-window
-          (oldest obligation age >= E AND no boundary since obligation created)
-        - The obligation is still OPEN (not yet escalated)
+        - No consumption boundary has occurred since the oldest obligation was
+          accepted (D4: level-triggered accept-time comparison)
+        - The obligation age >= interrupt_after_s (D1/D3: fires before escalation)
 
-        D2: Per obligation, at most one interrupt per E-window. Multiple OPEN
-        obligations share one coalesced interrupt (D3) governed by the OLDEST
-        obligation's age.
+        D3/N1: Only interrupt_after_s is consulted here; escalate_after_s stays
+        on check_health_warning only.
+
+        Args:
+            terminal_id: Terminal to check.
+            mailbox_id: Current mailbox for the terminal.
+            oldest_obligation_age_s: Age of the oldest OPEN obligation.
+            interrupt_after_s: The interrupt-before-escalation timer (D1).
+            oldest_obligation_accepted_at: Monotonic time when the oldest obligation
+                was accepted.  Used for D4 level-triggered boundary comparison.
+                If None, any recorded boundary blocks (legacy behavior).
         """
         with self._lock:
             state = self._states.get(terminal_id)
@@ -164,15 +177,21 @@ class BoundaryPullService:
             if state.interrupt_state != InterruptState.ARMED:
                 return False
 
-            # D2: Fire only when no boundary for the E-window
-            # The E-window is the obligation's own age clock
+            # D4: Level-triggered boundary comparison — only a boundary at-or-after
+            # the oldest obligation's accepted_at blocks the interrupt.  A boundary
+            # recorded before the obligation was accepted does NOT block.
             if state.last_boundary_at is not None:
-                # A boundary occurred — no interrupt needed (pull is working)
-                return False
+                if oldest_obligation_accepted_at is not None:
+                    # Only block if boundary is at-or-after obligation acceptance
+                    if state.last_boundary_at >= oldest_obligation_accepted_at:
+                        return False
+                    # else: stale boundary, does not block
+                else:
+                    # Legacy path: any boundary blocks
+                    return False
 
-            # No boundary has occurred at all — check if obligation age >= E
-            # (the one case pull cannot reach: stuck thinking for >E seconds)
-            if oldest_obligation_age_s < escalate_after_s:
+            # D3/D1: Fire when obligation age >= interrupt_after_s
+            if oldest_obligation_age_s < interrupt_after_s:
                 return False
 
             return True
@@ -328,17 +347,36 @@ class BoundaryPullService:
         with self._lock:
             self._states.pop(terminal_id, None)
 
-    def reset_boundary_counter(self, terminal_id: str) -> None:
-        """Reset boundary counter when all obligations settle (new E-window)."""
+    def reset_boundary_counter(self, terminal_id: str) -> bool:
+        """D6/S1: Oneshot re-arm — called unconditionally on every pull-cycle exit.
+
+        Records last_reset_at on exit; returns True when last_boundary_at > last_reset_at
+        (i.e., a notify_boundary call landed between cycles), signaling the caller to
+        re-poll instead of arming into a lost notify.
+
+        Also clears boundary state and re-arms the interrupt from MASKED.
+        """
         with self._lock:
             state = self._states.get(terminal_id)
             if state is None:
-                return
+                return False
+
+            now = time.monotonic()
+            work_arrived = False
+
+            # S1: return True when a boundary arrived since the last reset
+            if state.last_boundary_at is not None:
+                if state.last_reset_at is None or state.last_boundary_at > state.last_reset_at:
+                    work_arrived = True
+
+            state.last_reset_at = now
             state.boundary_deliveries_observed = 0
             state.last_boundary_at = None
             state.interrupt_fired_at = None
             if state.interrupt_state == InterruptState.MASKED:
                 state.interrupt_state = InterruptState.ARMED
+
+            return work_arrived
 
     # ------------------------------------------------------------------
     # Introspection (for testing)
@@ -357,6 +395,7 @@ class BoundaryPullService:
                 boundary_deliveries_observed=state.boundary_deliveries_observed,
                 last_boundary_at=state.last_boundary_at,
                 interrupt_fired_at=state.interrupt_fired_at,
+                last_reset_at=state.last_reset_at,
                 last_pending_count_written=state.last_pending_count_written,
             )
 

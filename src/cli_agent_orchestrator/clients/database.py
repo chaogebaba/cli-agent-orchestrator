@@ -8561,6 +8561,15 @@ def commit_supervisor_callback_progress(
             if current_cursor is None:
                 current_cursor = 0
             if int(current_cursor) != expected_cursor:
+                # F203 D14/S2: monotonic advance fallback — if new_cursor >
+                # current_cursor, advance unconditionally even on CAS mismatch.
+                # This prevents the stall where the CAS guard rejects stale callers
+                # and no fallback writer exists.
+                if new_cursor > int(current_cursor):
+                    mailbox.callback_notified_through_id = new_cursor
+                    mailbox.updated_at = _utcnow()
+                    db.commit()
+                    return CallbackProgressResult(kind="advanced_monotonic", reason="cas_bypass_monotonic")
                 return CallbackProgressResult(kind="cas_mismatch", reason="cursor_mismatch")
 
             # Advance cursor (equal is valid for replay-only progress)

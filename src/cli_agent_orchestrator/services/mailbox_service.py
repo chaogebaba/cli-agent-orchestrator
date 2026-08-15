@@ -1125,6 +1125,17 @@ def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
                 nudge_discipline.on_cursor_advance(terminal_id, _f178_mailbox_id)
             except Exception:
                 pass
+            # F203 D5: boundary notify primary producer — on the reachable
+            # cursor-advance path (no episode precondition).  The watchdog
+            # secondary producer stays as a fallback.
+            try:
+                from cli_agent_orchestrator.services.boundary_pull_service import (
+                    boundary_pull_service,
+                )
+
+                boundary_pull_service.notify_boundary(terminal_id, _f178_mailbox_id)
+            except Exception:
+                pass
             # F123: re-evaluate supervisor-pending sentinel after ack settlement.
             if settled_count > 0:
                 from cli_agent_orchestrator.clients.database import (

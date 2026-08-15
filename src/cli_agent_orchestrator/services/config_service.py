@@ -216,6 +216,10 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_DELIVERY_TICK_S": ("delivery.tick_s", "float", 5.0),
     "CAO_DELIVERY_ESCALATE_AFTER_S": ("delivery.escalate_after_s", "float", 120.0),
     "CAO_DELIVERY_TRACE_RETENTION_H": ("delivery.trace_retention_h", "float", 168.0),
+    # F203: interrupt-before-escalation timer (D1); clamped at read time (D2)
+    "CAO_DELIVERY_INTERRUPT_AFTER_S": ("delivery.interrupt_after_s", "float", 30.0),
+    # F203 N2: transport ejection base duration
+    "CAO_DELIVERY_BASE_EJECTION_S": ("delivery.base_ejection_s", "float", 30.0),
     # FX193-A1: jitter config (delivery.jitter=off restores deterministic ladder)
     "CAO_DELIVERY_JITTER": ("delivery.jitter", "str", "on"),
 }
@@ -492,6 +496,8 @@ _ALL_PATHS = sorted(
         "delivery.phase",
         "delivery.tick_s",
         "delivery.escalate_after_s",
+        "delivery.interrupt_after_s",
+        "delivery.base_ejection_s",
         "delivery.trace_retention_h",
         "delivery.jitter",
     }

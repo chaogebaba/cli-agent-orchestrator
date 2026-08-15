@@ -237,6 +237,8 @@ class StalledCallbackWatchdog:
         self._dead_owed: dict[str, dict[str, _RetiredMember]] = {}
         # FX181 D5: dedup key per caller, set only after successful persist
         self._quiescence_last_fired: dict[str, tuple[tuple[str, int], ...]] = {}
+        # F203 D16: cadence gate — next_tick_due monotonic stamp
+        self._next_tick_due: float = 0.0
 
     @contextmanager
     def callback_insert_guard(self, sender_id: str):
@@ -468,8 +470,22 @@ class StalledCallbackWatchdog:
             del self._episodes[tid]
 
     def _fx191_convergence_tick(self) -> None:
-        """FX191 D5: convergence loop — first sibling tick in the run loop."""
+        """FX191 D5: convergence loop — first sibling tick in the run loop.
+
+        F203 D16: guarded by a monotonic next-due stamp of delivery.tick_s.
+        The run loop re-enters faster than tick_s because asyncio.wait_for
+        returns early on every status event — the loop is correct, the
+        unconditional tick call was the defect.
+        """
+        now = time.monotonic()
+        if now < self._next_tick_due:
+            return
         try:
+            from cli_agent_orchestrator.services.config_service import ConfigService
+
+            tick_s = float(ConfigService.get("delivery.tick_s", 5.0))
+            self._next_tick_due = now + tick_s
+
             from cli_agent_orchestrator.services.delivery_service import convergence_tick
 
             convergence_tick()
@@ -1216,6 +1232,28 @@ class StalledCallbackWatchdog:
 
             caller_id = metadata.get("caller_id")
             if not caller_id or caller_id == terminal_id:
+                # F203 D15: supervisor terminals have no caller_id by construction.
+                # Check if this is a supervisor-role terminal — if so, self-notify
+                # via the obligation path instead of refusing.
+                agent_profile = metadata.get("agent_profile", "")
+                if not caller_id and agent_profile in ("supervisor", "code_supervisor", "chao_supervisor"):
+                    # Supervisor self-notify: create obligation targeting own mailbox
+                    try:
+                        from cli_agent_orchestrator.services.delivery_service import (
+                            _create_self_notify_obligation,
+                        )
+                        _create_self_notify_obligation(terminal_id)
+                        logger.debug(
+                            "waiting-inbox watchdog: supervisor self-notify for %s",
+                            terminal_id,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "waiting-inbox watchdog: supervisor self-notify failed for %s",
+                            terminal_id, exc_info=True,
+                        )
+                    continue
+                # Worker with corrupt caller_id — original refusal behavior
                 logger.warning(
                     "waiting-inbox watchdog: refusing invalid caller for terminal %s",
                     terminal_id,
@@ -1313,6 +1351,25 @@ class StalledCallbackWatchdog:
 
                 caller_id = metadata.get("caller_id")
                 if not caller_id or caller_id == terminal_id:
+                    # F203 D15: supervisor self-notify for caller-less supervisor terminals
+                    agent_profile = metadata.get("agent_profile", "")
+                    if not caller_id and agent_profile in ("supervisor", "code_supervisor", "chao_supervisor"):
+                        try:
+                            from cli_agent_orchestrator.services.delivery_service import (
+                                _create_self_notify_obligation,
+                            )
+                            _create_self_notify_obligation(terminal_id)
+                            logger.debug(
+                                "ready-backlog watchdog: supervisor self-notify for %s",
+                                terminal_id,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "ready-backlog watchdog: supervisor self-notify failed for %s",
+                                terminal_id, exc_info=True,
+                            )
+                        continue
+                    # Worker with corrupt caller_id
                     logger.warning(
                         "ready-backlog watchdog: refusing invalid caller for terminal %s",
                         terminal_id,
