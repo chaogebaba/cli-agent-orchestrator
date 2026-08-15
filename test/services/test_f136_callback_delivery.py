@@ -1101,9 +1101,9 @@ class TestProductionPathSmoke:
             create_logical_inbox_message,
             _create_logical_inbox_message_inner,
         )
-        import inspect
-        wrapper_src = inspect.getsource(create_logical_inbox_message)
-        assert "_create_logical_inbox_message_inner" in wrapper_src
+        # Verify the wrapper delegates to the inner function via bytecode
+        # (immune to source-file-on-disk races under xdist/worktree resets).
+        assert "_create_logical_inbox_message_inner" in create_logical_inbox_message.__code__.co_names
 
     def test_create_routed_inbox_message_importable(self):
         """create_routed_inbox_message is importable and callable."""
