@@ -230,6 +230,88 @@ class TestH2EscalationDisplayMessage:
             ]
             assert len(display_calls) >= 1, "tmux display-message should fire on failed injection"
 
+    def test_display_message_on_supervisor_role_exempt(self, supervisor_f206):
+        """F210: the floor also consumes the supervisor exemption defer.
+
+        The exemption returns decision="defer" precisely so this floor still
+        fires (F210 D3); a "fail" decision would have changed the caller's
+        contract for every supervisor obligation.
+        """
+        db_factory = supervisor_f206
+        with db_factory() as db:
+            msg = InboxModel(
+                sender_id="worker02",
+                receiver_id="sup_f206",
+                logical_receiver_id="mb_f206",
+                message="test F210 exemption floor",
+                status=MessageStatus.PENDING.value,
+                orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+            )
+            db.add(msg)
+            db.flush()
+            obl = DeliveryObligationModel(
+                inbox_row_id=msg.id,
+                mailbox_id="mb_f206",
+                state="OPEN",
+                accepted_at=_utcnow() - timedelta(seconds=35),
+                first_attempt_at=_utcnow() - timedelta(seconds=34),
+                next_attempt_at=_utcnow() - timedelta(seconds=1),
+                attempts=6,
+            )
+            db.add(obl)
+            db.commit()
+            msg_id = msg.id
+
+        from cli_agent_orchestrator.services.delivery_service import (
+            DeliveryTarget,
+            LadderResult,
+            _escalate,
+        )
+
+        mock_subprocess = MagicMock()
+        mock_subprocess.return_value.returncode = 0
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.delivery_service.attempt_rung2"
+            ) as mock_rung2,
+            patch(
+                "cli_agent_orchestrator.services.delivery_service.resolve_supervisor_target"
+            ) as mock_resolve,
+            patch(
+                "cli_agent_orchestrator.services.delivery_service.subprocess.run",
+                mock_subprocess,
+            ),
+        ):
+            mock_resolve.return_value = DeliveryTarget(
+                terminal_id="sup_f206",
+                tmux_session="cao-test-f206",
+                tmux_window="supervisor",
+                cc_inbox_path=None,
+            )
+            mock_rung2.return_value = LadderResult(
+                delivered=False,
+                phase="transport_attempt",
+                decision="defer",
+                reason="supervisor_role_exempt",
+            )
+
+            with db_factory() as db:
+                obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg_id).one()
+                _escalate(db, obl, _utcnow(), 35.0)
+                db.commit()
+
+            display_calls = [
+                c for c in mock_subprocess.call_args_list
+                if any("display-message" in str(arg) for arg in c[0])
+            ]
+            assert len(display_calls) >= 1
+
+        with db_factory() as db:
+            obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg_id).one()
+            assert obl.state == "ESCALATED"
+            assert obl.terminal_reason == "supervisor_role_exempt"
+
 
 # ---------------------------------------------------------------------------
 # H3: Re-resolve ESCALATED obligations (reachability)
@@ -240,7 +322,13 @@ class TestH3ReresolveEscalated:
     """H3: _reresolve_escalated picks up ESCALATED obligations and retries."""
 
     def test_reresolve_delivers_when_draft_clears(self, supervisor_f206):
-        """ESCALATED obligation with cleared draft gets re-injected and settles ACKED."""
+        """ESCALATED obligation with cleared draft gets re-injected and settles ACKED.
+
+        F210: attempt_rung2 is stubbed here, so this remains a claim about
+        _reresolve_escalated's settle logic on a delivered rung2 — a result the
+        real rung now returns only for non-supervisor mailboxes (D1). The
+        supervisor re-resolve outcome is the display-message case below.
+        """
         db_factory = supervisor_f206
         now = _utcnow()
 

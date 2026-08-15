@@ -79,6 +79,48 @@ def supervisor_setup(fx191_db):
     return fx191_db
 
 
+@pytest.fixture
+def worker_setup(fx191_db):
+    """F210: a NON-supervisor mailbox + terminal.
+
+    Rung2 composer injection is exempt for supervisor-role terminals (F210 D1),
+    so every case whose claim is "the floor injects" has to address a mailbox
+    whose role is not "supervisor". Production creates obligations only for
+    supervisor mailboxes; the rung survives as a gated liveness reserve (D14),
+    and this fixture is how its behaviour stays under test.
+    """
+    with fx191_db() as db:
+        db.add(
+            TerminalModel(
+                id="wrk12345",
+                tmux_session="cao-test",
+                tmux_window="worker",
+                provider="claude_code",
+                agent_profile="worker",
+            )
+        )
+        db.add(
+            MailboxModel(
+                id="mb_test_wrk",
+                session_name="cao-test",
+                role="worker",
+                current_terminal_id="wrk12345",
+                generation=1,
+                consumed_through_id=0,
+                cc_inbox_path="/tmp/test-inbox/worker.json",
+            )
+        )
+        db.add(
+            MailboxIncarnationModel(
+                mailbox_id="mb_test_wrk",
+                generation=1,
+                terminal_id="wrk12345",
+            )
+        )
+        db.commit()
+    return fx191_db
+
+
 # ---------------------------------------------------------------------------
 # AC1: Obligation created atomically with message
 # ---------------------------------------------------------------------------
@@ -393,22 +435,28 @@ class TestAC6NoRegistry:
         assert result.decision == "defer"
         assert result.reason == "no_registry_records"
 
-    def test_rung2_delivers_without_registry(self, supervisor_setup):
+    def test_rung2_delivers_without_registry(self, worker_setup):
         from cli_agent_orchestrator.services.delivery_service import (
             DeliveryTarget,
             attempt_rung2,
         )
 
         target = DeliveryTarget(
-            terminal_id="sup12345",
+            terminal_id="wrk12345",
             tmux_session="cao-test",
-            tmux_window="supervisor",
+            tmux_window="worker",
             cc_inbox_path=None,
             has_registry=False,
         )
         with (
             patch(
                 "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
+                return_value=None,
+            ),
+            # F210 D8: no provider → the sink's authority re-read degrades to a
+            # no-op, leaving the pre-F210 single-capture gate as the only guard.
+            patch(
+                "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
                 return_value=None,
             ),
             patch(
@@ -427,7 +475,7 @@ class TestAC6NoRegistry:
 class TestAC7Rung2NoPreconditions:
     """AC7: Rung 2 works with no registry, no path, lower row_id, held delivery lock."""
 
-    def test_rung2_no_deliverability_gates(self, supervisor_setup):
+    def test_rung2_no_deliverability_gates(self, worker_setup):
         """Rung 2 only needs tmux_session + tmux_window."""
         from cli_agent_orchestrator.services.delivery_service import (
             DeliveryTarget,
@@ -435,15 +483,21 @@ class TestAC7Rung2NoPreconditions:
         )
 
         target = DeliveryTarget(
-            terminal_id="sup12345",
+            terminal_id="wrk12345",
             tmux_session="cao-test",
-            tmux_window="supervisor",
+            tmux_window="worker",
             cc_inbox_path=None,
             has_registry=False,
         )
         with (
             patch(
                 "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
+                return_value=None,
+            ),
+            # F210 D8: no provider → the sink's authority re-read degrades to a
+            # no-op, leaving the pre-F210 single-capture gate as the only guard.
+            patch(
+                "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
                 return_value=None,
             ),
             patch(
@@ -463,16 +517,16 @@ class TestAC7Rung2NoPreconditions:
 class TestAC8NudgeTextSafe:
     """AC8: Rung 2 text contains only CAO-computed integers, no worker content."""
 
-    def test_no_worker_content_in_nudge(self, supervisor_setup):
+    def test_no_worker_content_in_nudge(self, worker_setup):
         from cli_agent_orchestrator.services.delivery_service import (
             DeliveryTarget,
             attempt_rung2,
         )
 
         target = DeliveryTarget(
-            terminal_id="sup12345",
+            terminal_id="wrk12345",
             tmux_session="cao-test",
-            tmux_window="supervisor",
+            tmux_window="worker",
             cc_inbox_path=None,
             has_registry=False,
         )
@@ -480,6 +534,12 @@ class TestAC8NudgeTextSafe:
         with (
             patch(
                 "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
+                return_value=None,
+            ),
+            # F210 D8: no provider → the sink's authority re-read degrades to a
+            # no-op, leaving the pre-F210 single-capture gate as the only guard.
+            patch(
+                "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
                 return_value=None,
             ),
             patch(
@@ -498,6 +558,9 @@ class TestAC8NudgeTextSafe:
         # Shell metacharacters from a hypothetical message body should NOT appear
         assert "$(rm -rf /)" not in text
         assert "; drop table" not in text
+        # F210 D9: the payload carries no newline — submission comes from
+        # tmux_client.send_keys' own Enter, never from a newline in the buffer.
+        assert "\n" not in text
 
 
 # ---------------------------------------------------------------------------
@@ -1131,7 +1194,7 @@ class TestAC17AlarmDiscipline:
 class TestAC18ConfigCannotBreakDelivery:
     """AC18: With all hostile config values, the floor still delivers."""
 
-    def test_all_hostile_config(self, supervisor_setup):
+    def test_all_hostile_config(self, worker_setup):
         """Every flag disabled → floor (rung 2) still delivers."""
         from cli_agent_orchestrator.services.delivery_service import (
             DeliveryTarget,
@@ -1139,9 +1202,9 @@ class TestAC18ConfigCannotBreakDelivery:
         )
 
         target = DeliveryTarget(
-            terminal_id="sup12345",
+            terminal_id="wrk12345",
             tmux_session="cao-test",
-            tmux_window="supervisor",
+            tmux_window="worker",
             cc_inbox_path=None,  # no path
             has_registry=False,  # no registry
         )
@@ -1150,6 +1213,12 @@ class TestAC18ConfigCannotBreakDelivery:
         with (
             patch(
                 "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
+                return_value=None,
+            ),
+            # F210 D8: no provider → the sink's authority re-read degrades to a
+            # no-op, leaving the pre-F210 single-capture gate as the only guard.
+            patch(
+                "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
                 return_value=None,
             ),
             patch(
@@ -1175,22 +1244,28 @@ class TestS1Rung2FloorInvocation:
     Kills mutant M5 (drop floor rung call).
     """
 
-    def test_rung2_send_keys_called_when_rung1_demotes(self, supervisor_setup):
+    def test_rung2_send_keys_called_when_rung1_demotes(self, worker_setup):
         """When rung1 demotes (no registry), _drive_one_obligation arms
         nudge_discipline and _fire_due_nudges calls rung2 which invokes
-        tmux send_keys — proving the floor rung is wired (fx193 path)."""
-        db_factory = supervisor_setup
+        tmux send_keys — proving the floor rung is wired (fx193 path).
+
+        F210: addressed at a non-supervisor mailbox. On a supervisor mailbox the
+        rung defers by exemption (D1), so send_keys is no longer this mutant's
+        observable there; the supervisor-side wiring proof is AC3 in
+        test_f210_supervisor_nudge_exemption.py.
+        """
+        db_factory = worker_setup
         with db_factory() as db:
             # Remove registry so rung1 demotes with "no_registry_records"
             # (cc_inbox_path stays valid but doorbell won't fire without registry)
-            mailbox = db.query(MailboxModel).filter_by(id="mb_test_sup").one()
+            mailbox = db.query(MailboxModel).filter_by(id="mb_test_wrk").one()
             mailbox.cc_inbox_path = None  # also nullify path to ensure rung1 demotes
             db.commit()
 
             msg = InboxModel(
                 sender_id="worker01",
-                receiver_id="sup12345",
-                logical_receiver_id="mb_test_sup",
+                receiver_id="wrk12345",
+                logical_receiver_id="mb_test_wrk",
                 message="rung2 integration proof",
                 status=MessageStatus.PENDING.value,
                 orchestration_type=OrchestrationType.SEND_MESSAGE.value,
@@ -1199,7 +1274,7 @@ class TestS1Rung2FloorInvocation:
             db.flush()
             from cli_agent_orchestrator.services.delivery_service import create_obligation
 
-            create_obligation(msg.id, "mb_test_sup", db)
+            create_obligation(msg.id, "mb_test_wrk", db)
             db.commit()
 
             obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
@@ -1216,6 +1291,10 @@ class TestS1Rung2FloorInvocation:
                 ) as mock_send_keys,
                 patch(
                     "cli_agent_orchestrator.services.delivery_service._check_safety_gates",
+                    return_value=None,
+                ),
+                patch(
+                    "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
                     return_value=None,
                 ),
                 patch(
