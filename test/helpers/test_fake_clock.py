@@ -87,15 +87,58 @@ class TestFakeClockDaemonThreadPattern:
 
 
 class TestTimeoutFires:
-    """AC10: pytest-timeout kills tests that exceed the configured limit."""
+    """AC10: pytest-timeout kills tests that exceed the configured limit.
 
-    @pytest.mark.timeout(1)
+    The canary runs a subprocess pytest invocation that deliberately exceeds
+    its timeout, then asserts the subprocess exits non-zero with 'Timeout' in
+    output.  This avoids crashing the xdist worker (thread-method timeout +
+    xdist = worker crash) while still proving pytest-timeout is active.
+    """
+
     @pytest.mark.slow
     def test_timeout_fires(self):
-        """This test deliberately exceeds its timeout to prove pytest-timeout
-        works. It is expected to be killed with a timeout error.
+        """Prove pytest-timeout is installed and fires correctly.
 
-        Run with: uv run pytest test/helpers/test_fake_clock.py::TestTimeoutFires::test_timeout_fires -n 0
-        Verify: exits non-zero with 'Timeout' in output.
+        Spawns a subprocess pytest run of a helper that sleeps past its
+        1-second timeout.  Asserts the run exits non-zero and reports
+        'Timeout'.
         """
-        time.sleep(10)  # will be killed by pytest-timeout after 1s
+        import subprocess
+        import sys
+        import textwrap
+        import tempfile
+        import os
+
+        # Write a tiny test file that deliberately exceeds its timeout.
+        canary_src = textwrap.dedent("""\
+            import time
+            import pytest
+
+            @pytest.mark.timeout(1)
+            def test_canary_sleep():
+                time.sleep(10)
+        """)
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", prefix="test_canary_", delete=False
+        ) as f:
+            f.write(canary_src)
+            canary_path = f.name
+
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pytest", canary_path, "-n", "0", "-x", "--tb=short"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert result.returncode != 0, (
+                f"Expected non-zero exit but got {result.returncode};\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
+            combined = result.stdout + result.stderr
+            assert "Timeout" in combined, (
+                f"Expected 'Timeout' in output but not found;\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
+        finally:
+            os.unlink(canary_path)
