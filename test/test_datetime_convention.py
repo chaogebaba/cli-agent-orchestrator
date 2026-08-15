@@ -52,7 +52,7 @@ def test_no_utcnow_grep():
     violations = []
     for py in SRC.rglob("*.py"):
         for i, line in enumerate(py.read_text().splitlines(), 1):
-            if "utcnow()" in line and "def _utcnow" not in line and "_utcnow()" not in line:  # _utcnow() exclusion: EMPIRICAL S1 fold (43 FPs on the sanctioned helper)
+            if "utcnow()" in line and "def _utcnow" not in line and "_utcnow()" not in line and "clock.utcnow()" not in line:  # _utcnow() exclusion: EMPIRICAL S1 fold (43 FPs on the sanctioned helper); clock.utcnow(): D3 sim seam
                 if line.lstrip().startswith("#"):
                     continue
                 violations.append(f"{py.relative_to(SRC)}:{i}")

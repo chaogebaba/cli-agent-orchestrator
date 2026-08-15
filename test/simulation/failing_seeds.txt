@@ -1,0 +1,5 @@
+# DST failing-seed corpus (D18)
+# Format: <seed> <incident_tag> [comment]
+# Every seed here is replayed on every make test-quick run.
+# A seed whose bug has been fixed passes (retention = non-regression proof).
+206000 F206e user_draft_present+escalation dead-end

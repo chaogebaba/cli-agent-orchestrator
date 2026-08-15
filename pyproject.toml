@@ -342,6 +342,7 @@ markers = [
     "pty: marks tests that require a real PTY (fail under nested tmux/pty envs)",
     "smoke: marks fast smoke tests (< 200 ms solo, core happy-path coverage)",
     "local_fixture: marks tests depending on machine-local fixture files (xfail when absent)",
+    "sim: marks deterministic-simulation (DST) liveness harness tests",
 ]
 asyncio_mode = "strict"
 testpaths = ["test"]
