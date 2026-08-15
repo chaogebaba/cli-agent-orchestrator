@@ -8,29 +8,15 @@ from pathlib import Path
 import pytest
 
 
-def _find_observer_script() -> Path:
-    for root in Path(__file__).resolve().parents:
-        script = root / "probes" / "base-refresh-observer.py"
-        if script.is_file():
-            return script
-    # Worktree fallback: git-common-dir points to main checkout's .git
-    try:
-        import subprocess as _sp
-        common = Path(_sp.check_output(
-            ["git", "rev-parse", "--git-common-dir"],
-            cwd=Path(__file__).resolve().parent, text=True,
-            stderr=_sp.DEVNULL,
-        ).strip())
-        # common = <root-repo>/cli-agent-orchestrator/.git → root repo = common.parents[1]
-        script = common.parents[1] / "probes" / "base-refresh-observer.py"
-        if script.is_file():
-            return script
-    except Exception:
-        pass
-    raise RuntimeError("base-refresh-observer.py not found in repository ancestors")
+from test.conftest import ROOT_REPO
 
+if ROOT_REPO is None:
+    pytest.skip("root repo not found (worktree without .git context)", allow_module_level=True)
 
-SCRIPT = _find_observer_script()
+SCRIPT = ROOT_REPO / "probes" / "base-refresh-observer.py"
+if not SCRIPT.is_file():
+    pytest.skip("base-refresh-observer.py not found in root repo", allow_module_level=True)
+
 TOKEN = "V2-ANSWER-TOKEN"
 
 
