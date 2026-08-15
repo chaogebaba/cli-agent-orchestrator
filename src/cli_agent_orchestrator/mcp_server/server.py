@@ -2014,7 +2014,7 @@ def _list_messages_impl(
     if after_id is not None:
         params["after_id"] = after_id
     if status is not None:
-        params["status"] = status
+        params["status"] = status.strip().lower()
     if generation is not None:
         params["generation"] = generation
     if original_receiver_id is not None:
