@@ -1868,17 +1868,39 @@ class TestClaudeCodeProviderEffortFlag:
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_real_seed_applies_design_reviewer_effort(self, mock_load, tmp_path, monkeypatch):
-        outer_template = Path(__file__).resolve().parents[3] / "providers.toml.default"
+        # Find providers.toml.default: walk ancestors, then try git-common-dir
+        outer_template = None
+        for parent in Path(__file__).resolve().parents:
+            candidate = parent / "providers.toml.default"
+            if candidate.exists():
+                outer_template = candidate
+                break
+        if outer_template is None:
+            # Worktree fallback: git-common-dir points to main checkout's .git
+            import subprocess as _sp
+            try:
+                common = Path(_sp.check_output(
+                    ["git", "rev-parse", "--git-common-dir"],
+                    cwd=Path(__file__).resolve().parent, text=True,
+                ).strip())
+                # common = <root-repo>/cli-agent-orchestrator/.git → root repo = common.parents[1]
+                candidate = common.parents[1] / "providers.toml.default"
+                if candidate.exists():
+                    outer_template = candidate
+            except Exception:
+                pass
+        if outer_template is None:
+            pytest.skip("providers.toml.default not found (worktree or ancestor)")
         defaults = tmp_path / "providers.toml"
         shutil.copyfile(outer_template, defaults)
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.settings_service.PROVIDER_DEFAULTS_FILE",
             defaults,
         )
-        mock_load.return_value = self._profile(name="design_reviewer")
+        mock_load.return_value = self._profile(name="claude_design_reviewer")
 
         args = shlex.split(
-            ClaudeCodeProvider("tid", "sess", "win", "design_reviewer")._build_claude_command()
+            ClaudeCodeProvider("tid", "sess", "win", "claude_design_reviewer")._build_claude_command()
         )
 
         assert args[args.index("--effort") + 1] == "high"
