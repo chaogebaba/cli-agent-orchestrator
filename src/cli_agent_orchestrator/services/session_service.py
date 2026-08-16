@@ -230,11 +230,10 @@ async def create_session(
             )
         except Exception as cause:
             try:
+                from cli_agent_orchestrator.services.terminal_service import delete_terminal
+
                 deleted = await asyncio.to_thread(
-                    __import__(
-                        "cli_agent_orchestrator.services.terminal_service",
-                        fromlist=["delete_terminal"],
-                    ).delete_terminal,
+                    delete_terminal,
                     terminal.id,
                     registry,
                 )
@@ -394,15 +393,30 @@ def delete_session(
         tokens = {token.terminal_id: token for token in leases}
         for terminal in terminals:
             try:
-                terminal_service._delete_terminal_under_lease(
+                result_or_false = terminal_service._delete_terminal_under_lease(
                     terminal["id"], tokens[terminal["id"]], registry=registry
                 )
+                # Deferred cleanup: provider returned False, row retained
+                if result_or_false is False or (
+                    isinstance(result_or_false, dict) and not result_or_false.get("terminal_deleted", True)
+                ):
+                    result["errors"].append({
+                        "terminal_id": terminal["id"],
+                        "error": "cleanup deferred; retry delete_session",
+                    })
             except Exception as e:
                 if str(e) == "resume_in_progress":
                     raise
                 logger.warning(f"Failed to cleanup terminal {terminal['id']}: {e}")
 
-        finalize_session(session_name, registry)
+        if not result["errors"]:
+            finalize_session(session_name, registry)
+        else:
+            # Kill the tmux session even if cleanup is deferred — this stops
+            # the processes so a subsequent retry can complete the cleanup.
+            backend = get_backend()
+            if backend.session_exists(session_name):
+                backend.kill_session(session_name)
 
         for token in reversed(leases):
             release_rebind_lease(token)
@@ -415,8 +429,11 @@ def delete_session(
         release_session_lifecycle_lease(lifecycle_lease)
         lifecycle_lease = None
 
-        result["deleted"].append(session_name)
-        logger.info(f"Deleted session: {session_name}")
+        if not result["errors"]:
+            result["deleted"].append(session_name)
+            logger.info(f"Deleted session: {session_name}")
+        else:
+            logger.warning(f"Session {session_name} has deferred cleanups; not fully deleted")
         return result
 
     except Exception as e:

@@ -586,6 +586,7 @@ async def run_agent_step(
             if cancel_signal is not None and cancel_signal.is_set():
                 cleanup = True
                 raise StepCancelledError(terminal_id=terminal_id) from exc
+            cleanup = True
             raise
 
         cleanup = True

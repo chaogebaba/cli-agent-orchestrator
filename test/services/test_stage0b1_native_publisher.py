@@ -182,6 +182,9 @@ class _Provider:
         self._done_first_detected = snapshot["done_first_detected"]
         self._idle_first_detected = snapshot["idle_first_detected"]
 
+    def mark_input_received(self):
+        self._task_dispatched = True
+
 
 @pytest.fixture
 def native_monitor(monkeypatch):
@@ -301,7 +304,7 @@ def test_send_failure_aborts_dispatch_and_restores_all_provider_flush_fields(
     monkeypatch.setattr(terminal_service, "update_last_active", lambda _terminal: None)
     monkeypatch.setattr(monitor, "get_status", lambda _terminal: TerminalStatus.IDLE)
     monkeypatch.setattr(monitor, "notify_input_sent", lambda _terminal: None)
-    monkeypatch.setattr(monitor, "clear_rolling_buffer", lambda _terminal: None)
+    monkeypatch.setattr(monitor, "clear_rolling_buffer", lambda _terminal, _provider=None: None)
 
     try:
         with pytest.raises(RuntimeError, match="backend send failed"):

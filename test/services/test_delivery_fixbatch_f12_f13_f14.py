@@ -100,7 +100,7 @@ def _terminal_send(
     monkeypatch.setattr(draft_guard.status_monitor, "get_rendered_screen", lambda _tid: None)
     monkeypatch.setattr(terminal_service.status_monitor, "notify_input_sent", lambda _tid: None)
     monkeypatch.setattr(
-        terminal_service.status_monitor, "clear_rolling_buffer", lambda _tid: None
+        terminal_service.status_monitor, "clear_rolling_buffer", lambda _tid, _p=None: None
     )
     monkeypatch.setattr(
         terminal_service.status_monitor,

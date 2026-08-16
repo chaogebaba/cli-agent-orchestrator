@@ -107,19 +107,23 @@ class TestDeleteTerminal:
     def test_refuses_ready_base_owner(self, mock_delete):
         error = requests.HTTPError("409")
         error.response = MagicMock(status_code=409)
+        error.response.json.return_value = {"detail": "ready_base owner; delete with force=true"}
         mock_delete.return_value.raise_for_status.side_effect = error
         result = delete_terminal("t1")
         assert result["success"] is False
         assert "Failed" in result["message"]
+        assert "ready_base" in result["message"]
 
     @patch("cli_agent_orchestrator.mcp_server.server.requests.delete")
     def test_refuses_protected_profile(self, mock_delete):
         error = requests.HTTPError("409")
         error.response = MagicMock(status_code=409)
+        error.response.json.return_value = {"detail": "protected profile; delete with force=true"}
         mock_delete.return_value.raise_for_status.side_effect = error
         result = delete_terminal("t1")
         assert result["success"] is False
         assert "Failed" in result["message"]
+        assert "protected" in result["message"]
 
     @patch("cli_agent_orchestrator.mcp_server.server.requests.delete")
     def test_force_overrides_protection(self, mock_delete):
@@ -165,6 +169,22 @@ class TestDeleteTerminal:
 
         assert result["success"] is True
         assert mock_delete.call_args.kwargs["params"] == {"force": False, "orphan": True}
+
+    def test_deferred_cleanup_returns_retryable_failure(self):
+        with patch("cli_agent_orchestrator.mcp_server.server.requests.delete") as mock_delete:
+            mock_delete.return_value.raise_for_status.return_value = None
+            mock_delete.return_value.json.return_value = {"success": False}
+            result = delete_terminal("t1")
+        assert result["success"] is False
+        assert "retry" in result["message"]
+
+    def test_deferred_cleanup_conflict_status_returns_retryable_failure(self):
+        with patch("cli_agent_orchestrator.mcp_server.server.requests.delete") as mock_delete:
+            mock_delete.return_value.status_code = 409
+            result = delete_terminal("t1")
+        assert result["success"] is False
+        assert "retry" in result["message"]
+        mock_delete.return_value.raise_for_status.assert_not_called()
 
     def test_not_found_returns_false(self):
         with patch("cli_agent_orchestrator.mcp_server.server.requests.delete") as mock_delete:

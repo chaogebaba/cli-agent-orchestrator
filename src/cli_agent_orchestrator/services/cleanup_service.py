@@ -25,6 +25,8 @@ from cli_agent_orchestrator.constants import (
     RETENTION_DAYS,
     TERMINAL_LOG_DIR,
 )
+from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.memory_format import parse_index_entry
 from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -50,13 +52,13 @@ def cleanup_old_data():
                 )
                 .all()
             )
-
             # D10+D14 (F202): pane liveness RESETS the idle clock — a live pane
             # is never reclaimed by idle-age retention alone, but a dead one still is.
             from cli_agent_orchestrator.backends.registry import get_backend
 
             backend = get_backend()
             reclaimable = []
+            retained_terminal_ids: set[str] = set()
             for terminal in old_terminals:
                 liveness = backend.window_liveness(terminal.tmux_session, terminal.tmux_window)
                 if liveness == "live":
@@ -76,6 +78,17 @@ def cleanup_old_data():
             for terminal in reclaimable:
                 fifo_manager.stop_reader(terminal.id)
                 status_monitor.clear_terminal(terminal.id)
+                # A stale Grok terminal can still own a private GROK_HOME. An
+                # explicit deferred cleanup is its retry handle, so retention
+                # housekeeping must not bulk-delete that row underneath it.
+                if (
+                    getattr(terminal, "provider", None) == ProviderType.GROK_CLI.value
+                    and provider_manager.cleanup_provider(terminal.id) is False
+                ):
+                    retained_terminal_ids.add(terminal.id)
+                    logger.warning(
+                        "Retaining stale Grok terminal %s while cleanup is deferred", terminal.id
+                    )
             skipped = (
                 db.query(TerminalModel)
                 .filter(
@@ -90,6 +103,7 @@ def cleanup_old_data():
                 preserve_warm_intent=False,
             )["terminal_deleted"]
             for terminal in reclaimable
+            if terminal.id not in retained_terminal_ids
         )
         logger.info(f"Deleted {deleted_terminals} old terminals from database")
         if skipped:

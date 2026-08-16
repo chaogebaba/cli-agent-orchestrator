@@ -196,7 +196,7 @@ def test_send_input_default_does_not_defer_on_dialog(monkeypatch, tmp_path):
     monkeypatch.setattr(terminal_service, "update_last_active", lambda _: None)
     monkeypatch.setattr(terminal_service.status_monitor, "notify_input_sent", lambda _: None)
     monkeypatch.setattr(
-        terminal_service.status_monitor, "clear_rolling_buffer", lambda _: None
+        terminal_service.status_monitor, "clear_rolling_buffer", lambda _tid, _p=None: None
     )
 
     with pytest.raises(draft_guard.DeliveryDeferredError):

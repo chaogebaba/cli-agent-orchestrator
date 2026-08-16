@@ -73,6 +73,7 @@ dependencies = [
     # Markdown parser used by the repository-local link validator.
     "markdown-it-py>=4.0.0",
     # not just a dev dependency — or every `cao` command would fail to import.
+    "psutil>=5.9.0,<7",
 ]
 
 [project.optional-dependencies]
@@ -310,6 +311,7 @@ dev = [
     "opentelemetry-exporter-otlp-proto-grpc>=1.27.0",
     "pytest-timeout>=2.3.1",
     "pytest-repeat>=0.9.3",
+    "types-psutil>=5.9.0",
 ]
 
 [tool.black]

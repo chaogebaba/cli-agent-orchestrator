@@ -274,8 +274,8 @@ async def execute_flow(name: str) -> bool:
 
         # Launch session
         session_name = f"cao-flow-{flow.name}"
+        terminals = list_terminals_by_session(session_name)
         if get_backend().session_exists(session_name):
-            terminals = list_terminals_by_session(session_name)
             # Only check the first (conductor) terminal for busy status.
             # Worker terminals spawned by the conductor may have stale status
             # after /exit and should not block flow recycling.
@@ -287,7 +287,6 @@ async def execute_flow(name: str) -> bool:
 
             await terminal_service.quiesce_deferred_terminals(terminals)
             for t in terminals:
-                provider_manager.cleanup_provider(t["id"])
                 # Tear down the event-driven pipeline for each recycled terminal:
                 # stop the FIFO reader thread (and unlink its *.fifo file) and clear
                 # the StatusMonitor buffers. Without this, repeated flow runs leak
@@ -300,9 +299,36 @@ async def execute_flow(name: str) -> bool:
                     status_monitor.clear_terminal(t["id"])
                 except Exception as e:
                     logger.warning(f"Failed to clear status buffers for {t['id']}: {e}")
+            get_backend().kill_session(session_name)
+            # A provider's private state must outlive the process that owns
+            # it.  Grok cleanup confirms any escaped updater has stopped
+            # before recursively deleting its private GROK_HOME.
+            cleanup_complete = True
+            for t in terminals:
+                if provider_manager.cleanup_provider(t["id"]) is False:
+                    cleanup_complete = False
+            if not cleanup_complete:
+                logger.warning(
+                    "Flow %s recycling cleanup deferred; retaining terminal metadata for retry",
+                    name,
+                )
+                return False
             for terminal in terminals:
                 terminal_service._delete_terminal_core(terminal["id"])
-            get_backend().kill_session(session_name)
+        elif terminals:
+            # Session vanished but retained terminal rows exist (from a prior
+            # deferred Grok cleanup). Retry cleanup before recreating.
+            cleanup_complete = True
+            for t in terminals:
+                if provider_manager.cleanup_provider(t["id"]) is False:
+                    cleanup_complete = False
+            if not cleanup_complete:
+                logger.warning("Flow %s has retained terminal cleanup; deferring next run", name)
+                return False
+            from cli_agent_orchestrator.services import terminal_service as ts_mod
+
+            for terminal in terminals:
+                ts_mod._delete_terminal_core(terminal["id"])
         from cli_agent_orchestrator.services.terminal_service import seed_resume_bootstrap
 
         fork_context = await seed_resume_bootstrap(flow.agent_profile, flow.provider, os.getcwd())

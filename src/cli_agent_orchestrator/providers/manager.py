@@ -217,6 +217,16 @@ class ProviderManager:
                     model=model,
                     skill_prompt=skill_prompt,
                 )
+            elif provider_type == ProviderType.GROK_CLI.value:
+                provider = GrokCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                    model=model,
+                )
             # --- Credentials-free mock provider (test/CI infrastructure) ---
             elif provider_type == ProviderType.MOCK_CLI.value:
                 provider = MockCliProvider(
@@ -308,13 +318,25 @@ class ProviderManager:
         logger.info(f"Created provider on-demand for terminal {terminal_id}")
         return provider
 
-    def cleanup_provider(self, terminal_id: str) -> None:
-        """Cleanup provider and remove from map (used when terminal is deleted)."""
+    def cleanup_provider(self, terminal_id: str) -> bool:
+        """Cleanup a provider, retaining retryable Grok state on failure.
+
+        Grok's private home can only be deleted after its escaped updater has
+        been positively stopped or ruled out.  A ``False`` return therefore
+        deliberately keeps the map entry (and lets the service keep DB
+        metadata) so a later lifecycle retry does not lose the only route to
+        that deterministic home.
+        """
         try:
             with self._lock:
-                provider = self._providers.pop(terminal_id, None)
+                provider = self._providers.get(terminal_id)
             if provider:
-                provider.cleanup()
+                cleanup_result = provider.cleanup()
+                if cleanup_result is False:
+                    logger.warning("Cleanup deferred for terminal: %s", terminal_id)
+                    return False
+                with self._lock:
+                    self._providers.pop(terminal_id, None)
                 from cli_agent_orchestrator.utils.persona_context import (
                     PersonaPlan,
                     reap_persona_generations,
@@ -323,8 +345,29 @@ class ProviderManager:
                 if isinstance(getattr(provider, "_persona_plan", None), PersonaPlan):
                     reap_persona_generations(terminal_id)
                 logger.info(f"Cleaned up provider for terminal: {terminal_id}")
+                return True
+
+            # Provider instances are in-memory only.  After cao-server
+            # restarts terminal deletion still has database metadata, but no
+            # provider map entry.  Grok has a deterministic, private on-disk
+            # home containing generated MCP config, so instantiate the small
+            # cleanup-only adapter rather than leaking that directory.
+            metadata = get_terminal_metadata(terminal_id)
+            if metadata and metadata.get("provider") == ProviderType.GROK_CLI.value:
+                cleanup_provider = GrokCliProvider(
+                    terminal_id,
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    metadata.get("agent_profile"),
+                )
+                if cleanup_provider.cleanup() is False:
+                    logger.warning("Cleanup deferred for restored Grok provider: %s", terminal_id)
+                    return False
+                logger.info("Cleaned up restored Grok provider for terminal: %s", terminal_id)
+            return True
         except Exception as e:
             logger.error(f"Failed to cleanup provider for terminal {terminal_id}: {e}")
+            return False
 
     def list_providers(self) -> Dict[str, str]:
         """List all active providers (for debugging)."""

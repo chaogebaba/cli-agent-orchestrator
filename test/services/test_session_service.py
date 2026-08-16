@@ -653,10 +653,29 @@ class TestDeleteSession:
     @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_under_lease")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
-    def test_delete_session_cleans_up_each_terminal(
+    def test_delete_session_reports_deferred_terminal_cleanup(
         self, mock_get_backend, mock_list_terminals, mock_delete_terminal
     ):
-        """Test that delete_session tears down every terminal in the session via delete_terminal."""
+        """An explicit retryable teardown result must not be reported deleted."""
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_list_terminals.return_value = [{"id": "grok-terminal"}]
+        mock_delete_terminal.return_value = False
+
+        result = delete_session("cao-grok")
+
+        assert result["deleted"] == []
+        assert result["errors"] == [
+            {"terminal_id": "grok-terminal", "error": "cleanup deferred; retry delete_session"}
+        ]
+        mock_get_backend.return_value.kill_session.assert_called_once_with("cao-grok")
+
+    @patch("cli_agent_orchestrator.services.terminal_service._delete_terminal_under_lease")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_delete_session_cleans_up_each_terminal(
+        self, mock_get_backend, mock_list_terminals, mock_delete_under_lease
+    ):
+        """Test that delete_session tears down every terminal in the session."""
         mock_get_backend.return_value.session_exists.side_effect = [True, False, False]
         mock_list_terminals.return_value = [
             {"id": "term-aaa"},
@@ -664,13 +683,13 @@ class TestDeleteSession:
             {"id": "term-ccc"},
             {"id": "term-ddd"},
         ]
+        mock_delete_under_lease.return_value = {"terminal_deleted": True}
 
         result = delete_session("cao-multi-terminal")
 
         assert result == {"deleted": ["cao-multi-terminal"], "errors": []}
-        # Verify delete_terminal was called for each terminal with the correct ID
-        assert mock_delete_terminal.call_count == 4
-        assert [call.args[0] for call in mock_delete_terminal.call_args_list] == [
+        assert mock_delete_under_lease.call_count == 4
+        assert [call.args[0] for call in mock_delete_under_lease.call_args_list] == [
             "term-aaa",
             "term-bbb",
             "term-ccc",

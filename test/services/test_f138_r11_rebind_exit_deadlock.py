@@ -81,11 +81,11 @@ def _mock_infra(monkeypatch):
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.status_monitor.notify_input_sent",
-        lambda _tid: None,
+        lambda _tid, _p=None: None,
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.status_monitor.clear_rolling_buffer",
-        lambda _tid: None,
+        lambda _tid, _p=None: None,
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.status_monitor.bind_dispatch_provider",
@@ -101,7 +101,7 @@ def _mock_infra(monkeypatch):
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.update_last_active",
-        lambda _tid: None,
+        lambda _tid, _p=None: None,
     )
     # Preserve draft / stash — no-op
     monkeypatch.setattr(
@@ -119,7 +119,7 @@ def _mock_infra(monkeypatch):
     # Auto-responder mark
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.auto_responder.auto_responder.mark_exit_suppress",
-        lambda _tid: None,
+        lambda _tid, _p=None: None,
     )
     # Fixture override path — not a fixture provider
     monkeypatch.setattr(
@@ -322,11 +322,11 @@ async def test_rebind_terminal_exit_phase_does_not_deadlock(monkeypatch):
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.status_monitor.notify_input_sent",
-        lambda _tid: None,
+        lambda _tid, _p=None: None,
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.status_monitor.clear_rolling_buffer",
-        lambda _tid: None,
+        lambda _tid, _p=None: None,
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.status_monitor.bind_dispatch_provider",
@@ -342,7 +342,7 @@ async def test_rebind_terminal_exit_phase_does_not_deadlock(monkeypatch):
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.update_last_active",
-        lambda _tid: None,
+        lambda _tid, _p=None: None,
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.preserve_draft_before_send",
@@ -358,7 +358,7 @@ async def test_rebind_terminal_exit_phase_does_not_deadlock(monkeypatch):
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.auto_responder.auto_responder.mark_exit_suppress",
-        lambda _tid: None,
+        lambda _tid, _p=None: None,
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service._fixture_send_input_override",
@@ -381,7 +381,7 @@ async def test_rebind_terminal_exit_phase_does_not_deadlock(monkeypatch):
     # Run rebind
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",
-        lambda _tid: None,
+        lambda _tid, _p=None: None,
     )
 
     result = await service.rebind_terminal(TERMINAL_ID)

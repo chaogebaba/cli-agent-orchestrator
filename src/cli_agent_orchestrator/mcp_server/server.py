@@ -2517,13 +2517,60 @@ def delete_terminal(
             params=params,
             timeout=_mcp_timeout(),
         )
+        if response.status_code == 409:
+            detail = ""
+            try:
+                body = response.json()
+                detail = body.get("detail", "") if isinstance(body, dict) else ""
+            except (ValueError, AttributeError, TypeError):
+                pass
+            # TerminalProtectionError and cascade conflicts carry a specific
+            # detail that is NOT about Grok cleanup deferral.
+            protection_indicators = ("ready_base", "protected", "cascade", "subtree")
+            if any(ind in str(detail).lower() for ind in protection_indicators):
+                msg = f"Failed to delete terminal: 409 Conflict ({detail})"
+                return {"success": False, "message": msg}
+            return {
+                "success": False,
+                "message": (
+                    f"Terminal {terminal_id} cleanup is pending; retry delete_terminal "
+                    "after the Grok process exits."
+                ),
+            }
         response.raise_for_status()
-        return response.json()
+        payload = response.json()
+        if not payload.get("success", True):
+            return {
+                "success": False,
+                "message": (
+                    f"Terminal {terminal_id} cleanup is pending; retry delete_terminal "
+                    "after the Grok process exits."
+                ),
+            }
+        return payload
     except ValueError as ve:
         return {"success": False, "message": str(ve)}
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
             return {"success": False, "message": f"Terminal {terminal_id} not found"}
+        if e.response is not None and e.response.status_code == 409:
+            detail = ""
+            try:
+                body = e.response.json()
+                detail = body.get("detail", "") if isinstance(body, dict) else ""
+            except (ValueError, AttributeError, TypeError):
+                pass
+            protection_indicators = ("ready_base", "protected", "cascade", "subtree")
+            if any(ind in str(detail).lower() for ind in protection_indicators):
+                msg = f"Failed to delete terminal: {e}" + (f" ({detail})" if detail else "")
+                return {"success": False, "message": msg}
+            return {
+                "success": False,
+                "message": (
+                    f"Terminal {terminal_id} cleanup is pending; retry delete_terminal "
+                    "after the Grok process exits."
+                ),
+            }
         # Surface server detail for all non-404 errors
         detail = ""
         if e.response is not None:
