@@ -5547,6 +5547,10 @@ def _delete_terminal_under_lease(
         delivery_lock = get_delivery_lock(terminal_id)
         delivery_lock.acquire()
         try:
+            try:
+                stalled_callback_watchdog.emit_pre_delete_notice(terminal_id)
+            except Exception as e:
+                logger.warning(f"Failed to emit pre-delete notice for {terminal_id}: {e}")
             stalled_callback_watchdog.clear_terminal(terminal_id)
             clear_terminal_delivery_state(terminal_id)
             try:

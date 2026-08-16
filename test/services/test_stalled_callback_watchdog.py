@@ -1394,3 +1394,123 @@ def test_trigger_a_rollover_is_stale_and_insert_failure_rolls_back_reservation()
         svc.notify_due()
         svc.notify_due()
     assert [notice.kind for notice in persisted] == ["stall", "chain"]
+
+
+
+class TestF128DeleteBeforeCallbackGuard:
+    """Tests for emit_pre_delete_notice (F128)."""
+
+    def test_open_episode_emits_notice(self):
+        """AC1: open episode -> one WatchdogNotice returned with correct fields."""
+        svc = StalledCallbackWatchdog(grace_seconds=120)
+        svc.record_inbound_task("w1", "caller1", "developer")
+        svc.record_status("w1", TerminalStatus.IDLE, now=10.0)
+        with patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "insert_barrier_escalation_message",
+            return_value=None,
+        ), patch(
+            "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message"
+        ) as mock_create:
+            notice = svc.emit_pre_delete_notice("w1")
+        assert notice is not None
+        assert notice.caller_id == "caller1"
+        assert notice.kind == "deletion"
+        assert "w1" in notice.message
+        assert "developer" in notice.message
+        mock_create.assert_called_once()
+
+    def test_callback_seen_no_notice(self):
+        """AC2: callback_seen=True -> None."""
+        svc = StalledCallbackWatchdog(grace_seconds=120)
+        svc.record_inbound_task("w1", "caller1", "developer")
+        svc._episodes["w1"].callback_seen = True
+        notice = svc.emit_pre_delete_notice("w1")
+        assert notice is None
+
+    def test_already_fired_no_notice(self):
+        """AC3/AC6: fired=True -> None (no double-notify)."""
+        svc = StalledCallbackWatchdog(grace_seconds=120)
+        svc.record_inbound_task("w1", "caller1", "developer")
+        svc._episodes["w1"].fired = True
+        notice = svc.emit_pre_delete_notice("w1")
+        assert notice is None
+
+    def test_no_episode_no_notice(self):
+        """AC4: no episode -> None."""
+        svc = StalledCallbackWatchdog(grace_seconds=120)
+        notice = svc.emit_pre_delete_notice("w1")
+        assert notice is None
+
+    def test_persist_failure_propagates_to_caller(self):
+        """AC8: _persist_notice raises via barrier path -> exception propagates
+        (Design B). episode.fired=True already set under _lock."""
+        svc = StalledCallbackWatchdog(grace_seconds=120)
+        svc.record_inbound_task("w1", "caller1", "developer")
+        with patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "insert_barrier_escalation_message",
+            side_effect=RuntimeError("db down"),
+        ):
+            with pytest.raises(RuntimeError, match="db down"):
+                svc.emit_pre_delete_notice("w1")
+        # fired=True was set before _persist_notice was called
+        assert svc._episodes["w1"].fired is True
+
+    def test_persist_failure_on_fallback_propagates(self):
+        """AC8: create_routed_inbox_message raises -> exception propagates
+        (Design B). Covers the common non-barrier supervisor path.
+        episode.fired=True already set under _lock."""
+        svc = StalledCallbackWatchdog(grace_seconds=120)
+        svc.record_inbound_task("w1", "caller1", "developer")
+        with patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "insert_barrier_escalation_message",
+            return_value=None,
+        ), patch(
+            "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
+            side_effect=RuntimeError("db down"),
+        ):
+            with pytest.raises(RuntimeError, match="db down"):
+                svc.emit_pre_delete_notice("w1")
+        assert svc._episodes["w1"].fired is True
+
+    def test_fired_prevents_subsequent_collect_due(self):
+        """AC6 integration: after emit_pre_delete_notice, collect_due skips."""
+        svc = StalledCallbackWatchdog(grace_seconds=3)
+        svc.record_inbound_task("w1", "caller1", "developer")
+        svc.record_status("w1", TerminalStatus.IDLE, now=10.0)
+        svc._episodes["w1"].last_screen_fp = "abc"
+        with patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "insert_barrier_escalation_message",
+            return_value=None,
+        ), patch(
+            "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message"
+        ):
+            svc.emit_pre_delete_notice("w1")
+        # Now attempt collect — should produce nothing (fired=True)
+        with _relational_watchdog_fakes({"w1", "caller1"}):
+            notices = svc.collect_due_notifications(now=200.0)
+        assert notices == []
+
+    def test_cascade_multiple_children(self):
+        """AC9: K open episodes in cascade -> K notices."""
+        svc = StalledCallbackWatchdog(grace_seconds=120)
+        svc.record_inbound_task("w1", "caller1", "developer")
+        svc.record_inbound_task("w2", "caller1", "reviewer")
+        svc.record_inbound_task("w3", "caller1", "developer")
+        svc._episodes["w2"].callback_seen = True  # w2 already acked
+        results = []
+        with patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "insert_barrier_escalation_message",
+            return_value=None,
+        ), patch(
+            "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message"
+        ):
+            for tid in ["w1", "w2", "w3"]:
+                results.append(svc.emit_pre_delete_notice(tid))
+        assert results[0] is not None  # w1: open
+        assert results[1] is None       # w2: callback_seen
+        assert results[2] is not None  # w3: open
