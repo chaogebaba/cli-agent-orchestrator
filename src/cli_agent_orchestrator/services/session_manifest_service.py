@@ -10,6 +10,7 @@ from typing import Any, Callable
 import frontmatter
 
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
+from cli_agent_orchestrator.services.fleet_service import _compute_init_health
 from cli_agent_orchestrator.services.fork_context_service import list_bases
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.verification_service import deployment_status
@@ -44,7 +45,8 @@ def _charter_projection(name: str) -> dict[str, Any]:
     }
 
 
-def build_session_manifest(session_name: str, terminal_id: str | None = None) -> dict[str, Any]:
+def build_session_manifest(session_name: str, terminal_id: str | None = None, _now: datetime | None = None) -> dict[str, Any]:
+    _manifest_now = _now or datetime.now(timezone.utc)
     sections = {
         name: "ok"
         for name in ("profiles", "ready_bases", "skills", "workflows", "terminals", "activation")
@@ -125,12 +127,16 @@ def build_session_manifest(session_name: str, terminal_id: str | None = None) ->
                         auth_staleness = "stale" if started_at < auth_mtime else "current"
             except Exception:
                 pass
+            status = status_monitor.get_status(item["id"]).value
+            init_health = _compute_init_health(item, _manifest_now)
+            if init_health == "failed":
+                status = "error"
             rows.append(
                 {
                     "id": item["id"],
                     "profile": item.get("agent_profile"),
                     "provider": item.get("provider"),
-                    "status": status_monitor.get_status(item["id"]).value,
+                    "status": status,
                     "caller_id": item.get("caller_id"),
                     "cwd": get_working_directory(item["id"]),
                     "kind": (
@@ -140,6 +146,8 @@ def build_session_manifest(session_name: str, terminal_id: str | None = None) ->
                             "worker" if role in {"developer", "reviewer", "worker"} else "unknown"
                         )
                     ),
+                    "init_state": item.get("init_state"),
+                    "init_health": init_health,
                     "recovery_state": item.get("recovery_state"),
                     "recovery_error": item.get("recovery_error"),
                     "fallback_terminal_id": item.get("fallback_terminal_id"),

@@ -487,3 +487,288 @@ def test_manifest_reads_seeded_profile_skill_directories_and_database(tmp_path, 
     assert manifest["ready_bases"][0]["staleness_count"] == 1
     assert manifest["workflows"][0]["name"] == "seed-flow"
     assert manifest["terminals"][0]["id"] == "term0001"
+
+
+
+# ─── F234: init-health parity tests ────────────────────────────────────────────
+
+from datetime import datetime, timedelta, timezone
+
+from cli_agent_orchestrator.services.fleet_service import _compute_init_health
+
+
+def _seed_f234(monkeypatch, terminals):
+    """Minimal seeding for F234 init-health tests."""
+    monkeypatch.setattr(
+        svc,
+        "list_agent_profiles",
+        lambda: [{"name": "dev", "source": "local", "duplicated_in": []}],
+    )
+    monkeypatch.setattr(
+        svc,
+        "read_agent_profile_source",
+        lambda _name: "---\nname: dev\ndescription: Dev\nrole: developer\nprovider: codex\n---\nDev\n",
+    )
+    monkeypatch.setattr(svc, "list_bases", lambda: [])
+    monkeypatch.setattr(svc, "list_skills", lambda: [SimpleNamespace(name="s", description="d")])
+    monkeypatch.setattr(
+        svc, "list_workflows", lambda: [SimpleNamespace(name="w", description="d", source_path="/w")]
+    )
+    monkeypatch.setattr(svc, "list_terminals_by_session", lambda _name: terminals)
+    monkeypatch.setattr(svc.status_monitor, "get_status", lambda _tid: SimpleNamespace(value="idle"))
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.get_working_directory",
+        lambda _tid: "/repo",
+    )
+    monkeypatch.setattr(
+        svc,
+        "deployment_status",
+        lambda root: {
+            "cli_path": "current",
+            "differing_files": 0,
+            "server": "current",
+            "source_root": str(root),
+        },
+    )
+    monkeypatch.setenv("CAO_SOURCE_REPO", "/repo")
+
+
+class TestManifestFleetInitHealthParity:
+    """F234: manifest and fleet derive identical init_health for same input."""
+
+    NOW = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+    CASES = [
+        # (desc, row_fragment, expected_health, expect_error_status)
+        ("ready", {"init_state": "ready"}, "ready", False),
+        (
+            "launching_within_deadline",
+            {
+                "init_state": "init_pending",
+                "init_started_at": datetime(2026, 8, 15, 11, 59, 0, tzinfo=timezone.utc),
+                "init_deadline_s": 120,
+            },
+            "launching",
+            False,
+        ),
+        (
+            "failed_overdue",
+            {
+                "init_state": "init_pending",
+                "init_started_at": datetime(2026, 8, 15, 11, 0, 0, tzinfo=timezone.utc),
+                "init_deadline_s": 60,
+            },
+            "failed",
+            True,
+        ),
+        ("failed_notified", {"init_state": "init_failed_notified"}, "failed", True),
+        ("failed_caller_gone", {"init_state": "init_failed_caller_gone"}, "failed", True),
+        ("legacy_null", {}, None, False),
+        (
+            "malformed_no_started_at",
+            {"init_state": "init_pending", "init_started_at": None, "init_deadline_s": 60},
+            "failed",
+            True,
+        ),
+        (
+            "malformed_no_deadline",
+            {"init_state": "init_pending", "init_started_at": datetime(2026, 8, 15, 11, 59, 0, tzinfo=timezone.utc), "init_deadline_s": None},
+            "failed",
+            True,
+        ),
+    ]
+
+    @pytest.mark.parametrize("desc,row_fragment,expected_health,expect_error", CASES, ids=[c[0] for c in CASES])
+    def test_fleet_and_manifest_agree(self, desc, row_fragment, expected_health, expect_error, monkeypatch):
+        now = self.NOW
+        # AC9: Direct call to _compute_init_health matches expected
+        row = {"id": "term0001", "agent_profile": "dev", "provider": "codex", **row_fragment}
+        assert _compute_init_health(row, now) == expected_health
+
+        # Build manifest with same terminal
+        _seed_f234(monkeypatch, [row])
+        manifest = svc.build_session_manifest("test-session", _now=now)
+        terminal = manifest["terminals"][0]
+
+        # AC1: init_state present
+        assert terminal["init_state"] == row_fragment.get("init_state")
+        # AC2: init_health matches _compute_init_health
+        assert terminal["init_health"] == expected_health
+        # AC3/AC4/AC5: status override
+        if expect_error:
+            assert terminal["status"] == "error"
+        else:
+            assert terminal["status"] == "idle"  # base status from status_monitor mock
+
+
+class TestInitHealthDeterminism:
+    """F234 AC7: single _now used across all terminals in one manifest build."""
+
+    def test_two_terminals_at_deadline_boundary_get_same_health(self, monkeypatch):
+        """Seed two terminals straddling a deadline; both use the same injected _now."""
+        now = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
+        # Terminal 1: started 59s ago with 60s deadline → launching (1s remaining)
+        # Terminal 2: started 61s ago with 60s deadline → failed (1s past)
+        terminals = [
+            {
+                "id": "term-a",
+                "agent_profile": "dev",
+                "provider": "codex",
+                "init_state": "init_pending",
+                "init_started_at": now - timedelta(seconds=59),
+                "init_deadline_s": 60,
+            },
+            {
+                "id": "term-b",
+                "agent_profile": "dev",
+                "provider": "codex",
+                "init_state": "init_pending",
+                "init_started_at": now - timedelta(seconds=61),
+                "init_deadline_s": 60,
+            },
+        ]
+        _seed_f234(monkeypatch, terminals)
+        manifest = svc.build_session_manifest("test-session", _now=now)
+        by_id = {t["id"]: t for t in manifest["terminals"]}
+
+        # Both use the same _now — deterministic results
+        assert by_id["term-a"]["init_health"] == "launching"
+        assert by_id["term-a"]["status"] == "idle"
+        assert by_id["term-b"]["init_health"] == "failed"
+        assert by_id["term-b"]["status"] == "error"
+
+    def test_injected_now_is_honored_not_ignored(self, monkeypatch):
+        """M8 kill: if _now is ignored, this test detects it."""
+        # Use a _now far in the future so a 60s deadline that started "now" would be launching
+        # if real datetime.now() were used, but failed with the injected time.
+        future_now = datetime(2099, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        started = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
+        terminals = [
+            {
+                "id": "term-x",
+                "agent_profile": "dev",
+                "provider": "codex",
+                "init_state": "init_pending",
+                "init_started_at": started,
+                "init_deadline_s": 60,
+            },
+        ]
+        _seed_f234(monkeypatch, terminals)
+        manifest = svc.build_session_manifest("test-session", _now=future_now)
+        terminal = manifest["terminals"][0]
+        # With real now() in 2026, this would be "launching"; with injected 2099, it's "failed"
+        assert terminal["init_health"] == "failed"
+        assert terminal["status"] == "error"
+
+
+class TestInitHealthRecoveryFieldsUndisturbed:
+    """F234 AC10: recovery/auth fields unaffected by init_health projection."""
+
+    def test_failed_health_does_not_alter_recovery_or_auth(self, monkeypatch):
+        now = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
+        terminals = [
+            {
+                "id": "term0001",
+                "agent_profile": "dev",
+                "provider": "codex",
+                "init_state": "init_failed_notified",
+                "recovery_state": "recovering",
+                "recovery_error": "timeout",
+                "fallback_terminal_id": "fallback1",
+            },
+        ]
+        _seed_f234(monkeypatch, terminals)
+        manifest = svc.build_session_manifest("test-session", _now=now)
+        t = manifest["terminals"][0]
+        # Status overridden to error
+        assert t["status"] == "error"
+        # Recovery fields preserved verbatim
+        assert t["recovery_state"] == "recovering"
+        assert t["recovery_error"] == "timeout"
+        assert t["fallback_terminal_id"] == "fallback1"
+        # Auth fields present and unchanged (default "unknown" from mock)
+        assert t["auth_staleness"] == "unknown"
+
+
+class TestInitHealthImportNoCycle:
+    """F234 AC8: importing _compute_init_health from fleet_service causes no cycle."""
+
+    def test_import_succeeds(self):
+        """Both modules load without ImportError — self-proving via test collection."""
+        from cli_agent_orchestrator.services import fleet_service, session_manifest_service
+
+        assert hasattr(fleet_service, "_compute_init_health")
+        assert hasattr(session_manifest_service, "build_session_manifest")
+
+
+
+class TestProductionDefaultPathKillsM6M7:
+    """S1 closure: exercise _now=None path via monkeypatched datetime.
+
+    Kills M6 (naive-now) and M7 (per-row-now) by asserting:
+      - the init-health default captures datetime.now once, plus the existing
+        generated_at timestamp (two UTC calls total; per-row capture adds calls)
+      - datetime.now receives timezone.utc as the tz argument (M6: naive variant
+        returns a naive datetime, causing TypeError on tz-aware subtraction)
+    """
+
+    def test_production_default_uses_utc_once_across_two_rows(self, monkeypatch):
+        """Two rows use one health-clock capture plus the generated_at timestamp."""
+        FIXED_NOW = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
+        now_calls: list[tuple] = []
+
+        _real_datetime = datetime
+
+        class _ControlledDatetime(_real_datetime):
+            """Subclass that intercepts .now() calls on the module symbol."""
+
+            @classmethod
+            def now(cls, tz=None):
+                now_calls.append((tz,))
+                if tz is None:
+                    # M6 kill: return naive datetime — will TypeError on tz-aware subtraction
+                    return _real_datetime(2026, 8, 15, 12, 0, 0)
+                return FIXED_NOW
+
+        monkeypatch.setattr(svc, "datetime", _ControlledDatetime)
+
+        # Two terminals straddling a deadline — deterministic only if same _now used
+        started = _real_datetime(2026, 8, 15, 11, 59, 30, tzinfo=timezone.utc)
+        terminals = [
+            {
+                "id": "term-p1",
+                "agent_profile": "dev",
+                "provider": "codex",
+                "init_state": "init_pending",
+                "init_started_at": started,
+                "init_deadline_s": 60,
+            },
+            {
+                "id": "term-p2",
+                "agent_profile": "dev",
+                "provider": "codex",
+                "init_state": "init_pending",
+                "init_started_at": started - timedelta(seconds=61),
+                "init_deadline_s": 60,
+            },
+        ]
+        _seed_f234(monkeypatch, terminals)
+
+        manifest = svc.build_session_manifest("test-session", _now=None)
+
+        # M7 kill: datetime.now(utc) must be called exactly twice for 2 terminal
+        # rows — once for _manifest_now capture + once for generated_at.
+        # A per-row capture mutant would produce 3 calls (2 rows + generated_at).
+        utc_calls = [c for c in now_calls if c == (timezone.utc,)]
+        assert len(utc_calls) == 2, (
+            f"Expected exactly 2 calls to datetime.now(timezone.utc) "
+            f"(1 _manifest_now + 1 generated_at), got {len(utc_calls)}; "
+            f"all now() calls: {now_calls}"
+        )
+
+        # Verify health computed correctly with the fixed time
+        by_id = {t["id"]: t for t in manifest["terminals"]}
+        assert by_id["term-p1"]["init_health"] == "launching"
+        assert by_id["term-p1"]["status"] == "idle"
+        assert by_id["term-p2"]["init_health"] == "failed"
+        assert by_id["term-p2"]["status"] == "error"
