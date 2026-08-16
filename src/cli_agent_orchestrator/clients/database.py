@@ -361,6 +361,9 @@ class InboxModel(Base):
     barrier_id = deferred(Column(Integer, nullable=True))
     barrier_member_key = deferred(Column(String, nullable=True))
     created_at = Column(DateTime(timezone=True), default=_utcnow)
+    __table_args__ = (
+        Index("ix_inbox_sender_receiver", "sender_id", "receiver_id"),
+    )
 
 
 class CallbackBarrierModel(Base):
@@ -560,6 +563,7 @@ class AuthorityPinModel(Base):
     sha256 = Column(String, nullable=False)
     version = Column(Integer, nullable=False)
     registered_by = Column(String, nullable=False)
+    frozen = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
     __table_args__ = (
         UniqueConstraint(
@@ -1146,6 +1150,7 @@ def init_db() -> None:
     _migrate_f175_dedup_columns()
     _migrate_fx191_trace_extension()
     _migrate_f218_dead_supervisor_safety()
+    _migrate_f129_frozen_authority()
 
 
 def _migrate_f218_dead_supervisor_safety() -> None:
@@ -1253,6 +1258,51 @@ def _migrate_f218_dead_supervisor_safety() -> None:
         # runtime (SQLite does not enforce named CHECK constraints after
         # creation without a table rebuild). The model definition governs
         # new DBs.
+
+
+def _migrate_f129_frozen_authority() -> None:
+    """Idempotent startup migration for F129 frozen-pin schema additions.
+
+    Called from init_db() after Base.metadata.create_all() and before any
+    service startup. Safe to run repeatedly — checks existence before acting.
+
+    Ordering:
+      1. init_db() calls Base.metadata.create_all()  (creates missing tables)
+      2. init_db() calls _migrate_f129_frozen_authority()
+      3. Service startup proceeds
+
+    Transaction/idempotence/error behavior:
+      - Uses the repository-standard `with engine.begin() as connection:`
+        migration pattern, so the column and index steps share one managed
+        transaction and commit together on successful context exit.
+      - Column check uses PRAGMA table_info(authority_pin) — if 'frozen' is
+        already present, the ALTER TABLE is skipped (idempotent).
+      - Index uses CREATE INDEX IF NOT EXISTS — inherently idempotent and
+        independently safe after any interrupted prior startup.
+      - On unrecoverable error (e.g. table does not exist at all), the context
+        rolls back where SQLite permits and the exception propagates; init_db()
+        aborts server startup. A half-migrated DB never serves traffic.
+      - Running twice in succession produces identical schema state (no-op on
+        second run).
+    """
+    with engine.begin() as connection:
+        # ── Step 1: Add 'frozen' column if missing ──
+        result = connection.execute(text("PRAGMA table_info(authority_pin)"))
+        columns = [row[1] for row in result.fetchall()]
+
+        if "frozen" not in columns:
+            connection.execute(text(
+                "ALTER TABLE authority_pin "
+                "ADD COLUMN frozen BOOLEAN NOT NULL DEFAULT 0"
+            ))
+            # Existing rows receive frozen=0 (FALSE) via DEFAULT — they remain
+            # mutable pins, preserving backward compatibility.
+
+        # ── Step 2: Add covering index if missing ──
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_inbox_sender_receiver "
+            "ON inbox (sender_id, receiver_id)"
+        ))
 
 
 def _migrate_fx191_trace_extension() -> None:
@@ -2673,6 +2723,7 @@ def create_terminal(
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     worktree_info: Optional[Dict[str, str]] = None,
+    authority_files: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -2717,6 +2768,18 @@ def create_terminal(
                 terminal_id=terminal_id,
                 profile_name=agent_profile,
                 dispatch_barrier=dispatch_barrier,
+            )
+        # F129: Register frozen authority pins in the SAME transaction
+        if authority_files:
+            from cli_agent_orchestrator.services.authority_pin_service import (
+                register_frozen_pins,
+            )
+
+            register_frozen_pins(
+                db,
+                task_key=terminal_id,
+                authority_files=authority_files,
+                registered_by=caller_id or "unknown",
             )
         db.commit()
         return {
@@ -2783,6 +2846,7 @@ def create_terminal_with_warm_intent(
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     worktree_info: Optional[Dict[str, str]] = None,
+    authority_files: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
     """Publish terminal metadata and a fork-only warm intent together."""
     import json as _json
@@ -2827,7 +2891,20 @@ def create_terminal_with_warm_intent(
                 profile_name=agent_profile,
                 dispatch_barrier=dispatch_barrier,
             )
+        # F129: Register frozen authority pins in the SAME transaction
+        if authority_files:
+            from cli_agent_orchestrator.services.authority_pin_service import (
+                register_frozen_pins,
+            )
+
+            register_frozen_pins(
+                db,
+                task_key=terminal_id,
+                authority_files=authority_files,
+                registered_by=caller_id or "unknown",
+            )
         if fork_mode == "fork" and parent_base_name and agent_profile:
+            # (frozen pins already registered above)
             claimed = False
             for attempt in range(3):
                 dead = (

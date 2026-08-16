@@ -189,6 +189,8 @@ def update_pin(worker_terminal_id: str, file_path: str, sha256: str) -> dict[str
         )
         if current is None:
             raise AuthorityPinError("already_pinned")
+        if current.frozen:
+            raise AuthorityPinError("frozen_pin_immutable")
         next_version = current.version + 1
         db.add(
             dbmod.AuthorityPinModel(
@@ -279,3 +281,164 @@ def verify_pin(file_path: str) -> dict[str, Any]:
         "observed_sha": observed,
         "reason": "content",
     }
+
+
+
+# ─── F129: Frozen-pin registration and validation ───────────────────────────
+
+
+from dataclasses import dataclass, field
+from typing import Literal
+
+
+@dataclass
+class PinCheckResult:
+    file_path: str
+    verdict: Literal["VALID", "DRIFT"]
+    expected: str
+    observed: str | None
+    reason: str | None  # "content", "missing", "unreadable", "not_regular"
+
+
+@dataclass
+class FrozenPinValidation:
+    outcome: Literal["no_frozen_pins", "valid", "drift"]
+    drifted: list[PinCheckResult] = field(default_factory=list)
+    all_results: list[PinCheckResult] = field(default_factory=list)
+
+
+def register_frozen_pins(
+    db: Any,
+    task_key: str,
+    authority_files: Sequence[Mapping[str, Any]],
+    registered_by: str,
+) -> list[dict[str, Any]]:
+    """Register frozen (immutable) authority pins inside an existing transaction.
+
+    Called from terminal_service.create_terminal WITHIN the same DB transaction
+    that creates the TerminalModel row. Validates each entry, server-hashes each
+    file, compares to caller-supplied sha256, and inserts AuthorityPinModel rows
+    with frozen=True.
+
+    Raises AuthorityPinError on any validation or hash-verification failure; the
+    caller is expected to ROLLBACK the enclosing transaction.
+    """
+    validated = _validate_pins(authority_files)
+
+    results: list[dict[str, Any]] = []
+    for file_path, expected_sha in validated:
+        observed, reason = _hash_file(file_path)
+        if reason is not None:
+            raise AuthorityPinError(f"authority_hash_mismatch")
+        if observed != expected_sha:
+            raise AuthorityPinError("authority_hash_mismatch")
+        db.add(
+            dbmod.AuthorityPinModel(
+                task_key=task_key,
+                file_path=file_path,
+                sha256=expected_sha,
+                version=1,
+                registered_by=registered_by,
+                frozen=True,
+            )
+        )
+        results.append({"file_path": file_path, "sha256": expected_sha, "version": 1})
+    db.flush()
+    return results
+
+
+def validate_frozen_pins(db: Any, sender_id: str) -> FrozenPinValidation:
+    """Validate all frozen pins for a sender BEFORE inbox row creation.
+
+    Called from create_inbox_message_endpoint BEFORE the mb_/direct branch.
+    Only invoked when sender_id resolves to a TerminalModel row (genuine
+    terminal principals).
+
+    Returns FrozenPinValidation with verdict and optional attestation/drift info.
+    """
+    frozen_rows = (
+        db.query(dbmod.AuthorityPinModel)
+        .filter_by(task_key=sender_id, frozen=True)
+        .order_by(dbmod.AuthorityPinModel.file_path, dbmod.AuthorityPinModel.version.desc())
+        .all()
+    )
+
+    if not frozen_rows:
+        return FrozenPinValidation(outcome="no_frozen_pins")
+
+    # Group by file_path, take highest version per file
+    current_pins: dict[str, Any] = {}
+    for row in frozen_rows:
+        if row.file_path not in current_pins:
+            current_pins[row.file_path] = row
+
+    # Hash each file and compare
+    results: list[PinCheckResult] = []
+    for file_path, pin in current_pins.items():
+        observed_sha, reason = _hash_file(file_path)
+        if reason is not None:
+            results.append(PinCheckResult(
+                file_path=file_path, verdict="DRIFT",
+                expected=pin.sha256, observed=None, reason=reason,
+            ))
+        elif observed_sha != pin.sha256:
+            results.append(PinCheckResult(
+                file_path=file_path, verdict="DRIFT",
+                expected=pin.sha256, observed=observed_sha, reason="content",
+            ))
+        else:
+            results.append(PinCheckResult(
+                file_path=file_path, verdict="VALID",
+                expected=pin.sha256, observed=observed_sha, reason=None,
+            ))
+
+    drifted = [r for r in results if r.verdict == "DRIFT"]
+    if drifted:
+        return FrozenPinValidation(outcome="drift", drifted=drifted, all_results=results)
+
+    return FrozenPinValidation(outcome="valid", all_results=results)
+
+
+def build_attestation(validation: FrozenPinValidation) -> str:
+    """Build model-visible attestation block for a VALID frozen-pin check."""
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines = [f"[FROZEN-PIN-ATTESTATION valid_at={now}]"]
+    for r in validation.all_results:
+        lines.append(f"VALID {r.file_path} sha256={r.expected}")
+    lines.append("[/FROZEN-PIN-ATTESTATION]")
+    return "\n".join(lines)
+
+
+def build_frozen_authority_block(pins: list[dict[str, str]]) -> str:
+    """Build the [FROZEN-AUTHORITY-PINS] block prepended to initial messages."""
+    lines = ["[FROZEN-AUTHORITY-PINS]"]
+    for pin in pins:
+        lines.append(f"path={pin['file_path']} sha256={pin['sha256']}")
+    lines.append("[/FROZEN-AUTHORITY-PINS]")
+    return "\n".join(lines)
+
+
+def format_drift_notice(sender_id: str, validation: FrozenPinValidation) -> str:
+    """Format the system-authored drift notice message."""
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines = [f"[FROZEN-PIN-DRIFT terminal={sender_id} detected_at={now}]"]
+    for r in validation.drifted:
+        reason_str = r.reason or "content"
+        expected_short = r.expected[:8] if r.expected else "?"
+        observed_short = (r.observed[:8] if r.observed else "none")
+        lines.append(
+            f"DRIFT {r.file_path} expected={expected_short} "
+            f"observed={observed_short} reason={reason_str}"
+        )
+    lines.append("[/FROZEN-PIN-DRIFT]")
+    lines.append("")
+    lines.append(
+        "Authority-pinned files have drifted since this worker was assigned.\n"
+        "The worker's callback payload has been suppressed (stale verdict).\n"
+        "Action required: delete this worker and cold-assign a fresh reviewer."
+    )
+    return "\n".join(lines)
