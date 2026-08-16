@@ -20,41 +20,29 @@ check-ext-apps-skills:
 
 .PHONY: test-smoke test-full test-quick
 
-# Lockfile for serializing full-suite runs across lanes (F169).
-SUITE_LOCK := /tmp/cao-suite.lock
+# --- F237: default-cached fork pytest via tcache ---
+# Resolve tcache from the fork's git common dir (F237 D4).
+# Layout coupling: fork is one level inside root repo. Override with env for
+# non-standard layouts. Existence guard below fires at parse time.
+TCACHE_BIN ?= $(shell git rev-parse --git-common-dir)/../../scripts/tcache
+$(if $(wildcard $(TCACHE_BIN)),,$(error F237: tcache not found at $(TCACHE_BIN). Set TCACHE_BIN env to override.))
 
-# Internal recipe: acquire exclusive flock, then run pytest under resource fence.
-# $(1) = extra pytest args appended after the default addopts.
-define _fenced_pytest
-	@( \
-	  echo "acquiring suite lock ($(SUITE_LOCK))..."; \
-	  exec 9>"$(SUITE_LOCK)"; \
-	  if ! flock -n 9 2>/dev/null; then \
-	    echo "waiting for suite lock (another suite is running)..."; \
-	    flock 9; \
-	  fi; \
-	  echo "lock acquired — running pytest"; \
-	  if command -v systemd-run >/dev/null 2>&1 && systemd-run --user --scope true >/dev/null 2>&1; then \
-	    echo "[fence] systemd-run --user --scope -p CPUWeight=30 -p MemoryHigh=70% nice -n 10"; \
-	    systemd-run --user --scope -p CPUWeight=30 -p MemoryHigh=70% nice -n 10 \
-	      uv run pytest $(1); \
-	  else \
-	    echo "[fence] WARNING: systemd-run unavailable — falling back to nice -n 10 (no memory cap)"; \
-	    nice -n 10 uv run pytest $(1); \
-	  fi \
-	)
-endef
+PYTEST_WRAPPER := $(CURDIR)/scripts/run-pytest.sh
+
+# F237 D3: content-hash interpreter verification for cross-worktree HIT
+export TCACHE_INTERP_CHECK := content
+
+ARGS ?=
 
 test-smoke:
 	uv run pytest -m smoke
 
-# Full suite (all markers, overrides addopts -m filter). Fenced + locked.
-# Extra args: make test-full ARGS="-m 'not e2e'"
-ARGS ?=
+# Full suite (all markers, overrides addopts -m filter). Cached by default (F237 D6).
+# Opt-out: make test-full TCACHE=off
 test-full:
-	$(call _fenced_pytest,-m "" $(ARGS))
+	"$(TCACHE_BIN)" run "$(PYTEST_WRAPPER)" -m "" $(ARGS)
 
-# Quick suite — default addopts unchanged (same as bare `uv run pytest`). Fenced + locked.
-# Exists so briefs have one vocabulary for the default-filtered run.
+# Quick suite — default addopts unchanged. Cached by default (F237 D6).
+# Opt-out: make test-quick TCACHE=off
 test-quick:
-	$(call _fenced_pytest,$(ARGS))
+	"$(TCACHE_BIN)" run "$(PYTEST_WRAPPER)" $(ARGS)
