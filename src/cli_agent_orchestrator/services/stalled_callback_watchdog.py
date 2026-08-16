@@ -353,6 +353,40 @@ class StalledCallbackWatchdog:
         with self._lock:
             return terminal_id in self._episodes
 
+    def emit_pre_delete_notice(self, terminal_id: str) -> WatchdogNotice | None:
+        """Emit one durable notice if an open un-fired episode exists, then return it.
+
+        Called by _delete_terminal_under_lease BEFORE clear_terminal, under the
+        terminal's delivery_lock. Returns None when no notice is warranted.
+        """
+        with self._lock:
+            episode = self._episodes.get(terminal_id)
+            if episode is None:
+                return None
+            if episode.callback_seen:
+                return None
+            if episode.fired:
+                return None
+            caller_id = episode.caller_id
+            profile = episode.profile
+            generation = episode.generation
+            episode.fired = True  # under _lock — atomic with the decision
+
+        # Outside _lock: durable insert (may block on DB)
+        notice = WatchdogNotice(
+            terminal_id=terminal_id,
+            caller_id=caller_id,
+            message=(
+                f"[watchdog] worker {terminal_id} ({profile}) deleted "
+                f"before callback — task result may be lost"
+            ),
+            idle_reason=None,
+            source_generation=generation,
+            kind="deletion",
+        )
+        self._persist_notice(notice)
+        return notice
+
     def clear_terminal(self, terminal_id: str) -> None:
         with self._lock:
             # FX181 S2: collect the callers whose owed set this delete actually
