@@ -659,3 +659,116 @@ def test_grok_command_empty_per_profile_model_clears_lower_tiers(
     assert " -m " not in command
     assert "grok-provider-model" not in command
     assert "grok-frontmatter-model" not in command
+
+
+
+# --- F235: Explicit model override tests ---
+
+
+def test_grok_command_explicit_model_override_wins(provider_defaults_file, monkeypatch) -> None:
+    """AC-1 + AC-4: explicit model= from assign/handoff wins over all layers."""
+    profile = type(
+        "Profile", (), {"model": "grok-profile-model", "mcpServers": None, "system_prompt": None}
+    )()
+    provider_defaults_file.write_text(
+        '[grok_cli]\nmodel = "grok-composer-2.5-fast"\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.grok_cli.load_agent_profile", lambda _name: profile
+    )
+
+    provider = GrokCliProvider(
+        terminal_id="term-grok",
+        session_name="session",
+        window_name="window",
+        agent_profile="grok_dev",
+        allowed_tools=["*"],
+        model="grok-3-mini",
+    )
+    command = provider._build_grok_command()
+
+    assert "-m grok-3-mini" in command
+    assert "grok-composer-2.5-fast" not in command
+    assert "grok-profile-model" not in command
+
+
+def test_grok_command_model_none_preserves_layered_resolution(
+    provider_defaults_file, monkeypatch
+) -> None:
+    """AC-2: model=None falls through to providers.toml -> profile chain."""
+    profile = type(
+        "Profile", (), {"model": "grok-profile-model", "mcpServers": None, "system_prompt": None}
+    )()
+    provider_defaults_file.write_text(
+        '[grok_cli]\nmodel = "grok-composer-2.5-fast"\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.grok_cli.load_agent_profile", lambda _name: profile
+    )
+
+    provider = GrokCliProvider(
+        terminal_id="term-grok",
+        session_name="session",
+        window_name="window",
+        agent_profile="grok_dev",
+        allowed_tools=["*"],
+        model=None,
+    )
+    command = provider._build_grok_command()
+
+    assert "-m grok-composer-2.5-fast" in command
+
+
+def test_grok_command_model_none_no_toml_no_profile_emits_nothing(monkeypatch) -> None:
+    """AC-3: model=None with no toml and no profile.model -> no -m flag."""
+    profile = type(
+        "Profile", (), {"model": None, "mcpServers": None, "system_prompt": None}
+    )()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.grok_cli.load_agent_profile", lambda _name: profile
+    )
+
+    provider = GrokCliProvider(
+        terminal_id="term-grok",
+        session_name="session",
+        window_name="window",
+        agent_profile="grok_dev",
+        allowed_tools=["*"],
+        model=None,
+    )
+    command = provider._build_grok_command()
+
+    assert " -m " not in command
+
+
+def test_manager_forwards_model_to_grok(monkeypatch) -> None:
+    """Integration: ProviderManager.create_provider passes model to GrokCliProvider.
+
+    Uses the real ProviderManager path. Bypasses load_persona_plan by passing
+    persona_plan=None explicitly through create_provider's own method seam
+    (the parameter accepts None to skip the lazy DB/filesystem load).
+    """
+    from cli_agent_orchestrator.providers.manager import ProviderManager
+
+    captured = {}
+
+    class FakeGrok:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.manager.GrokCliProvider", FakeGrok
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.manager.ProviderManager.commit_provider",
+        lambda self, tid, prov: prov,
+    )
+
+    mgr = ProviderManager()
+    mgr.create_provider(
+        "grok_cli", "t1", "sess", "win",
+        agent_profile="grok_dev", model="grok-3-mini",
+        persona_plan=None,
+    )
+
+    assert captured["model"] == "grok-3-mini"

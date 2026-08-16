@@ -105,6 +105,7 @@ class GrokCliProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
         fork_context: Optional[ForkContext] = None,
+        model: Optional[str] = None,
     ):
         super().__init__(
             terminal_id, session_name, window_name, allowed_tools, skill_prompt, fork_context
@@ -117,6 +118,7 @@ class GrokCliProvider(BaseProvider):
         self._initialized = False
         self._input_received = False
         self._agent_profile = agent_profile
+        self._model = model
 
     @property
     def paste_enter_count(self) -> int:
@@ -163,13 +165,16 @@ class GrokCliProvider(BaseProvider):
         provider_defaults = get_provider_defaults("grok_cli")
         profile_name = getattr(profile, "name", None) or self._agent_profile
         profile_defaults = get_provider_profile_defaults(provider_defaults, profile_name)
-        model = resolve_provider_string_option(
-            profile_defaults,
-            provider_defaults,
-            profile,
-            "model",
-            "model",
-        )
+        if self._model:
+            model = self._model
+        else:
+            model = resolve_provider_string_option(
+                profile_defaults,
+                provider_defaults,
+                profile,
+                "model",
+                "model",
+            )
         if isinstance(model, str) and model:
             command_parts.extend(["-m", model])
 
