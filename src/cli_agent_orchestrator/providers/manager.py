@@ -134,6 +134,7 @@ class ProviderManager:
                     allowed_tools,
                     skill_prompt=skill_prompt,
                     fork_context=fork_context,
+                    model=model,
                 )
             elif provider_type == ProviderType.CLAUDE_CODE.value:
                 provider = ClaudeCodeProvider(
