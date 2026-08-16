@@ -48,6 +48,7 @@ from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     TRANSCRIPT_BINDING_SOURCES,
     TRANSCRIPT_HOOK_BINDING_SOURCES,
+    TerminalModel,
     adopt_mailbox_rows_at_startup,
     callback_barrier_status,
     cancel_callback_barrier,
@@ -322,6 +323,14 @@ class CreateTerminalBody(BaseModel):
     initial_message_orchestration_type: Optional[str] = None
     fork_context: Optional[ForkContext] = None
     refresh_base_name: Optional[str] = None
+    authority_files: Optional[List[Dict[str, str]]] = Field(
+        default=None,
+        description=(
+            "Frozen authority pins: [{file_path, sha256}]. Registered atomically "
+            "BEFORE provider initialization; assign fails and the terminal is "
+            "unwound if pinning fails."
+        ),
+    )
     barrier: Optional[str] = None
     barrier_timeout_seconds: Optional[StrictInt] = None
     barrier_member_key: Optional[str] = None
@@ -3566,6 +3575,7 @@ async def create_terminal_in_session(
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            authority_files=body.authority_files if body else None,
         )
         return result
     except HTTPException:
@@ -6530,6 +6540,120 @@ async def create_inbox_message_endpoint(
                 "message": "callback barrier dispatch is available only through MCP",
             },
         )
+
+    # ── F129: Frozen-pin validation (before mb_/direct branch) ──
+    # Only validate genuine terminal senders (DB-resident TerminalModel)
+    sender_terminal = None
+    try:
+        from cli_agent_orchestrator.clients.database import SessionLocal as _f129_session
+        with _f129_session() as _f129_db:
+            sender_terminal = (
+                _f129_db.query(TerminalModel).filter_by(id=sender_id).first()
+            )
+            if sender_terminal is not None:
+                from cli_agent_orchestrator.services.authority_pin_service import (
+                    validate_frozen_pins,
+                    build_attestation,
+                    format_drift_notice,
+                    FrozenPinValidation,
+                )
+
+                validation = validate_frozen_pins(_f129_db, sender_id)
+                if validation.outcome == "drift":
+                    # Resolve recorded caller
+                    caller_id = sender_terminal.caller_id
+                    if caller_id is None:
+                        # Caller gone — cannot deliver notice
+                        return {
+                            "success": False,
+                            "error": {
+                                "code": "frozen_pin_drift_no_caller",
+                                "message": "Recorded caller is gone; drift notice not deliverable.",
+                            },
+                        }
+                    # Check caller terminal still exists
+                    caller_terminal = (
+                        _f129_db.query(TerminalModel).filter_by(id=caller_id).first()
+                    )
+                    if caller_terminal is None:
+                        return {
+                            "success": False,
+                            "error": {
+                                "code": "frozen_pin_drift_no_caller",
+                                "message": "Recorded caller is gone; drift notice not deliverable.",
+                            },
+                        }
+                    # Dedup: check if drift notice already delivered
+                    drift_sender_key = f"cao-system:drift:{sender_id}"
+                    from cli_agent_orchestrator.clients.database import InboxModel as _f129_inbox
+                    existing = (
+                        _f129_db.query(_f129_inbox)
+                        .filter(
+                            _f129_inbox.sender_id == drift_sender_key,
+                            _f129_inbox.receiver_id == caller_id,
+                        )
+                        .first()
+                    )
+                    if existing is not None:
+                        return {
+                            "success": False,
+                            "error": {
+                                "code": "frozen_pin_drift_already_notified",
+                                "notice_id": existing.id,
+                                "message": "Drift already reported. This terminal's task is invalidated.",
+                            },
+                        }
+                    # Create drift notice (unfenced — system sender, not terminal principal)
+                    from cli_agent_orchestrator.clients.database import (
+                        MessageStatus as _f129_ms,
+                    )
+
+                    notice_text = format_drift_notice(sender_id, validation)
+                    notice_row = _f129_inbox(
+                        sender_id=drift_sender_key,
+                        receiver_id=caller_id,
+                        message=notice_text,
+                        status=_f129_ms.PENDING.value,
+                    )
+                    _f129_db.add(notice_row)
+                    _f129_db.commit()
+                    # Try to deliver the notice
+                    try:
+                        inbox_service.deliver_pending(
+                            caller_id, registry=get_plugin_registry(request)
+                        )
+                    except Exception:
+                        pass
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "frozen_pin_drift",
+                            "drifted": [
+                                {
+                                    "file_path": r.file_path,
+                                    "expected": r.expected,
+                                    "observed": r.observed,
+                                    "reason": r.reason,
+                                }
+                                for r in validation.drifted
+                            ],
+                            "message": (
+                                "Frozen-pinned authority files have drifted. Your callback "
+                                "was suppressed and a drift notice was delivered to the "
+                                "recorded caller. This terminal's task is invalidated."
+                            ),
+                        },
+                    }
+                elif validation.outcome == "valid":
+                    attestation = build_attestation(validation)
+                    message = f"{attestation}\n\n{message}"
+                # outcome == "no_frozen_pins" → fall through unchanged
+    except HTTPException:
+        raise
+    except Exception:
+        logger.debug("F129 pin validation skipped due to unexpected error", exc_info=True)
+    # ── END F129 frozen-pin validation ──
+
     if receiver_id.startswith("mb_"):
         from cli_agent_orchestrator.services.mailbox_service import create_logical_inbox_message
 

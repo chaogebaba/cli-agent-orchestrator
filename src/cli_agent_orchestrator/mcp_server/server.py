@@ -297,6 +297,7 @@ def _create_terminal(
     model: Optional[str] = None,
     lifecycle: Literal["ephemeral", "sticky"] | None = None,
     use_worktree: bool = False,
+    authority_files: Optional[List[Dict[str, str]]] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -395,6 +396,8 @@ def _create_terminal(
                 json_body["barrier"] = barrier
                 json_body["barrier_timeout_seconds"] = barrier_timeout_seconds
                 json_body["barrier_member_key"] = barrier_member_key
+            if authority_files is not None:
+                json_body["authority_files"] = authority_files
 
         response = cao_http.post(
             f"/sessions/{session_name}/terminals",
@@ -1355,6 +1358,7 @@ def _assign_impl(
     lifecycle: Literal["ephemeral", "sticky"] | None = None,
     engine: Optional[str] = None,
     use_worktree: bool = False,
+    authority_files: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1551,12 +1555,13 @@ def _assign_impl(
             model=model,
             lifecycle=lifecycle,
             use_worktree=use_worktree,
+            authority_files=authority_files,
             **create_kwargs,
         )
 
         window_name = generate_window_name(agent_profile, terminal_id)
         dn = display_name(terminal_id, agent_profile)
-        return {
+        result = {
             "success": True,
             "terminal_id": terminal_id,
             "display_name": dn,
@@ -1571,6 +1576,12 @@ def _assign_impl(
                 + _get_cleanup_nudge()
             ),
         }
+        if authority_files:
+            result["frozen_pins"] = [
+                {"file_path": af["file_path"], "sha256": af["sha256"], "version": 1}
+                for af in authority_files
+            ]
+        return result
 
     except requests.HTTPError as exc:
         detail = (
@@ -1729,6 +1740,15 @@ async def assign(
             "sharing the supervisor's working directory. Default false."
         ),
     ),
+    authority_files: Optional[List[Dict[str, str]]] = Field(
+        default=None,
+        description=(
+            "Optional list of authority files to freeze as version-1 pins for this "
+            "worker. Each entry: {file_path: absolute path, sha256: content hash}. "
+            "Registered atomically BEFORE provider initialization; assign fails "
+            "and the terminal is unwound if pinning fails."
+        ),
+    ),
 ) -> Dict[str, Any]:
     return _assign_impl(
         agent_profile,
@@ -1744,6 +1764,7 @@ async def assign(
         lifecycle,
         engine=engine,
         use_worktree=use_worktree,
+        authority_files=authority_files,
     )
 
 

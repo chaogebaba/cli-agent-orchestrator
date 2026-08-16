@@ -900,6 +900,7 @@ async def create_terminal(
     use_worktree: bool = False,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    authority_files: Optional[List[Dict[str, str]]] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -1421,6 +1422,9 @@ async def create_terminal(
                     "init_owner_epoch": SERVER_INIT_OWNER_EPOCH,
                     "init_deadline_s": float(get_server_settings()["artifact_validate_deadline_s"]),
                 }
+            # F129: Pass authority_files through to the DB publication function
+            if authority_files:
+                init_fields["authority_files"] = authority_files
             delivery_authority = get_delivery_lock(terminal_id)
             mailbox_authority = get_mailbox_authority_lock(session_name, "supervisor")
             with delivery_authority:
@@ -1676,6 +1680,15 @@ async def create_terminal(
             shell_command = None  # unknown until initialize() runs
             if fork_context and initial_message and refresh_base_name is None:
                 initial_message = f"{fork_context.initial_preamble}\n\n{initial_message}"
+            # F129: Prepend [FROZEN-AUTHORITY-PINS] block so worker can
+            # identify pinned files for verify_pin at task start
+            if authority_files and initial_message:
+                from cli_agent_orchestrator.services.authority_pin_service import (
+                    build_frozen_authority_block,
+                )
+
+                pins_block = build_frozen_authority_block(authority_files)
+                initial_message = f"{pins_block}\n\n{initial_message}"
             published_snapshot = get_terminal_metadata(terminal_id)
             if published_snapshot is None:
                 raise RuntimeError("terminal_metadata_missing")
