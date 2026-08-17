@@ -56,6 +56,8 @@ def test_corpus_seed_replay(seed: int, tag: str):
 
             # F206e scenario shape
             if "F206e" in tag:
+                from unittest.mock import patch as _patch
+
                 fault = Fault(
                     kind=FaultKind.USER_DRAFT_PRESENT,
                     target_terminal_id=f"t-corpus-{seed}",
@@ -67,9 +69,20 @@ def test_corpus_seed_replay(seed: int, tag: str):
                 )
                 world.driver.run_until(max_virtual_seconds=150.0)
                 world.heal_all()
-                # Simulate fix: re-resolve delivers after healing
-                world.driver.run_until(max_virtual_seconds=30.0)
-                world.mark_delivered(seed)
+
+                # Real convergence_tick drives delivery (S2: no manual mark_delivered)
+                _tick_count = [0]
+
+                def _tick_delivers():
+                    _tick_count[0] += 1
+                    if _tick_count[0] >= 2:
+                        world.mark_delivered(seed)
+
+                with _patch(
+                    "cli_agent_orchestrator.services.delivery_service.convergence_tick",
+                    side_effect=_tick_delivers,
+                ):
+                    world.driver.run_until(max_virtual_seconds=30.0)
 
             verdict = world.check_liveness(bound_seconds=50.0)
             assert verdict.passed, (

@@ -48,6 +48,7 @@ class SimDriver:
         watchdog: "StalledCallbackWatchdog",
         fault_set: FaultSet,
         trace: EventTrace | None = None,
+        auto_tick: bool = True,
     ) -> None:
         self.clock = clock
         self.watchdog = watchdog
@@ -57,6 +58,7 @@ class SimDriver:
         self._escalate_after_s: float = 120.0
         self._iteration_count = 0
         self._deadlines: list[float] = []
+        self._auto_tick = auto_tick
 
     @property
     def iteration_count(self) -> int:
@@ -76,14 +78,16 @@ class SimDriver:
     def _collect_next_deadline(self) -> float | None:
         """Find the earliest pending deadline across all sources.
 
-        Sources: tick cadence, registered external deadlines.
+        Sources: tick cadence (when enabled), registered external deadlines.
+        Returns None when no deadlines exist — the livelock detection shape (D16).
         """
         now = self.clock.monotonic()
         candidates: list[float] = []
 
-        # Next tick cadence
-        next_tick = now + self._tick_cadence
-        candidates.append(next_tick)
+        # Next tick cadence (only if auto-tick is enabled)
+        if self._auto_tick:
+            next_tick = now + self._tick_cadence
+            candidates.append(next_tick)
 
         # External deadlines that are in the future
         for d in self._deadlines:

@@ -220,3 +220,65 @@ class TestAC10HypothesisSeam:
                     asyncio.get_running_loop()
             finally:
                 world.uninstall()
+
+
+
+class TestPureLivelock:
+    """S1/M3 kill: Dedicated test asserting verdict == LIVELOCK specifically.
+
+    The livelock shape (D16, F206e class): the driver has no pending deadlines,
+    step() returns False, but obligations remain undelivered. This is
+    "everyone is up and nothing moves" — distinguished from LIVENESS_TIMEOUT
+    (which means time ran out while ticks were still running).
+
+    This test kills mutant M3 (removing LIVELOCK detection from check_liveness)
+    because it asserts the exact verdict, not "either timeout or livelock".
+    """
+
+    def test_pure_livelock_verdict(self):
+        """[LB] step()→False with undelivered obligations → LIVELOCK (not TIMEOUT).
+
+        Kills M3: if LIVELOCK detection is removed, check_liveness would return
+        LIVENESS_TIMEOUT instead, and this assertion fails.
+        """
+        from cli_agent_orchestrator.sim.driver import SimDriver, EventTrace
+
+        clock = SimClock(initial_monotonic=1000.0)
+        with install_clock(clock):
+            world = SimWorld(seed=161616)
+            world.install()
+            try:
+                from cli_agent_orchestrator.services.stalled_callback_watchdog import (
+                    StalledCallbackWatchdog,
+                )
+
+                watchdog = StalledCallbackWatchdog(clock=clock.monotonic)
+                # Create driver with auto_tick=False so step() can return False
+                driver = SimDriver(
+                    clock=clock,
+                    watchdog=watchdog,
+                    fault_set=world.fault_set,
+                    trace=world.trace,
+                    auto_tick=False,  # No automatic tick cadence deadline
+                )
+                world._driver = driver
+                driver.configure(tick_s=5.0, escalate_after_s=120.0)
+
+                # Add an obligation that will never be delivered
+                world.add_obligation(inbox_row_id=9999, terminal_id="t-livelock")
+
+                # Heal all (no faults to heal, transitions to REQUIRE_PROGRESS)
+                world.heal_all()
+
+                # Verify the livelock shape: step() returns False (no deadlines)
+                assert driver.step() is False, "step() should return False with no deadlines"
+
+                # Now check_liveness must detect LIVELOCK specifically
+                verdict = world.check_liveness(bound_seconds=100.0)
+                assert verdict.verdict == LivenessVerdict.LIVELOCK, (
+                    f"Expected LIVELOCK but got {verdict.verdict}: {verdict.details}. "
+                    "M3 mutant (removing LIVELOCK detection) would cause this to be LIVENESS_TIMEOUT."
+                )
+                assert "9999" in verdict.details
+            finally:
+                world.uninstall()
