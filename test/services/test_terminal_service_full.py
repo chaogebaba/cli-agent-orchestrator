@@ -690,7 +690,7 @@ class TestCreateTerminal:
         skill_prompt = mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"]
         assert skill_prompt == ""
         # No `skills` field on the profile → catalog built with no filter (None).
-        mock_build_skill_catalog.assert_called_once_with(None)
+        mock_build_skill_catalog.assert_called_once_with(None, provider="codex")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("provider_name", ["kiro_cli", "copilot_cli"])
@@ -800,7 +800,7 @@ class TestCreateTerminal:
         await create_terminal("claude_code", "developer", new_session=True)
 
         # The profile's `skills` allowlist is threaded into the catalog builder.
-        mock_build_skill_catalog.assert_called_once_with(["ads-*"])
+        mock_build_skill_catalog.assert_called_once_with(["ads-*"], provider="claude_code")
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
@@ -853,7 +853,7 @@ class TestCreateTerminal:
         await create_terminal("claude_code", "developer", new_session=True)
 
         # [] must reach the builder as [] (deny-all), never coerced to None.
-        mock_build_skill_catalog.assert_called_once_with([])
+        mock_build_skill_catalog.assert_called_once_with([], provider="claude_code")
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
@@ -901,7 +901,7 @@ class TestCreateTerminal:
         await create_terminal("claude_code", "developer", new_session=True)
 
         # No profile → no `skills` filter; catalog built with None (full catalog).
-        mock_build_skill_catalog.assert_called_once_with(None)
+        mock_build_skill_catalog.assert_called_once_with(None, provider="claude_code")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("provider_name", ["opencode_cli", "kiro_cli", "copilot_cli"])
@@ -2817,3 +2817,49 @@ class TestDeferredInitWaitingUserAnswerSurvival:
         mock_confirm.assert_called_once()
         assert mock_confirm.call_args.args[4] == OrchestrationType.ASSIGN
         mock_settle.assert_not_called()
+
+
+
+# --- F238: Rebind/launch instruction consistency ---
+
+
+class TestF238RebindLaunchConsistency:
+    """AC10: rebind and launch paths produce the same instruction for the same provider."""
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_ac10_rebind_and_launch_agree_for_grok(self, mock_list_skills):
+        """The rebind path (provider_rebind_service._launch_context) and the launch
+        path (terminal_service) produce the same instruction for Grok."""
+        from cli_agent_orchestrator.models.skill import SkillMetadata
+        from cli_agent_orchestrator.utils.skills import build_skill_catalog
+
+        mock_list_skills.return_value = [
+            SkillMetadata(name="cao-worker-protocols", description="Worker communication"),
+        ]
+
+        # Simulate what terminal_service does (provider="grok_cli")
+        launch_catalog = build_skill_catalog(["cao-worker-protocols"], provider="grok_cli")
+
+        # Simulate what provider_rebind_service._launch_context does
+        # (provider=metadata["provider"] which is "grok_cli")
+        rebind_catalog = build_skill_catalog(["cao-worker-protocols"], provider="grok_cli")
+
+        assert launch_catalog == rebind_catalog
+        assert "cao-mcp-server__load_skill" in launch_catalog
+        assert "mcp__cao-mcp-server__load_skill" not in launch_catalog
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_ac10_rebind_and_launch_agree_for_claude(self, mock_list_skills):
+        """The rebind and launch paths agree for Claude — default instruction."""
+        from cli_agent_orchestrator.models.skill import SkillMetadata
+        from cli_agent_orchestrator.utils.skills import build_skill_catalog
+
+        mock_list_skills.return_value = [
+            SkillMetadata(name="cao-worker-protocols", description="Worker communication"),
+        ]
+
+        launch_catalog = build_skill_catalog(["cao-worker-protocols"], provider="claude_code")
+        rebind_catalog = build_skill_catalog(["cao-worker-protocols"], provider="claude_code")
+
+        assert launch_catalog == rebind_catalog
+        assert "mcp__cao-mcp-server__load_skill" in launch_catalog

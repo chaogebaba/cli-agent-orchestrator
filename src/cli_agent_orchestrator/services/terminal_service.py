@@ -1330,7 +1330,7 @@ async def create_terminal(
         # Step 3: Build a runtime skill catalog only for providers that consume
         # it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
         skill_prompt = (
-            build_skill_catalog(profile.skills if profile else None)
+            build_skill_catalog(profile.skills if profile else None, provider=provider)
             if provider in RUNTIME_SKILL_PROMPT_PROVIDERS
             else None
         )

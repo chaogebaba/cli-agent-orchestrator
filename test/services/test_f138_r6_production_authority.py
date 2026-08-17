@@ -940,7 +940,7 @@ class TestCreateTerminalProcesslessReservationGate:
         monkeypatch.setattr(svc, "FIFO_DIR", tmp_path)
         monkeypatch.setattr(svc, "dispatch_plugin_event", lambda *_a, **_k: None)
         monkeypatch.setattr(svc, "get_herdr_inbox_service", lambda: None)
-        monkeypatch.setattr(svc, "build_skill_catalog", lambda _filter: "")
+        monkeypatch.setattr(svc, "build_skill_catalog", lambda _filter, **_kw: "")
         monkeypatch.setattr(
             svc.provider_manager, "create_provider", lambda *_a, **_k: provider_instance
         )
@@ -1178,7 +1178,7 @@ class TestR7ProcesslessGenerationInit:
         monkeypatch.setattr(svc, "FIFO_DIR", tmp_path)
         monkeypatch.setattr(svc, "dispatch_plugin_event", lambda *_a, **_k: None)
         monkeypatch.setattr(svc, "get_herdr_inbox_service", lambda: None)
-        monkeypatch.setattr(svc, "build_skill_catalog", lambda _filter: "")
+        monkeypatch.setattr(svc, "build_skill_catalog", lambda _filter, **_kw: "")
         monkeypatch.setattr(
             svc.provider_manager, "create_provider", lambda *_a, **_k: provider_instance
         )
