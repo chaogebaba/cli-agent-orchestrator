@@ -31,6 +31,14 @@ if [ -n "${CAO_TEST_WORKERS:-}" ]; then
     echo "[fence] CAO_TEST_WORKERS=$CAO_TEST_WORKERS — overriding addopts -n" >&2
 fi
 
+# TCACHE_EMITS_EFFECTIVE_ARGV — D23: tcache probes for this marker before key computation.
+# Print effective argv (NUL-separated) and exit WITHOUT touching the suite lock.
+if [[ "${1:-}" == "--tcache-print-effective-argv" ]]; then
+    shift
+    printf '%s\0' "$@" "${WORKER_OVERRIDE[@]}"
+    exit 0
+fi
+
 # Acquire exclusive flock (F169 serialization)
 exec 9>"$SUITE_LOCK"
 if ! flock -n 9 2>/dev/null; then
