@@ -18,7 +18,7 @@ check-ext-apps-skills:
 	uv run python scripts/vendor_ext_apps_skills.py --check
 
 
-.PHONY: test-smoke test-full test-quick
+.PHONY: test-smoke test-full test-quick test-ci test-live test-hygiene
 
 # --- F237: default-cached fork pytest via tcache ---
 # Resolve tcache from the fork's git common dir (F237 D4).
@@ -34,8 +34,10 @@ export TCACHE_INTERP_CHECK := content
 
 ARGS ?=
 
+# F254 D29: smoke routed through the fence (flock) like its siblings.
+# Not cached (a 5-second suite gains nothing from a content-addressed cache).
 test-smoke:
-	uv run pytest -m smoke
+	"$(PYTEST_WRAPPER)" -m smoke $(ARGS)
 
 # Full suite (all markers, overrides addopts -m filter). Cached by default (F237 D6).
 # Opt-out: make test-full TCACHE=off
@@ -46,3 +48,16 @@ test-full:
 # Opt-out: make test-quick TCACHE=off
 test-quick:
 	"$(TCACHE_BIN)" run "$(PYTEST_WRAPPER)" $(ARGS)
+
+# F254 D29/D30: CI target — identical to test-full marker expression.
+# CI passes extra flags (coverage, ignores) via ARGS=.
+test-ci:
+	"$(TCACHE_BIN)" run "$(PYTEST_WRAPPER)" -m "not live and not e2e" $(ARGS)
+
+# F254 D30: opt-in live/e2e tier (never in a gate).
+test-live:
+	"$(PYTEST_WRAPPER)" -m "live or e2e" $(ARGS)
+
+# F254 D30: hygiene run — serial, budgets enforced.
+test-hygiene:
+	CAO_TEST_TIER_BUDGET=enforce "$(PYTEST_WRAPPER)" -n 0 -m "" $(ARGS)
