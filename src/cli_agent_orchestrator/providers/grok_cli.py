@@ -65,7 +65,11 @@ PROCESSING_PATTERN = (
 COMPLETION_PATTERN = r"^\s*(?:Turn completed in [\d.]+s\.|Worked for [\d.]+s\.)\s*$"
 RUNNING_PATTERN = r"^\s*Worked for [\d.]+s\.\s+\d+ commands? still running\.\s*$"
 WAITING_USER_ANSWER_PATTERN = (
-    r"Run Grok Build in a project directory\?" r"|↑/↓ navigate" r"|Enter:submit"
+    r"Run Grok Build in a project directory\?"
+    r"|↑/↓ navigate"
+    r"|Enter:submit"
+    # F264: first-run trust-directory dialog footer (bottom row)
+    r"|Enter or y to trust\b"
 )
 # Real grok dialogs render in the bottom rows (question + options + footer = 5 rows max).
 # Waiting signals from higher scrollback rows are stale quoted prose, not real dialogs.
