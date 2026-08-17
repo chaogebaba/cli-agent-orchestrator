@@ -44,6 +44,7 @@ from cli_agent_orchestrator.clients.database import update_terminal_resolved_mod
 from cli_agent_orchestrator.clients.database import (
     create_terminal_with_warm_intent,
     delete_terminal_and_warm_intent,
+    delete_terminals_by_session,
     get_ready_provider_session,
     get_terminal_metadata,
 )
@@ -870,6 +871,16 @@ def _capture_f138_issuance_context() -> tuple[int | None, str | None]:
     return issuance_ticks, issuance_boot_id
 
 
+def _resolve_working_directory(working_directory: Optional[str]) -> str:
+    """Resolve launch cwd exactly as the tmux backend does before creation."""
+    return resolve_and_validate_path(
+        working_directory if working_directory is not None else os.getcwd(),
+        allow_create=False,
+        allow_file=False,
+        description="Working directory",
+    )
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -964,14 +975,13 @@ async def create_terminal(
     """
     require_provider_admitted(provider)
     if working_directory is not None:
-        if not os.path.isabs(os.path.expanduser(working_directory)):
-            raise ValueError(
-                f"invalid_working_directory: Working directory must be an absolute path: "
-                f"{working_directory}"
-            )
+        # Expand and resolve early so the preflight disk-space check and
+        # worktree path-override see an absolute, canonical path. Relative
+        # paths (e.g. ".") are resolved via os.getcwd() at this point.
+        expanded = os.path.realpath(os.path.abspath(os.path.expanduser(working_directory)))
         try:
             working_directory = resolve_and_validate_path(
-                working_directory, description="Working directory"
+                expanded, description="Working directory"
             )
         except ValueError as exc:
             raise ValueError(f"invalid_working_directory: {exc}") from exc
@@ -1273,6 +1283,13 @@ async def create_terminal(
         else:
             _worktree_info_dict = None
 
+        # Resolve AFTER the worktree block, not before: when `use_worktree` is set
+        # the block above REPLACES `working_directory` with the new worktree path,
+        # so resolving earlier would both launch tmux in the pre-worktree directory
+        # (defeating the isolation #100 provides) and persist that stale path as the
+        # terminal's working_directory. This is the effective launch cwd either way.
+        resolved_working_directory = _resolve_working_directory(working_directory)
+
         # Step 2: Create tmux session or window
         if new_session:
             # Ensure session name has the CAO prefix for identification
@@ -1289,11 +1306,12 @@ async def create_terminal(
                 session_name,
                 window_name,
                 terminal_id,
-                working_directory,
+                resolved_working_directory,
                 extra_env=env_vars,
             )
             session_created = True  # only set after successful creation
             window_created = True
+            delete_terminals_by_session(session_name)
 
             # Persist forwarded env only after the tmux session actually
             # exists; the failure path below clears it if a later step
@@ -1314,7 +1332,7 @@ async def create_terminal(
                     session_name,
                     window_name,
                     terminal_id,
-                    working_directory,
+                    resolved_working_directory,
                     extra_env=extra_env,
                 )
             except Exception as exc:
@@ -1460,6 +1478,7 @@ async def create_terminal(
                                 group=group,
                                 metadata=metadata,
                                 worktree_info=_worktree_info_dict,
+                                working_directory=resolved_working_directory,
                                 **init_fields,
                             )
                         else:
@@ -1485,6 +1504,7 @@ async def create_terminal(
                                 group=group,
                                 metadata=metadata,
                                 worktree_info=_worktree_info_dict,
+                                working_directory=resolved_working_directory,
                                 **init_fields,
                             )
                     else:
@@ -1513,6 +1533,7 @@ async def create_terminal(
                                     group=group,
                                     metadata=metadata,
                                     worktree_info=_worktree_info_dict,
+                                    working_directory=resolved_working_directory,
                                     **init_fields,
                                 )
                             else:
@@ -1539,6 +1560,7 @@ async def create_terminal(
                                     group=group,
                                     metadata=metadata,
                                     worktree_info=_worktree_info_dict,
+                                    working_directory=resolved_working_directory,
                                     **init_fields,
                                 )
                         else:
@@ -1564,6 +1586,7 @@ async def create_terminal(
                                     group=group,
                                     metadata=metadata,
                                     worktree_info=_worktree_info_dict,
+                                    working_directory=resolved_working_directory,
                                     **init_fields,
                                 )
                             else:
@@ -1589,6 +1612,7 @@ async def create_terminal(
                                     group=group,
                                     metadata=metadata,
                                     worktree_info=_worktree_info_dict,
+                                    working_directory=resolved_working_directory,
                                     **init_fields,
                                 )
         except Exception as exc:

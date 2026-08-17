@@ -84,11 +84,14 @@ class TestPersonaPlanningSeam:
         warnings = [record for record in caplog.records if "shared-auth" in record.message]
         assert len(warnings) == 1
 
+pytestmark = pytest.mark.usefixtures("isolated_memory_db")
+
 
 class TestCreateTerminalCleanup:
     """Test error cleanup paths in create_terminal."""
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
@@ -116,6 +119,7 @@ class TestCreateTerminalCleanup:
         mock_log_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
     ):
         """When provider.initialize() fails, cleanup should kill session, cleanup
         provider, AND roll back the DB terminal row."""
@@ -309,6 +313,7 @@ class TestCreateTerminalCleanup:
         mock_tmux.kill_window.assert_called_once_with("cao-existing", "w1")
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
@@ -336,6 +341,7 @@ class TestCreateTerminalCleanup:
         mock_log_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
     ):
         """Cleanup errors should be swallowed, original error re-raised. The DB
         rollback still runs after cleanup_provider raises, and its own error is
@@ -367,6 +373,7 @@ class TestCreateTerminalCleanup:
         mock_db_delete.assert_called_once_with("tid1", preserve_warm_intent=False)
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
@@ -392,6 +399,7 @@ class TestCreateTerminalCleanup:
         mock_log_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
     ):
         """New sessions without the prefix get it added automatically."""
         from cli_agent_orchestrator.services.terminal_service import create_terminal
@@ -431,6 +439,7 @@ class TestCreateTerminalSessionCleanupGuard:
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch(
         "cli_agent_orchestrator.services.terminal_service.generate_window_name", return_value="w1"
@@ -446,6 +455,7 @@ class TestCreateTerminalSessionCleanupGuard:
         mock_tid,
         mock_wname,
         mock_db_create,
+        mock_db_delete,
         mock_pm,
         mock_tmux,
         mock_log_dir,
@@ -469,11 +479,13 @@ class TestCreateTerminalSessionCleanupGuard:
         mock_tmux.kill_session.assert_not_called()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch(
         "cli_agent_orchestrator.services.terminal_service.generate_window_name", return_value="w1"
@@ -489,11 +501,13 @@ class TestCreateTerminalSessionCleanupGuard:
         mock_tid,
         mock_wname,
         mock_db_create,
+        mock_db_delete,
         mock_pm,
         mock_tmux,
         mock_log_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
     ):
         """When we successfully created the session but a later step fails, cleanup SHOULD kill it."""
         from cli_agent_orchestrator.services.terminal_service import create_terminal
