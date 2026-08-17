@@ -18,11 +18,6 @@ G5 — ``time.sleep(`` with a literal argument > 0.05 in any file whose census
 Precedent: P-ASTGUARD (three in-tree instances) + P-RATCHET.
 """
 
-import pytest
-
-# AST-walk tests scan the entire test tree — naturally > 1 s.
-pytestmark = pytest.mark.slow
-
 from __future__ import annotations
 
 import ast
@@ -31,12 +26,16 @@ from pathlib import Path
 
 import pytest
 
+# AST-walk tests scan the entire test tree — naturally > 1 s.
+pytestmark = pytest.mark.slow
+
 # Paths relative to repo root.
 _TEST_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _TEST_DIR.parent
 _PYPROJECT = _REPO_ROOT / "pyproject.toml"
 _CENSUS_FILE = _TEST_DIR / "tier-census.json"
 _SLEEP_BASELINE = _TEST_DIR / "f254-sleep-baseline.txt"
+_SUBPROCESS_BASELINE = _TEST_DIR / "f254-subprocess-baseline.txt"
 
 
 def _load_registered_markers() -> set[str]:
@@ -92,6 +91,14 @@ def _load_sleep_baseline() -> set[str]:
     if not _SLEEP_BASELINE.exists():
         return set()
     lines = _SLEEP_BASELINE.read_text().splitlines()
+    return {line.strip() for line in lines if line.strip() and not line.startswith("#")}
+
+
+def _load_subprocess_baseline() -> set[str]:
+    """Load the subprocess baseline (set of relative file paths with known subprocess calls)."""
+    if not _SUBPROCESS_BASELINE.exists():
+        return set()
+    lines = _SUBPROCESS_BASELINE.read_text().splitlines()
     return {line.strip() for line in lines if line.strip() and not line.startswith("#")}
 
 
@@ -174,18 +181,29 @@ class TestG1UnregisteredMarkers:
 
 
 class TestG2SubprocessInUnit:
-    """G2: no subprocess.Popen/run or requests.<verb> in unit-tier files."""
+    """G2: no subprocess.Popen/run or requests.<verb> in unit-tier files.
+
+    Like G5, this is scoped to files NOT in the subprocess baseline
+    (existing population predates the guard; shrink-only ratchet).
+    """
 
     _SUBPROCESS_ATTRS = {"Popen", "run", "call", "check_call", "check_output"}
     _REQUESTS_VERBS = {"get", "post", "put", "delete", "patch", "head", "options"}
 
     def test_no_real_io_in_unit_tier(self):
         census = _load_census()
+        baseline = _load_subprocess_baseline()
         violations: list[str] = []
 
         for py_file in _TEST_DIR.rglob("*.py"):
             if "__pycache__" in str(py_file):
                 continue
+
+            rel_str = str(py_file.relative_to(_REPO_ROOT))
+            # Skip files in the baseline (existing violations).
+            if rel_str in baseline:
+                continue
+
             tier = _file_tier_from_census(census, py_file)
             if tier != "unit":
                 continue
