@@ -80,6 +80,28 @@ The Vite dev server proxies API calls to the backend at `localhost:9889`. Make s
 > [CONTRIBUTING.md](CONTRIBUTING.md#recording-test-fixtures-safely). A gitleaks
 > scan gates every PR; run it locally with `scripts/security-scan.sh gitleaks`.
 
+### Suite invoker matrix (F254 D30)
+
+This is the **only** canonical invoker table. Every test invocation goes through
+exactly one of these paths.
+
+| Where you are | What you run | Fenced | Cached | Tier |
+|---------------|--------------|--------|--------|------|
+| root repo | `scripts/run-root-tests.sh` | no | no | root hooks/installer |
+| fork, pre-commit | `make test-quick` | yes | yes | `unit or contract` |
+| fork, merge gate | `make test-full` | yes | yes | `not live and not e2e` |
+| fork, CI | `make test-ci` | yes | yes | `not live and not e2e` |
+| fork, hygiene | `make test-hygiene` | yes | no | all, `-n 0`, budgets enforced |
+| fork, opt-in live | `make test-live` | yes | no | `live or e2e` |
+| agent seat | dispatch a suite lane; never invoke directly | — | — | per m8 hook |
+
+**Rules:**
+- The fork suite runs at `-n 2` only (override via `CAO_TEST_WORKERS`).
+- The fence (`scripts/run-pytest.sh`) acquires `/tmp/cao-suite.lock` via flock —
+  one suite per machine at a time.
+- `make test-smoke` also acquires the flock (routed through the fence).
+- The root suite (`scripts/run-root-tests.sh`) needs no fence — it is pure Python.
+
 ### Unit Tests
 
 Unit tests are fast and use mocked dependencies:
