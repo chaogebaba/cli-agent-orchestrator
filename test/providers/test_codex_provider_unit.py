@@ -103,10 +103,11 @@ class TestCodexProviderInitialization:
         assert provider.blocks_orchestrated_input_while_waiting_user_answer is True
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
-    async def test_initialize_success(self, mock_tmux, mock_wait_shell, mock_wait_status):
+    async def test_initialize_success(self, mock_tmux, mock_wait_shell, mock_wait_status, _mock_sleep):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         mock_tmux.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
@@ -140,10 +141,11 @@ class TestCodexProviderInitialization:
             await provider.initialize()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
-    async def test_initialize_codex_timeout(self, mock_tmux, mock_wait_shell, mock_wait_status):
+    async def test_initialize_codex_timeout(self, mock_tmux, mock_wait_shell, mock_wait_status, _mock_sleep):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False
         mock_tmux.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
@@ -551,12 +553,13 @@ class TestCodexBuildCommand:
             provider._build_codex_command()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_initialize_with_agent_profile(
-        self, mock_tmux, mock_load_profile, mock_wait_shell, mock_wait_status, tmp_path
+        self, mock_tmux, mock_load_profile, mock_wait_shell, mock_wait_status, _mock_sleep, tmp_path
     ):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
@@ -3435,11 +3438,12 @@ class TestCodexProviderTrustPrompt:
         assert status != TerminalStatus.WAITING_USER_ANSWER
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_initialize_includes_waiting_user_answer_in_target_status(
-        self, mock_tmux, mock_wait_shell, mock_wait_status
+        self, mock_tmux, mock_wait_shell, mock_wait_status, _mock_sleep
     ):
         """Regression test for the real, live-reproduced failure: an account with no
         credentials configured yet reaches a correctly-rendered, fully-alive login screen
@@ -3804,11 +3808,12 @@ class TestCodexProviderExitDetection:
         assert provider.get_status("OpenAI Codex (v0.98.0)\n› \n") == TerminalStatus.IDLE
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_initialize_captures_shell_baseline(
-        self, mock_backend, mock_wait_shell, mock_wait_status
+        self, mock_backend, mock_wait_shell, mock_wait_status, _mock_sleep
     ):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True

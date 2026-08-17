@@ -345,6 +345,8 @@ markers = [
     "smoke: marks fast smoke tests (< 200 ms solo, core happy-path coverage)",
     "local_fixture: marks tests depending on machine-local fixture files (xfail when absent)",
     "sim: marks deterministic-simulation (DST) liveness harness tests",
+    "unit: marks pure unit tests (derived by tier plugin or explicit)",
+    "contract: marks contract tests that run against a live cao_server subprocess",
 ]
 asyncio_mode = "strict"
 testpaths = ["test"]
@@ -352,13 +354,17 @@ python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
 # ---------------------------------------------------------------------------
-# Tier invocations (fx147):
-#   smoke:   uv run pytest -m smoke            (< 5 s, ~15-25 tests)
-#   default: uv run pytest                     (existing filter, < 60 s)
-#   full:    uv run pytest -m ""               (everything, unbounded)
+# Tier invocations (fx147 → F254 Phase 0):
+#   smoke:   make test-smoke                   (< 5 s, ~15-25 tests)
+#   quick:   make test-quick                   (unit + contract, pre-commit)
+#   full:    make test-full                    (not live, not e2e — merge gate)
+#   live:    make test-live                    (opt-in only, requires auth)
 # ---------------------------------------------------------------------------
-# Local/default: skip e2e + slow real-binary tests. CI passes --cov explicitly.
-addopts = "-n 4 -m 'not e2e and not slow and not live and not pty'"
+# F254 D20: -n 2 (15 GiB host RAM rule; -n 4 aborted at 1.90 GiB MemAvailable).
+# F254 D21: --dist loadgroup (makes xdist_group marks functional; was inert under -n N default 'load').
+# F254 D22: --strict-markers (unregistered mark = collection error, not silent no-op).
+#           -p no:randomly (deterministic order; plugin not installed but guard against future add).
+addopts = "-n 2 --dist loadgroup --strict-markers -p no:randomly"
 timeout = 30
 timeout_method = "thread"
 faulthandler_timeout = 35

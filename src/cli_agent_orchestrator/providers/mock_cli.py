@@ -78,6 +78,10 @@ class MockCliProvider(BaseProvider):
     # ARM7: configurable startup delay for crash-restart timing tests
     # Set CAO_MOCK_CLI_STARTUP_DELAY_MS to inject a delay before init completes
     _STARTUP_DELAY_ENV = "CAO_MOCK_CLI_STARTUP_DELAY_MS"
+    # F254 D9: busy-hold for UX-3 injection_during_prompt scenario.
+    # Set CAO_MOCK_CLI_BUSY_MS to hold the fake in PROCESSING for that many ms
+    # after each send_input, enabling zero-sleep testing of busy-gate behaviour.
+    _BUSY_MS_ENV = "CAO_MOCK_CLI_BUSY_MS"
 
     def __init__(
         self,
@@ -91,6 +95,8 @@ class MockCliProvider(BaseProvider):
         self._delay_ms = delay_ms
         self._fixture_capability = None
         self._fixture_never_set_event: Optional[asyncio.Event] = None
+        # F254 D9: timestamp until which get_status returns PROCESSING
+        self._busy_until: float = 0.0
 
     def _load_fixture_capability(self):
         """Load the fixture capability from the active manifest if in sandbox mode."""
@@ -270,6 +276,14 @@ class MockCliProvider(BaseProvider):
             enter_count=1,
         )
 
+        # F254 D9: arm the busy-hold window after send, enabling zero-sleep
+        # testing of the UX-3 injection gate (busy worker blocks paste).
+        import time as _time
+
+        _busy_raw = os.environ.get(self._BUSY_MS_ENV, "")
+        if _busy_raw.strip().isdigit() and int(_busy_raw) > 0:
+            self._busy_until = _time.monotonic() + int(_busy_raw) / 1000.0
+
         if cap is not None and cap.variant == "post-send-death":
             # F139 D9: wait for receipt marker, then raise
             receipt_path = cap.state_dir / f"receipt-{self.terminal_id}"
@@ -292,6 +306,12 @@ class MockCliProvider(BaseProvider):
         """Pattern-match the binary's output buffer to determine current state."""
         if not buffer:
             return TerminalStatus.UNKNOWN
+
+        # F254 D9: CAO_MOCK_CLI_BUSY_MS busy-hold window
+        import time as _time
+
+        if self._busy_until and _time.monotonic() < self._busy_until:
+            return TerminalStatus.PROCESSING
 
         # F139 D10: process-less is always ready
         if self._fixture_capability and self._fixture_capability.variant == "process-less":

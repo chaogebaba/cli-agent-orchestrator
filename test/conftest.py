@@ -115,14 +115,13 @@ _AUTH_TEST_DOMAIN = "test.local"
 _AUTH_TEST_AUDIENCE = "cao://test"
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def rsa_keys():
-    """Generate a fresh RSA-2048 keypair for the test.
+    """Generate a session-scoped RSA-2048 keypair for tests.
 
-    Same shape as the local fixture in ``test/security/test_auth.py``
-    (which still wins locally — pytest fixture resolution prefers the
-    closest definition). Lifted here so sibling test modules can mint
-    their own tokens without duplicating the RSA boilerplate.
+    F254 D25: promoted from function to session scope — the value is immutable
+    and regenerating RSA-2048 per test is pure waste (0.17 s setup cluster).
+    Local overrides in test/security/test_auth.py win by proximity (D11).
     """
     from authlib.jose import JsonWebKey
     from cryptography.hazmat.primitives import serialization
@@ -223,29 +222,47 @@ def _reset_backend_registry():
 
 
 @pytest.fixture(autouse=True)
-def _isolate_seam_parity_state():
-    """Keep durable parity windows from leaking across unrelated tests."""
+def _isolate_seam_parity_and_incarnations():
+    """F254 D24: unified teardown for seam-parity and process-incarnation tables.
 
+    Replaces three separate autouse fixtures (two _clean_f138_incarnations +
+    one _isolate_seam_parity_state) with a single DB session, reducing per-test
+    overhead from 3 sessions to 1 (and 4→1 under test/services/).
+    """
     yield
 
-    from cli_agent_orchestrator.clients.database import (
-        SeamParityMismatchModel,
-        SeamParityModel,
-        SessionLocal,
-    )
-    from sqlalchemy import inspect
     from sqlalchemy.exc import SQLAlchemyError
 
     try:
+        from cli_agent_orchestrator.clients.database import (
+            SeamParityMismatchModel,
+            SeamParityModel,
+            SessionLocal,
+        )
+        from sqlalchemy import inspect, text
+
         with SessionLocal() as db:
-            tables = set(inspect(db.get_bind()).get_table_names())
-            for model in (SeamParityMismatchModel, SeamParityModel):
-                if model.__tablename__ in tables:
-                    db.query(model).delete()
+            # Seam-parity cleanup (was _isolate_seam_parity_state)
+            try:
+                tables = set(inspect(db.get_bind()).get_table_names())
+                for model in (SeamParityMismatchModel, SeamParityModel):
+                    if model.__tablename__ in tables:
+                        db.query(model).delete()
+            except (AttributeError, SQLAlchemyError):
+                # Migration and fault-injection tests intentionally replace
+                # SessionLocal with incomplete schemas.
+                pass
+
+            # F138 incarnation cleanup (was _clean_f138_incarnations)
+            try:
+                db.execute(text("DELETE FROM process_incarnations"))
+                db.execute(text("DELETE FROM orphan_reconcile_jobs"))
+            except Exception:
+                pass
+
             db.commit()
-    except (AttributeError, SQLAlchemyError):
-        # Migration and fault-injection tests intentionally replace SessionLocal
-        # with incomplete schemas, fake queries, or commit failures.
+    except Exception:
+        # If SessionLocal itself is broken (e.g. no DB file), skip silently.
         pass
 
 
@@ -268,22 +285,6 @@ def _hermetic_cao_env(monkeypatch):
     # HTTP clients must not inherit the enclosing CAO sandbox binding.
     monkeypatch.delenv("CAO_ENDPOINT", raising=False)
     monkeypatch.delenv("CAO_INSTANCE_ID", raising=False)
-
-
-@pytest.fixture(autouse=True)
-def _clean_f138_incarnations():
-    """F138: clear process_incarnations between tests to prevent UNIQUE violations."""
-    yield
-    try:
-        from cli_agent_orchestrator.clients.database import SessionLocal
-        from sqlalchemy import text
-
-        with SessionLocal() as db:
-            db.execute(text("DELETE FROM process_incarnations"))
-            db.execute(text("DELETE FROM orphan_reconcile_jobs"))
-            db.commit()
-    except Exception:
-        pass
 
 
 @pytest.fixture
