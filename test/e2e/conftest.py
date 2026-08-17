@@ -26,12 +26,11 @@ import requests
 from cli_agent_orchestrator.constants import API_BASE_URL
 
 
-def pytest_collection_modifyitems(items):
-    """Mark real E2E tests live while keeping the no-op script-runner subtree local."""
-    for item in items:
-        path = str(item.path)
-        if "/test/e2e/" in path and "/test/e2e/script_runner/" not in path:
-            item.add_marker(pytest.mark.live)
+# NOTE: The pytest_collection_modifyitems hook that previously lived here
+# (marking /test/e2e/ items as ``live``) has been folded into
+# test/plugins/tier_marks.py rule 2 (F254 D15). The tier plugin is
+# authoritative for all tier derivation; keeping a duplicate here would
+# double-mark items.
 
 
 @pytest.fixture(scope="session", autouse=True)
