@@ -130,6 +130,11 @@ class GrokCliProvider(BaseProvider):
         self._prepare_grok_home()
 
     @property
+    def resolved_model(self) -> Optional[str]:
+        """Return the effective model resolved during command build."""
+        return getattr(self, '_resolved_model', None)
+
+    @property
     def paste_enter_count(self) -> int:
         """Grok submits bracketed-pasted input with one Enter."""
         return 1
@@ -188,6 +193,7 @@ class GrokCliProvider(BaseProvider):
                 "model",
                 "model",
             )
+        self._resolved_model = model if (isinstance(model, str) and model) else None
         if isinstance(model, str) and model:
             command_parts.extend(["-m", model])
 

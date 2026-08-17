@@ -901,6 +901,7 @@ class CodexProvider(BaseProvider):
 
         model, codex_config = _resolved_codex_profile_config(profile, self._agent_profile)
         resolved_model = self._model if self._model is not None else model
+        self._resolved_model = resolved_model if resolved_model else None
         if resolved_model:
             command_parts.extend(["--model", resolved_model])
 
@@ -1497,6 +1498,11 @@ class CodexProvider(BaseProvider):
     # ClaudeCodeProvider reference implementation for a provider that DOES need
     # a purpose-built override.
     supports_screen_detection = True
+
+    @property
+    def resolved_model(self) -> Optional[str]:
+        """Return the effective model resolved during command build."""
+        return getattr(self, '_resolved_model', None)
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:

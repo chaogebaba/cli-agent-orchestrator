@@ -226,6 +226,11 @@ class AntigravityCliProvider(BaseProvider):
         self._turns: int = 0
 
     @property
+    def resolved_model(self) -> Optional[str]:
+        """Return the effective model (direct, no TOML chain)."""
+        return self._model
+
+    @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
         """agy's approval dialogs / pickers consume pasted text as the answer.
 

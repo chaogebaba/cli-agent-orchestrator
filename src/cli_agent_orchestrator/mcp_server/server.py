@@ -1204,6 +1204,16 @@ async def _handoff_impl(
 
         execution_time = time.time() - start_time
         dn = display_name(terminal_id, agent_profile) if terminal_id else terminal_id
+        # F127: read resolved_model from DB (handoff blocks until completion, so always known)
+        _f127_handoff_model = None
+        if terminal_id:
+            try:
+                from cli_agent_orchestrator.services.terminal_service import get_terminal_metadata
+                _hm = get_terminal_metadata(terminal_id)
+                if _hm:
+                    _f127_handoff_model = _hm.get("resolved_model")
+            except Exception:
+                pass
         return HandoffResult(
             success=True,
             message=f"Successfully handed off to {dn} ({provider}) in {execution_time:.2f}s"
@@ -1212,6 +1222,7 @@ async def _handoff_impl(
             terminal_id=terminal_id,
             display_name=dn,
             window_name=data.get("window_name"),
+            resolved_model=_f127_handoff_model,
         )
 
     except Exception as e:
@@ -1224,6 +1235,94 @@ async def _handoff_impl(
 
 
 # Shared by both handoff and assign's tool signatures below.
+
+
+@mcp.tool()
+async def interrupt_terminal(
+    terminal_id: str = Field(description="Terminal ID to interrupt"),
+) -> dict:
+    """Cooperatively interrupt a running terminal.
+
+    Sends the provider-appropriate interrupt sequence (e.g. Ctrl-C, Escape) to stop
+    the current task. Terminal remains alive and reusable. Only works when
+    terminal status is PROCESSING.
+    """
+    import asyncio as _asyncio
+
+    try:
+        from cli_agent_orchestrator.services.terminal_service import get_terminal_metadata
+        metadata = get_terminal_metadata(terminal_id)
+        if not metadata:
+            return {"success": False, "terminal_id": terminal_id, "message": "Terminal not found"}
+
+        # Guard: reject if init_pending
+        if metadata.get("init_state") == "init_pending":
+            return {
+                "success": False,
+                "terminal_id": terminal_id,
+                "prior_status": None,
+                "final_status": None,
+                "message": "Cannot interrupt during initialization",
+            }
+
+        # Guard: only interrupt PROCESSING terminals
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+        current_status = status_monitor.get_status(terminal_id).value
+        if current_status != "processing":
+            return {
+                "success": False,
+                "terminal_id": terminal_id,
+                "prior_status": current_status,
+                "final_status": current_status,
+                "message": f"Terminal is not processing (status: {current_status})",
+            }
+
+        # Get provider interrupt keys
+        from cli_agent_orchestrator.providers.manager import get_provider_class
+        provider_type = metadata.get("provider", "")
+        provider_cls = get_provider_class(provider_type)
+        keys = provider_cls.interrupt_keys
+
+        # Send interrupt keys
+        prior_status = current_status
+        for key in keys:
+            _send_terminal_key(terminal_id, key)
+
+        # Poll for status transition (up to 10s, 0.5s interval)
+        timeout = 10.0
+        interval = 0.5
+        elapsed = 0.0
+        final_status = current_status
+        while elapsed < timeout:
+            await _asyncio.sleep(interval)
+            elapsed += interval
+            final_status = status_monitor.get_status(terminal_id).value
+            if final_status != "processing":
+                return {
+                    "success": True,
+                    "terminal_id": terminal_id,
+                    "prior_status": prior_status,
+                    "final_status": final_status,
+                    "message": f"Terminal interrupted successfully (transitioned to {final_status})",
+                }
+
+        # Timeout - provider ignored the interrupt
+        return {
+            "success": False,
+            "terminal_id": terminal_id,
+            "prior_status": prior_status,
+            "final_status": "processing",
+            "message": "Timeout: terminal did not transition away from processing within 10s",
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "terminal_id": terminal_id,
+            "message": f"Interrupt failed: {str(e)}",
+        }
+
+
 _model_field_desc = (
     "Optional model override for the worker agent (e.g. a concrete model name/id "
     "accepted by the resolved provider's own --model flag). Takes precedence over "
@@ -1561,12 +1660,24 @@ def _assign_impl(
 
         window_name = generate_window_name(agent_profile, terminal_id)
         dn = display_name(terminal_id, agent_profile)
+        # F127: for kiro_cli, resolved_model is known immediately (pre-resolved).
+        # For other providers, it's None until init completes (deferred init).
+        _f127_resolved = None
+        if agent_profile:
+            try:
+                from cli_agent_orchestrator.services.terminal_service import get_terminal_metadata
+                _f127_meta = get_terminal_metadata(terminal_id)
+                if _f127_meta:
+                    _f127_resolved = _f127_meta.get("resolved_model")
+            except Exception:
+                pass
         result = {
             "success": True,
             "terminal_id": terminal_id,
             "display_name": dn,
             "window_name": window_name,
             "forked_from": forked_from_info,
+            "resolved_model": _f127_resolved,
             "init_health": "launching",
             "message": (
                 f"Task assigned to {dn} ({terminal_id}). "

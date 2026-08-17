@@ -131,6 +131,11 @@ class HermesProvider(BaseProvider):
         self._stable_idle_timer_count = 0
 
     @property
+    def resolved_model(self) -> Optional[str]:
+        """Return the effective model resolved during command build."""
+        return getattr(self, '_resolved_model', None)
+
+    @property
     def paste_enter_count(self) -> int:
         """Hermes submits bracketed paste with a single Enter."""
         return 1
@@ -164,6 +169,7 @@ class HermesProvider(BaseProvider):
         # `model` parameter) and wins over the profile's own static model
         # field when both are given.
         resolved_model = self._model or (profile.model if profile else None)
+        self._resolved_model = resolved_model if resolved_model else None
         if resolved_model:
             command_parts.extend(["--model", resolved_model])
 

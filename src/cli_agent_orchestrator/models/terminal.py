@@ -87,6 +87,7 @@ class Terminal(BaseModel):
     reparented_from: Optional[str] = None
     allowed_tools: Optional[List[str]] = Field(None, description="Allowed CAO tools")
     engine: Optional[KiroEngine] = Field(None, description="Resolved Kiro engine")
+    resolved_model: Optional[str] = Field(None, description="Effective model resolved at init time")
     shell_command: Optional[str] = Field(
         None, description="Shell process name captured before kiro launch"
     )
