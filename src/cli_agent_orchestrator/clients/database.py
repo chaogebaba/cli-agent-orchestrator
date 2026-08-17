@@ -3291,39 +3291,45 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
     """List all terminals in a tmux session."""
     with SessionLocal() as db:
         terminals = db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).all()
-        return [
-            {
-                "id": t.id,
-                "tmux_session": t.tmux_session,
-                "tmux_window": t.tmux_window,
-                "provider": t.provider,
-                "agent_profile": t.agent_profile,
-                "working_directory": t.working_directory,
-                "allowed_tools": (
-                    __import__("json").loads(t.allowed_tools)
-                    if isinstance(t.allowed_tools, str) and t.allowed_tools
-                    else None
-                ),
-                "shell_command": t.shell_command,
-                "caller_id": t.caller_id,
-                "caller_mailbox_id": t.caller_mailbox_id,
-                "lifecycle": t.lifecycle,
-                "reparented_from": t.reparented_from,
-                "provider_session_id": t.provider_session_id,
-                "recovery_state": t.recovery_state,
-                "recovery_error": t.recovery_error,
-                "recovery_updated_at": t.recovery_updated_at,
-                "fallback_terminal_id": t.fallback_terminal_id,
-                "init_state": t.init_state,
-                "init_started_at": t.init_started_at,
-                "init_owner_epoch": t.init_owner_epoch,
-                "init_failure_token": t.init_failure_token,
-                "init_deadline_s": t.init_deadline_s,
-                "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
-                "last_active": t.last_active,
-            }
-            for t in terminals
-        ]
+        results = []
+        for t in terminals:
+            try:
+                results.append({
+                    "id": t.id,
+                    "tmux_session": t.tmux_session,
+                    "tmux_window": t.tmux_window,
+                    "provider": t.provider,
+                    "agent_profile": t.agent_profile,
+                    "working_directory": t.working_directory,
+                    "allowed_tools": (
+                        __import__("json").loads(t.allowed_tools)
+                        if isinstance(t.allowed_tools, str) and t.allowed_tools
+                        else None
+                    ),
+                    "shell_command": t.shell_command,
+                    "caller_id": t.caller_id,
+                    "caller_mailbox_id": t.caller_mailbox_id,
+                    "lifecycle": t.lifecycle,
+                    "reparented_from": t.reparented_from,
+                    "provider_session_id": t.provider_session_id,
+                    "recovery_state": t.recovery_state,
+                    "recovery_error": t.recovery_error,
+                    "recovery_updated_at": t.recovery_updated_at,
+                    "fallback_terminal_id": t.fallback_terminal_id,
+                    "init_state": t.init_state,
+                    "init_started_at": t.init_started_at,
+                    "init_owner_epoch": t.init_owner_epoch,
+                    "init_failure_token": t.init_failure_token,
+                    "init_deadline_s": t.init_deadline_s,
+                    "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
+                    "last_active": t.last_active,
+                })
+            except Exception as exc:
+                # F264: skip stale/zombie rows whose attribute load raises
+                # ObjectDeletedError (or similar) instead of crashing the pass
+                logger.debug("list_terminals_by_session: skipping stale row: %s", exc)
+                continue
+        return results
 
 
 def update_last_active(terminal_id: str) -> bool:
