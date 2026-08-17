@@ -251,6 +251,11 @@ class KimiCliProvider(BaseProvider):
         self._last_dispatch_time = 0.0
 
     @property
+    def resolved_model(self) -> Optional[str]:
+        """Return the effective model resolved during command build."""
+        return getattr(self, '_resolved_model', None)
+
+    @property
     def paste_enter_count(self) -> int:
         """Kimi CLI's prompt_toolkit submits on single Enter after bracketed paste."""
         return 1
@@ -326,6 +331,7 @@ class KimiCliProvider(BaseProvider):
         # field when both are given; applies even with no profile at all
         # (matches codex.py/hermes.py's own resolution shape).
         resolved_model = self._model or (profile.model if profile else None)
+        self._resolved_model = resolved_model if resolved_model else None
         if resolved_model:
             command_parts.extend(["--model", resolved_model])
 

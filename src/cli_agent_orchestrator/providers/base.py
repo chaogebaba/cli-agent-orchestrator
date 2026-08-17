@@ -92,6 +92,8 @@ class BaseProvider(ABC):
     launch_health_grace_s: float = 0.0
     # F139 r5 D15: empty-shell fixture signals confirmed-dead to _provider_child_alive
     launch_health_failure_confirmed: bool = False
+    # F127: provider-specific interrupt key sequence for cooperative interrupt
+    interrupt_keys: list[str] = ["C-c"]
     """Abstract base class for CLI tool providers.
 
     All CLI providers must inherit from this class and implement the abstract methods.
@@ -182,6 +184,17 @@ class BaseProvider(ABC):
     @shell_baseline.setter
     def shell_baseline(self, value: Optional[str]) -> None:
         self._shell_baseline = value
+
+    @property
+    def resolved_model(self) -> Optional[str]:
+        """Return the effective model string after initialization.
+
+        Providers override to return the model name that was actually passed to
+        their CLI. Default returns None (honest: model unknown or not applicable).
+        NEVER re-derives from argv or re-resolves TOML — this is the stored value
+        from construction/init time only.
+        """
+        return None
 
     @property
     def status(self) -> TerminalStatus:

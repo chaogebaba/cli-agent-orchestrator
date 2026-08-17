@@ -225,6 +225,11 @@ class KiroCliProvider(BaseProvider):
         self._new_tui_header_pattern = rf"{re.escape(self._agent_profile)}\s+·\s+.*·\s+◔\s*\d+%"
 
     @property
+    def resolved_model(self) -> Optional[str]:
+        """Return the effective model resolved by the service layer."""
+        return getattr(self, '_model', None)
+
+    @property
     def paste_enter_count(self) -> int:
         """Kiro CLI 2.11 needs 2 Enters after bracketed paste to submit.
 

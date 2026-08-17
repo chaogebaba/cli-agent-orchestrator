@@ -354,6 +354,17 @@ class ClaudeCodeProvider(BaseProvider):
     blocks_orchestrated_input_while_waiting_user_answer = True
     _TAIL_HASH_LINES = 30
 
+    # F127: claude_code uses Escape to interrupt
+    interrupt_keys: list[str] = ["Escape"]
+
+    @property
+    def resolved_model(self) -> "Optional[str]":
+        """Return the effective model resolved during command build.
+
+        Returns None for native_agent path (honest: CAO does not control model).
+        """
+        return getattr(self, '_resolved_model', None)
+
     def __init__(
         self,
         terminal_id: str,
@@ -495,11 +506,13 @@ class ClaudeCodeProvider(BaseProvider):
             # for native-agent wrappers.
             # CAO_TERMINAL_ID propagates via tmux pane env inheritance.
             command_parts.extend(["--agent", native])
+            self._resolved_model = None  # F127: honest unknown for native_agent path
         elif self._agent_profile is not None and profile is None:
             # No CAO profile exists — pass agent name directly to Claude Code's
             # native agent store (~/.claude/agents/). Same thin-orchestrator
             # pattern as the Kiro CLI provider.
             command_parts.extend(["--agent", self._agent_profile])
+            self._resolved_model = self._model if self._model else None  # F127
             if self._model:
                 command_parts.extend(["--model", self._model])
         elif profile is not None:
@@ -516,6 +529,7 @@ class ClaudeCodeProvider(BaseProvider):
                 profile_defaults, defaults, profile, "model", "model"
             )
             resolved_model = self._model if self._model is not None else model
+            self._resolved_model = resolved_model if resolved_model else None  # F127
             if resolved_model:
                 command_parts.extend(["--model", resolved_model])
             effort = resolve_provider_string_option(

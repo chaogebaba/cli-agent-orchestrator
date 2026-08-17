@@ -71,6 +71,11 @@ class CopilotCliProvider(BaseProvider):
         self._copilot_help_text_cache: Optional[str] = None
 
     @property
+    def resolved_model(self) -> Optional[str]:
+        """Return the effective model (direct, no TOML chain)."""
+        return self._model
+
+    @property
     def paste_enter_count(self) -> int:
         return 1
 

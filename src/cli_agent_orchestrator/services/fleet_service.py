@@ -146,6 +146,7 @@ def build_fleet(session_name: str) -> dict[str, Any]:
                 "init_health": init_health,
                 "since_last_input": since_last_input,
                 "lifecycle": row.get("lifecycle", "ephemeral"),
+                "resolved_model": row.get("resolved_model"),
                 "reparented_from": row.get("reparented_from"),
             }
         )

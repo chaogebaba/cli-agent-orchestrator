@@ -167,6 +167,8 @@ class TerminalModel(Base):
     last_notified_inbox_id = Column(Integer, nullable=True)
     last_doorbell_row_id = Column(Integer, nullable=True)
     last_active = Column(DateTime(timezone=True), default=_utcnow)
+    # F127: resolved model string persisted post-initialize
+    resolved_model = Column(String, nullable=True)
     __table_args__ = (
         CheckConstraint(
             "lifecycle IN ('ephemeral','sticky')",
@@ -1151,6 +1153,7 @@ def init_db() -> None:
     _migrate_fx191_trace_extension()
     _migrate_f218_dead_supervisor_safety()
     _migrate_f129_frozen_authority()
+    _migrate_f127_resolved_model()
 
 
 def _migrate_f218_dead_supervisor_safety() -> None:
@@ -1303,6 +1306,19 @@ def _migrate_f129_frozen_authority() -> None:
             "CREATE INDEX IF NOT EXISTS ix_inbox_sender_receiver "
             "ON inbox (sender_id, receiver_id)"
         ))
+
+
+
+def _migrate_f127_resolved_model() -> None:
+    """F127: Add nullable resolved_model column to terminals table."""
+    from sqlalchemy import text as _text
+
+    with engine.begin() as connection:
+        columns = connection.execute(_text("PRAGMA table_info(terminals)")).mappings().all()
+        if columns and not any(column["name"] == "resolved_model" for column in columns):
+            connection.execute(
+                _text("ALTER TABLE terminals ADD COLUMN resolved_model TEXT DEFAULT NULL")
+            )
 
 
 def _migrate_fx191_trace_extension() -> None:
@@ -2724,6 +2740,7 @@ def create_terminal(
     metadata: Optional[Dict[str, Any]] = None,
     worktree_info: Optional[Dict[str, str]] = None,
     authority_files: Optional[List[Dict[str, str]]] = None,
+    resolved_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -2751,6 +2768,7 @@ def create_terminal(
             group=_json.dumps(group) if group else None,
             metadata_json=_json.dumps(metadata) if metadata else None,
             worktree_info=_json.dumps(worktree_info) if worktree_info else None,
+            resolved_model=resolved_model,
         )
         db.add(terminal)
         db.flush()
@@ -2847,6 +2865,7 @@ def create_terminal_with_warm_intent(
     metadata: Optional[Dict[str, Any]] = None,
     worktree_info: Optional[Dict[str, str]] = None,
     authority_files: Optional[List[Dict[str, str]]] = None,
+    resolved_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Publish terminal metadata and a fork-only warm intent together."""
     import json as _json
@@ -2873,6 +2892,7 @@ def create_terminal_with_warm_intent(
             group=_json.dumps(group) if group else None,
             metadata_json=_json.dumps(metadata) if metadata else None,
             worktree_info=_json.dumps(worktree_info) if worktree_info else None,
+            resolved_model=resolved_model,
         )
         db.add(terminal)
         db.flush()
@@ -3312,6 +3332,18 @@ def update_terminal_shell_command(terminal_id: str, shell_command: str) -> bool:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal:
             terminal.shell_command = shell_command
+            db.commit()
+            return True
+        return False
+
+
+
+def update_terminal_resolved_model(terminal_id: str, resolved_model: str) -> bool:
+    """F127: Persist the resolved model string for a terminal."""
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal:
+            terminal.resolved_model = resolved_model
             db.commit()
             return True
         return False

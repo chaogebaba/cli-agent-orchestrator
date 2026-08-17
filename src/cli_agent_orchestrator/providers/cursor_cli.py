@@ -249,6 +249,11 @@ class CursorCliProvider(BaseProvider):
         self._turns: int = 0
 
     @property
+    def resolved_model(self) -> Optional[str]:
+        """Return the effective model (direct, no TOML chain)."""
+        return self._model
+
+    @property
     def paste_enter_count(self) -> int:
         """Cursor CLI submits on a single Enter after bracketed paste."""
         return 1

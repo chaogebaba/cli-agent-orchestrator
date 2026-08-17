@@ -40,6 +40,7 @@ from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
+from cli_agent_orchestrator.clients.database import update_terminal_resolved_model
 from cli_agent_orchestrator.clients.database import (
     create_terminal_with_warm_intent,
     delete_terminal_and_warm_intent,
@@ -1423,6 +1424,9 @@ async def create_terminal(
                     "init_owner_epoch": SERVER_INIT_OWNER_EPOCH,
                     "init_deadline_s": float(get_server_settings()["artifact_validate_deadline_s"]),
                 }
+            # F127: for kiro_cli, resolved_model is known pre-init; persist at creation
+            if provider == "kiro_cli" and model:
+                init_fields["resolved_model"] = model
             # F129: Pass authority_files through to the DB publication function
             if authority_files:
                 init_fields["authority_files"] = authority_files
@@ -3682,6 +3686,18 @@ def _schedule_deferred_init(
                     terminal_id,
                     shell_command,
                 )
+            # F127: persist resolved_model post-initialize
+            _f127_resolved = provider_instance.resolved_model
+            if _f127_resolved is not None:
+                await _tracked_blocking(
+                    terminal_id,
+                    generation,
+                    "abandonable",
+                    "capture_persist",
+                    update_terminal_resolved_model,
+                    terminal_id,
+                    _f127_resolved,
+                )
             if prepared_message:
                 # For assign/handoff the sender is the CALLER (the supervisor),
                 # not this MCP server; _assign_impl on the MCP-server side already
@@ -4009,6 +4025,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "allowed_tools": metadata.get("allowed_tools"),
             "provider_session_id": metadata.get("provider_session_id"),
             "engine": metadata.get("engine"),
+            "resolved_model": metadata.get("resolved_model"),
             "group": metadata.get("group"),
             "metadata": metadata.get("metadata"),
             "status": status,
