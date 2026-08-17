@@ -1,0 +1,9 @@
+# F254 D18 G5: sleep baseline (shrink-only ratchet).
+# Files listed here are exempt from the time.sleep(>0.05) AST guard
+# in unit/contract-tier tests. Remove entries as sleeps are fixed.
+# Format: one relative file path per line (from repo root).
+test/services/test_fx170_native_doorbell.py
+test/services/test_fx179_epoch_timestamps.py
+test/services/test_inbox_service.py
+test/services/test_wiki_lint_offload.py
+test/utils/test_atomic_file.py
