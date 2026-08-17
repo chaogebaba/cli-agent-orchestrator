@@ -64,15 +64,15 @@ def _load_entries() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config: Config, items: list[Item]) -> None:
     """Apply quarantine behaviours to collected items.
 
-    This hook intentionally does NOT use trylast=True because xdist's remote
-    worker processes xdist_group markers in its own pytest_collection_modifyitems
-    (without priority). We must add our markers BEFORE xdist appends the @group
-    suffix to nodeids. Running at default priority (before tier_marks uses trylast)
-    is safe because quarantine only adds xdist_group/xfail markers — it doesn't
-    interfere with tier derivation.
+    tryfirst=True is REQUIRED: xdist/remote.py has its own
+    pytest_collection_modifyitems (default priority) that reads xdist_group
+    markers and appends @group suffixes to nodeids. If we run after xdist,
+    it sees no markers and skips the suffix — loadgroup scheduler never
+    groups the tests. Running first ensures our markers are visible to xdist.
     """
     entries = _load_entries()
     if not entries:

@@ -100,6 +100,69 @@ reason  = "Fleet lifecycle race under xdist; passes serial"
 owner   = "pre-existing"
 expires = "2026-10-01"
 
+[[entry]]
+nodeid  = "test/services/test_f72_fleet_lifecycle.py::test_ac13_held_row_target_exists_after_delete"
+class   = "worker_crash"
+reason  = "P4 empirical gate R1: FAILED under -n 2, passes serial (reviewer-verified)"
+owner   = "pre-existing"
+expires = "2026-10-01"
+
+[[entry]]
+nodeid  = "test/services/test_stage0_flip_machinery.py::test_backend_failure_warning_is_rate_limited_per_terminal"
+class   = "worker_crash"
+reason  = "P4 empirical gate R1: FAILED under -n 2, passes serial (reviewer-verified)"
+owner   = "pre-existing"
+expires = "2026-10-01"
+
+[[entry]]
+nodeid  = "test/services/test_ready_deadline_edge_probe.py::test_ready_completion_at_deadline_has_one_lawful_owner"
+class   = "worker_crash"
+reason  = "P4 R2 gate run 4: FAILED under -n 2, passes serial"
+owner   = "pre-existing"
+expires = "2026-10-01"
+
+[[entry]]
+nodeid  = "test/services/test_fx191_convergent_delivery.py::TestS2AC14MultiTickConvergence::test_safety_gate_obligations_escalate_within_bound[waiting_user_answer]"
+class   = "worker_crash"
+reason  = "P4 R2 gate: FAILED under -n 2, passes serial (timing-dependent convergence)"
+owner   = "pre-existing"
+expires = "2026-10-01"
+
+[[entry]]
+nodeid  = "test/services/test_f72_fleet_lifecycle.py::test_uncertain_kill_stops_keeps_row_and_releases_quarantine_exit_lease"
+class   = "worker_crash"
+reason  = "P4 R2 gate: FAILED under -n 2, passes serial (fleet lifecycle race)"
+owner   = "pre-existing"
+expires = "2026-10-01"
+
+[[entry]]
+nodeid  = "test/services/test_fifo_reader.py::TestReaderThreadLifecycle::test_stop_right_after_writer_eof_does_not_leak"
+class   = "worker_crash"
+reason  = "P4 R2 gate: FAILED under -n 2, passes serial (FIFO teardown race)"
+owner   = "pre-existing"
+expires = "2026-10-01"
+
+[[entry]]
+nodeid  = "test/providers/test_claude_transcript_hook.py::test_project_and_generated_session_start_hooks_both_fire"
+class   = "worker_crash"
+reason  = "P4 R2 gate: FAILED under -n 2, passes serial (subprocess hook timing)"
+owner   = "pre-existing"
+expires = "2026-10-01"
+
+[[entry]]
+nodeid  = "test/providers/test_claude_transcript_hook.py::test_project_and_two_generated_hooks_are_additive_and_failure_isolated[0]"
+class   = "worker_crash"
+reason  = "P4 R2 gate: FAILED under -n 2, passes serial (subprocess hook timing)"
+owner   = "pre-existing"
+expires = "2026-10-01"
+
+[[entry]]
+nodeid  = "test/providers/test_claude_transcript_hook.py::test_project_and_two_generated_hooks_are_additive_and_failure_isolated[1]"
+class   = "worker_crash"
+reason  = "P4 R2 gate: FAILED under -n 2, passes serial (subprocess hook timing)"
+owner   = "pre-existing"
+expires = "2026-10-01"
+
 # --- Pre-existing: environment-dependent, fail serial too ---
 
 [[entry]]
