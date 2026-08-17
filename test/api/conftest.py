@@ -34,13 +34,19 @@ class TestClientWithHost(TestClient):
         return super().request(method, url, **kwargs)
 
 
-@pytest.fixture
-def client(monkeypatch):
-    """Test client with proper Host header for security middleware."""
-    monkeypatch.setattr(
+@pytest.fixture(scope="module")
+def client(request):
+    """Module-scoped test client with proper Host header for security middleware.
+
+    F254 D25: promoted from function to module scope — TestClient(app) holds no
+    per-test state that existing autouse fixtures do not already reset.
+    """
+    from unittest.mock import patch
+
+    with patch(
         "cli_agent_orchestrator.services.terminal_guard_service."
         "get_ready_provider_session_by_source_terminal",
         lambda _terminal_id: None,
-    )
-    app.state.plugin_registry = PluginRegistry()
-    return TestClientWithHost(app)
+    ):
+        app.state.plugin_registry = PluginRegistry()
+        yield TestClientWithHost(app)
