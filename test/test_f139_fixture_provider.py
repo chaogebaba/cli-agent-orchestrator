@@ -1038,6 +1038,7 @@ class TestProductionSendInputReachability:
 class TestMockCliEmptyShell:
     """D8: empty-shell initialize returns success only after fixture exit."""
 
+    @pytest.mark.slow  # F254 D19: exceeds unit budget
     def test_initialize_waits_for_shell_baseline_return(self, tmp_path):
         from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
 

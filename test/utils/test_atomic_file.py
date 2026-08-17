@@ -389,6 +389,7 @@ def _hold_lock_in_subprocess(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="fcntl.flock is POSIX-only")
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_second_writer_blocked_by_subprocess_holding_lock(tmp_path: Path) -> None:
     """Multi-process coverage of the lock: a real OS subprocess acquires and
     holds the CAO-owned lockfile via flock (the same mechanism

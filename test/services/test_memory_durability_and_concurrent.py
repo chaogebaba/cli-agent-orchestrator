@@ -166,6 +166,7 @@ def _worker_store(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="fcntl not available on Windows")
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_concurrent_writers_both_present(tmp_path: Path) -> None:
     pytest.importorskip("fcntl")
 

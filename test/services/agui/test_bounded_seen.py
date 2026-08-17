@@ -82,6 +82,7 @@ def test_supervisor_dashboard_seen_is_bounded() -> None:
     assert len(d._seen) == before
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_session_timeline_seen_and_started_ids_are_bounded() -> None:
     t = MultiAgentSessionTimeline(RecordingUiEmitter())
     n = _SEEN_CAP + 5000

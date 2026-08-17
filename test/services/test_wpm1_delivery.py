@@ -219,6 +219,7 @@ def test_wpm1_atomic_helper_acquires_immediate_write_lock(wpm1_db):
     assert "BEGIN" not in statements
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_wpm1_busy_exhaustion_is_closed_and_next_wake_retries_pair(wpm1_db):
     message, attempt = _ambiguous()
     lock = wpm1_db.kw["bind"].raw_connection()
@@ -242,6 +243,7 @@ def test_wpm1_busy_exhaustion_is_closed_and_next_wake_retries_pair(wpm1_db):
     )
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_wpm1_service_merge_busy_aborted_never_flips_pending_failed(wpm1_db):
     message, _attempt = _ambiguous()
     lock = wpm1_db.kw["bind"].raw_connection()
@@ -1210,6 +1212,7 @@ def test_successor_writer_pins_exact_exhausted_source_despite_newer_overlap(wpm1
         )
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_successor_restart_after_exhaustion_merge_injects_once(wpm1_db):
     prior_evidence = {
         "resolution_kind": "binding",
@@ -1333,6 +1336,7 @@ def test_successor_restart_after_begin_commit_recovers_and_never_respawns(wpm1_d
         assert json.loads(recovered.evidence)["crash_recovery"]
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_successor_restart_after_paste_return_recovers_and_never_respawns(wpm1_db):
     prior_evidence = {
         "resolution_kind": "binding",

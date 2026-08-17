@@ -2,6 +2,11 @@
 import ast
 from pathlib import Path
 
+import pytest
+
+# F254 D19: entire module exceeds unit budget (AST walk over full source tree).
+pytestmark = pytest.mark.slow
+
 SRC = Path(__file__).resolve().parents[1] / "src" / "cli_agent_orchestrator"
 
 

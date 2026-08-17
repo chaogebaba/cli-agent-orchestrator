@@ -310,6 +310,7 @@ def test_concurrent_updates_serialize_without_duplicate_versions(pin_db, tmp_pat
     assert versions == [1, 2, 3]
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_busy_lock_returns_db_busy(pin_db, tmp_path):
     authority = tmp_path / "authority.md"
     authority.write_text("v1")

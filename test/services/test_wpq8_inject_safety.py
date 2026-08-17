@@ -412,6 +412,7 @@ def test_wpq8_all_midturn_dialog_providers_expose_hazard(provider_class, rows):
     assert provider.classify_injection_hazard(rows) == "interactive_dialog"
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_wpq8_kimi_startup_only_dialog_is_not_midturn_hazard():
     provider = KimiCliProvider("worker", "session", "window")
     assert provider.classify_injection_hazard(["A new version is available"]) is None

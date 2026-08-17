@@ -13,6 +13,10 @@ from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
+# F254 D19: entire module exceeds unit budget (provider startup waits).
+pytestmark = pytest.mark.slow
+
+
 from cli_agent_orchestrator.models.agent_profile import (
     AgentProfile,
     ContainerConfig,

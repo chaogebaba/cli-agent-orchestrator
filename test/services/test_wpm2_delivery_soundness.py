@@ -690,6 +690,7 @@ def test_wpm2_recovery_skips_held_lock_presubmit(wpm2_db, tmp_path):
         lock.release()
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_wpm2_recovery_skips_held_lock_tail(wpm2_db, tmp_path):
     message, attempt = _open_old_attempt(wpm2_db, age=120)
     lock = get_delivery_lock("receiver")
@@ -883,6 +884,7 @@ def test_wpm2_pre_submit_exception_keeps_deferred_failed_semantics(wpm2_db):
     assert paste.call_count == 1 and attempt["outcome"] == "deferred"
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_wpm2_submit_exception_uncertain_acceptance_settles_anchorless_ambiguous(wpm2_db):
     message, _ = _deliver_scenario(
         wpm2_db, admission_status=TerminalStatus.IDLE,
@@ -1452,6 +1454,7 @@ def test_wpm2_overflow_then_service_refresh_finds_hit_without_open(wpm2_db, tmp_
     assert trace["attempts"][0]["evidence"]["kind"] == "transcript_queued_command"
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_wpm2_overflow_absent_refresh_advances_baseline_then_opens(wpm2_db, tmp_path):
     path, cursor = _overflow_file(tmp_path)
     create_transcript_binding("receiver", "session", str(path), path.stat().st_ino, "test")
@@ -1501,6 +1504,7 @@ def test_wpm2_overflow_absent_refresh_advances_baseline_then_opens(wpm2_db, tmp_
     assert persisted["size"] == path.stat().st_size
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_wpm2_overflow_cursor_crash_before_and_after_commit(wpm2_db, tmp_path):
     path, cursor = _overflow_file(tmp_path)
     create_transcript_binding("receiver", "session", str(path), path.stat().st_ino, "test")

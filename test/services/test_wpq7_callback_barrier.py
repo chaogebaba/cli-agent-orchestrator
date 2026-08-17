@@ -860,6 +860,7 @@ def test_utf8_cap_preserves_codepoint_and_points_to_durable_sources(barrier_db):
         assert "list_messages/message trace" in combined.message
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_composed_pending_writer_count_is_ten_after_digest_seats_retire(barrier_db):
     root = Path(__file__).parents[2] / "src" / "cli_agent_orchestrator"
     expected = {

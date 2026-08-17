@@ -3291,6 +3291,7 @@ class TestCodexProviderTrustPrompt:
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    @pytest.mark.slow  # F254 D19: exceeds unit budget
     async def test_initialize_with_trust_prompt(self, mock_tmux, mock_wait_shell, mock_wait_status):
         """Test that initialize handles trust prompt during startup."""
         mock_wait_shell.return_value = True
@@ -3311,6 +3312,7 @@ class TestCodexProviderTrustPrompt:
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    @pytest.mark.slow  # F254 D19: exceeds unit budget
     async def test_initialize_with_trust_prompt_v2(
         self, mock_tmux, mock_wait_shell, mock_wait_status
     ):
@@ -3656,6 +3658,7 @@ class TestCodexProviderUpdateDialog:
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    @pytest.mark.slow  # F254 D19: exceeds unit budget
     async def test_initialize_dismisses_update_dialog(
         self, mock_tmux, mock_wait_shell, mock_wait_status
     ):

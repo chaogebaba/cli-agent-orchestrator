@@ -326,6 +326,7 @@ if HAS_HYPOTHESIS:
                             )
 
     TestDeliveryFSM = DeliveryFSMStateful.TestCase
+    TestDeliveryFSM.pytestmark = [pytest.mark.slow]  # F254 D19: exceeds unit budget
     TestDeliveryFSM.settings = settings(
         max_examples=100,
         stateful_step_count=40,

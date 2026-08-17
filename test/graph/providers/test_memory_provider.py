@@ -165,6 +165,7 @@ def _disable_llm(monkeypatch) -> None:
 
 class TestMemoryProviderHappyPath:
     @pytest.mark.asyncio
+    @pytest.mark.slow  # F254 D19: exceeds unit budget
     async def test_nodes_edges_from_populated_scope(self, populated_scope, monkeypatch):
         """AC 1-4, updated for issue #511: topic nodes for every index key; the
         relates_to edge now comes from the relationship STORE (attrs.source is

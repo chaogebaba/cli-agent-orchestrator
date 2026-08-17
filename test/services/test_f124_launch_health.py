@@ -554,6 +554,7 @@ class TestConfirmLaunchHealth:
 class TestConfirmLaunchHealthF163aRetry:
     """F163-a: bounded retry tolerates slow shell forks."""
 
+    @pytest.mark.slow  # F254 D19: exceeds unit budget
     def test_still_shell_for_4s_then_forks_no_raise(self, monkeypatch):
         """F163-a: probe returns False for ~4s then True → no raise, tolerates slow fork."""
         from cli_agent_orchestrator.services.terminal_service import (

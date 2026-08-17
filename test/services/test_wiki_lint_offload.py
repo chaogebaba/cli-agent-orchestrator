@@ -25,6 +25,7 @@ def db_engine(tmp_path: Path) -> Any:
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 async def test_stale_claim_detector_does_not_block_event_loop(
     tmp_path: Path, db_engine: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

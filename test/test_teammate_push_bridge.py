@@ -235,6 +235,7 @@ class TestAC3WriteFailureGracefulFallback:
 
         assert result is False
 
+    @pytest.mark.slow  # F254 D19: exceeds unit budget
     def test_permission_error(self, tmp_path: Path) -> None:
         """Inbox file not writable → graceful fallback."""
         inbox_dir = tmp_path / "teams" / "inboxes"

@@ -109,6 +109,7 @@ pytest_plugins = (
     "test.plugins.local_fixture_guard",
     "test.plugins.smoke_tags",
     "test.plugins.tier_marks",
+    "test.plugins.tier_budget",
 )
 
 
