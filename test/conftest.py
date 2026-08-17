@@ -110,6 +110,7 @@ pytest_plugins = (
     "test.plugins.smoke_tags",
     "test.plugins.tier_marks",
     "test.plugins.tier_budget",
+    "test.plugins.quarantine",
 )
 
 
