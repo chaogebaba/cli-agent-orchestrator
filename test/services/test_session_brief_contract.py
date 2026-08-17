@@ -120,7 +120,7 @@ async def test_required_brief_is_built_after_db_and_fifo_and_before_provider(mon
     provider.initialize.side_effect = lambda: order.append("provider")
 
     monkeypatch.setattr(svc, "load_agent_profile", lambda _name: profile)
-    monkeypatch.setattr(svc, "build_skill_catalog", lambda _filter: "SKILLS")
+    monkeypatch.setattr(svc, "build_skill_catalog", lambda _filter, **_kw: "SKILLS")
     monkeypatch.setattr(svc, "generate_terminal_id", lambda: "term0001")
     monkeypatch.setattr(svc, "generate_session_name", lambda: "cao-test")
     monkeypatch.setattr(svc, "generate_window_name", lambda *_a: "supervisor-1")
@@ -184,7 +184,7 @@ def _install_failure_harness(monkeypatch, tmp_path, *, build_effect):
     create_provider = Mock(return_value=provider)
 
     monkeypatch.setattr(svc, "load_agent_profile", lambda _name: profile)
-    monkeypatch.setattr(svc, "build_skill_catalog", lambda _filter: "SKILLS")
+    monkeypatch.setattr(svc, "build_skill_catalog", lambda _filter, **_kw: "SKILLS")
     monkeypatch.setattr(svc, "generate_terminal_id", lambda: "term0001")
     monkeypatch.setattr(svc, "generate_session_name", lambda: "cao-test")
     monkeypatch.setattr(svc, "generate_window_name", lambda *_a: "supervisor-1")

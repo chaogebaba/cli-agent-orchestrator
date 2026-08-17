@@ -772,3 +772,120 @@ def test_manager_forwards_model_to_grok(monkeypatch) -> None:
     )
 
     assert captured["model"] == "grok-3-mini"
+
+
+
+# --- F238: Grok skill instruction in launch command ---
+
+
+def test_ac7_grok_command_skill_instruction_uses_correct_tool_name(monkeypatch) -> None:
+    """AC7: The assembled Grok launch command's --system-prompt-override contains
+    cao-mcp-server__load_skill and does not contain the broken invocation name
+    mcp__cao-mcp-server__load_skill."""
+    from unittest.mock import patch as mock_patch
+
+    from cli_agent_orchestrator.models.skill import SkillMetadata
+
+    profile = type(
+        "Profile",
+        (),
+        {
+            "name": "grok_dev",
+            "model": None,
+            "reasoningEffort": None,
+            "mcpServers": None,
+            "system_prompt": "You are a Grok worker.",
+        },
+    )()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.grok_cli.load_agent_profile",
+        lambda _name: profile,
+    )
+
+    skills = [
+        SkillMetadata(name="cao-worker-protocols", description="Worker communication"),
+    ]
+
+    provider = GrokCliProvider(
+        terminal_id="term-grok",
+        session_name="session",
+        window_name="window",
+        agent_profile="grok_dev",
+        allowed_tools=["*"],
+        skill_prompt="placeholder",  # will be overwritten below
+    )
+
+    # Build the real skill prompt that would be injected by terminal_service
+    from cli_agent_orchestrator.utils.skills import build_skill_catalog
+
+    with mock_patch("cli_agent_orchestrator.utils.skills.list_skills", return_value=skills):
+        real_skill_prompt = build_skill_catalog(provider="grok_cli")
+
+    provider._skill_prompt = real_skill_prompt
+
+    command = provider._build_grok_command()
+
+    assert "cao-mcp-server__load_skill" in command
+    assert "mcp__cao-mcp-server__load_skill" not in command
+
+
+
+def test_ac9_all_grok_profiles_register_cao_mcp_server() -> None:
+    """AC9: All six shipped grok_*.md profiles register the CAO MCP server under
+    exactly the key 'cao-mcp-server', pinning the D3 literal."""
+    import yaml
+
+    # Profiles live in the root repo's profiles/ directory, which is the parent
+    # of the orchestrator fork directory.
+    root_repo = Path(__file__).resolve().parents[2]
+    # Try the common monorepo layouts
+    candidates = [
+        root_repo.parent / "profiles",  # cli-agent-orchestrator/../profiles
+        root_repo.parent.parent / "profiles",  # deeper nesting
+    ]
+    profiles_dir = None
+    for candidate in candidates:
+        if candidate.is_dir() and (candidate / "grok_base.md").exists():
+            profiles_dir = candidate
+            break
+
+    if profiles_dir is None:
+        # Fall back: search upward from the test file
+        current = Path(__file__).resolve().parent
+        while current != current.parent:
+            candidate = current / "profiles"
+            if candidate.is_dir() and (candidate / "grok_base.md").exists():
+                profiles_dir = candidate
+                break
+            current = current.parent
+
+    assert profiles_dir is not None, (
+        "Could not locate profiles/ directory with grok_base.md"
+    )
+
+    expected_profiles = [
+        "grok_base.md",
+        "grok_dev.md",
+        "grok_doc_keeper.md",
+        "grok_oracle.md",
+        "grok_reviewer.md",
+        "grok_tester.md",
+    ]
+
+    for profile_name in expected_profiles:
+        profile_path = profiles_dir / profile_name
+        assert profile_path.exists(), f"Missing profile: {profile_path}"
+
+        content = profile_path.read_text(encoding="utf-8")
+        # Extract YAML frontmatter between --- markers
+        parts = content.split("---", 2)
+        assert len(parts) >= 3, f"No YAML frontmatter in {profile_name}"
+        frontmatter_data = yaml.safe_load(parts[1])
+
+        assert "mcpServers" in frontmatter_data, (
+            f"{profile_name} has no mcpServers in frontmatter"
+        )
+        assert "cao-mcp-server" in frontmatter_data["mcpServers"], (
+            f"{profile_name} does not register 'cao-mcp-server' — found keys: "
+            f"{list(frontmatter_data['mcpServers'].keys())}"
+        )

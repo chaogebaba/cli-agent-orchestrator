@@ -196,7 +196,7 @@ async def _wait_for_backend_proof(
 
 def _launch_context(metadata: dict) -> str | None:
     profile = load_agent_profile(metadata["agent_profile"])
-    prompt = build_skill_catalog(profile.skills)
+    prompt = build_skill_catalog(profile.skills, provider=metadata["provider"])
     if profile.sessionBrief:
         from cli_agent_orchestrator.services.session_manifest_service import (
             build_session_manifest,
