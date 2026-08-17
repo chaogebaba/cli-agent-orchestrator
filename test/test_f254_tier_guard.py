@@ -18,6 +18,11 @@ G5 — ``time.sleep(`` with a literal argument > 0.05 in any file whose census
 Precedent: P-ASTGUARD (three in-tree instances) + P-RATCHET.
 """
 
+import pytest
+
+# AST-walk tests scan the entire test tree — naturally > 1 s.
+pytestmark = pytest.mark.slow
+
 from __future__ import annotations
 
 import ast

@@ -573,6 +573,7 @@ def test_outer_parent_death_tears_down_full_bwrap_descendant_closure(tmp_path: P
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bwrap unavailable")
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_outer_parent_death_probe_kills_die_with_parent_removal_mutant(tmp_path: Path) -> None:
     plane = _plane(tmp_path, "claude_code")
     assert plane.native_home is not None

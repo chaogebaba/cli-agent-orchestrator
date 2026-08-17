@@ -78,6 +78,7 @@ class TestQueueFullRateLimit:
         assert queue.qsize() == 4
 
     @pytest.mark.asyncio
+    @pytest.mark.slow  # F254 D19: exceeds unit budget
     async def test_drop_summary_reports_dropped_count(self, small_queue_settings, caplog):
         """The summary log should include a numeric count so operators can see
         how bad the back-pressure got."""

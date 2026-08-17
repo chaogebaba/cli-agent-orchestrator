@@ -289,6 +289,7 @@ def test_orphan_sender_absent_is_logged_only_without_notice(scratch_db):
         assert db.query(InboxModel).filter(InboxModel.message.startswith("p5-orphan ")).count() == 0
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_real_deliver_pending_replay_tags_exact_wire_and_trace(scratch_db):
     database.create_terminal("sender", "s", "sender", "codex")
     database.create_terminal("receiver", "s", "receiver", "claude_code")

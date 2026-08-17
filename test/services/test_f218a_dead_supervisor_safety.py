@@ -901,6 +901,7 @@ class TestScopeProbeIntegration:
         assert probe.session_present is True
         assert set(probe.sibling_windows) == {"worker-1", "worker-2"}
 
+    @pytest.mark.slow  # F254 D19: exceeds unit budget
     def test_session_absent_consecutive(self):
         """has_session=False twice → session_gone."""
         from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend

@@ -274,6 +274,7 @@ class TestCreateSession:
         engine.dispose()
 
     @pytest.mark.asyncio
+    @pytest.mark.slow  # F254 D19: exceeds unit budget
     async def test_wpq11_fresh_worker_submits_exactly_one_caller_task(self, monkeypatch):
         from cli_agent_orchestrator.models.inbox import OrchestrationType
         from cli_agent_orchestrator.services import terminal_service

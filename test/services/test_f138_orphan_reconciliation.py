@@ -2473,6 +2473,7 @@ class TestD16PermissionErrorDecisionTree:
 class TestD15D16Integration:
     """Combined: two FIFO ticks + separate liveness gone → one job."""
 
+    @pytest.mark.slow  # F254 D19: exceeds unit budget
     def test_fifo_two_ticks_plus_liveness_creates_one_job(self, db_session, tmp_path, monkeypatch):
         """Two FIFO definitive-absence ticks + one status liveness gone → one job."""
         import cli_agent_orchestrator.services.fifo_reader as fr

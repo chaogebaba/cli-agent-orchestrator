@@ -520,6 +520,7 @@ def test_ac13_schema_accepts_one_hunk_and_defaults_expect_count(tmp_path: Path) 
     ],
     ids=["malformed UTF-8", "lone surrogate"],
 )
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_ac13_raw_byte_decode_rejections(document: bytes, tmp_path: Path) -> None:
     path = tmp_path / "raw.md"
     path.write_bytes(b"a b c\n")

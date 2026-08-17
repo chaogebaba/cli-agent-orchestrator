@@ -11,6 +11,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+# F254 D19: entire module exceeds unit budget (provider startup waits).
+pytestmark = pytest.mark.slow
+
+
 
 @pytest.fixture
 def provider():

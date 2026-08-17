@@ -72,6 +72,7 @@ def _raw_tmux_calls(tree: ast.AST) -> list[ast.AST]:
     return violations
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_endpoint_ast_guard_is_closed() -> None:
     request_methods = {"get", "post", "put", "patch", "delete", "request"}
     for path in _python_files():
@@ -433,6 +434,7 @@ def test_dead_tmux_socket_is_reaped_and_live_one_is_refused() -> None:
     assert bootstrap._unlink_dead_tmux_socket(socket_name) is False
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_up_reclaims_a_dead_socket_of_the_same_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -550,6 +552,7 @@ def _free_port() -> int:
         return int(listener.getsockname()[1])
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_empty_cache_invalid_and_valid_lifecycle_audit(tmp_path: Path) -> None:
     before = _cache_snapshot()
     env = {

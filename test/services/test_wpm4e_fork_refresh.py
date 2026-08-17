@@ -549,6 +549,7 @@ async def test_e1_hung_refresh_dispatch_completes_with_stale_preamble(monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 async def test_e1_deferred_schedule_returns_while_refresh_is_running(monkeypatch):
     entered = asyncio.Event()
     release = asyncio.Event()

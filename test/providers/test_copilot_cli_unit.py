@@ -242,6 +242,7 @@ class TestCopilotCliProviderInitialization:
     @patch("cli_agent_orchestrator.providers.copilot_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     @patch.object(CopilotCliProvider, "_accept_trust_prompts")
+    @pytest.mark.slow  # F254 D19: exceeds unit budget
     async def test_initialize_handles_trust_prompt_then_idle(
         self,
         mock_accept,

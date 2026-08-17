@@ -153,6 +153,7 @@ def _assert_corrective_pre_paste_retries_untagged(scratch_db: Any, error: Except
     assert trace["attempts"][-1]["prior_attempt_uuid"] is None
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_corrective_pre_paste_deferral_retries_untagged(scratch_db: Any) -> None:
     _assert_corrective_pre_paste_retries_untagged(
         scratch_db, DeliveryDeferredError("pre-paste defer")

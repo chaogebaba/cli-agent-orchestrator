@@ -36,6 +36,7 @@ def isolated_db(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 async def test_ready_completion_at_deadline_has_one_lawful_owner(
     isolated_db, monkeypatch,
 ):

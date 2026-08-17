@@ -690,6 +690,7 @@ def test_wpm2_recovery_skips_held_lock_presubmit(wpm2_db, tmp_path):
         lock.release()
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_wpm2_recovery_skips_held_lock_tail(wpm2_db, tmp_path):
     message, attempt = _open_old_attempt(wpm2_db, age=120)
     lock = get_delivery_lock("receiver")
@@ -1452,6 +1453,7 @@ def test_wpm2_overflow_then_service_refresh_finds_hit_without_open(wpm2_db, tmp_
     assert trace["attempts"][0]["evidence"]["kind"] == "transcript_queued_command"
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_wpm2_overflow_absent_refresh_advances_baseline_then_opens(wpm2_db, tmp_path):
     path, cursor = _overflow_file(tmp_path)
     create_transcript_binding("receiver", "session", str(path), path.stat().st_ino, "test")

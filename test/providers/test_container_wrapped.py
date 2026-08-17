@@ -233,6 +233,7 @@ async def test_idle_timeout_prompt_handler(mock_backend, mock_time, mock_sleep):
 @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
 @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
 @patch(_BACKEND)
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 async def test_wrapped_provider_lifecycle(
     mock_backend, mock_wait_status, mock_wait_shell, mock_load, mock_build, mock_ensure
 ):

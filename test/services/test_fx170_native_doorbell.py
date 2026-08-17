@@ -593,6 +593,7 @@ class TestAC7NativeRingIndependentOfTeammatePush:
 # ===========================================================================
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 class TestAC10WakeVerification:
     """D8 verification: statusUpdatedAt must advance for success."""
 

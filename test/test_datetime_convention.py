@@ -1,4 +1,8 @@
 """Enforce aware-UTC datetime convention fork-wide."""
+
+# F254 D19: entire module exceeds unit budget (provider startup waits).
+pytestmark = pytest.mark.slow
+
 import ast
 from pathlib import Path
 

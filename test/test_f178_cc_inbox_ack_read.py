@@ -144,6 +144,7 @@ def test_foreign_entries_untouched(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_absent_file_noop(tmp_path: Path) -> None:
     """When the CC inbox file doesn't exist, return 0 without error."""
     inbox_path = tmp_path / "nonexistent" / "team-lead.json"
@@ -198,6 +199,7 @@ def test_non_array_file_failsafe(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_locked_file_graceful(tmp_path: Path) -> None:
     """When lockfile is held by another process, timeout gracefully."""
     inbox_path = tmp_path / "team-lead.json"

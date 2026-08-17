@@ -382,6 +382,7 @@ class TestHerdrBackendCommands:
         assert "Enter" in calls[-1]
 
     @patch("subprocess.run")
+    @pytest.mark.slow  # F254 D19: exceeds unit budget
     def test_send_keys_force_bracketed_wraps_when_pane_runs_a_real_tui(self, mock_run, backend):
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
         tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]

@@ -87,6 +87,7 @@ def test_telemetry_package_noops_without_otel_sdk() -> None:
     assert "OK" in proc.stdout
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_api_main_imports_without_otel_sdk() -> None:
     """cao-server's module import path survives a base (no-extra) install."""
     probe = _BLOCK_OTEL_AND_PROBE.replace(

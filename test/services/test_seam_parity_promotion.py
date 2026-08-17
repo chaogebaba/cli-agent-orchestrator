@@ -773,6 +773,7 @@ def test_t5b_confirmation_wrapper_crash_rolls_back_and_leaves_poison(
     assert seam_parity._poison_path(op).exists()
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_t5b_subprocess_reset_clears_marker_failure_server_inhibition(
     tmp_path, monkeypatch
 ) -> None:
@@ -960,6 +961,7 @@ def test_t6_cli_status_rollback_reset_and_no_promote(parity_db) -> None:
     assert conflict.exit_code == 1
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_t6_cli_status_initializes_fresh_home(tmp_path) -> None:
     result = _run_seam_subprocess(tmp_path / "fresh-home", "status", "--json")
     assert result.returncode == 0, result.stderr

@@ -1054,6 +1054,7 @@ class TestTeardownIsBestEffort:
         assert result.last_message == "the answer"
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 class TestIdleCompletionSignal:
     """#409a: a post-input IDLE (after the agent worked) resolves as done, so a
     provider that settles IDLE instead of emitting COMPLETED no longer hangs."""

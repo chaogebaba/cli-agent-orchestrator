@@ -365,6 +365,7 @@ class TestVerifyWakeEpochTimestamps:
         t.join(timeout=5)
         assert result is True
 
+    @pytest.mark.slow  # F254 D19: exceeds unit budget
     def test_epoch_ms_no_change_fails(self, sessions_dir):
         """statusUpdatedAt stays same epoch-ms → verify returns False."""
         from cli_agent_orchestrator.services.cc_session_registry import (
