@@ -1,0 +1,117 @@
+# F254 D31 — Quarantine registry.
+#
+# Every test that is known-flaky or known-red lives here with a class, reason,
+# owner, and expiry. The tier plugin (test/plugins/quarantine.py) reads this at
+# collection time and applies the D32 behaviour per class.
+#
+# Classes (D32):
+#   xdist_flaky  — passes serial, fails under -n 2. Serialized via xdist_group("quarantine-serial").
+#   worker_crash — crashes the xdist worker (loses co-scheduled tests). Deselected under -n > 0
+#                  unless CAO_TEST_QUARANTINE=run. Serialized when it does run.
+#   known_red    — fails serial too. Marked xfail(strict=False, run=True) so recovery is noticed.
+#
+# Precedent: P-SEEDFILE (test/simulation/failing_seeds.txt, test/plugins/smoke_tags.py:16-49).
+
+# --- F238 xdist-sensitive: shared TracerProvider state across workers ---
+# These tests use a shared InMemorySpanExporter (process-global OTel TracerProvider).
+# Under -n 2, other OTel-using tests on the same worker corrupt the exporter's
+# span list. Serialization alone doesn't help — the pollution comes from non-quarantined
+# OTel tests co-scheduled on the same worker. Classified as worker_crash per D32:
+# they corrupt the shared resource for co-scheduled tests (same impact class).
+
+[[entry]]
+nodeid  = "test/telemetry/test_spans.py::TestInvokeAgentSpan::test_emits_invoke_agent_with_required_attributes"
+class   = "worker_crash"
+reason  = "F238 — shared TracerProvider corrupted by co-scheduled OTel tests; passes serial only"
+owner   = "F238"
+expires = "2026-10-01"
+
+[[entry]]
+nodeid  = "test/telemetry/test_spans.py::TestExecuteToolSpan::test_emits_execute_tool"
+class   = "worker_crash"
+reason  = "F238 — shared TracerProvider corrupted by co-scheduled OTel tests; passes serial only"
+owner   = "F238"
+expires = "2026-10-01"
+
+[[entry]]
+nodeid  = "test/telemetry/test_spans.py::TestChatSpan::test_emits_chat_with_request_model"
+class   = "worker_crash"
+reason  = "F238 — shared TracerProvider corrupted by co-scheduled OTel tests; passes serial only"
+owner   = "F238"
+expires = "2026-10-01"
+
+[[entry]]
+nodeid  = "test/telemetry/test_spans.py::TestChatSpanConversationId::test_chat_span_sets_conversation_id"
+class   = "worker_crash"
+reason  = "F238 — shared TracerProvider corrupted by co-scheduled OTel tests; passes serial only"
+owner   = "F238"
+expires = "2026-10-01"
+
+# --- F238 xdist-sensitive: cross-worker module-level state in auth constants ---
+
+[[entry]]
+nodeid  = "test/security/test_auth.py::test_expected_audience_defaults_to_api_base_url_when_enabled"
+class   = "xdist_flaky"
+reason  = "F238 §1 — passes serial, fails under -n 2 (cross-worker monkeypatch of constants)"
+owner   = "F238"
+expires = "2026-10-01"
+
+[[entry]]
+nodeid  = "test/security/test_auth.py::test_audience_fallback_enforced_in_validation"
+class   = "xdist_flaky"
+reason  = "F238 §1 — passes serial, fails under -n 2 (cross-worker monkeypatch of constants)"
+owner   = "F238"
+expires = "2026-10-01"
+
+# --- Pre-existing xdist-flaky: timing/race under parallel execution ---
+
+[[entry]]
+nodeid  = "test/services/test_fifo_reader.py::TestReaderThreadLifecycle::test_data_received_across_writer_reconnects"
+class   = "worker_crash"
+reason  = "FIFO pipe-pane reconnect race under parallel load; passes serial (P3 gate: transient)"
+owner   = "pre-existing"
+expires = "2026-10-01"
+
+[[entry]]
+nodeid  = "test/services/test_wpm4a_deferred_init_hardening.py::test_dispatcher_uses_slot_grant_not_delayed_validator_entry"
+class   = "worker_crash"
+reason  = "Slot-grant timing race under xdist load; passes serial"
+owner   = "pre-existing"
+expires = "2026-10-01"
+
+[[entry]]
+nodeid  = "test/services/test_wpm4a_deferred_init_hardening.py::test_quiesce_wins_after_ready_sync_call_starts"
+class   = "worker_crash"
+reason  = "Quiesce/ready sync race under xdist load; passes serial"
+owner   = "pre-existing"
+expires = "2026-10-01"
+
+[[entry]]
+nodeid  = "test/cli/commands/test_fold.py::test_ac13_raw_byte_decode_rejections[malformed UTF-8]"
+class   = "worker_crash"
+reason  = "Intermittent assertion under xdist load (byte-decode timing); passes serial"
+owner   = "pre-existing"
+expires = "2026-10-01"
+
+[[entry]]
+nodeid  = "test/services/test_f72_fleet_lifecycle.py::test_ac13_no_surviving_ancestor_cancels_with_reason"
+class   = "worker_crash"
+reason  = "Fleet lifecycle race under xdist; passes serial"
+owner   = "pre-existing"
+expires = "2026-10-01"
+
+# --- Pre-existing: environment-dependent, fail serial too ---
+
+[[entry]]
+nodeid  = "test/services/test_worktree_branch_integrity.py::TestProductionPathForkPlusWorktree::test_create_terminal_fork_worktree_propagates_worktree_info"
+class   = "known_red"
+reason  = "Env-dependent — working directory not created by git in temp fixture; fails serial"
+owner   = "pre-existing"
+expires = "2026-10-01"
+
+[[entry]]
+nodeid  = "test/providers/test_grok_cli_unit.py::test_ac9_all_grok_profiles_register_cao_mcp_server"
+class   = "known_red"
+reason  = "Env-dependent — requires profiles/ directory with grok_base.md; absent in worktree layout"
+owner   = "pre-existing"
+expires = "2026-10-01"
