@@ -3687,7 +3687,7 @@ def _schedule_deferred_init(
                     shell_command,
                 )
             # F127: persist resolved_model post-initialize
-            _f127_resolved = provider_instance.resolved_model
+            _f127_resolved = getattr(provider_instance, "resolved_model", None)
             if _f127_resolved is not None:
                 await _tracked_blocking(
                     terminal_id,
