@@ -3312,6 +3312,7 @@ class TestCodexProviderTrustPrompt:
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    @pytest.mark.slow  # F254 D19: exceeds unit budget
     async def test_initialize_with_trust_prompt_v2(
         self, mock_tmux, mock_wait_shell, mock_wait_status
     ):

@@ -98,6 +98,7 @@ def test_endpoint_ast_guard_is_closed() -> None:
             assert relative.endswith("services/install_service.py"), relative
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_tmux_ast_guard_is_closed() -> None:
     allowed = {"utils/tmux_command.py", "sandbox_bootstrap.py"}
     for path in _python_files():
@@ -632,6 +633,7 @@ def test_empty_cache_invalid_and_valid_lifecycle_audit(tmp_path: Path) -> None:
     assert _cache_snapshot() == before
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_real_down_purge_rejects_symlink_swapped_root(tmp_path: Path) -> None:
     root = tmp_path / "purge"
     moved = tmp_path / "purge-moved"

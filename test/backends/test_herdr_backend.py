@@ -404,6 +404,7 @@ class TestHerdrBackendCommands:
         assert text_arg == "\x1b[200~hello world\x1b[201~"
 
     @patch("subprocess.run")
+    @pytest.mark.slow  # F254 D19: exceeds unit budget
     def test_send_keys_force_bracketed_skips_wrap_for_bare_shell(self, mock_run, backend):
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
         tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]

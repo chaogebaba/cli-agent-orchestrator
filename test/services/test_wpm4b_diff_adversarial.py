@@ -160,6 +160,7 @@ def test_corrective_pre_paste_deferral_retries_untagged(scratch_db: Any) -> None
     )
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_corrective_pre_paste_input_blocked_retries_untagged(scratch_db: Any) -> None:
     _assert_corrective_pre_paste_retries_untagged(
         scratch_db, TerminalInputBlockedError("pre-paste blocked")

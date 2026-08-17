@@ -243,6 +243,7 @@ def test_wpm1_busy_exhaustion_is_closed_and_next_wake_retries_pair(wpm1_db):
     )
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_wpm1_service_merge_busy_aborted_never_flips_pending_failed(wpm1_db):
     message, _attempt = _ambiguous()
     lock = wpm1_db.kw["bind"].raw_connection()
