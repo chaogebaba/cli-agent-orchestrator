@@ -36,6 +36,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import DeclarativeBase, Session, declarative_base, deferred, sessionmaker
+from sqlalchemy.orm.exc import ObjectDeletedError, DetachedInstanceError, StaleDataError
 from tzlocal import get_localzone
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
@@ -3324,7 +3325,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                     "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                     "last_active": t.last_active,
                 })
-            except Exception as exc:
+            except (ObjectDeletedError, DetachedInstanceError, StaleDataError) as exc:
                 # F264: skip stale/zombie rows whose attribute load raises
                 # ObjectDeletedError (or similar) instead of crashing the pass
                 logger.debug("list_terminals_by_session: skipping stale row: %s", exc)
