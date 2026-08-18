@@ -74,6 +74,7 @@ jobs:
             --deselect test/services/test_fx193_nudge_discipline.py::TestA1FullJitter::test_step0_degenerates_to_exactly_30s \
             --deselect test/services/test_fx193_nudge_discipline.py::TestA1FullJitter::test_a1_ac2_seeded_rng_reproduces_exact_delays \
             --deselect test/test_g7a_sandbox.py::test_up_reclaims_a_dead_socket_of_the_same_name \
+            --deselect test/services/test_stalled_callback_watchdog.py::test_trigger_a_rollover_is_stale_and_insert_failure_rolls_back_reservation \
             2>&1 | tee pytest-output.log
 
       - name: Write step summary
