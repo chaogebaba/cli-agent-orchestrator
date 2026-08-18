@@ -355,6 +355,12 @@ def _strip_cli_noise(text: str) -> str:
     return cleaned.strip()
 
 
+# F277: Background wiki classification (compile, find_related, contradiction) belongs
+# on the free/cheap tier. With dario routing sonnet→DeepSeek, requesting claude-sonnet-5
+# keeps these fire-and-forget calls off the expensive opus-5 default that the Max
+# subscription advertises via Anthropic's defaultModel response.
+_F277_BACKGROUND_MODEL = "claude-sonnet-5"
+
 # Per-provider headless invocation. Verified 2026-06: claude/codex/kiro-cli.
 # Every backend MUST run with its tools disabled / sandboxed read-only: the
 # compile prompt embeds memory content, which is attacker-influenced (agents
@@ -365,7 +371,10 @@ _CLI_BACKENDS: "dict[str, _CliBackend]" = {
         provider="claude_code",
         binary="claude",
         # --tools "" disables every built-in tool for the run.
-        build_argv=lambda prompt, outfile: ["claude", "-p", "--tools", ""],
+        # --model pins to the cheap tier (F277).
+        build_argv=lambda prompt, outfile: [
+            "claude", "-p", "--tools", "", "--model", _F277_BACKGROUND_MODEL,
+        ],
         stdin_for=lambda prompt: prompt,
         uses_outfile=False,
         extract=lambda stdout, _f: stdout.strip(),
@@ -374,12 +383,15 @@ _CLI_BACKENDS: "dict[str, _CliBackend]" = {
         provider="codex",
         binary="codex",
         # read-only sandbox: model-generated commands cannot write or network.
+        # --model pins to the cheap tier (F277).
         build_argv=lambda prompt, outfile: [
             "codex",
             "exec",
             "--skip-git-repo-check",
             "--sandbox",
             "read-only",
+            "--model",
+            _F277_BACKGROUND_MODEL,
             "-o",
             outfile or "",
             prompt,
@@ -392,11 +404,14 @@ _CLI_BACKENDS: "dict[str, _CliBackend]" = {
         provider="kiro_cli",
         binary="kiro-cli",
         # --trust-tools= (empty set) trusts no tools for the run.
+        # --model pins to the cheap tier (F277).
         build_argv=lambda prompt, outfile: [
             "kiro-cli",
             "chat",
             "--no-interactive",
             "--trust-tools=",
+            "--model",
+            _F277_BACKGROUND_MODEL,
             prompt,
         ],
         stdin_for=lambda prompt: None,
