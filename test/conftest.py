@@ -108,6 +108,7 @@ pytest_plugins = (
     "test.plugins.rss_guard",
     "test.plugins.local_fixture_guard",
     "test.plugins.smoke_tags",
+    "test.plugins.suite_slot",
     "test.plugins.tier_marks",
     "test.plugins.tier_budget",
     "test.plugins.quarantine",
