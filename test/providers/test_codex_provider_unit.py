@@ -3708,6 +3708,7 @@ class TestCodexProviderUpdateDialog:
 class TestCodexProviderUpdateDialogLive:
     """Live binary tests for update dialog config key. Requires CAO_RUN_LIVE_PROVIDER_TESTS=1."""
 
+    @pytest.mark.live
     @pytest.mark.skipif(
         os.environ.get("CAO_RUN_LIVE_PROVIDER_TESTS", "") != "1",
         reason="Live provider tests disabled. Set CAO_RUN_LIVE_PROVIDER_TESTS=1 to enable.",
@@ -3739,6 +3740,7 @@ class TestCodexProviderUpdateDialogLive:
                 "unknown" not in combined.lower() or "configuration field" not in combined.lower()
             )
 
+    @pytest.mark.live
     @pytest.mark.skipif(
         os.environ.get("CAO_RUN_LIVE_PROVIDER_TESTS", "") != "1",
         reason="Live provider tests disabled. Set CAO_RUN_LIVE_PROVIDER_TESTS=1 to enable.",
