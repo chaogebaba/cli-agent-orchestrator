@@ -107,10 +107,34 @@ def _is_config_stale(row: dict[str, Any], canonical_hash: str | None) -> bool | 
     metadata = row.get("metadata")
     if not isinstance(metadata, dict):
         return None
-    stored_hash = metadata.get("config_sha256")
+    # D12: read from reserved 'cao' namespace, with legacy top-level fallback (AC13)
+    cao_ns = metadata.get("cao")
+    if isinstance(cao_ns, dict):
+        stored_hash = cao_ns.get("config_sha256")
+    else:
+        stored_hash = None
+    # Legacy fallback: rows stamped by Half 1 before the D12 repoint
+    if not isinstance(stored_hash, str):
+        stored_hash = metadata.get("config_sha256")
     if not isinstance(stored_hash, str):
         return None
     return stored_hash != canonical_hash
+
+
+def _is_wedge_suspect(row: dict[str, Any]) -> bool | None:
+    """F295 Half 2 AC10: check if a grok_cli terminal is wedge-suspected."""
+    if row.get("provider") != "grok_cli":
+        return None
+    metadata = row.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    cao_ns = metadata.get("cao")
+    if not isinstance(cao_ns, dict):
+        return None
+    suspect = cao_ns.get("wedge_suspect")
+    if suspect is True:
+        return True
+    return None
 
 
 def build_fleet(session_name: str) -> dict[str, Any]:
@@ -192,6 +216,8 @@ def build_fleet(session_name: str) -> dict[str, Any]:
                 "reparented_from": row.get("reparented_from"),
                 # F295 AC2: config_stale for grok_cli terminals
                 "config_stale": _is_config_stale(row, grok_canonical_hash),
+                # F295 Half 2 AC10: wedge_suspect for grok_cli terminals
+                "wedge_suspect": _is_wedge_suspect(row),
             }
         )
     return {"session_name": session_name, "terminals": projected}

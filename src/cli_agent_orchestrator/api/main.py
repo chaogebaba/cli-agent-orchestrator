@@ -181,6 +181,7 @@ from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.http import resolve_endpoint
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
+from cli_agent_orchestrator.utils.grok_preflight import RelayPreflightFailed
 from cli_agent_orchestrator.utils.provider_auth import ProviderAuthRefreshFailed
 from cli_agent_orchestrator.utils.provider_plane import (
     NativeHomeIsolationUnavailable,
@@ -3644,7 +3645,11 @@ async def create_terminal_in_session(
         # a capability rejection is a bad request, not a missing resource. Matches
         # POST /sessions, which already returns 400 for the identical failure.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except (NativeHomeIsolationUnavailable, ProviderAuthRefreshFailed) as e:
+    except (
+        NativeHomeIsolationUnavailable,
+        ProviderAuthRefreshFailed,
+        RelayPreflightFailed,
+    ) as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": e.code, "message": e.detail},
