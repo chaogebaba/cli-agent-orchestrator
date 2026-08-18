@@ -5599,7 +5599,14 @@ def _delete_terminal_under_lease(
             logger.warning(
                 "Terminal %s cleanup deferred; retaining metadata for a retry", terminal_id
             )
-            return False
+            return {
+                "terminal_deleted": False,
+                "intent_deleted": False,
+                "intent_error": None,
+                "intent_retain_reason": "cleanup_deferred",
+                "rollback_kill_uncertain": True,
+                "cleanup_deferred": True,
+            }
         from cli_agent_orchestrator.utils.persona_context import cleanup_persona
 
         cleanup_persona(terminal_id)
