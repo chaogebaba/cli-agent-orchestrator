@@ -21,7 +21,7 @@ class TestCanaryD8_2:
     """Validate that _assign_impl's request reaches the cao_server subprocess DB."""
 
     def test_assign_creates_terminal_row_in_subprocess_db(
-        self, cao_server: CaoServer, monkeypatch, tmp_path
+        self, cao_server: CaoServer, monkeypatch, tmp_path, track_session
     ):
         """Call _assign_impl with CAO_ENDPOINT pointed at the live server.
 
@@ -43,6 +43,8 @@ class TestCanaryD8_2:
         resp.raise_for_status()
         supervisor_terminal = resp.json()
         supervisor_id = supervisor_terminal["id"]
+        actual_session = supervisor_terminal.get("session_name", f"cao-{session_name}")
+        track_session(actual_session)
 
         # Step 2: Count terminal rows BEFORE the assign call.
         conn = sqlite3.connect(str(cao_server.db_path))

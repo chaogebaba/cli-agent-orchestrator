@@ -17,7 +17,7 @@ class TestSendMessageContractUX2:
     """Contract tests for send_message: UX-2 Delivery invariant."""
 
     def test_send_message_queues_on_server(
-        self, cao_server: CaoServer, monkeypatch, tmp_path
+        self, cao_server: CaoServer, monkeypatch, tmp_path, track_session
     ):
         """Drive delivery_three_messages scenario against live server."""
         session_name = f"sm-contract-{uuid.uuid4().hex[:8]}"
@@ -32,6 +32,7 @@ class TestSendMessageContractUX2:
         )
         resp.raise_for_status()
         sup_id = resp.json()["id"]
+        track_session(resp.json().get("session_name", session_name))
 
         monkeypatch.setenv("CAO_ENDPOINT", cao_server.url)
         monkeypatch.setenv("CAO_TERMINAL_ID", sup_id)
@@ -73,7 +74,7 @@ class TestSendMessageContractUX3:
     """Contract tests for send_message: UX-3 Non-interruption."""
 
     def test_send_to_busy_worker_queues_not_injects(
-        self, cao_server: CaoServer, monkeypatch, tmp_path
+        self, cao_server: CaoServer, monkeypatch, tmp_path, track_session
     ):
         """Sending to a busy worker queues rather than interrupting."""
         session_name = f"sm-ni-{uuid.uuid4().hex[:8]}"
@@ -88,6 +89,7 @@ class TestSendMessageContractUX3:
         )
         resp.raise_for_status()
         sup_id = resp.json()["id"]
+        track_session(resp.json().get("session_name", session_name))
 
         monkeypatch.setenv("CAO_ENDPOINT", cao_server.url)
         monkeypatch.setenv("CAO_TERMINAL_ID", sup_id)
@@ -116,7 +118,7 @@ class TestSendMessageContractUX5:
     """Contract tests for send_message: UX-5 Authority."""
 
     def test_send_with_barrier_accepted(
-        self, cao_server: CaoServer, monkeypatch, tmp_path
+        self, cao_server: CaoServer, monkeypatch, tmp_path, track_session
     ):
         """send_message with barrier validates ownership (expected behavior)."""
         session_name = f"sm-auth-{uuid.uuid4().hex[:8]}"
@@ -131,6 +133,7 @@ class TestSendMessageContractUX5:
         )
         resp.raise_for_status()
         sup_id = resp.json()["id"]
+        track_session(resp.json().get("session_name", session_name))
 
         monkeypatch.setenv("CAO_ENDPOINT", cao_server.url)
         monkeypatch.setenv("CAO_TERMINAL_ID", sup_id)

@@ -12,7 +12,7 @@ import requests
 from test.fixtures.cao_server import CaoServer
 
 
-def _setup_session(cao_server: CaoServer):
+def _setup_session(cao_server: CaoServer, track_fn=None):
     """Create a session + supervisor terminal, return (sup_id, session_name)."""
     session_name = f"contract-{uuid.uuid4().hex[:8]}"
     resp = requests.post(
@@ -26,7 +26,10 @@ def _setup_session(cao_server: CaoServer):
     )
     resp.raise_for_status()
     data = resp.json()
-    return data["id"], data.get("session_name", f"cao-{session_name}")
+    actual_session = data.get("session_name", f"cao-{session_name}")
+    if track_fn:
+        track_fn(actual_session)
+    return data["id"], actual_session
 
 
 @pytest.mark.ux(surface="S04", invariant="UX-2", kind="C")
@@ -34,10 +37,10 @@ class TestListMessagesContractUX2:
     """Contract tests for list_messages / ack_messages: UX-2."""
 
     def test_list_messages_against_live_server(
-        self, cao_server: CaoServer, monkeypatch, tmp_path
+        self, cao_server: CaoServer, monkeypatch, track_session, tmp_path
     ):
         """list_messages via MCP impl hits the live server."""
-        sup_id, session = _setup_session(cao_server)
+        sup_id, session = _setup_session(cao_server, track_session)
         monkeypatch.setenv("CAO_ENDPOINT", cao_server.url)
         monkeypatch.setenv("CAO_TERMINAL_ID", sup_id)
 
@@ -53,7 +56,7 @@ class TestAuthorityPinsContractUX5:
     """Contract tests for authority pins: UX-5."""
 
     def test_verify_pin_computes_correct_hash(
-        self, cao_server: CaoServer, monkeypatch, tmp_path
+        self, cao_server: CaoServer, monkeypatch, track_session, tmp_path
     ):
         """Verify pin computes sha256 of a real file (authority validation)."""
         monkeypatch.setenv("CAO_ENDPOINT", cao_server.url)
@@ -75,10 +78,10 @@ class TestBarrierContractUX4:
     """Contract tests for callback barrier: UX-4."""
 
     def test_barrier_creation_via_assign(
-        self, cao_server: CaoServer, monkeypatch, tmp_path
+        self, cao_server: CaoServer, monkeypatch, track_session, tmp_path
     ):
         """Assign with barrier parameter creates a barrier on the server."""
-        sup_id, session = _setup_session(cao_server)
+        sup_id, session = _setup_session(cao_server, track_session)
         monkeypatch.setenv("CAO_ENDPOINT", cao_server.url)
         monkeypatch.setenv("CAO_TERMINAL_ID", sup_id)
 
@@ -102,10 +105,10 @@ class TestWorkflowContractUX4:
     """Contract tests for workflow: UX-4."""
 
     def test_workflow_list_against_live_server(
-        self, cao_server: CaoServer, monkeypatch
+        self, cao_server: CaoServer, monkeypatch, track_session
     ):
         """workflow_list queries the live server."""
-        sup_id, _ = _setup_session(cao_server)
+        sup_id, _ = _setup_session(cao_server, track_session)
         monkeypatch.setenv("CAO_ENDPOINT", cao_server.url)
         monkeypatch.setenv("CAO_TERMINAL_ID", sup_id)
 
@@ -125,10 +128,10 @@ class TestFleetContractUX6:
     """Contract tests for session_manifest / fleet: UX-6."""
 
     def test_terminal_queryable_on_live_server(
-        self, cao_server: CaoServer, monkeypatch
+        self, cao_server: CaoServer, monkeypatch, track_session
     ):
         """Created terminal is queryable via GET /terminals/{id}."""
-        sup_id, session = _setup_session(cao_server)
+        sup_id, session = _setup_session(cao_server, track_session)
         monkeypatch.setenv("CAO_ENDPOINT", cao_server.url)
         monkeypatch.setenv("CAO_TERMINAL_ID", sup_id)
 
@@ -144,10 +147,10 @@ class TestSiblingsContractUX6:
     """Contract tests for peek/delete/interrupt: UX-6."""
 
     def test_peek_terminal_against_live_server(
-        self, cao_server: CaoServer, monkeypatch, tmp_path
+        self, cao_server: CaoServer, monkeypatch, track_session, tmp_path
     ):
         """peek_terminal queries the live server for pane content."""
-        sup_id, session = _setup_session(cao_server)
+        sup_id, session = _setup_session(cao_server, track_session)
         monkeypatch.setenv("CAO_ENDPOINT", cao_server.url)
         monkeypatch.setenv("CAO_TERMINAL_ID", sup_id)
 
@@ -162,7 +165,7 @@ class TestSiblingsContractUX6:
 class TestProfilesContractUX6:
     """Contract tests for find_profiles / base sessions: UX-6."""
 
-    def test_find_profiles_returns_results(self, cao_server: CaoServer, monkeypatch):
+    def test_find_profiles_returns_results(self, cao_server: CaoServer, monkeypatch, track_session):
         """find_profiles returns profile metadata (local operation)."""
         monkeypatch.setenv("CAO_ENDPOINT", cao_server.url)
         monkeypatch.setenv("CAO_TERMINAL_ID", "aa11bb22")
@@ -173,7 +176,7 @@ class TestProfilesContractUX6:
         assert isinstance(results, list)
 
     def test_list_base_sessions_via_api(
-        self, cao_server: CaoServer, monkeypatch
+        self, cao_server: CaoServer, monkeypatch, track_session
     ):
         """list_base_sessions is a local operation that returns a list."""
         monkeypatch.setenv("CAO_ENDPOINT", cao_server.url)
