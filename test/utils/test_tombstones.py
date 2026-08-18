@@ -26,6 +26,43 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
 REGISTRY_PATH = Path(__file__).resolve().parents[2] / "orchestrator" / "tombstones" / "registry.jsonl"
 FORK_SRC = Path(__file__).resolve().parents[2] / "src"
 
+# tombstone-report lives in the ROOT repo (beside scripts/tcache).
+# Resolve via git common-dir (handles worktrees) or fall back to env.
+def _find_root_repo_scripts() -> Path:
+    """Locate root-repo scripts/ from the fork worktree."""
+    # Try env override first (test isolation)
+    env_path = os.environ.get("CAO_TOMBSTONE_REPORT_PATH")
+    if env_path:
+        return Path(env_path).parent
+    # Walk up from this file's fork root to find the root repo
+    fork_root = Path(__file__).resolve().parents[2]
+    # Normal checkout: fork is at <root>/cli-agent-orchestrator/
+    root_candidate = fork_root.parent
+    if (root_candidate / "scripts" / "tombstone-report").exists():
+        return root_candidate / "scripts"
+    # Worktree: use git common-dir
+    import subprocess
+    try:
+        common = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=str(fork_root), capture_output=True, text=True
+        ).stdout.strip()
+        if common:
+            common_path = Path(common).resolve()
+            # common-dir is .git inside the fork; root repo is two levels up
+            root_from_git = common_path.parent.parent
+            if (root_from_git / "scripts" / "tombstone-report").exists():
+                return root_from_git / "scripts"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    # Fallback: known absolute path
+    fallback = Path("/home/chao/VScode_projects/cli-subagents/scripts")
+    if (fallback / "tombstone-report").exists():
+        return fallback
+    return fork_root / "scripts"  # last resort
+
+ROOT_SCRIPTS_DIR = _find_root_repo_scripts()
+
 
 @pytest.fixture
 def tomb_dir(tmp_path):
@@ -80,7 +117,7 @@ def _run_report(*args, tomb_dir=None, registry=None, fork_root=None):
     if fork_root:
         env["CAO_FORK_ROOT"] = str(fork_root)
     result = subprocess.run(
-        [sys.executable, str(SCRIPTS_DIR / "tombstone-report")] + list(args),
+        [sys.executable, str(ROOT_SCRIPTS_DIR / "tombstone-report")] + list(args),
         capture_output=True,
         text=True,
         env=env,
