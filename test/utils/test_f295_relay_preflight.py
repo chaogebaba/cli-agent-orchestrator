@@ -72,8 +72,8 @@ class TestOfficialRouteNoProbe:
                 "cli_agent_orchestrator.utils.sandbox_guard.is_sandbox",
                 return_value=False,
             ),
-            patch("requests.post", side_effect=AssertionError("should not call")),
-            patch("requests.get", side_effect=AssertionError("should not call")),
+            patch("cli_agent_orchestrator.utils.grok_preflight._http.post", side_effect=AssertionError("should not call")),
+            patch("cli_agent_orchestrator.utils.grok_preflight._http.get", side_effect=AssertionError("should not call")),
         ):
             # Should succeed without making any network call
             run_preflight(agent_profile="dev", model=None)
@@ -100,8 +100,8 @@ class TestOfficialRouteNoProbe:
                 "cli_agent_orchestrator.utils.sandbox_guard.is_sandbox",
                 return_value=False,
             ),
-            patch("requests.post", side_effect=AssertionError("should not call")),
-            patch("requests.get", side_effect=AssertionError("should not call")),
+            patch("cli_agent_orchestrator.utils.grok_preflight._http.post", side_effect=AssertionError("should not call")),
+            patch("cli_agent_orchestrator.utils.grok_preflight._http.get", side_effect=AssertionError("should not call")),
         ):
             run_preflight(agent_profile="dev", model=None)
 
@@ -140,7 +140,7 @@ class TestExactlyOneProbe:
                 "cli_agent_orchestrator.utils.sandbox_guard.is_sandbox",
                 return_value=False,
             ),
-            patch("requests.post", return_value=mock_resp) as mock_post,
+            patch("cli_agent_orchestrator.utils.grok_preflight._http.post", return_value=mock_resp) as mock_post,
         ):
             run_preflight(agent_profile="dev", model=None)
             assert mock_post.call_count == 1
@@ -187,7 +187,7 @@ class TestKeyRedaction:
                 "cli_agent_orchestrator.utils.sandbox_guard.is_sandbox",
                 return_value=False,
             ),
-            patch("requests.post", return_value=mock_resp),
+            patch("cli_agent_orchestrator.utils.grok_preflight._http.post", return_value=mock_resp),
         ):
             with pytest.raises(RelayPreflightFailed) as exc_info:
                 run_preflight(agent_profile="dev", model=None)
@@ -231,7 +231,7 @@ class TestEscapes:
                 "cli_agent_orchestrator.utils.sandbox_guard.is_sandbox",
                 return_value=False,
             ),
-            patch("requests.post", side_effect=AssertionError("should not call")),
+            patch("cli_agent_orchestrator.utils.grok_preflight._http.post", side_effect=AssertionError("should not call")),
         ):
             # Dead relay but preflight disabled → no exception
             run_preflight(agent_profile="dev", model=None)
@@ -242,7 +242,7 @@ class TestEscapes:
                 "cli_agent_orchestrator.utils.sandbox_guard.is_sandbox",
                 return_value=True,
             ),
-            patch("requests.post", side_effect=AssertionError("should not call")),
+            patch("cli_agent_orchestrator.utils.grok_preflight._http.post", side_effect=AssertionError("should not call")),
         ):
             run_preflight(agent_profile="dev", model=None)
 
@@ -278,7 +278,7 @@ class TestProbeShapes:
             patch(
                 "cli_agent_orchestrator.utils.sandbox_guard.is_sandbox", return_value=False
             ),
-            patch("requests.post", return_value=mock_resp) as mock_post,
+            patch("cli_agent_orchestrator.utils.grok_preflight._http.post", return_value=mock_resp) as mock_post,
         ):
             run_preflight(agent_profile=None, model="m")
             url_called = mock_post.call_args[0][0]
@@ -309,7 +309,7 @@ class TestProbeShapes:
             patch(
                 "cli_agent_orchestrator.utils.sandbox_guard.is_sandbox", return_value=False
             ),
-            patch("requests.post", return_value=mock_resp) as mock_post,
+            patch("cli_agent_orchestrator.utils.grok_preflight._http.post", return_value=mock_resp) as mock_post,
         ):
             run_preflight(agent_profile=None, model="m")
             url_called = mock_post.call_args[0][0]
@@ -341,8 +341,8 @@ class TestProbeShapes:
             patch(
                 "cli_agent_orchestrator.utils.sandbox_guard.is_sandbox", return_value=False
             ),
-            patch("requests.get", return_value=mock_resp) as mock_get,
-            patch("requests.post", side_effect=AssertionError("should not POST")),
+            patch("cli_agent_orchestrator.utils.grok_preflight._http.get", return_value=mock_resp) as mock_get,
+            patch("cli_agent_orchestrator.utils.grok_preflight._http.post", side_effect=AssertionError("should not POST")),
         ):
             # 404 passes (any HTTP response = transport alive)
             run_preflight(agent_profile=None, model="m")
@@ -370,7 +370,7 @@ class TestProbeShapes:
                 "cli_agent_orchestrator.utils.sandbox_guard.is_sandbox", return_value=False
             ),
             patch(
-                "requests.get",
+                "cli_agent_orchestrator.utils.grok_preflight._http.get",
                 side_effect=requests.ConnectionError("Connection refused"),
             ),
         ):
@@ -410,7 +410,7 @@ class TestConnectionRefused:
                 "cli_agent_orchestrator.utils.sandbox_guard.is_sandbox", return_value=False
             ),
             patch(
-                "requests.post",
+                "cli_agent_orchestrator.utils.grok_preflight._http.post",
                 side_effect=requests.ConnectionError("Connection refused"),
             ),
         ):
@@ -442,7 +442,7 @@ class TestConnectionRefused:
             patch(
                 "cli_agent_orchestrator.utils.sandbox_guard.is_sandbox", return_value=False
             ),
-            patch("requests.post", side_effect=requests.Timeout("timed out")),
+            patch("cli_agent_orchestrator.utils.grok_preflight._http.post", side_effect=requests.Timeout("timed out")),
         ):
             with pytest.raises(RelayPreflightFailed) as exc_info:
                 run_preflight(agent_profile="dev", model=None)

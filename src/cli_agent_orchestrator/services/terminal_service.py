@@ -1191,9 +1191,9 @@ async def create_terminal(
         # F295 Half 2 Step 1a: Preflight the provider's launch route BEFORE any
         # resource allocation (D1, S1). Raises RelayPreflightFailed on a dead relay.
         _preflight_provider_cls = get_provider_class(provider)
-        await _preflight_provider_cls.preflight_launch(
-            agent_profile=agent_profile, model=model
-        )
+        _preflight_hook = getattr(_preflight_provider_cls, "preflight_launch", None)
+        if _preflight_hook is not None:
+            await _preflight_hook(agent_profile=agent_profile, model=model)
 
         # F138: Reserve process incarnation token before window creation.
         # Process-less providers (has_process_child=False) skip this entirely.
