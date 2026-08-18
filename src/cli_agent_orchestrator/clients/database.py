@@ -3324,6 +3324,11 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                     "init_deadline_s": t.init_deadline_s,
                     "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                     "last_active": t.last_active,
+                    "metadata": (
+                        __import__("json").loads(t.metadata_json)
+                        if t.metadata_json
+                        else None
+                    ),
                 })
             except (ObjectDeletedError, DetachedInstanceError, StaleDataError) as exc:
                 # F264: skip stale/zombie rows whose attribute load raises

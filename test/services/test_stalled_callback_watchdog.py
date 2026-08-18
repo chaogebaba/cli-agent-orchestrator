@@ -1348,7 +1348,7 @@ def test_notify_due_trigger_a_is_deduped_and_coalesces_trigger_b():
 
 
 def test_trigger_a_rollover_is_stale_and_insert_failure_rolls_back_reservation():
-    svc = StalledCallbackWatchdog(grace_seconds=3)
+    svc = StalledCallbackWatchdog(grace_seconds=3, clock=lambda: 1000.0)
     _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
     _arm_watchdog_episode(svc, "T", "W", inbound_at=0, idle_since=0, sampled=True)
     with _relational_watchdog_fakes({"W", "T", "C"}):
@@ -1368,7 +1368,7 @@ def test_trigger_a_rollover_is_stale_and_insert_failure_rolls_back_reservation()
         assert [call.args[0].kind for call in persist.call_args_list] == ["waiting", "stall"]
         assert not svc._chain_notified
 
-    svc = StalledCallbackWatchdog(grace_seconds=3)
+    svc = StalledCallbackWatchdog(grace_seconds=3, clock=lambda: 1000.0)
     _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
     _arm_watchdog_episode(svc, "T", "W", inbound_at=0, idle_since=0, sampled=True)
     with (
@@ -1379,7 +1379,7 @@ def test_trigger_a_rollover_is_stale_and_insert_failure_rolls_back_reservation()
         svc.notify_due()
     assert not svc._chain_notified
 
-    svc = StalledCallbackWatchdog(grace_seconds=3)
+    svc = StalledCallbackWatchdog(grace_seconds=3, clock=lambda: 1000.0)
     _arm_watchdog_episode(svc, "W", "C", inbound_at=0, idle_since=0, sampled=True)
     _arm_watchdog_episode(svc, "T", "W", inbound_at=0, idle_since=0, sampled=True)
     persisted = []

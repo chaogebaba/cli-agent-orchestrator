@@ -1230,7 +1230,7 @@ class StalledCallbackWatchdog:
     def notify_due(self, registry: PluginRegistry | None = None) -> None:
         from cli_agent_orchestrator.services.inbox_service import inbox_service
 
-        now = time.monotonic()
+        now = self._clock()
         notices = self.collect_due_notifications(now=now)
         jobs = [(notice, self._reserve_chain_notice(notice, now)) for notice in notices]
         chain_pairs = {

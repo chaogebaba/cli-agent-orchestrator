@@ -18,6 +18,7 @@ import shlex
 import shutil
 import signal
 import tempfile
+import tomllib
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -136,7 +137,7 @@ class GrokCliProvider(BaseProvider):
     @property
     def resolved_model(self) -> Optional[str]:
         """Return the effective model resolved during command build."""
-        return getattr(self, '_resolved_model', None)
+        return getattr(self, "_resolved_model", None)
 
     @property
     def paste_enter_count(self) -> int:
@@ -175,7 +176,19 @@ class GrokCliProvider(BaseProvider):
 
     def _build_grok_command(self) -> str:
         profile = self._load_profile()
-        command_parts = [GROK_BINARY, "--always-approve", "--permission-mode", "bypassPermissions", "--minimal"]
+        command_parts = [
+            GROK_BINARY,
+            "--always-approve",
+            "--permission-mode",
+            "bypassPermissions",
+            "--minimal",
+        ]
+
+        # F295 AC0: rebuild private config from canonical on every launch.
+        # This ensures routing changes (e.g. cc-switch) propagate without
+        # manual terminal respawn.  MCP sections survive because
+        # ensure_grok_mcp_servers upserts them AFTER this rebuild.
+        self._rebuild_private_config()
 
         if profile and profile.mcpServers:
             ensure_grok_mcp_servers(
@@ -232,7 +245,11 @@ class GrokCliProvider(BaseProvider):
         else:
             command_parts.extend(["--session-id", self.allocated_session_uuid])
 
-        return f"env GROK_HOME={shlex.quote(str(self._home_path()))} {shlex.join(command_parts)}"
+        return (
+            f"env GROK_HOME={shlex.quote(str(self._home_path()))}"
+            f" GROK_CLAUDE_HOOKS_ENABLED=0"
+            f" {shlex.join(command_parts)}"
+        )
 
     def _allocate_session_uuid(self) -> str:
         try:
@@ -666,12 +683,76 @@ class GrokCliProvider(BaseProvider):
             seed = canonical_config.read_text(encoding="utf-8") if canonical_config.exists() else ""
             self._atomic_write_private(private_config, seed)
 
+    def _rebuild_private_config(self) -> None:
+        """F295 AC0: rebuild private config from canonical on every launch.
+
+        Reads the canonical ``~/.grok/config.toml``, sanity-parses with tomllib,
+        and on success atomically overwrites the private copy.  On canonical
+        missing or parse failure, keeps the existing private config (fail-safe
+        to stale-but-working) and logs a warning.
+
+        Also stamps the canonical sha256 into terminal metadata (AC2).
+        """
+        from cli_agent_orchestrator.clients.database import update_terminal_metadata
+
+        plane = provider_home("grok_cli")
+        canonical_path = plane.home / "config.toml"
+        private_config = self._home_path() / "config.toml"
+
+        if not canonical_path.exists():
+            logger.warning(
+                "F295: canonical config %s missing; keeping existing private config "
+                "for terminal %s",
+                canonical_path,
+                self.terminal_id,
+            )
+            return
+
+        try:
+            canonical_text = canonical_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            logger.warning(
+                "F295: cannot read canonical config %s: %s; keeping existing private config",
+                canonical_path,
+                exc,
+            )
+            return
+
+        # Sanity-parse gate: reject corrupted/malformed TOML
+        try:
+            tomllib.loads(canonical_text)
+        except tomllib.TOMLDecodeError as exc:
+            logger.warning(
+                "F295: canonical config %s failed TOML parse: %s; "
+                "keeping existing private config for terminal %s",
+                canonical_path,
+                exc,
+                self.terminal_id,
+            )
+            return
+
+        # Atomic overwrite of private config with fresh canonical content
+        self._atomic_write_private(private_config, canonical_text)
+
+        # AC2: stamp sha256 of the canonical text into terminal metadata
+        canonical_hash = hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()
+        try:
+            update_terminal_metadata(self.terminal_id, {"config_sha256": canonical_hash})
+        except Exception as exc:
+            logger.warning(
+                "F295: failed to stamp config hash for terminal %s: %s",
+                self.terminal_id,
+                exc,
+            )
+
     def _atomic_write_private(self, path: Path, content: str) -> None:
         """Atomic write with restrictive permissions."""
         fd = None
         temp_path = None
         try:
-            fd, temp_path = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+            fd, temp_path = tempfile.mkstemp(
+                dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+            )
             os.fchmod(fd, 0o600)
             os.write(fd, content.encode("utf-8"))
             os.fsync(fd)

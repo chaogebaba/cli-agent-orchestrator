@@ -6,23 +6,36 @@ calls the ticks inline, in a seeded order.
 
 Virtual time advances by jump-to-next-deadline (D13), not fixed increment.
 Wall-clock cost of a 10-minute virtual scenario stays milliseconds.
+
+F254 D12: The tick roster is data (a list of Tick tuples), not hardcoded branches.
+The current seven ticks are `DELIVERY_TICKS`, a module constant.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, List, NamedTuple
 
 from cli_agent_orchestrator.sim.clock import SimClock
-from cli_agent_orchestrator.sim.faults import FaultKind, FaultSet
+from cli_agent_orchestrator.sim.faults import FaultSet
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.services.stalled_callback_watchdog import StalledCallbackWatchdog
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# D12: Tick is a named callable. The roster is configuration, not a switch.
+# ---------------------------------------------------------------------------
+
+
+class Tick(NamedTuple):
+    """A single tick in the driver's roster."""
+
+    name: str
+    fn: Callable[[float], None]
 
 
 @dataclass
@@ -35,10 +48,54 @@ class EventTrace:
         self.events.append({"type": event_type, **kwargs})
 
 
+def _build_delivery_ticks(watchdog: "StalledCallbackWatchdog") -> List[Tick]:
+    """Build the default seven delivery ticks from a watchdog instance.
+
+    This is the DELIVERY_TICKS constant materialized for a specific watchdog.
+    The tick order and set are identical to the pre-D12 hardcoded body.
+
+    NOTE: convergence_tick is imported at CALL TIME (not build time) to support
+    test patching — the original _run_ticks also imported per-call.
+    """
+
+    def _convergence(now: float) -> None:
+        from cli_agent_orchestrator.services.delivery_service import convergence_tick
+        convergence_tick()
+
+    def _poll_unarmed(now: float) -> None:
+        watchdog.poll_unarmed_statuses(now=now)
+
+    def _refresh_screen(now: float) -> None:
+        watchdog.refresh_screen_fingerprints(now=now)
+
+    def _notify_due(now: float) -> None:
+        watchdog.notify_due()
+
+    def _tick_waiting(now: float) -> None:
+        watchdog.tick_waiting_inbox(now=now)
+
+    def _tick_ready(now: float) -> None:
+        watchdog.tick_ready_backlog(now=now)
+
+    def _tick_quiescence(now: float) -> None:
+        watchdog.tick_quiescence(now=now)
+
+    return [
+        Tick("_fx191_convergence_tick", _convergence),
+        Tick("poll_unarmed_statuses", _poll_unarmed),
+        Tick("refresh_screen_fingerprints", _refresh_screen),
+        Tick("notify_due", _notify_due),
+        Tick("tick_waiting_inbox", _tick_waiting),
+        Tick("tick_ready_backlog", _tick_ready),
+        Tick("tick_quiescence", _tick_quiescence),
+    ]
+
+
 class SimDriver:
     """Drives the convergence ticks in deterministic order under simulated time.
 
     D10: The roster is the full run-loop fan-out — all seven ticks.
+    D12: The roster is data (ticks parameter), not a hardcoded body.
     D13: Time advances by jump-to-next-deadline.
     """
 
@@ -49,6 +106,7 @@ class SimDriver:
         fault_set: FaultSet,
         trace: EventTrace | None = None,
         auto_tick: bool = True,
+        ticks: List[Tick] | None = None,
     ) -> None:
         self.clock = clock
         self.watchdog = watchdog
@@ -59,6 +117,8 @@ class SimDriver:
         self._iteration_count = 0
         self._deadlines: list[float] = []
         self._auto_tick = auto_tick
+        # D12: ticks roster — defaults to DELIVERY_TICKS when None
+        self._ticks: List[Tick] = ticks if ticks is not None else _build_delivery_ticks(watchdog)
 
     @property
     def iteration_count(self) -> int:
@@ -121,68 +181,23 @@ class SimDriver:
         # Remove consumed deadlines
         self._deadlines = [d for d in self._deadlines if d > self.clock.monotonic()]
 
-        # Run the seven ticks in order (D10 roster)
+        # Run the ticks in roster order (D12)
         now = self.clock.monotonic()
         self._run_ticks(now)
         self._iteration_count += 1
         return True
 
     def _run_ticks(self, now: float) -> None:
-        """Run all seven ticks from the D10 roster."""
+        """Run all ticks from the roster (D12: data-driven, not hardcoded)."""
         self.trace.record("tick_iteration", now=now, iteration=self._iteration_count)
 
-        # 1. _fx191_convergence_tick — calls convergence_tick() from delivery_service
-        #    We call it via the delivery_service directly since we bypass the watchdog's run loop
-        try:
-            from cli_agent_orchestrator.services.delivery_service import convergence_tick
-
-            convergence_tick()
-            self.trace.record("tick", name="_fx191_convergence_tick", now=now)
-        except Exception as e:
-            self.trace.record("tick_error", name="_fx191_convergence_tick", error=str(e))
-            logger.debug("convergence_tick error in sim", exc_info=True)
-
-        # 2. poll_unarmed_statuses
-        try:
-            self.watchdog.poll_unarmed_statuses(now=now)
-            self.trace.record("tick", name="poll_unarmed_statuses", now=now)
-        except Exception as e:
-            self.trace.record("tick_error", name="poll_unarmed_statuses", error=str(e))
-
-        # 3. refresh_screen_fingerprints
-        try:
-            self.watchdog.refresh_screen_fingerprints(now=now)
-            self.trace.record("tick", name="refresh_screen_fingerprints", now=now)
-        except Exception as e:
-            self.trace.record("tick_error", name="refresh_screen_fingerprints", error=str(e))
-
-        # 4. notify_due
-        try:
-            self.watchdog.notify_due()
-            self.trace.record("tick", name="notify_due", now=now)
-        except Exception as e:
-            self.trace.record("tick_error", name="notify_due", error=str(e))
-
-        # 5. tick_waiting_inbox
-        try:
-            self.watchdog.tick_waiting_inbox(now=now)
-            self.trace.record("tick", name="tick_waiting_inbox", now=now)
-        except Exception as e:
-            self.trace.record("tick_error", name="tick_waiting_inbox", error=str(e))
-
-        # 6. tick_ready_backlog
-        try:
-            self.watchdog.tick_ready_backlog(now=now)
-            self.trace.record("tick", name="tick_ready_backlog", now=now)
-        except Exception as e:
-            self.trace.record("tick_error", name="tick_ready_backlog", error=str(e))
-
-        # 7. tick_quiescence
-        try:
-            self.watchdog.tick_quiescence(now=now)
-            self.trace.record("tick", name="tick_quiescence", now=now)
-        except Exception as e:
-            self.trace.record("tick_error", name="tick_quiescence", error=str(e))
+        for tick in self._ticks:
+            try:
+                tick.fn(now)
+                self.trace.record("tick", name=tick.name, now=now)
+            except Exception as e:
+                self.trace.record("tick_error", name=tick.name, error=str(e))
+                logger.debug("tick %s error in sim", tick.name, exc_info=True)
 
     def run_until(
         self,
@@ -200,3 +215,19 @@ class SimDriver:
                 # No deadline available — add the tick cadence as a fallback
                 self.add_deadline(self.clock.monotonic() + self._tick_cadence)
             iterations += 1
+
+
+# ---------------------------------------------------------------------------
+# D12: Module-level constant for the default tick names (documentation only).
+# The actual Tick objects are built per-driver via _build_delivery_ticks().
+# ---------------------------------------------------------------------------
+
+DELIVERY_TICK_NAMES = [
+    "_fx191_convergence_tick",
+    "poll_unarmed_statuses",
+    "refresh_screen_fingerprints",
+    "notify_due",
+    "tick_waiting_inbox",
+    "tick_ready_backlog",
+    "tick_quiescence",
+]

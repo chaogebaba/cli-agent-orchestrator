@@ -15,7 +15,7 @@ import logging
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Generator
+from typing import Callable, Generator
 from unittest.mock import MagicMock, patch
 
 from cli_agent_orchestrator.sim.clock import SimClock, install as install_clock
@@ -37,6 +37,7 @@ class LivenessVerdict:
     PASS = "PASS"
     LIVENESS_TIMEOUT = "LIVENESS_TIMEOUT"
     LIVELOCK = "LIVELOCK"
+    INVARIANT_VIOLATION = "INVARIANT_VIOLATION"  # F254 D13
 
     def __init__(self, verdict: str, details: str = "", seed: int = 0) -> None:
         self.verdict = verdict
@@ -73,6 +74,9 @@ class SimWorld:
         # Obligation tracking (lightweight — the real state is in the DB stubs)
         self._obligations: list[dict[str, object]] = []
         self._delivered: set[int] = set()
+        # D13: backend attachment and invariant registry
+        self._attached_backend = None
+        self._invariants: list[dict] = []
 
     @property
     def seed(self) -> int:
@@ -107,7 +111,64 @@ class SimWorld:
         if not self._installed:
             return
         uninstall_rng(self._rng)
+        # D13: uninstall attached backend
+        if self._attached_backend is not None:
+            from cli_agent_orchestrator.backends import registry
+            registry._backend = None
+            self._attached_backend = None
         self._installed = False
+
+    # ------------------------------------------------------------------
+    # D13: Backend attachment and invariant registry (P3 seams #2 and #3)
+    # ------------------------------------------------------------------
+
+    def attach_backend(self, backend) -> None:
+        """Install a FakeBackend via the registry for this world's lifetime.
+
+        D13 seam #2: makes screen-level faults expressible. The backend is
+        uninstalled in uninstall().
+        """
+        from cli_agent_orchestrator.backends import registry
+        registry.set_backend(backend)
+        self._attached_backend = backend
+
+    def register_invariant(self, name: str, fn: Callable[[], bool]) -> None:
+        """Register a named invariant checked after every step().
+
+        D13 seam #3: invariants are callables checked post-tick, post-heal.
+        A violation records trace("invariant_violation") and yields
+        INVARIANT_VIOLATION verdict. Pre-heal violations are expected and
+        not recorded (amendment #1).
+
+        Args:
+            name: Human-readable invariant name (e.g. "UX-2 delivery")
+            fn: Returns True if invariant holds, False if violated.
+        """
+        self._invariants.append({"name": name, "fn": fn})
+
+    def _check_invariants(self) -> LivenessVerdict | None:
+        """Check all registered invariants. Returns violation verdict or None."""
+        for inv in self._invariants:
+            try:
+                if not inv["fn"]():
+                    self._trace.record(
+                        "invariant_violation",
+                        name=inv["name"],
+                        seed=self._seed,
+                    )
+                    return LivenessVerdict(
+                        LivenessVerdict.INVARIANT_VIOLATION,
+                        details=f"invariant={inv['name']}",
+                        seed=self._seed,
+                    )
+            except Exception as e:
+                self._trace.record(
+                    "invariant_error",
+                    name=inv["name"],
+                    error=str(e),
+                    seed=self._seed,
+                )
+        return None
 
     def inject(self, fault: Fault) -> None:
         """Inject a fault into the simulation (D15 phase 1 only)."""

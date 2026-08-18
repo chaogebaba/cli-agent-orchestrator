@@ -39,7 +39,7 @@ except ModuleNotFoundError:  # Python < 3.11
 # ---------------------------------------------------------------------------
 
 _QUARANTINE_FILE = Path(__file__).resolve().parent.parent / "quarantine.toml"
-_VALID_CLASSES = frozenset({"xdist_flaky", "worker_crash", "known_red"})
+_VALID_CLASSES = frozenset({"xdist_flaky", "worker_crash", "known_red", "serial_only"})
 _QUARANTINE_GROUP = "quarantine-serial"  # D34: named by resource/isolation
 
 
@@ -78,6 +78,12 @@ def pytest_collection_modifyitems(config: Config, items: list[Item]) -> None:
     if not entries:
         return
 
+    # D1 (F262): CAO_TEST_QUARANTINE=off makes the plugin fully inert —
+    # no deselect, no xdist_group marker, no xfail. Restores exactly the
+    # scheduling that filed the entry.
+    if os.environ.get("CAO_TEST_QUARANTINE", "").lower() == "off":
+        return
+
     # Build a lookup: nodeid → entry
     quarantine_map: dict[str, dict] = {e["nodeid"]: e for e in entries}
 
@@ -98,6 +104,12 @@ def pytest_collection_modifyitems(config: Config, items: list[Item]) -> None:
 
         if cls == "xdist_flaky":
             # Serialize via the quarantine group (D34)
+            item.add_marker(pytest.mark.xdist_group(_QUARANTINE_GROUP))
+            remaining.append(item)
+
+        elif cls == "serial_only":
+            # D4 (F262): permanently serialized after diagnosis — same behaviour
+            # as xdist_flaky but with no expiry and a mandatory verdict pointer.
             item.add_marker(pytest.mark.xdist_group(_QUARANTINE_GROUP))
             remaining.append(item)
 
