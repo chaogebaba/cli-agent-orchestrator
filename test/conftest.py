@@ -108,9 +108,12 @@ pytest_plugins = (
     "test.plugins.rss_guard",
     "test.plugins.local_fixture_guard",
     "test.plugins.smoke_tags",
+    "test.plugins.suite_slot",
     "test.plugins.tier_marks",
     "test.plugins.tier_budget",
     "test.plugins.quarantine",
+    "test.plugins.quarantine_expiry",
+    "test.plugins.env_capabilities",
 )
 
 
@@ -222,6 +225,48 @@ def _reset_backend_registry():
     registry._backend = None
     yield
     registry._backend = original
+
+
+@pytest.fixture(autouse=True)
+def _sim_leak_guard():
+    """F254 D14: suite-wide guard — no sim clock/RNG/backend leaks across tests.
+
+    Promoted from test/simulation/conftest.py to suite-wide scope. Extended
+    to also assert backends.registry._backend is None on entry (D14 amendment).
+    """
+    from cli_agent_orchestrator.sim.clock import active as clock_active
+    from cli_agent_orchestrator.sim.rng import active as rng_active
+    from cli_agent_orchestrator.backends import registry
+
+    # Pre-check: should not be installed
+    leaked_clock_pre = clock_active()
+    leaked_rng_pre = rng_active()
+    if leaked_clock_pre is not None or leaked_rng_pre is not None:
+        # Force cleanup from a previous leak
+        import cli_agent_orchestrator.sim.clock as _clk
+        import cli_agent_orchestrator.sim.rng as _rng
+        _clk._active_clock = None
+        _rng._active_rng = None
+
+    yield
+
+    # Post-check: must be clean after test
+    leaked_clock = clock_active()
+    leaked_rng = rng_active()
+    if leaked_clock is not None or leaked_rng is not None:
+        import cli_agent_orchestrator.sim.clock as _clk
+        import cli_agent_orchestrator.sim.rng as _rng
+        _clk._active_clock = None
+        _rng._active_rng = None
+        parts = []
+        if leaked_clock is not None:
+            parts.append("SimClock")
+        if leaked_rng is not None:
+            parts.append("SimRNG")
+        pytest.fail(
+            f"Sim binding leak detected: {', '.join(parts)} still installed after test. "
+            "Wrap sim usage in a context manager or call world.uninstall() (D14)."
+        )
 
 
 @pytest.fixture(autouse=True)

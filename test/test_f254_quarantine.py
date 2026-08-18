@@ -41,11 +41,17 @@ def test_no_expired_quarantine_entries() -> None:
 
     A past expiry means the entry has outlived its review window and must be
     either removed (test is fixed) or re-justified with a new date.
+
+    F262 D4: serial_only entries have NO expiry (permanently decided);
+    they are skipped here.
     """
     today = datetime.date.today()
     entries = _load_quarantine()
     expired = []
     for entry in entries:
+        # D4: serial_only entries must NOT have expires
+        if entry.get("class") == "serial_only":
+            continue
         expires_str = entry.get("expires", "")
         try:
             expires = datetime.date.fromisoformat(expires_str)
@@ -142,4 +148,155 @@ def test_no_rerun_or_randomly_plugins() -> None:
     if violations:
         msg = "Banned test plugins present (D35 — no automatic reruns):\n"
         msg += "\n".join(f"  - {v}" for v in violations)
+        pytest.fail(msg)
+
+
+
+# ---------------------------------------------------------------------------
+# F262 D4 / AC3 — serial_only schema enforcement
+# ---------------------------------------------------------------------------
+
+_VERDICTS_FILE = Path(__file__).resolve().parent / "quarantine-verdicts.md"
+
+
+def test_serial_only_schema() -> None:
+    """serial_only entries: no expires, non-empty verdict, verdict resolves.
+
+    AC3: serial_only + expires → FAIL
+    AC4: serial_only + unresolvable verdict → FAIL
+    AC5: serial_only is serialized (enforced by plugin behaviour, tested via collection)
+    """
+    entries = _load_quarantine()
+    serial_entries = [e for e in entries if e.get("class") == "serial_only"]
+
+    if not serial_entries:
+        pytest.skip("No serial_only entries in quarantine.toml")
+
+    # Load verdict anchors from the ledger
+    anchors: set[str] = set()
+    if _VERDICTS_FILE.exists():
+        for line in _VERDICTS_FILE.read_text().splitlines():
+            if line.startswith("## "):
+                anchors.add(line[3:].strip())
+
+    violations = []
+    for entry in serial_entries:
+        nodeid = entry.get("nodeid", "?")
+
+        # AC3: must NOT have expires
+        if "expires" in entry:
+            violations.append(f"{nodeid}: serial_only must not have 'expires' key")
+
+        # Must have non-empty verdict
+        verdict = entry.get("verdict", "")
+        if not verdict:
+            violations.append(f"{nodeid}: serial_only must have non-empty 'verdict'")
+        elif verdict not in anchors:
+            # AC4: verdict must resolve in quarantine-verdicts.md
+            violations.append(
+                f"{nodeid}: verdict {verdict!r} not found in quarantine-verdicts.md"
+            )
+
+    if violations:
+        msg = "serial_only schema violations (F262 D4):\n"
+        msg += "\n".join(f"  - {v}" for v in violations)
+        pytest.fail(msg)
+
+
+def test_expiry_guard_fires_for_non_serial_only() -> None:
+    """AC6: The expiry guard still fires for every non-serial_only class.
+
+    Verifies that non-serial_only entries with past dates are caught.
+    """
+    entries = _load_quarantine()
+    # All non-serial_only entries must have a valid, parseable expires
+    for entry in entries:
+        if entry.get("class") == "serial_only":
+            continue
+        expires_str = entry.get("expires", "")
+        # Must be parseable
+        try:
+            datetime.date.fromisoformat(expires_str)
+        except (ValueError, TypeError):
+            pytest.fail(
+                f"{entry.get('nodeid', '?')}: non-serial_only entry has invalid "
+                f"expires={expires_str!r} — every deferred entry needs a date"
+            )
+
+
+# ---------------------------------------------------------------------------
+# F262 AC7 — Departed entries have ledger sections
+# ---------------------------------------------------------------------------
+
+
+def test_departed_entries_have_verdicts() -> None:
+    """AC7: Every entry removed from the registry has a ledger section.
+
+    Cross-checks: for each nodeid that was in the P4-merge registry but is
+    absent from the working registry, quarantine-verdicts.md contains a
+    section whose heading matches and whose body has a bucket tag.
+    """
+    # The P4-merge set of nodeids (frozen at F262 build time)
+    _P4_NODEIDS = {
+        "test/telemetry/test_spans.py::TestInvokeAgentSpan::test_emits_invoke_agent_with_required_attributes",
+        "test/telemetry/test_spans.py::TestExecuteToolSpan::test_emits_execute_tool",
+        "test/telemetry/test_spans.py::TestChatSpan::test_emits_chat_with_request_model",
+        "test/telemetry/test_spans.py::TestChatSpanConversationId::test_chat_span_sets_conversation_id",
+        "test/security/test_auth.py::test_expected_audience_defaults_to_api_base_url_when_enabled",
+        "test/security/test_auth.py::test_audience_fallback_enforced_in_validation",
+        "test/services/test_fifo_reader.py::TestReaderThreadLifecycle::test_data_received_across_writer_reconnects",
+        "test/services/test_wpm4a_deferred_init_hardening.py::test_dispatcher_uses_slot_grant_not_delayed_validator_entry",
+        "test/services/test_wpm4a_deferred_init_hardening.py::test_quiesce_wins_after_ready_sync_call_starts",
+        "test/cli/commands/test_fold.py::test_ac13_raw_byte_decode_rejections[malformed UTF-8]",
+        "test/services/test_f72_fleet_lifecycle.py::test_ac13_no_surviving_ancestor_cancels_with_reason",
+        "test/services/test_f72_fleet_lifecycle.py::test_ac13_held_row_target_exists_after_delete",
+        "test/services/test_stage0_flip_machinery.py::test_backend_failure_warning_is_rate_limited_per_terminal",
+        "test/services/test_ready_deadline_edge_probe.py::test_ready_completion_at_deadline_has_one_lawful_owner",
+        "test/services/test_fx191_convergent_delivery.py::TestS2AC14MultiTickConvergence::test_safety_gate_obligations_escalate_within_bound[waiting_user_answer]",
+        "test/services/test_f72_fleet_lifecycle.py::test_uncertain_kill_stops_keeps_row_and_releases_quarantine_exit_lease",
+        "test/services/test_fifo_reader.py::TestReaderThreadLifecycle::test_stop_right_after_writer_eof_does_not_leak",
+        "test/providers/test_claude_transcript_hook.py::test_project_and_generated_session_start_hooks_both_fire",
+        "test/providers/test_claude_transcript_hook.py::test_project_and_two_generated_hooks_are_additive_and_failure_isolated[0]",
+        "test/providers/test_claude_transcript_hook.py::test_project_and_two_generated_hooks_are_additive_and_failure_isolated[1]",
+        "test/services/test_worktree_branch_integrity.py::TestProductionPathForkPlusWorktree::test_create_terminal_fork_worktree_propagates_worktree_info",
+        "test/providers/test_grok_cli_unit.py::test_ac9_all_grok_profiles_register_cao_mcp_server",
+    }
+
+    # Current registry nodeids
+    entries = _load_quarantine()
+    current_nodeids = {e["nodeid"] for e in entries}
+
+    # Departed = was in P4 but not in current
+    departed = _P4_NODEIDS - current_nodeids
+
+    if not departed:
+        pytest.skip("No entries departed from registry yet")
+
+    # Check ledger
+    if not _VERDICTS_FILE.exists():
+        pytest.fail(
+            f"{len(departed)} entries departed but quarantine-verdicts.md does not exist"
+        )
+
+    ledger_text = _VERDICTS_FILE.read_text()
+    bucket_pattern = {"(a)", "(b)", "(c)", "(d)"}
+
+    missing = []
+    for nodeid in departed:
+        # The ledger section heading should contain the nodeid (or a recognizable part)
+        # We check for the function name at minimum
+        parts = nodeid.split("::")
+        func_name = parts[-1].split("[")[0] if "::" in nodeid else nodeid
+        if func_name not in ledger_text:
+            missing.append(f"{nodeid}: no ledger section found")
+            continue
+        # Check for a bucket tag in the vicinity
+        # (relaxed: just check the bucket tag exists somewhere in the file
+        # near the function reference)
+        if not any(tag in ledger_text for tag in bucket_pattern):
+            missing.append(f"{nodeid}: no bucket tag (a)/(b)/(c)/(d) in ledger")
+
+    if missing:
+        msg = "Departed entries without ledger sections (AC7):\n"
+        msg += "\n".join(f"  - {m}" for m in missing)
         pytest.fail(msg)

@@ -575,10 +575,10 @@ def cao_terminal(
     #
     # Same gate every other live-provider test uses (see
     # test/providers/test_kiro_cli_integration.py).
-    if os.environ.get("CAO_RUN_LIVE_PROVIDER_TESTS", "") != "1":
+    if not request.config.getoption("--run-live", default=False):
         pytest.skip(
             f"cao_terminal boots the real {provider!r} CLI, which may start an "
-            "interactive login. Set CAO_RUN_LIVE_PROVIDER_TESTS=1 to enable."
+            "interactive login. Use --run-live to enable."
         )
     if shutil.which(_PROVIDER_BINARIES.get(provider, provider)) is None:
         pytest.skip(f"provider CLI for {provider!r} is not on PATH")

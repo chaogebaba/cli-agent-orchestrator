@@ -557,6 +557,14 @@ def purge_stale_terminal_records() -> int:
                     len(unreadable),
                 )
                 continue
+            # F296: Attempt provider cleanup before purging the row. This
+            # handles cleanup_deferred zombies whose escaped processes have
+            # since died. Best-effort — if cleanup still defers, proceed with
+            # DB delete anyway (window confirmed gone, row must not persist).
+            try:
+                provider_manager.cleanup_provider(terminal_id)
+            except Exception:
+                pass
             if delete_terminal_and_warm_intent(terminal_id, preserve_warm_intent=False)[
                 "terminal_deleted"
             ]:
@@ -5248,6 +5256,11 @@ def _delete_terminal_inner(
                     "uncertain": [{"id": node_id, "reason": "rollback_kill_uncertain"}],
                     "unattempted": order[index + 1 :],
                 }
+            if result.get("cleanup_deferred"):
+                # F296: Window confirmed dead but provider home cleanup deferred
+                # (escaped processes). Non-blocking — cascade continues.
+                reaped.append({"id": node_id, "status": "cleanup_deferred"})
+                continue
             disposition = "killed_while_busy" if busy else "reaped"
             reaped.append({"id": node_id, "status": disposition})
             parent_writer = getattr(get_backend(), "set_window_parent", None)
@@ -5599,7 +5612,14 @@ def _delete_terminal_under_lease(
             logger.warning(
                 "Terminal %s cleanup deferred; retaining metadata for a retry", terminal_id
             )
-            return False
+            return {
+                "terminal_deleted": False,
+                "intent_deleted": False,
+                "intent_error": None,
+                "intent_retain_reason": "cleanup_deferred",
+                "rollback_kill_uncertain": False,
+                "cleanup_deferred": True,
+            }
         from cli_agent_orchestrator.utils.persona_context import cleanup_persona
 
         cleanup_persona(terminal_id)

@@ -22,8 +22,6 @@ if [ ! -f "$REPO_ROOT/pyproject.toml" ]; then
     exit 1
 fi
 
-SUITE_LOCK="/tmp/cao-suite.lock"
-
 # F254 D26: honor CAO_TEST_WORKERS override (later -n wins over addopts).
 WORKER_OVERRIDE=()
 if [ -n "${CAO_TEST_WORKERS:-}" ]; then
@@ -39,13 +37,10 @@ if [[ "${1:-}" == "--tcache-print-effective-argv" ]]; then
     exit 0
 fi
 
-# Acquire exclusive flock (F169 serialization)
-exec 9>"$SUITE_LOCK"
-if ! flock -n 9 2>/dev/null; then
-    echo "waiting for suite lock (another suite is running)..." >&2
-    flock 9
-fi
-echo "lock acquired — running pytest" >&2
+# D4/AC4.2: flock removed — suite serialization now lives in the pytest layer
+# (test/plugins/suite_slot.py). The wrapper is no longer the lock acquisition
+# site; it remains only for the resource fence (systemd-run/nice).
+echo "[fence] running pytest (slot lock held by pytest plugin)" >&2
 
 # Resource fence: systemd-run --user --scope if available
 if command -v systemd-run >/dev/null 2>&1 && systemd-run --user --scope true >/dev/null 2>&1; then

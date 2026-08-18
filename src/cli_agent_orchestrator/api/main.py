@@ -1548,6 +1548,13 @@ async def lifespan(app: FastAPI):
     callback_barrier_task = asyncio.create_task(callback_barrier_daemon())
     deferred_init_watchdog_task = asyncio.create_task(deferred_init_watchdog(registry))
 
+    # F295 AC4: Start grok canonical config watcher
+    from cli_agent_orchestrator.services.grok_config_watcher import grok_config_watcher
+
+    grok_config_watcher_task = (
+        None if is_sandbox() else asyncio.create_task(grok_config_watcher.run())
+    )
+
     # F138: Start orphan reconciliation dispatcher
     from cli_agent_orchestrator.services.orphan_reconcile_service import orphan_reconcile_service
 
@@ -1600,6 +1607,9 @@ async def lifespan(app: FastAPI):
     watchdog_task.cancel()
     callback_barrier_task.cancel()
     deferred_init_watchdog_task.cancel()
+    # F295 AC4: Stop grok config watcher
+    if grok_config_watcher_task is not None:
+        grok_config_watcher_task.cancel()
     # F138: Stop orphan reconciliation dispatcher
     orphan_reconcile_service.stop()
     orphan_reconcile_task.cancel()

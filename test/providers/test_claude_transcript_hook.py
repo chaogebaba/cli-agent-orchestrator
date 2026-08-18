@@ -82,7 +82,7 @@ def test_project_and_generated_session_start_hooks_both_fire(tmp_path):
         generated_path.write_text(json.dumps(generated), encoding="utf-8")
         env = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE")}
         subprocess.run(
-            [claude, "-p", "Reply with exactly OK.", "--settings", str(generated_path)],
+            [claude, "-p", "Reply with exactly OK.", "--model", "claude-sonnet-5", "--settings", str(generated_path)],
             cwd=tmp_path,
             env=env,
             text=True,
@@ -160,7 +160,7 @@ def test_project_and_two_generated_hooks_are_additive_and_failure_isolated(
         generated_path.write_text(json.dumps(generated), encoding="utf-8")
         env = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE")}
         subprocess.run(
-            [claude, "-p", "Reply with exactly OK.", "--settings", str(generated_path)],
+            [claude, "-p", "Reply with exactly OK.", "--model", "claude-sonnet-5", "--settings", str(generated_path)],
             cwd=tmp_path,
             env=env,
             text=True,
