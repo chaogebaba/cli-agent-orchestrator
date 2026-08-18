@@ -18,7 +18,7 @@ check-ext-apps-skills:
 	uv run python scripts/vendor_ext_apps_skills.py --check
 
 
-.PHONY: test-smoke test-full test-quick test-ci test-live test-hygiene test-tiers
+.PHONY: test-smoke test-full test-quick test-ci test-live test-hygiene test-census test-tiers
 
 # --- F237: default-cached fork pytest via tcache ---
 # Resolve tcache from the fork's git common dir (F237 D4).
@@ -63,6 +63,12 @@ test-live:
 # F254 D30: hygiene run — serial, budgets enforced.
 test-hygiene:
 	CAO_TEST_TIER_BUDGET=enforce "$(PYTEST_WRAPPER)" -n 0 -m "" $(ARGS)
+
+# F259: per-test resource census. Never cached (D12 forces a MISS); routed
+# through the fence so profiling numbers are taken under the same CPUWeight /
+# MemoryHigh / nice envelope as every other suite run.
+test-census:
+	CAO_TEST_CENSUS=1 "$(PYTEST_WRAPPER)" -m "" $(ARGS)
 
 # F254 D17: tier census — collect-only, writes test/tier-census.json.
 test-tiers:
