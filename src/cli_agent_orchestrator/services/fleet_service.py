@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from tzlocal import get_localzone
@@ -12,6 +14,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.utils.provider_plane import provider_home
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +26,21 @@ def _as_utc(dt: datetime | None) -> datetime | None:
     if dt.tzinfo is not None:
         return dt.astimezone(timezone.utc)
     return dt.replace(tzinfo=timezone.utc)
+
+
+def _current_grok_canonical_hash() -> str | None:
+    """F295 AC2: compute sha256 of the current canonical grok config.
+
+    Returns None if the canonical config does not exist or cannot be read.
+    """
+    try:
+        canonical_path = provider_home("grok_cli").home / "config.toml"
+        if not canonical_path.exists():
+            return None
+        text = canonical_path.read_text(encoding="utf-8")
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    except Exception:
+        return None
 
 
 def _compute_init_health(row: dict[str, Any], now: datetime) -> str | None:
@@ -75,6 +93,26 @@ def _depths(rows: list[dict[str, Any]]) -> dict[str, int]:
     return memo
 
 
+def _is_config_stale(row: dict[str, Any], canonical_hash: str | None) -> bool | None:
+    """F295 AC2: determine if a grok_cli terminal's config is stale.
+
+    Returns True if the terminal's stored config hash differs from the current
+    canonical hash.  Returns None for non-grok providers or when comparison is
+    not possible (no canonical, no stored hash).
+    """
+    if row.get("provider") != "grok_cli":
+        return None
+    if canonical_hash is None:
+        return None
+    metadata = row.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    stored_hash = metadata.get("config_sha256")
+    if not isinstance(stored_hash, str):
+        return None
+    return stored_hash != canonical_hash
+
+
 def build_fleet(session_name: str) -> dict[str, Any]:
     rows = list_terminals_by_session(session_name)
     if not rows:
@@ -94,6 +132,10 @@ def build_fleet(session_name: str) -> dict[str, Any]:
     by_id = {row["id"]: row for row in rows}
     depths = _depths(rows)
     now = datetime.now(timezone.utc)
+
+    # F295 AC2: compute current canonical hash once per fleet call
+    grok_canonical_hash = _current_grok_canonical_hash()
+
     projected: list[dict[str, Any]] = []
     for row in sorted(rows, key=lambda item: item["id"]):
         parent_id = row.get("caller_id")
@@ -148,6 +190,8 @@ def build_fleet(session_name: str) -> dict[str, Any]:
                 "lifecycle": row.get("lifecycle", "ephemeral"),
                 "resolved_model": row.get("resolved_model"),
                 "reparented_from": row.get("reparented_from"),
+                # F295 AC2: config_stale for grok_cli terminals
+                "config_stale": _is_config_stale(row, grok_canonical_hash),
             }
         )
     return {"session_name": session_name, "terminals": projected}
