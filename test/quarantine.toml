@@ -21,47 +21,47 @@
 
 [[entry]]
 nodeid  = "test/telemetry/test_spans.py::TestInvokeAgentSpan::test_emits_invoke_agent_with_required_attributes"
-class   = "worker_crash"
-reason  = "F238 — shared TracerProvider corrupted by co-scheduled OTel tests; passes serial only"
-owner   = "F238"
-expires = "2026-10-01"
+class   = "serial_only"
+reason  = "F262 C1 — process-global OTel TracerProvider is un-isolatable (conftest.py:3-5)"
+owner   = "F262"
+verdict = "test_emits_invoke_agent_with_required_attributes"
 
 [[entry]]
 nodeid  = "test/telemetry/test_spans.py::TestExecuteToolSpan::test_emits_execute_tool"
-class   = "worker_crash"
-reason  = "F238 — shared TracerProvider corrupted by co-scheduled OTel tests; passes serial only"
-owner   = "F238"
-expires = "2026-10-01"
+class   = "serial_only"
+reason  = "F262 C1 — process-global OTel TracerProvider is un-isolatable (conftest.py:3-5)"
+owner   = "F262"
+verdict = "test_emits_invoke_agent_with_required_attributes"
 
 [[entry]]
 nodeid  = "test/telemetry/test_spans.py::TestChatSpan::test_emits_chat_with_request_model"
-class   = "worker_crash"
-reason  = "F238 — shared TracerProvider corrupted by co-scheduled OTel tests; passes serial only"
-owner   = "F238"
-expires = "2026-10-01"
+class   = "serial_only"
+reason  = "F262 C1 — process-global OTel TracerProvider is un-isolatable (conftest.py:3-5)"
+owner   = "F262"
+verdict = "test_emits_invoke_agent_with_required_attributes"
 
 [[entry]]
 nodeid  = "test/telemetry/test_spans.py::TestChatSpanConversationId::test_chat_span_sets_conversation_id"
-class   = "worker_crash"
-reason  = "F238 — shared TracerProvider corrupted by co-scheduled OTel tests; passes serial only"
-owner   = "F238"
-expires = "2026-10-01"
+class   = "serial_only"
+reason  = "F262 C1 — process-global OTel TracerProvider is un-isolatable (conftest.py:3-5)"
+owner   = "F262"
+verdict = "test_emits_invoke_agent_with_required_attributes"
 
 # --- F238 xdist-sensitive: cross-worker module-level state in auth constants ---
 
 [[entry]]
 nodeid  = "test/security/test_auth.py::test_expected_audience_defaults_to_api_base_url_when_enabled"
-class   = "xdist_flaky"
-reason  = "F238 §1 — passes serial, fails under -n 2 (cross-worker monkeypatch of constants)"
-owner   = "F238"
-expires = "2026-10-01"
+class   = "serial_only"
+reason  = "F262 C6 — cross-worker monkeypatch of module-level auth constants"
+owner   = "F262"
+verdict = "test_expected_audience_defaults_to_api_base_url_when_enabled"
 
 [[entry]]
 nodeid  = "test/security/test_auth.py::test_audience_fallback_enforced_in_validation"
-class   = "xdist_flaky"
-reason  = "F238 §1 — passes serial, fails under -n 2 (cross-worker monkeypatch of constants)"
-owner   = "F238"
-expires = "2026-10-01"
+class   = "serial_only"
+reason  = "F262 C6 — cross-worker monkeypatch of module-level auth constants"
+owner   = "F262"
+verdict = "test_expected_audience_defaults_to_api_base_url_when_enabled"
 
 # --- Pre-existing xdist-flaky: timing/race under parallel execution ---
 
