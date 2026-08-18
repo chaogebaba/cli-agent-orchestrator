@@ -16,7 +16,7 @@ class TestHandoffContractUX1:
     """Contract tests for handoff: UX-1 Arrival invariant."""
 
     def test_handoff_creates_worker_with_brief(
-        self, cao_server: CaoServer, monkeypatch, tmp_path
+        self, cao_server: CaoServer, monkeypatch, tmp_path, track_session
     ):
         """Handoff (via _assign_impl) creates a worker on the live server."""
         session_name = f"ho-contract-{uuid.uuid4().hex[:8]}"
@@ -30,7 +30,9 @@ class TestHandoffContractUX1:
             timeout=30,
         )
         resp.raise_for_status()
-        sup_id = resp.json()["id"]
+        data = resp.json()
+        sup_id = data["id"]
+        track_session(data.get("session_name", f"cao-{session_name}"))
 
         monkeypatch.setenv("CAO_ENDPOINT", cao_server.url)
         monkeypatch.setenv("CAO_TERMINAL_ID", sup_id)
@@ -60,7 +62,7 @@ class TestHandoffContractUX4:
     """Contract tests for handoff: UX-4 Return invariant."""
 
     def test_handoff_worker_has_caller_id(
-        self, cao_server: CaoServer, monkeypatch, tmp_path
+        self, cao_server: CaoServer, monkeypatch, tmp_path, track_session
     ):
         """Worker created by handoff has caller_id set for callback routing."""
         session_name = f"ho-cb-{uuid.uuid4().hex[:8]}"
@@ -74,7 +76,9 @@ class TestHandoffContractUX4:
             timeout=30,
         )
         resp.raise_for_status()
-        sup_id = resp.json()["id"]
+        data = resp.json()
+        sup_id = data["id"]
+        track_session(data.get("session_name", f"cao-{session_name}"))
 
         monkeypatch.setenv("CAO_ENDPOINT", cao_server.url)
         monkeypatch.setenv("CAO_TERMINAL_ID", sup_id)

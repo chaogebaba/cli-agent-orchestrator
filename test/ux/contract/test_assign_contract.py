@@ -18,7 +18,7 @@ from test.ux.scenarios import arrival_two_workers
 class TestAssignContractUX1:
     """Contract tests for assign: UX-1 Arrival invariant."""
 
-    def _setup_supervisor(self, cao_server: CaoServer):
+    def _setup_supervisor(self, cao_server: CaoServer, track_fn=None):
         """Create a supervisor terminal and return its ID + session."""
         session_name = f"contract-{uuid.uuid4().hex[:8]}"
         resp = requests.post(
@@ -32,13 +32,16 @@ class TestAssignContractUX1:
         )
         resp.raise_for_status()
         data = resp.json()
-        return data["id"], session_name
+        actual_session = data.get("session_name", f"cao-{session_name}")
+        if track_fn:
+            track_fn(actual_session)
+        return data["id"], actual_session
 
     def test_assign_brief_reaches_server_intact(
-        self, cao_server: CaoServer, monkeypatch, tmp_path
+        self, cao_server: CaoServer, monkeypatch, tmp_path, track_session
     ):
         """Assign's message reaches the server and is stored for the worker."""
-        sup_id, _ = self._setup_supervisor(cao_server)
+        sup_id, _ = self._setup_supervisor(cao_server, track_session)
         monkeypatch.setenv("CAO_ENDPOINT", cao_server.url)
         monkeypatch.setenv("CAO_TERMINAL_ID", sup_id)
 
@@ -63,10 +66,10 @@ class TestAssignContractUX1:
         assert terminal_data["provider"] == "mock_cli"
 
     def test_arrival_scenario_contract(
-        self, cao_server: CaoServer, monkeypatch, tmp_path
+        self, cao_server: CaoServer, monkeypatch, tmp_path, track_session
     ):
         """Drive arrival_two_workers against live server (contract substrate)."""
-        sup_id, _ = self._setup_supervisor(cao_server)
+        sup_id, _ = self._setup_supervisor(cao_server, track_session)
         monkeypatch.setenv("CAO_ENDPOINT", cao_server.url)
         monkeypatch.setenv("CAO_TERMINAL_ID", sup_id)
 
@@ -107,7 +110,7 @@ class TestAssignContractUX6:
     """Contract tests for assign: UX-6 Visibility invariant."""
 
     def test_assigned_worker_visible_in_fleet(
-        self, cao_server: CaoServer, monkeypatch, tmp_path
+        self, cao_server: CaoServer, monkeypatch, tmp_path, track_session
     ):
         """After assign, the worker appears in fleet view."""
         session_name = f"fleet-{uuid.uuid4().hex[:8]}"
@@ -125,6 +128,7 @@ class TestAssignContractUX6:
         sup_id = data["id"]
         # The server prefixes session names with "cao-"
         actual_session = data.get("session_name", f"cao-{session_name}")
+        track_session(actual_session)
 
         monkeypatch.setenv("CAO_ENDPOINT", cao_server.url)
         monkeypatch.setenv("CAO_TERMINAL_ID", sup_id)
