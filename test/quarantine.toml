@@ -80,3 +80,13 @@ class   = "known_red"
 reason  = "Env-dependent — requires profiles/ directory with grok_base.md; absent in worktree layout"
 owner   = "pre-existing"
 expires = "2026-10-01"
+
+
+# --- Re-quarantined: irreproducible under -n 2 (F262 verdict (d)) ---
+
+[[entry]]
+nodeid  = "test/services/test_ready_deadline_edge_probe.py::test_ready_completion_at_deadline_has_one_lawful_owner"
+class   = "serial_only"
+reason  = "F262 verdict (d) — irreproducible timing flake; re-quarantine trigger: any failure under -n 2"
+owner   = "WP-suite-D2"
+verdict = "test_ready_completion_at_deadline_has_one_lawful_owner"
