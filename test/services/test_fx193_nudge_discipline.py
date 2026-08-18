@@ -942,7 +942,7 @@ class TestA1FullJitter:
                 discipline.arm_or_coalesce("sup1", "mb1", 1, 50)
                 discipline.record_status("sup1", TerminalStatus.IDLE)
 
-                now = time.monotonic() + 0.01
+                now = 100000.0  # Fixed base avoids time.monotonic() divergence
                 # Fire first
                 discipline.collect_due(
                     now=now, get_consumption_cursor=cursor_at_zero, get_pending_oldest=pending
@@ -1103,7 +1103,7 @@ class TestA1FullJitter:
             state = discipline.get_state("sup1")
             assert state is not None
             delay = state.visibility_timeout_at - now
-            assert delay == 30.0, f"Step 0 should be exactly 30s, got {delay}s"
+            assert delay == pytest.approx(30.0), f"Step 0 should be ~30s, got {delay}s"
 
     def test_receive_count_tracks_fires(self):
         """SQS vocabulary: receive_count increments on each fire."""

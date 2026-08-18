@@ -94,6 +94,7 @@ def test_cwd_key_pinned_encodings() -> None:
     assert cwd_key("/home/chao/.claude_test") == "-home-chao--claude-test"
 
 
+@pytest.mark.requires_bwrap
 def test_filter_and_compose_claude_manifest_rehydration(persona_env: dict[str, Path]) -> None:
     corpus = _seed_memory(persona_env)
     (persona_env["claude"] / "agents.json").write_text("{}\n", encoding="utf-8")
@@ -157,6 +158,7 @@ def test_filter_and_compose_claude_manifest_rehydration(persona_env: dict[str, P
     assert persona_env["cwd"].joinpath("CLAUDE.md").is_file()
 
 
+@pytest.mark.requires_bwrap
 def test_reap_persona_generations_keeps_current_only(persona_env: dict[str, Path]) -> None:
     persona_env["cwd"].mkdir()
     policy = ContextPolicy(scope="persona")
@@ -174,6 +176,7 @@ def test_reap_persona_generations_keeps_current_only(persona_env: dict[str, Path
     cleanup_persona("terminal-reap")
 
 
+@pytest.mark.requires_bwrap
 def test_manifest_rehydration_fails_loud_on_invalid_runtime_root(
     persona_env: dict[str, Path],
 ) -> None:
@@ -190,6 +193,7 @@ def test_manifest_rehydration_fails_loud_on_invalid_runtime_root(
         persona_env["runtime"].chmod(0o700)
 
 
+@pytest.mark.requires_bwrap
 def test_manifest_rehydration_fails_loud_on_inaccessible_persona_root(
     persona_env: dict[str, Path],
 ) -> None:
@@ -210,6 +214,7 @@ def test_manifest_rehydration_fails_loud_on_inaccessible_persona_root(
         terminal_root.chmod(0o700)
 
 
+@pytest.mark.requires_bwrap
 def test_generation_reaper_fails_loud_on_inaccessible_persona_root(
     persona_env: dict[str, Path],
 ) -> None:
@@ -329,6 +334,7 @@ def test_two_codex_personas_render_distinct_developer_instructions(
     assert instructions_one != instructions_two
 
 
+@pytest.mark.requires_bwrap
 def test_provider_manager_rehydrates_manifest_plan(persona_env: dict[str, Path]) -> None:
     _seed_memory(persona_env)
     expected = compose_persona_plan(

@@ -955,6 +955,7 @@ def test_probe_08_each_direct_writer_resolves_dead_incarnation_to_mailbox(scratc
         assert direct.enqueue_generation == logical.enqueue_generation == 2
 
 
+@pytest.mark.requires_git_object("33aad1c")
 @pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_probe_09_raw_addressed_output_bytes_match_parent_33aad1c(tmp_path):
     repo = Path(__file__).resolve().parents[2]

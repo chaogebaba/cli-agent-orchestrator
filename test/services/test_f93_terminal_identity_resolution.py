@@ -169,6 +169,7 @@ def test_ac4b_unreadable_window_defers_then_clean_scan_purges(
     assert purge_effects.deleted == ["dead"]
 
 
+@pytest.mark.requires_herdr
 def test_ac5_herdr_inherits_error_liveness_and_never_auto_purges(
     monkeypatch, purge_effects
 ) -> None:

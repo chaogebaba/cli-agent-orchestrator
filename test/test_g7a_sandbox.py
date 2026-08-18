@@ -435,6 +435,7 @@ def test_dead_tmux_socket_is_reaped_and_live_one_is_refused() -> None:
     assert bootstrap._unlink_dead_tmux_socket(socket_name) is False
 
 
+@pytest.mark.requires_tmux
 @pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_up_reclaims_a_dead_socket_of_the_same_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -460,11 +461,19 @@ def test_up_reclaims_a_dead_socket_of_the_same_name(
         text=True,
     )
     assert socket_path.exists()
-    dead_inode = socket_path.stat().st_ino
     root = tmp_path / "reclaim"
     try:
         assert bootstrap.command_up(argparse.Namespace(root=str(root), port=_free_port())) == 0
-        assert socket_path.stat().st_ino != dead_inode
+        # After reclaim, a new live tmux server owns the socket — verify it answers.
+        result = subprocess.run(
+            ["tmux", "-L", socket_name, "list-sessions"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert result.returncode == 0, (
+            f"Socket not owned by a live tmux server after reclaim: {result.stderr}"
+        )
         assert bootstrap._sentinel_owned(bootstrap._load_owned(root)[0])
     finally:
         bootstrap.command_down(argparse.Namespace(root=str(root), purge=True))

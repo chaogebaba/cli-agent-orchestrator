@@ -61,20 +61,6 @@ jobs:
             --junitxml=junit-results.xml \
             --tb=short \
             -q \
-            --deselect test/utils/test_persona_context.py::test_manifest_rehydration_fails_loud_on_inaccessible_persona_root \
-            --deselect test/utils/test_persona_context.py::test_filter_and_compose_claude_manifest_rehydration \
-            --deselect test/utils/test_persona_context.py::test_manifest_rehydration_fails_loud_on_invalid_runtime_root \
-            --deselect test/utils/test_persona_context.py::test_reap_persona_generations_keeps_current_only \
-            --deselect test/utils/test_persona_context.py::test_provider_manager_rehydrates_manifest_plan \
-            --deselect test/utils/test_persona_context.py::test_generation_reaper_fails_loud_on_inaccessible_persona_root \
-            --deselect test/test_f139_fixture_provider.py::TestAdmitProvider::test_credential_provider_still_admitted \
-            --deselect test/services/test_f93_terminal_identity_resolution.py::test_ac5_herdr_inherits_error_liveness_and_never_auto_purges \
-            --deselect test/services/test_wave3b_supervisor_mailbox.py::test_probe_09_raw_addressed_output_bytes_match_parent_33aad1c \
-            --deselect test/services/test_fifo_reader.py::TestReaderLoopCoalescing::test_rapid_writes_produce_fewer_publishes_than_writes \
-            --deselect test/services/test_fx193_nudge_discipline.py::TestA1FullJitter::test_step0_degenerates_to_exactly_30s \
-            --deselect test/services/test_fx193_nudge_discipline.py::TestA1FullJitter::test_a1_ac2_seeded_rng_reproduces_exact_delays \
-            --deselect test/test_g7a_sandbox.py::test_up_reclaims_a_dead_socket_of_the_same_name \
-            --deselect test/services/test_stalled_callback_watchdog.py::test_trigger_a_rollover_is_stale_and_insert_failure_rolls_back_reservation \
             2>&1 | tee pytest-output.log
 
       - name: Write step summary
