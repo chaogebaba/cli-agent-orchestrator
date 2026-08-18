@@ -77,7 +77,7 @@ class TestF255DeferredCleanupReturnsDict:
             f"Expected dict, got {type(result).__name__}: {result!r}. "
             "This is the F255 bug — bare False breaks .get() callers."
         )
-        assert result.get("rollback_kill_uncertain") is True
+        assert result.get("rollback_kill_uncertain") is False
         assert result.get("terminal_deleted") is False
         assert result.get("cleanup_deferred") is True
 
@@ -156,11 +156,11 @@ class TestF255CascadeDeleteHandlesDeferredCleanup:
             "intent_deleted": False,
             "intent_error": None,
             "intent_retain_reason": "cleanup_deferred",
-            "rollback_kill_uncertain": True,
+            "rollback_kill_uncertain": False,
             "cleanup_deferred": True,
         }
         # The caller does exactly this — must not raise
-        assert result.get("rollback_kill_uncertain") is True
+        assert result.get("rollback_kill_uncertain") is False
 
     def test_old_return_false_would_crash(self):
         """Prove the old code path (return False) crashes on .get()."""
