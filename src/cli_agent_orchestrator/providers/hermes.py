@@ -269,6 +269,8 @@ class HermesProvider(BaseProvider):
 
     def get_idle_pattern_for_log(self) -> str:
         """Return Hermes idle prompt pattern for log file monitoring."""
+        from cli_agent_orchestrator.utils.tombstones import tombstone
+        tombstone("TS-0002e")
         return IDLE_PROMPT_PATTERN_LOG
 
     def _has_stable_idle_timer(self, tail_output: str) -> bool:

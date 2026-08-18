@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""tombstone-report — read-only verdict engine for F261 dead-code tombstones.
+
+Modes:
+  (default)    Print verdict blocks for all registered sites.
+  --json       Same data, one JSON object per site, one per line.
+  --verify     Check registry/code drift in both directions.
+  --compact    Fold old exec records (the ONLY writing path).
+
+Exit codes:
+  0  all clean
+  1  at least one verdict is actionable (unfired_ripe / fired_test_only)
+  2  drift detected (--verify)
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ── Paths ──────────────────────────────────────────────────────────────
+
+_LEDGER = Path(
+    os.environ.get("CAO_TOMBSTONE_DIR")
+    or os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+        "cao-tombstones",
+    )
+) / "fired.jsonl"
+
+_REGISTRY = Path(
+    os.environ.get("CAO_TOMBSTONE_REGISTRY")
+    or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "orchestrator", "tombstones", "registry.jsonl")
+)
+
+_FORK_ROOT = Path(
+    os.environ.get("CAO_FORK_ROOT")
+    or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
+)
+
+# ── Ledger parsing ─────────────────────────────────────────────────────
+
+
+def _read_ledger() -> list[dict]:
+    """Read all parseable records from the ledger.  Skip bad lines."""
+    records = []
+    if not _LEDGER.exists():
+        return records
+    for line in _LEDGER.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except (json.JSONDecodeError, ValueError):
+            continue  # skip corrupt lines (AC12)
+    return records
+
+
+def _read_registry() -> list[dict]:
+    """Read registry records."""
+    records = []
+    if not _REGISTRY.exists():
+        return records
+    for line in _REGISTRY.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return records
+
+
+# ── Verdict logic ──────────────────────────────────────────────────────
+
+
+def _compute_verdict(site: dict, ledger: list[dict]) -> dict:
+    """Compute the verdict for a single registry site against the ledger."""
+    site_id = site["id"]
+    planted_at = site["planted_at"]
+    planted_ts = _parse_iso(planted_at)
+    soak = site.get("soak", {})
+    soak_prod_exec = soak.get("prod_exec", 20)
+    soak_test_exec = soak.get("test_exec", 3)
+    soak_days = soak.get("days", 14)
+
+    # Retired sites get a pass-through verdict
+    if site.get("retired_at"):
+        return {
+            "id": site_id,
+            "verdict": f"retired:{site.get('retired_verdict', 'unknown')}",
+            "fires_prod": 0,
+            "fires_test": 0,
+            "execs_prod": 0,
+            "execs_test": 0,
+        }
+
+    # Gather fires and execs for this site
+    fires_prod = 0
+    fires_test = 0
+    for rec in ledger:
+        if rec.get("k") == "fire" and rec.get("id") == site_id:
+            if rec.get("ctx") == "test":
+                fires_test += 1
+            else:
+                fires_prod += 1
+
+    # Count qualifying exec records (build.mt > planted_at)
+    execs_prod = 0
+    execs_test = 0
+    for rec in ledger:
+        if rec.get("k") not in ("exec", "execroll"):
+            continue
+        build = rec.get("build", {})
+        mt = build.get("mt", 0)
+        if mt <= planted_ts:
+            continue  # this exec predates the plant
+        n = rec.get("n", 1)  # execroll carries a count
+        if rec.get("ctx") == "test":
+            execs_test += n
+        else:
+            execs_prod += n
+
+    # Determine verdict
+    if fires_prod > 0:
+        verdict = "fired_prod"
+        reason = None
+        next_action = "Remove tombstone line; retire registry record as evidence site is live."
+    elif fires_test > 0:
+        verdict = "fired_test_only"
+        reason = None
+        next_action = "Remove site + its tests as one reviewed change; retire record."
+    elif execs_prod == 0 and execs_test == 0:
+        verdict = "no_evidence"
+        reason = "no_ledger" if not _LEDGER.exists() else "not_deployed"
+        next_action = "Deploy (install.sh + restart) to begin soak."
+    else:
+        # Check if all soak conjuncts are met
+        age_days = (time.time() - planted_ts) / 86400
+        prod_ok = execs_prod >= soak_prod_exec
+        test_ok = execs_test >= soak_test_exec
+        age_ok = age_days >= soak_days
+
+        if prod_ok and test_ok and age_ok:
+            verdict = "unfired_ripe"
+            reason = None
+            next_action = "Remove site + registry retire; see registry rationale."
+        else:
+            verdict = "unfired_green"
+            # Name the short conjunct(s)
+            short = []
+            if not prod_ok:
+                short.append(f"prod_exec {execs_prod}/{soak_prod_exec}")
+            if not test_ok:
+                short.append(f"test_exec {execs_test}/{soak_test_exec}")
+            if not age_ok:
+                short.append(f"age {int(age_days)}d/{soak_days}d")
+            reason = " | ".join(short)
+            next_action = "Wait for soak conjuncts."
+
+    return {
+        "id": site_id,
+        "verdict": verdict,
+        "reason": reason,
+        "fires_prod": fires_prod,
+        "fires_test": fires_test,
+        "execs_prod": execs_prod,
+        "execs_test": execs_test,
+        "next_action": next_action,
+        "location": f"{site.get('file', '')}::{site.get('symbol', '')}  ({site.get('shape', '')})",
+        "planted": planted_at,
+        "soak_status": f"prod>={soak_prod_exec} {'OK' if execs_prod >= soak_prod_exec else 'SHORT'} | "
+                       f"test>={soak_test_exec} {'OK' if execs_test >= soak_test_exec else 'SHORT'} | "
+                       f"age>={soak_days}d {'OK' if (time.time() - planted_ts) / 86400 >= soak_days else 'SHORT'}",
+    }
+
+
+def _check_drift(site: dict) -> str | None:
+    """Check if the code at the site has drifted from the registry snapshot.
+
+    Returns None if OK, or a reason string if drifted.
+    """
+    site_file = _FORK_ROOT.parent / site["file"]
+    if not site_file.exists():
+        return "file_missing"
+    # Read the enclosing construct and hash it
+    # We can't perfectly re-extract the construct, but we can grep for the
+    # tombstone line and verify the file hasn't changed by checking snippet_sha256
+    # For drift detection, we rely on --verify's separate mechanism
+    return None
+
+
+def _parse_iso(ts_str: str) -> float:
+    """Parse ISO 8601 timestamp to epoch seconds."""
+    # Handle both Z and +00:00 suffixes
+    ts_str = ts_str.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(ts_str)
+        return dt.timestamp()
+    except (ValueError, TypeError):
+        return 0.0
+
+
+# ── Verify mode ────────────────────────────────────────────────────────
+
+
+def _verify(registry: list[dict]) -> list[str]:
+    """Check registry/code drift in both directions."""
+    errors = []
+    registry_ids = {r["id"] for r in registry if not r.get("retired_at")}
+
+    # Find tombstone calls in the fork source
+    code_ids: set[str] = set()
+    src_dir = _FORK_ROOT
+    if src_dir.exists():
+        for py_file in src_dir.rglob("*.py"):
+            try:
+                content = py_file.read_text(errors="replace")
+            except OSError:
+                continue
+            for m in re.finditer(r'tombstone\("(TS-[^"]+)"\)', content):
+                code_ids.add(m.group(1))
+
+    # E-ORPHAN-SITE: in code but not in registry
+    for cid in sorted(code_ids - registry_ids):
+        errors.append(f"E-ORPHAN-SITE: {cid} (in code, absent from registry)")
+
+    # E-MISSING-SITE: in registry but not in code
+    for rid in sorted(registry_ids - code_ids):
+        errors.append(f"E-MISSING-SITE: {rid} (in registry, absent from code)")
+
+    # Snippet drift check for sites present in both
+    for site in registry:
+        if site.get("retired_at"):
+            continue
+        sid = site["id"]
+        if sid not in code_ids:
+            continue  # already reported as E-MISSING-SITE
+        expected_hash = site.get("snippet_sha256", "")
+        if not expected_hash:
+            continue
+        # Recompute snippet hash from the current file
+        site_file = _FORK_ROOT.parent / site["file"]
+        if not site_file.exists():
+            continue
+        actual_hash = _compute_snippet_hash(site, site_file)
+        if actual_hash and actual_hash != expected_hash:
+            errors.append(f"E-DRIFTED: {sid} (snippet_sha256 mismatch: expected {expected_hash[:12]}…, got {actual_hash[:12]}…)")
+
+    return errors
+
+
+def _compute_snippet_hash(site: dict, file_path: Path) -> str | None:
+    """Recompute snippet hash for a site, excluding tombstone lines."""
+    symbol = site.get("symbol", "")
+    shape = site.get("shape", "")
+
+    try:
+        lines = file_path.read_text(errors="replace").splitlines(keepends=True)
+    except OSError:
+        return None
+
+    # Find the enclosing construct based on shape
+    if shape in ("test_only_reachable", "zero_reference", "test_only_family"):
+        # Function-level: find `def {symbol}` and take until next def at same indent or end
+        snippet_lines = _extract_function(lines, symbol)
+    elif shape == "legacy_branch":
+        # Branch arm: find the specific code pattern
+        snippet_lines = _extract_legacy_branch(lines, site)
+    elif shape == "except_arm":
+        # Except handler
+        snippet_lines = _extract_except_arm(lines, site)
+    else:
+        return None
+
+    if not snippet_lines:
+        return None
+
+    # Exclude tombstone lines from the hash
+    filtered = [l for l in snippet_lines if 'tombstone(' not in l and 'from cli_agent_orchestrator.utils.tombstones' not in l]
+    content = "".join(filtered)
+    return hashlib.sha256(content.encode()).hexdigest()
+
+
+def _extract_function(lines: list[str], symbol: str) -> list[str]:
+    """Extract a function body by symbol name."""
+    start = None
+    indent = None
+    for i, line in enumerate(lines):
+        if re.match(rf'\s*(async\s+)?def\s+{re.escape(symbol)}\s*\(', line):
+            start = i
+            indent = len(line) - len(line.lstrip())
+            break
+    if start is None:
+        return []
+    # Collect until next def/class at same or lower indent, or EOF
+    result = [lines[start]]
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
+        stripped = line.lstrip()
+        if stripped and not stripped.startswith('#'):
+            line_indent = len(line) - len(stripped)
+            if line_indent <= indent and (stripped.startswith('def ') or stripped.startswith('async def ') or stripped.startswith('class ')):
+                break
+        result.append(line)
+    # Strip trailing blank lines
+    while result and not result[-1].strip():
+        result.pop()
+    return result
+
+
+def _extract_legacy_branch(lines: list[str], site: dict) -> list[str]:
+    """Extract the legacy branch code for TS-0004/TS-0005."""
+    site_id = site["id"]
+    if site_id == "TS-0004":
+        # The _pane_cache block: starts with `if terminal_id in self._pane_cache:`
+        # ends before the next `if` at the same indent
+        for i, line in enumerate(lines):
+            if 'terminal_id in self._pane_cache' in line and 'if' in line:
+                indent = len(line) - len(line.lstrip())
+                result = [lines[i]]
+                for j in range(i + 1, min(i + 10, len(lines))):
+                    nxt = lines[j]
+                    nxt_stripped = nxt.lstrip()
+                    nxt_indent = len(nxt) - len(nxt_stripped) if nxt_stripped else 999
+                    if nxt_indent <= indent and nxt_stripped and not nxt_stripped.startswith('#'):
+                        break
+                    result.append(nxt)
+                return result
+    elif site_id == "TS-0005":
+        # The window fallback: starts with `if session_name and window_name:`
+        # ends before the next statement at same indent
+        for i, line in enumerate(lines):
+            if 'session_name and window_name' in line and line.lstrip().startswith('if'):
+                # Make sure this is the one inside get_pane_id (after _pane_cache)
+                # Check that it follows the _pane_cache block
+                if i > 0 and any('_pane_cache' in lines[j] for j in range(max(0, i-10), i)):
+                    indent = len(line) - len(line.lstrip())
+                    result = [lines[i]]
+                    for j in range(i + 1, min(i + 10, len(lines))):
+                        nxt = lines[j]
+                        nxt_stripped = nxt.lstrip()
+                        nxt_indent = len(nxt) - len(nxt_stripped) if nxt_stripped else 999
+                        if nxt_indent <= indent and nxt_stripped and not nxt_stripped.startswith('#'):
+                            break
+                        result.append(nxt)
+                    return result
+    return []
+
+
+def _extract_except_arm(lines: list[str], site: dict) -> list[str]:
+    """Extract the except handler for TS-0006."""
+    for i, line in enumerate(lines):
+        if 'except (json.JSONDecodeError, AttributeError)' in line:
+            # Take the except line + all indented body lines
+            indent = len(line) - len(line.lstrip())
+            result = [lines[i]]
+            for j in range(i + 1, min(i + 10, len(lines))):
+                nxt = lines[j]
+                nxt_stripped = nxt.lstrip()
+                nxt_indent = len(nxt) - len(nxt_stripped) if nxt_stripped else 999
+                if nxt_stripped and nxt_indent <= indent:
+                    break
+                result.append(nxt)
+            return result
+    return []
+
+
+# ── Compact mode ───────────────────────────────────────────────────────
+
+
+def _compact():
+    """Fold exec records older than 24h into execroll summaries.
+
+    This is the ONLY writing path in the tool.
+    """
+    if not _LEDGER.exists():
+        print("tombstone-report: no ledger to compact")
+        return
+
+    records = _read_ledger()
+    if not records:
+        print("tombstone-report: ledger empty, nothing to compact")
+        return
+
+    cutoff = time.time() - 86400  # 24 hours ago
+    keep: list[dict] = []
+    # Group old exec records by (day, ctx, build.root, build.mt)
+    rolls: dict[tuple, int] = {}
+
+    for rec in records:
+        k = rec.get("k")
+        if k == "fire":
+            # fire records are NEVER compacted
+            keep.append(rec)
+        elif k == "execroll":
+            # Already rolled — keep as-is
+            keep.append(rec)
+        elif k == "exec":
+            ts_str = rec.get("ts", "")
+            ts_epoch = _parse_iso(ts_str)
+            if ts_epoch > cutoff:
+                # Recent — keep raw
+                keep.append(rec)
+            else:
+                # Old — fold into roll
+                build = rec.get("build", {})
+                day = ts_str[:10] if len(ts_str) >= 10 else "unknown"
+                ctx = rec.get("ctx", "prod")
+                key = (day, ctx, build.get("root", ""), build.get("mt", 0))
+                rolls[key] = rolls.get(key, 0) + 1
+        else:
+            keep.append(rec)
+
+    # Create execroll records
+    for (day, ctx, root, mt), n in sorted(rolls.items()):
+        keep.append({
+            "k": "execroll",
+            "day": day,
+            "ctx": ctx,
+            "build": {"root": root, "mt": mt},
+            "n": n,
+        })
+
+    # Atomic rewrite via temp file + os.replace (AC13)
+    ledger_dir = _LEDGER.parent
+    ledger_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=str(ledger_dir), suffix=".jsonl.tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            for rec in keep:
+                f.write(json.dumps(rec, sort_keys=True, separators=(",", ":")) + "\n")
+        os.replace(tmp_path, str(_LEDGER))
+    except BaseException:
+        # Clean up temp on failure
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+    before_count = len(records)
+    after_count = len(keep)
+    print(f"tombstone-report --compact: {before_count} -> {after_count} records "
+          f"({len(rolls)} exec rolls created)")
+
+
+# ── Output formatting ──────────────────────────────────────────────────
+
+
+def _format_verdict_block(v: dict) -> str:
+    """Format one verdict as a human-readable block."""
+    lines = [
+        "tombstone-report v1",
+        f"site:         {v['id']}",
+        f"location:     {v.get('location', '')}",
+        f"verdict:      {v['verdict']}",
+    ]
+    if v.get("reason"):
+        lines.append(f"reason:       {v['reason']}")
+    lines.append(f"planted:      {v.get('planted', '')}")
+    lines.append(f"fires:        prod={v['fires_prod']} test={v['fires_test']}")
+    lines.append(f"execs:        prod={v['execs_prod']} test={v['execs_test']}   (since plant, instrumented builds only)")
+    lines.append(f"soak:         {v.get('soak_status', '')}")
+    lines.append(f"next_action:  {v.get('next_action', '')}")
+    return "\n".join(lines)
+
+
+# ── Main ───────────────────────────────────────────────────────────────
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Dead-code tombstone verdict engine (F261)")
+    parser.add_argument("--json", action="store_true", help="Output as JSON lines")
+    parser.add_argument("--verify", action="store_true", help="Check registry/code drift")
+    parser.add_argument("--compact", action="store_true", help="Fold old exec records (writes)")
+    parser.add_argument("--site", type=str, help="Report on a single site ID only")
+    args = parser.parse_args()
+
+    if args.compact:
+        _compact()
+        return
+
+    registry = _read_registry()
+    if not registry:
+        print("tombstone-report: no registry found at", _REGISTRY, file=sys.stderr)
+        sys.exit(1)
+
+    if args.verify:
+        errors = _verify(registry)
+        if errors:
+            for e in errors:
+                print(e, file=sys.stderr)
+            sys.exit(2)
+        else:
+            print("tombstone-report --verify: OK (no drift)")
+            sys.exit(0)
+
+    # Default mode: compute and print verdicts
+    ledger = _read_ledger()
+    actionable = False
+
+    for site in registry:
+        if args.site and site["id"] != args.site:
+            continue
+        v = _compute_verdict(site, ledger)
+        if v["verdict"] in ("unfired_ripe", "fired_test_only"):
+            actionable = True
+        if args.json:
+            print(json.dumps(v, sort_keys=True))
+        else:
+            print(_format_verdict_block(v))
+            print()
+
+    sys.exit(1 if actionable else 0)
+
+
+if __name__ == "__main__":
+    main()

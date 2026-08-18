@@ -1114,6 +1114,8 @@ class KimiCliProvider(BaseProvider):
         sanitised WARNING. ``KeyboardInterrupt`` and ``SystemExit``
         propagate.
         """
+        from cli_agent_orchestrator.utils.tombstones import tombstone
+        tombstone("TS-0001")
         from cli_agent_orchestrator.services.wiki_compiler import _sanitize_for_log
 
         try:

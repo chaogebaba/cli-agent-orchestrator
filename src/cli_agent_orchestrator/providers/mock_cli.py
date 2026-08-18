@@ -381,6 +381,8 @@ class MockCliProvider(BaseProvider):
             )
 
     def get_idle_pattern_for_log(self) -> str:
+        from cli_agent_orchestrator.utils.tombstones import tombstone
+        tombstone("TS-0002a")
         return IDLE_PROMPT_PATTERN_LOG
 
     def exit_cli(self) -> str:

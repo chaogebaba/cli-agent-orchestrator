@@ -730,6 +730,8 @@ class HerdrBackend(TerminalBackend):
                 pane_info = data.get("pane", data) if isinstance(data, dict) else data
                 foreground_process = cast(str | None, pane_info.get("foreground_process"))
             except (json.JSONDecodeError, AttributeError):
+                from cli_agent_orchestrator.utils.tombstones import tombstone
+                tombstone("TS-0006")
                 foreground_process = None
         marker = service.read_identity_marker(terminal_id)
         if marker is None or marker.pane_id != resolved_pane:
@@ -867,10 +869,14 @@ class HerdrBackend(TerminalBackend):
 
         # Legacy fallback (removed in a follow-up once the map is proven):
         if terminal_id in self._pane_cache:
+            from cli_agent_orchestrator.utils.tombstones import tombstone
+            tombstone("TS-0004")
             pane_id, cached_at = self._pane_cache[terminal_id]
             if time.time() - cached_at < _PANE_CACHE_TTL:
                 return pane_id
         if session_name and window_name:
+            from cli_agent_orchestrator.utils.tombstones import tombstone
+            tombstone("TS-0005")
             return self._resolve_pane_id_from_window(session_name, window_name)
 
         raise TerminalNotFoundError(terminal_id)
