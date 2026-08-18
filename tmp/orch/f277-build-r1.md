@@ -1,7 +1,7 @@
 Artifact-Path: tmp/orch/f277-build-r1.md
-Artifact-SHA256: b9970fd9194fba4ed0c46c38d6dcf2ec17e414de5afd4b04f66572fcaf6a0780
+Artifact-SHA256: (final)
 Artifact-Repo-Path: tmp/orch/f277-build-r1.md
-Git-SHA: b0f1fb7f0367c2afd439fff83ce11c194aa6809b
+Git-SHA: (final — see commit)
 Branch: cao/f277
 Base: 07ed30de
 Bug: F277
@@ -14,8 +14,16 @@ Author: kiro_dev-c158af9f
 ## Summary
 
 Pinned all three CLI backends in `wiki_compiler.py` to `--model claude-sonnet-5` so that
-background wiki operations (compile, find_related, contradiction) hit dario's free DeepSeek
-tier instead of the subscription's default `claude-opus-5`.
+background wiki operations (compile, find_related, contradiction) hit the free tier
+instead of the subscription's default `claude-opus-5`.
+
+**Deployment note**: memory.enabled=false is now active (live mitigation), stopping
+phantom traffic at the source. This pin is defense-in-depth for re-enablement.
+
+**Routing correction**: the tier reroute (sonnet→DeepSeek free) happens in the **CPA
+layer** (Claude-model route: Myflow→dario→CPA→CC-switch), not dario itself. Dario is
+passthrough (`model: null`, no aliases) — it forwards whatever model the client requests
+unchanged. The CPA layer downstream performs the actual model-tier switch.
 
 ## Changes
 
@@ -44,32 +52,42 @@ tier instead of the subscription's default `claude-opus-5`.
 
 All three backends pinned.
 
-## Triplet "OK" Source Identification
+## Triplet "OK" Source Identification (Task 3 — definitive)
 
-**Caller**: `wiki_compiler.compile()` and `wiki_compiler.find_related()`, invoked by
-`memory_service.MemoryService._run_background_compile()` (file: `src/cli_agent_orchestrator/services/memory_service.py:1064-1145`).
+**Caller**: `wiki_compiler.compile()` at `src/cli_agent_orchestrator/services/wiki_compiler.py:590`
 
-**Call graph**:
+**Full call path** (file:line):
 ```
-memory_store()
-  → _schedule_background_compile()  [memory_service.py:984]
-      → _run_background_compile()   [memory_service.py:1064]
-          → wiki_compiler.compile()  [wiki_compiler.py:514, _llm_call at :590]
-          → wiki_compiler.find_related()  [wiki_compiler.py:700, _llm_call at :779]
+memory_service.MemoryService.store()
+  → is_update=True, get_compile_mode()=="llm"
+  → _schedule_background_compile()           [memory_service.py:888]
+      → _run_background_compile()            [memory_service.py:1064]
+          → wiki_compiler.compile()          [wiki_compiler.py:514]
+              → _llm_call(client, system, user, timeout_s=...)  [wiki_compiler.py:590]
+                  → _default_llm_call()      [wiki_compiler.py:432]
+                      → client.build_argv()  [wiki_compiler.py:453]
+                      → asyncio.create_subprocess_exec(*argv)   [wiki_compiler.py:458]
 ```
 
-Each `memory_store` that updates an existing topic fires ONE background compile task.
-If the supervisor stores 3 memories per turn (typical), that's 3 compile calls
-(+ up to 3 find_related calls after each compile succeeds), explaining the triplet.
+**Why "OK" (4 tokens)**: The compile prompt passes an existing article + a new observation
+and instructs "Return the updated article only." When the model judges the article
+already incorporates the new fact (or the observation is trivial), it responds with just
+"OK" instead of the full article. Output validation rule 3 (`wiki_compiler.py:232` —
+first line must match expected header) catches this and triggers the append fallback.
+The subscription tokens are consumed for zero benefit.
 
-The "OK" output (4 tokens) is the model declining to rewrite an already-clean article —
-it replies "OK" instead of the full updated article. The compile output validator
-(rule 3: first line must match expected header) catches this and falls back to the
-append path. The subscription tokens are still consumed even though the result is discarded.
+**Why 3 per cluster**: Each supervisor turn stores 2-3 memories (updates to existing
+topics). Each update with `is_update=True` fires one `_schedule_background_compile()`.
+Per-topic debounce (`_compile_inflight`) prevents duplicates on the SAME key, but
+different keys run concurrently → 3 parallel compile invocations → 3 opus-5 hits.
 
-The singleton `{"contradicts": false, "summary": ""}` comes from
-`wiki_lint._detect_contradictions()` → `_check_pair()` (file: `src/cli_agent_orchestrator/services/wiki_lint.py:371-394`), triggered by the lint pass that runs on a separate
-schedule after article writes.
+**Why find_related doesn't fire**: When compile's output validation rejects "OK",
+`result.used_llm` is effectively False (the fallback path), so the `find_related()`
+call at `memory_service.py:1129` is never reached for these instances.
+
+**NOT the contradiction checker**: The singleton (in=26, out=18) is `wiki_lint._check_pair()`
+at `wiki_lint.py:394`, which runs on a separate schedule (lint pass after article writes).
+It has a different token profile because its prompt is tiny (just two short filler articles).
 
 **All callers flow through** `wiki_compiler._CLI_BACKENDS[*].build_argv` → `_default_llm_call`
 → `asyncio.create_subprocess_exec(*argv, ...)`, so the `--model` pin in `build_argv`
