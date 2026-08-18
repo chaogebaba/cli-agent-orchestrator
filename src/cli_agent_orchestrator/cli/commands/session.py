@@ -39,6 +39,8 @@ def _get_terminal(terminal_id):
 
 
 def _get_terminal_output(terminal_id):
+    from cli_agent_orchestrator.utils.tombstones import tombstone
+    tombstone("TS-0003")
     response = cao_http.get(f"/terminals/{terminal_id}/output", params={"mode": "last"})
     response.raise_for_status()
     return response.json()

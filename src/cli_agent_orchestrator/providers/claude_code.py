@@ -1560,6 +1560,8 @@ class ClaudeCodeProvider(BaseProvider):
 
     def get_idle_pattern_for_log(self) -> str:
         """Return Claude Code IDLE prompt pattern for log files."""
+        from cli_agent_orchestrator.utils.tombstones import tombstone
+        tombstone("TS-0002h")
         return IDLE_PROMPT_PATTERN_LOG
 
     # Start-of-line idle prompt for extraction: ❯ or > at the beginning of a line

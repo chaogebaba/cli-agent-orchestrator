@@ -1138,6 +1138,8 @@ class KiroCliProvider(BaseProvider):
         Returns a pattern that matches either the legacy UI format
         or the new TUI format.
         """
+        from cli_agent_orchestrator.utils.tombstones import tombstone
+        tombstone("TS-0002b")
         return rf"(?:{IDLE_PROMPT_PATTERN_LOG}|{NEW_TUI_IDLE_PATTERN_LOG})"
 
     def exit_cli(self) -> str:

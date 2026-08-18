@@ -547,6 +547,8 @@ class CopilotCliProvider(BaseProvider):
         return TerminalStatus.COMPLETED
 
     def get_idle_pattern_for_log(self) -> str:
+        from cli_agent_orchestrator.utils.tombstones import tombstone
+        tombstone("TS-0002g")
         return IDLE_PROMPT_PATTERN_LOG
 
     def extract_last_message_from_script(self, script_output: str) -> str:
