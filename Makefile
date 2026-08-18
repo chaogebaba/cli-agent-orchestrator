@@ -20,6 +20,19 @@ check-ext-apps-skills:
 
 .PHONY: test-smoke test-full test-quick test-ci test-live test-hygiene test-tiers
 
+# --- F273: /data preflight — fail-fast when /data is not mounted ---
+# Every fenced test target exports TMPDIR=/data/cao-scratch/tmp so pytest, xdist
+# workers, and strace never touch the RAM-backed /tmp (7.7G tmpfs → swap death).
+define F273_PREFLIGHT
+@if ! findmnt -rno TARGET /data >/dev/null 2>&1; then \
+    echo "F273: /data is not mounted — ask the user to plug in /data (sudo systemctl start data.mount). /tmp fallback is banned." >&2; \
+    exit 2; \
+fi
+@mkdir -p /data/cao-scratch/tmp
+endef
+
+export TMPDIR := /data/cao-scratch/tmp
+
 # --- F237: default-cached fork pytest via tcache ---
 # Resolve tcache from the fork's git common dir (F237 D4).
 # Layout coupling: fork is one level inside root repo. Override with env for
@@ -37,11 +50,13 @@ ARGS ?=
 # F254 D29: smoke routed through the fence (flock) like its siblings.
 # Not cached (a 5-second suite gains nothing from a content-addressed cache).
 test-smoke:
+	$(F273_PREFLIGHT)
 	"$(PYTEST_WRAPPER)" -m smoke $(ARGS)
 
 # Full suite (all markers, overrides addopts -m filter). Cached by default (F237 D6).
 # Opt-out: make test-full TCACHE=off
 test-full:
+	$(F273_PREFLIGHT)
 	"$(TCACHE_BIN)" run "$(PYTEST_WRAPPER)" -m "" $(ARGS)
 
 # Quick suite — default addopts unchanged. Cached by default (F237 D6).
@@ -49,19 +64,23 @@ test-full:
 # F279: belt-and-braces live exclusion (live tests are env-gated individually,
 # but -m "not live" gives CI parity with test-ci).
 test-quick:
+	$(F273_PREFLIGHT)
 	"$(TCACHE_BIN)" run "$(PYTEST_WRAPPER)" -m "not live" $(ARGS)
 
 # F254 D29/D30: CI target — identical to test-full marker expression.
 # CI passes extra flags (coverage, ignores) via ARGS=.
 test-ci:
+	$(F273_PREFLIGHT)
 	"$(TCACHE_BIN)" run "$(PYTEST_WRAPPER)" -m "not live and not e2e" $(ARGS)
 
 # F254 D30: opt-in live/e2e tier (never in a gate).
 test-live:
+	$(F273_PREFLIGHT)
 	"$(PYTEST_WRAPPER)" -m "live or e2e" --run-live $(ARGS)
 
 # F254 D30: hygiene run — serial, budgets enforced.
 test-hygiene:
+	$(F273_PREFLIGHT)
 	CAO_TEST_TIER_BUDGET=enforce "$(PYTEST_WRAPPER)" -n 0 -m "" $(ARGS)
 
 # F254 D17: tier census — collect-only, writes test/tier-census.json.

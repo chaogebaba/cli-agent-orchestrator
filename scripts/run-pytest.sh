@@ -22,6 +22,7 @@ if [ ! -f "$REPO_ROOT/pyproject.toml" ]; then
     exit 1
 fi
 
+
 # F254 D26: honor CAO_TEST_WORKERS override (later -n wins over addopts).
 WORKER_OVERRIDE=()
 if [ -n "${CAO_TEST_WORKERS:-}" ]; then
