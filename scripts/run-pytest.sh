@@ -22,7 +22,7 @@ if [ ! -f "$REPO_ROOT/pyproject.toml" ]; then
     exit 1
 fi
 
-SUITE_LOCK="/tmp/cao-suite.lock"
+SUITE_LOCK="/data/cao-scratch/tmp/cao-suite.lock"
 
 # F254 D26: honor CAO_TEST_WORKERS override (later -n wins over addopts).
 WORKER_OVERRIDE=()
