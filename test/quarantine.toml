@@ -42,7 +42,7 @@ nodeid    = "test/telemetry/test_spans.py::TestInvokeAgentSpan::test_emits_invok
 class     = "serial_only"
 reason    = "F262 C1 — process-global OTel TracerProvider is un-isolatable (conftest.py:3-5)"
 owner     = "F262"
-filed     = "2026-08-19"
+filed     = "2026-08-18"
 review_by = "2026-09-18"
 verdict   = "test_emits_invoke_agent_with_required_attributes"
 
@@ -51,7 +51,7 @@ nodeid    = "test/telemetry/test_spans.py::TestExecuteToolSpan::test_emits_execu
 class     = "serial_only"
 reason    = "F262 C1 — process-global OTel TracerProvider is un-isolatable (conftest.py:3-5)"
 owner     = "F262"
-filed     = "2026-08-19"
+filed     = "2026-08-18"
 review_by = "2026-09-18"
 verdict   = "test_emits_invoke_agent_with_required_attributes"
 
@@ -60,7 +60,7 @@ nodeid    = "test/telemetry/test_spans.py::TestChatSpan::test_emits_chat_with_re
 class     = "serial_only"
 reason    = "F262 C1 — process-global OTel TracerProvider is un-isolatable (conftest.py:3-5)"
 owner     = "F262"
-filed     = "2026-08-19"
+filed     = "2026-08-18"
 review_by = "2026-09-18"
 verdict   = "test_emits_invoke_agent_with_required_attributes"
 
@@ -69,7 +69,7 @@ nodeid    = "test/telemetry/test_spans.py::TestChatSpanConversationId::test_chat
 class     = "serial_only"
 reason    = "F262 C1 — process-global OTel TracerProvider is un-isolatable (conftest.py:3-5)"
 owner     = "F262"
-filed     = "2026-08-19"
+filed     = "2026-08-18"
 review_by = "2026-09-18"
 verdict   = "test_emits_invoke_agent_with_required_attributes"
 
@@ -82,7 +82,7 @@ nodeid    = "test/security/test_auth.py::test_expected_audience_defaults_to_api_
 class     = "serial_only"
 reason    = "F262 C6 — cross-worker monkeypatch of module-level auth constants"
 owner     = "F262"
-filed     = "2026-08-19"
+filed     = "2026-08-18"
 review_by = "2026-09-18"
 verdict   = "test_expected_audience_defaults_to_api_base_url_when_enabled"
 
@@ -91,7 +91,7 @@ nodeid    = "test/security/test_auth.py::test_audience_fallback_enforced_in_vali
 class     = "serial_only"
 reason    = "F262 C6 — cross-worker monkeypatch of module-level auth constants"
 owner     = "F262"
-filed     = "2026-08-19"
+filed     = "2026-08-18"
 review_by = "2026-09-18"
 verdict   = "test_expected_audience_defaults_to_api_base_url_when_enabled"
 
@@ -102,7 +102,7 @@ nodeid    = "test/services/test_worktree_branch_integrity.py::TestProductionPath
 class     = "known_red"
 reason    = "Env-dependent — working directory not created by git in temp fixture; fails serial"
 owner     = "pre-existing"
-filed     = "2026-08-19"
+filed     = "2026-08-18"
 review_by = "2026-09-18"
 
 [[entry]]
@@ -110,7 +110,7 @@ nodeid    = "test/providers/test_grok_cli_unit.py::test_ac9_all_grok_profiles_re
 class     = "known_red"
 reason    = "Env-dependent — requires profiles/ directory with grok_base.md; absent in worktree layout"
 owner     = "pre-existing"
-filed     = "2026-08-19"
+filed     = "2026-08-18"
 review_by = "2026-09-18"
 
 # --- Re-quarantined: irreproducible under -n 2 (F262 verdict (d)) ---
@@ -120,6 +120,6 @@ nodeid    = "test/services/test_ready_deadline_edge_probe.py::test_ready_complet
 class     = "serial_only"
 reason    = "F262 verdict (d) — irreproducible timing flake; re-quarantine trigger: any failure under -n 2"
 owner     = "WP-suite-D2"
-filed     = "2026-08-19"
+filed     = "2026-08-18"
 review_by = "2026-09-18"
 verdict   = "test_ready_completion_at_deadline_has_one_lawful_owner"

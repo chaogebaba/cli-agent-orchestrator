@@ -32,13 +32,19 @@ Already present in `test/plugins/quarantine.py:42`:
 _VALID_CLASSES = frozenset({"xdist_flaky", "worker_crash", "known_red", "serial_only"})
 ```
 
-Verification:
+Note: `-m serial_only` selects 0 items by design — the quarantine plugin applies
+`pytest.mark.xdist_group("quarantine-serial")`, never `pytest.mark.serial_only`.
+The marker registration satisfies `--strict-markers` (so the class name can appear
+in test code or CLI without a collection error), but selection is via the quarantine
+plugin's `modifyitems` hook, not marker filtering.
+
+Verification (marker registered, collection does not error):
 ```
 $ uv run pytest --collect-only -q -n 0 -m serial_only 2>&1 | tail -3
-7 tests collected (11704 deselected) in 5.96s
+no tests collected (11711 deselected) in 10.26s
 ```
 
-**Status: PASS** — marker registered, --strict-markers passes, collection works.
+**Status: PASS** — marker registered, --strict-markers passes, 0 collected is correct.
 
 ---
 
@@ -49,7 +55,7 @@ $ uv run pytest --collect-only -q -n 0 -m serial_only 2>&1 | tail -3
 All 9 entries now carry required fields:
 - `class` — one of {serial_only, known_red}
 - `reason` — root-cause description
-- `filed` — 2026-08-19 (UTC date entry added)
+- `filed` — 2026-08-18 (UTC date entry added)
 - `review_by` — 2026-09-18 (filed + 30 days)
 
 Header documents the mechanical criteria.
