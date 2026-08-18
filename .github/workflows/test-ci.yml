@@ -1,0 +1,58 @@
+name: Fork CI – test-ci parity suite
+
+on:
+  push:
+    branches:
+      - 'cao/**'
+  workflow_dispatch:
+
+jobs:
+  test-ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "latest"
+
+      - name: Set up Python 3.14
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run test-ci suite
+        run: |
+          uv run pytest \
+            -m "not live and not e2e" \
+            -n 4 \
+            --dist loadgroup \
+            --strict-markers \
+            -p no:randomly \
+            --timeout=30 \
+            --timeout-method=thread \
+            --junitxml=junit-results.xml \
+            --tb=short \
+            -q
+
+      - name: Generate last-lines summary
+        if: always()
+        run: |
+          echo "=== Last 80 lines of test output ===" > last-lines.txt
+          # pytest output is in the step log; junit has structured results
+          echo "See junit-results.xml for structured results" >> last-lines.txt
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            junit-results.xml
+            last-lines.txt
+          retention-days: 14
