@@ -1,9 +1,14 @@
-# WP-SUITE D3 Build Report (r1)
+# WP-SUITE D3 Build Report (r1, amended)
 
 Builder: kiro_dev (terminal 84ef6fdb, isolated worktree)
 Base: `ce48138b` (f254-phase3-enforcement, includes D1/D2/D4)
 Branch: `cao/84ef6fdb`
 Date: 2026-08-19
+
+**Amendments (gate fix round, 0B/1S/2N):**
+- S1: removed `2>/dev/null` on vocab-hash `cat` — missing file now fails step loudly.
+- N1: `wall_time_seconds` parsed from junit XML `time=` attribute (real suite wall time).
+- N2: derived-attestation lookup branch commented as forward-looking dead code.
 
 ---
 

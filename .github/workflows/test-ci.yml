@@ -48,12 +48,13 @@ jobs:
         id: identity
         run: |
           # AC3.5b: vocabulary_version = sha256 over the four vocabulary files.
+          # S1 fix: no 2>/dev/null — a missing vocab file must fail the step loudly.
           VOCAB_VERSION=$(cat \
             pyproject.toml \
             test/plugins/env_capabilities.py \
             test/plugins/quarantine.py \
             test/quarantine.toml \
-            2>/dev/null | sha256sum | cut -d' ' -f1)
+            | sha256sum | cut -d' ' -f1)
 
           # Deterministic JSON — keys in sorted order, no trailing newline variation.
           # This file must be byte-for-byte reproducible from the tree alone.
@@ -102,6 +103,9 @@ jobs:
           fi
 
           # AC3.6: check evidence_kind — if derived, verify the direct root too.
+          # N2: this branch is forward-looking dead code today. The workflow only
+          # mints "direct" attestations; derived would only exist if a future
+          # short-circuit run chose to mint (currently it does not — it just skips).
           EVIDENCE_KIND=$(echo "$RESULT" | jq -r '.[0].verificationResult.statement.predicate.evidence_kind // "direct"' 2>/dev/null)
           if [ "$EVIDENCE_KIND" = "derived" ]; then
             DERIVED_FROM=$(echo "$RESULT" | jq -r '.[0].verificationResult.statement.predicate.derived_from // empty' 2>/dev/null)
@@ -235,13 +239,16 @@ jobs:
             echo "SUITE_TESTS=$(grep -oP 'tests="\K[^"]+' junit-results.xml | head -1)" >> "$GITHUB_ENV"
             echo "SUITE_FAILURES=$(grep -oP 'failures="\K[^"]+' junit-results.xml | head -1)" >> "$GITHUB_ENV"
             echo "SUITE_SKIPPED=$(grep -oP 'skipped="\K[^"]+' junit-results.xml | head -1)" >> "$GITHUB_ENV"
+            # N1 fix: parse real wall time from junit XML root element's time= attribute.
+            WALL_TIME=$(grep -oP 'time="\K[^"]+' junit-results.xml | head -1)
+            echo "SUITE_WALL_TIME=${WALL_TIME:-0}" >> "$GITHUB_ENV"
           else
             echo "SUITE_TESTS=0" >> "$GITHUB_ENV"
             echo "SUITE_FAILURES=1" >> "$GITHUB_ENV"
             echo "SUITE_SKIPPED=0" >> "$GITHUB_ENV"
+            echo "SUITE_WALL_TIME=0" >> "$GITHUB_ENV"
           fi
           echo "SUITE_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
-          echo "SUITE_WALL_TIME=$SECONDS" >> "$GITHUB_ENV"
 
       # AC3.5/AC3.6/AC3.7/AC3.9: mint attestation on successful direct run.
       # Minting is the LAST step — nothing else runs while id-token is hot.
