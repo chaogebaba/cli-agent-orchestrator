@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'cao/**'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          version: "latest"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run test-ci suite
+        shell: bash
+        run: |
+          set -o pipefail
+          # -n 4 is safe here: the runner has 16 GB RAM (vs the laptop's 15 GB
+          # where pyproject's -n 2 was tuned to stay under 1.9 GiB MemAvailable).
+          # 4 workers peak at ~6 GB on the suite, well within the runner's headroom.
+          uv run pytest \
+            -m "not live and not e2e" \
+            -n 4 \
+            --dist loadgroup \
+            --strict-markers \
+            -p no:randomly \
+            --timeout=30 \
+            --timeout-method=thread \
+            --junitxml=junit-results.xml \
+            --tb=short \
+            -q \
+            --deselect test/utils/test_persona_context.py::test_manifest_rehydration_fails_loud_on_inaccessible_persona_root \
+            --deselect test/utils/test_persona_context.py::test_filter_and_compose_claude_manifest_rehydration \
+            --deselect test/utils/test_persona_context.py::test_manifest_rehydration_fails_loud_on_invalid_runtime_root \
+            --deselect test/utils/test_persona_context.py::test_reap_persona_generations_keeps_current_only \
+            --deselect test/utils/test_persona_context.py::test_provider_manager_rehydrates_manifest_plan \
+            --deselect test/utils/test_persona_context.py::test_generation_reaper_fails_loud_on_inaccessible_persona_root \
+            --deselect test/test_f139_fixture_provider.py::TestAdmitProvider::test_credential_provider_still_admitted \
+            --deselect test/services/test_f93_terminal_identity_resolution.py::test_ac5_herdr_inherits_error_liveness_and_never_auto_purges \
+            --deselect test/services/test_wave3b_supervisor_mailbox.py::test_probe_09_raw_addressed_output_bytes_match_parent_33aad1c \
+            --deselect test/services/test_fifo_reader.py::TestReaderLoopCoalescing::test_rapid_writes_produce_fewer_publishes_than_writes \
+            --deselect test/services/test_fx193_nudge_discipline.py::TestA1FullJitter::test_step0_degenerates_to_exactly_30s \
+            --deselect test/services/test_fx193_nudge_discipline.py::TestA1FullJitter::test_a1_ac2_seeded_rng_reproduces_exact_delays \
+            --deselect test/test_g7a_sandbox.py::test_up_reclaims_a_dead_socket_of_the_same_name \
+            --deselect test/services/test_stalled_callback_watchdog.py::test_trigger_a_rollover_is_stale_and_insert_failure_rolls_back_reservation \
+            2>&1 | tee pytest-output.log
+
+      - name: Write step summary
+        if: always()
+        run: |
+          {
+            echo "## Test Results"
+            echo ""
+            if [ -f junit-results.xml ]; then
+              tests=$(grep -oP 'tests="\K[^"]+' junit-results.xml | head -1)
+              failures=$(grep -oP 'failures="\K[^"]+' junit-results.xml | head -1)
+              errors=$(grep -oP 'errors="\K[^"]+' junit-results.xml | head -1)
+              skipped=$(grep -oP 'skipped="\K[^"]+' junit-results.xml | head -1)
+              if [ "${failures:-0}" = "0" ] && [ "${errors:-0}" = "0" ]; then
+                echo ":white_check_mark: **${tests} passed**, ${skipped} skipped"
+              else
+                echo ":x: **${failures} failed**, ${errors} errors out of ${tests} tests (${skipped} skipped)"
+              fi
+            else
+              echo ":warning: No junit-results.xml found"
+            fi
+            echo ""
+            echo "<details><summary>Suite tail (last 40 lines)</summary>"
+            echo ""
+            echo '```'
+            tail -40 pytest-output.log 2>/dev/null || echo "no output log"
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-results
+          path: |
+            junit-results.xml
+            pytest-output.log
+          retention-days: 14
