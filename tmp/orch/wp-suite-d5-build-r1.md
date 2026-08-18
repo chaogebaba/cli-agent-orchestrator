@@ -56,7 +56,7 @@ All 9 entries now carry required fields:
 - `class` — one of {serial_only, known_red}
 - `reason` — root-cause description
 - `filed` — 2026-08-18 (UTC date entry added)
-- `review_by` — 2026-09-18 (filed + 30 days)
+- `review_by` — 2026-09-17 (filed + 30 days)
 
 Header documents the mechanical criteria.
 
