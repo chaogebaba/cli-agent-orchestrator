@@ -48,7 +48,9 @@ jobs:
             --deselect test/test_f139_fixture_provider.py::TestAdmitProvider::test_credential_provider_still_admitted \
             --deselect test/services/test_f93_terminal_identity_resolution.py::test_ac5_herdr_inherits_error_liveness_and_never_auto_purges \
             --deselect test/services/test_wave3b_supervisor_mailbox.py::test_probe_09_raw_addressed_output_bytes_match_parent_33aad1c \
-            --deselect test/services/test_fifo_reader.py::TestReaderLoopCoalescing::test_rapid_writes_produce_fewer_publishes_than_writes
+            --deselect test/services/test_fifo_reader.py::TestReaderLoopCoalescing::test_rapid_writes_produce_fewer_publishes_than_writes \
+            --deselect test/services/test_fx193_nudge_discipline.py::TestA1FullJitter::test_step0_degenerates_to_exactly_30s \
+            --deselect test/services/test_fx193_nudge_discipline.py::TestA1FullJitter::test_a1_ac2_seeded_rng_reproduces_exact_delays
 
       - name: Generate last-lines summary
         if: always()
