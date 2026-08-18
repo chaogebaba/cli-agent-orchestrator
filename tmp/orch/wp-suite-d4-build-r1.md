@@ -2,7 +2,7 @@
 
 **Wall:** D4 — suite slot at the pytest layer (F272)
 **Branch:** `cao/95e96790`
-**HEAD:** `20878cab2c3f66c220097737798d99bfe4d919f1`
+**HEAD:** `2f6ee3e65de40b69c1e8c81e17793a4b7a66b689`
 **Base:** fork mainline at same commit (worktree branch, no prior commits)
 
 ## Diff stat
@@ -62,7 +62,9 @@ Exit code: 2 (make wraps pytest exit 1 → make error 2)
 
 ## Operational note: sibling serialization
 
-During this run, sibling terminal `473b1670` was running its own full suite on the same lock path. My run waited for slot release (the plugin's block-and-wait default), then acquired. This confirms cross-worktree serialization works via the shared `/data/cao-scratch/.suite-slot.lock` path — the same resource the legacy wrapper used at `/tmp/cao-suite.lock`, now unified.
+During this run, sibling terminal `473b1670` was running its own full suite on the same lock path. My run waited for slot release (the plugin's block-and-wait default), then acquired. This confirms cross-worktree serialization works via the shared `/data/cao-scratch/.suite-slot.lock` path.
+
+**Rollout caveat:** until D4 merges fleet-wide, old-tree lanes (wrapper flock on `/tmp/cao-suite.lock`) and new-tree lanes (plugin flock on `/data/cao-scratch/.suite-slot.lock`) do NOT mutually serialize. The gap is time-bounded and closes when all worktrees rebase onto a D4-carrying branch. Accepting the brief gap is deliberate — two locks on two paths for one resource is the deadlock shape the blueprint calls out (AC4.2), and merging the paths prematurely would require keeping both acquisition sites alive.
 
 ## Verdict
 
