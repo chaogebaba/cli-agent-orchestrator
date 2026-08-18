@@ -221,6 +221,11 @@ jobs:
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
+          # AC6.2: append performance ledger (top-10 slowest files) to step summary.
+          if [ -f junit-results.xml ]; then
+            python3 scripts/suite-ledger.py --github-summary junit-results.xml >> $GITHUB_STEP_SUMMARY
+          fi
+
       - name: Upload test artifacts
         if: always() && steps.cache_check.outputs.hit != 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
