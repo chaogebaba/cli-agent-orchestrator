@@ -10,10 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json as _json
 import logging
-import os
 from pathlib import Path
-from typing import Any
 
 from cli_agent_orchestrator.utils.provider_plane import provider_home
 
@@ -32,20 +31,14 @@ def _count_stale_grok_terminals(canonical_hash: str) -> int:
     """Count live grok_cli terminals whose stored config hash differs."""
     from cli_agent_orchestrator.clients.database import SessionLocal, TerminalModel
 
-    import json as _json
-
     count = 0
     with SessionLocal() as db:
-        terminals = (
-            db.query(TerminalModel)
-            .filter(TerminalModel.provider == "grok_cli")
-            .all()
-        )
+        terminals = db.query(TerminalModel).filter(TerminalModel.provider == "grok_cli").all()
         for t in terminals:
             if not t.metadata_json:
                 continue
             try:
-                metadata = _json.loads(t.metadata_json)
+                metadata = _json.loads(str(t.metadata_json))
             except (ValueError, TypeError):
                 continue
             stored = metadata.get("config_sha256")
@@ -76,9 +69,7 @@ def _push_supervisor_notice(canonical_hash: str, stale_count: int) -> bool:
         f"respawn to pick up routing changes."
     )
     try:
-        create_routed_inbox_message(
-            "cao-system:grok-config-watcher", supervisor_id, message
-        )
+        create_routed_inbox_message("cao-system:grok-config-watcher", supervisor_id, message)
         logger.info(
             "F295 AC4: pushed config-change notice to supervisor %s (%d stale)",
             supervisor_id,
@@ -86,9 +77,7 @@ def _push_supervisor_notice(canonical_hash: str, stale_count: int) -> bool:
         )
         return True
     except Exception as exc:
-        logger.warning(
-            "F295 AC4: failed to push config-change notice: %s", exc, exc_info=True
-        )
+        logger.warning("F295 AC4: failed to push config-change notice: %s", exc, exc_info=True)
         return False
 
 

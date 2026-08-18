@@ -137,7 +137,7 @@ class GrokCliProvider(BaseProvider):
     @property
     def resolved_model(self) -> Optional[str]:
         """Return the effective model resolved during command build."""
-        return getattr(self, '_resolved_model', None)
+        return getattr(self, "_resolved_model", None)
 
     @property
     def paste_enter_count(self) -> int:
@@ -176,7 +176,13 @@ class GrokCliProvider(BaseProvider):
 
     def _build_grok_command(self) -> str:
         profile = self._load_profile()
-        command_parts = [GROK_BINARY, "--always-approve", "--permission-mode", "bypassPermissions", "--minimal"]
+        command_parts = [
+            GROK_BINARY,
+            "--always-approve",
+            "--permission-mode",
+            "bypassPermissions",
+            "--minimal",
+        ]
 
         # F295 AC0: rebuild private config from canonical on every launch.
         # This ensures routing changes (e.g. cc-switch) propagate without
@@ -740,7 +746,9 @@ class GrokCliProvider(BaseProvider):
         fd = None
         temp_path = None
         try:
-            fd, temp_path = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+            fd, temp_path = tempfile.mkstemp(
+                dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+            )
             os.fchmod(fd, 0o600)
             os.write(fd, content.encode("utf-8"))
             os.fsync(fd)
