@@ -132,12 +132,11 @@ class TestCoverageMatrix:
         )
 
     def test_no_unrostered_mcp_tools(self):
-        """Every @mcp.tool() in server.py has a roster row (D6.3, AC-A3).
+        """Every subagent-UX @mcp.tool() in server.py has a roster row (D6.3, AC-A3).
 
-        This guards against adding an MCP tool without coverage.
-        NOTE: This test uses tool function names from the decorator, which
-        may not map 1:1 to the roster's mcp_tools list. We check that the
-        roster is non-empty and covers the major tools.
+        Walks server.py AST, extracts tool function names, removes known
+        non-UX utilities (memory, emit_ui, codex_review, etc.), and asserts
+        every remaining tool appears in the roster.
         """
         surfaces = _load_surfaces()
 
@@ -147,7 +146,26 @@ class TestCoverageMatrix:
             for tool in surface.get("mcp_tools", []):
                 rostered_tools.add(tool)
 
-        # The roster must have tools (sanity)
+        # Extract actual @mcp.tool() names from server.py AST
+        extracted_tools = _extract_mcp_tool_names()
+        assert len(extracted_tools) > 0, "No @mcp.tool() found in server.py"
+
+        # Known non-UX utilities excluded from the roster per D3's frozen scope.
+        # These are infrastructure/memory tools, not subagent-orchestration surfaces.
+        _KNOWN_NON_UX = {
+            "memory_store", "memory_recall", "memory_forget",
+            "codex_review", "emit_ui", "load_skill", "get_compact_marker",
+        }
+
+        # Check: every extracted tool (minus known exclusions) must be rostered
+        unrostered = extracted_tools - rostered_tools - _KNOWN_NON_UX
+        assert not unrostered, (
+            f"Found {len(unrostered)} @mcp.tool() function(s) in server.py "
+            f"with no roster row in ux_surfaces.toml:\n"
+            + "\n".join(f"  - {t}" for t in sorted(unrostered))
+        )
+
+        # Sanity: roster must have tools
         assert len(rostered_tools) > 0, "No tools in roster"
         assert len(surfaces) == 12, f"Expected 12 surfaces, got {len(surfaces)}"
 

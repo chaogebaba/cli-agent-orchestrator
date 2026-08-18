@@ -38,7 +38,7 @@ Format follows `test/simulation/dst-mutation-ledger.md`.
 
 ## Entry 3: S10 fleet — UX-6 Visibility (C-kind sole coverage)
 
-- **Seam:** `src/cli_agent_orchestrator/mcp_server/server.py:1010` (`_fleet_impl`)
+- **Seam:** `src/cli_agent_orchestrator/mcp_server/server.py:1007` (`async def fleet`)
 - **Applied diff:**
   ```diff
   - response = cao_http.get(f"/sessions/{session_name}/fleet", ...)
@@ -54,15 +54,15 @@ Format follows `test/simulation/dst-mutation-ledger.md`.
 
 ## Entry 4: S06 authority pins — UX-5 (S-kind sole coverage of drift detection)
 
-- **Seam:** `src/cli_agent_orchestrator/services/authority_pin_service.py:350` (`compute_file_sha256`)
+- **Seam:** `src/cli_agent_orchestrator/services/authority_pin_service.py:215` (`_hash_file`)
 - **Applied diff:**
   ```diff
-  - return hashlib.sha256(content).hexdigest()
-  + return "0" * 64  # always returns zero hash
+  - sha256_hash = hashlib.sha256()
+  + return ("0" * 64, None)  # always returns zero hash
   ```
 - **Command:** `uv run pytest test/ux/semantic/test_other_semantic.py::TestAuthorityPinsSemanticUX5 -xvs -n 0`
 - **Exit code:** 1 (FAILED)
-- **Failing excerpt:** `AssertionError: computed sha256 does not match`
+- **Failing excerpt:** `AssertionError: assert '000...000' == '<expected_sha>'`
 - **Post-restore sha256:** verified by `git checkout -- src/`
 - **Targeting witness:** The semantic test verifies the sha256 computation is correct; a constant return breaks drift detection.
 
@@ -70,14 +70,16 @@ Format follows `test/simulation/dst-mutation-ledger.md`.
 
 ## Entry 5: S07 callback barrier — UX-4 (S-kind sole coverage of barrier creation)
 
-- **Seam:** `src/cli_agent_orchestrator/services/callback_barrier_service.py:33` (`create_barrier`)
+- **Seam:** `src/cli_agent_orchestrator/clients/database.py:5168` (`_attach_dispatch_barrier_in_db`)
 - **Applied diff:**
   ```diff
-  - barrier_id = db.execute(insert_stmt).lastrowid
-  + barrier_id = -1  # never creates a real barrier
+  -     db.execute(
+  -         insert(CallbackBarrierModel).values(...)
+  -     )
+  +     pass  # barrier never created
   ```
 - **Command:** `uv run pytest test/ux/semantic/test_other_semantic.py::TestBarrierSemanticUX4 -xvs -n 0`
 - **Exit code:** 1 (FAILED)
-- **Failing excerpt:** `AssertionError: assert -1 > 0`
+- **Failing excerpt:** `AssertionError: Barrier row not created` (row is None after INSERT)
 - **Post-restore sha256:** verified by `git checkout -- src/`
-- **Targeting witness:** The semantic test asserts barrier_id > 0; a broken creation path is caught.
+- **Targeting witness:** The semantic test directly inserts via `CallbackBarrierModel` and asserts `barrier_id > 0`; skipping the insert means no row exists and the assertion fails.

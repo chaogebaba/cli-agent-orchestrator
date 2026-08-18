@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from test.ux.scenarios import fleet_after_death
+
 
 @pytest.mark.ux(surface="S10", invariant="UX-6", kind="E")
 class TestFleetEnvelopeUX6:
@@ -142,3 +144,40 @@ class TestProfilesEnvelopeUX6:
             data = resp.json()
 
         assert isinstance(data, list)
+
+
+
+    def test_fleet_after_death_scenario_envelope(self, monkeypatch):
+        """Drive fleet_after_death scenario against mocked substrate."""
+        monkeypatch.setenv("CAO_TERMINAL_ID", "aa11bb22")
+        monkeypatch.setenv("CAO_ENDPOINT", "http://127.0.0.1:19999")
+
+        workers = ["w1", "w2", "w3"]
+        killed = set()
+
+        def create_workers(count):
+            return workers[:count]
+
+        def kill_one(tid):
+            killed.add(tid)
+
+        def get_fleet():
+            return {"terminals": [
+                {"id": w, "status": "gone" if w in killed else "idle"}
+                for w in workers
+            ]}
+
+        def get_manifest():
+            return {"terminals": [w for w in workers if w not in killed]}
+
+        def get_siblings(tid):
+            return [w for w in workers if w != tid and w not in killed]
+
+        result = fleet_after_death(
+            create_workers_fn=create_workers,
+            kill_one_fn=kill_one,
+            get_fleet_fn=get_fleet,
+            get_manifest_fn=get_manifest,
+            get_siblings_fn=get_siblings,
+        )
+        assert result.success, f"Scenario failed: {result.failures}"

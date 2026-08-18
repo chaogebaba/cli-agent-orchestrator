@@ -29,12 +29,34 @@ class TestAuthorityPinsSemanticUX5:
 
 @pytest.mark.ux(surface="S07", invariant="UX-4", kind="S")
 class TestBarrierSemanticUX4:
-    def test_barrier_table_exists(self):
+    def test_barrier_creation_produces_valid_id(self):
+        """Creating a barrier row produces a positive barrier_id."""
         from cli_agent_orchestrator.clients.database import SessionLocal
         from sqlalchemy import text
+        from datetime import datetime, timedelta
+
         with SessionLocal() as db:
-            tables = db.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%barrier%'")).fetchall()
-            assert len(tables) >= 1
+            db.execute(text(
+                "INSERT INTO callback_barrier "
+                "(owner_terminal_id, owner_generation, label, state, timeout_at, created_at) "
+                "VALUES ('sem07su', 1, 'sem-test-barrier', 'OPEN', "
+                "datetime('now', '+60 seconds'), datetime('now'))"
+            ))
+            db.flush()
+
+            row = db.execute(
+                text("SELECT id, label, state FROM callback_barrier WHERE label = 'sem-test-barrier'")
+            ).fetchone()
+
+            assert row is not None, "Barrier row not created"
+            barrier_id = row[0]
+            assert barrier_id > 0, f"Expected barrier_id > 0, got {barrier_id}"
+            assert row[1] == "sem-test-barrier"
+            assert row[2] == "OPEN"
+
+            # Cleanup
+            db.execute(text("DELETE FROM callback_barrier WHERE label = 'sem-test-barrier'"))
+            db.commit()
 
 
 @pytest.mark.ux(surface="S08", invariant="UX-4", kind="S")

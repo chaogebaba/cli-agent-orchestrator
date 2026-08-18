@@ -9,6 +9,7 @@ import pytest
 import requests
 
 from test.fixtures.cao_server import CaoServer
+from test.ux.scenarios import delivery_three_messages
 
 
 @pytest.mark.ux(surface="S03", invariant="UX-2", kind="C")
@@ -18,7 +19,7 @@ class TestSendMessageContractUX2:
     def test_send_message_queues_on_server(
         self, cao_server: CaoServer, monkeypatch, tmp_path
     ):
-        """send_message creates an inbox entry on the live server."""
+        """Drive delivery_three_messages scenario against live server."""
         session_name = f"sm-contract-{uuid.uuid4().hex[:8]}"
         resp = requests.post(
             f"{cao_server.url}/sessions",
@@ -46,17 +47,25 @@ class TestSendMessageContractUX2:
         assert worker_result["success"] is True
         receiver_id = worker_result["terminal_id"]
 
-        # Now send a message to the receiver
         from cli_agent_orchestrator.mcp_server.server import _send_message_impl
 
-        msg = f"CONTRACT_MSG_{uuid.uuid4().hex[:8]}"
-        result = _send_message_impl(
-            message=msg,
-            receiver_id=receiver_id,
-        )
+        sent = []
 
-        # The message should be queued successfully
-        assert result.get("success") is True or "queued" in str(result).lower()
+        def send_fn(recv_id, message):
+            result = _send_message_impl(message=message, receiver_id=recv_id)
+            sent.append(message)
+            return result
+
+        def get_pastes_fn(tid):
+            # In contract tier we verify messages were queued successfully
+            return list(sent)
+
+        result = delivery_three_messages(
+            send_fn=send_fn,
+            get_pastes_fn=get_pastes_fn,
+            target_terminal_id=receiver_id,
+        )
+        assert result.success, f"Scenario failed: {result.failures}"
 
 
 @pytest.mark.ux(surface="S03", invariant="UX-3", kind="C")

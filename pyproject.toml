@@ -381,4 +381,5 @@ filterwarnings = [
     "ignore::ResourceWarning",
     "ignore:'asyncio.iscoroutinefunction':DeprecationWarning",
     "ignore::pytest_mock.plugin.PytestMockWarning",
+    "ignore:\\[tier-budget WARN\\]:UserWarning",
 ]

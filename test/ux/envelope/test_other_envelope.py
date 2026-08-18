@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from test.ux.scenarios import frozen_pin_drift, return_barrier_of_two
+
 
 @pytest.mark.ux(surface="S04", invariant="UX-2", kind="E")
 class TestListMessagesEnvelopeUX2:
@@ -177,3 +179,67 @@ class TestWorkflowEnvelopeUX4:
         assert isinstance(data, dict)
         assert data.get("ok") is True
         assert "run_id" in data
+
+
+
+    def test_frozen_pin_drift_scenario_envelope(self, monkeypatch, tmp_path):
+        """Drive frozen_pin_drift scenario against mocked substrate."""
+        monkeypatch.setenv("CAO_TERMINAL_ID", "aa11bb22")
+        monkeypatch.setenv("CAO_ENDPOINT", "http://127.0.0.1:19999")
+
+        pin_file = tmp_path / "pinned.py"
+        pin_file.write_text("original")
+        original_sha = hashlib.sha256(pin_file.read_bytes()).hexdigest()
+
+        def pin_fn(tid, path, sha):
+            return {"success": True}
+
+        def mutate_fn(path):
+            pin_file.write_text("mutated!")
+            return hashlib.sha256(pin_file.read_bytes()).hexdigest()
+
+        def send_past_pin_fn(tid, msg):
+            # Simulate refusal due to drift
+            return {"success": False, "message": "drift detected: file hash changed"}
+
+        result = frozen_pin_drift(
+            pin_fn=pin_fn,
+            mutate_file_fn=mutate_fn,
+            send_past_pin_fn=send_past_pin_fn,
+            target_terminal_id="worker-pinned",
+            pin_file_path=str(pin_file),
+            pin_sha256=original_sha,
+        )
+        assert result.success, f"Scenario failed: {result.failures}"
+
+
+class _TestBarrierScenarioMixin:
+    """Shared barrier scenario test for E-kind."""
+
+    def _test_return_barrier_scenario(self):
+        wakes = [0]
+
+        def assign_with_barrier(profile, msg, barrier, workdir):
+            return {"success": True, "terminal_id": f"w-{msg[:1]}"}
+
+        def complete_worker(tid):
+            pass  # workers complete
+
+        def get_wakes():
+            wakes[0] = 1  # barrier fires once
+            return wakes[0]
+
+        result = return_barrier_of_two(
+            assign_with_barrier_fn=assign_with_barrier,
+            complete_worker_fn=complete_worker,
+            get_supervisor_wakes_fn=get_wakes,
+        )
+        assert result.success, f"Scenario failed: {result.failures}"
+
+
+@pytest.mark.ux(surface="S07", invariant="UX-4", kind="E")
+class TestBarrierScenarioEnvelopeUX4(_TestBarrierScenarioMixin):
+    """Envelope test for barrier using return_barrier_of_two scenario."""
+
+    def test_return_barrier_scenario_envelope(self):
+        self._test_return_barrier_scenario()

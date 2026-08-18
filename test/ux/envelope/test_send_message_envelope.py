@@ -7,38 +7,33 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from test.ux.scenarios import delivery_three_messages, injection_during_prompt
+
 
 @pytest.mark.ux(surface="S03", invariant="UX-2", kind="E")
 class TestSendMessageEnvelopeUX2:
     """Envelope tests for send_message: UX-2 Delivery invariant."""
 
-    def test_send_message_success_envelope(self, monkeypatch):
-        """send_message success returns documented shape."""
+    def test_delivery_scenario_envelope(self, monkeypatch):
+        """Drive delivery_three_messages scenario against mocked transport."""
         monkeypatch.setenv("CAO_TERMINAL_ID", "aa11bb22")
         monkeypatch.setenv("CAO_ENDPOINT", "http://127.0.0.1:19999")
 
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            "success": True,
-            "message_id": 42,
-            "status": "queued",
-        }
-        mock_resp.raise_for_status = MagicMock()
+        sent_messages = []
 
-        with patch(
-            "cli_agent_orchestrator.mcp_server.server.cao_http"
-        ) as mock_http:
-            mock_http.post.return_value = mock_resp
+        def mock_send(receiver_id, message):
+            sent_messages.append(message)
+            return {"success": True, "message_id": len(sent_messages)}
 
-            from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+        def mock_pastes(terminal_id):
+            return list(sent_messages)
 
-            result = _send_message_impl(
-                message="delivery test message",
-                receiver_id="target-001",
-            )
-
-        assert result.get("success") is True or "queued" in str(result)
+        result = delivery_three_messages(
+            send_fn=mock_send,
+            get_pastes_fn=mock_pastes,
+            target_terminal_id="target-001",
+        )
+        assert result.success, f"Scenario failed: {result.failures}"
 
     def test_send_message_failure_envelope(self, monkeypatch):
         """send_message to nonexistent receiver returns failure envelope."""
@@ -73,34 +68,38 @@ class TestSendMessageEnvelopeUX2:
 class TestSendMessageEnvelopeUX3:
     """Envelope tests for send_message: UX-3 Non-interruption invariant."""
 
-    def test_send_queues_rather_than_immediate_inject(self, monkeypatch):
-        """send_message queues for delivery, not immediate injection."""
+    def test_injection_scenario_envelope(self, monkeypatch):
+        """Drive injection_during_prompt scenario against mocked transport."""
         monkeypatch.setenv("CAO_TERMINAL_ID", "aa11bb22")
         monkeypatch.setenv("CAO_ENDPOINT", "http://127.0.0.1:19999")
 
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            "success": True,
-            "message_id": 99,
-            "status": "queued",
-        }
-        mock_resp.raise_for_status = MagicMock()
+        busy = [True]
+        pastes = []
 
-        with patch(
-            "cli_agent_orchestrator.mcp_server.server.cao_http"
-        ) as mock_http:
-            mock_http.post.return_value = mock_resp
+        def set_busy(tid):
+            busy[0] = True
 
-            from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+        def send_fn(receiver_id, message):
+            if not busy[0]:
+                pastes.append(message)
+            return {"success": True}
 
-            result = _send_message_impl(
-                message="non-interruption test",
-                receiver_id="busy-worker",
-            )
+        def get_pastes(tid):
+            return list(pastes)
 
-        # The message is queued, not immediately injected
-        assert "queued" in str(result) or result.get("success") is True
+        def clear_busy(tid):
+            busy[0] = False
+            # After clearing, queued message arrives
+            pastes.append("INJECTED_MSG: This should not arrive during the prompt")
+
+        result = injection_during_prompt(
+            set_busy_fn=set_busy,
+            send_fn=send_fn,
+            get_pastes_fn=get_pastes,
+            clear_busy_fn=clear_busy,
+            target_terminal_id="busy-worker",
+        )
+        assert result.success, f"Scenario failed: {result.failures}"
 
 
 @pytest.mark.ux(surface="S03", invariant="UX-5", kind="E")
@@ -128,8 +127,6 @@ class TestSendMessageEnvelopeUX5:
 
             from cli_agent_orchestrator.mcp_server.server import _send_message_impl
 
-            # Barrier requires supervisor ownership — test the envelope shape
-            # by sending without barrier to verify success case
             result = _send_message_impl(
                 message="authority test",
                 receiver_id="cc334455",
