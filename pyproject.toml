@@ -353,6 +353,7 @@ markers = [
     "requires_herdr: test requires herdr binary on PATH",
     "requires_git_object: test requires a specific git object reachable in the repo",
     "requires_tmux: test requires tmux on PATH",
+    "serial_only: quarantined test that must run serial (xdist_group quarantine-serial)",
 ]
 asyncio_mode = "strict"
 testpaths = ["test"]

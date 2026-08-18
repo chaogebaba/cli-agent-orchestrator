@@ -112,6 +112,7 @@ pytest_plugins = (
     "test.plugins.tier_marks",
     "test.plugins.tier_budget",
     "test.plugins.quarantine",
+    "test.plugins.quarantine_expiry",
     "test.plugins.env_capabilities",
 )
 

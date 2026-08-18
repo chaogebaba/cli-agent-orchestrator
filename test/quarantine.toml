@@ -1,94 +1,125 @@
-# F254 D31 — Quarantine registry.
+# F254 D31 / WP-SUITE D5 — Quarantine registry.
 #
 # Every test that is known-flaky or known-red lives here with a class, reason,
 # owner, and expiry. The tier plugin (test/plugins/quarantine.py) reads this at
 # collection time and applies the D32 behaviour per class.
 #
 # Classes (D32):
+#   serial_only  — permanently serialized after diagnosis. Same scheduling as
+#                  xdist_flaky (xdist_group("quarantine-serial")) but with a
+#                  mandatory verdict pointer and a known root cause. Burn-down
+#                  criterion: fix the fixture isolation bug named in `reason`.
 #   xdist_flaky  — passes serial, fails under -n 2. Serialized via xdist_group("quarantine-serial").
 #   worker_crash — crashes the xdist worker (loses co-scheduled tests). Deselected under -n > 0
 #                  unless CAO_TEST_QUARANTINE=run. Serialized when it does run.
 #   known_red    — fails serial too. Marked xfail(strict=False, run=True) so recovery is noticed.
 #
+# --- Burn-down criteria (D5 AC5.3) ---
+#
+# Each entry MUST carry:
+#   class    — one of the classes above
+#   reason   — human-readable root-cause description
+#   filed    — UTC date (YYYY-MM-DD) when the entry was added
+#   review_by — filed + 30 days; the ledger's own expiry enforced by the suite
+#
+# Enforcement: `make test-hygiene` FAILS (exit 1) if any entry's review_by is
+# in the past. The quarantine_expiry plugin (test/plugins/quarantine_expiry.py)
+# checks this at collection time via pytest_configure.
+#
+# An entry past review_by must be resolved: either fix the test (remove entry),
+# re-file with a new review_by (requires a reason update documenting progress),
+# or escalate to known_red with an incident link.
+#
 # Precedent: P-SEEDFILE (test/simulation/failing_seeds.txt, test/plugins/smoke_tags.py:16-49).
 
-# --- F238 xdist-sensitive: shared TracerProvider state across workers ---
-# These tests use a shared InMemorySpanExporter (process-global OTel TracerProvider).
+# --- F238/F262 xdist-sensitive: shared TracerProvider state across workers ---
+# Root cause: process-global OTel TracerProvider (conftest.py:3-5) is un-isolatable.
 # Under -n 2, other OTel-using tests on the same worker corrupt the exporter's
-# span list. Serialization alone doesn't help — the pollution comes from non-quarantined
-# OTel tests co-scheduled on the same worker. Classified as worker_crash per D32:
-# they corrupt the shared resource for co-scheduled tests (same impact class).
+# span list. Burn-down: session-scoped TracerProvider reset fixture.
 
 [[entry]]
-nodeid  = "test/telemetry/test_spans.py::TestInvokeAgentSpan::test_emits_invoke_agent_with_required_attributes"
-class   = "serial_only"
-reason  = "F262 C1 — process-global OTel TracerProvider is un-isolatable (conftest.py:3-5)"
-owner   = "F262"
-verdict = "test_emits_invoke_agent_with_required_attributes"
+nodeid    = "test/telemetry/test_spans.py::TestInvokeAgentSpan::test_emits_invoke_agent_with_required_attributes"
+class     = "serial_only"
+reason    = "F262 C1 — process-global OTel TracerProvider is un-isolatable (conftest.py:3-5)"
+owner     = "F262"
+filed     = "2026-08-18"
+review_by = "2026-09-17"
+verdict   = "test_emits_invoke_agent_with_required_attributes"
 
 [[entry]]
-nodeid  = "test/telemetry/test_spans.py::TestExecuteToolSpan::test_emits_execute_tool"
-class   = "serial_only"
-reason  = "F262 C1 — process-global OTel TracerProvider is un-isolatable (conftest.py:3-5)"
-owner   = "F262"
-verdict = "test_emits_invoke_agent_with_required_attributes"
+nodeid    = "test/telemetry/test_spans.py::TestExecuteToolSpan::test_emits_execute_tool"
+class     = "serial_only"
+reason    = "F262 C1 — process-global OTel TracerProvider is un-isolatable (conftest.py:3-5)"
+owner     = "F262"
+filed     = "2026-08-18"
+review_by = "2026-09-17"
+verdict   = "test_emits_invoke_agent_with_required_attributes"
 
 [[entry]]
-nodeid  = "test/telemetry/test_spans.py::TestChatSpan::test_emits_chat_with_request_model"
-class   = "serial_only"
-reason  = "F262 C1 — process-global OTel TracerProvider is un-isolatable (conftest.py:3-5)"
-owner   = "F262"
-verdict = "test_emits_invoke_agent_with_required_attributes"
+nodeid    = "test/telemetry/test_spans.py::TestChatSpan::test_emits_chat_with_request_model"
+class     = "serial_only"
+reason    = "F262 C1 — process-global OTel TracerProvider is un-isolatable (conftest.py:3-5)"
+owner     = "F262"
+filed     = "2026-08-18"
+review_by = "2026-09-17"
+verdict   = "test_emits_invoke_agent_with_required_attributes"
 
 [[entry]]
-nodeid  = "test/telemetry/test_spans.py::TestChatSpanConversationId::test_chat_span_sets_conversation_id"
-class   = "serial_only"
-reason  = "F262 C1 — process-global OTel TracerProvider is un-isolatable (conftest.py:3-5)"
-owner   = "F262"
-verdict = "test_emits_invoke_agent_with_required_attributes"
+nodeid    = "test/telemetry/test_spans.py::TestChatSpanConversationId::test_chat_span_sets_conversation_id"
+class     = "serial_only"
+reason    = "F262 C1 — process-global OTel TracerProvider is un-isolatable (conftest.py:3-5)"
+owner     = "F262"
+filed     = "2026-08-18"
+review_by = "2026-09-17"
+verdict   = "test_emits_invoke_agent_with_required_attributes"
 
-# --- F238 xdist-sensitive: cross-worker module-level state in auth constants ---
-
-[[entry]]
-nodeid  = "test/security/test_auth.py::test_expected_audience_defaults_to_api_base_url_when_enabled"
-class   = "serial_only"
-reason  = "F262 C6 — cross-worker monkeypatch of module-level auth constants"
-owner   = "F262"
-verdict = "test_expected_audience_defaults_to_api_base_url_when_enabled"
+# --- F238/F262 xdist-sensitive: cross-worker module-level state in auth constants ---
+# Root cause: monkeypatch of module-level auth constants leaks across workers.
+# Burn-down: per-worker auth-constant isolation fixture.
 
 [[entry]]
-nodeid  = "test/security/test_auth.py::test_audience_fallback_enforced_in_validation"
-class   = "serial_only"
-reason  = "F262 C6 — cross-worker monkeypatch of module-level auth constants"
-owner   = "F262"
-verdict = "test_expected_audience_defaults_to_api_base_url_when_enabled"
+nodeid    = "test/security/test_auth.py::test_expected_audience_defaults_to_api_base_url_when_enabled"
+class     = "serial_only"
+reason    = "F262 C6 — cross-worker monkeypatch of module-level auth constants"
+owner     = "F262"
+filed     = "2026-08-18"
+review_by = "2026-09-17"
+verdict   = "test_expected_audience_defaults_to_api_base_url_when_enabled"
 
-# --- Pre-existing xdist-flaky: timing/race under parallel execution ---
+[[entry]]
+nodeid    = "test/security/test_auth.py::test_audience_fallback_enforced_in_validation"
+class     = "serial_only"
+reason    = "F262 C6 — cross-worker monkeypatch of module-level auth constants"
+owner     = "F262"
+filed     = "2026-08-18"
+review_by = "2026-09-17"
+verdict   = "test_expected_audience_defaults_to_api_base_url_when_enabled"
 
 # --- Pre-existing: environment-dependent, fail serial too ---
 
 [[entry]]
-nodeid  = "test/services/test_worktree_branch_integrity.py::TestProductionPathForkPlusWorktree::test_create_terminal_fork_worktree_propagates_worktree_info"
-class   = "known_red"
-reason  = "Env-dependent — working directory not created by git in temp fixture; fails serial"
-owner   = "pre-existing"
-expires = "2026-10-01"
+nodeid    = "test/services/test_worktree_branch_integrity.py::TestProductionPathForkPlusWorktree::test_create_terminal_fork_worktree_propagates_worktree_info"
+class     = "known_red"
+reason    = "Env-dependent — working directory not created by git in temp fixture; fails serial"
+owner     = "pre-existing"
+filed     = "2026-08-18"
+review_by = "2026-09-17"
 
 [[entry]]
-nodeid  = "test/providers/test_grok_cli_unit.py::test_ac9_all_grok_profiles_register_cao_mcp_server"
-class   = "known_red"
-reason  = "Env-dependent — requires profiles/ directory with grok_base.md; absent in worktree layout"
-owner   = "pre-existing"
-expires = "2026-10-01"
-
+nodeid    = "test/providers/test_grok_cli_unit.py::test_ac9_all_grok_profiles_register_cao_mcp_server"
+class     = "known_red"
+reason    = "Env-dependent — requires profiles/ directory with grok_base.md; absent in worktree layout"
+owner     = "pre-existing"
+filed     = "2026-08-18"
+review_by = "2026-09-17"
 
 # --- Re-quarantined: irreproducible under -n 2 (F262 verdict (d)) ---
 
 [[entry]]
-nodeid  = "test/services/test_ready_deadline_edge_probe.py::test_ready_completion_at_deadline_has_one_lawful_owner"
-class   = "serial_only"
-reason  = "F262 verdict (d) — irreproducible timing flake; re-quarantine trigger: any failure under -n 2"
-owner   = "WP-suite-D2"
-filed   = "2026-08-19"
-review_by = "2026-09-18"
-verdict = "test_ready_completion_at_deadline_has_one_lawful_owner"
+nodeid    = "test/services/test_ready_deadline_edge_probe.py::test_ready_completion_at_deadline_has_one_lawful_owner"
+class     = "serial_only"
+reason    = "F262 verdict (d) — irreproducible timing flake; re-quarantine trigger: any failure under -n 2"
+owner     = "WP-suite-D2"
+filed     = "2026-08-18"
+review_by = "2026-09-17"
+verdict   = "test_ready_completion_at_deadline_has_one_lawful_owner"
