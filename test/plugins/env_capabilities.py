@@ -1,8 +1,12 @@
-"""Environment-capability marker guard (WP-suite D2, AC2.1).
+"""Environment-capability marker guard (WP-suite D2, AC2.1 + AC2.4).
 
 Tests marked with ``requires_*`` markers are auto-skipped at collection time
 when the corresponding capability is absent from the host. Detectors are pure
 functions — no network, no subprocess beyond the git check.
+
+The ``--run-live`` opt-in (AC2.4) gates all ``live``-marked tests: without it,
+live tests are skipped regardless of environment. This replaces the per-site
+``CAO_RUN_LIVE_PROVIDER_TESTS`` env-var checks with one vocabulary.
 
 Registered via ``pytest_plugins`` in ``test/conftest.py``.
 Follows the shape proven at ``test/plugins/local_fixture_guard.py``.
@@ -74,12 +78,34 @@ _SIMPLE_MARKERS: dict[str, tuple[callable, str]] = {
 
 
 # ---------------------------------------------------------------------------
+# --run-live option (AC2.4).
+# ---------------------------------------------------------------------------
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--run-live",
+        action="store_true",
+        default=False,
+        help="Enable live/e2e provider tests (replaces CAO_RUN_LIVE_PROVIDER_TESTS env var).",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Hook.
 # ---------------------------------------------------------------------------
 
 
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    run_live = config.getoption("--run-live", default=False)
+
     for item in items:
+        # --run-live gate: skip live-marked tests unless opted in.
+        if not run_live and item.get_closest_marker("live"):
+            item.add_marker(
+                pytest.mark.skip(reason="Live tests disabled. Use --run-live to enable.")
+            )
+
         for marker_name, (detector, reason) in _SIMPLE_MARKERS.items():
             if item.get_closest_marker(marker_name) and not detector():
                 item.add_marker(pytest.mark.skip(reason=reason))

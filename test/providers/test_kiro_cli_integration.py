@@ -36,16 +36,12 @@ from cli_agent_orchestrator.services.terminal_service import (
     send_input,
 )
 
-# Skip integration tests by default (deselected in pyproject.toml addopts).
-# Run with: CAO_RUN_LIVE_PROVIDER_TESTS=1 pytest test/providers/test_kiro_cli_integration.py
+# Skip integration tests by default (gated by --run-live plugin opt-in).
+# Run with: uv run pytest --run-live test/providers/test_kiro_cli_integration.py
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.slow,
     pytest.mark.live,
-    pytest.mark.skipif(
-        os.environ.get("CAO_RUN_LIVE_PROVIDER_TESTS", "") != "1",
-        reason="Live provider tests disabled. Set CAO_RUN_LIVE_PROVIDER_TESTS=1 to enable.",
-    ),
 ]
 
 KIRO_AGENTS_DIR = Path.home() / ".kiro" / "agents"

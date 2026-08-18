@@ -89,4 +89,6 @@ nodeid  = "test/services/test_ready_deadline_edge_probe.py::test_ready_completio
 class   = "serial_only"
 reason  = "F262 verdict (d) — irreproducible timing flake; re-quarantine trigger: any failure under -n 2"
 owner   = "WP-suite-D2"
+filed   = "2026-08-19"
+review_by = "2026-09-18"
 verdict = "test_ready_completion_at_deadline_has_one_lawful_owner"
