@@ -179,6 +179,9 @@ class TestMemoryProviderHappyPath:
         # The fixture already seeded the ACTIVE relates_to a→b store edge
         # (origin=compiler). No contradiction is stored here, so none projects —
         # a separate test covers store-sourced contradictions.
+        # F279: stub the LLM client so run_lint's contradiction pass never fires
+        # a real API call (in=26/out=18 leak on every suite run).
+        _disable_llm(monkeypatch)
         provider = MemoryGraphProvider(memory_service=populated_scope)
 
         view = await provider.project(scope="global")

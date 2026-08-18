@@ -46,8 +46,10 @@ test-full:
 
 # Quick suite — default addopts unchanged. Cached by default (F237 D6).
 # Opt-out: make test-quick TCACHE=off
+# F279: belt-and-braces live exclusion (live tests are env-gated individually,
+# but -m "not live" gives CI parity with test-ci).
 test-quick:
-	"$(TCACHE_BIN)" run "$(PYTEST_WRAPPER)" $(ARGS)
+	"$(TCACHE_BIN)" run "$(PYTEST_WRAPPER)" -m "not live" $(ARGS)
 
 # F254 D29/D30: CI target — identical to test-full marker expression.
 # CI passes extra flags (coverage, ignores) via ARGS=.
