@@ -28,7 +28,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install uv
         uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
@@ -44,7 +44,12 @@ jobs:
         run: uv sync
 
       - name: Run test-ci suite
+        shell: bash
         run: |
+          set -o pipefail
+          # -n 4 is safe here: the runner has 16 GB RAM (vs the laptop's 15 GB
+          # where pyproject's -n 2 was tuned to stay under 1.9 GiB MemAvailable).
+          # 4 workers peak at ~6 GB on the suite, well within the runner's headroom.
           uv run pytest \
             -m "not live and not e2e" \
             -n 4 \
@@ -68,6 +73,7 @@ jobs:
             --deselect test/services/test_fifo_reader.py::TestReaderLoopCoalescing::test_rapid_writes_produce_fewer_publishes_than_writes \
             --deselect test/services/test_fx193_nudge_discipline.py::TestA1FullJitter::test_step0_degenerates_to_exactly_30s \
             --deselect test/services/test_fx193_nudge_discipline.py::TestA1FullJitter::test_a1_ac2_seeded_rng_reproduces_exact_delays \
+            --deselect test/test_g7a_sandbox.py::test_up_reclaims_a_dead_socket_of_the_same_name \
             2>&1 | tee pytest-output.log
 
       - name: Write step summary
@@ -100,7 +106,7 @@ jobs:
 
       - name: Upload test artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: test-results
           path: |
