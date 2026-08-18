@@ -1,26 +1,43 @@
-name: Fork CI – test-ci parity suite
+name: CI
 
 on:
   push:
     branches:
+      - main
       - 'cao/**'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test-ci:
+  test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
         with:
           version: "latest"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
 
-      - name: Set up Python 3.14
+      - name: Set up Python
         run: uv python install 3.14
 
       - name: Install dependencies
@@ -50,18 +67,36 @@ jobs:
             --deselect test/services/test_wave3b_supervisor_mailbox.py::test_probe_09_raw_addressed_output_bytes_match_parent_33aad1c \
             --deselect test/services/test_fifo_reader.py::TestReaderLoopCoalescing::test_rapid_writes_produce_fewer_publishes_than_writes \
             --deselect test/services/test_fx193_nudge_discipline.py::TestA1FullJitter::test_step0_degenerates_to_exactly_30s \
-            --deselect test/services/test_fx193_nudge_discipline.py::TestA1FullJitter::test_a1_ac2_seeded_rng_reproduces_exact_delays
+            --deselect test/services/test_fx193_nudge_discipline.py::TestA1FullJitter::test_a1_ac2_seeded_rng_reproduces_exact_delays \
+            2>&1 | tee pytest-output.log
 
-      - name: Generate last-lines summary
+      - name: Write step summary
         if: always()
         run: |
-          echo "=== Test run summary ===" > last-lines.txt
-          if [ -f junit-results.xml ]; then
-            # Extract test counts from junit XML
-            grep -o 'tests="[^"]*"\|failures="[^"]*"\|errors="[^"]*"\|skipped="[^"]*"' junit-results.xml | head -4 >> last-lines.txt
-          fi
-          echo "" >> last-lines.txt
-          echo "See junit-results.xml for full structured results" >> last-lines.txt
+          {
+            echo "## Test Results"
+            echo ""
+            if [ -f junit-results.xml ]; then
+              tests=$(grep -oP 'tests="\K[^"]+' junit-results.xml | head -1)
+              failures=$(grep -oP 'failures="\K[^"]+' junit-results.xml | head -1)
+              errors=$(grep -oP 'errors="\K[^"]+' junit-results.xml | head -1)
+              skipped=$(grep -oP 'skipped="\K[^"]+' junit-results.xml | head -1)
+              if [ "${failures:-0}" = "0" ] && [ "${errors:-0}" = "0" ]; then
+                echo ":white_check_mark: **${tests} passed**, ${skipped} skipped"
+              else
+                echo ":x: **${failures} failed**, ${errors} errors out of ${tests} tests (${skipped} skipped)"
+              fi
+            else
+              echo ":warning: No junit-results.xml found"
+            fi
+            echo ""
+            echo "<details><summary>Suite tail (last 40 lines)</summary>"
+            echo ""
+            echo '```'
+            tail -40 pytest-output.log 2>/dev/null || echo "no output log"
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload test artifacts
         if: always()
@@ -70,5 +105,5 @@ jobs:
           name: test-results
           path: |
             junit-results.xml
-            last-lines.txt
+            pytest-output.log
           retention-days: 14
