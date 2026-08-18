@@ -245,7 +245,11 @@ class GrokCliProvider(BaseProvider):
         else:
             command_parts.extend(["--session-id", self.allocated_session_uuid])
 
-        return f"env GROK_HOME={shlex.quote(str(self._home_path()))} {shlex.join(command_parts)}"
+        return (
+            f"env GROK_HOME={shlex.quote(str(self._home_path()))}"
+            f" GROK_CLAUDE_HOOKS_ENABLED=0"
+            f" {shlex.join(command_parts)}"
+        )
 
     def _allocate_session_uuid(self) -> str:
         try:
