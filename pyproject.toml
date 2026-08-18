@@ -348,6 +348,11 @@ markers = [
     "unit: marks pure unit tests (derived by tier plugin or explicit)",
     "contract: marks contract tests that run against a live cao_server subprocess",
     "ux: F254 UX coverage mark (surface, invariant, kind) for coverage-matrix enforcement",
+    "requires_bwrap: test requires bwrap (bubblewrap sandbox) on PATH",
+    "requires_codex_auth: test requires ~/.codex/auth.json to exist",
+    "requires_herdr: test requires herdr binary on PATH",
+    "requires_git_object: test requires a specific git object reachable in the repo",
+    "requires_tmux: test requires tmux on PATH",
 ]
 asyncio_mode = "strict"
 testpaths = ["test"]

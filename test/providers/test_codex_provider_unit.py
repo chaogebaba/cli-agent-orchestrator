@@ -3706,13 +3706,9 @@ class TestCodexProviderUpdateDialog:
 
 
 class TestCodexProviderUpdateDialogLive:
-    """Live binary tests for update dialog config key. Requires CAO_RUN_LIVE_PROVIDER_TESTS=1."""
+    """Live binary tests for update dialog config key. Requires --run-live."""
 
     @pytest.mark.live
-    @pytest.mark.skipif(
-        os.environ.get("CAO_RUN_LIVE_PROVIDER_TESTS", "") != "1",
-        reason="Live provider tests disabled. Set CAO_RUN_LIVE_PROVIDER_TESTS=1 to enable.",
-    )
     def test_check_for_update_on_startup_accepted_by_binary(self):
         """check_for_update_on_startup is a recognized config key under --strict-config."""
         import subprocess
@@ -3741,10 +3737,6 @@ class TestCodexProviderUpdateDialogLive:
             )
 
     @pytest.mark.live
-    @pytest.mark.skipif(
-        os.environ.get("CAO_RUN_LIVE_PROVIDER_TESTS", "") != "1",
-        reason="Live provider tests disabled. Set CAO_RUN_LIVE_PROVIDER_TESTS=1 to enable.",
-    )
     def test_bogus_config_key_rejected_negative_control(self):
         """Negative control: a bogus key IS rejected under --strict-config."""
         import subprocess
@@ -3835,10 +3827,7 @@ class TestCodexProviderExitDetection:
 
 
 class TestCodexLaunchFlagsValidity:
-    @pytest.mark.skipif(
-        os.environ.get("CAO_RUN_LIVE_PROVIDER_TESTS", "") != "1",
-        reason="Live provider tests disabled. Set CAO_RUN_LIVE_PROVIDER_TESTS=1 to enable.",
-    )
+    @pytest.mark.live
     def test_codex_launch_flags_are_valid(self):
         import subprocess
 

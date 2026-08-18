@@ -551,6 +551,7 @@ class TestAdmitProvider:
         admit_provider("mock_cli")  # must not raise in production
         admit_provider("codex")  # existing behavior unchanged
 
+    @pytest.mark.requires_codex_auth
     def test_credential_provider_still_admitted(self, tmp_path, monkeypatch):
         """AC13: existing credential providers retain admission in sandbox."""
         # In a real sandbox the credential home dirs must exist for seeding.

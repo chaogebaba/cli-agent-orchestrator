@@ -58,7 +58,7 @@ test-ci:
 
 # F254 D30: opt-in live/e2e tier (never in a gate).
 test-live:
-	"$(PYTEST_WRAPPER)" -m "live or e2e" $(ARGS)
+	"$(PYTEST_WRAPPER)" -m "live or e2e" --run-live $(ARGS)
 
 # F254 D30: hygiene run — serial, budgets enforced.
 test-hygiene:

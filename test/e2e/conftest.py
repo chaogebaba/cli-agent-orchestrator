@@ -34,8 +34,8 @@ from cli_agent_orchestrator.constants import API_BASE_URL
 
 
 @pytest.fixture(scope="session", autouse=True)
-def require_live_provider_opt_in():
-    """Refuse to boot real provider CLIs unless the developer opted in.
+def require_live_provider_opt_in(request):
+    """Refuse to boot real provider CLIs unless --run-live was passed.
 
     Every test under test/e2e/ drives REAL provider binaries through a real
     cao-server (see _create_terminal_with_tools -> POST {API_BASE_URL}/sessions
@@ -45,17 +45,16 @@ def require_live_provider_opt_in():
     interactive login. Observed twice on 2026-07-27: an `-m "e2e or slow"` run
     opened Firefox asking the developer to log in to their real kiro account.
 
-    Being on PATH is not consent to use someone's credentials. This is the same
-    gate the live provider tests already use
-    (test/providers/test_kiro_cli_integration.py:45-48); test/e2e/ simply never
-    adopted it. Autouse + session scope so it fires before any provider starts,
-    for every file in this tree at once.
+    Being on PATH is not consent to use someone's credentials. Gated by the
+    --run-live plugin option (AC2.4); the env_capabilities plugin skips all
+    live-marked tests when --run-live is absent, making this fixture
+    belt-and-braces only.
     """
-    if os.environ.get("CAO_RUN_LIVE_PROVIDER_TESTS", "") != "1":
+    if not request.config.getoption("--run-live", default=False):
         pytest.skip(
             "Live provider E2E disabled: these tests launch real provider CLIs "
             "and an unauthenticated one will open an interactive login. "
-            "Set CAO_RUN_LIVE_PROVIDER_TESTS=1 to enable."
+            "Use --run-live to enable."
         )
 
 
