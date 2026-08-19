@@ -782,7 +782,13 @@ class GrokCliProvider(BaseProvider):
                     pass
 
     def _pids_using_home(self, home: Path) -> list[int] | None:
-        """Find PIDs with GROK_HOME set to this path. Returns None on uncertainty."""
+        """Find PIDs with GROK_HOME set to this path.
+
+        F312: Returns None ONLY when a process that is plausibly ours (descendant
+        of terminal pane or has cwd/open-files touching this home) cannot be
+        inspected.  Uninspectable processes unrelated to this terminal are treated
+        as not-ours and never block cleanup.
+        """
         home_str = str(home)
         uid = os.getuid()
         result: list[int] = []
@@ -790,12 +796,89 @@ class GrokCliProvider(BaseProvider):
             for pid in psutil.pids():
                 inspection = self._inspect_home_process(pid, home_str, uid)
                 if inspection is None:
-                    return None  # uncertainty → defer
+                    # AccessDenied — check if this pid is plausibly related to us.
+                    if self._pid_plausibly_related(pid, home):
+                        return None  # genuine uncertainty on a related process
+                    # Unrelated uninspectable process — not ours, continue.
+                    continue
                 if inspection:
                     result.append(pid)
         except psutil.Error:
             return None
         return result
+
+    def _pid_plausibly_related(self, pid: int, home: Path) -> bool:
+        """F312: Heuristic — is this uninspectable pid plausibly a child of our terminal?
+
+        Checks: (1) is it a descendant of the terminal's pane process, or
+        (2) does its cwd or any open file reference the GROK_HOME path.
+        Returns False (not related) if none of these can be confirmed.
+
+        Residual risk: if a genuine grok child denies parent(), cwd(), AND
+        open_files() inspection simultaneously (triple-deny), this heuristic
+        returns False and cleanup proceeds — potentially removing a home that
+        is still in use.  In practice this requires a same-uid process with
+        PR_SET_DUMPABLE=0 AND restricted /proc/pid access, which grok children
+        never configure.  The risk is accepted as preferable to the prior
+        behavior of deferring cleanup forever on any AccessDenied.
+        """
+        home_str = str(home)
+        try:
+            proc = psutil.Process(pid)
+            # Check if it's a descendant of our pane
+            try:
+                from cli_agent_orchestrator.services.fork_context_service import pane_pid
+
+                our_pane = pane_pid(self.session_name, self.window_name)
+                if our_pane:
+                    parent = proc.parent()
+                    # Walk ancestry up to 10 levels
+                    visited: set[int] = set()
+                    ancestor = parent
+                    for _ in range(10):
+                        if ancestor is None:
+                            break
+                        if ancestor.pid in visited:
+                            break
+                        visited.add(ancestor.pid)
+                        if ancestor.pid == our_pane:
+                            return True
+                        try:
+                            ancestor = ancestor.parent()
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            break
+            except Exception:
+                pass
+
+            # Check cwd
+            try:
+                cwd = proc.cwd()
+                if cwd and cwd.startswith(home_str):
+                    return True
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                pass
+
+            # Check open files
+            try:
+                for f in proc.open_files():
+                    if f.path.startswith(home_str):
+                        return True
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                pass
+
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            pass
+        except psutil.AccessDenied:
+            pass
+
+        # Cannot confirm any relationship — treat as unrelated
+        logger.debug(
+            "F312: pid %d triple-deny (parent/cwd/open_files all inaccessible); "
+            "treating as unrelated to GROK_HOME %s",
+            pid,
+            home,
+        )
+        return False
 
     def _inspect_home_process(self, pid: int, home_str: str, uid: int) -> bool | None:
         """Check if a single PID uses the given GROK_HOME. Returns None on uncertainty."""
