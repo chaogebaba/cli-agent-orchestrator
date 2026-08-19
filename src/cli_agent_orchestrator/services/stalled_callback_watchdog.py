@@ -155,6 +155,9 @@ class _Episode:
     last_progress_at: float | None = None       # monotonic time of last FP change while processing
     np_fired_key: tuple[int, float] | None = None  # (generation, processing_since) dedup
     last_np_hint: str | None = None             # sanitized bounded last-line hint from filtered tail
+    # F295 Half 2 D9: absolute-age wedge arm (grok_cli only)
+    wedge_fired_key: tuple[int, float] | None = None  # (generation, processing_since) dedup
+    wedge_flagged: bool = False                 # whether wedge_suspect is currently set
 
 
 @dataclass(frozen=True)
@@ -504,6 +507,9 @@ class StalledCallbackWatchdog:
                     episode.last_progress_at = None
                     episode.np_fired_key = None
                     episode.last_np_hint = None
+                    # F295 Half 2: clear wedge state on status transition
+                    episode.wedge_flagged = False
+                    episode.wedge_fired_key = None
             # F97: garbage-collect completed episodes
             self._gc_fired_episodes()
         # FX193 D2: notify nudge discipline of status change (outside lock)
@@ -1922,6 +1928,161 @@ class StalledCallbackWatchdog:
             if ep is episode and ep.generation == stall_generation:
                 ep.np_fired_key = (stall_generation, processing_since)
 
+    # -----------------------------------------------------------------------
+    # F295 Half 2 D9: grok wedge watchdog (absolute-age arm, flag+notify only)
+    # -----------------------------------------------------------------------
+
+    def tick_wedge(self) -> None:
+        """F295 Half 2: absolute-age arm for grok_cli terminals (D7/D9/D10)."""
+        try:
+            self._tick_wedge_inner()
+        except Exception:
+            logger.exception("tick_wedge outer fault (fail-silent)")
+
+    def _tick_wedge_inner(self) -> None:
+        from cli_agent_orchestrator.services.config_service import ConfigService
+
+        if not ConfigService.get("supervisor.watchdog.grok_wedge", True):
+            return
+
+        now = time.monotonic()
+        wedge_age_s = float(ConfigService.get("supervisor.watchdog.grok_wedge_age_s", 900.0))
+        wedge_age_s = max(300.0, min(7200.0, wedge_age_s))
+        if wedge_age_s == 0:
+            return  # 0 disables (D14)
+
+        # Collect candidates: grok_cli, PROCESSING, age >= wedge_age_s, not fired
+        candidates: list[tuple[str, _Episode]] = []
+        with self._lock:
+            for terminal_id, episode in self._episodes.items():
+                if terminal_id in self._paused:
+                    continue
+                if episode.processing_since is None:
+                    continue
+                if episode.wedge_fired_key is not None:
+                    continue  # already fired for this processing episode
+                if now - episode.processing_since < wedge_age_s:
+                    continue
+                candidates.append((terminal_id, episode))
+
+        if not candidates:
+            return
+
+        for terminal_id, episode in candidates:
+            try:
+                self._evaluate_wedge(terminal_id, episode, now)
+            except Exception:
+                logger.exception(
+                    "tick_wedge per-terminal fault for %s (fail-silent)", terminal_id
+                )
+
+    def _evaluate_wedge(self, terminal_id: str, episode: _Episode, now: float) -> None:
+        """D9/D10/D11: recheck + flag + notify for a single grok_cli terminal."""
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        # D9: scope to grok_cli only
+        meta = get_terminal_metadata(terminal_id)
+        if meta is None:
+            # D11: terminal reaped between candidacy and recheck → no flag, no notice
+            with self._lock:
+                ep = self._episodes.get(terminal_id)
+                if ep is episode:
+                    ep.wedge_fired_key = None
+                    ep.wedge_flagged = False
+            return
+        if meta.get("provider") != "grok_cli":
+            return
+
+        # D5-style recheck: status must still be PROCESSING
+        from cli_agent_orchestrator.services.stalled_callback_watchdog import receiver_state_view
+
+        status = receiver_state_view.snapshot_view(
+            "watchdog.wedge_recheck",
+            terminal_id,
+            max_age_s=5.0,
+            none_behavior="watchdog",
+            monitor=status_monitor,
+        )
+        if status != TerminalStatus.PROCESSING:
+            # Status transitioned — clear wedge state
+            self._clear_wedge_flag(terminal_id, episode)
+            return
+
+        # Confirm episode is still the same
+        with self._lock:
+            ep = self._episodes.get(terminal_id)
+            if ep is not episode:
+                return
+            if ep.wedge_fired_key is not None:
+                return  # fired between candidacy and recheck
+            if ep.processing_since is None:
+                return
+            generation = ep.generation
+            processing_since = ep.processing_since
+            caller_id = ep.caller_id
+            profile = ep.profile
+
+        processing_age = int(now - processing_since)
+
+        # D12: flag wedge_suspect in system metadata
+        try:
+            from cli_agent_orchestrator.clients.database import merge_terminal_system_metadata
+
+            merge_terminal_system_metadata(terminal_id, {"wedge_suspect": True})
+        except Exception:
+            logger.warning("F295: failed to set wedge_suspect for %s", terminal_id, exc_info=True)
+
+        # D11: notify caller, fallback to supervisor
+        recipient = caller_id
+        if get_terminal_metadata(caller_id) is None:
+            from cli_agent_orchestrator.services.mailbox_service import (
+                get_current_supervisor_terminal_id,
+            )
+
+            recipient = get_current_supervisor_terminal_id()
+        if not recipient:
+            logger.info("F295 wedge: no recipient for %s, dropping notice", terminal_id)
+        else:
+            message = (
+                f"[wedge-watchdog] grok worker {profile}-{terminal_id} has been PROCESSING "
+                f"for {processing_age}s (gen={generation}). Possible relay wedge.\n"
+                f"Check: peek_terminal {terminal_id}\n"
+                f"Remedy: delete_terminal {terminal_id} then re-assign."
+            )
+            try:
+                from cli_agent_orchestrator.services.mailbox_service import (
+                    create_routed_inbox_message,
+                )
+
+                create_routed_inbox_message(
+                    f"watchdog:wedge:{terminal_id}", recipient, message
+                )
+            except Exception:
+                logger.warning(
+                    "F295 wedge: failed to send notice for %s", terminal_id, exc_info=True
+                )
+                return  # D2 ordering: don't set fired key if persist fails
+
+        # Set fired key ONLY after successful persist (D2 ordering)
+        with self._lock:
+            ep = self._episodes.get(terminal_id)
+            if ep is episode and ep.generation == generation:
+                ep.wedge_fired_key = (generation, processing_since)
+                ep.wedge_flagged = True
+
+    def _clear_wedge_flag(self, terminal_id: str, episode: _Episode) -> None:
+        """Clear wedge_suspect from system metadata and episode state."""
+        with self._lock:
+            ep = self._episodes.get(terminal_id)
+            if ep is episode and ep.wedge_flagged:
+                ep.wedge_flagged = False
+        try:
+            from cli_agent_orchestrator.clients.database import merge_terminal_system_metadata
+
+            merge_terminal_system_metadata(terminal_id, {"wedge_suspect": None})
+        except Exception:
+            pass  # best effort
+
     async def run(self, registry: PluginRegistry | None = None) -> None:
         from cli_agent_orchestrator.services import seam_parity
 
@@ -1949,6 +2110,7 @@ class StalledCallbackWatchdog:
                 await asyncio.to_thread(self.tick_ready_backlog, registry)
                 await asyncio.to_thread(self.tick_quiescence)
                 await asyncio.to_thread(self.tick_no_progress)
+                await asyncio.to_thread(self.tick_wedge)
                 parity_now = self._parity_clock()
                 if parity_now >= next_parity_sweep:
                     next_parity_sweep = parity_now + 60.0

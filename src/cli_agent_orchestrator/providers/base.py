@@ -87,6 +87,13 @@ class BaseProvider(ABC):
     supports_seed_resume_identity: bool = False
     signal_kinds: frozenset[str] = frozenset()
     liveness_anchor: AnchorSpec | None = None
+
+    # F295 Half 2 D1: generic preflight hook, awaited before any resource.
+    @classmethod
+    async def preflight_launch(cls, *, agent_profile: str | None, model: str | None) -> None:
+        """Prove the launch route before any resource is allocated. Default: no-op."""
+        return None
+
     # F124 S4: provider process contract
     has_process_child: bool = True
     launch_health_grace_s: float = 0.0

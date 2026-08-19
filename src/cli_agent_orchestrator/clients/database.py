@@ -3069,16 +3069,93 @@ def update_terminal_group(terminal_id: str, group: Optional[List[str]]) -> bool:
 
 
 def update_terminal_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]]) -> bool:
-    """Replace a terminal's free-form metadata dict. ``None``/``{}`` clears it."""
+    """Replace a terminal's free-form metadata dict. ``None``/``{}`` clears it.
+
+    D12: preserves the reserved ``cao`` system namespace across worker full-replace.
+    """
     import json as _json
 
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if not terminal:
             return False
-        terminal.metadata_json = _json.dumps(metadata) if metadata else None
+        # D12: preserve the reserved 'cao' key from existing metadata
+        existing_cao: Dict[str, Any] | None = None
+        if terminal.metadata_json:
+            try:
+                existing = _json.loads(str(terminal.metadata_json))
+                if isinstance(existing, dict):
+                    existing_cao = existing.get("cao")
+            except (ValueError, TypeError):
+                pass
+        # Build new dict: worker payload + preserved cao namespace
+        if metadata:
+            new_meta = dict(metadata)
+            # Strip any worker-provided 'cao' key (workers cannot write system namespace)
+            new_meta.pop("cao", None)
+            if existing_cao is not None:
+                new_meta["cao"] = existing_cao
+        else:
+            # Clearing: keep only the system namespace if it exists
+            new_meta = {"cao": existing_cao} if existing_cao else None
+        terminal.metadata_json = _json.dumps(new_meta) if new_meta else None
         db.commit()
         return True
+
+
+# ---------------------------------------------------------------------------
+# F295 Half 2 D12: System metadata (reserved 'cao' namespace)
+# ---------------------------------------------------------------------------
+
+_SYSTEM_KEY = "cao"
+
+
+def merge_terminal_system_metadata(terminal_id: str, patch: Dict[str, Any]) -> bool:
+    """Read-modify-write the reserved ``cao`` sub-dict inside metadata_json.
+
+    The ``cao`` key is system-owned and invisible to worker full-replace (D12).
+    ``patch`` keys are merged (upsert); keys not in ``patch`` are preserved.
+    """
+    import json as _json
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return False
+        existing: Dict[str, Any] = {}
+        if terminal.metadata_json:
+            try:
+                existing = _json.loads(str(terminal.metadata_json))
+                if not isinstance(existing, dict):
+                    existing = {}
+            except (ValueError, TypeError):
+                existing = {}
+        cao_ns = existing.get(_SYSTEM_KEY)
+        if not isinstance(cao_ns, dict):
+            cao_ns = {}
+        cao_ns.update(patch)
+        existing[_SYSTEM_KEY] = cao_ns
+        terminal.metadata_json = _json.dumps(existing)
+        db.commit()
+        return True
+
+
+def read_terminal_system_metadata(terminal_id: str) -> Dict[str, Any]:
+    """Read the reserved ``cao`` sub-dict from a terminal's metadata, or ``{}``."""
+    import json as _json
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal or not terminal.metadata_json:
+            return {}
+        try:
+            metadata = _json.loads(str(terminal.metadata_json))
+        except (ValueError, TypeError):
+            return {}
+        if not isinstance(metadata, dict):
+            return {}
+        cao_ns = metadata.get(_SYSTEM_KEY)
+        return dict(cao_ns) if isinstance(cao_ns, dict) else {}
 
 
 # ---------------------------------------------------------------------------

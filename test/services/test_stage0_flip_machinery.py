@@ -506,7 +506,7 @@ def test_trace_manifest_is_byte_exact_and_has_36_hits() -> None:
     )
     expected = manifest_path.read_text(encoding="utf-8")
     _assert_trace_manifest_current(Path(__file__).parents[2], expected)
-    assert len([line for line in expected.splitlines() if line]) == 37
+    assert len([line for line in expected.splitlines() if line]) == 38
 
 
 def test_trace_manifest_failure_names_regen_command(tmp_path: Path) -> None:

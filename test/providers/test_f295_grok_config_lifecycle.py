@@ -262,7 +262,7 @@ class TestAC2StalenessStamp:
             patch("cli_agent_orchestrator.providers.grok_cli.provider_home") as mock_plane,
             patch("cli_agent_orchestrator.providers.grok_cli.get_backend") as mock_backend,
             patch("cli_agent_orchestrator.providers.grok_cli.load_agent_profile") as mock_profile,
-            patch("cli_agent_orchestrator.clients.database.update_terminal_metadata") as mock_meta,
+            patch("cli_agent_orchestrator.clients.database.merge_terminal_system_metadata") as mock_meta,
         ):
             mock_plane.return_value = grok_plane
             backend_inst = MagicMock()

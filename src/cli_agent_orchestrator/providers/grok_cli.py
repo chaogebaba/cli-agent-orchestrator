@@ -108,6 +108,16 @@ class GrokCliProvider(BaseProvider):
     composer_clear_keys = ["C-a", "C-k"]
     clear_immune_ghosts = False
 
+    # F295 Half 2 D8: spinner animation stops counting as progress.
+    liveness_exclude_patterns = [PROCESSING_PATTERN]
+
+    @classmethod
+    async def preflight_launch(cls, *, agent_profile: str | None, model: str | None) -> None:
+        """F295 Half 2 D1: prove the relay route before resource allocation."""
+        from cli_agent_orchestrator.utils.grok_preflight import run_preflight
+
+        run_preflight(agent_profile=agent_profile, model=model)
+
     def __init__(
         self,
         terminal_id: str,
@@ -693,8 +703,6 @@ class GrokCliProvider(BaseProvider):
 
         Also stamps the canonical sha256 into terminal metadata (AC2).
         """
-        from cli_agent_orchestrator.clients.database import update_terminal_metadata
-
         plane = provider_home("grok_cli")
         canonical_path = plane.home / "config.toml"
         private_config = self._home_path() / "config.toml"
@@ -734,10 +742,13 @@ class GrokCliProvider(BaseProvider):
         # Atomic overwrite of private config with fresh canonical content
         self._atomic_write_private(private_config, canonical_text)
 
-        # AC2: stamp sha256 of the canonical text into terminal metadata
+        # AC2: stamp sha256 of the canonical text into terminal system metadata (D12).
+        # Uses the reserved 'cao' namespace so worker full-replace cannot erase it.
         canonical_hash = hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()
         try:
-            update_terminal_metadata(self.terminal_id, {"config_sha256": canonical_hash})
+            from cli_agent_orchestrator.clients.database import merge_terminal_system_metadata
+
+            merge_terminal_system_metadata(self.terminal_id, {"config_sha256": canonical_hash})
         except Exception as exc:
             logger.warning(
                 "F295: failed to stamp config hash for terminal %s: %s",

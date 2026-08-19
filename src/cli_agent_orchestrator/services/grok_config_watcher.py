@@ -41,7 +41,13 @@ def _count_stale_grok_terminals(canonical_hash: str) -> int:
                 metadata = _json.loads(str(t.metadata_json))
             except (ValueError, TypeError):
                 continue
-            stored = metadata.get("config_sha256")
+            # D12: read from reserved 'cao' namespace, with legacy top-level fallback (AC13)
+            stored = None
+            cao_ns = metadata.get("cao") if isinstance(metadata, dict) else None
+            if isinstance(cao_ns, dict):
+                stored = cao_ns.get("config_sha256")
+            if not isinstance(stored, str):
+                stored = metadata.get("config_sha256") if isinstance(metadata, dict) else None
             if isinstance(stored, str) and stored != canonical_hash:
                 count += 1
     return count
