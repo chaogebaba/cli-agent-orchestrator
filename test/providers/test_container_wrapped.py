@@ -247,8 +247,13 @@ async def test_wrapped_provider_lifecycle(
     mock_load.return_value = AgentProfile(name="c", description="d", provider_init_timeout=180)
     mock_wait_shell.return_value = True
     mock_wait_status.return_value = True
-    # A workspace-trust dialog is showing at startup (handled by the prompt handler).
-    mock_backend.get_history.return_value = "Yes, I trust this folder"
+    # D6c: The trust dialog shows on the first buffer read; subsequent reads show
+    # the version banner so the idle-gap loop exits immediately instead of spinning
+    # for ~20s of real asyncio.sleep(1.0) calls (ledger: 25.04s → ~1s).
+    mock_backend.get_history.side_effect = [
+        "Yes, I trust this folder",
+        "Welcome to Claude Code v2.1.211",
+    ]
     # Wrapped exec -> native status is always unresolved; status is buffer-driven.
     mock_backend.get_native_status.return_value = None
 
