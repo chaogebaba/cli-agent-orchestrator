@@ -270,13 +270,16 @@ class ClineCliProvider(BaseProvider):
 
         lines = clean_output.splitlines()
         tail = "\n".join(lines[-20:])
+        idle_detected = self._has_idle_prompt(lines)
 
         # Check for waiting/permission prompts.
         if re.search(WAITING_USER_ANSWER_PATTERN, tail, re.IGNORECASE):
             return TerminalStatus.WAITING_USER_ANSWER
 
-        # Check for errors.
-        if re.search(ERROR_PATTERN, tail, re.MULTILINE | re.IGNORECASE):
+        # Check for errors — but NOT when the idle prompt is also visible
+        # (the error text is likely a quoted line in the response, not a
+        # real terminal error). Priority-inversion guard (S1).
+        if not idle_detected and re.search(ERROR_PATTERN, tail, re.MULTILINE | re.IGNORECASE):
             return TerminalStatus.ERROR
 
         # Check for active processing.
@@ -284,7 +287,7 @@ class ClineCliProvider(BaseProvider):
             return TerminalStatus.PROCESSING
 
         # Check for idle prompt at end.
-        if self._has_idle_prompt(lines):
+        if idle_detected:
             if self._input_received:
                 return TerminalStatus.COMPLETED
             return TerminalStatus.IDLE

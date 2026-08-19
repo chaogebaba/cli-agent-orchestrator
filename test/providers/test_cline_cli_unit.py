@@ -290,6 +290,21 @@ class TestClineCliStatusDetection:
         output = "Something happened\nError: model not found\n"
         assert provider.get_status(output) == TerminalStatus.ERROR
 
+    def test_error_suppressed_when_idle_prompt_present(self):
+        """S1: quoted error lines in response don't trigger ERROR when idle prompt visible."""
+        provider = self._make_provider()
+        provider._initialized = True
+        output = "The error was:\nError: model not found\nThat's the issue.\n\n❯ "
+        assert provider.get_status(output) == TerminalStatus.IDLE
+
+    def test_error_suppressed_when_idle_prompt_completed(self):
+        """S1: quoted error lines after input don't block COMPLETED verdict."""
+        provider = self._make_provider()
+        provider._initialized = True
+        provider._input_received = True
+        output = "I found this error:\nError: connection refused\nFixed it.\n\n❯ "
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
     def test_waiting_user_answer(self):
         provider = self._make_provider()
         provider._initialized = True
@@ -395,10 +410,18 @@ class TestClineCliRegistration:
             "test-session",
             "win-0",
             agent_profile="developer",
-            model="deepseek/deepseek-chat",
+            model="deepseek/deepseek-v4-flash",
         )
         assert isinstance(provider, ClineCliProvider)
-        assert provider._model == "deepseek/deepseek-chat"
+        assert provider._model == "deepseek/deepseek-v4-flash"
+
+    def test_cline_in_soft_enforcement_providers(self):
+        """S2: cline_cli is in SOFT_ENFORCEMENT_PROVIDERS (no native tool blocking)."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            SOFT_ENFORCEMENT_PROVIDERS,
+        )
+
+        assert "cline_cli" in SOFT_ENFORCEMENT_PROVIDERS
 
 
 # ─── Miscellaneous properties ─────────────────────────────────────────────────

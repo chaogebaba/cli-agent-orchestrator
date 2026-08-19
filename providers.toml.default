@@ -1,6 +1,7 @@
 # providers.toml.default — template for ~/.aws/cli-agent-orchestrator/providers.toml
-# install.sh and `cao redeploy` copy this ONLY if the target does not exist; an
-# existing providers.toml is never overwritten by default (your hand edits win).
+# `cao config reconcile` (called by `cao redeploy`) seeds this ONLY if the
+# target does not exist; an existing providers.toml is never overwritten by
+# default (your hand edits win).
 # Use `cao redeploy --force-providers` to reset the live file from this template
 # (it backs the old one up first).
 #
