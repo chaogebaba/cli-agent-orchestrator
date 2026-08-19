@@ -2000,7 +2000,7 @@ class CodexProvider(BaseProvider):
                 signals.append(
                     ScreenSignal("progress", "TUI_PROGRESS_PATTERN", index, row, "corroborable")
                 )
-            if TRUST_SELECTOR_PATTERN.search(row):
+            if legacy_status == TerminalStatus.WAITING_USER_ANSWER and TRUST_SELECTOR_PATTERN.search(row):
                 signals.append(ScreenSignal("waiting", "TRUST_SELECTOR_PATTERN", index))
             if (
                 not progress_rows
