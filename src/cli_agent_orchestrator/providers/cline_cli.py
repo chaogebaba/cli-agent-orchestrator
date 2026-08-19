@@ -46,10 +46,21 @@ CLINE_BINARY = str(Path.home() / ".bun" / "bin" / "cline")
 
 # Cline TUI idle prompt: the input indicator at the end of output.
 # Confirmed via cline/cline source: the TUI renders a ❯ glyph as the
-# brand.prompt character (themeable) plus "Ask anything..." placeholder text
-# in the composer when idle (see agentwrapper/agent-orchestrator#4048,
-# cline/cline CHANGELOG "restyled chat input: bold accent prompt glyph").
+# brand.prompt character (themeable) plus placeholder text in the composer
+# when idle.  Two observed idle screens:
+#   Virgin (first launch):   ❯ What can I do for you?
+#   Post-exchange:           ❯ Ask anything...
+# Both are prompt-glyph + placeholder ON THE SAME LINE.  A banner line
+# "What can I do for you?" can also appear ABOVE the composer but must NOT
+# count as idle on its own (can co-exist with a processing state).
 IDLE_PROMPT_PATTERN = r"^\s*[❯>]\s*$"
+
+# Composer-line idle: prompt glyph followed by a known placeholder phrase.
+# This is the PRIMARY idle signal — it matches the actual rendered composer.
+IDLE_COMPOSER_PATTERN = r"^\s*[❯>]\s+(?:What can I do for you\??|Ask anything.*)"
+
+# Legacy placeholder search (matches "Ask anything" anywhere in a line).
+# Kept as a secondary fallback for edge-case screen truncations.
 IDLE_PLACEHOLDER_PATTERN = r"Ask anything"
 
 # Processing indicators: spinner/working text.
@@ -306,22 +317,40 @@ class ClineCliProvider(BaseProvider):
     def _has_idle_prompt(lines: list[str]) -> bool:
         """Check if idle prompt is visible in the last few lines.
 
-        Cline's TUI shows either:
-        - A bare ❯ or > glyph on its own line (the composer prompt), or
-        - The "Ask anything..." placeholder text in the composer area.
-        Both indicate the TUI is idle and ready for input.
+        Cline's TUI shows the composer line in one of these forms:
+        - Virgin idle:       ❯ What can I do for you?
+        - Post-exchange:     ❯ Ask anything...
+        - Bare (rare/old):   ❯
+
+        The real TUI layout has STATUS BAR lines BELOW the composer:
+          ────────────────
+          ❯ Ask anything...
+          ────────────────
+          ClinePass: DeepSeek V4 Flash (high) ...
+          cli-subagents (quirks-merge-train)
+          ⏵⏵ Auto-approve all enabled (Shift+Tab)
+
+        So we must scan ALL non-empty lines in the 8-line tail window
+        (not stop at the first non-matching line from the bottom).
+
+        A bare "What can I do for you?" banner line (no ❯ glyph) does NOT
+        count — it co-exists with processing state and must not short-circuit.
         """
         tail = lines[-8:] if len(lines) >= 8 else lines
-        for line in reversed(tail):
+        for line in tail:
             stripped = line.strip()
             if not stripped:
                 continue
+            # Primary: composer line with glyph + placeholder text.
+            if re.match(IDLE_COMPOSER_PATTERN, stripped):
+                return True
+            # Fallback: bare prompt glyph only.
             if re.match(IDLE_PROMPT_PATTERN, stripped):
                 return True
+            # Secondary fallback: "Ask anything" anywhere in line (handles
+            # rare cases where escape stripping removes the glyph).
             if re.search(IDLE_PLACEHOLDER_PATTERN, stripped, re.IGNORECASE):
                 return True
-            # Non-empty non-prompt line — stop looking.
-            break
         return False
 
     def classify_injection_hazard(self, rows: list[str]) -> str | None:
