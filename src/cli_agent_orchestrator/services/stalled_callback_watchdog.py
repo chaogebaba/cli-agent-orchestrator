@@ -361,6 +361,12 @@ class StalledCallbackWatchdog:
 
         Called by _delete_terminal_under_lease BEFORE clear_terminal, under the
         terminal's delivery_lock. Returns None when no notice is warranted.
+
+        F310: Before firing, consult the durable inbox for a delivered/acked
+        callback from this worker since the current episode's dispatch time.
+        A follow-up send_message re-arms the episode (callback_seen=False on
+        the new generation), but the worker's prior callback is authoritative —
+        if the DB shows a delivered message, the result was NOT lost.
         """
         with self._lock:
             episode = self._episodes.get(terminal_id)
@@ -373,6 +379,33 @@ class StalledCallbackWatchdog:
             caller_id = episode.caller_id
             profile = episode.profile
             generation = episode.generation
+            episode_started = episode.episode_started_wall_at
+
+        # F310: DB ground-truth check — outside _lock (may block on DB).
+        # If a callback from this worker reached the caller since the episode
+        # started, the result is safe regardless of in-memory episode state.
+        try:
+            status = get_callback_status_since(terminal_id, caller_id, episode_started)
+            if status is not None:
+                # Durable evidence: callback delivered/acked — no loss.
+                return None
+        except Exception:
+            # DB unavailable: fall through to the conservative path (fire).
+            logger.debug(
+                "F310: get_callback_status_since failed for %s; "
+                "falling through to loss warning",
+                terminal_id,
+                exc_info=True,
+            )
+
+        with self._lock:
+            # Re-check under lock: episode may have been settled concurrently.
+            episode = self._episodes.get(terminal_id)
+            if episode is None or episode.callback_seen or episode.fired:
+                return None
+            if episode.generation != generation:
+                # Episode was replaced — stale decision; abort.
+                return None
             episode.fired = True  # under _lock — atomic with the decision
 
         # Outside _lock: durable insert (may block on DB)
