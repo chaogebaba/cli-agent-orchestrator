@@ -34,6 +34,7 @@ def test_list_terminals_by_session_skips_stale_rows():
     good_terminal.init_failure_token = None
     good_terminal.init_deadline_s = None
     good_terminal.engine = None
+    good_terminal.metadata_json = None
     good_terminal.last_active = None
 
     stale_terminal = MagicMock()
