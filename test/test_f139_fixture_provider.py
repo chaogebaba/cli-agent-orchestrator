@@ -1049,12 +1049,15 @@ class TestMockCliEmptyShell:
         provider._fixture_capability = cap
 
         backend = MagicMock()
-        # First call returns the fixture binary command (still running), second
-        # returns the shell baseline (child exited).
+        # D6c: First call is the baseline capture (before launch) → "bash".
+        # Then _wait_for_fixture_child_gone polls: "mock_cli" (fixture still
+        # running, != baseline) → "bash" (matches baseline → immediate return).
+        # Previous ordering had baseline="mock_cli" so the loop never matched
+        # and hit the 15s timeout (ledger: 15.06s → <0.5s).
         backend.get_pane_current_command.side_effect = [
-            "mock_cli",
-            "bash",
-            "bash",  # stabilizes on baseline
+            "bash",      # baseline capture (before fixture launch)
+            "mock_cli",  # fixture binary still running
+            "bash",      # child exited, back to shell baseline
         ]
 
         with (
