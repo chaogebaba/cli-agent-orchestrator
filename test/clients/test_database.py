@@ -661,6 +661,24 @@ class TestMessageTraceTransactions:
         mock_terminal.provider = "kiro_cli"
         mock_terminal.agent_profile = "developer"
         mock_terminal.working_directory = "/workspace/project"
+        mock_terminal.allowed_tools = None
+        mock_terminal.shell_command = None
+        mock_terminal.caller_id = None
+        mock_terminal.caller_mailbox_id = None
+        mock_terminal.lifecycle = "ephemeral"
+        mock_terminal.reparented_from = None
+        mock_terminal.provider_session_id = None
+        mock_terminal.recovery_state = None
+        mock_terminal.recovery_error = None
+        mock_terminal.recovery_updated_at = None
+        mock_terminal.fallback_terminal_id = None
+        mock_terminal.init_state = None
+        mock_terminal.init_started_at = None
+        mock_terminal.init_owner_epoch = None
+        mock_terminal.init_failure_token = None
+        mock_terminal.init_deadline_s = None
+        mock_terminal.engine = None
+        mock_terminal.metadata_json = None
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()

@@ -937,12 +937,19 @@ class TestA1FullJitter:
             delays_run1: list[float] = []
             delays_run2: list[float] = []
 
-            for delays_list in (delays_run1, delays_run2):
-                discipline = NudgeDiscipline(rng=SeededRNG(99))
-                discipline.arm_or_coalesce("sup1", "mb1", 1, 50)
-                discipline.record_status("sup1", TerminalStatus.IDLE)
+            # Patch time.monotonic to a fixed value so arm_or_coalesce is
+            # deterministic (it uses time.monotonic() for the initial
+            # visibility_timeout_at).
+            fixed_mono = 100000.0
 
-                now = 100000.0  # Fixed base avoids time.monotonic() divergence
+            for delays_list in (delays_run1, delays_run2):
+                with patch("cli_agent_orchestrator.services.nudge_discipline.time") as mock_time:
+                    mock_time.monotonic.return_value = fixed_mono
+                    discipline = NudgeDiscipline(rng=SeededRNG(99))
+                    discipline.arm_or_coalesce("sup1", "mb1", 1, 50)
+                    discipline.record_status("sup1", TerminalStatus.IDLE)
+
+                now = fixed_mono  # Aligned with the patched monotonic value
                 # Fire first
                 discipline.collect_due(
                     now=now, get_consumption_cursor=cursor_at_zero, get_pending_oldest=pending

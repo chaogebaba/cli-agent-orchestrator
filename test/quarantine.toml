@@ -103,6 +103,7 @@ class     = "known_red"
 reason    = "Env-dependent — working directory not created by git in temp fixture; fails serial"
 owner     = "pre-existing"
 filed     = "2026-08-18"
+expires   = "2026-09-17"
 review_by = "2026-09-17"
 
 [[entry]]
@@ -111,6 +112,7 @@ class     = "known_red"
 reason    = "Env-dependent — requires profiles/ directory with grok_base.md; absent in worktree layout"
 owner     = "pre-existing"
 filed     = "2026-08-18"
+expires   = "2026-09-17"
 review_by = "2026-09-17"
 
 # --- Re-quarantined: irreproducible under -n 2 (F262 verdict (d)) ---

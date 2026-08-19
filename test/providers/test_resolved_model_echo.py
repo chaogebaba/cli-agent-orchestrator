@@ -49,6 +49,7 @@ class TestKiroCliResolvedModel:
 
 
 class TestGrokCliResolvedModel:
+    @patch("cli_agent_orchestrator.providers.grok_cli.GrokCliProvider._rebuild_private_config")
     @patch("cli_agent_orchestrator.providers.grok_cli.load_agent_profile", return_value=None)
     @patch("cli_agent_orchestrator.providers.grok_cli.get_provider_defaults", return_value={})
     @patch("cli_agent_orchestrator.providers.grok_cli.get_provider_profile_defaults", return_value={})
