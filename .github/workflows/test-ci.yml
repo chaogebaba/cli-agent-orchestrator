@@ -263,7 +263,7 @@ jobs:
           steps.cache_check.outputs.hit != 'true' &&
           success() &&
           (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-        uses: actions/attest@11bbd243972067817e9ed160cb123cab3601f436 # v2
+        uses: actions/attest@ce27ba3b4a9a139d9a20a4a07d69fabb52f1e5bc # v2
         with:
           subject-path: suite-identity.json
           predicate-type: "https://cao.dev/attestations/suite-result/v1"
