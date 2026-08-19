@@ -67,4 +67,6 @@ reasoning_effort = "medium"
 model = "auto"
 
 [cline_cli]
-model = "deepseek/deepseek-chat"
+api_provider = "cline-pass"
+model = "deepseek/deepseek-v4-flash"
+thinking = "high"

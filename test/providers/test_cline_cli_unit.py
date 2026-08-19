@@ -14,6 +14,7 @@ from cli_agent_orchestrator.providers.cline_cli import (
     CLINE_BINARY,
     ClineCliProvider,
     ERROR_PATTERN,
+    IDLE_PLACEHOLDER_PATTERN,
     IDLE_PROMPT_PATTERN,
     PROCESSING_PATTERN,
     WAITING_USER_ANSWER_PATTERN,
@@ -26,10 +27,12 @@ from cli_agent_orchestrator.providers.cline_cli import (
 class TestClineCliProviderCommand:
     """Tests for launch command construction."""
 
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
-    def test_build_command_default(self, mock_load):
-        """Default command includes --tui and --auto-approve true."""
+    def test_build_command_default(self, mock_load, mock_defaults):
+        """Default command includes --tui, --auto-approve true, -P cline-pass, --thinking high."""
         mock_load.side_effect = FileNotFoundError("no profile")
+        mock_defaults.return_value = {"api_provider": "cline-pass"}
 
         provider = ClineCliProvider("t1234567", "sess", "win0")
         cmd = provider._build_command()
@@ -39,14 +42,20 @@ class TestClineCliProviderCommand:
         assert "--tui" in parts
         assert "--auto-approve" in parts
         assert "true" in parts
-        # No model flag without profile or providers.toml
+        assert "-P" in parts
+        assert parts[parts.index("-P") + 1] == "cline-pass"
+        assert "--thinking" in parts
+        assert parts[parts.index("--thinking") + 1] == "high"
+        # No model flag without profile or providers.toml model key
         assert "-m" not in parts
         assert "-s" not in parts
 
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
-    def test_build_command_with_model_override(self, mock_load):
+    def test_build_command_with_model_override(self, mock_load, mock_defaults):
         """Explicit model kwarg is forwarded as -m."""
         mock_load.side_effect = FileNotFoundError("no profile")
+        mock_defaults.return_value = {"api_provider": "cline-pass"}
 
         provider = ClineCliProvider(
             "t1234567", "sess", "win0", model="deepseek/deepseek-chat"
@@ -56,10 +65,14 @@ class TestClineCliProviderCommand:
 
         assert "-m" in parts
         assert parts[parts.index("-m") + 1] == "deepseek/deepseek-chat"
+        assert "-P" in parts
+        assert parts[parts.index("-P") + 1] == "cline-pass"
 
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
-    def test_build_command_with_system_prompt(self, mock_load):
+    def test_build_command_with_system_prompt(self, mock_load, mock_defaults):
         """Profile system prompt is forwarded as -s."""
+        mock_defaults.return_value = {"api_provider": "cline-pass"}
         profile = MagicMock()
         profile.system_prompt = "You are a test agent."
         profile.model = None
@@ -73,9 +86,11 @@ class TestClineCliProviderCommand:
         assert "-s" in parts
         assert parts[parts.index("-s") + 1] == "You are a test agent."
 
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
-    def test_build_command_skill_prompt_appended(self, mock_load):
+    def test_build_command_skill_prompt_appended(self, mock_load, mock_defaults):
         """Skill prompt is appended to system prompt."""
+        mock_defaults.return_value = {"api_provider": "cline-pass"}
         profile = MagicMock()
         profile.system_prompt = "Base prompt."
         profile.model = None
@@ -137,17 +152,69 @@ class TestClineCliModelResolution:
         assert result == "deepseek/deepseek-chat"
         mock_defaults.assert_called_once_with("cline_cli")
 
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
-    def test_resolved_model_property(self, mock_load):
+    def test_resolved_model_property(self, mock_load, mock_defaults):
         """resolved_model is set after _build_command."""
         mock_load.side_effect = FileNotFoundError("no profile")
+        mock_defaults.return_value = {"api_provider": "cline-pass"}
 
         provider = ClineCliProvider(
-            "t1234567", "sess", "win0", model="deepseek/deepseek-chat"
+            "t1234567", "sess", "win0", model="deepseek/deepseek-v4-flash"
         )
         provider._build_command()
 
-        assert provider.resolved_model == "deepseek/deepseek-chat"
+        assert provider.resolved_model == "deepseek/deepseek-v4-flash"
+
+
+# ─── Thinking / reasoning effort ──────────────────────────────────────────────
+
+
+class TestClineCliThinking:
+    """Tests for --thinking flag resolution."""
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_profile_defaults")
+    @patch("cli_agent_orchestrator.providers.cline_cli.resolve_provider_string_option")
+    @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
+    def test_default_thinking_high(self, mock_load, mock_resolve, mock_prof, mock_defaults):
+        """Without any override, thinking defaults to 'high'."""
+        mock_load.side_effect = FileNotFoundError("no profile")
+        mock_defaults.return_value = {}
+        mock_prof.return_value = {}
+        mock_resolve.return_value = None  # no toml override
+
+        provider = ClineCliProvider("t1234567", "sess", "win0")
+        result = provider._resolve_thinking()
+        assert result == "high"
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_profile_defaults")
+    @patch("cli_agent_orchestrator.providers.cline_cli.resolve_provider_string_option")
+    @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
+    def test_toml_thinking_override(self, mock_load, mock_resolve, mock_prof, mock_defaults):
+        """providers.toml thinking value overrides the default."""
+        mock_load.side_effect = FileNotFoundError("no profile")
+        mock_defaults.return_value = {"thinking": "medium"}
+        mock_prof.return_value = {}
+        mock_resolve.return_value = "medium"
+
+        provider = ClineCliProvider("t1234567", "sess", "win0")
+        result = provider._resolve_thinking()
+        assert result == "medium"
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
+    @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
+    def test_thinking_in_command(self, mock_load, mock_defaults):
+        """--thinking flag appears in the built command."""
+        mock_load.side_effect = FileNotFoundError("no profile")
+        mock_defaults.return_value = {"api_provider": "cline-pass", "thinking": "xhigh"}
+
+        provider = ClineCliProvider("t1234567", "sess", "win0")
+        parts = shlex.split(provider._build_command())
+
+        assert "--thinking" in parts
+        assert parts[parts.index("--thinking") + 1] == "xhigh"
 
 
 # ─── Status detection ─────────────────────────────────────────────────────────
@@ -198,6 +265,12 @@ class TestClineCliStatusDetection:
         output = "Do you want to proceed? [y/n]"
         assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
 
+    def test_idle_via_ask_anything_placeholder(self):
+        provider = self._make_provider()
+        provider._initialized = True
+        output = "Welcome to Cline\n\nAsk anything..."
+        assert provider.get_status(output) == TerminalStatus.IDLE
+
 
 # ─── Idle prompt detection ────────────────────────────────────────────────────
 
@@ -221,6 +294,16 @@ class TestClineCliIdlePrompt:
         """Prompt beyond the 8-line tail window is not detected."""
         lines = ["❯ "] + ["filler line"] * 20
         assert ClineCliProvider._has_idle_prompt(lines) is False
+
+    def test_ask_anything_placeholder(self):
+        """Cline TUI 'Ask anything...' placeholder is detected as idle."""
+        lines = ["some response", "", "Ask anything..."]
+        assert ClineCliProvider._has_idle_prompt(lines) is True
+
+    def test_ask_anything_with_prefix(self):
+        """Placeholder with leading whitespace."""
+        lines = ["output", "  Ask anything or type / for commands"]
+        assert ClineCliProvider._has_idle_prompt(lines) is True
 
 
 # ─── Response extraction ──────────────────────────────────────────────────────

@@ -45,7 +45,12 @@ CLINE_BINARY = str(Path.home() / ".bun" / "bin" / "cline")
 # ─── Status detection patterns ───────────────────────────────────────────────
 
 # Cline TUI idle prompt: the input indicator at the end of output.
+# Confirmed via cline/cline source: the TUI renders a ❯ glyph as the
+# brand.prompt character (themeable) plus "Ask anything..." placeholder text
+# in the composer when idle (see agentwrapper/agent-orchestrator#4048,
+# cline/cline CHANGELOG "restyled chat input: bold accent prompt glyph").
 IDLE_PROMPT_PATTERN = r"^\s*[❯>]\s*$"
+IDLE_PLACEHOLDER_PATTERN = r"Ask anything"
 
 # Processing indicators: spinner/working text.
 PROCESSING_PATTERN = (
@@ -147,14 +152,62 @@ class ClineCliProvider(BaseProvider):
             "model",
         )
 
+    def _resolve_provider_id(self) -> Optional[str]:
+        """Resolve the Cline API provider id (e.g. 'cline-pass').
+
+        Resolution: providers.toml [cline_cli] api_provider > default 'cline-pass'.
+        The 'cline-pass' provider routes through ClinePass (free DeepSeek V4 Flash),
+        while 'cline' routes through OpenRouter (paid per-token).
+        """
+        provider_defaults = get_provider_defaults("cline_cli")
+        return provider_defaults.get("api_provider") or "cline-pass"
+
+    def _resolve_thinking(self) -> Optional[str]:
+        """Resolve reasoning effort level for --thinking flag.
+
+        Resolution: [cline_cli.profiles.<name>] thinking > [cline_cli] thinking >
+        profile.reasoningEffort field > default 'high'.
+        Valid values: none|low|medium|high|xhigh (per cline --help).
+        """
+        profile = None
+        try:
+            if self._agent_profile:
+                profile = load_agent_profile(self._agent_profile)
+        except (FileNotFoundError, RuntimeError):
+            pass
+        provider_defaults = get_provider_defaults("cline_cli")
+        profile_name = getattr(profile, "name", None) or self._agent_profile
+        profile_defaults = get_provider_profile_defaults(provider_defaults, profile_name)
+        resolved = resolve_provider_string_option(
+            profile_defaults,
+            provider_defaults,
+            profile,
+            "thinking",
+            "reasoningEffort",
+        )
+        if isinstance(resolved, str) and resolved:
+            return resolved
+        # Default to high reasoning effort for coding tasks.
+        return "high"
+
     def _build_command(self) -> str:
         """Build the cline CLI launch command for interactive TUI mode."""
         command_parts = [CLINE_BINARY, "--tui", "--auto-approve", "true"]
+
+        # API provider selection (cline-pass = ClinePass subscription, free).
+        api_provider = self._resolve_provider_id()
+        if api_provider:
+            command_parts.extend(["-P", api_provider])
 
         model = self._resolve_model()
         self._resolved_model = model if (isinstance(model, str) and model) else None
         if isinstance(model, str) and model:
             command_parts.extend(["-m", model])
+
+        # Reasoning effort (default: high).
+        thinking = self._resolve_thinking()
+        if isinstance(thinking, str) and thinking:
+            command_parts.extend(["--thinking", thinking])
 
         # System prompt from agent profile.
         profile = None
@@ -244,13 +297,21 @@ class ClineCliProvider(BaseProvider):
 
     @staticmethod
     def _has_idle_prompt(lines: list[str]) -> bool:
-        """Check if idle prompt is visible in the last few lines."""
+        """Check if idle prompt is visible in the last few lines.
+
+        Cline's TUI shows either:
+        - A bare ❯ or > glyph on its own line (the composer prompt), or
+        - The "Ask anything..." placeholder text in the composer area.
+        Both indicate the TUI is idle and ready for input.
+        """
         tail = lines[-8:] if len(lines) >= 8 else lines
         for line in reversed(tail):
             stripped = line.strip()
             if not stripped:
                 continue
             if re.match(IDLE_PROMPT_PATTERN, stripped):
+                return True
+            if re.search(IDLE_PLACEHOLDER_PATTERN, stripped, re.IGNORECASE):
                 return True
             # Non-empty non-prompt line — stop looking.
             break
