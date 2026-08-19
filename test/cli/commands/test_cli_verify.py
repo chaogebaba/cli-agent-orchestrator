@@ -433,7 +433,7 @@ def test_verify_manifest_regen_preserves_identities_across_line_shift(
     regenerated = manifest_path.read_text(encoding="utf-8")
     committed_rows = committed.splitlines()
     regenerated_rows = regenerated.splitlines()
-    assert len(committed_rows) == len(regenerated_rows) == 37
+    assert len(committed_rows) == len(regenerated_rows) == 38
     assert [_trace_identity(row) for row in committed_rows] == [
         _trace_identity(row) for row in regenerated_rows
     ]
