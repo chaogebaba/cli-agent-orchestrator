@@ -790,6 +790,7 @@ SOFT_ENFORCEMENT_PROVIDERS = {
     ProviderType.KIMI_CLI.value,
     ProviderType.CODEX.value,
     ProviderType.ANTIGRAVITY_CLI.value,
+    ProviderType.CLINE_CLI.value,
 }
 
 MAX_PEEK_TERMINAL_LINES = 200
