@@ -299,6 +299,12 @@ class TestCreateSession:
         monkeypatch.setattr(
             terminal_service, "_mark_ready_if_generation_current", AsyncMock(return_value=True)
         )
+        # D6c: _confirm_worker_started_or_resubmit calls wait_until_status with an
+        # 8s timeout; without this patch the test burns the full timeout on a mock
+        # provider that never transitions (ledger: 8.55s → <0.5s).
+        monkeypatch.setattr(
+            terminal_service, "wait_until_status", AsyncMock(return_value=True)
+        )
 
         terminal_service._schedule_deferred_init(
             provider,
