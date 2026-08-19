@@ -14,11 +14,108 @@ from cli_agent_orchestrator.providers.cline_cli import (
     CLINE_BINARY,
     ClineCliProvider,
     ERROR_PATTERN,
+    IDLE_COMPOSER_PATTERN,
     IDLE_PLACEHOLDER_PATTERN,
     IDLE_PROMPT_PATTERN,
     PROCESSING_PATTERN,
     WAITING_USER_ANSWER_PATTERN,
 )
+
+
+# ─── Real screen captures (from live cline 3.0.55, ClinePass, 2026-08-19) ───
+
+# Virgin idle: first launch, no exchange yet.
+# The "What can I do for you?" text appears both as a banner AND on the
+# composer line (with ❯ glyph).
+REAL_SCREEN_VIRGIN_IDLE = """\
+
+
+
+
+ What can I do for you?
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ What can I do for you?
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ClinePass: DeepSeek V4 Flash (high) ██████ (0)                                                                                                                                      ○ Plan ● Act (Tab)
+ cli-subagents (quirks-merge-train)
+ ⏵⏵ Auto-approve all enabled (Shift+Tab)
+"""
+
+# Post-response idle: after a successful exchange, composer shows "Ask anything...".
+REAL_SCREEN_POST_RESPONSE_IDLE = """\
+ ❯ reply with exactly: OK
+
+ ▶ Thinking: The user just wants me to reply with exactly "OK". This is a simple request without coding context, so I should answer directly.
+
+ * OK
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Ask anything...
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ClinePass: DeepSeek V4 Flash (high) ██████ (6,346)                                                                                                                                  ○ Plan ● Act (Tab)
+ cli-subagents (quirks-merge-train)
+ ⏵⏵ Auto-approve all enabled (Shift+Tab)
+"""
+
+# Composer with typed text: user has started typing (not idle).
+REAL_SCREEN_COMPOSER_WITH_TEXT = """\
+ ❯ reply with exactly: OK
+
+ ▶ Thinking: The user just wants me to reply with exactly "OK".
+
+ * OK
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ hello world this is my typed text
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ClinePass: DeepSeek V4 Flash (high) ██████ (6,346)                                                                                                                                  ○ Plan ● Act (Tab)
+ cli-subagents (quirks-merge-train)
+ ⏵⏵ Auto-approve all enabled (Shift+Tab)
+"""
 
 
 # ─── Command construction ────────────────────────────────────────────────────
@@ -252,7 +349,7 @@ class TestClineCliThinking:
 
 
 class TestClineCliStatusDetection:
-    """Tests for get_status terminal state detection."""
+    """Tests for get_status terminal state detection using REAL screen captures."""
 
     def _make_provider(self) -> ClineCliProvider:
         return ClineCliProvider("t1234567", "sess", "win0")
@@ -265,18 +362,32 @@ class TestClineCliStatusDetection:
         provider = self._make_provider()
         assert provider.get_status("   \n\n  ") == TerminalStatus.UNKNOWN
 
-    def test_idle_prompt_detected(self):
+    def test_virgin_idle_screen(self):
+        """Real virgin idle screen (first launch, 'What can I do for you?')."""
         provider = self._make_provider()
         provider._initialized = True
-        output = "Welcome to Cline\n\n❯ "
-        assert provider.get_status(output) == TerminalStatus.IDLE
+        assert provider.get_status(REAL_SCREEN_VIRGIN_IDLE) == TerminalStatus.IDLE
 
-    def test_idle_with_prior_input_is_completed(self):
+    def test_post_response_idle_screen(self):
+        """Real post-response idle screen ('Ask anything...')."""
+        provider = self._make_provider()
+        provider._initialized = True
+        assert provider.get_status(REAL_SCREEN_POST_RESPONSE_IDLE) == TerminalStatus.IDLE
+
+    def test_post_response_with_input_is_completed(self):
+        """Post-response screen after input has been sent = COMPLETED."""
         provider = self._make_provider()
         provider._initialized = True
         provider._input_received = True
-        output = "Some response text\n\n❯ "
-        assert provider.get_status(output) == TerminalStatus.COMPLETED
+        assert provider.get_status(REAL_SCREEN_POST_RESPONSE_IDLE) == TerminalStatus.COMPLETED
+
+    def test_composer_with_typed_text_is_not_idle(self):
+        """Screen with typed text in composer is NOT idle (user is typing)."""
+        provider = self._make_provider()
+        provider._initialized = True
+        # The composer shows "❯ hello world this is my typed text" which does
+        # NOT match idle patterns — it's arbitrary user text, not a placeholder.
+        assert provider.get_status(REAL_SCREEN_COMPOSER_WITH_TEXT) != TerminalStatus.IDLE
 
     def test_processing_spinner(self):
         provider = self._make_provider()
@@ -294,7 +405,7 @@ class TestClineCliStatusDetection:
         """S1: quoted error lines in response don't trigger ERROR when idle prompt visible."""
         provider = self._make_provider()
         provider._initialized = True
-        output = "The error was:\nError: model not found\nThat's the issue.\n\n❯ "
+        output = "The error was:\nError: model not found\nThat's the issue.\n\n❯ Ask anything..."
         assert provider.get_status(output) == TerminalStatus.IDLE
 
     def test_error_suppressed_when_idle_prompt_completed(self):
@@ -302,7 +413,7 @@ class TestClineCliStatusDetection:
         provider = self._make_provider()
         provider._initialized = True
         provider._input_received = True
-        output = "I found this error:\nError: connection refused\nFixed it.\n\n❯ "
+        output = "I found this error:\nError: connection refused\nFixed it.\n\n❯ Ask anything..."
         assert provider.get_status(output) == TerminalStatus.COMPLETED
 
     def test_waiting_user_answer(self):
@@ -311,20 +422,61 @@ class TestClineCliStatusDetection:
         output = "Do you want to proceed? [y/n]"
         assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
 
-    def test_idle_via_ask_anything_placeholder(self):
+    def test_banner_only_not_idle(self):
+        """A banner 'What can I do for you?' without the ❯ glyph is NOT idle.
+
+        The banner text appears above the composer and can co-exist with
+        processing state.  Only the composer line (glyph + placeholder)
+        should trigger idle detection.
+        """
         provider = self._make_provider()
         provider._initialized = True
-        output = "Welcome to Cline\n\nAsk anything..."
-        assert provider.get_status(output) == TerminalStatus.IDLE
+        # Simulate: banner present, but bottom line is a processing indicator.
+        output = "What can I do for you?\n\n⠹ Thinking..."
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_processing_with_idle_composer_visible(self):
+        """Real processing screen: ❯ Ask anything... is visible at bottom BUT
+        '⠦ Thinking...' spinner is present — PROCESSING takes priority.
+
+        Captured live from cline 3.0.55 during actual message processing.
+        """
+        provider = self._make_provider()
+        provider._initialized = True
+        output = (
+            " ❯ write a poem\n"
+            "\n"
+            " ⠦ Thinking... (esc to cancel)\n"
+            "\n" * 30 +
+            "────────────────────────────────────────\n"
+            "❯ Ask anything...\n"
+            "────────────────────────────────────────\n"
+            " ClinePass: DeepSeek V4 Flash (high) ██████ (6,148)\n"
+            " 5046ee32 (f323-cline-idle-timeout)\n"
+            " ⏵⏵ Auto-approve all enabled (Shift+Tab)\n"
+        )
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
 
 
 # ─── Idle prompt detection ────────────────────────────────────────────────────
 
 
 class TestClineCliIdlePrompt:
-    """Tests for _has_idle_prompt helper."""
+    """Tests for _has_idle_prompt helper with real screen patterns."""
+
+    def test_virgin_composer_line(self):
+        """'❯ What can I do for you?' composer line is detected as idle."""
+        lines = ["", "What can I do for you?", "", "────", "❯ What can I do for you?", "────", "ClinePass: ..."]
+        # The tail window includes the composer line.
+        assert ClineCliProvider._has_idle_prompt(lines) is True
+
+    def test_post_response_composer_line(self):
+        """'❯ Ask anything...' composer line is detected as idle."""
+        lines = ["response text", "", "────", "❯ Ask anything...", "────", "ClinePass: ..."]
+        assert ClineCliProvider._has_idle_prompt(lines) is True
 
     def test_bare_prompt(self):
+        """Bare ❯ still works (fallback for older cline versions)."""
         lines = ["some output", "", "❯ "]
         assert ClineCliProvider._has_idle_prompt(lines) is True
 
@@ -338,17 +490,53 @@ class TestClineCliIdlePrompt:
 
     def test_prompt_buried_too_deep(self):
         """Prompt beyond the 8-line tail window is not detected."""
-        lines = ["❯ "] + ["filler line"] * 20
+        lines = ["❯ What can I do for you?"] + ["filler line"] * 20
         assert ClineCliProvider._has_idle_prompt(lines) is False
 
-    def test_ask_anything_placeholder(self):
-        """Cline TUI 'Ask anything...' placeholder is detected as idle."""
+    def test_ask_anything_without_glyph_fallback(self):
+        """'Ask anything...' without glyph still detected (escape-strip edge case)."""
         lines = ["some response", "", "Ask anything..."]
         assert ClineCliProvider._has_idle_prompt(lines) is True
 
-    def test_ask_anything_with_prefix(self):
-        """Placeholder with leading whitespace."""
-        lines = ["output", "  Ask anything or type / for commands"]
+    def test_typed_text_not_idle(self):
+        """'❯ hello world' (user text, not placeholder) is NOT idle."""
+        lines = ["prev response", "────", "❯ hello world this is my typed text", "────", "ClinePass: ..."]
+        assert ClineCliProvider._has_idle_prompt(lines) is False
+
+    def test_status_bar_lines_below_composer(self):
+        """Real screen has status bar lines below composer — still detect idle.
+
+        Real layout (bottom 5 lines):
+          ❯ Ask anything...
+          ──────────...
+          ClinePass: DeepSeek V4 Flash (high) ██████ (6,346)   ...
+          cli-subagents (quirks-merge-train)
+          ⏵⏵ Auto-approve all enabled (Shift+Tab)
+
+        The status/info lines are non-empty and don't match — but the scan
+        should still find the composer in the 8-line tail.
+        """
+        lines = [
+            "response text",
+            "",
+            "────────────────────────────────────────",
+            "❯ Ask anything...",
+            "────────────────────────────────────────",
+            " ClinePass: DeepSeek V4 Flash (high) ██████ (6,346)",
+            " cli-subagents (quirks-merge-train)",
+            " ⏵⏵ Auto-approve all enabled (Shift+Tab)",
+        ]
+        assert ClineCliProvider._has_idle_prompt(lines) is True
+
+    def test_virgin_full_tail(self):
+        """Real virgin screen tail — the bottom-most non-empty lines are status lines,
+        but the composer '❯ What can I do for you?' is within the 8-line window."""
+        lines = REAL_SCREEN_VIRGIN_IDLE.splitlines()
+        assert ClineCliProvider._has_idle_prompt(lines) is True
+
+    def test_post_response_full_tail(self):
+        """Real post-response screen tail."""
+        lines = REAL_SCREEN_POST_RESPONSE_IDLE.splitlines()
         assert ClineCliProvider._has_idle_prompt(lines) is True
 
 
