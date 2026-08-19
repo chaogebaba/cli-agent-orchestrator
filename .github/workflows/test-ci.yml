@@ -13,6 +13,12 @@ on:
       - '**.md'
       - 'docs/**'
   workflow_dispatch:
+    inputs:
+      census:
+        description: 'Run per-test resource census (F259)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -70,7 +76,10 @@ jobs:
       - name: Check attestation cache
         id: cache_check
         # AC3.7: skip lookup on pull_request from forks (no OIDC token available).
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        # F259 D15: skip lookup when census is requested (census must always execute).
+        if: |
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+          inputs.census != true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -175,6 +184,8 @@ jobs:
         if: steps.cache_check.outputs.hit != 'true'
         id: suite
         shell: bash
+        env:
+          CAO_TEST_CENSUS: ${{ inputs.census == true && '1' || '' }}
         run: |
           set -o pipefail
           # -n 4 is safe here: the runner has 16 GB RAM (vs the laptop's 15 GB
@@ -236,6 +247,15 @@ jobs:
             pytest-output.log
           retention-days: 14
 
+      # F259 D15: upload resource census JSON as a separate artifact.
+      - name: Upload resource census
+        if: always() && inputs.census == true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: resource-census
+          path: tmp/orch/resource-census.json
+          retention-days: 14
+
       # Extract suite results into env for the attestation predicate.
       - name: Extract suite results
         if: steps.cache_check.outputs.hit != 'true' && success()
@@ -257,11 +277,13 @@ jobs:
 
       # AC3.5/AC3.6/AC3.7/AC3.9: mint attestation on successful direct run.
       # Minting is the LAST step — nothing else runs while id-token is hot.
+      # F259 D15: census runs do NOT mint (timing-poisoned wall_time_seconds).
       - name: Mint suite attestation
         # AC3.7: only mint when OIDC token is available (not on fork PRs).
         if: |
           steps.cache_check.outputs.hit != 'true' &&
           success() &&
+          inputs.census != true &&
           (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         uses: actions/attest@11bbd243972067817e9ed160cb123cab3601f436 # v2
         with:

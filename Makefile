@@ -18,7 +18,7 @@ check-ext-apps-skills:
 	uv run python scripts/vendor_ext_apps_skills.py --check
 
 
-.PHONY: test-smoke test-full test-quick test-ci test-live test-hygiene test-tiers
+.PHONY: test-smoke test-full test-quick test-ci test-live test-hygiene test-census test-tiers
 
 # --- F273: /data preflight — fail-fast when /data is not mounted ---
 # Every fenced test target exports TMPDIR=/data/cao-scratch/tmp so pytest, xdist
@@ -82,6 +82,12 @@ test-live:
 test-hygiene:
 	$(F273_PREFLIGHT)
 	CAO_TEST_TIER_BUDGET=enforce "$(PYTEST_WRAPPER)" -n 0 -m "" $(ARGS)
+
+# F259: per-test resource census. Never cached (D12 forces a MISS); routed
+# through the fence so profiling numbers are taken under the same CPUWeight /
+# MemoryHigh / nice envelope as every other suite run.
+test-census:
+	CAO_TEST_CENSUS=1 "$(PYTEST_WRAPPER)" -m "" $(ARGS)
 
 # F254 D17: tier census — collect-only, writes test/tier-census.json.
 test-tiers:

@@ -114,6 +114,7 @@ pytest_plugins = (
     "test.plugins.quarantine",
     "test.plugins.quarantine_expiry",
     "test.plugins.env_capabilities",
+    "test.plugins.resource_census",
 )
 
 
