@@ -40,7 +40,6 @@ from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
-from cli_agent_orchestrator.clients.database import update_terminal_resolved_model
 from cli_agent_orchestrator.clients.database import (
     create_terminal_with_warm_intent,
     delete_terminal_and_warm_intent,
@@ -62,6 +61,7 @@ from cli_agent_orchestrator.clients.database import (
     update_provider_session_snapshot,
     update_terminal_group,
     update_terminal_metadata,
+    update_terminal_resolved_model,
     update_terminal_shell_command,
     update_terminal_tmux_window,
 )
@@ -376,6 +376,43 @@ def _commit_provider_runtime_identity(
         raise RuntimeError("terminal_identity_persist_failed")
 
 
+def _wait_for_session_artifact_sync(
+    provider_instance,
+    session_uuid: str,
+    cwd: str,
+    *,
+    deadline_s: float = 5.0,
+    poll_interval: float = 0.4,
+    liveness_check: "Callable[[], bool] | None" = None,
+) -> None:
+    """F311: Single shared bounded retry for artifact validation.
+
+    Used by BOTH the synchronous create path (directly) and the deferred-init
+    path (offloaded via _tracked_blocking).  Retries on RetryableArtifactValidation
+    until the deadline; re-raises the last if the bound expires (genuine inert).
+
+    If liveness_check is provided and returns False, raises _DeferredInitFailure
+    (deferred-init path uses this for worker-vanished detection).
+    """
+    import time as _time
+
+    origin = _time.monotonic()
+    deadline = origin + deadline_s
+    while True:
+        try:
+            provider_instance.validate_session_artifact(session_uuid, cwd)
+            return
+        except RetryableArtifactValidation:
+            if _time.monotonic() >= deadline:
+                raise
+            if liveness_check is not None and not liveness_check():
+                raise _DeferredInitFailure("worker_vanished")
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                raise
+            _time.sleep(min(poll_interval, remaining))
+
+
 def _persist_provider_runtime_identity(
     provider_instance,
     terminal_id: str,
@@ -390,7 +427,7 @@ def _persist_provider_runtime_identity(
     )
     if prepared is None:
         return
-    provider_instance.validate_session_artifact(prepared.session_uuid, prepared.cwd)
+    _wait_for_session_artifact_sync(provider_instance, prepared.session_uuid, prepared.cwd)
     _commit_provider_runtime_identity(terminal_id, prepared)
 
 
@@ -454,18 +491,14 @@ def rearm_fifo_readers_at_startup() -> dict:
                 incarnation_id=None,
             )
         except Exception:
-            logger.warning(
-                "startup_rearm_fifo_failed terminal=%s", terminal_id, exc_info=True
-            )
+            logger.warning("startup_rearm_fifo_failed terminal=%s", terminal_id, exc_info=True)
             continue
 
         # Re-arm pipe-pane so tmux streams output into the FIFO again.
         try:
             backend.pipe_pane(session_name, window_name, str(fifo_path))
         except Exception:
-            logger.warning(
-                "startup_rearm_pipe_pane_failed terminal=%s", terminal_id, exc_info=True
-            )
+            logger.warning("startup_rearm_pipe_pane_failed terminal=%s", terminal_id, exc_info=True)
             continue
 
         rearmed += 1
@@ -988,9 +1021,7 @@ async def create_terminal(
         # paths (e.g. ".") are resolved via os.getcwd() at this point.
         expanded = os.path.realpath(os.path.abspath(os.path.expanduser(working_directory)))
         try:
-            working_directory = resolve_and_validate_path(
-                expanded, description="Working directory"
-            )
+            working_directory = resolve_and_validate_path(expanded, description="Working directory")
         except ValueError as exc:
             raise ValueError(f"invalid_working_directory: {exc}") from exc
     else:
@@ -2005,6 +2036,28 @@ async def create_terminal(
                 "Create rollback deferred Grok cleanup for %s; retaining terminal metadata for retry",
                 terminal_id,
             )
+        # F314: force-remove the provisioned GROK_HOME on create failure.
+        # This terminal never ran successfully, so no legitimate grok child
+        # should be using it.  Only remove the exact home provisioned this call.
+        if terminal_id is not None:
+            try:
+                from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
+
+                _rollback_provider = provider_manager.get_provider(terminal_id)
+                if isinstance(_rollback_provider, GrokCliProvider):
+                    _rollback_home = _rollback_provider._home_path()
+                    if _rollback_home.exists() and _rollback_provider._is_managed_home(
+                        _rollback_home
+                    ):
+                        import shutil as _shutil
+
+                        _shutil.rmtree(_rollback_home, ignore_errors=True)
+                        logger.info(
+                            "F314: removed stranded GROK_HOME on create rollback: %s",
+                            _rollback_home,
+                        )
+            except Exception as _f314_exc:
+                logger.debug("F314: GROK_HOME rollback cleanup failed: %s", _f314_exc)
         if resume_uuid and uuid_lease_token is not None and owned_uuid_lease:
             from cli_agent_orchestrator.services.provider_session_lease import (
                 release_provider_session_lease,
@@ -2338,39 +2391,30 @@ async def _validate_deferred_artifact(
     generation: str,
     deadline_s: float,
 ) -> None:
-    origin = time.monotonic()
-    deadline = origin + deadline_s
-    while True:
-        try:
-            _result, _grant = await _tracked_blocking(
-                terminal_id,
-                generation,
-                "abandonable",
-                "validate",
-                provider_instance.validate_session_artifact,
-                prepared.session_uuid,
-                prepared.cwd,
-                deadline=deadline,
-            )
-            return
-        except RetryableArtifactValidation as exc:
-            if time.monotonic() >= deadline:
-                raise exc
-            live, _ = await _tracked_blocking(
-                terminal_id,
-                generation,
-                "abandonable",
-                "metadata_read",
-                _deferred_worker_live,
-                terminal_id,
-                deadline=deadline,
-            )
-            if not live:
-                raise _DeferredInitFailure("worker_vanished")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise exc
-            await asyncio.sleep(min(POLL_INTERVAL, remaining))
+    """Async artifact wait for deferred-init path.
+
+    F311: delegates to the shared _wait_for_session_artifact_sync helper
+    (offloaded to a thread via _tracked_blocking) with a liveness check
+    so worker-vanished is detected between retries.
+    """
+
+    def _liveness() -> bool:
+        return _deferred_worker_live(terminal_id)
+
+    await _tracked_blocking(
+        terminal_id,
+        generation,
+        "abandonable",
+        "validate",
+        _wait_for_session_artifact_sync,
+        provider_instance,
+        prepared.session_uuid,
+        prepared.cwd,
+        deadline_s=deadline_s,
+        poll_interval=POLL_INTERVAL,
+        liveness_check=_liveness,
+        deadline=time.monotonic() + deadline_s,
+    )
 
 
 def _delete_terminal_core(
@@ -5130,12 +5174,14 @@ def delete_terminal(
     session_name = root["tmux_session"]
 
     # D16: Open teardown intent BEFORE any tmux call. Committed immediately.
+    from cli_agent_orchestrator.clients.database import SessionLocal
+    from cli_agent_orchestrator.services.config_service import ConfigService
     from cli_agent_orchestrator.services.teardown_intent_service import (
-        open_intent as _f218_open_intent,
         close_intent as _f218_close_intent,
     )
-    from cli_agent_orchestrator.services.config_service import ConfigService
-    from cli_agent_orchestrator.clients.database import SessionLocal
+    from cli_agent_orchestrator.services.teardown_intent_service import (
+        open_intent as _f218_open_intent,
+    )
 
     ttl_s = float(ConfigService.get("teardown.intent_ttl_s", 300.0))
     _f218_intent_id: str | None = None
