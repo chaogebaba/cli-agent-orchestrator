@@ -14,6 +14,7 @@ from cli_agent_orchestrator.models.terminal import ForkContext
 from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+from cli_agent_orchestrator.providers.cline_cli import ClineCliProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.cursor_cli import CursorCliProvider
@@ -38,6 +39,7 @@ PROVIDER_CLASSES = {
     ProviderType.HERMES.value: HermesProvider,
     ProviderType.CURSOR_CLI.value: CursorCliProvider,
     ProviderType.ANTIGRAVITY_CLI.value: AntigravityCliProvider,
+    ProviderType.CLINE_CLI.value: ClineCliProvider,
     ProviderType.MOCK_CLI.value: MockCliProvider,
 }
 
@@ -216,6 +218,16 @@ class ProviderManager:
                     allowed_tools,
                     model=model,
                     skill_prompt=skill_prompt,
+                )
+            elif provider_type == ProviderType.CLINE_CLI.value:
+                provider = ClineCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                    model=model,
                 )
             elif provider_type == ProviderType.GROK_CLI.value:
                 provider = GrokCliProvider(

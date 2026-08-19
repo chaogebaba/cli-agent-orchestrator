@@ -1,0 +1,70 @@
+# providers.toml.default — template for ~/.aws/cli-agent-orchestrator/providers.toml
+# install.sh and `cao redeploy` copy this ONLY if the target does not exist; an
+# existing providers.toml is never overwritten by default (your hand edits win).
+# Use `cao redeploy --force-providers` to reset the live file from this template
+# (it backs the old one up first).
+#
+# THIS FILE IS THE VERSIONED KNOWN-GOOD. When you tune the live file and the
+# tuning is meant to last, mirror it back here — a stale template turns any
+# force-reset into a silent downgrade.
+#
+# Precedence at runtime: providers.toml [<provider>.profiles.<name>] >
+# providers.toml [<provider>] > profile field > CLI built-in default.
+# Override is per-key and decided by KEY PRESENCE:
+#   key with a non-empty value  -> forces that value everywhere
+#   key set to ""               -> suppresses the flag entirely (CLI's own default),
+#                                  even if a profile pins a model
+#   key absent                  -> falls back to the profile field, then CLI default
+#
+# A [<provider>.profiles.<name>] stanza naming a profile that does not exist is
+# SILENTLY IGNORED (settings_service.get_provider_profile_defaults returns {}).
+# There is no warning — check spelling against profiles/ when an override
+# appears to have no effect.
+
+[codex]
+model = "gpt-5.6-sol"
+reasoning_effort = "high"
+
+[grok_cli]
+model = "grok-4.5"
+
+# F295 Half 2: Relay preflight probe on creation (D1-D6).
+# Set to false to disable the preflight entirely (e.g. offline work).
+# relay_preflight = true
+# relay_preflight_timeout_s = 20
+
+[grok_cli.profiles.grok_oracle]
+reasoning_effort = "medium"
+
+[grok_cli.profiles.grok_dev]
+reasoning_effort = "high"
+
+[grok_cli.profiles.grok_reviewer]
+reasoning_effort = "high"
+
+[codex.profiles.codex_empirical_reviewer]
+model = "gpt-5.6-sol"
+reasoning_effort = "high"
+
+# [claude_code]
+# model = ""            # empty clears; absent falls back to profile/CLI
+# reasoning_effort = ""
+
+[claude_code.profiles.claude_design_reviewer]
+reasoning_effort = "high"
+
+[claude_code.profiles.claude_blueprint_maker]
+reasoning_effort = "high"
+
+[claude_code.profiles.claude_blueprint_maker_tester]
+reasoning_effort = "medium"
+
+# Delivery confirmation polling timeout in seconds (default: 10.0).
+# [inbox]
+# confirmation_timeout_seconds = 10.0
+
+[kiro_cli]
+model = "auto"
+
+[cline_cli]
+model = "deepseek/deepseek-chat"
