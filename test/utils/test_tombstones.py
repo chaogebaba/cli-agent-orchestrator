@@ -28,20 +28,29 @@ FORK_SRC = Path(__file__).resolve().parents[2] / "src"
 
 # tombstone-report lives in the ROOT repo (beside scripts/tcache).
 # Resolve via git common-dir (handles worktrees) or fall back to env.
-def _find_root_repo_scripts() -> Path:
-    """Locate root-repo scripts/ from the fork worktree."""
+_SCRIPT_NAME = "tombstone-report"
+
+
+def _find_root_repo_scripts() -> "Path | None":
+    """Locate root-repo scripts/ from the fork worktree.
+
+    Returns the directory Path if an executable tombstone-report is found,
+    or None if no candidate resolves (e.g. standalone fork CI checkout).
+    """
     # Try env override first (test isolation)
     env_path = os.environ.get("CAO_TOMBSTONE_REPORT_PATH")
     if env_path:
-        return Path(env_path).parent
+        p = Path(env_path)
+        if p.exists():
+            return p.parent
+        return None
     # Walk up from this file's fork root to find the root repo
     fork_root = Path(__file__).resolve().parents[2]
     # Normal checkout: fork is at <root>/cli-agent-orchestrator/
     root_candidate = fork_root.parent
-    if (root_candidate / "scripts" / "tombstone-report").exists():
+    if (root_candidate / "scripts" / _SCRIPT_NAME).exists():
         return root_candidate / "scripts"
     # Worktree: use git common-dir
-    import subprocess
     try:
         common = subprocess.run(
             ["git", "rev-parse", "--git-common-dir"],
@@ -51,17 +60,23 @@ def _find_root_repo_scripts() -> Path:
             common_path = Path(common).resolve()
             # common-dir is .git inside the fork; root repo is two levels up
             root_from_git = common_path.parent.parent
-            if (root_from_git / "scripts" / "tombstone-report").exists():
+            if (root_from_git / "scripts" / _SCRIPT_NAME).exists():
                 return root_from_git / "scripts"
     except (OSError, subprocess.SubprocessError):
         pass
-    # Fallback: known absolute path
-    fallback = Path("/home/chao/VScode_projects/cli-subagents/scripts")
-    if (fallback / "tombstone-report").exists():
-        return fallback
-    return fork_root / "scripts"  # last resort
+    # No candidate found — signal to caller
+    return None
+
 
 ROOT_SCRIPTS_DIR = _find_root_repo_scripts()
+
+if ROOT_SCRIPTS_DIR is None:
+    pytest.skip(
+        "tombstone-report script not found — this module requires the root repo "
+        "(cli-subagents) scripts/ directory. Set CAO_TOMBSTONE_REPORT_PATH to the "
+        "script path to override.",
+        allow_module_level=True,
+    )
 
 
 @pytest.fixture
@@ -729,3 +744,23 @@ class TestKillSwitch:
         # Should produce NO records at all (not even exec)
         records = _read_ledger(tomb_dir)
         assert len(records) == 0
+
+
+
+# ── F305: resolver returns None when script is absent ──────────────────
+
+
+class TestResolverSkipPath:
+    """Guard against silent-skip regression: verify the resolver returns None
+    when no candidate directory actually contains the tombstone-report script."""
+
+    def test_resolver_returns_none_with_nonexistent_env_override(self, tmp_path, monkeypatch):
+        """CAO_TOMBSTONE_REPORT_PATH pointing to a missing file -> None."""
+        monkeypatch.setenv(
+            "CAO_TOMBSTONE_REPORT_PATH", str(tmp_path / "nonexistent" / "tombstone-report")
+        )
+        import test.utils.test_tombstones as mod
+        result = mod._find_root_repo_scripts()
+        assert result is None, (
+            f"Expected None when CAO_TOMBSTONE_REPORT_PATH points to a missing file, got {result}"
+        )
