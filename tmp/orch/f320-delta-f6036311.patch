@@ -1,0 +1,105 @@
+diff --git a/providers.toml.default b/providers.toml.default
+index 442863c9..e4f90b3c 100644
+--- a/providers.toml.default
++++ b/providers.toml.default
+@@ -1,6 +1,7 @@
+ # providers.toml.default — template for ~/.aws/cli-agent-orchestrator/providers.toml
+-# install.sh and `cao redeploy` copy this ONLY if the target does not exist; an
+-# existing providers.toml is never overwritten by default (your hand edits win).
++# `cao config reconcile` (called by `cao redeploy`) seeds this ONLY if the
++# target does not exist; an existing providers.toml is never overwritten by
++# default (your hand edits win).
+ # Use `cao redeploy --force-providers` to reset the live file from this template
+ # (it backs the old one up first).
+ #
+diff --git a/src/cli_agent_orchestrator/providers/cline_cli.py b/src/cli_agent_orchestrator/providers/cline_cli.py
+index b0a05121..a351f7f8 100644
+--- a/src/cli_agent_orchestrator/providers/cline_cli.py
++++ b/src/cli_agent_orchestrator/providers/cline_cli.py
+@@ -270,13 +270,16 @@ class ClineCliProvider(BaseProvider):
+ 
+         lines = clean_output.splitlines()
+         tail = "\n".join(lines[-20:])
++        idle_detected = self._has_idle_prompt(lines)
+ 
+         # Check for waiting/permission prompts.
+         if re.search(WAITING_USER_ANSWER_PATTERN, tail, re.IGNORECASE):
+             return TerminalStatus.WAITING_USER_ANSWER
+ 
+-        # Check for errors.
+-        if re.search(ERROR_PATTERN, tail, re.MULTILINE | re.IGNORECASE):
++        # Check for errors — but NOT when the idle prompt is also visible
++        # (the error text is likely a quoted line in the response, not a
++        # real terminal error). Priority-inversion guard (S1).
++        if not idle_detected and re.search(ERROR_PATTERN, tail, re.MULTILINE | re.IGNORECASE):
+             return TerminalStatus.ERROR
+ 
+         # Check for active processing.
+@@ -284,7 +287,7 @@ class ClineCliProvider(BaseProvider):
+             return TerminalStatus.PROCESSING
+ 
+         # Check for idle prompt at end.
+-        if self._has_idle_prompt(lines):
++        if idle_detected:
+             if self._input_received:
+                 return TerminalStatus.COMPLETED
+             return TerminalStatus.IDLE
+diff --git a/src/cli_agent_orchestrator/services/terminal_service.py b/src/cli_agent_orchestrator/services/terminal_service.py
+index bd037d8e..88b3f565 100644
+--- a/src/cli_agent_orchestrator/services/terminal_service.py
++++ b/src/cli_agent_orchestrator/services/terminal_service.py
+@@ -790,6 +790,7 @@ SOFT_ENFORCEMENT_PROVIDERS = {
+     ProviderType.KIMI_CLI.value,
+     ProviderType.CODEX.value,
+     ProviderType.ANTIGRAVITY_CLI.value,
++    ProviderType.CLINE_CLI.value,
+ }
+ 
+ MAX_PEEK_TERMINAL_LINES = 200
+diff --git a/test/providers/test_cline_cli_unit.py b/test/providers/test_cline_cli_unit.py
+index 750adfc5..a537d90f 100644
+--- a/test/providers/test_cline_cli_unit.py
++++ b/test/providers/test_cline_cli_unit.py
+@@ -290,6 +290,21 @@ class TestClineCliStatusDetection:
+         output = "Something happened\nError: model not found\n"
+         assert provider.get_status(output) == TerminalStatus.ERROR
+ 
++    def test_error_suppressed_when_idle_prompt_present(self):
++        """S1: quoted error lines in response don't trigger ERROR when idle prompt visible."""
++        provider = self._make_provider()
++        provider._initialized = True
++        output = "The error was:\nError: model not found\nThat's the issue.\n\n❯ "
++        assert provider.get_status(output) == TerminalStatus.IDLE
++
++    def test_error_suppressed_when_idle_prompt_completed(self):
++        """S1: quoted error lines after input don't block COMPLETED verdict."""
++        provider = self._make_provider()
++        provider._initialized = True
++        provider._input_received = True
++        output = "I found this error:\nError: connection refused\nFixed it.\n\n❯ "
++        assert provider.get_status(output) == TerminalStatus.COMPLETED
++
+     def test_waiting_user_answer(self):
+         provider = self._make_provider()
+         provider._initialized = True
+@@ -395,10 +410,18 @@ class TestClineCliRegistration:
+             "test-session",
+             "win-0",
+             agent_profile="developer",
+-            model="deepseek/deepseek-chat",
++            model="deepseek/deepseek-v4-flash",
+         )
+         assert isinstance(provider, ClineCliProvider)
+-        assert provider._model == "deepseek/deepseek-chat"
++        assert provider._model == "deepseek/deepseek-v4-flash"
++
++    def test_cline_in_soft_enforcement_providers(self):
++        """S2: cline_cli is in SOFT_ENFORCEMENT_PROVIDERS (no native tool blocking)."""
++        from cli_agent_orchestrator.services.terminal_service import (
++            SOFT_ENFORCEMENT_PROVIDERS,
++        )
++
++        assert "cline_cli" in SOFT_ENFORCEMENT_PROVIDERS
+ 
+ 
+ # ─── Miscellaneous properties ─────────────────────────────────────────────────
