@@ -1,0 +1,25 @@
+--- a/providers.toml.default
++++ b/providers.toml.default
+@@ providers.toml.default [grok_cli] section (add after existing keys) @@
++# F295 Half 2: Relay preflight probe on creation (D1-D6).
++# Set to false to disable the preflight entirely (e.g. offline work).
++# relay_preflight = true
++# relay_preflight_timeout_s = 20
+
+--- a/USAGE.md
++++ b/USAGE.md
+@@ USAGE.md grok section (add one paragraph) @@
++### Relay preflight & wedge watchdog (F295 Half 2)
++
++When a grok worker is created and the resolved model routes through a relay
++(`base_url` in `~/.grok/config.toml`), CAO probes the relay first. If the
++relay is unreachable, creation fails with a structured error naming the
++endpoint and failure kind — no terminal row or tmux window is left behind.
++Knobs: `[grok_cli] relay_preflight` (bool, default true),
++`relay_preflight_timeout_s` (int, default 20) in `providers.toml`.
++
++A live grok worker in PROCESSING for longer than `grok_wedge_age_s` (default
++900, clamped 300-7200) triggers a one-shot inbox notice naming `peek_terminal`
++and `delete_terminal` as the remedy. No automatic action is taken. Knobs:
++`supervisor.watchdog.grok_wedge` (bool), `supervisor.watchdog.grok_wedge_age_s`
++(int) in `settings.json`.
