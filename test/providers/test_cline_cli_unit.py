@@ -216,6 +216,37 @@ class TestClineCliThinking:
         assert "--thinking" in parts
         assert parts[parts.index("--thinking") + 1] == "xhigh"
 
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_profile_defaults")
+    @patch("cli_agent_orchestrator.providers.cline_cli.resolve_provider_string_option")
+    @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
+    def test_explicit_empty_suppresses_thinking(self, mock_load, mock_resolve, mock_prof, mock_defaults):
+        """Explicit empty string in providers.toml suppresses the --thinking flag."""
+        mock_load.side_effect = FileNotFoundError("no profile")
+        mock_defaults.return_value = {"thinking": ""}
+        mock_prof.return_value = {}
+        mock_resolve.return_value = ""  # explicit empty
+
+        provider = ClineCliProvider("t1234567", "sess", "win0")
+        assert provider._resolve_thinking() == ""
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.resolve_provider_string_option")
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_profile_defaults")
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
+    @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
+    def test_empty_thinking_omits_flag_from_command(self, mock_load, mock_defaults, mock_prof, mock_resolve):
+        """Empty thinking value results in no --thinking flag in the command."""
+        mock_load.side_effect = FileNotFoundError("no profile")
+        mock_defaults.return_value = {"api_provider": "cline-pass"}
+        mock_prof.return_value = {}
+        # First call for model (returns None), second call for thinking (returns "")
+        mock_resolve.side_effect = [None, ""]
+
+        provider = ClineCliProvider("t1234567", "sess", "win0")
+        parts = shlex.split(provider._build_command())
+
+        assert "--thinking" not in parts
+
 
 # ─── Status detection ─────────────────────────────────────────────────────────
 

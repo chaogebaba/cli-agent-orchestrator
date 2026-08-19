@@ -168,6 +168,9 @@ class ClineCliProvider(BaseProvider):
         Resolution: [cline_cli.profiles.<name>] thinking > [cline_cli] thinking >
         profile.reasoningEffort field > default 'high'.
         Valid values: none|low|medium|high|xhigh (per cline --help).
+
+        An explicit empty string ("") in providers.toml suppresses the flag
+        entirely (falls back to Cline's own provider default).
         """
         profile = None
         try:
@@ -185,9 +188,10 @@ class ClineCliProvider(BaseProvider):
             "thinking",
             "reasoningEffort",
         )
-        if isinstance(resolved, str) and resolved:
+        # Explicit empty string = suppress the flag (return "").
+        if isinstance(resolved, str):
             return resolved
-        # Default to high reasoning effort for coding tasks.
+        # No key present anywhere → default to high reasoning effort.
         return "high"
 
     def _build_command(self) -> str:
