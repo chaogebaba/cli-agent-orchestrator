@@ -1,10 +1,20 @@
-"""Unit tests for Cline CLI provider."""
+"""Unit tests for Cline CLI provider (plain-mode one-shot invocations).
+
+Tests cover:
+  - Command construction (base args, model/provider/thinking/system-prompt resolution)
+  - Dispatcher script generation (escaping torture cases)
+  - Status detection via pane_current_command baseline
+  - Session-id correlation via history snapshot
+  - Message file handling
+  - Response extraction from scrollback
+"""
 
 from __future__ import annotations
 
+import json
 import shlex
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
 
@@ -12,144 +22,99 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.cline_cli import (
     CLINE_BINARY,
-    ClineCliProvider,
+    DISPATCHER_IDLE_CMD,
     ERROR_PATTERN,
-    IDLE_COMPOSER_PATTERN,
-    IDLE_PLACEHOLDER_PATTERN,
-    IDLE_PROMPT_PATTERN,
-    PROCESSING_PATTERN,
-    WAITING_USER_ANSWER_PATTERN,
+    SCRATCH_DIR,
+    ClineCliProvider,
+    _build_dispatcher_script,
 )
 
 
-# ─── Real screen captures (from live cline 3.0.55, ClinePass, 2026-08-19) ───
-
-# Virgin idle: first launch, no exchange yet.
-# The "What can I do for you?" text appears both as a banner AND on the
-# composer line (with ❯ glyph).
-REAL_SCREEN_VIRGIN_IDLE = """\
+# ─── Dispatcher script generation ────────────────────────────────────────────
 
 
+class TestDispatcherScript:
+    """Tests for _build_dispatcher_script."""
+
+    def test_basic_script_structure(self):
+        """Script has the expected loop structure."""
+        script = _build_dispatcher_script(
+            "/home/user/.bun/bin/cline",
+            "/data/cao-scratch/cline-msgs",
+            "t1234567",
+            "/home/user/.bun/bin/cline --auto-approve true -P cline-pass",
+        )
+        assert "while true" in script
+        assert "cat >" in script
+        assert "_cao_msg_n=" in script
+        assert "t1234567" in script
+        assert "/data/cao-scratch/cline-msgs" in script
+        assert '--auto-approve true' in script
+
+    def test_script_uses_cat_for_idle(self):
+        """Script uses cat as the blocking read (idle sentinel)."""
+        script = _build_dispatcher_script(
+            CLINE_BINARY, "/tmp/msgs", "tABCDEFG", f"{CLINE_BINARY} --auto-approve true"
+        )
+        assert "cat >" in script
+
+    def test_script_invokes_cline_with_cat_substitution(self):
+        """Script invokes cline with $(cat <file>) for safe escaping."""
+        script = _build_dispatcher_script(
+            CLINE_BINARY, "/data/msgs", "t1234567",
+            f"{CLINE_BINARY} --auto-approve true -P cline-pass --thinking high"
+        )
+        assert '"$(cat "$_cao_msgfile")"' in script
+
+    def test_script_skips_empty_files(self):
+        """Script skips empty message files ([ -s ] check)."""
+        script = _build_dispatcher_script(
+            CLINE_BINARY, "/data/msgs", "t1234567", f"{CLINE_BINARY} --auto-approve true"
+        )
+        assert '[ -s "$_cao_msgfile" ] || continue' in script
+
+    def test_script_increments_message_counter(self):
+        """Script increments _cao_msg_n for unique filenames."""
+        script = _build_dispatcher_script(
+            CLINE_BINARY, "/data/msgs", "t1234567", f"{CLINE_BINARY} --auto-approve true"
+        )
+        assert "_cao_msg_n=$((_cao_msg_n + 1))" in script
 
 
- What can I do for you?
+# ─── Command construction (base args) ────────────────────────────────────────
 
 
-
-
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-❯ What can I do for you?
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
- ClinePass: DeepSeek V4 Flash (high) ██████ (0)                                                                                                                                      ○ Plan ● Act (Tab)
- cli-subagents (quirks-merge-train)
- ⏵⏵ Auto-approve all enabled (Shift+Tab)
-"""
-
-# Post-response idle: after a successful exchange, composer shows "Ask anything...".
-REAL_SCREEN_POST_RESPONSE_IDLE = """\
- ❯ reply with exactly: OK
-
- ▶ Thinking: The user just wants me to reply with exactly "OK". This is a simple request without coding context, so I should answer directly.
-
- * OK
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-❯ Ask anything...
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
- ClinePass: DeepSeek V4 Flash (high) ██████ (6,346)                                                                                                                                  ○ Plan ● Act (Tab)
- cli-subagents (quirks-merge-train)
- ⏵⏵ Auto-approve all enabled (Shift+Tab)
-"""
-
-# Composer with typed text: user has started typing (not idle).
-REAL_SCREEN_COMPOSER_WITH_TEXT = """\
- ❯ reply with exactly: OK
-
- ▶ Thinking: The user just wants me to reply with exactly "OK".
-
- * OK
-
-
-
-
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-❯ hello world this is my typed text
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
- ClinePass: DeepSeek V4 Flash (high) ██████ (6,346)                                                                                                                                  ○ Plan ● Act (Tab)
- cli-subagents (quirks-merge-train)
- ⏵⏵ Auto-approve all enabled (Shift+Tab)
-"""
-
-
-# ─── Command construction ────────────────────────────────────────────────────
-
-
-class TestClineCliProviderCommand:
-    """Tests for launch command construction."""
+class TestClineCliBaseArgs:
+    """Tests for _build_base_args (command construction)."""
 
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
-    def test_build_command_default(self, mock_load, mock_defaults):
-        """Default command includes --tui, --auto-approve true, -P cline-pass, --thinking high."""
+    def test_default_base_args(self, mock_load, mock_defaults):
+        """Default: --auto-approve true, -P cline-pass, --thinking high."""
         mock_load.side_effect = FileNotFoundError("no profile")
         mock_defaults.return_value = {"api_provider": "cline-pass"}
 
         provider = ClineCliProvider("t1234567", "sess", "win0")
-        cmd = provider._build_command()
-        parts = shlex.split(cmd)
+        args = provider._build_base_args()
+        parts = shlex.split(args)
 
         assert parts[0] == CLINE_BINARY
-        assert "--tui" in parts
         assert "--auto-approve" in parts
         assert "true" in parts
         assert "-P" in parts
         assert parts[parts.index("-P") + 1] == "cline-pass"
         assert "--thinking" in parts
         assert parts[parts.index("--thinking") + 1] == "high"
-        # No model flag without profile or providers.toml model key
+        # No --tui (plain mode)
+        assert "--tui" not in parts
+        assert "-i" not in parts
+        # No -m without model override
         assert "-m" not in parts
         assert "-s" not in parts
 
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
-    def test_build_command_with_model_override(self, mock_load, mock_defaults):
+    def test_base_args_with_model_override(self, mock_load, mock_defaults):
         """Explicit model kwarg is forwarded as -m."""
         mock_load.side_effect = FileNotFoundError("no profile")
         mock_defaults.return_value = {"api_provider": "cline-pass"}
@@ -157,17 +122,15 @@ class TestClineCliProviderCommand:
         provider = ClineCliProvider(
             "t1234567", "sess", "win0", model="deepseek/deepseek-chat"
         )
-        cmd = provider._build_command()
-        parts = shlex.split(cmd)
+        args = provider._build_base_args()
+        parts = shlex.split(args)
 
         assert "-m" in parts
         assert parts[parts.index("-m") + 1] == "deepseek/deepseek-chat"
-        assert "-P" in parts
-        assert parts[parts.index("-P") + 1] == "cline-pass"
 
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
-    def test_build_command_with_system_prompt(self, mock_load, mock_defaults):
+    def test_base_args_with_system_prompt(self, mock_load, mock_defaults):
         """Profile system prompt is forwarded as -s."""
         mock_defaults.return_value = {"api_provider": "cline-pass"}
         profile = MagicMock()
@@ -177,15 +140,15 @@ class TestClineCliProviderCommand:
         mock_load.return_value = profile
 
         provider = ClineCliProvider("t1234567", "sess", "win0", agent_profile="test-agent")
-        cmd = provider._build_command()
-        parts = shlex.split(cmd)
+        args = provider._build_base_args()
+        parts = shlex.split(args)
 
         assert "-s" in parts
         assert parts[parts.index("-s") + 1] == "You are a test agent."
 
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
-    def test_build_command_skill_prompt_appended(self, mock_load, mock_defaults):
+    def test_base_args_skill_prompt_appended(self, mock_load, mock_defaults):
         """Skill prompt is appended to system prompt."""
         mock_defaults.return_value = {"api_provider": "cline-pass"}
         profile = MagicMock()
@@ -199,13 +162,26 @@ class TestClineCliProviderCommand:
             agent_profile="agent",
             skill_prompt="Extra skill instructions.",
         )
-        cmd = provider._build_command()
-        parts = shlex.split(cmd)
+        args = provider._build_base_args()
+        parts = shlex.split(args)
 
         assert "-s" in parts
         system_arg = parts[parts.index("-s") + 1]
         assert "Base prompt." in system_arg
         assert "Extra skill instructions." in system_arg
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
+    @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
+    def test_no_tui_flag_in_base_args(self, mock_load, mock_defaults):
+        """Plain mode: no --tui or -i flag."""
+        mock_load.side_effect = FileNotFoundError("no profile")
+        mock_defaults.return_value = {"api_provider": "cline-pass"}
+
+        provider = ClineCliProvider("t1234567", "sess", "win0")
+        args = provider._build_base_args()
+
+        assert "--tui" not in args
+        assert " -i " not in args
 
 
 # ─── Model resolution ────────────────────────────────────────────────────────
@@ -252,14 +228,14 @@ class TestClineCliModelResolution:
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
     def test_resolved_model_property(self, mock_load, mock_defaults):
-        """resolved_model is set after _build_command."""
+        """resolved_model is set after _build_base_args."""
         mock_load.side_effect = FileNotFoundError("no profile")
         mock_defaults.return_value = {"api_provider": "cline-pass"}
 
         provider = ClineCliProvider(
             "t1234567", "sess", "win0", model="deepseek/deepseek-v4-flash"
         )
-        provider._build_command()
+        provider._build_base_args()
 
         assert provider.resolved_model == "deepseek/deepseek-v4-flash"
 
@@ -279,7 +255,7 @@ class TestClineCliThinking:
         mock_load.side_effect = FileNotFoundError("no profile")
         mock_defaults.return_value = {}
         mock_prof.return_value = {}
-        mock_resolve.return_value = None  # no toml override
+        mock_resolve.return_value = None
 
         provider = ClineCliProvider("t1234567", "sess", "win0")
         result = provider._resolve_thinking()
@@ -302,13 +278,13 @@ class TestClineCliThinking:
 
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
-    def test_thinking_in_command(self, mock_load, mock_defaults):
-        """--thinking flag appears in the built command."""
+    def test_thinking_in_base_args(self, mock_load, mock_defaults):
+        """--thinking flag appears in the built base args."""
         mock_load.side_effect = FileNotFoundError("no profile")
         mock_defaults.return_value = {"api_provider": "cline-pass", "thinking": "xhigh"}
 
         provider = ClineCliProvider("t1234567", "sess", "win0")
-        parts = shlex.split(provider._build_command())
+        parts = shlex.split(provider._build_base_args())
 
         assert "--thinking" in parts
         assert parts[parts.index("--thinking") + 1] == "xhigh"
@@ -322,7 +298,7 @@ class TestClineCliThinking:
         mock_load.side_effect = FileNotFoundError("no profile")
         mock_defaults.return_value = {"thinking": ""}
         mock_prof.return_value = {}
-        mock_resolve.return_value = ""  # explicit empty
+        mock_resolve.return_value = ""
 
         provider = ClineCliProvider("t1234567", "sess", "win0")
         assert provider._resolve_thinking() == ""
@@ -331,8 +307,8 @@ class TestClineCliThinking:
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_profile_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
-    def test_empty_thinking_omits_flag_from_command(self, mock_load, mock_defaults, mock_prof, mock_resolve):
-        """Empty thinking value results in no --thinking flag in the command."""
+    def test_empty_thinking_omits_flag_from_base_args(self, mock_load, mock_defaults, mock_prof, mock_resolve):
+        """Empty thinking value results in no --thinking flag in base args."""
         mock_load.side_effect = FileNotFoundError("no profile")
         mock_defaults.return_value = {"api_provider": "cline-pass"}
         mock_prof.return_value = {}
@@ -340,7 +316,7 @@ class TestClineCliThinking:
         mock_resolve.side_effect = [None, ""]
 
         provider = ClineCliProvider("t1234567", "sess", "win0")
-        parts = shlex.split(provider._build_command())
+        parts = shlex.split(provider._build_base_args())
 
         assert "--thinking" not in parts
 
@@ -349,195 +325,212 @@ class TestClineCliThinking:
 
 
 class TestClineCliStatusDetection:
-    """Tests for get_status terminal state detection using REAL screen captures."""
+    """Tests for get_status based on pane_current_command."""
+
+    def _make_provider(self, initialized=True, dispatched=False) -> ClineCliProvider:
+        provider = ClineCliProvider("t1234567", "sess", "win0")
+        provider._initialized = initialized
+        provider._task_dispatched_flag = dispatched
+        provider.shell_baseline = "zsh"
+        return provider
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_backend")
+    def test_idle_before_dispatch(self, mock_backend):
+        """pane_current_command == 'cat' before any dispatch → IDLE."""
+        mock_backend.return_value.get_pane_current_command.return_value = "cat"
+        provider = self._make_provider(initialized=True, dispatched=False)
+        assert provider.get_status("") == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_backend")
+    def test_completed_after_dispatch(self, mock_backend):
+        """pane_current_command == 'cat' after dispatch → COMPLETED."""
+        mock_backend.return_value.get_pane_current_command.return_value = "cat"
+        provider = self._make_provider(initialized=True, dispatched=True)
+        assert provider.get_status("") == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_backend")
+    def test_processing_cline_running(self, mock_backend):
+        """pane_current_command == 'cline' → PROCESSING."""
+        mock_backend.return_value.get_pane_current_command.return_value = "cline"
+        provider = self._make_provider(initialized=True, dispatched=True)
+        assert provider.get_status("") == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_backend")
+    def test_processing_node_running(self, mock_backend):
+        """pane_current_command == 'node' (cline subprocess) → PROCESSING."""
+        mock_backend.return_value.get_pane_current_command.return_value = "node"
+        provider = self._make_provider(initialized=True, dispatched=True)
+        assert provider.get_status("") == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_backend")
+    def test_error_shell_baseline(self, mock_backend):
+        """pane_current_command == shell_baseline → ERROR (dispatcher crashed)."""
+        mock_backend.return_value.get_pane_current_command.return_value = "zsh"
+        provider = self._make_provider(initialized=True, dispatched=True)
+        assert provider.get_status("") == TerminalStatus.ERROR
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_backend")
+    def test_error_shell_baseline_before_dispatch(self, mock_backend):
+        """Shell baseline before dispatch also = ERROR."""
+        mock_backend.return_value.get_pane_current_command.return_value = "zsh"
+        provider = self._make_provider(initialized=True, dispatched=False)
+        assert provider.get_status("") == TerminalStatus.ERROR
+
+    def test_uninitialized_unknown(self):
+        """Uninitialized provider → UNKNOWN."""
+        provider = self._make_provider(initialized=False)
+        assert provider.get_status("") == TerminalStatus.UNKNOWN
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_backend")
+    def test_session_id_correlation_on_completion(self, mock_backend):
+        """Session ID is correlated on first COMPLETED detection."""
+        mock_backend.return_value.get_pane_current_command.return_value = "cat"
+        provider = self._make_provider(initialized=True, dispatched=True)
+        provider._message_count = 1
+        provider._pre_run_history_ids = {"old_session_1"}
+
+        with patch.object(provider, "_snapshot_history_ids") as mock_snapshot:
+            mock_snapshot.return_value = {"old_session_1", "new_session_abc"}
+            status = provider.get_status("")
+
+        assert status == TerminalStatus.COMPLETED
+        assert provider._session_id == "new_session_abc"
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_backend")
+    def test_session_id_not_re_correlated(self, mock_backend):
+        """Once session_id is set, don't re-correlate."""
+        mock_backend.return_value.get_pane_current_command.return_value = "cat"
+        provider = self._make_provider(initialized=True, dispatched=True)
+        provider._message_count = 1
+        provider._session_id = "already_set"
+
+        with patch.object(provider, "_correlate_session_id") as mock_correlate:
+            provider.get_status("")
+            mock_correlate.assert_not_called()
+
+
+# ─── Session-id correlation ───────────────────────────────────────────────────
+
+
+class TestClineCliSessionCorrelation:
+    """Tests for history snapshot and session correlation."""
 
     def _make_provider(self) -> ClineCliProvider:
         return ClineCliProvider("t1234567", "sess", "win0")
 
-    def test_empty_output_unknown(self):
-        provider = self._make_provider()
-        assert provider.get_status("") == TerminalStatus.UNKNOWN
-
-    def test_whitespace_only_unknown(self):
-        provider = self._make_provider()
-        assert provider.get_status("   \n\n  ") == TerminalStatus.UNKNOWN
-
-    def test_virgin_idle_screen(self):
-        """Real virgin idle screen (first launch, 'What can I do for you?')."""
-        provider = self._make_provider()
-        provider._initialized = True
-        assert provider.get_status(REAL_SCREEN_VIRGIN_IDLE) == TerminalStatus.IDLE
-
-    def test_post_response_idle_screen(self):
-        """Real post-response idle screen ('Ask anything...')."""
-        provider = self._make_provider()
-        provider._initialized = True
-        assert provider.get_status(REAL_SCREEN_POST_RESPONSE_IDLE) == TerminalStatus.IDLE
-
-    def test_post_response_with_input_is_completed(self):
-        """Post-response screen after input has been sent = COMPLETED."""
-        provider = self._make_provider()
-        provider._initialized = True
-        provider._input_received = True
-        assert provider.get_status(REAL_SCREEN_POST_RESPONSE_IDLE) == TerminalStatus.COMPLETED
-
-    def test_composer_with_typed_text_is_not_idle(self):
-        """Screen with typed text in composer is NOT idle (user is typing)."""
-        provider = self._make_provider()
-        provider._initialized = True
-        # The composer shows "❯ hello world this is my typed text" which does
-        # NOT match idle patterns — it's arbitrary user text, not a placeholder.
-        assert provider.get_status(REAL_SCREEN_COMPOSER_WITH_TEXT) != TerminalStatus.IDLE
-
-    def test_processing_spinner(self):
-        provider = self._make_provider()
-        provider._initialized = True
-        output = "Generating...\n⠹ Thinking..."
-        assert provider.get_status(output) == TerminalStatus.PROCESSING
-
-    def test_error_detection(self):
-        provider = self._make_provider()
-        provider._initialized = True
-        output = "Something happened\nError: model not found\n"
-        assert provider.get_status(output) == TerminalStatus.ERROR
-
-    def test_error_suppressed_when_idle_prompt_present(self):
-        """S1: quoted error lines in response don't trigger ERROR when idle prompt visible."""
-        provider = self._make_provider()
-        provider._initialized = True
-        output = "The error was:\nError: model not found\nThat's the issue.\n\n❯ Ask anything..."
-        assert provider.get_status(output) == TerminalStatus.IDLE
-
-    def test_error_suppressed_when_idle_prompt_completed(self):
-        """S1: quoted error lines after input don't block COMPLETED verdict."""
-        provider = self._make_provider()
-        provider._initialized = True
-        provider._input_received = True
-        output = "I found this error:\nError: connection refused\nFixed it.\n\n❯ Ask anything..."
-        assert provider.get_status(output) == TerminalStatus.COMPLETED
-
-    def test_waiting_user_answer(self):
-        provider = self._make_provider()
-        provider._initialized = True
-        output = "Do you want to proceed? [y/n]"
-        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
-
-    def test_banner_only_not_idle(self):
-        """A banner 'What can I do for you?' without the ❯ glyph is NOT idle.
-
-        The banner text appears above the composer and can co-exist with
-        processing state.  Only the composer line (glyph + placeholder)
-        should trigger idle detection.
-        """
-        provider = self._make_provider()
-        provider._initialized = True
-        # Simulate: banner present, but bottom line is a processing indicator.
-        output = "What can I do for you?\n\n⠹ Thinking..."
-        assert provider.get_status(output) == TerminalStatus.PROCESSING
-
-    def test_processing_with_idle_composer_visible(self):
-        """Real processing screen: ❯ Ask anything... is visible at bottom BUT
-        '⠦ Thinking...' spinner is present — PROCESSING takes priority.
-
-        Captured live from cline 3.0.55 during actual message processing.
-        """
-        provider = self._make_provider()
-        provider._initialized = True
-        output = (
-            " ❯ write a poem\n"
-            "\n"
-            " ⠦ Thinking... (esc to cancel)\n"
-            "\n" * 30 +
-            "────────────────────────────────────────\n"
-            "❯ Ask anything...\n"
-            "────────────────────────────────────────\n"
-            " ClinePass: DeepSeek V4 Flash (high) ██████ (6,148)\n"
-            " 5046ee32 (f323-cline-idle-timeout)\n"
-            " ⏵⏵ Auto-approve all enabled (Shift+Tab)\n"
+    @patch("cli_agent_orchestrator.providers.cline_cli.subprocess.run")
+    def test_snapshot_history_ids_success(self, mock_run):
+        """Successful history snapshot returns session IDs."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps([
+                {"sessionId": "sess_001", "status": "completed"},
+                {"sessionId": "sess_002", "status": "completed"},
+            ]),
         )
-        assert provider.get_status(output) == TerminalStatus.PROCESSING
+        provider = self._make_provider()
+        ids = provider._snapshot_history_ids()
+        assert ids == {"sess_001", "sess_002"}
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.subprocess.run")
+    def test_snapshot_history_ids_failure(self, mock_run):
+        """Failed history command returns empty set."""
+        mock_run.return_value = MagicMock(returncode=1, stderr="error")
+        provider = self._make_provider()
+        ids = provider._snapshot_history_ids()
+        assert ids == set()
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.subprocess.run")
+    def test_snapshot_history_ids_timeout(self, mock_run):
+        """Timeout returns empty set."""
+        import subprocess
+        mock_run.side_effect = subprocess.TimeoutExpired("cline", 10)
+        provider = self._make_provider()
+        ids = provider._snapshot_history_ids()
+        assert ids == set()
+
+    def test_correlate_single_new_id(self):
+        """Single new ID after invocation is correctly correlated."""
+        provider = self._make_provider()
+        provider._pre_run_history_ids = {"sess_001", "sess_002"}
+        with patch.object(provider, "_snapshot_history_ids") as mock_snap:
+            mock_snap.return_value = {"sess_001", "sess_002", "sess_003"}
+            result = provider._correlate_session_id()
+        assert result == "sess_003"
+
+    def test_correlate_ambiguous_multiple_new(self):
+        """Multiple new IDs → ambiguous, returns None."""
+        provider = self._make_provider()
+        provider._pre_run_history_ids = {"sess_001"}
+        with patch.object(provider, "_snapshot_history_ids") as mock_snap:
+            mock_snap.return_value = {"sess_001", "sess_002", "sess_003"}
+            result = provider._correlate_session_id()
+        assert result is None
+
+    def test_correlate_no_new_ids(self):
+        """No new IDs → returns None."""
+        provider = self._make_provider()
+        provider._pre_run_history_ids = {"sess_001", "sess_002"}
+        with patch.object(provider, "_snapshot_history_ids") as mock_snap:
+            mock_snap.return_value = {"sess_001", "sess_002"}
+            result = provider._correlate_session_id()
+        assert result is None
 
 
-# ─── Idle prompt detection ────────────────────────────────────────────────────
+# ─── Escaping torture cases ───────────────────────────────────────────────────
 
 
-class TestClineCliIdlePrompt:
-    """Tests for _has_idle_prompt helper with real screen patterns."""
+class TestClineCliEscaping:
+    """Tests that the dispatcher script handles difficult message content.
 
-    def test_virgin_composer_line(self):
-        """'❯ What can I do for you?' composer line is detected as idle."""
-        lines = ["", "What can I do for you?", "", "────", "❯ What can I do for you?", "────", "ClinePass: ..."]
-        # The tail window includes the composer line.
-        assert ClineCliProvider._has_idle_prompt(lines) is True
+    The dispatcher writes message content to a file via cat, then uses
+    $(cat <file>) to pass it to cline. This should survive all special chars.
+    """
 
-    def test_post_response_composer_line(self):
-        """'❯ Ask anything...' composer line is detected as idle."""
-        lines = ["response text", "", "────", "❯ Ask anything...", "────", "ClinePass: ..."]
-        assert ClineCliProvider._has_idle_prompt(lines) is True
+    def test_script_handles_quotes_in_base_args(self):
+        """System prompt with quotes is properly escaped in base_args."""
+        provider = ClineCliProvider("t1234567", "sess", "win0")
+        with patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults") as mock_defaults:
+            mock_defaults.return_value = {"api_provider": "cline-pass"}
+            with patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile") as mock_load:
+                profile = MagicMock()
+                profile.system_prompt = 'Say "hello" and \'goodbye\''
+                profile.model = None
+                profile.name = "quotey"
+                mock_load.return_value = profile
+                provider._agent_profile = "quotey"
 
-    def test_bare_prompt(self):
-        """Bare ❯ still works (fallback for older cline versions)."""
-        lines = ["some output", "", "❯ "]
-        assert ClineCliProvider._has_idle_prompt(lines) is True
+                args = provider._build_base_args()
+                # Verify the args string is valid shell (can be parsed back)
+                parts = shlex.split(args)
+                assert "-s" in parts
+                system_arg = parts[parts.index("-s") + 1]
+                assert '"hello"' in system_arg
+                assert "'goodbye'" in system_arg
 
-    def test_bare_gt_prompt(self):
-        lines = ["some output", "", "> "]
-        assert ClineCliProvider._has_idle_prompt(lines) is True
-
-    def test_no_prompt(self):
-        lines = ["some output", "more output"]
-        assert ClineCliProvider._has_idle_prompt(lines) is False
-
-    def test_prompt_buried_too_deep(self):
-        """Prompt beyond the 8-line tail window is not detected."""
-        lines = ["❯ What can I do for you?"] + ["filler line"] * 20
-        assert ClineCliProvider._has_idle_prompt(lines) is False
-
-    def test_ask_anything_without_glyph_fallback(self):
-        """'Ask anything...' without glyph still detected (escape-strip edge case)."""
-        lines = ["some response", "", "Ask anything..."]
-        assert ClineCliProvider._has_idle_prompt(lines) is True
-
-    def test_typed_text_not_idle(self):
-        """'❯ hello world' (user text, not placeholder) is NOT idle."""
-        lines = ["prev response", "────", "❯ hello world this is my typed text", "────", "ClinePass: ..."]
-        assert ClineCliProvider._has_idle_prompt(lines) is False
-
-    def test_status_bar_lines_below_composer(self):
-        """Real screen has status bar lines below composer — still detect idle.
-
-        Real layout (bottom 5 lines):
-          ❯ Ask anything...
-          ──────────...
-          ClinePass: DeepSeek V4 Flash (high) ██████ (6,346)   ...
-          cli-subagents (quirks-merge-train)
-          ⏵⏵ Auto-approve all enabled (Shift+Tab)
-
-        The status/info lines are non-empty and don't match — but the scan
-        should still find the composer in the 8-line tail.
-        """
-        lines = [
-            "response text",
-            "",
-            "────────────────────────────────────────",
-            "❯ Ask anything...",
-            "────────────────────────────────────────",
-            " ClinePass: DeepSeek V4 Flash (high) ██████ (6,346)",
-            " cli-subagents (quirks-merge-train)",
-            " ⏵⏵ Auto-approve all enabled (Shift+Tab)",
-        ]
-        assert ClineCliProvider._has_idle_prompt(lines) is True
-
-    def test_virgin_full_tail(self):
-        """Real virgin screen tail — the bottom-most non-empty lines are status lines,
-        but the composer '❯ What can I do for you?' is within the 8-line window."""
-        lines = REAL_SCREEN_VIRGIN_IDLE.splitlines()
-        assert ClineCliProvider._has_idle_prompt(lines) is True
-
-    def test_post_response_full_tail(self):
-        """Real post-response screen tail."""
-        lines = REAL_SCREEN_POST_RESPONSE_IDLE.splitlines()
-        assert ClineCliProvider._has_idle_prompt(lines) is True
+    def test_message_file_content_survives_special_chars(self):
+        """The file-based approach survives newlines, quotes, backticks, $."""
+        # This tests the concept: cat > file writes EXACTLY what stdin receives.
+        # The $(cat file) expansion then passes that content as a single argument.
+        # No escaping needed in the message itself — only the file path needs quoting.
+        difficult_message = (
+            'Hello "world"\n'
+            "It's a test\n"
+            "Price is $100\n"
+            "Run `echo foo`\n"
+            "Backslash: \\\n"
+            "Semicolon; ampersand& pipe|\n"
+        )
+        # The dispatcher script template uses fixed paths — message goes to cat's stdin.
+        # Verify the script doesn't try to inline-escape the message.
+        script = _build_dispatcher_script(
+            CLINE_BINARY, "/data/msgs", "tESCAPE1",
+            f"{CLINE_BINARY} --auto-approve true"
+        )
+        # The script should NOT contain any message content — it reads from stdin.
+        assert difficult_message not in script
+        # The $(cat "$_cao_msgfile") construct handles the escaping.
+        assert '"$(cat "$_cao_msgfile")"' in script
 
 
 # ─── Response extraction ──────────────────────────────────────────────────────
@@ -550,27 +543,62 @@ class TestClineCliExtraction:
         return ClineCliProvider("t1234567", "sess", "win0")
 
     def test_basic_extraction(self):
+        """Extract response between cline invocation and next dispatcher prompt."""
         provider = self._make_provider()
-        script = "❯ what is 2+2\nThe answer is 4.\n\n❯ "
+        script = (
+            f"{CLINE_BINARY} --auto-approve true \"$(cat /data/msgs/t1234567_1.txt)\"\n"
+            "The answer is 42.\n"
+            "\n"
+        )
         result = provider.extract_last_message_from_script(script)
-        assert result == "The answer is 4."
+        assert result == "The answer is 42."
 
     def test_multiline_extraction(self):
+        """Multi-line response is extracted correctly."""
         provider = self._make_provider()
-        script = "❯ explain\nLine one.\nLine two.\nLine three.\n\n❯ "
+        script = (
+            f"{CLINE_BINARY} --auto-approve true \"$(cat /data/msgs/t1234567_1.txt)\"\n"
+            "Line one.\n"
+            "Line two.\n"
+            "Line three.\n"
+        )
         result = provider.extract_last_message_from_script(script)
         assert "Line one." in result
         assert "Line three." in result
 
-    def test_no_user_input_raises(self):
+    def test_stops_at_dispatcher_prompt(self):
+        """Extraction stops at next dispatcher cat > line."""
         provider = self._make_provider()
-        with pytest.raises(ValueError, match="No user input"):
-            provider.extract_last_message_from_script("just some text without prompt")
+        script = (
+            f"{CLINE_BINARY} --auto-approve true \"$(cat /data/msgs/t1234567_1.txt)\"\n"
+            "Response text here.\n"
+            "cat > /data/msgs/t1234567_2.txt\n"
+            "This should not be included.\n"
+        )
+        result = provider.extract_last_message_from_script(script)
+        assert result == "Response text here."
+        assert "not be included" not in result
+
+    def test_no_invocation_fallback(self):
+        """Without a cline invocation line, falls back to all non-empty content."""
+        provider = self._make_provider()
+        script = "Just some random output.\nAnother line.\n"
+        result = provider.extract_last_message_from_script(script)
+        assert "Just some random output." in result
+        assert "Another line." in result
 
     def test_empty_response_raises(self):
+        """Empty response after cline invocation raises ValueError."""
         provider = self._make_provider()
+        script = f"{CLINE_BINARY} --auto-approve true \"$(cat /data/msgs/t1234567_1.txt)\"\n\n"
         with pytest.raises(ValueError, match="Empty Cline response"):
-            provider.extract_last_message_from_script("❯ hello\n\n❯ ")
+            provider.extract_last_message_from_script(script)
+
+    def test_no_content_at_all_raises(self):
+        """Completely empty input with no cline line and no content raises."""
+        provider = self._make_provider()
+        with pytest.raises(ValueError, match="No cline invocation"):
+            provider.extract_last_message_from_script("")
 
 
 # ─── Provider registration ────────────────────────────────────────────────────
@@ -624,11 +652,11 @@ class TestClineCliProperties:
 
     def test_paste_submit_delay(self):
         provider = ClineCliProvider("t1234567", "sess", "win0")
-        assert provider.paste_submit_delay == 0.3
+        assert provider.paste_submit_delay == 0.1
 
     def test_exit_cli(self):
         provider = ClineCliProvider("t1234567", "sess", "win0")
-        assert provider.exit_cli() == "/exit"
+        assert provider.exit_cli() == "exit"
 
     def test_cleanup(self):
         provider = ClineCliProvider("t1234567", "sess", "win0")
@@ -637,6 +665,75 @@ class TestClineCliProperties:
         assert provider._initialized is False
 
     def test_classify_injection_hazard_none(self):
+        """Plain one-shot mode has no injection hazard."""
         provider = ClineCliProvider("t1234567", "sess", "win0")
         rows = ["some text", "more text"]
         assert provider.classify_injection_hazard(rows) is None
+
+    def test_session_id_property(self):
+        """session_id property returns the correlated ID."""
+        provider = ClineCliProvider("t1234567", "sess", "win0")
+        assert provider.session_id is None
+        provider._session_id = "test_session_123"
+        assert provider.session_id == "test_session_123"
+
+    def test_dispatcher_idle_cmd_is_cat(self):
+        """The idle sentinel command is 'cat'."""
+        assert DISPATCHER_IDLE_CMD == "cat"
+
+
+# ─── EOF dispatch (Ctrl-D) ────────────────────────────────────────────────────
+
+
+class TestClineCliEofDispatch:
+    """Tests for the Ctrl-D EOF dispatch in _after_dispatch_commit_locked."""
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_backend")
+    @patch("cli_agent_orchestrator.providers.cline_cli.subprocess.run")
+    def test_after_dispatch_sends_eof(self, mock_subprocess, mock_backend):
+        """_after_dispatch_commit_locked spawns a thread that sends C-d."""
+        import time
+
+        # Mock subprocess for history snapshot
+        mock_subprocess.return_value = MagicMock(
+            returncode=0, stdout="[]"
+        )
+
+        provider = ClineCliProvider("t1234567", "sess", "win0")
+        provider._after_dispatch_commit_locked()
+
+        # Wait for the thread to execute
+        time.sleep(0.5)
+
+        mock_backend.return_value.send_special_key.assert_called_once_with(
+            "sess", "win0", "C-d"
+        )
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_backend")
+    @patch("cli_agent_orchestrator.providers.cline_cli.subprocess.run")
+    def test_after_dispatch_sets_flags(self, mock_subprocess, mock_backend):
+        """_after_dispatch_commit_locked sets task_dispatched and increments count."""
+        mock_subprocess.return_value = MagicMock(returncode=0, stdout="[]")
+
+        provider = ClineCliProvider("t1234567", "sess", "win0")
+        assert provider._task_dispatched_flag is False
+        assert provider._message_count == 0
+
+        provider._after_dispatch_commit_locked()
+
+        assert provider._task_dispatched_flag is True
+        assert provider._message_count == 1
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_backend")
+    @patch("cli_agent_orchestrator.providers.cline_cli.subprocess.run")
+    def test_after_dispatch_snapshots_history(self, mock_subprocess, mock_backend):
+        """_after_dispatch_commit_locked snapshots history for correlation."""
+        mock_subprocess.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps([{"sessionId": "existing_1"}]),
+        )
+
+        provider = ClineCliProvider("t1234567", "sess", "win0")
+        provider._after_dispatch_commit_locked()
+
+        assert provider._pre_run_history_ids == {"existing_1"}
