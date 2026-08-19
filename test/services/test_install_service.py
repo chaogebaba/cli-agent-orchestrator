@@ -1294,3 +1294,15 @@ class TestInstallKASPermissions:
         # Still passes through when declared (pass-through-if-declared)
         kiro_config = json.loads((install_paths["kiro_dir"] / "v2-perms.json").read_text())
         assert kiro_config["permissions"] == {"rules": [{"capability": "shell", "effect": "allow"}]}
+
+
+def test_install_omp_writes_context_only(install_paths: dict[str, Path]) -> None:
+    profile = install_paths["local_store_dir"] / "omp-agent.md"
+    profile.write_text(_profile_text(name="omp-agent"), encoding="utf-8")
+
+    result = install_agent("omp-agent", "omp")
+
+    assert result.success is True
+    assert result.provider == "omp"
+    assert result.agent_file is None
+    assert (install_paths["context_dir"] / "omp-agent.md").exists()

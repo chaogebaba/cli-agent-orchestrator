@@ -12,6 +12,7 @@ from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.manager import ProviderManager
+from cli_agent_orchestrator.providers.omp import OmpProvider
 
 
 def test_create_provider_codex_stores_mapping():
@@ -436,4 +437,19 @@ def test_create_provider_mock_cli_stores_mapping():
     )
 
     assert isinstance(provider, MockCliProvider)
+    assert manager.get_provider("t1") is provider
+
+
+def test_create_provider_omp_stores_mapping():
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.OMP.value,
+        terminal_id="t1",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile="developer",
+        skill_prompt="skill catalog",
+    )
+
+    assert isinstance(provider, OmpProvider)
     assert manager.get_provider("t1") is provider

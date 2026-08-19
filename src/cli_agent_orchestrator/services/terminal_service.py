@@ -667,7 +667,8 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.GROK_CLI.value,
     ProviderType.KIMI_CLI.value,
     ProviderType.ANTIGRAVITY_CLI.value,
-    ProviderType.GROK_CLI.value,
+    ProviderType.OMP.value,
+    ProviderType.CLINE_CLI.value,
 }
 
 SESSION_BRIEF_MARKER = "SESSION BRIEF UNAVAILABLE — world-model incomplete"
@@ -791,6 +792,7 @@ SOFT_ENFORCEMENT_PROVIDERS = {
     ProviderType.CODEX.value,
     ProviderType.ANTIGRAVITY_CLI.value,
     ProviderType.CLINE_CLI.value,
+    ProviderType.OMP.value,
 }
 
 MAX_PEEK_TERMINAL_LINES = 200
