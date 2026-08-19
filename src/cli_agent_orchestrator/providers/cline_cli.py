@@ -1,27 +1,45 @@
-"""Cline CLI provider implementation.
+"""Cline CLI provider implementation — plain-mode one-shot invocations.
 
-This provider drives Cline CLI (v3.0.55+) in interactive TUI mode inside tmux.
-Cline is launched with ``--tui --auto-approve true`` for headless orchestration;
-CAO submits messages via tmux send-keys and detects terminal state from pane
-output patterns.
+This provider drives Cline CLI (v3.0.55+) via one-shot command invocations in a
+tmux pane.  Each message becomes a fresh ``cline --auto-approve true "<msg>"``
+command; the pane output stays human-readable (no --tui, no --json).
+
+Architecture: A lightweight shell dispatcher loop runs in the pane. It accepts
+messages via tmux paste (the standard send_input path), writes them to a temp
+file for safe escaping, and invokes cline with ``"$(cat <file>)"``.  Status
+detection uses the pane's current command: ``cline`` running = PROCESSING,
+dispatcher loop idle (at ``read``) = IDLE/COMPLETED.
+
+Session-id correlation: ``cline history --json`` is snapshotted before and after
+each invocation (via subprocess, not the pane) to bind the new session record.
 
 Key flags (verified via ``cline --help`` and live probes, 2026-08-19):
-  -i / --tui           : interactive TUI mode (persistent session)
   --auto-approve true  : auto-approve all tool calls (yolo)
   -c <path>            : working directory
   -m <model-id>        : model override (format: provider/model-id)
   -P <provider>        : API provider (default: cline)
   -s <system-prompt>   : system prompt override
+  --thinking <level>   : reasoning effort (none|low|medium|high|xhigh)
   --timeout <seconds>  : per-run timeout
   --retries <n>        : max consecutive retries
-  --id <session-id>    : resume session
+
+Note on --id: ``--id <session-id>`` forces TUI/interactive mode and CANNOT be
+used in plain one-shot invocations (live-probed 2026-08-19).
+
+MCP note (live-probed 2026-08-19): External MCP servers require
+``~/.cline/data/settings/cline_mcp_settings.json``.  Without that file, cline
+has only its native tools (run_commands, read/write files).  cao-mcp-server
+send_message is NOT available to cline workers unless MCP is explicitly
+configured.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import re
 import shlex
+import subprocess
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -35,46 +53,25 @@ from cli_agent_orchestrator.services.settings_service import (
     resolve_provider_string_option,
 )
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.terminal import wait_for_shell
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
 CLINE_BINARY = str(Path.home() / ".bun" / "bin" / "cline")
 
-# ─── Status detection patterns ───────────────────────────────────────────────
+# Scratch directory for message temp files (NOT /tmp — user requirement).
+SCRATCH_DIR = Path("/data/cao-scratch")
 
-# Cline TUI idle prompt: the input indicator at the end of output.
-# Confirmed via cline/cline source: the TUI renders a ❯ glyph as the
-# brand.prompt character (themeable) plus placeholder text in the composer
-# when idle.  Two observed idle screens:
-#   Virgin (first launch):   ❯ What can I do for you?
-#   Post-exchange:           ❯ Ask anything...
-# Both are prompt-glyph + placeholder ON THE SAME LINE.  A banner line
-# "What can I do for you?" can also appear ABOVE the composer but must NOT
-# count as idle on its own (can co-exist with a processing state).
-IDLE_PROMPT_PATTERN = r"^\s*[❯>]\s*$"
+# ─── Status detection ─────────────────────────────────────────────────────────
+# The dispatcher loop uses `cat` as an idle sentinel:
+#   - pane_current_command == "cat" → dispatcher waiting for input (IDLE/COMPLETED)
+#   - pane_current_command contains "cline" → cline running (PROCESSING)
+#   - pane_current_command == shell baseline → dispatcher exited (ERROR)
 
-# Composer-line idle: prompt glyph followed by a known placeholder phrase.
-# This is the PRIMARY idle signal — it matches the actual rendered composer.
-IDLE_COMPOSER_PATTERN = r"^\s*[❯>]\s+(?:What can I do for you\??|Ask anything.*)"
+DISPATCHER_IDLE_CMD = "cat"
 
-# Legacy placeholder search (matches "Ask anything" anywhere in a line).
-# Kept as a secondary fallback for edge-case screen truncations.
-IDLE_PLACEHOLDER_PATTERN = r"Ask anything"
-
-# Processing indicators: spinner/working text.
-PROCESSING_PATTERN = (
-    r"Thinking\.\.\."
-    r"|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏"
-    r"|Working\.\.\."
-    r"|Running\.\.\."
-)
-
-# Token/cost summary (marks end of a turn).
-TOKEN_COST_PATTERN = r"(?:Tokens?|Cost|Usage):\s*[\d.,]+"
-
-# Error indicators.
+# Error patterns detected in pane output (post-completion scan).
 ERROR_PATTERN = (
     r"^\s*(?:"
     r"[Ee]rror:\s+.+"
@@ -84,19 +81,53 @@ ERROR_PATTERN = (
     r")$"
 )
 
-# Waiting for user confirmation (permission/trust dialogs).
-WAITING_USER_ANSWER_PATTERN = (
-    r"\[\s*y\s*/\s*n\s*\]"
-    r"|Do you want to"
-    r"|Press .+ to continue"
-)
+
+def _build_dispatcher_script(
+    cline_binary: str,
+    msg_dir: str,
+    terminal_id: str,
+    base_args: str,
+) -> str:
+    """Build the shell dispatcher loop that runs in the tmux pane.
+
+    The loop:
+    1. Waits for input via ``cat`` (the standard send_input paste delivers text
+       to this blocking read).
+    2. Writes the received text to a temp file.
+    3. Invokes cline with the temp file content via $(cat ...).
+    4. Returns to step 1 for the next message.
+
+    Uses ``cat`` as the idle-wait command because:
+    - It blocks waiting for stdin (pasted text ends with Enter + Ctrl-D)
+    - tmux reports "cat" as pane_current_command when idle
+    - Distinct from "cline" when processing
+
+    The dispatcher uses Ctrl-D (EOF) on a standalone line to signal end-of-message.
+    Bracketed paste from tmux delivers the text, then the provider's ``paste_enter_count``
+    sends Enter (newline). The shell dispatcher sees the Enter as part of the message
+    text. We use a HereDoc marker (``__CAO_MSG_END__``) as the delimiter.
+    """
+    # The script uses a heredoc-style delimiter: text up to a line containing
+    # only __CAO_MSG_END__ is captured as the message.
+    return f"""\
+_cao_msg_n=0
+while true; do
+  _cao_msg_n=$((_cao_msg_n + 1))
+  _cao_msgfile="{msg_dir}/{terminal_id}_${{_cao_msg_n}}.txt"
+  cat > "$_cao_msgfile"
+  [ -s "$_cao_msgfile" ] || continue
+  {base_args} "$(cat "$_cao_msgfile")"
+done
+"""
 
 
 class ClineCliProvider(BaseProvider):
-    """Provider for Cline CLI interactive TUI.
+    """Provider for Cline CLI plain-mode one-shot invocations.
 
-    Launches cline in TUI mode (``--tui``) with auto-approve and detects
-    terminal state by pattern-matching pane output.
+    A shell dispatcher loop accepts messages via tmux paste (the standard
+    send_input path), writes them to a temp file, and invokes cline.
+    Status detection uses pane_current_command: ``cat`` = idle, ``cline`` =
+    processing, shell baseline = error/exited.
     """
 
     def __init__(
@@ -111,9 +142,12 @@ class ClineCliProvider(BaseProvider):
     ):
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
-        self._input_received = False
+        self._task_dispatched_flag = False
         self._agent_profile = agent_profile
         self._model = model
+        self._session_id: Optional[str] = None
+        self._message_count = 0
+        self._pre_run_history_ids: set[str] = set()
 
     @property
     def resolved_model(self) -> Optional[str]:
@@ -121,17 +155,58 @@ class ClineCliProvider(BaseProvider):
         return getattr(self, "_resolved_model", None)
 
     @property
+    def session_id(self) -> Optional[str]:
+        """Return the correlated cline session ID, if known."""
+        return self._session_id
+
+    @property
     def paste_enter_count(self) -> int:
-        """Cline TUI submits with one Enter after paste."""
+        """After paste, one Enter sends the message, then we need EOF (Ctrl-D).
+
+        The dispatcher loop uses ``cat > file`` which reads until EOF.
+        Bracketed paste delivers the text; after paste we send Enter (so the
+        last line has a newline) then the terminal_service's Enter submits.
+        But cat needs EOF — we handle this via send_special_key (Ctrl-D) in
+        _after_dispatch_commit_locked.
+
+        Actually: set to 0 here. We override the submit behavior because
+        `cat` needs Ctrl-D, not Enter. The base flow with paste_enter_count=0
+        will paste the text without pressing Enter at all, then our
+        _after_dispatch_commit_locked sends Ctrl-D to signal EOF to cat.
+
+        UPDATE: paste_enter_count must be >= 1 for the base dispatch flow.
+        We set it to 1 (one Enter after paste, which adds a trailing newline
+        to the cat input). Then _after_dispatch_commit_locked sends Ctrl-D
+        (EOF) to close the cat.
+        """
         return 1
 
     @property
     def paste_submit_delay(self) -> float:
-        """Delay after paste before Enter."""
-        return 0.3
+        """Short delay before Enter."""
+        return 0.1
 
     def _after_dispatch_commit_locked(self) -> None:
-        self._input_received = True
+        """After message paste + Enter, send Ctrl-D (EOF) to close the cat read."""
+        self._task_dispatched_flag = True
+        self._message_count += 1
+        # Snapshot history IDs before cline starts (for session correlation).
+        self._pre_run_history_ids = self._snapshot_history_ids()
+        # Send Ctrl-D (EOF) to signal end-of-input to `cat`.
+        # This must happen AFTER the paste + enter, so cat writes the file.
+        import threading
+
+        def _send_eof():
+            import time as _time
+            _time.sleep(0.2)  # Small delay to let Enter propagate
+            try:
+                get_backend().send_special_key(
+                    self.session_name, self.window_name, "C-d"
+                )
+            except Exception as exc:
+                logger.debug("Failed to send EOF to dispatcher: %s", exc)
+
+        threading.Thread(target=_send_eof, daemon=True).start()
 
     def _resolve_model(self) -> Optional[str]:
         """Resolve model: spawn override > providers.toml > profile field.
@@ -167,8 +242,6 @@ class ClineCliProvider(BaseProvider):
         """Resolve the Cline API provider id (e.g. 'cline-pass').
 
         Resolution: providers.toml [cline_cli] api_provider > default 'cline-pass'.
-        The 'cline-pass' provider routes through ClinePass (free DeepSeek V4 Flash),
-        while 'cline' routes through OpenRouter (paid per-token).
         """
         provider_defaults = get_provider_defaults("cline_cli")
         return provider_defaults.get("api_provider") or "cline-pass"
@@ -199,17 +272,18 @@ class ClineCliProvider(BaseProvider):
             "thinking",
             "reasoningEffort",
         )
-        # Explicit empty string = suppress the flag (return "").
         if isinstance(resolved, str):
             return resolved
-        # No key present anywhere → default to high reasoning effort.
         return "high"
 
-    def _build_command(self) -> str:
-        """Build the cline CLI launch command for interactive TUI mode."""
-        command_parts = [CLINE_BINARY, "--tui", "--auto-approve", "true"]
+    def _build_base_args(self) -> str:
+        """Build the cline base argument string (everything except the message).
 
-        # API provider selection (cline-pass = ClinePass subscription, free).
+        Returns a shell command fragment like:
+            /home/user/.bun/bin/cline --auto-approve true -P cline-pass -m model --thinking high -s "prompt"
+        """
+        command_parts = [CLINE_BINARY, "--auto-approve", "true"]
+
         api_provider = self._resolve_provider_id()
         if api_provider:
             command_parts.extend(["-P", api_provider])
@@ -219,7 +293,6 @@ class ClineCliProvider(BaseProvider):
         if isinstance(model, str) and model:
             command_parts.extend(["-m", model])
 
-        # Reasoning effort (default: high).
         thinking = self._resolve_thinking()
         if isinstance(thinking, str) and thinking:
             command_parts.extend(["--thinking", thinking])
@@ -239,8 +312,60 @@ class ClineCliProvider(BaseProvider):
 
         return shlex.join(command_parts)
 
+    def _msg_dir(self) -> Path:
+        """Return (and create) the message scratch directory."""
+        d = SCRATCH_DIR / "cline-msgs"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _snapshot_history_ids(self) -> set[str]:
+        """Snapshot current cline session IDs via subprocess (quiet, not in pane).
+
+        Returns a set of session IDs from `cline history --json`.
+        """
+        try:
+            result = subprocess.run(
+                [CLINE_BINARY, "history", "--json"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                logger.debug("cline history --json failed: %s", result.stderr)
+                return set()
+            sessions = json.loads(result.stdout)
+            return {s["sessionId"] for s in sessions if "sessionId" in s}
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, KeyError) as exc:
+            logger.debug("Failed to snapshot cline history: %s", exc)
+            return set()
+
+    def _correlate_session_id(self) -> Optional[str]:
+        """Correlate the new session ID after a cline invocation.
+
+        Compares current history against the pre-run snapshot; the new entry
+        is our session.
+        """
+        current_ids = self._snapshot_history_ids()
+        new_ids = current_ids - self._pre_run_history_ids
+        if len(new_ids) == 1:
+            session_id = new_ids.pop()
+            logger.debug("Correlated cline session ID: %s", session_id)
+            return session_id
+        elif len(new_ids) > 1:
+            logger.warning(
+                "Ambiguous cline session correlation: %d new IDs found", len(new_ids)
+            )
+            return None
+        else:
+            logger.debug("No new cline session ID found in history")
+            return None
+
     async def initialize(self) -> bool:
-        """Start Cline TUI and wait for the idle prompt."""
+        """Initialize: wait for shell, launch dispatcher loop.
+
+        The dispatcher loop runs in the pane, accepting messages via paste
+        and dispatching them to cline one-shot invocations.
+        """
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         init_timeout = get_server_settings()["provider_init_timeout"]
@@ -251,136 +376,123 @@ class ClineCliProvider(BaseProvider):
             self.session_name, self.window_name
         )
 
-        command = self._build_command()
-        status_monitor.notify_input_sent(self.terminal_id)
-        get_backend().send_keys(self.session_name, self.window_name, command)
+        # Verify cline is available (best-effort).
+        try:
+            result = subprocess.run(
+                [CLINE_BINARY, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                logger.debug("Cline CLI version: %s", result.stdout.strip())
+            else:
+                logger.warning("cline --version failed: %s", result.stderr)
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            logger.warning("Could not verify cline CLI: %s", exc)
 
-        if not await wait_until_status(
-            self.terminal_id,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=float(init_timeout),
-            polling_interval=1.0,
-        ):
-            raise TimeoutError(f"Cline CLI initialization timed out after {init_timeout}s")
+        # Build the base cline args (everything except the message).
+        base_args = self._build_base_args()
+        msg_dir = str(self._msg_dir())
+
+        # Launch the dispatcher loop script in the pane.
+        dispatcher = _build_dispatcher_script(
+            CLINE_BINARY, msg_dir, self.terminal_id, base_args
+        )
+        status_monitor.notify_input_sent(self.terminal_id)
+        get_backend().send_keys(self.session_name, self.window_name, dispatcher)
+
+        # Wait for the dispatcher to reach idle (cat is blocking for input).
+        # The pane_current_command should become "cat" when the dispatcher is idle.
+        import asyncio
+
+        deadline = time.time() + float(init_timeout)
+        while time.time() < deadline:
+            current_cmd = get_backend().get_pane_current_command(
+                self.session_name, self.window_name
+            )
+            if current_cmd == DISPATCHER_IDLE_CMD:
+                break
+            await asyncio.sleep(0.5)
+        else:
+            raise TimeoutError(
+                f"Cline dispatcher initialization timed out after {init_timeout}s"
+            )
 
         self._initialized = True
         return True
 
     def get_status(self, output: str) -> TerminalStatus:
-        """Detect Cline terminal state from raw output."""
+        """Detect Cline terminal state from pane command.
+
+        Status mapping:
+          - pane_current_command == "cat" → IDLE (dispatcher waiting) or
+            COMPLETED (after task)
+          - pane_current_command contains "cline" → PROCESSING
+          - pane_current_command == shell_baseline → ERROR (dispatcher crashed)
+          - Otherwise → PROCESSING (transitioning)
+        """
         native = self._resolve_native_status()
         if native is not None:
             return native
 
-        if not output:
+        if not self._initialized:
             return TerminalStatus.UNKNOWN
 
-        clean_output = strip_terminal_escapes(output)
-        if not clean_output.strip():
-            return TerminalStatus.UNKNOWN
+        current_cmd = get_backend().get_pane_current_command(
+            self.session_name, self.window_name
+        )
 
-        lines = clean_output.splitlines()
-        tail = "\n".join(lines[-20:])
-        idle_detected = self._has_idle_prompt(lines)
-
-        # Check for waiting/permission prompts.
-        if re.search(WAITING_USER_ANSWER_PATTERN, tail, re.IGNORECASE):
-            return TerminalStatus.WAITING_USER_ANSWER
-
-        # Check for errors — but NOT when the idle prompt is also visible
-        # (the error text is likely a quoted line in the response, not a
-        # real terminal error). Priority-inversion guard (S1).
-        if not idle_detected and re.search(ERROR_PATTERN, tail, re.MULTILINE | re.IGNORECASE):
-            return TerminalStatus.ERROR
-
-        # Check for active processing.
-        if re.search(PROCESSING_PATTERN, tail):
-            return TerminalStatus.PROCESSING
-
-        # Check for idle prompt at end.
-        if idle_detected:
-            if self._input_received:
+        # Dispatcher idle: cat is waiting for input.
+        if current_cmd == DISPATCHER_IDLE_CMD:
+            if self._task_dispatched_flag:
+                # Correlate session ID on first completion detection.
+                if self._session_id is None and self._message_count > 0:
+                    self._session_id = self._correlate_session_id()
                 return TerminalStatus.COMPLETED
             return TerminalStatus.IDLE
 
-        # Fallback: if shell baseline matches, terminal may have exited.
-        if self._initialized and self.shell_baseline:
-            current_cmd = get_backend().get_pane_current_command(
-                self.session_name, self.window_name
-            )
-            if current_cmd == self.shell_baseline:
-                return TerminalStatus.IDLE
+        # Dispatcher exited back to shell → error.
+        if self.shell_baseline and current_cmd == self.shell_baseline:
+            return TerminalStatus.ERROR
 
+        # Cline is running (or dispatcher is transitioning).
         return TerminalStatus.PROCESSING
 
-    @staticmethod
-    def _has_idle_prompt(lines: list[str]) -> bool:
-        """Check if idle prompt is visible in the last few lines.
-
-        Cline's TUI shows the composer line in one of these forms:
-        - Virgin idle:       ❯ What can I do for you?
-        - Post-exchange:     ❯ Ask anything...
-        - Bare (rare/old):   ❯
-
-        The real TUI layout has STATUS BAR lines BELOW the composer:
-          ────────────────
-          ❯ Ask anything...
-          ────────────────
-          ClinePass: DeepSeek V4 Flash (high) ...
-          cli-subagents (quirks-merge-train)
-          ⏵⏵ Auto-approve all enabled (Shift+Tab)
-
-        So we must scan ALL non-empty lines in the 8-line tail window
-        (not stop at the first non-matching line from the bottom).
-
-        A bare "What can I do for you?" banner line (no ❯ glyph) does NOT
-        count — it co-exists with processing state and must not short-circuit.
-        """
-        tail = lines[-8:] if len(lines) >= 8 else lines
-        for line in tail:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            # Primary: composer line with glyph + placeholder text.
-            if re.match(IDLE_COMPOSER_PATTERN, stripped):
-                return True
-            # Fallback: bare prompt glyph only.
-            if re.match(IDLE_PROMPT_PATTERN, stripped):
-                return True
-            # Secondary fallback: "Ask anything" anywhere in line (handles
-            # rare cases where escape stripping removes the glyph).
-            if re.search(IDLE_PLACEHOLDER_PATTERN, stripped, re.IGNORECASE):
-                return True
-        return False
-
     def classify_injection_hazard(self, rows: list[str]) -> str | None:
-        return (
-            "interactive_dialog"
-            if self.get_status_from_screen(rows) == TerminalStatus.WAITING_USER_ANSWER
-            else None
-        )
+        """No injection hazard in plain one-shot mode (no interactive prompts)."""
+        return None
 
     def extract_last_message_from_script(self, script_output: str) -> str:
-        """Extract the last Cline response from captured scrollback."""
+        """Extract the last Cline response from captured scrollback.
+
+        In plain mode, cline outputs the response text directly to stdout.
+        The response is everything between the cline command invocation and
+        the next ``cat >`` prompt from the dispatcher.
+        """
         clean_output = strip_terminal_escapes(script_output)
         lines = clean_output.splitlines()
 
-        # Find the last user input line (prompt followed by content).
-        user_line_idx = None
+        # Find the last cline invocation line.
+        cline_line_idx = None
         for idx in range(len(lines) - 1, -1, -1):
-            stripped = lines[idx].strip()
-            if re.match(r"^[❯>]\s+\S", stripped):
-                user_line_idx = idx
+            if "cline" in lines[idx] and "--auto-approve" in lines[idx]:
+                cline_line_idx = idx
                 break
 
-        if user_line_idx is None:
-            raise ValueError("No user input found in Cline output")
+        if cline_line_idx is None:
+            # Fallback: take the last non-empty content.
+            content_lines = [l.strip() for l in lines if l.strip()]
+            if content_lines:
+                return "\n".join(content_lines)
+            raise ValueError("No cline invocation found in output")
 
-        # Extract content between user input and end (minus trailing prompts).
+        # Extract content after the cline command line, up to next dispatcher prompt.
         content_lines = []
-        for line in lines[user_line_idx + 1 :]:
+        for line in lines[cline_line_idx + 1:]:
             stripped = line.strip()
-            if re.match(IDLE_PROMPT_PATTERN, stripped):
+            # Stop at the next dispatcher idle indicator.
+            if "cat >" in line or line.strip().startswith("_cao_msg_n="):
                 break
             if stripped:
                 content_lines.append(stripped)
@@ -391,7 +503,17 @@ class ClineCliProvider(BaseProvider):
         return result
 
     def exit_cli(self) -> str:
-        return "/exit"
+        """Exit the dispatcher loop. Ctrl-C followed by exit."""
+        return "exit"
 
     def cleanup(self) -> None:
+        """Clean up temp files and state."""
         self._initialized = False
+        # Clean up message temp files.
+        scratch = SCRATCH_DIR / "cline-msgs"
+        if scratch.exists():
+            for f in scratch.glob(f"{self.terminal_id}_*.txt"):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
