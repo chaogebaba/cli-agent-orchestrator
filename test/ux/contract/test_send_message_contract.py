@@ -37,6 +37,17 @@ class TestSendMessageContractUX2:
         monkeypatch.setenv("CAO_ENDPOINT", cao_server.url)
         monkeypatch.setenv("CAO_TERMINAL_ID", sup_id)
 
+        # F332: Read the issued auth_token from the server's DB so
+        # _send_to_inbox can present it in the X-CAO-Terminal-Token header.
+        import sqlite3
+        conn = sqlite3.connect(str(cao_server.db_path))
+        token_row = conn.execute(
+            "SELECT auth_token FROM terminals WHERE id = ?", (sup_id,)
+        ).fetchone()
+        conn.close()
+        if token_row and token_row[0]:
+            monkeypatch.setenv("CAO_TERMINAL_TOKEN", token_row[0])
+
         # Create a second terminal to be the receiver
         from cli_agent_orchestrator.mcp_server.server import _assign_impl
 

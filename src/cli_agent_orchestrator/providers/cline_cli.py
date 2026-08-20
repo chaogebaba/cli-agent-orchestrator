@@ -1,4 +1,4 @@
-"""Cline CLI provider implementation — plain-mode one-shot invocations.
+"""Cline CLI provider implementation — sandbox-mode one-shot invocations.
 
 This provider drives Cline CLI (v3.0.55+) via one-shot command invocations in a
 tmux pane.  Each message becomes a fresh ``cline --auto-approve true "<msg>"``
@@ -15,6 +15,7 @@ each invocation (via subprocess, not the pane) to bind the new session record.
 
 Key flags (verified via ``cline --help`` and live probes, 2026-08-19):
   --auto-approve true  : auto-approve all tool calls (yolo)
+  --data-dir <path>    : isolated sandbox dir (enables sandbox mode, no hub)
   -c <path>            : working directory
   -m <model-id>        : model override (format: provider/model-id)
   -P <provider>        : API provider (default: cline)
@@ -26,18 +27,20 @@ Key flags (verified via ``cline --help`` and live probes, 2026-08-19):
 Note on --id: ``--id <session-id>`` forces TUI/interactive mode and CANNOT be
 used in plain one-shot invocations (live-probed 2026-08-19).
 
-MCP note (live-probed 2026-08-19): External MCP servers require
-``~/.cline/data/settings/cline_mcp_settings.json``.  Without that file, cline
-has only its native tools (run_commands, read/write files).  cao-mcp-server
-send_message is NOT available to cline workers unless MCP is explicitly
-configured.
+MCP configuration (live-probed 2026-08-20): Each worker runs in sandbox mode
+via ``--data-dir``, which places the agent core in-process (no hub daemon).
+The MCP settings file is materialized at ``<data-dir>/settings/cline_mcp_settings.json``
+with cao-mcp-server configured per-worker (own CAO_TERMINAL_ID + CAO_TERMINAL_TOKEN).
+Credentials are seeded via a symlink allowlist from ``~/.cline/data/``.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import shlex
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -53,6 +56,7 @@ from cli_agent_orchestrator.services.settings_service import (
     resolve_provider_string_option,
 )
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -62,6 +66,22 @@ CLINE_BINARY = str(Path.home() / ".bun" / "bin" / "cline")
 
 # Scratch directory for message temp files (NOT /tmp — user requirement).
 SCRATCH_DIR = Path("/data/cao-scratch")
+
+# Per-worker sandbox data directory root (D1).
+CLINE_SANDBOX_ROOT = SCRATCH_DIR / "cline-home"
+
+# User's production cline data dir (source for symlinks).
+_CLINE_USER_DATA = Path.home() / ".cline" / "data"
+
+# D2: Symlink allowlist — exactly these files are linked from the user's
+# production data dir into each worker's sandbox. Everything else is fresh.
+# NEVER add db/, sessions/, or locks/ (Do-NOT 4).
+_SANDBOX_SYMLINK_ALLOWLIST: list[tuple[str, ...]] = [
+    ("secrets.json",),
+    ("globalState.json",),
+    ("settings", "providers.json"),
+    ("settings", "global-settings.json"),
+]
 
 # ─── Status detection ─────────────────────────────────────────────────────────
 # The dispatcher loop uses `cat` as an idle sentinel:
@@ -276,6 +296,91 @@ class ClineCliProvider(BaseProvider):
             return resolved
         return "high"
 
+    def _data_dir(self) -> Path:
+        """Return this worker's sandbox data directory path."""
+        return CLINE_SANDBOX_ROOT / self.terminal_id
+
+    def _ensure_data_dir(self) -> Path:
+        """Create the worker's sandbox data dir and seed it with D2 symlinks.
+
+        Returns the data dir path. The dir is created fresh; symlinks point at
+        the user's production cline credentials so the worker is pre-authenticated.
+        """
+        dd = self._data_dir()
+        dd.mkdir(parents=True, exist_ok=True)
+        settings_dir = dd / "settings"
+        settings_dir.mkdir(parents=True, exist_ok=True)
+
+        links_created = 0
+        for parts in _SANDBOX_SYMLINK_ALLOWLIST:
+            link_path = dd.joinpath(*parts)
+            target = _CLINE_USER_DATA.joinpath(*parts)
+            if target.exists() and not link_path.exists():
+                link_path.parent.mkdir(parents=True, exist_ok=True)
+                link_path.symlink_to(target)
+                links_created += 1
+
+        return dd
+
+    def _materialize_mcp_settings(self, dd: Path) -> None:
+        """Write cline_mcp_settings.json into the sandbox settings dir.
+
+        The entry uses resolve_cao_mcp_command(persisted=True) for the binary path
+        and injects this worker's CAO_TERMINAL_ID + CAO_TERMINAL_TOKEN into the
+        env block.
+        """
+        profile = None
+        if self._agent_profile:
+            try:
+                profile = load_agent_profile(self._agent_profile)
+            except (FileNotFoundError, RuntimeError):
+                pass
+
+        # Resolve command from profile or use defaults
+        mcp_servers = profile.mcpServers if profile and profile.mcpServers else {}
+        cao_entry = mcp_servers.get("cao-mcp-server", {})
+        raw_command = cao_entry.get("command", "cao-mcp-server")
+        raw_args = cao_entry.get("args", []) or []
+        command, args = resolve_cao_mcp_command(raw_command, raw_args, persisted=True)
+
+        # Build the MCP settings with per-worker identity
+        env_block: dict[str, str] = {
+            "CAO_TERMINAL_ID": self.terminal_id,
+        }
+        terminal_token = os.environ.get("CAO_TERMINAL_TOKEN", "")
+        if terminal_token:
+            env_block["CAO_TERMINAL_TOKEN"] = terminal_token
+        # Forward endpoint so MCP server can reach the API
+        from cli_agent_orchestrator.utils.http import resolve_endpoint
+        env_block["CAO_ENDPOINT"] = resolve_endpoint()
+        instance_id = os.environ.get("CAO_INSTANCE_ID", "")
+        if instance_id:
+            env_block["CAO_INSTANCE_ID"] = instance_id
+
+        settings = {
+            "mcpServers": {
+                "cao-mcp-server": {
+                    "command": command,
+                    "args": args,
+                    "env": env_block,
+                    "disabled": False,
+                }
+            }
+        }
+
+        settings_file = dd / "settings" / "cline_mcp_settings.json"
+        tmp_file = settings_file.with_suffix(".json.tmp")
+        tmp_file.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        os.replace(str(tmp_file), str(settings_file))
+
+        logger.info(
+            "cline worker %s: sandbox=%s (seeded: %d links), mcp=cao-mcp-server (resolved: %s)",
+            self.terminal_id,
+            dd,
+            sum(1 for p in _SANDBOX_SYMLINK_ALLOWLIST if (dd / Path(*p)).is_symlink()),
+            command,
+        )
+
     def _build_base_args(self) -> str:
         """Build the cline base argument string (everything except the message).
 
@@ -310,6 +415,9 @@ class ClineCliProvider(BaseProvider):
         if system_prompt:
             command_parts.extend(["-s", system_prompt])
 
+        # D1/D3: sandbox mode via --data-dir
+        command_parts.extend(["--data-dir", str(self._data_dir())])
+
         return shlex.join(command_parts)
 
     def _msg_dir(self) -> Path:
@@ -322,10 +430,11 @@ class ClineCliProvider(BaseProvider):
         """Snapshot current cline session IDs via subprocess (quiet, not in pane).
 
         Returns a set of session IDs from `cline history --json`.
+        Uses --data-dir to read the worker's own sandbox history (D3/AC7).
         """
         try:
             result = subprocess.run(
-                [CLINE_BINARY, "history", "--json"],
+                [CLINE_BINARY, "history", "--json", "--data-dir", str(self._data_dir())],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -376,10 +485,14 @@ class ClineCliProvider(BaseProvider):
             self.session_name, self.window_name
         )
 
+        # F329': Set up per-worker sandbox data dir and materialize MCP settings
+        dd = self._ensure_data_dir()
+        self._materialize_mcp_settings(dd)
+
         # Verify cline is available (best-effort).
         try:
             result = subprocess.run(
-                [CLINE_BINARY, "--version"],
+                [CLINE_BINARY, "--version", "--data-dir", str(self._data_dir())],
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -507,7 +620,7 @@ class ClineCliProvider(BaseProvider):
         return "exit"
 
     def cleanup(self) -> None:
-        """Clean up temp files and state."""
+        """Clean up temp files, sandbox dir, and state."""
         self._initialized = False
         # Clean up message temp files.
         scratch = SCRATCH_DIR / "cline-msgs"
@@ -517,3 +630,29 @@ class ClineCliProvider(BaseProvider):
                     f.unlink()
                 except OSError:
                     pass
+
+        # D5: Remove the worker's sandbox data dir.
+        # Guard: only delete if parent is CLINE_SANDBOX_ROOT and basename is our terminal_id.
+        dd = self._data_dir()
+        if dd.parent == CLINE_SANDBOX_ROOT and dd.name == self.terminal_id:
+            if dd.exists():
+                try:
+                    # shutil.rmtree unlinks symlinks without following them (safe for D2 links)
+                    shutil.rmtree(dd)
+                    logger.info("cline worker %s: sandbox dir removed: %s", self.terminal_id, dd)
+                except OSError as exc:
+                    logger.warning(
+                        "cline worker %s: failed to remove sandbox dir %s: %s",
+                        self.terminal_id,
+                        dd,
+                        exc,
+                    )
+        else:
+            logger.warning(
+                "cline worker %s: sandbox dir guard refused removal: %s "
+                "(parent=%s, expected=%s)",
+                self.terminal_id,
+                dd,
+                dd.parent,
+                CLINE_SANDBOX_ROOT,
+            )

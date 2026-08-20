@@ -521,6 +521,12 @@ class CursorCliProvider(BaseProvider):
             if "CAO_TERMINAL_ID" not in env:
                 env["CAO_TERMINAL_ID"] = self.terminal_id
                 servers[server_name]["env"] = env
+            if "CAO_TERMINAL_TOKEN" not in env:
+                import os as _os
+                _token = _os.environ.get("CAO_TERMINAL_TOKEN", "")
+                if _token:
+                    env["CAO_TERMINAL_TOKEN"] = _token
+                    servers[server_name]["env"] = env
 
         # Cursor v2026 plugin manifests are JSON files inside the
         # plugin dir. The exact schema is undocumented in the help

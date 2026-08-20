@@ -576,6 +576,12 @@ class ClaudeCodeProvider(BaseProvider):
                     if "CAO_TERMINAL_ID" not in env:
                         env["CAO_TERMINAL_ID"] = self.terminal_id
                         mcp_config[server_name]["env"] = env
+                    if "CAO_TERMINAL_TOKEN" not in env:
+                        import os as _os
+                        _token = _os.environ.get("CAO_TERMINAL_TOKEN", "")
+                        if _token:
+                            env["CAO_TERMINAL_TOKEN"] = _token
+                            mcp_config[server_name]["env"] = env
 
                 tmp_dir = cao_tmp_dir()
                 mcp_file = tmp_dir / f"{self.terminal_id}.mcp.json"
