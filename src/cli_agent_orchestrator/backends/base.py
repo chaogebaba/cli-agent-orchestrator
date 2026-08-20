@@ -100,6 +100,7 @@ class TerminalBackend(ABC):
         terminal_id: str,
         working_directory: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        terminal_token: Optional[str] = None,
     ) -> str:
         """Create a new terminal session with an initial window.
 
@@ -108,6 +109,7 @@ class TerminalBackend(ABC):
             window_name: Name for the initial window/tab
             terminal_id: Unique terminal identifier to inject into the environment
             working_directory: Optional starting directory
+            terminal_token: Optional per-terminal auth token to inject into the environment
 
         Returns:
             The actual window name assigned by the backend
@@ -204,6 +206,7 @@ class TerminalBackend(ABC):
         working_directory: Optional[str] = None,
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        terminal_token: Optional[str] = None,
     ) -> str:
         """Create a new window/tab in an existing session.
 
@@ -213,6 +216,7 @@ class TerminalBackend(ABC):
             terminal_id: Unique terminal identifier to inject into the environment
             working_directory: Optional starting directory
             window_shell: Optional shell command to run instead of default shell
+            terminal_token: Optional per-terminal auth token to inject into the environment
 
         Returns:
             The actual window name assigned by the backend

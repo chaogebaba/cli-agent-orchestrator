@@ -329,6 +329,7 @@ class HerdrBackend(TerminalBackend):
         terminal_id: str,
         working_directory: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        terminal_token: Optional[str] = None,
     ) -> str:
         """Create a herdr workspace (= CAO session) with an initial tab."""
         import os
@@ -340,7 +341,7 @@ class HerdrBackend(TerminalBackend):
             args.extend(["--cwd", working_directory])
         # Inject CAO identity + operator-forwarded env natively via --env
         # (replaces the former shell ``export`` send-text injection).
-        args.extend(self._build_env_args(terminal_id, session_name, extra_env))
+        args.extend(self._build_env_args(terminal_id, session_name, extra_env, terminal_token=terminal_token))
 
         result = self._run_herdr(args)
 
@@ -482,6 +483,7 @@ class HerdrBackend(TerminalBackend):
         working_directory: Optional[str] = None,
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        terminal_token: Optional[str] = None,
     ) -> str:
         """Create a new tab in the workspace."""
         import os
@@ -496,7 +498,7 @@ class HerdrBackend(TerminalBackend):
             args.extend(["--cwd", working_directory])
         # Inject CAO identity + operator-forwarded env natively via --env
         # (replaces the former shell ``export`` send-text injection).
-        args.extend(self._build_env_args(terminal_id, session_name, extra_env))
+        args.extend(self._build_env_args(terminal_id, session_name, extra_env, terminal_token=terminal_token))
 
         result = self._run_herdr(args)
 
@@ -1007,6 +1009,7 @@ class HerdrBackend(TerminalBackend):
         terminal_id: str,
         session_name: str,
         extra_env: Optional[Dict[str, str]] = None,
+        terminal_token: Optional[str] = None,
     ) -> List[str]:
         """Build ``--env KEY=VALUE`` argument pairs for a create command.
 
@@ -1041,6 +1044,8 @@ class HerdrBackend(TerminalBackend):
         # override them (mirrors TmuxClient, which forces these to win).
         env["CAO_TERMINAL_ID"] = terminal_id
         env["CAO_SESSION_NAME"] = session_name
+        if terminal_token:
+            env["CAO_TERMINAL_TOKEN"] = terminal_token
 
         args: List[str] = []
         for key, value in env.items():

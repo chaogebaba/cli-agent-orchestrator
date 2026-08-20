@@ -48,6 +48,10 @@ def bind_mcp_server_identity(config: dict[str, Any], terminal_id: str) -> dict[s
         "CAO_INSTANCE_ID": os.environ.get("CAO_INSTANCE_ID", ""),
         "CAO_ENDPOINT": resolve_endpoint(),
     }
+    # F332: Forward CAO_TERMINAL_TOKEN so MCP servers can authenticate callbacks
+    terminal_token = os.environ.get("CAO_TERMINAL_TOKEN", "")
+    if terminal_token:
+        expected["CAO_TERMINAL_TOKEN"] = terminal_token
     for key, value in expected.items():
         supplied = env.get(key)
         if supplied is not None and supplied != value:

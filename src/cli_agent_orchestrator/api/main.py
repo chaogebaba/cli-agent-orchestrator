@@ -6637,6 +6637,47 @@ async def create_inbox_message_endpoint(
             },
         )
 
+    # ── F332: Sender-token authentication (before F129 drift block) ──
+    # If the caller presents a valid operator bearer (CAO_AUTH_LOCAL_TOKEN),
+    # the terminal token check is bypassed — the operator is trusted.
+    from cli_agent_orchestrator.security.auth import get_local_bearer
+    operator_bearer = get_local_bearer()
+    auth_header = request.headers.get("authorization", "")
+    has_operator_bearer = (
+        operator_bearer
+        and auth_header.lower().startswith("bearer ")
+        and auth_header[7:] == operator_bearer
+    )
+
+    if not has_operator_bearer:
+        presented_token = request.headers.get("x-cao-terminal-token")
+        from cli_agent_orchestrator.clients.database import SessionLocal as _f332_session
+        with _f332_session() as _f332_db:
+            from cli_agent_orchestrator.services.terminal_token_service import verify_sender_token
+            ok, error_code = verify_sender_token(_f332_db, sender_id, presented_token)
+            if not ok:
+                logger.warning(
+                    "inbox POST rejected: %s sender_id=%s receiver_id=%s presented=%s",
+                    error_code,
+                    sender_id,
+                    receiver_id,
+                    "absent" if not presented_token else "mismatch",
+                )
+                remedy = (
+                    "Callers must present X-CAO-Terminal-Token matching sender_id. "
+                    "Inside a CAO terminal this is $CAO_TERMINAL_TOKEN. "
+                    "Do not hand-write inbox POSTs — call the send_message MCP tool."
+                    if error_code == "E-SENDER-TOKEN"
+                    else "sender_id is not a live terminal issued by this server."
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "code": error_code,
+                        "message": remedy,
+                    },
+                )
+
     # ── F129: Frozen-pin validation (before mb_/direct branch) ──
     # Only validate genuine terminal senders (DB-resident TerminalModel)
     sender_terminal = None

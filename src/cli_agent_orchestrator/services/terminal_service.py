@@ -1339,7 +1339,10 @@ async def create_terminal(
         # terminal's working_directory. This is the effective launch cwd either way.
         resolved_working_directory = _resolve_working_directory(working_directory)
 
-        # Step 2: Create tmux session or window
+        # Step 2: Issue per-terminal auth token (F332) and create tmux session or window
+        import secrets as _secrets
+        terminal_token = _secrets.token_urlsafe(32)
+
         if new_session:
             # Ensure session name has the CAO prefix for identification
             # Prevent duplicate sessions
@@ -1357,6 +1360,7 @@ async def create_terminal(
                 terminal_id,
                 resolved_working_directory,
                 extra_env=env_vars,
+                terminal_token=terminal_token,
             )
             session_created = True  # only set after successful creation
             window_created = True
@@ -1383,6 +1387,7 @@ async def create_terminal(
                     terminal_id,
                     resolved_working_directory,
                     extra_env=extra_env,
+                    terminal_token=terminal_token,
                 )
             except Exception as exc:
                 if lease_token is not None:
@@ -1528,6 +1533,7 @@ async def create_terminal(
                                 metadata=metadata,
                                 worktree_info=_worktree_info_dict,
                                 working_directory=resolved_working_directory,
+                                auth_token=terminal_token,
                                 **init_fields,
                             )
                         else:
@@ -1554,6 +1560,7 @@ async def create_terminal(
                                 metadata=metadata,
                                 worktree_info=_worktree_info_dict,
                                 working_directory=resolved_working_directory,
+                                auth_token=terminal_token,
                                 **init_fields,
                             )
                     else:
@@ -1583,6 +1590,7 @@ async def create_terminal(
                                     metadata=metadata,
                                     worktree_info=_worktree_info_dict,
                                     working_directory=resolved_working_directory,
+                                    auth_token=terminal_token,
                                     **init_fields,
                                 )
                             else:
@@ -1610,6 +1618,7 @@ async def create_terminal(
                                     metadata=metadata,
                                     worktree_info=_worktree_info_dict,
                                     working_directory=resolved_working_directory,
+                                    auth_token=terminal_token,
                                     **init_fields,
                                 )
                         else:
@@ -1636,6 +1645,7 @@ async def create_terminal(
                                     metadata=metadata,
                                     worktree_info=_worktree_info_dict,
                                     working_directory=resolved_working_directory,
+                                    auth_token=terminal_token,
                                     **init_fields,
                                 )
                             else:
@@ -1662,6 +1672,7 @@ async def create_terminal(
                                     metadata=metadata,
                                     worktree_info=_worktree_info_dict,
                                     working_directory=resolved_working_directory,
+                                    auth_token=terminal_token,
                                     **init_fields,
                                 )
         except Exception as exc:

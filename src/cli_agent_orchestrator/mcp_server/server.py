@@ -881,9 +881,17 @@ def _send_to_inbox(
     }
     if park_warm:
         params["park_warm"] = True
+
+    # F332: Attach terminal token header for sender authentication
+    headers: dict[str, str] = {}
+    terminal_token = os.environ.get("CAO_TERMINAL_TOKEN")
+    if terminal_token:
+        headers["X-CAO-Terminal-Token"] = terminal_token
+
     response = cao_http.post(
         f"/terminals/{receiver_id}/inbox/messages",
         params=params,
+        headers=headers or None,
         timeout=_mcp_timeout(),
     )
     response.raise_for_status()

@@ -196,6 +196,12 @@ class OmpProvider(BaseProvider):
                 if "CAO_TERMINAL_ID" not in env:
                     env["CAO_TERMINAL_ID"] = self.terminal_id
                     config["env"] = env
+                if "CAO_TERMINAL_TOKEN" not in env:
+                    import os as _os
+                    _token = _os.environ.get("CAO_TERMINAL_TOKEN", "")
+                    if _token:
+                        env["CAO_TERMINAL_TOKEN"] = _token
+                        config["env"] = env
             servers[name] = config
 
         self._write_private_file(

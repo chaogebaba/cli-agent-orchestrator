@@ -405,6 +405,12 @@ class KimiCliProvider(BaseProvider):
                         if "CAO_TERMINAL_ID" not in env:
                             env["CAO_TERMINAL_ID"] = self.terminal_id
                             mcp_config[server_name]["env"] = env
+                        if "CAO_TERMINAL_TOKEN" not in env:
+                            import os as _os
+                            _token = _os.environ.get("CAO_TERMINAL_TOKEN", "")
+                            if _token:
+                                env["CAO_TERMINAL_TOKEN"] = _token
+                                mcp_config[server_name]["env"] = env
 
                     command_parts.extend(["--mcp-config", json.dumps(mcp_config)])
 

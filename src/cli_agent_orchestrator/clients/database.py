@@ -135,6 +135,7 @@ class TerminalModel(Base):
     reparented_from = Column(String, nullable=True)
     instance_id = Column(String, nullable=True)
     caller_mailbox_id = deferred(Column(String, nullable=True))
+    auth_token = Column(String, nullable=True, unique=True)
     provider_session_id = Column(String, nullable=True)
     recovery_state = Column(String, nullable=True)
     recovery_error = Column(String, nullable=True)
@@ -1101,6 +1102,36 @@ def _ensure_db_dir() -> None:
 
 # Module-level singletons
 _ensure_db_dir()
+
+# ── F334 (#190): Production DB fence ──────────────────────────────────────────
+# If PYTEST_CURRENT_TEST is set (pytest injects this automatically), refuse to
+# bind the real production DATABASE_FILE unless explicitly overridden. This
+# makes it impossible for an import-order regression to silently point the test
+# suite at the production database.
+def _fence_production_db() -> None:
+    """Raise if tests are about to bind the production database."""
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return  # not in a test — no fence
+    if os.environ.get("CAO_ALLOW_PROD_DB_IN_TESTS") == "1":
+        return  # explicit override — operator knows what they're doing
+    import pwd
+    # Use the REAL user home from passwd (immune to HOME env override)
+    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    prod_db_dir = (real_home / ".aws" / "cli-agent-orchestrator" / "db").resolve()
+    resolved_db = DB_DIR.resolve()
+    if resolved_db == prod_db_dir:
+        raise RuntimeError(
+            f"F334 FENCE: test process attempted to bind the PRODUCTION database "
+            f"at {resolved_db / 'cli-agent-orchestrator.db'}. "
+            f"This means CAO_HOME_DIR was not set before constants.py was imported. "
+            f"Set CAO_HOME_DIR to a temp dir in conftest.py BEFORE any "
+            f"cli_agent_orchestrator import, or set CAO_ALLOW_PROD_DB_IN_TESTS=1 "
+            f"to override (contract tests only)."
+        )
+
+
+_fence_production_db()
+
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -1156,6 +1187,7 @@ def init_db() -> None:
     _migrate_f218_dead_supervisor_safety()
     _migrate_f129_frozen_authority()
     _migrate_f127_resolved_model()
+    _migrate_terminal_auth_token()
 
 
 def _migrate_f218_dead_supervisor_safety() -> None:
@@ -1321,6 +1353,14 @@ def _migrate_f127_resolved_model() -> None:
             connection.execute(
                 _text("ALTER TABLE terminals ADD COLUMN resolved_model TEXT DEFAULT NULL")
             )
+
+
+def _migrate_terminal_auth_token() -> None:
+    """F332: Add nullable auth_token column to terminals table for sender authentication."""
+    with engine.begin() as connection:
+        columns = connection.execute(text("PRAGMA table_info(terminals)")).mappings().all()
+        if columns and "auth_token" not in {row["name"] for row in columns}:
+            connection.execute(text("ALTER TABLE terminals ADD COLUMN auth_token TEXT"))
 
 
 def _migrate_fx191_trace_extension() -> None:
@@ -2749,6 +2789,7 @@ def create_terminal(
     worktree_info: Optional[Dict[str, str]] = None,
     authority_files: Optional[List[Dict[str, str]]] = None,
     resolved_model: Optional[str] = None,
+    auth_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -2778,6 +2819,7 @@ def create_terminal(
             metadata_json=_json.dumps(metadata) if metadata else None,
             worktree_info=_json.dumps(worktree_info) if worktree_info else None,
             resolved_model=resolved_model,
+            auth_token=auth_token,
         )
         db.add(terminal)
         db.flush()

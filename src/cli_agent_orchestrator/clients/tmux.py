@@ -371,6 +371,7 @@ class TmuxClient:
         terminal_id: str,
         working_directory: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        terminal_token: Optional[str] = None,
     ) -> str:
         """Create detached tmux session with initial window and return window name."""
         try:
@@ -410,6 +411,8 @@ class TmuxClient:
             # value. See issue #248.
             self._merge_extra_env(environment, extra_env)
             environment["CAO_TERMINAL_ID"] = terminal_id
+            if terminal_token:
+                environment["CAO_TERMINAL_TOKEN"] = terminal_token
 
             # Explicit 220x50 pane size avoids the default 80x24 that tmux
             # assigns to detached sessions. kiro-cli 2.1.x's TUI v2 fails to
@@ -487,6 +490,7 @@ class TmuxClient:
         working_directory: Optional[str] = None,
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        terminal_token: Optional[str] = None,
     ) -> str:
         """Create window in session and return window name.
 
@@ -504,6 +508,8 @@ class TmuxClient:
             window_env: dict[str, str] = {}
             self._merge_extra_env(window_env, extra_env)
             window_env["CAO_TERMINAL_ID"] = terminal_id
+            if terminal_token:
+                window_env["CAO_TERMINAL_TOKEN"] = terminal_token
 
             kwargs: dict = {
                 "window_name": window_name,

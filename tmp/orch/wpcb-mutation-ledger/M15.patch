@@ -1,0 +1,27 @@
+diff --git a/src/cli_agent_orchestrator/api/main.py b/src/cli_agent_orchestrator/api/main.py
+index 7971ef5b..2d709f02 100644
+--- a/src/cli_agent_orchestrator/api/main.py
++++ b/src/cli_agent_orchestrator/api/main.py
+@@ -6656,20 +6656,8 @@ async def create_inbox_message_endpoint(
+                     receiver_id,
+                     "absent" if not presented_token else "mismatch",
+                 )
+-                remedy = (
+-                    "Callers must present X-CAO-Terminal-Token matching sender_id. "
+-                    "Inside a CAO terminal this is $CAO_TERMINAL_TOKEN. "
+-                    "Do not hand-write inbox POSTs — call the send_message MCP tool."
+-                    if error_code == "E-SENDER-TOKEN"
+-                    else "sender_id is not a live terminal issued by this server."
+-                )
+-                raise HTTPException(
+-                    status_code=status.HTTP_403_FORBIDDEN,
+-                    detail={
+-                        "code": error_code,
+-                        "message": remedy,
+-                    },
+-                )
++                # M15 MUTANT: log but don't refuse — simulates check after drift
++                pass
+ 
+     # ── F129: Frozen-pin validation (before mb_/direct branch) ──
+     # Only validate genuine terminal senders (DB-resident TerminalModel)
