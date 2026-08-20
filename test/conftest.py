@@ -115,6 +115,9 @@ pytest_plugins = (
     "test.plugins.quarantine_expiry",
     "test.plugins.env_capabilities",
     "test.plugins.resource_census",
+    "test.plugins.basetemp_offload",
+    "test.plugins.tmux_finalizer",
+    "test.plugins.worktree_pruner",
 )
 
 

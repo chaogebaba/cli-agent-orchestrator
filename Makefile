@@ -18,7 +18,7 @@ check-ext-apps-skills:
 	uv run python scripts/vendor_ext_apps_skills.py --check
 
 
-.PHONY: test-smoke test-full test-quick test-ci test-live test-hygiene test-census test-tiers
+.PHONY: test-smoke test-full test-quick test-ci test-live test-hygiene test-census test-tiers clean-test-residue
 
 # --- F273: /data preflight — fail-fast when /data is not mounted ---
 # Every fenced test target exports TMPDIR=/data/cao-scratch/tmp so pytest, xdist
@@ -92,3 +92,14 @@ test-census:
 # F254 D17: tier census — collect-only, writes test/tier-census.json.
 test-tiers:
 	uv run pytest --collect-only -q -n 0 --tier-report=test/tier-census.json $(ARGS)
+
+
+
+# F330: Fenced sweep of all test-suite residue classes.
+# Safety: matches ONLY test-created naming prefixes; can NEVER touch live sessions.
+# Use --dry-run to preview without removing anything.
+clean-test-residue:
+	uv run python scripts/clean_test_residue.py
+
+clean-test-residue-dry:
+	uv run python scripts/clean_test_residue.py --dry-run
