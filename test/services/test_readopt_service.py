@@ -7,6 +7,7 @@ subprocess calls so these tests never touch the real tmux server.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -18,6 +19,7 @@ from cli_agent_orchestrator.clients.database import (
     SessionLocal,
     TerminalModel,
 )
+from cli_agent_orchestrator.models.terminal import InboxReceiverId
 from cli_agent_orchestrator.services.readopt_service import (
     ReadoptPlan,
     ReadoptResult,
@@ -25,6 +27,19 @@ from cli_agent_orchestrator.services.readopt_service import (
     apply_readopt,
     scan_for_orphans,
 )
+
+# Extract the raw regex from the Annotated type's StringConstraints
+_INBOX_RECEIVER_ID_PATTERN: re.Pattern = re.compile(
+    InboxReceiverId.__metadata__[0].pattern  # type: ignore[attr-defined]
+)
+
+
+def _assert_valid_inbox_receiver_id(value: str) -> None:
+    """Assert that value matches the system-wide InboxReceiverId contract."""
+    assert _INBOX_RECEIVER_ID_PATTERN.match(value), (
+        f"'{value}' does not match InboxReceiverId pattern "
+        f"'{_INBOX_RECEIVER_ID_PATTERN.pattern}'"
+    )
 
 
 class TestWindowNamePattern:
@@ -149,6 +164,20 @@ class TestScanForOrphans:
         assert result.planned == []
         assert "abcd1234" in result.skipped_existing
 
+    @patch("cli_agent_orchestrator.services.readopt_service._resolve_provider_for_profile")
+    def test_unresolvable_profile_skipped_with_warning(self, mock_provider):
+        """D4: unresolvable profiles must be skipped, not recorded with a wrong provider."""
+        mock_provider.return_value = None  # Cannot resolve
+
+        windows = [
+            ("cao-mystery", "unknown_profile-dead0000"),
+        ]
+        result = scan_for_orphans(tmux_windows=windows)
+        assert result.planned == []
+        assert len(result.errors) == 1
+        assert "dead0000" in result.errors[0]
+        assert "unknown_profile" in result.errors[0]
+
 
 class TestApplyReadopt:
     """Test that apply_readopt writes the correct rows."""
@@ -198,8 +227,11 @@ class TestApplyReadopt:
             term = db.query(TerminalModel).filter_by(id="ee334455").one()
             assert term.lifecycle == "sticky"
 
-            # Check mailbox
-            mbx = db.query(MailboxModel).filter_by(id="mbx-ee334455").one()
+            # Check mailbox — must use mb_ prefix per InboxReceiverId contract
+            expected_mbx_id = "mb_ee334455"
+            _assert_valid_inbox_receiver_id(expected_mbx_id)
+
+            mbx = db.query(MailboxModel).filter_by(id=expected_mbx_id).one()
             assert mbx.session_name == "cao-sup-test"
             assert mbx.role == "supervisor"
             assert mbx.current_terminal_id == "ee334455"
@@ -207,10 +239,21 @@ class TestApplyReadopt:
             # Check incarnation
             inc = (
                 db.query(MailboxIncarnationModel)
-                .filter_by(mailbox_id="mbx-ee334455", generation=1)
+                .filter_by(mailbox_id=expected_mbx_id, generation=1)
                 .one()
             )
             assert inc.terminal_id == "ee334455"
+
+    def test_mailbox_id_matches_inbox_receiver_id_pattern(self):
+        """D2: readopted mailbox IDs must match the InboxReceiverId contract."""
+        # Verify the mb_ + 8-hex pattern matches
+        _assert_valid_inbox_receiver_id("mb_deadbeef")
+        _assert_valid_inbox_receiver_id("mb_00112233")
+        _assert_valid_inbox_receiver_id("mb_abcdef01")
+
+        # Verify the OLD scheme would NOT match (regression guard)
+        assert not _INBOX_RECEIVER_ID_PATTERN.match("mbx-deadbeef")
+        assert not _INBOX_RECEIVER_ID_PATTERN.match("mbx-00112233")
 
     def test_apply_skips_if_appeared_between_scan_and_apply(self):
         """Simulate a race: terminal appears between scan and apply."""

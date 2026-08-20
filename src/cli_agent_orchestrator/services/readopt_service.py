@@ -33,9 +33,6 @@ _WINDOW_NAME_RE = re.compile(r"^(.+)-([0-9a-f]{8})$")
 # Profiles with these roles get a supervisor mailbox
 _SUPERVISOR_ROLES = frozenset({"supervisor"})
 
-# Fallback provider when profile cannot be resolved
-_FALLBACK_PROVIDER = "kiro_cli"
-
 
 @dataclass(frozen=True)
 class ReadoptPlan:
@@ -85,14 +82,30 @@ def _list_tmux_windows() -> list[tuple[str, str]]:
     return results
 
 
-def _resolve_provider_for_profile(profile_name: str) -> str:
-    """Resolve the provider for a profile name. Falls back to kiro_cli."""
-    try:
-        from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
+def _resolve_provider_for_profile(profile_name: str) -> str | None:
+    """Resolve the provider for a profile name.
 
-        return resolve_provider(profile_name, _FALLBACK_PROVIDER)
-    except Exception:
-        return _FALLBACK_PROVIDER
+    Returns None when the profile cannot be loaded at all (file missing,
+    parse error) — the caller must skip the terminal rather than record a
+    wrong provider that delete_terminal's provider-specific cleanup would
+    later act on.
+    """
+    try:
+        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+
+        profile = load_agent_profile(profile_name)
+        if profile.provider:
+            from cli_agent_orchestrator.constants import PROVIDERS
+
+            if profile.provider in PROVIDERS:
+                return profile.provider
+        # Profile loaded but has no explicit provider — use default
+        from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
+
+        return DEFAULT_PROVIDER
+    except (FileNotFoundError, RuntimeError, ValueError):
+        # Profile cannot be resolved — caller must skip this terminal
+        return None
 
 
 def _resolve_role_for_profile(profile_name: str) -> str | None:
@@ -168,6 +181,17 @@ def scan_for_orphans(
             continue
 
         provider = _resolve_provider_for_profile(profile_name)
+        if provider is None:
+            # D4: cannot resolve provider truthfully — skip with warning
+            msg = (
+                f"skipped {terminal_id} (session={sess}): "
+                f"profile '{profile_name}' not found or invalid — "
+                f"cannot determine provider"
+            )
+            result.errors.append(msg)
+            logger.warning("f335_readopt_skip_unresolvable: %s", msg)
+            continue
+
         is_supervisor = _is_supervisor_profile(profile_name)
         lifecycle = "sticky" if is_supervisor else "ephemeral"
 
@@ -229,7 +253,7 @@ def apply_readopt(result: ReadoptResult) -> ReadoptResult:
 
                 # Insert supervisor mailbox + incarnation if needed
                 if plan.needs_mailbox:
-                    mailbox_id = f"mbx-{plan.terminal_id}"
+                    mailbox_id = f"mb_{plan.terminal_id}"
                     mailbox = MailboxModel(
                         id=mailbox_id,
                         session_name=plan.tmux_session,
