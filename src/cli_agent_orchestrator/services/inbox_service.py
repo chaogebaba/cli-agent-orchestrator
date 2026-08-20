@@ -465,6 +465,15 @@ _wake_states: dict[str, _WakeState] = {}
 _failure_streaks: dict[str, int] = {}
 _BACKOFF_SCHEDULE = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
 
+# F339: Max consecutive terminal-not-found failures before dead-lettering the
+# delivery episode. Mirrors SQS maxReceiveCount=3 / Cloudflare Queues default=3.
+MAX_GHOST_RETRIES = 3
+
+# F339: Terminals whose delivery episodes have been permanently abandoned.
+# Once a terminal enters this set, _f136_run_callback_delivery returns
+# immediately with ghost_terminal_abandoned — no further work is attempted.
+_ghost_abandoned: set[str] = set()
+
 
 @dataclass
 class CallbackRunOutcome:
@@ -569,6 +578,9 @@ def clear_terminal_delivery_state(terminal_id: str) -> None:
     """Clear per-terminal state while retaining permanent delivery-lock identity."""
     with _delivery_seq_guard:
         _delivery_wake_seq.pop(terminal_id, None)
+    # F339: Allow re-delivery if the terminal is re-created
+    _ghost_abandoned.discard(terminal_id)
+    _failure_streaks.pop(terminal_id, None)
     service = globals().get("inbox_service")
     if isinstance(service, InboxService):
         service._clear_identity_authority(terminal_id)
@@ -784,6 +796,10 @@ class InboxService:
         MAX_ROWS_PER_RUN = 50
         MAX_SECONDS_PER_RUN = 0.200
 
+        # F339: If this terminal has already been permanently abandoned, short-circuit.
+        if terminal_id in _ghost_abandoned:
+            return CallbackRunOutcome(reason="ghost_terminal_abandoned")
+
         # Resolve mailbox for this terminal
         from cli_agent_orchestrator.clients.database import (
             MailboxIncarnationModel,
@@ -857,6 +873,26 @@ class InboxService:
                             retryable_failure_count=1,
                         )
                 else:
+                    # F339: Ghost terminal detection — self-heal failed because
+                    # terminal metadata is gone. Check bounded-retry budget.
+                    streak = _failure_streaks.get(terminal_id, 0)
+                    if streak >= MAX_GHOST_RETRIES:
+                        # Budget exhausted — dead-letter this episode.
+                        logger.warning(
+                            "F339 dead-letter: ghost terminal %s — delivery episode "
+                            "abandoned after %d consecutive terminal-not-found failures",
+                            terminal_id,
+                            streak,
+                        )
+                        # Mark permanently abandoned and clear wake state
+                        _ghost_abandoned.add(terminal_id)
+                        with _delivery_seq_guard:
+                            _wake_states.pop(terminal_id, None)
+                        _failure_streaks.pop(terminal_id, None)
+                        return CallbackRunOutcome(
+                            cursor_before=batch.cursor,
+                            reason="ghost_terminal_abandoned",
+                        )
                     return CallbackRunOutcome(
                         cursor_before=batch.cursor,
                         reason="no_path",
@@ -1050,6 +1086,14 @@ class InboxService:
 
     def _f136_post_delivery(self, terminal_id: str, outcome: "CallbackRunOutcome") -> None:
         """D15: After delivery, decide: immediate rerun, delayed retry, or idle."""
+        # F339: Ghost terminal abandoned — ensure wake state stays cleared and
+        # no further wakes are scheduled, even if request_delivery re-created it
+        # between the runner's pop and this point.
+        if outcome.reason == "ghost_terminal_abandoned":
+            with _delivery_seq_guard:
+                _wake_states.pop(terminal_id, None)
+            return
+
         # fx168 FIX-2: Perform stale-path reconcile outside the runner's lock scope.
         # set_supervisor_callback_inbox_path acquires its own locks and signals
         # request_delivery internally; the needs_immediate_wake flag re-arms the runner.
