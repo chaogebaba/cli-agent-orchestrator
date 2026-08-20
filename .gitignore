@@ -83,3 +83,4 @@ target/
 # committing one would put a multi-MB executable into the history the weekly
 # gitleaks sweep scans, for the same reason target/ is ignored. (#321)
 wheelhouse/
+node_modules
