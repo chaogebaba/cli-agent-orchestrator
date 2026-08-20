@@ -1,0 +1,8 @@
+[gw0] linux -- Python 3.14.7 /home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/9b0f21a0/.venv/bin/python
+E   AssertionError: assert '--data-dir' in '/home/chao/.bun/bin/cline --auto-approve true -P cline-pass --thinking high'
+/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/9b0f21a0/test/providers/test_cline_sandbox.py:43: AssertionError: assert '--data-dir' in '/home/chao/.bun/bin/cline --auto-approve true -P cline-pass --thinking high'
+=========================== short test summary info ============================
+FAILED test/providers/test_cline_sandbox.py::TestAC7_DataDirInSubprocessCalls::test_build_base_args_includes_data_dir
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+!!!!!!!!!!!! xdist.dsession.Interrupted: stopping after 1 failures !!!!!!!!!!!!!
+1 failed, 1 passed in 2.92s

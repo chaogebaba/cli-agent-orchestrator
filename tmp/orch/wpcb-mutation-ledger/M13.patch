@@ -1,12 +1,13 @@
+diff --git a/src/cli_agent_orchestrator/services/terminal_token_service.py b/src/cli_agent_orchestrator/services/terminal_token_service.py
+index 0ded355e..bfc10aa5 100644
 --- a/src/cli_agent_orchestrator/services/terminal_token_service.py
 +++ b/src/cli_agent_orchestrator/services/terminal_token_service.py
-@@ -49,7 +49,8 @@ def verify_sender_token(
+@@ -51,7 +51,7 @@ def verify_sender_token(
      if terminal is None or terminal.auth_token is None:
          return False, "E-SENDER-UNKNOWN"
  
 -    if not hmac.compare_digest(terminal.auth_token, presented):
-+    # M10 MUTANT: only check token existence, not binding to sender_id
-+    if not presented:
++    if terminal.auth_token != presented:  # M13: timing-vulnerable ==
          return False, "E-SENDER-TOKEN"
  
      return True, ""

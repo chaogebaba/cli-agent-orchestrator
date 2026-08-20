@@ -1,0 +1,12 @@
+diff --git a/src/cli_agent_orchestrator/providers/cline_cli.py b/src/cli_agent_orchestrator/providers/cline_cli.py
+index 532726bc..75b1172b 100644
+--- a/src/cli_agent_orchestrator/providers/cline_cli.py
++++ b/src/cli_agent_orchestrator/providers/cline_cli.py
+@@ -81,6 +81,7 @@ _SANDBOX_SYMLINK_ALLOWLIST: list[tuple[str, ...]] = [
+     ("globalState.json",),
+     ("settings", "providers.json"),
+     ("settings", "global-settings.json"),
++    ("db",),  # M4: added db
+ ]
+ 
+ # ─── Status detection ─────────────────────────────────────────────────────────

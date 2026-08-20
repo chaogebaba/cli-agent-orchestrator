@@ -1,3 +1,4 @@
 $ uv run pytest test/api/test_security.py test/api/test_lifespan_inbox.py test/backends/ test/providers/test_base_provider.py -q --tb=no
-# Run at branch commit 38385e0f (full WP-CALLBACKS build)
+# Full branch source
+# Commit: e2284a7a
 247 passed in 7.00s

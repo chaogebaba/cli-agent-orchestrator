@@ -1,0 +1,13 @@
+diff --git a/src/cli_agent_orchestrator/mcp_server/server.py b/src/cli_agent_orchestrator/mcp_server/server.py
+index c314e780..bfc3815b 100644
+--- a/src/cli_agent_orchestrator/mcp_server/server.py
++++ b/src/cli_agent_orchestrator/mcp_server/server.py
+@@ -886,7 +886,7 @@ def _send_to_inbox(
+     headers: dict[str, str] = {}
+     terminal_token = os.environ.get("CAO_TERMINAL_TOKEN")
+     if terminal_token:
+-        headers["X-CAO-Terminal-Token"] = terminal_token
++        headers["Authorization"] = f"Bearer {terminal_token}"  # M9
+ 
+     response = cao_http.post(
+         f"/terminals/{receiver_id}/inbox/messages",

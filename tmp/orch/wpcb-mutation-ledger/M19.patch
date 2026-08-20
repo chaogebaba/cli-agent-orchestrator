@@ -1,0 +1,13 @@
+diff --git a/src/cli_agent_orchestrator/mcp_server/app_tools.py b/src/cli_agent_orchestrator/mcp_server/app_tools.py
+index 1c3e83fd..49a59e03 100644
+--- a/src/cli_agent_orchestrator/mcp_server/app_tools.py
++++ b/src/cli_agent_orchestrator/mcp_server/app_tools.py
+@@ -152,7 +152,7 @@ def _post_json(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+     """
+     import os
+ 
+-    headers = _auth_headers() or {}
++    headers = {}  # M19: removed auth_headers
+     # F332: Attach terminal token header for sender authentication
+     terminal_token = os.environ.get("CAO_TERMINAL_TOKEN")
+     if terminal_token:

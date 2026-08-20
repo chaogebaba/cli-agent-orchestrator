@@ -1,0 +1,17 @@
+diff --git a/src/cli_agent_orchestrator/services/terminal_token_service.py b/src/cli_agent_orchestrator/services/terminal_token_service.py
+index 0ded355e..9836985e 100644
+--- a/src/cli_agent_orchestrator/services/terminal_token_service.py
++++ b/src/cli_agent_orchestrator/services/terminal_token_service.py
+@@ -48,8 +48,11 @@ def verify_sender_token(
+         return False, "E-SENDER-TOKEN"
+ 
+     terminal = db.query(TerminalModel).filter_by(id=sender_id).first()
+-    if terminal is None or terminal.auth_token is None:
++    if terminal is None:
+         return False, "E-SENDER-UNKNOWN"
++    if terminal.auth_token is None:
++        # M12 MUTANT: treat NULL token as grandfathered — allow
++        return True, ""
+ 
+     if not hmac.compare_digest(terminal.auth_token, presented):
+         return False, "E-SENDER-TOKEN"

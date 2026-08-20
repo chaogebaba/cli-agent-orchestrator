@@ -1,0 +1,13 @@
+diff --git a/src/cli_agent_orchestrator/providers/cline_cli.py b/src/cli_agent_orchestrator/providers/cline_cli.py
+index 532726bc..bfdb2003 100644
+--- a/src/cli_agent_orchestrator/providers/cline_cli.py
++++ b/src/cli_agent_orchestrator/providers/cline_cli.py
+@@ -634,7 +634,7 @@ class ClineCliProvider(BaseProvider):
+         # D5: Remove the worker's sandbox data dir.
+         # Guard: only delete if parent is CLINE_SANDBOX_ROOT and basename is our terminal_id.
+         dd = self._data_dir()
+-        if dd.parent == CLINE_SANDBOX_ROOT and dd.name == self.terminal_id:
++        if True:  # M8: no guard
+             if dd.exists():
+                 try:
+                     # shutil.rmtree unlinks symlinks without following them (safe for D2 links)

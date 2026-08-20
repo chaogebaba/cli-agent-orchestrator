@@ -1,0 +1,6 @@
+/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/9b0f21a0/test/api/test_inbox_sender_token.py:205: assert 404 == 403
+=========================== short test summary info ============================
+FAILED test/api/test_inbox_sender_token.py::TestAC9_TokenCheckPrecedesDrift::test_forged_sender_with_drift_gets_403_not_drift_notice
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+!!!!!!!!!!!! xdist.dsession.Interrupted: stopping after 1 failures !!!!!!!!!!!!!
+1 failed in 4.25s

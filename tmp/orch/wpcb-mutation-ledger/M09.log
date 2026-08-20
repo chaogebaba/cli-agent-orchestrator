@@ -1,0 +1,6 @@
+/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/9b0f21a0/test/mcp_server/test_terminal_token_header.py:38: AssertionError: assert None == 'test_secret_token_123'
+=========================== short test summary info ============================
+FAILED test/mcp_server/test_terminal_token_header.py::TestSendToInboxHeader::test_token_header_attached
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+!!!!!!!!!!!! xdist.dsession.Interrupted: stopping after 1 failures !!!!!!!!!!!!!
+1 failed in 5.91s

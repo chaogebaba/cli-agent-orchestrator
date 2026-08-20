@@ -1,0 +1,13 @@
+diff --git a/src/cli_agent_orchestrator/providers/cline_cli.py b/src/cli_agent_orchestrator/providers/cline_cli.py
+index 532726bc..97eb61d7 100644
+--- a/src/cli_agent_orchestrator/providers/cline_cli.py
++++ b/src/cli_agent_orchestrator/providers/cline_cli.py
+@@ -638,7 +638,7 @@ class ClineCliProvider(BaseProvider):
+             if dd.exists():
+                 try:
+                     # shutil.rmtree unlinks symlinks without following them (safe for D2 links)
+-                    shutil.rmtree(dd)
++                    import subprocess; subprocess.run(["rm", "-rf", str(dd)], check=True)  # M7: rm -rf follows symlinks
+                     logger.info("cline worker %s: sandbox dir removed: %s", self.terminal_id, dd)
+                 except OSError as exc:
+                     logger.warning(
