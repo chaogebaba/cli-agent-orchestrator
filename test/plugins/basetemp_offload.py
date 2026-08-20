@@ -49,7 +49,12 @@ def pytest_configure(config: pytest.Config) -> None:
         return
 
     basetemp = _resolve_basetemp()
-    basetemp.mkdir(parents=True, exist_ok=True)
+    try:
+        basetemp.mkdir(parents=True, exist_ok=True)
+    except (PermissionError, OSError):
+        # The configured path is not creatable on this host (e.g. CI runner
+        # without /data). Fall back to pytest's default basetemp.
+        return
 
     # Override the internal config option so tmp_path / tmp_path_factory use it.
     config.option.basetemp = str(basetemp)

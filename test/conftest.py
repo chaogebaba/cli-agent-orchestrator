@@ -118,6 +118,7 @@ pytest_plugins = (
     "test.plugins.basetemp_offload",
     "test.plugins.tmux_finalizer",
     "test.plugins.worktree_pruner",
+    "test.plugins.xdist_remove_node_fix",
 )
 
 
