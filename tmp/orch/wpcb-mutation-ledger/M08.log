@@ -1,6 +1,6 @@
-[suite-slot] lock acquired — pid=2601832 terminal=9b0f21a0 since=2026-08-20T07:12:52Z
-bringing up nodes...
-bringing up nodes...
-
-.                                                                        [100%]
-1 passed in 2.14s
+/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/9b0f21a0/test/providers/test_cline_sandbox.py:197: AssertionError: Guard failed to refuse — dir was deleted despite parent mismatch
+=========================== short test summary info ============================
+FAILED test/providers/test_cline_sandbox.py::TestAC15_CleanupSandboxDir::test_cleanup_refuses_wrong_parent
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+!!!!!!!!!!!! xdist.dsession.Interrupted: stopping after 1 failures !!!!!!!!!!!!!
+1 failed in 2.92s

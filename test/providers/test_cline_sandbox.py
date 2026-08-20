@@ -68,46 +68,50 @@ class TestAC7_DataDirInSubprocessCalls:
 class TestAC8_MaterializedMCPSettings:
     """AC8: The materialized MCP settings entry is correct and resolved."""
 
-    def test_mcp_settings_content(self, cline_provider, tmp_path):
-        """cline_mcp_settings.json has correct command, env with terminal ID + token."""
-        from cli_agent_orchestrator.providers.cline_cli import CLINE_SANDBOX_ROOT
+    def test_mcp_settings_uses_resolved_command(self, cline_provider, tmp_path):
+        """M6 kill: materialized command comes from resolve_cao_mcp_command, not hardcoded."""
+        # Mock resolve_cao_mcp_command to return a known sentinel value.
+        # If the provider hardcodes the path instead of calling the resolver,
+        # the settings file will NOT contain our sentinel.
+        SENTINEL_CMD = "/resolved/by/mcp_resolution/cao-mcp-server"
+        SENTINEL_ARGS = ["--resolved-arg"]
 
-        # Override the sandbox root to use tmp_path
         with patch(
             "cli_agent_orchestrator.providers.cline_cli.CLINE_SANDBOX_ROOT", tmp_path
+        ), patch(
+            "cli_agent_orchestrator.providers.cline_cli._CLINE_USER_DATA",
+            tmp_path / "fake_user_data",
+        ), patch.dict(os.environ, {
+            "CAO_TERMINAL_TOKEN": "test_token_xyz",
+            "CAO_INSTANCE_ID": "inst_1",
+        }), patch(
+            "cli_agent_orchestrator.utils.http.resolve_endpoint",
+            return_value="http://localhost:9889",
+        ), patch(
+            "cli_agent_orchestrator.providers.cline_cli.load_agent_profile",
+            side_effect=FileNotFoundError,
+        ), patch(
+            "cli_agent_orchestrator.providers.cline_cli.resolve_cao_mcp_command",
+            return_value=(SENTINEL_CMD, SENTINEL_ARGS),
         ):
-            with patch(
-                "cli_agent_orchestrator.providers.cline_cli._CLINE_USER_DATA",
-                tmp_path / "fake_user_data",
-            ):
-                dd = tmp_path / cline_provider.terminal_id
-                dd.mkdir(parents=True)
-                (dd / "settings").mkdir(parents=True)
-
-                with patch.dict(os.environ, {
-                    "CAO_TERMINAL_TOKEN": "test_token_xyz",
-                    "CAO_INSTANCE_ID": "inst_1",
-                }):
-                    with patch(
-                        "cli_agent_orchestrator.utils.http.resolve_endpoint",
-                        return_value="http://localhost:9889",
-                    ):
-                        with patch(
-                            "cli_agent_orchestrator.providers.cline_cli.load_agent_profile",
-                            side_effect=FileNotFoundError,
-                        ):
-                            cline_provider._materialize_mcp_settings(dd)
+            dd = tmp_path / cline_provider.terminal_id
+            dd.mkdir(parents=True)
+            (dd / "settings").mkdir(parents=True)
+            cline_provider._materialize_mcp_settings(dd)
 
         settings_file = dd / "settings" / "cline_mcp_settings.json"
         assert settings_file.exists()
 
         settings = json.loads(settings_file.read_text())
-        servers = settings["mcpServers"]
-        assert "cao-mcp-server" in servers
-
-        entry = servers["cao-mcp-server"]
+        entry = settings["mcpServers"]["cao-mcp-server"]
         assert entry["disabled"] is False
-        assert entry["command"]  # resolved, not empty
+
+        # AC8 tightened: command MUST equal the resolver's return value
+        assert entry["command"] == SENTINEL_CMD, (
+            f"Materialized command {entry['command']!r} != resolver return {SENTINEL_CMD!r}. "
+            f"M6 mutant (hardcoded path) would produce the hardcoded value here."
+        )
+        assert entry["args"] == SENTINEL_ARGS
         assert entry["env"]["CAO_TERMINAL_ID"] == "abc12345"
         assert entry["env"]["CAO_TERMINAL_TOKEN"] == "test_token_xyz"
         assert entry["env"]["CAO_ENDPOINT"] == "http://localhost:9889"
@@ -146,24 +150,48 @@ class TestAC15_CleanupSandboxDir:
         assert user_secrets.exists()
 
     def test_cleanup_refuses_wrong_parent(self, cline_provider, tmp_path):
-        """cleanup() refuses if parent is not CLINE_SANDBOX_ROOT."""
-        wrong_root = tmp_path / "wrong-root"
-        wrong_root.mkdir()
-        dd = wrong_root / cline_provider.terminal_id
-        dd.mkdir()
+        """cleanup() refuses if _data_dir()'s parent doesn't match CLINE_SANDBOX_ROOT.
 
-        # Set CLINE_SANDBOX_ROOT to something different
-        correct_root = tmp_path / "cline-home"
-        correct_root.mkdir()
+        Fixed for M8: _data_dir() and the test's dd must agree so the guard
+        is actually exercised. We create the dir at _data_dir()'s resolved path,
+        then change CLINE_SANDBOX_ROOT so the guard's comparison fails.
+        """
+        # Phase 1: create the sandbox dir at the "original" root
+        original_root = tmp_path / "cline-home"
+        original_root.mkdir()
+        dd = original_root / cline_provider.terminal_id
+        dd.mkdir()
+        (dd / "marker.txt").write_text("should survive")
+
+        # Phase 2: patch CLINE_SANDBOX_ROOT to a DIFFERENT path
+        # so the guard sees dd.parent != CLINE_SANDBOX_ROOT and refuses.
+        different_root = tmp_path / "different-root"
+        different_root.mkdir()
 
         with patch(
-            "cli_agent_orchestrator.providers.cline_cli.CLINE_SANDBOX_ROOT", correct_root
+            "cli_agent_orchestrator.providers.cline_cli.CLINE_SANDBOX_ROOT", different_root
         ):
             with patch(
                 "cli_agent_orchestrator.providers.cline_cli.SCRATCH_DIR", tmp_path
             ):
-                # This should NOT delete dd because parent doesn't match
-                cline_provider.cleanup()
+                # _data_dir() = different_root / terminal_id (doesn't exist)
+                # But we need _data_dir() to point at dd for the guard to fire.
+                # So patch it directly:
+                pass
 
-        # Dir is still there — guard refused
-        assert dd.exists()
+        # Better approach: override _data_dir() to return dd, but set
+        # CLINE_SANDBOX_ROOT to something different from dd's parent.
+        with patch.object(
+            cline_provider, "_data_dir", return_value=dd
+        ):
+            with patch(
+                "cli_agent_orchestrator.providers.cline_cli.CLINE_SANDBOX_ROOT", different_root
+            ):
+                with patch(
+                    "cli_agent_orchestrator.providers.cline_cli.SCRATCH_DIR", tmp_path
+                ):
+                    cline_provider.cleanup()
+
+        # Dir still exists — guard refused deletion because
+        # dd.parent (original_root) != CLINE_SANDBOX_ROOT (different_root)
+        assert dd.exists(), "Guard failed to refuse — dir was deleted despite parent mismatch"

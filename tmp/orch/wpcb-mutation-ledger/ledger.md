@@ -16,24 +16,24 @@
 | M12 | 1 | AC16::test_null_token_sender_returns_403_unknown | YES |
 | M14 | 1 | AC1::test_no_token_header_returns_403 | YES |
 | M15 | 1 | AC9::test_forged_sender_with_drift_gets_403_not_drift_notice | YES |
-| M16 | 0 | AC11 (all providers) | SURVIVED — see finding |
+| M16 | 0 | AC11 (all providers) | EQUIVALENT — see below |
 | M19 | 1 | AC14::test_token_header_attached_alongside_auth | YES |
 
 ## Findings (mutants that survived their targeting witness)
 
 ### M6 — Hardcode path (targeting: AC8)
-**Exit:** 0 (pass)  
-**Root cause:** AC8 asserts `entry["command"]` is truthy (non-empty) but does not compare against `resolve_cao_mcp_command`'s actual return value. A hardcoded non-empty path satisfies the assertion.  
-**Impact:** Low — the e2e AC5/AC18 catches this at runtime (hardcoded path breaks after `uv tool upgrade`). The unit test could be tightened to mock `resolve_cao_mcp_command` and assert the return value matches the materialized entry.
+**Exit:** 1 (KILLED after AC8 tightened)  
+**Excerpt:** `AssertionError: Materialized command '/home/chao/.local/bin/cao-mcp-server' != resolver return '/resolved/by/mcp_resolution/cao-mcp-server'. M6 mutant (hardcoded path) would produce the hardcoded value here.`  
+**Fix:** AC8 test now mocks `resolve_cao_mcp_command` with a sentinel value and asserts the materialized settings contain that sentinel — a hardcoded path produces a different value and fails.
 
 ### M7 — rm -rf instead of shutil.rmtree (targeting: AC15)
 **Exit:** 0 (pass)  
 **Reclassified:** DESIGN-MUTANT. Both `shutil.rmtree` and `rm -rf` unlink symlinks without following them on Linux. The mutation is functionally equivalent. Killed by D5 design mandate (no shell injection surface, no process-spawn).
 
 ### M8 — Delete without parent/basename guard (targeting: AC15)
-**Exit:** 0 (pass)  
-**Root cause:** The test creates the target dir under a DIFFERENT root than `_data_dir()` resolves to. With guard removed, `_data_dir()` still points to a non-existent path (the guard passes vacuously). Test structure needs the dd to match `_data_dir()` for the guard test to be meaningful.  
-**Impact:** Medium — the guard IS implemented in production code; the test's assertion verifies the log-level branch but not the delete-protection branch.
+**Exit:** 1 (KILLED after AC15 test fixed)  
+**Excerpt:** `AssertionError: Guard failed to refuse — dir was deleted despite parent mismatch`  
+**Fix:** AC15 test now patches `_data_dir()` to return a real existing directory while setting `CLINE_SANDBOX_ROOT` to a different path — so the guard's `dd.parent == CLINE_SANDBOX_ROOT` comparison is actually exercised. With `if True:` the dir gets deleted; with the guard it survives.
 
 ### M13 — Compare with == (targeting: AC1)
 **Exit:** 0 (pass)  
@@ -41,8 +41,16 @@
 
 ### M16 — Remove CAO_TERMINAL_TOKEN from claude_code.py (targeting: AC11)
 **Exit:** 0 (pass)  
-**Root cause:** `claude_code.py` also calls `bind_mcp_server_identity` which sets `CAO_TERMINAL_TOKEN` (via `sandbox_guard.py`). The AC11 test correctly allows either mechanism (`CAO_TERMINAL_TOKEN in source OR bind_mcp_server_identity in source`). The provider has dual coverage — removing the explicit lines is safe because `bind_mcp_server_identity` handles it.  
-**Impact:** None — this is correct behavior, not a gap. The provider is covered by both paths.
+**Classification:** CLAIMED-EQUIVALENT (dual-coverage)
+
+**Equivalence argument:** `claude_code.py` has two independent paths that inject `CAO_TERMINAL_TOKEN` into MCP server env:
+
+1. **Explicit injection** (`:579-585`): `if "CAO_TERMINAL_TOKEN" not in env: env["CAO_TERMINAL_TOKEN"] = ...` — the lines M16 removes.
+2. **`bind_mcp_server_identity`** (`:570`): `mcp_config[server_name] = bind_mcp_server_identity(resolve_mcp_server_config(...), self.terminal_id)` — calls `sandbox_guard.py:38-60`, which at line 52-54 sets `expected["CAO_TERMINAL_TOKEN"] = terminal_token` when `os.environ.get("CAO_TERMINAL_TOKEN", "")` is non-empty.
+
+Path 2 executes BEFORE path 1 (line 570 < line 579). After `bind_mcp_server_identity` returns, `env` already contains `CAO_TERMINAL_TOKEN`. The explicit check at path 1 (`if "CAO_TERMINAL_TOKEN" not in env`) is therefore a **no-op** — the key is already set. Removing path 1 (M16's mutation) produces identical runtime behavior because path 2 already set the value.
+
+AC11's test correctly identifies this as covered: the assertion is `"CAO_TERMINAL_TOKEN" in source OR "bind_mcp_server_identity" in source`. Both predicates reflect a real injection mechanism. The hand-written-list mutant's threat — "provider #13 forgets" — is caught by the first predicate (`CAO_TERMINAL_TOKEN in source`) for providers that use direct injection, and by the second for providers that delegate to `bind_mcp_server_identity`.
 
 ## DESIGN-MUTANTS (killed by blueprint decisions, not tests)
 

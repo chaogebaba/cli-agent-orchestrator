@@ -1,6 +1,6 @@
-[suite-slot] lock acquired — pid=2599975 terminal=9b0f21a0 since=2026-08-20T07:11:59Z
-bringing up nodes...
-bringing up nodes...
-
-.                                                                        [100%]
-1 passed in 2.87s
+/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/9b0f21a0/test/providers/test_cline_sandbox.py:110: AssertionError: Materialized command '/home/chao/.local/bin/cao-mcp-server' != resolver return '/resolved/by/mcp_resolution/cao-mcp-server'. M6 mutant (hardcoded path) would produce the hardcoded value here.
+=========================== short test summary info ============================
+FAILED test/providers/test_cline_sandbox.py::TestAC8_MaterializedMCPSettings::test_mcp_settings_uses_resolved_command
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+!!!!!!!!!!!! xdist.dsession.Interrupted: stopping after 1 failures !!!!!!!!!!!!!
+1 failed in 2.82s
