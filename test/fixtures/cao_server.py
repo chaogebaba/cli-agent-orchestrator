@@ -204,6 +204,9 @@ def _subprocess_env(
             "CAO_A2A_DISABLED": "true",
             "OTEL_SDK_DISABLED": "true",
             "PYTHONUNBUFFERED": "1",
+            # F334 (#190): Test-spawned sessions carry a distinctive prefix
+            # so incident triage can distinguish them from production sessions.
+            "CAO_SESSION_PREFIX": "cao-test-",
         }
     )
     if extra:

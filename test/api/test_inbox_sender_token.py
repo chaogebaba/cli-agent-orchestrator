@@ -179,3 +179,37 @@ class TestAC16_SenderUnknown:
         assert response.status_code == 403
         detail = response.json()["detail"]
         assert detail["code"] == "E-SENDER-UNKNOWN"
+
+
+
+class TestAC9_TokenCheckPrecedesDrift:
+    """AC9: The token check precedes the F129 drift block.
+
+    A forged POST naming a sender with drifted frozen pins produces 403
+    and NO drift notice — the token check fires first.
+    """
+
+    def test_forged_sender_with_drift_gets_403_not_drift_notice(self, client):
+        """Even if sender would trigger drift, 403 fires first."""
+        # Create a sender terminal (with token) that will be the "drifted" one
+        _create_terminal_with_token("aa111111", "real_token_for_a")
+        _create_terminal_with_token("bb222222", "token_for_b")
+
+        # Attempt to POST as aa111111 with WRONG token — should 403
+        # before the F129 drift logic ever runs
+        response = client.post(
+            "/terminals/bb222222/inbox/messages",
+            params={"sender_id": "aa111111", "message": "drift trigger"},
+            headers={"X-CAO-Terminal-Token": "wrong_token"},
+        )
+        assert response.status_code == 403
+        detail = response.json()["detail"]
+        assert detail["code"] == "E-SENDER-TOKEN"
+
+        # Verify no drift notice was created (F129 never ran)
+        from cli_agent_orchestrator.clients.database import SessionLocal, InboxModel
+
+        with SessionLocal() as db:
+            # No inbox messages at all for either terminal
+            count = db.query(InboxModel).count()
+            assert count == 0, f"Expected 0 inbox rows, got {count} — drift notice leaked"

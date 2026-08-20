@@ -50,8 +50,10 @@ def _env_positive_float(name: str, default: float) -> float:
 # =============================================================================
 # Session Configuration
 # =============================================================================
-# All CAO-managed tmux sessions are prefixed to distinguish them from user sessions
-SESSION_PREFIX = "cao-"
+# All CAO-managed tmux sessions are prefixed to distinguish them from user sessions.
+# In test environments (CaoServer fixture), CAO_SESSION_PREFIX overrides the
+# default so test-spawned sessions are identifiable during incident triage (#190).
+SESSION_PREFIX = os.environ.get("CAO_SESSION_PREFIX", "cao-")
 
 # =============================================================================
 # Provider Configuration
