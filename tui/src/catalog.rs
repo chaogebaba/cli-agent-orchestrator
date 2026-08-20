@@ -86,7 +86,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 100;
+const COMMAND_COUNT: usize = 101;
 
 /// What the TUI does with a command.
 ///
@@ -183,7 +183,7 @@ pub struct Command {
 ///
 /// `pub(crate)` since Bolt 3: `server-client`'s route-table tests walk it to assert that every
 /// IN-APP command has a route and that no HANDOFF or HIDE command does. Deriving that set any
-/// other way would mean re-listing 98 commands in a second place, which is a worse trade than
+/// other way would mean re-listing 99 commands in a second place, which is a worse trade than
 /// widening the visibility of a compile-time constant. Still crate-private — no consumer outside
 /// this crate exists, and the table is not a public API. (#321)
 pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
@@ -262,7 +262,8 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::BarrierStatus,
     CommandId::BaseRegister,
     CommandId::ConfigReconcile,
-    CommandId::Doctor,
+    CommandId::DoctorCheck,
+    CommandId::DoctorReadopt,
     CommandId::Fold,
     CommandId::LedgerCheck,
     CommandId::MailboxDelete,
@@ -299,9 +300,13 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
 /// the crate is built. (#321)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CommandId {
+    // `cao doctor *`
+    /// `cao doctor check`
+    DoctorCheck,
+    /// `cao doctor readopt`
+    DoctorReadopt,
+
     // Top-level leaves.
-    /// `cao doctor`
-    Doctor,
     /// `cao info`
     Info,
     /// `cao init`
@@ -559,15 +564,25 @@ pub enum CommandId {
 fn entry(id: CommandId) -> Command {
     match id {
 
-        CommandId::Doctor => Command {
-            id: CommandId::Doctor,
-            parent: None,
-            leaf_name: "doctor",
-            summary: "Pre-flight diagnostics: check provider binaries, server health, and profile validity.",
+        CommandId::DoctorCheck => Command {
+            id: CommandId::DoctorCheck,
+            parent: Some("doctor"),
+            leaf_name: "check",
+            summary: "Pre-flight diagnostics: check provider binaries are resolvable and executable.",
             policy: Policy::Hidden,
             params: &[],
             handoff_reason: None,
             // HIDE: diagnostic command, no TUI integration needed
+        },
+        CommandId::DoctorReadopt => Command {
+            id: CommandId::DoctorReadopt,
+            parent: Some("doctor"),
+            leaf_name: "readopt",
+            summary: "Re-adopt live tmux panes whose terminal rows vanished.",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: disaster-recovery command, no TUI integration needed
         },
         CommandId::Info => Command {
             id: CommandId::Info,
@@ -1689,7 +1704,7 @@ mod tests {
         counts
     }
 
-    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 56 HIDE, totalling 98.**
+    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 58 HIDE, totalling 100.**
     ///
     /// Every number here is a **hard-coded literal**, and that is the entire design of the test.
     /// Deriving any of them from the table — `assert_eq!(in_app, TABLE.iter().filter(..).count())`
@@ -1731,11 +1746,11 @@ mod tests {
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 57, "expected 57 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 58, "expected 58 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            99,
-            "the three policy counts must account for all 99 leaf commands of the Click tree"
+            100,
+            "the three policy counts must account for all 100 leaf commands of the Click tree"
         );
 
         // The three counts summing to 99 does not prove 99 *distinct* commands were counted: a
@@ -1745,8 +1760,8 @@ mod tests {
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            98,
-            "DISPLAY_ORDER must list 98 DISTINCT commands; a duplicate would let one command go \
+            99,
+            "DISPLAY_ORDER must list 99 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -1813,7 +1828,8 @@ mod tests {
             #[allow(clippy::needless_match)]
             fn identity(id: CommandId) -> CommandId {
                 match id {
-                    CommandId::Doctor => CommandId::Doctor,
+                    CommandId::DoctorCheck => CommandId::DoctorCheck,
+                    CommandId::DoctorReadopt => CommandId::DoctorReadopt,
                     CommandId::Info => CommandId::Info,
                     CommandId::Init => CommandId::Init,
                     CommandId::Install => CommandId::Install,
