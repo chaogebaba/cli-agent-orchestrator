@@ -271,7 +271,8 @@ fn route(id: CommandId) -> Option<Route> {
         // HIDE: no route exists (`cao info` reads local session context, `cao init` bootstraps
         // the DB, `cao mcp-server` is a foreground server, `cao shutdown` can kill the TUI's own
         // tmux session, `cao tui` must not offer itself, `cao update` may replace the binary).
-        CommandId::Doctor => None,
+        CommandId::DoctorCheck => None,
+        CommandId::DoctorReadopt => None,
         CommandId::Info => None,
         CommandId::Init => None,
         CommandId::McpServer => None,

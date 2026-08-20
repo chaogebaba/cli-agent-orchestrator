@@ -1563,6 +1563,13 @@ async def lifespan(app: FastAPI):
     orphan_reconcile_task = asyncio.create_task(orphan_reconcile_service.run())
     logger.info("F138 OrphanReconcileService started")
 
+    # F335: Periodic SQLite backup (hourly, keep 24)
+    from cli_agent_orchestrator.services.db_backup_service import backup_daemon as _f335_backup
+
+    _f335_backup_task = None if is_sandbox() else asyncio.create_task(_f335_backup())
+    if _f335_backup_task:
+        logger.info("F335 DB backup daemon started")
+
     # Herdr delivers inbox via its own socket events; the tmux backend uses the
     # FIFO -> EventBus pipeline (StatusMonitor / LogWriter / InboxService) started
     # above. Start the herdr inbox service only when the herdr backend is active
