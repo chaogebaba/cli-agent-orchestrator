@@ -1,0 +1,1200 @@
+diff --git a/src/cli_agent_orchestrator/api/main.py b/src/cli_agent_orchestrator/api/main.py
+index 347f0ac8..1a777d9e 100644
+--- a/src/cli_agent_orchestrator/api/main.py
++++ b/src/cli_agent_orchestrator/api/main.py
+@@ -1563,6 +1563,13 @@ async def lifespan(app: FastAPI):
+     orphan_reconcile_task = asyncio.create_task(orphan_reconcile_service.run())
+     logger.info("F138 OrphanReconcileService started")
+ 
++    # F335: Periodic SQLite backup (hourly, keep 24)
++    from cli_agent_orchestrator.services.db_backup_service import backup_daemon as _f335_backup
++
++    _f335_backup_task = None if is_sandbox() else asyncio.create_task(_f335_backup())
++    if _f335_backup_task:
++        logger.info("F335 DB backup daemon started")
++
+     # Herdr delivers inbox via its own socket events; the tmux backend uses the
+     # FIFO -> EventBus pipeline (StatusMonitor / LogWriter / InboxService) started
+     # above. Start the herdr inbox service only when the herdr backend is active
+diff --git a/src/cli_agent_orchestrator/cli/commands/doctor.py b/src/cli_agent_orchestrator/cli/commands/doctor.py
+index 5dbab508..3f15c2df 100644
+--- a/src/cli_agent_orchestrator/cli/commands/doctor.py
++++ b/src/cli_agent_orchestrator/cli/commands/doctor.py
+@@ -1,4 +1,9 @@
+-"""Pre-flight health check for CAO provider binaries."""
++"""Pre-flight health check and registry self-heal for CAO.
++
++Provides:
++- ``cao doctor`` — verify provider binaries are resolvable and executable
++- ``cao doctor readopt`` — re-adopt live tmux panes whose terminal rows vanished
++"""
+ 
+ import os
+ import sys
+@@ -9,9 +14,25 @@ import click
+ from cli_agent_orchestrator.utils.binary_resolution import resolve_provider_binary
+ 
+ 
+-@click.command()
++class _DoctorGroup(click.Group):
++    """Group that invokes the check subcommand when called without a subcommand."""
++
++    def invoke(self, ctx: click.Context) -> None:
++        if not ctx.protected_args and not ctx.invoked_subcommand:
++            # No subcommand given — run the default "check" behaviour
++            ctx.invoke(check)
++            return
++        super().invoke(ctx)
++
++
++@click.group(cls=_DoctorGroup, invoke_without_command=True)
+ def doctor() -> None:
+-    """Pre-flight check: verify provider binaries are resolvable and executable."""
++    """Pre-flight check and registry self-heal utilities."""
++
++
++@doctor.command()
++def check() -> None:
++    """Verify provider binaries are resolvable and executable."""
+     providers = {
+         "codex": "codex",
+         "grok": str(Path.home() / ".grok" / "bin" / "grok"),
+@@ -28,3 +49,60 @@ def doctor() -> None:
+         click.echo(f"  {name}: {status} ({resolved})")
+ 
+     sys.exit(0 if all_pass else 1)
++
++
++@doctor.command()
++@click.option("--apply", is_flag=True, default=False, help="Execute readoptions (default: dry-run)")
++def readopt(apply: bool) -> None:
++    """Re-adopt live tmux panes whose terminal rows vanished.
++
++    Scans the host tmux server for cao-* sessions with windows named
++    <profile>-<terminalid>. For each ID missing from the terminals table,
++    reconstructs the minimal registry rows (terminal + supervisor mailbox
++    when the profile role is 'supervisor').
++
++    DRY-RUN by default — prints the plan without writing. Pass --apply to
++    execute.
++    """
++    from cli_agent_orchestrator.services.readopt_service import (
++        apply_readopt,
++        scan_for_orphans,
++    )
++
++    click.echo("Scanning tmux for orphaned CAO windows...")
++    result = scan_for_orphans()
++
++    if result.skipped_test:
++        click.echo(f"  Skipped {len(result.skipped_test)} test-session windows")
++    if result.skipped_existing:
++        click.echo(f"  Skipped {len(result.skipped_existing)} already-registered terminals")
++
++    if not result.planned:
++        click.echo("  No orphaned terminals found. Registry is consistent.")
++        sys.exit(0)
++
++    click.echo(f"\n  Found {len(result.planned)} orphaned terminal(s):")
++    for plan in result.planned:
++        mailbox_note = " [+mailbox]" if plan.needs_mailbox else ""
++        click.echo(
++            f"    {plan.terminal_id}  session={plan.tmux_session}  "
++            f"profile={plan.agent_profile}  provider={plan.provider}  "
++            f"lifecycle={plan.lifecycle}{mailbox_note}"
++        )
++
++    if not apply:
++        click.echo("\n  DRY RUN — pass --apply to execute.")
++        sys.exit(0)
++
++    click.echo("\n  Applying...")
++    apply_readopt(result)
++
++    if result.applied:
++        click.echo(f"  Adopted {len(result.applied)} terminal(s): {', '.join(result.applied)}")
++    if result.errors:
++        click.echo(f"  Errors ({len(result.errors)}):")
++        for err in result.errors:
++            click.echo(f"    {err}")
++        sys.exit(1)
++
++    sys.exit(0)
+diff --git a/src/cli_agent_orchestrator/services/db_backup_service.py b/src/cli_agent_orchestrator/services/db_backup_service.py
+new file mode 100644
+index 00000000..729cfbe4
+--- /dev/null
++++ b/src/cli_agent_orchestrator/services/db_backup_service.py
+@@ -0,0 +1,149 @@
++"""F335: Periodic SQLite backup service.
++
++Performs hourly ``.backup`` of the CAO database to
++``~/.aws/cli-agent-orchestrator/db/backups/<UTC-timestamp>.db``,
++keeping the newest 24 copies and deleting older ones.
++
++Uses the SQLite backup API (``sqlite3.Connection.backup()``) which is safe
++for live databases — never a raw file copy of a WAL-mode DB.
++
++Designed to run as an in-server periodic asyncio task (preferred over
++external timers per the issue spec).
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import sqlite3
++import time
++from datetime import datetime, timezone
++from pathlib import Path
++
++logger = logging.getLogger(__name__)
++
++# Retention: keep the newest N backups
++_MAX_BACKUPS = 24
++
++# Interval between backups in seconds (1 hour)
++_BACKUP_INTERVAL_S = 3600
++
++
++def _backup_dir() -> Path:
++    """Resolve the backup directory. Deferred to avoid import-time side effects."""
++    from cli_agent_orchestrator.constants import DB_DIR
++
++    return DB_DIR / "backups"
++
++
++def _database_path() -> Path:
++    """Resolve the live database file path."""
++    from cli_agent_orchestrator.constants import DATABASE_FILE
++
++    return DATABASE_FILE
++
++
++def run_backup(
++    *,
++    db_path: Path | None = None,
++    backup_dir: Path | None = None,
++    max_backups: int = _MAX_BACKUPS,
++) -> Path | None:
++    """Execute one SQLite backup using the backup API.
++
++    Args:
++        db_path: Source database file. Defaults to the production DB.
++        backup_dir: Destination directory. Defaults to db/backups/.
++        max_backups: Number of backups to retain.
++
++    Returns:
++        Path to the new backup file, or None on failure.
++    """
++    if db_path is None:
++        db_path = _database_path()
++    if backup_dir is None:
++        backup_dir = _backup_dir()
++
++    if not db_path.exists():
++        logger.warning("f335_backup: source DB does not exist: %s", db_path)
++        return None
++
++    backup_dir.mkdir(parents=True, exist_ok=True)
++
++    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
++    dest_path = backup_dir / f"{timestamp}.db"
++
++    try:
++        # Use sqlite3 backup API — safe for live WAL-mode databases
++        src_conn = sqlite3.connect(str(db_path), timeout=30)
++        dst_conn = sqlite3.connect(str(dest_path))
++        try:
++            src_conn.backup(dst_conn)
++        finally:
++            dst_conn.close()
++            src_conn.close()
++
++        logger.info("f335_backup: created %s", dest_path)
++    except Exception as e:
++        logger.error("f335_backup_failed: %s", e)
++        # Clean up partial file
++        if dest_path.exists():
++            try:
++                dest_path.unlink()
++            except OSError:
++                pass
++        return None
++
++    # Retention: delete oldest backups beyond max_backups
++    _prune_old_backups(backup_dir, max_backups)
++
++    return dest_path
++
++
++def _prune_old_backups(backup_dir: Path, max_backups: int) -> int:
++    """Delete the oldest backups exceeding max_backups. Returns count deleted."""
++    # List all .db files sorted by name (timestamp-based, so alphabetical = chronological)
++    backups = sorted(backup_dir.glob("*.db"))
++    to_delete = backups[: max(0, len(backups) - max_backups)]
++    deleted = 0
++    for old in to_delete:
++        try:
++            old.unlink()
++            deleted += 1
++            logger.debug("f335_backup_pruned: %s", old.name)
++        except OSError as e:
++            logger.warning("f335_backup_prune_failed: %s: %s", old.name, e)
++    return deleted
++
++
++async def backup_daemon(
++    *,
++    interval_s: float = _BACKUP_INTERVAL_S,
++    max_backups: int = _MAX_BACKUPS,
++    db_path: Path | None = None,
++    backup_dir: Path | None = None,
++) -> None:
++    """Long-running async daemon that performs periodic backups.
++
++    Runs an initial backup at startup, then repeats every ``interval_s``
++    seconds. Designed to be launched via ``asyncio.create_task()`` in the
++    server lifespan.
++    """
++    logger.info(
++        "f335_backup_daemon: starting (interval=%ds, retain=%d)",
++        interval_s,
++        max_backups,
++    )
++
++    while True:
++        try:
++            await asyncio.to_thread(
++                run_backup,
++                db_path=db_path,
++                backup_dir=backup_dir,
++                max_backups=max_backups,
++            )
++        except Exception:
++            logger.exception("f335_backup_daemon: unhandled error in backup cycle")
++
++        await asyncio.sleep(interval_s)
+diff --git a/src/cli_agent_orchestrator/services/readopt_service.py b/src/cli_agent_orchestrator/services/readopt_service.py
+new file mode 100644
+index 00000000..b1dbce7f
+--- /dev/null
++++ b/src/cli_agent_orchestrator/services/readopt_service.py
+@@ -0,0 +1,291 @@
++"""F335: Registry self-heal — re-adopt live tmux panes when terminal rows vanish.
++
++Scans the host tmux server for cao-* sessions whose windows are named
++``<profile>-<terminalid8hex>``; for each id missing from the ``terminals``
++table, reconstructs the minimal registry rows:
++- terminals row (id, tmux_session, tmux_window, provider, agent_profile,
++  lifecycle, init_state=ready)
++- supervisor mailbox + mailbox_incarnations link (when the profile role is
++  "supervisor")
++
++DRY-RUN by default; ``--apply`` executes the inserts. Never touches rows
++that already exist. Skips sessions matching the test prefix ``cao-test-*``.
++"""
++
++from __future__ import annotations
++
++import logging
++import re
++import subprocess
++from dataclasses import dataclass, field
++from datetime import datetime, timezone
++from typing import Sequence
++
++logger = logging.getLogger(__name__)
++
++# Test-session prefix to skip (wp-callbacks convention: fixture sessions
++# use "cao-test-" prefix so they never collide with production)
++_TEST_SESSION_PREFIX = "cao-test-"
++
++# Pattern: window name is <profile>-<8-char hex terminal id>
++_WINDOW_NAME_RE = re.compile(r"^(.+)-([0-9a-f]{8})$")
++
++# Profiles with these roles get a supervisor mailbox
++_SUPERVISOR_ROLES = frozenset({"supervisor"})
++
++
++@dataclass(frozen=True)
++class ReadoptPlan:
++    """One terminal that would be re-adopted."""
++
++    terminal_id: str
++    tmux_session: str
++    tmux_window: str
++    agent_profile: str
++    provider: str
++    lifecycle: str
++    needs_mailbox: bool
++
++
++@dataclass
++class ReadoptResult:
++    """Aggregate result of a readopt scan/apply."""
++
++    planned: list[ReadoptPlan] = field(default_factory=list)
++    skipped_existing: list[str] = field(default_factory=list)
++    skipped_test: list[str] = field(default_factory=list)
++    applied: list[str] = field(default_factory=list)
++    errors: list[str] = field(default_factory=list)
++
++
++def _list_tmux_windows() -> list[tuple[str, str]]:
++    """Return (session_name, window_name) for all windows on the tmux server.
++
++    Uses ``tmux list-windows -a -F '#{session_name}:#{window_name}'``.
++    Returns empty list if tmux is not running or no sessions exist.
++    """
++    try:
++        output = subprocess.check_output(
++            ["tmux", "list-windows", "-a", "-F", "#{session_name}\t#{window_name}"],
++            text=True,
++            stderr=subprocess.DEVNULL,
++            timeout=10,
++        )
++    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
++        return []
++
++    results: list[tuple[str, str]] = []
++    for line in output.strip().splitlines():
++        parts = line.split("\t", 1)
++        if len(parts) == 2:
++            results.append((parts[0], parts[1]))
++    return results
++
++
++def _resolve_provider_for_profile(profile_name: str) -> str | None:
++    """Resolve the provider for a profile name.
++
++    Returns None when the profile cannot be loaded at all (file missing,
++    parse error) — the caller must skip the terminal rather than record a
++    wrong provider that delete_terminal's provider-specific cleanup would
++    later act on.
++    """
++    try:
++        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
++
++        profile = load_agent_profile(profile_name)
++        if profile.provider:
++            from cli_agent_orchestrator.constants import PROVIDERS
++
++            if profile.provider in PROVIDERS:
++                return profile.provider
++        # Profile loaded but has no explicit provider — use default
++        from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
++
++        return DEFAULT_PROVIDER
++    except (FileNotFoundError, RuntimeError, ValueError):
++        # Profile cannot be resolved — caller must skip this terminal
++        return None
++
++
++def _resolve_role_for_profile(profile_name: str) -> str | None:
++    """Resolve the role from a profile's frontmatter. Returns None on failure."""
++    try:
++        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
++
++        profile = load_agent_profile(profile_name)
++        return getattr(profile, "role", None)
++    except Exception:
++        return None
++
++
++def _is_supervisor_profile(profile_name: str) -> bool:
++    """Return True if the profile's role is a supervisor role."""
++    role = _resolve_role_for_profile(profile_name)
++    return role in _SUPERVISOR_ROLES
++
++
++def _existing_terminal_ids(db) -> set[str]:
++    """Return the set of terminal IDs currently in the database."""
++    from cli_agent_orchestrator.clients.database import TerminalModel
++
++    rows = db.query(TerminalModel.id).all()
++    return {r[0] for r in rows}
++
++
++def scan_for_orphans(
++    *, tmux_windows: list[tuple[str, str]] | None = None
++) -> ReadoptResult:
++    """Scan tmux for cao-* session windows missing from the terminals table.
++
++    Args:
++        tmux_windows: Optional pre-fetched window list (for testing).
++            If None, queries the live tmux server.
++
++    Returns:
++        ReadoptResult with planned readoptions (dry-run; nothing written).
++    """
++    from cli_agent_orchestrator.clients.database import SessionLocal
++
++    if tmux_windows is None:
++        tmux_windows = _list_tmux_windows()
++
++    result = ReadoptResult()
++
++    # Filter to cao-* sessions only
++    cao_windows: list[tuple[str, str]] = []
++    for sess, win in tmux_windows:
++        if not sess.startswith("cao-"):
++            continue
++        if sess.startswith(_TEST_SESSION_PREFIX):
++            result.skipped_test.append(f"{sess}:{win}")
++            continue
++        cao_windows.append((sess, win))
++
++    if not cao_windows:
++        return result
++
++    with SessionLocal() as db:
++        existing_ids = _existing_terminal_ids(db)
++
++    for sess, win in cao_windows:
++        m = _WINDOW_NAME_RE.match(win)
++        if m is None:
++            continue  # Not a CAO-managed window name
++
++        profile_name = m.group(1)
++        terminal_id = m.group(2)
++
++        if terminal_id in existing_ids:
++            result.skipped_existing.append(terminal_id)
++            continue
++
++        provider = _resolve_provider_for_profile(profile_name)
++        if provider is None:
++            # D4: cannot resolve provider truthfully — skip with warning
++            msg = (
++                f"skipped {terminal_id} (session={sess}): "
++                f"profile '{profile_name}' not found or invalid — "
++                f"cannot determine provider"
++            )
++            result.errors.append(msg)
++            logger.warning("f335_readopt_skip_unresolvable: %s", msg)
++            continue
++
++        is_supervisor = _is_supervisor_profile(profile_name)
++        lifecycle = "sticky" if is_supervisor else "ephemeral"
++
++        result.planned.append(
++            ReadoptPlan(
++                terminal_id=terminal_id,
++                tmux_session=sess,
++                tmux_window=win,
++                agent_profile=profile_name,
++                provider=provider,
++                lifecycle=lifecycle,
++                needs_mailbox=is_supervisor,
++            )
++        )
++
++    return result
++
++
++def apply_readopt(result: ReadoptResult) -> ReadoptResult:
++    """Execute the planned readoptions — insert terminal + mailbox rows.
++
++    Mutates ``result.applied`` and ``result.errors`` in place.
++    Never touches rows that already exist (uses INSERT OR IGNORE semantics).
++    """
++    from cli_agent_orchestrator.clients.database import (
++        MailboxIncarnationModel,
++        MailboxModel,
++        SessionLocal,
++        TerminalModel,
++    )
++
++    now = datetime.now(timezone.utc)
++
++    for plan in result.planned:
++        try:
++            with SessionLocal.begin() as db:
++                # Double-check: skip if row appeared between scan and apply
++                exists = (
++                    db.query(TerminalModel.id)
++                    .filter_by(id=plan.terminal_id)
++                    .first()
++                )
++                if exists:
++                    result.skipped_existing.append(plan.terminal_id)
++                    continue
++
++                # Insert terminal row
++                terminal = TerminalModel(
++                    id=plan.terminal_id,
++                    tmux_session=plan.tmux_session,
++                    tmux_window=plan.tmux_window,
++                    provider=plan.provider,
++                    agent_profile=plan.agent_profile,
++                    lifecycle=plan.lifecycle,
++                    init_state="ready",
++                    last_active=now,
++                )
++                db.add(terminal)
++
++                # Insert supervisor mailbox + incarnation if needed
++                if plan.needs_mailbox:
++                    mailbox_id = f"mb_{plan.terminal_id}"
++                    mailbox = MailboxModel(
++                        id=mailbox_id,
++                        session_name=plan.tmux_session,
++                        role="supervisor",
++                        current_terminal_id=plan.terminal_id,
++                        generation=1,
++                        consumed_through_id=0,
++                        schema_version=1,
++                        created_at=now,
++                        updated_at=now,
++                    )
++                    db.add(mailbox)
++
++                    incarnation = MailboxIncarnationModel(
++                        mailbox_id=mailbox_id,
++                        generation=1,
++                        terminal_id=plan.terminal_id,
++                        published_at=now,
++                    )
++                    db.add(incarnation)
++
++                result.applied.append(plan.terminal_id)
++                logger.info(
++                    "f335_readopt: adopted terminal=%s session=%s profile=%s mailbox=%s",
++                    plan.terminal_id,
++                    plan.tmux_session,
++                    plan.agent_profile,
++                    plan.needs_mailbox,
++                )
++        except Exception as e:
++            msg = f"terminal={plan.terminal_id}: {type(e).__name__}: {e}"
++            result.errors.append(msg)
++            logger.error("f335_readopt_error: %s", msg)
++
++    return result
+diff --git a/test/services/test_db_backup_service.py b/test/services/test_db_backup_service.py
+new file mode 100644
+index 00000000..304a41cc
+--- /dev/null
++++ b/test/services/test_db_backup_service.py
+@@ -0,0 +1,150 @@
++"""Tests for F335 db_backup_service — periodic SQLite backup.
++
++Isolation: creates a fresh SQLite DB in a temporary directory, never
++touches the real DATABASE_FILE or HOME directory.
++"""
++
++from __future__ import annotations
++
++import sqlite3
++import tempfile
++import time
++from pathlib import Path
++
++import pytest
++
++from cli_agent_orchestrator.services.db_backup_service import (
++    _prune_old_backups,
++    run_backup,
++)
++
++
++@pytest.fixture
++def isolated_db(tmp_path: Path) -> Path:
++    """Create a small test SQLite database in a temp dir."""
++    db_path = tmp_path / "test.db"
++    conn = sqlite3.connect(str(db_path))
++    conn.execute("CREATE TABLE test_data (id INTEGER PRIMARY KEY, value TEXT)")
++    conn.execute("INSERT INTO test_data VALUES (1, 'hello')")
++    conn.commit()
++    conn.close()
++    return db_path
++
++
++@pytest.fixture
++def backup_dir(tmp_path: Path) -> Path:
++    """Provide a clean backup directory."""
++    d = tmp_path / "backups"
++    d.mkdir()
++    return d
++
++
++class TestRunBackup:
++    """Test the one-shot backup function."""
++
++    def test_creates_backup_file(self, isolated_db: Path, backup_dir: Path):
++        result = run_backup(db_path=isolated_db, backup_dir=backup_dir)
++        assert result is not None
++        assert result.exists()
++        assert result.suffix == ".db"
++        assert result.parent == backup_dir
++
++    def test_backup_is_valid_sqlite(self, isolated_db: Path, backup_dir: Path):
++        result = run_backup(db_path=isolated_db, backup_dir=backup_dir)
++        assert result is not None
++
++        conn = sqlite3.connect(str(result))
++        rows = conn.execute("SELECT value FROM test_data WHERE id = 1").fetchall()
++        conn.close()
++        assert rows == [("hello",)]
++
++    def test_backup_creates_dir_if_missing(self, isolated_db: Path, tmp_path: Path):
++        target = tmp_path / "nested" / "backups"
++        assert not target.exists()
++        result = run_backup(db_path=isolated_db, backup_dir=target)
++        assert result is not None
++        assert target.exists()
++
++    def test_returns_none_if_source_missing(self, tmp_path: Path):
++        fake_db = tmp_path / "nonexistent.db"
++        backup_dir = tmp_path / "backups"
++        result = run_backup(db_path=fake_db, backup_dir=backup_dir)
++        assert result is None
++
++    def test_multiple_backups_have_unique_names(self, isolated_db: Path, backup_dir: Path):
++        r1 = run_backup(db_path=isolated_db, backup_dir=backup_dir)
++        # Slight delay to get a different timestamp
++        time.sleep(1.1)
++        r2 = run_backup(db_path=isolated_db, backup_dir=backup_dir)
++        assert r1 is not None
++        assert r2 is not None
++        assert r1 != r2
++
++    def test_backup_with_wal_mode(self, tmp_path: Path, backup_dir: Path):
++        """Verify backup works with WAL-mode databases (production config)."""
++        db_path = tmp_path / "wal_test.db"
++        conn = sqlite3.connect(str(db_path))
++        conn.execute("PRAGMA journal_mode=WAL")
++        conn.execute("CREATE TABLE t (x INTEGER)")
++        conn.execute("INSERT INTO t VALUES (42)")
++        conn.commit()
++        conn.close()
++
++        result = run_backup(db_path=db_path, backup_dir=backup_dir)
++        assert result is not None
++
++        conn = sqlite3.connect(str(result))
++        rows = conn.execute("SELECT x FROM t").fetchall()
++        conn.close()
++        assert rows == [(42,)]
++
++
++class TestPruneOldBackups:
++    """Test the retention/pruning logic."""
++
++    def test_prune_keeps_newest(self, backup_dir: Path):
++        # Create 5 backups with sequential timestamps
++        for i in range(5):
++            (backup_dir / f"2026010{i}T000000Z.db").write_text("x")
++
++        deleted = _prune_old_backups(backup_dir, max_backups=3)
++        assert deleted == 2
++        remaining = sorted(f.name for f in backup_dir.glob("*.db"))
++        assert remaining == [
++            "20260102T000000Z.db",
++            "20260103T000000Z.db",
++            "20260104T000000Z.db",
++        ]
++
++    def test_prune_noop_when_under_limit(self, backup_dir: Path):
++        for i in range(2):
++            (backup_dir / f"2026010{i}T000000Z.db").write_text("x")
++
++        deleted = _prune_old_backups(backup_dir, max_backups=5)
++        assert deleted == 0
++        assert len(list(backup_dir.glob("*.db"))) == 2
++
++    def test_prune_empty_dir(self, backup_dir: Path):
++        deleted = _prune_old_backups(backup_dir, max_backups=24)
++        assert deleted == 0
++
++    def test_prune_exact_limit(self, backup_dir: Path):
++        for i in range(3):
++            (backup_dir / f"2026010{i}T000000Z.db").write_text("x")
++
++        deleted = _prune_old_backups(backup_dir, max_backups=3)
++        assert deleted == 0
++
++    def test_integration_run_backup_prunes(self, isolated_db: Path, backup_dir: Path):
++        """run_backup with max_backups=2 should prune old ones."""
++        # Create 3 pre-existing backups
++        for i in range(3):
++            (backup_dir / f"2020010{i}T000000Z.db").write_text("x")
++
++        # Now run a real backup with max=2
++        result = run_backup(db_path=isolated_db, backup_dir=backup_dir, max_backups=2)
++        assert result is not None
++
++        # Should have the new backup + 1 old one = 2 total (pruned the 2 oldest)
++        remaining = list(backup_dir.glob("*.db"))
++        assert len(remaining) == 2
+diff --git a/test/services/test_readopt_service.py b/test/services/test_readopt_service.py
+new file mode 100644
+index 00000000..b2980ccb
+--- /dev/null
++++ b/test/services/test_readopt_service.py
+@@ -0,0 +1,325 @@
++"""Tests for F335 readopt_service — registry self-heal.
++
++Isolation: uses the test conftest's in-memory DB (CAO_HOME_DIR is already
++overridden to a temp dir by the top-level conftest.py). Mocks tmux
++subprocess calls so these tests never touch the real tmux server.
++"""
++
++from __future__ import annotations
++
++import re
++from datetime import datetime, timezone
++from unittest.mock import patch
++
++import pytest
++
++from cli_agent_orchestrator.clients.database import (
++    MailboxIncarnationModel,
++    MailboxModel,
++    SessionLocal,
++    TerminalModel,
++)
++from cli_agent_orchestrator.models.terminal import InboxReceiverId
++from cli_agent_orchestrator.services.readopt_service import (
++    ReadoptPlan,
++    ReadoptResult,
++    _WINDOW_NAME_RE,
++    apply_readopt,
++    scan_for_orphans,
++)
++
++# Extract the raw regex from the Annotated type's StringConstraints
++_INBOX_RECEIVER_ID_PATTERN: re.Pattern = re.compile(
++    InboxReceiverId.__metadata__[0].pattern  # type: ignore[attr-defined]
++)
++
++
++def _assert_valid_inbox_receiver_id(value: str) -> None:
++    """Assert that value matches the system-wide InboxReceiverId contract."""
++    assert _INBOX_RECEIVER_ID_PATTERN.match(value), (
++        f"'{value}' does not match InboxReceiverId pattern "
++        f"'{_INBOX_RECEIVER_ID_PATTERN.pattern}'"
++    )
++
++
++class TestWindowNamePattern:
++    """Ensure the regex matches the expected naming convention."""
++
++    def test_valid_window_name(self):
++        m = _WINDOW_NAME_RE.match("developer-a1b2c3d4")
++        assert m is not None
++        assert m.group(1) == "developer"
++        assert m.group(2) == "a1b2c3d4"
++
++    def test_valid_hyphenated_profile(self):
++        m = _WINDOW_NAME_RE.match("code-supervisor-deadbeef")
++        assert m is not None
++        assert m.group(1) == "code-supervisor"
++        assert m.group(2) == "deadbeef"
++
++    def test_uppercase_hex_rejected(self):
++        """Terminal IDs are lowercase hex only."""
++        m = _WINDOW_NAME_RE.match("developer-A1B2C3D4")
++        assert m is None
++
++    def test_too_short_id(self):
++        m = _WINDOW_NAME_RE.match("developer-a1b2c3")
++        assert m is None
++
++    def test_too_long_id(self):
++        m = _WINDOW_NAME_RE.match("developer-a1b2c3d4e5")
++        assert m is None
++
++    def test_no_dash(self):
++        m = _WINDOW_NAME_RE.match("developera1b2c3d4")
++        assert m is None
++
++
++class TestScanForOrphans:
++    """Test scan logic with mocked tmux output."""
++
++    def test_empty_tmux(self):
++        result = scan_for_orphans(tmux_windows=[])
++        assert result.planned == []
++        assert result.skipped_test == []
++
++    def test_non_cao_sessions_ignored(self):
++        windows = [
++            ("my-session", "developer-a1b2c3d4"),
++            ("user-stuff", "some-window"),
++        ]
++        result = scan_for_orphans(tmux_windows=windows)
++        assert result.planned == []
++
++    def test_test_sessions_skipped(self):
++        windows = [
++            ("cao-test-fixtures", "developer-a1b2c3d4"),
++            ("cao-test-e2e", "reviewer-deadbeef"),
++        ]
++        result = scan_for_orphans(tmux_windows=windows)
++        assert result.planned == []
++        assert len(result.skipped_test) == 2
++
++    @patch("cli_agent_orchestrator.services.readopt_service._resolve_provider_for_profile")
++    @patch("cli_agent_orchestrator.services.readopt_service._is_supervisor_profile")
++    def test_orphan_detected(self, mock_is_sup, mock_provider):
++        mock_provider.return_value = "kiro_cli"
++        mock_is_sup.return_value = False
++
++        windows = [
++            ("cao-my-session", "developer-a1b2c3d4"),
++        ]
++        result = scan_for_orphans(tmux_windows=windows)
++        assert len(result.planned) == 1
++        plan = result.planned[0]
++        assert plan.terminal_id == "a1b2c3d4"
++        assert plan.tmux_session == "cao-my-session"
++        assert plan.agent_profile == "developer"
++        assert plan.provider == "kiro_cli"
++        assert plan.lifecycle == "ephemeral"
++        assert plan.needs_mailbox is False
++
++    @patch("cli_agent_orchestrator.services.readopt_service._resolve_provider_for_profile")
++    @patch("cli_agent_orchestrator.services.readopt_service._is_supervisor_profile")
++    def test_supervisor_gets_mailbox(self, mock_is_sup, mock_provider):
++        mock_provider.return_value = "kiro_cli"
++        mock_is_sup.return_value = True
++
++        windows = [
++            ("cao-prod", "code_supervisor-cafe0123"),
++        ]
++        result = scan_for_orphans(tmux_windows=windows)
++        assert len(result.planned) == 1
++        plan = result.planned[0]
++        assert plan.lifecycle == "sticky"
++        assert plan.needs_mailbox is True
++
++    @patch("cli_agent_orchestrator.services.readopt_service._resolve_provider_for_profile")
++    @patch("cli_agent_orchestrator.services.readopt_service._is_supervisor_profile")
++    def test_existing_terminal_skipped(self, mock_is_sup, mock_provider):
++        """Terminals already in the DB should be skipped."""
++        mock_provider.return_value = "kiro_cli"
++        mock_is_sup.return_value = False
++
++        # Insert a terminal so it exists
++        now = datetime.now(timezone.utc)
++        with SessionLocal.begin() as db:
++            db.add(
++                TerminalModel(
++                    id="abcd1234",
++                    tmux_session="cao-existing",
++                    tmux_window="developer-abcd1234",
++                    provider="kiro_cli",
++                    agent_profile="developer",
++                    lifecycle="ephemeral",
++                    init_state="ready",
++                    last_active=now,
++                )
++            )
++
++        windows = [
++            ("cao-existing", "developer-abcd1234"),
++        ]
++        result = scan_for_orphans(tmux_windows=windows)
++        assert result.planned == []
++        assert "abcd1234" in result.skipped_existing
++
++    @patch("cli_agent_orchestrator.services.readopt_service._resolve_provider_for_profile")
++    def test_unresolvable_profile_skipped_with_warning(self, mock_provider):
++        """D4: unresolvable profiles must be skipped, not recorded with a wrong provider."""
++        mock_provider.return_value = None  # Cannot resolve
++
++        windows = [
++            ("cao-mystery", "unknown_profile-dead0000"),
++        ]
++        result = scan_for_orphans(tmux_windows=windows)
++        assert result.planned == []
++        assert len(result.errors) == 1
++        assert "dead0000" in result.errors[0]
++        assert "unknown_profile" in result.errors[0]
++
++
++class TestApplyReadopt:
++    """Test that apply_readopt writes the correct rows."""
++
++    def test_apply_creates_terminal_row(self):
++        plan = ReadoptPlan(
++            terminal_id="ff001122",
++            tmux_session="cao-apply-test",
++            tmux_window="developer-ff001122",
++            agent_profile="developer",
++            provider="kiro_cli",
++            lifecycle="ephemeral",
++            needs_mailbox=False,
++        )
++        result = ReadoptResult(planned=[plan])
++        apply_readopt(result)
++
++        assert "ff001122" in result.applied
++        assert result.errors == []
++
++        with SessionLocal() as db:
++            row = db.query(TerminalModel).filter_by(id="ff001122").one()
++            assert row.tmux_session == "cao-apply-test"
++            assert row.agent_profile == "developer"
++            assert row.provider == "kiro_cli"
++            assert row.lifecycle == "ephemeral"
++            assert row.init_state == "ready"
++
++    def test_apply_creates_mailbox_for_supervisor(self):
++        plan = ReadoptPlan(
++            terminal_id="ee334455",
++            tmux_session="cao-sup-test",
++            tmux_window="code_supervisor-ee334455",
++            agent_profile="code_supervisor",
++            provider="kiro_cli",
++            lifecycle="sticky",
++            needs_mailbox=True,
++        )
++        result = ReadoptResult(planned=[plan])
++        apply_readopt(result)
++
++        assert "ee334455" in result.applied
++        assert result.errors == []
++
++        with SessionLocal() as db:
++            # Check terminal
++            term = db.query(TerminalModel).filter_by(id="ee334455").one()
++            assert term.lifecycle == "sticky"
++
++            # Check mailbox — must use mb_ prefix per InboxReceiverId contract
++            expected_mbx_id = "mb_ee334455"
++            _assert_valid_inbox_receiver_id(expected_mbx_id)
++
++            mbx = db.query(MailboxModel).filter_by(id=expected_mbx_id).one()
++            assert mbx.session_name == "cao-sup-test"
++            assert mbx.role == "supervisor"
++            assert mbx.current_terminal_id == "ee334455"
++
++            # Check incarnation
++            inc = (
++                db.query(MailboxIncarnationModel)
++                .filter_by(mailbox_id=expected_mbx_id, generation=1)
++                .one()
++            )
++            assert inc.terminal_id == "ee334455"
++
++    def test_mailbox_id_matches_inbox_receiver_id_pattern(self):
++        """D2: readopted mailbox IDs must match the InboxReceiverId contract."""
++        # Verify the mb_ + 8-hex pattern matches
++        _assert_valid_inbox_receiver_id("mb_deadbeef")
++        _assert_valid_inbox_receiver_id("mb_00112233")
++        _assert_valid_inbox_receiver_id("mb_abcdef01")
++
++        # Verify the OLD scheme would NOT match (regression guard)
++        assert not _INBOX_RECEIVER_ID_PATTERN.match("mbx-deadbeef")
++        assert not _INBOX_RECEIVER_ID_PATTERN.match("mbx-00112233")
++
++    def test_apply_skips_if_appeared_between_scan_and_apply(self):
++        """Simulate a race: terminal appears between scan and apply."""
++        now = datetime.now(timezone.utc)
++        with SessionLocal.begin() as db:
++            db.add(
++                TerminalModel(
++                    id="race0001",
++                    tmux_session="cao-race",
++                    tmux_window="developer-race0001",
++                    provider="kiro_cli",
++                    agent_profile="developer",
++                    lifecycle="ephemeral",
++                    init_state="ready",
++                    last_active=now,
++                )
++            )
++
++        plan = ReadoptPlan(
++            terminal_id="race0001",
++            tmux_session="cao-race",
++            tmux_window="developer-race0001",
++            agent_profile="developer",
++            provider="kiro_cli",
++            lifecycle="ephemeral",
++            needs_mailbox=False,
++        )
++        result = ReadoptResult(planned=[plan])
++        apply_readopt(result)
++
++        # Should have been skipped, not applied
++        assert "race0001" not in result.applied
++        assert "race0001" in result.skipped_existing
++
++    def test_apply_never_touches_existing_rows(self):
++        """Even if planned, existing rows must not be modified."""
++        now = datetime.now(timezone.utc)
++        with SessionLocal.begin() as db:
++            db.add(
++                TerminalModel(
++                    id="keep0001",
++                    tmux_session="cao-original",
++                    tmux_window="developer-keep0001",
++                    provider="codex",
++                    agent_profile="developer",
++                    lifecycle="ephemeral",
++                    init_state="ready",
++                    last_active=now,
++                )
++            )
++
++        plan = ReadoptPlan(
++            terminal_id="keep0001",
++            tmux_session="cao-different",
++            tmux_window="reviewer-keep0001",
++            agent_profile="reviewer",
++            provider="kiro_cli",
++            lifecycle="sticky",
++            needs_mailbox=True,
++        )
++        result = ReadoptResult(planned=[plan])
++        apply_readopt(result)
++
++        # Original row should be unchanged
++        with SessionLocal() as db:
++            row = db.query(TerminalModel).filter_by(id="keep0001").one()
++            assert row.tmux_session == "cao-original"
++            assert row.provider == "codex"
++            assert row.agent_profile == "developer"
+diff --git a/tui/src/catalog.rs b/tui/src/catalog.rs
+index 1b9e0989..75e03cf2 100644
+--- a/tui/src/catalog.rs
++++ b/tui/src/catalog.rs
+@@ -86,7 +86,7 @@ use std::vec::Vec;
+ /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
+ /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
+ /// (#321)
+-const COMMAND_COUNT: usize = 100;
++const COMMAND_COUNT: usize = 101;
+ 
+ /// What the TUI does with a command.
+ ///
+@@ -183,7 +183,7 @@ pub struct Command {
+ ///
+ /// `pub(crate)` since Bolt 3: `server-client`'s route-table tests walk it to assert that every
+ /// IN-APP command has a route and that no HANDOFF or HIDE command does. Deriving that set any
+-/// other way would mean re-listing 98 commands in a second place, which is a worse trade than
++/// other way would mean re-listing 99 commands in a second place, which is a worse trade than
+ /// widening the visibility of a compile-time constant. Still crate-private — no consumer outside
+ /// this crate exists, and the table is not a public API. (#321)
+ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
+@@ -262,7 +262,8 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
+     CommandId::BarrierStatus,
+     CommandId::BaseRegister,
+     CommandId::ConfigReconcile,
+-    CommandId::Doctor,
++    CommandId::DoctorCheck,
++    CommandId::DoctorReadopt,
+     CommandId::Fold,
+     CommandId::LedgerCheck,
+     CommandId::MailboxDelete,
+@@ -299,9 +300,13 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
+ /// the crate is built. (#321)
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+ pub enum CommandId {
++    // `cao doctor *`
++    /// `cao doctor check`
++    DoctorCheck,
++    /// `cao doctor readopt`
++    DoctorReadopt,
++
+     // Top-level leaves.
+-    /// `cao doctor`
+-    Doctor,
+     /// `cao info`
+     Info,
+     /// `cao init`
+@@ -559,16 +564,26 @@ pub enum CommandId {
+ fn entry(id: CommandId) -> Command {
+     match id {
+ 
+-        CommandId::Doctor => Command {
+-            id: CommandId::Doctor,
+-            parent: None,
+-            leaf_name: "doctor",
+-            summary: "Pre-flight diagnostics: check provider binaries, server health, and profile validity.",
++        CommandId::DoctorCheck => Command {
++            id: CommandId::DoctorCheck,
++            parent: Some("doctor"),
++            leaf_name: "check",
++            summary: "Pre-flight diagnostics: check provider binaries are resolvable and executable.",
+             policy: Policy::Hidden,
+             params: &[],
+             handoff_reason: None,
+             // HIDE: diagnostic command, no TUI integration needed
+         },
++        CommandId::DoctorReadopt => Command {
++            id: CommandId::DoctorReadopt,
++            parent: Some("doctor"),
++            leaf_name: "readopt",
++            summary: "Re-adopt live tmux panes whose terminal rows vanished.",
++            policy: Policy::Hidden,
++            params: &[],
++            handoff_reason: None,
++            // HIDE: disaster-recovery command, no TUI integration needed
++        },
+         CommandId::Info => Command {
+             id: CommandId::Info,
+             parent: None,
+@@ -1689,7 +1704,7 @@ mod tests {
+         counts
+     }
+ 
+-    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 56 HIDE, totalling 98.**
++    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 58 HIDE, totalling 100.**
+     ///
+     /// Every number here is a **hard-coded literal**, and that is the entire design of the test.
+     /// Deriving any of them from the table — `assert_eq!(in_app, TABLE.iter().filter(..).count())`
+@@ -1731,11 +1746,11 @@ mod tests {
+ 
+         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
+         assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
+-        assert_eq!(hidden, 57, "expected 57 HIDE commands, found {hidden}");
++        assert_eq!(hidden, 58, "expected 58 HIDE commands, found {hidden}");
+         assert_eq!(
+             in_app + handoff + hidden,
+-            99,
+-            "the three policy counts must account for all 99 leaf commands of the Click tree"
++            100,
++            "the three policy counts must account for all 100 leaf commands of the Click tree"
+         );
+ 
+         // The three counts summing to 99 does not prove 99 *distinct* commands were counted: a
+@@ -1745,8 +1760,8 @@ mod tests {
+         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
+         assert_eq!(
+             distinct.len(),
+-            98,
+-            "DISPLAY_ORDER must list 98 DISTINCT commands; a duplicate would let one command go \
++            99,
++            "DISPLAY_ORDER must list 99 DISTINCT commands; a duplicate would let one command go \
+              uncounted while the totals still summed correctly"
+         );
+     }
+@@ -1813,7 +1828,8 @@ mod tests {
+             #[allow(clippy::needless_match)]
+             fn identity(id: CommandId) -> CommandId {
+                 match id {
+-                    CommandId::Doctor => CommandId::Doctor,
++                    CommandId::DoctorCheck => CommandId::DoctorCheck,
++                    CommandId::DoctorReadopt => CommandId::DoctorReadopt,
+                     CommandId::Info => CommandId::Info,
+                     CommandId::Init => CommandId::Init,
+                     CommandId::Install => CommandId::Install,
+diff --git a/tui/src/server.rs b/tui/src/server.rs
+index 6d431e1b..249a5d18 100644
+--- a/tui/src/server.rs
++++ b/tui/src/server.rs
+@@ -271,7 +271,8 @@ fn route(id: CommandId) -> Option<Route> {
+         // HIDE: no route exists (`cao info` reads local session context, `cao init` bootstraps
+         // the DB, `cao mcp-server` is a foreground server, `cao shutdown` can kill the TUI's own
+         // tmux session, `cao tui` must not offer itself, `cao update` may replace the binary).
+-        CommandId::Doctor => None,
++        CommandId::DoctorCheck => None,
++        CommandId::DoctorReadopt => None,
+         CommandId::Info => None,
+         CommandId::Init => None,
+         CommandId::McpServer => None,
