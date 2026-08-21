@@ -149,6 +149,31 @@ class TestAC15_CleanupSandboxDir:
         # But the symlink TARGET (user's secrets) still exists
         assert user_secrets.exists()
 
+    def test_cleanup_uses_shutil_rmtree(self, cline_provider, tmp_path):
+        """F338 S1: cleanup() must delete the sandbox dir via shutil.rmtree,
+        never a spawned `rm -rf` subprocess (M7 ledger: functionally equivalent
+        for symlink safety, but D5 mandates no process-spawn in cleanup).
+        """
+        sandbox_root = tmp_path / "cline-home"
+        sandbox_root.mkdir()
+        dd = sandbox_root / cline_provider.terminal_id
+        dd.mkdir()
+        (dd / "marker.txt").write_text("should be removed via rmtree")
+
+        with patch(
+            "cli_agent_orchestrator.providers.cline_cli.CLINE_SANDBOX_ROOT", sandbox_root
+        ), patch(
+            "cli_agent_orchestrator.providers.cline_cli.SCRATCH_DIR", tmp_path
+        ), patch(
+            "cli_agent_orchestrator.providers.cline_cli.shutil.rmtree"
+        ) as mock_rmtree, patch(
+            "cli_agent_orchestrator.providers.cline_cli.subprocess.run"
+        ) as mock_run:
+            cline_provider.cleanup()
+
+        mock_rmtree.assert_called_once_with(dd)
+        mock_run.assert_not_called()
+
     def test_cleanup_refuses_wrong_parent(self, cline_provider, tmp_path):
         """cleanup() refuses if _data_dir()'s parent doesn't match CLINE_SANDBOX_ROOT.
 

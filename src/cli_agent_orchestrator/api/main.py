@@ -49,6 +49,7 @@ from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     TRANSCRIPT_BINDING_SOURCES,
     TRANSCRIPT_HOOK_BINDING_SOURCES,
+    SessionLocal,
     TerminalModel,
     adopt_mailbox_rows_at_startup,
     callback_barrier_status,
@@ -179,9 +180,9 @@ from cli_agent_orchestrator.services.workflow_journal import (
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.grok_preflight import RelayPreflightFailed
 from cli_agent_orchestrator.utils.http import resolve_endpoint
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
-from cli_agent_orchestrator.utils.grok_preflight import RelayPreflightFailed
 from cli_agent_orchestrator.utils.provider_auth import ProviderAuthRefreshFailed
 from cli_agent_orchestrator.utils.provider_plane import (
     NativeHomeIsolationUnavailable,
@@ -6651,8 +6652,7 @@ async def create_inbox_message_endpoint(
 
     if not has_operator_bearer:
         presented_token = request.headers.get("x-cao-terminal-token")
-        from cli_agent_orchestrator.clients.database import SessionLocal as _f332_session
-        with _f332_session() as _f332_db:
+        with SessionLocal() as _f332_db:
             from cli_agent_orchestrator.services.terminal_token_service import verify_sender_token
             ok, error_code = verify_sender_token(_f332_db, sender_id, presented_token)
             if not ok:
@@ -6689,10 +6689,10 @@ async def create_inbox_message_endpoint(
             )
             if sender_terminal is not None:
                 from cli_agent_orchestrator.services.authority_pin_service import (
-                    validate_frozen_pins,
+                    FrozenPinValidation,
                     build_attestation,
                     format_drift_notice,
-                    FrozenPinValidation,
+                    validate_frozen_pins,
                 )
 
                 validation = validate_frozen_pins(_f129_db, sender_id)
@@ -6741,9 +6741,7 @@ async def create_inbox_message_endpoint(
                             },
                         }
                     # Create drift notice (unfenced — system sender, not terminal principal)
-                    from cli_agent_orchestrator.clients.database import (
-                        MessageStatus as _f129_ms,
-                    )
+                    from cli_agent_orchestrator.clients.database import MessageStatus as _f129_ms
 
                     notice_text = format_drift_notice(sender_id, validation)
                     notice_row = _f129_inbox(
