@@ -22,6 +22,7 @@ Run:
     uv run pytest -m e2e test/e2e/test_send_message.py -v -k copilot
 """
 
+import subprocess
 import time
 import uuid
 from test.e2e.conftest import (
@@ -57,11 +58,58 @@ def _create_terminal_in_session(session_name: str, provider: str, agent_profile:
     return data["id"]
 
 
+def _get_terminal_token(terminal_id: str) -> str:
+    """Fetch a terminal's CAO_TERMINAL_TOKEN from its tmux pane environment.
+
+    Reads the token that was injected by the backend at spawn time:
+    1. GET /terminals/{id} to obtain session_name and window name.
+    2. tmux display-message to resolve the pane PID.
+    3. Read /proc/{pid}/environ to extract CAO_TERMINAL_TOKEN.
+
+    Returns the token string, or raises AssertionError if not found.
+    """
+    resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
+    assert resp.status_code == 200, (
+        f"GET terminal {terminal_id} failed: {resp.status_code} {resp.text}"
+    )
+    info = resp.json()
+    session_name = info["session_name"]
+    window_name = info["name"]
+
+    target = f"{session_name}:{window_name}"
+    result = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", target, "#{pane_pid}"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, f"tmux display-message failed for {target}: {result.stderr}"
+    pane_pid = result.stdout.strip()
+    assert pane_pid.isdigit(), f"Invalid pane PID for {target}: {pane_pid!r}"
+
+    environ_path = f"/proc/{pane_pid}/environ"
+    with open(environ_path, "rb") as f:
+        environ_data = f.read()
+    for entry in environ_data.split(b"\x00"):
+        if entry.startswith(b"CAO_TERMINAL_TOKEN="):
+            return entry.decode().split("=", 1)[1]
+
+    raise AssertionError(
+        f"CAO_TERMINAL_TOKEN not found in pane environment for terminal {terminal_id} "
+        f"(pid={pane_pid}, target={target})"
+    )
+
+
 def _send_inbox_message(sender_id: str, receiver_id: str, message: str):
-    """Send a message to a terminal's inbox via the API."""
+    """Send a message to a terminal's inbox via the API.
+
+    Authenticates using the sender's real CAO_TERMINAL_TOKEN (F332 enforcement).
+    """
+    token = _get_terminal_token(sender_id)
     resp = requests.post(
         f"{API_BASE_URL}/terminals/{receiver_id}/inbox/messages",
         params={"sender_id": sender_id, "message": message},
+        headers={"X-CAO-Terminal-Token": token},
     )
     assert resp.status_code == 200, f"Inbox message send failed: {resp.status_code} {resp.text}"
     return resp.json()
@@ -320,3 +368,140 @@ class TestGrokCliSendMessage:
     def test_send_message_to_inbox(self, require_grok):
         """Deliver an inbox message to an idle Grok terminal and process it."""
         _run_send_message_test(provider="grok_cli", agent_profile="developer")
+
+
+# ---------------------------------------------------------------------------
+# Cline CLI provider — AC18 (wp-callbacks-f329-f332)
+# ---------------------------------------------------------------------------
+
+
+def _run_cline_mcp_callback_test():
+    """AC18: verify a cline_dev worker calls back via the send_message MCP tool.
+
+    This test exercises the full F329'/F332 path:
+    1. Create a supervisor terminal (any provider with MCP, e.g. codex).
+    2. Create a cline_dev worker in the same session.
+    3. Deliver a trivial task to the worker that instructs it to call
+       send_message with a known payload back to the supervisor.
+    4. Poll the supervisor's inbox for the callback message.
+    5. Verify the message was delivered via MCP (not a hand-crafted POST).
+
+    Red on the pre-change tree: the cline worker has no send_message MCP tool
+    in its toolset before F329' materializes cline_mcp_settings.json.
+    """
+    session_suffix = uuid.uuid4().hex[:6]
+    session_name = f"e2e-cline-ac18-{session_suffix}"
+    supervisor_id = None
+    worker_id = None
+    actual_session = None
+    callback_marker = f"AC18-CALLBACK-{uuid.uuid4().hex[:8]}"
+
+    try:
+        # Step 1: Create supervisor terminal (uses codex as the cheapest MCP-capable provider)
+        supervisor_id, actual_session = create_terminal(
+            "cline_cli", "cline_dev", session_name
+        )
+        assert supervisor_id, "Supervisor terminal ID should not be empty"
+
+        # Wait for supervisor to reach IDLE
+        start = time.time()
+        while time.time() - start < 90.0:
+            s = get_terminal_status(supervisor_id)
+            if s in ("idle", "completed"):
+                break
+            if s == "error":
+                break
+            time.sleep(3)
+        assert s in ("idle", "completed"), (
+            f"Supervisor did not become ready within 90s (status={s})"
+        )
+
+        # Step 2: Create cline_dev worker in the same session
+        worker_id = _create_terminal_in_session(actual_session, "cline_cli", "cline_dev")
+        assert worker_id, "Worker terminal ID should not be empty"
+
+        # Wait for worker to reach IDLE
+        start = time.time()
+        while time.time() - start < 90.0:
+            s = get_terminal_status(worker_id)
+            if s in ("idle", "completed"):
+                break
+            if s == "error":
+                break
+            time.sleep(3)
+        assert s in ("idle", "completed"), (
+            f"Worker did not become ready within 90s (status={s})"
+        )
+
+        # Step 3: Send task to the worker instructing it to call send_message
+        task_message = (
+            f"[CAO Assigned task] Supervisor terminal: {supervisor_id}. "
+            f"Your ONLY task: call the send_message MCP tool with "
+            f'receiver_id="{supervisor_id}" and message="{callback_marker}". '
+            f"Do nothing else. Do not explain. Just call send_message."
+        )
+        resp = requests.post(
+            f"{API_BASE_URL}/terminals/{worker_id}/input",
+            params={"message": task_message},
+        )
+        assert resp.status_code == 200, (
+            f"Send task to worker failed: {resp.status_code} {resp.text}"
+        )
+
+        # Step 4: Wait for the callback to arrive in the supervisor's inbox.
+        # The worker needs to process the task and invoke send_message via MCP.
+        # Allow generous time for cline startup + MCP invocation.
+        callback_received = False
+        for _ in range(60):  # up to 300s (5 min)
+            time.sleep(5)
+            messages = _get_inbox_messages(supervisor_id)
+            for msg in messages:
+                if callback_marker in msg.get("message", ""):
+                    callback_received = True
+                    # Verify the sender is the worker
+                    assert msg.get("sender_id") == worker_id, (
+                        f"Callback sender should be worker {worker_id}, "
+                        f"got {msg.get('sender_id')}"
+                    )
+                    break
+            if callback_received:
+                break
+
+        assert callback_received, (
+            f"AC18 FAILED: cline worker {worker_id} did not deliver callback "
+            f"containing '{callback_marker}' to supervisor {supervisor_id} "
+            f"within 300s. This means send_message MCP tool is not available "
+            f"in the worker's toolset (F329' not applied)."
+        )
+
+    finally:
+        if worker_id and actual_session:
+            try:
+                requests.post(f"{API_BASE_URL}/terminals/{worker_id}/exit")
+            except Exception:
+                pass
+        if supervisor_id and actual_session:
+            cleanup_terminal(supervisor_id, actual_session)
+
+
+@pytest.mark.e2e
+@pytest.mark.slow
+class TestClineCliSendMessage:
+    """AC18: E2E cline worker calls back via the send_message MCP tool.
+
+    Verifies F329' (MCP materialization) + F332 (sender-token authentication)
+    end-to-end: a cline_dev worker, assigned a trivial task, delivers its
+    result via the send_message MCP tool — the inbox row's provenance is the
+    MCP path, not a hand-crafted curl.
+
+    Red on the pre-change tree: today the MCP tool does not exist in the
+    worker's toolset (cline_cli.py does not materialize cline_mcp_settings.json).
+    """
+
+    def test_cline_worker_mcp_callback(self, require_cline):
+        """A cline_dev worker delivers a callback via send_message MCP tool."""
+        _run_cline_mcp_callback_test()
+
+    def test_send_message_to_inbox(self, require_cline):
+        """Standard inbox delivery test for cline_cli provider."""
+        _run_send_message_test(provider="cline_cli", agent_profile="cline_dev")

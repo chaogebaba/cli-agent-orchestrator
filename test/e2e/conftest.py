@@ -139,6 +139,13 @@ def require_copilot():
 
 
 @pytest.fixture()
+def require_cline():
+    """Skip test if cline CLI is not available."""
+    if not _cli_available("cline"):
+        pytest.skip("cline CLI not installed")
+
+
+@pytest.fixture()
 def require_opencode():
     """Skip test if opencode binary is not available."""
     if not _cli_available("opencode"):
