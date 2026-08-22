@@ -1938,6 +1938,7 @@ async def health_check():
         "status": "ok",
         "service": "cli-agent-orchestrator",
         "terminal_backend": backend_name,
+        "ws_monitor": bool(ConfigService.get("supervisor.wake.ws_monitor", default=False)),
         "components": {
             "cao": "ok",
             "herdr": _probe("herdr"),
