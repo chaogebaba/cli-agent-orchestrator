@@ -2880,6 +2880,7 @@ def create_terminal(
                 registered_by=caller_id or "unknown",
             )
         db.commit()
+        invalidate_terminal_metadata_cache(terminal.id)
         return {
             "id": terminal.id,
             "tmux_session": terminal.tmux_session,
@@ -3070,18 +3071,31 @@ def create_terminal_with_warm_intent(
 # F351: TTL cache for get_terminal_metadata — eliminates repeated identical DB
 # queries within the same tick cycle (watchdog, status_monitor, delivery all
 # call this for the same terminal_id within milliseconds of each other).
+#
+# CPython GIL guarantees atomic dict get/set/pop, so the read/write hot path
+# is lock-free. The lock is only held during clear() to prevent
+# iteration-during-mutation in test fixtures.
 # ---------------------------------------------------------------------------
-import threading as _threading_cache
+from threading import Lock as _CacheLock
 
 _terminal_metadata_cache: Dict[str, tuple[float, Any]] = {}
-_terminal_metadata_cache_lock = _threading_cache.Lock()
+_terminal_metadata_cache_lock = _CacheLock()
 _TERMINAL_METADATA_TTL_S = 2.0
 
 
 def invalidate_terminal_metadata_cache(terminal_id: str) -> None:
     """Evict a terminal's cached metadata after a mutation."""
+    _terminal_metadata_cache.pop(terminal_id, None)
+    # Also evict session-level entries that may include stale data
+    for k in list(_terminal_metadata_cache):
+        if k.startswith("__session__"):
+            _terminal_metadata_cache.pop(k, None)
+
+
+def clear_terminal_metadata_cache() -> None:
+    """Clear the entire cache. Called by test fixtures (B2) to prevent cross-test leakage."""
     with _terminal_metadata_cache_lock:
-        _terminal_metadata_cache.pop(terminal_id, None)
+        _terminal_metadata_cache.clear()
 
 
 def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
@@ -3089,17 +3103,15 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
     import json as _json
 
     now = time.monotonic()
-    with _terminal_metadata_cache_lock:
-        entry = _terminal_metadata_cache.get(terminal_id)
-        if entry is not None and (now - entry[0]) < _TERMINAL_METADATA_TTL_S:
-            return entry[1]
+    entry = _terminal_metadata_cache.get(terminal_id)
+    if entry is not None and (now - entry[0]) < _TERMINAL_METADATA_TTL_S:
+        return entry[1]
 
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if not terminal:
             logger.warning(f"Terminal metadata not found for terminal_id: {terminal_id}")
-            with _terminal_metadata_cache_lock:
-                _terminal_metadata_cache[terminal_id] = (now, None)
+            _terminal_metadata_cache[terminal_id] = (now, None)
             return None
         logger.debug(
             f"Retrieved terminal metadata for {terminal_id}: provider={terminal.provider}, session={terminal.tmux_session}"
@@ -3142,8 +3154,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "worktree_info": worktree_info_raw,
             "last_active": terminal.last_active,
         }
-        with _terminal_metadata_cache_lock:
-            _terminal_metadata_cache[terminal_id] = (now, result)
+        _terminal_metadata_cache[terminal_id] = (now, result)
         return result
 
 
@@ -3284,6 +3295,7 @@ def set_terminal_last_notified_inbox_id(terminal_id: str, message_id: int) -> bo
         if message_id > current:
             terminal.last_notified_inbox_id = message_id
             db.commit()
+            invalidate_terminal_metadata_cache(terminal_id)
         return True
 
 
@@ -3306,6 +3318,7 @@ def set_terminal_last_doorbell_row_id(terminal_id: str, row_id: int) -> bool:
         if row_id > current:
             terminal.last_doorbell_row_id = row_id
             db.commit()
+            invalidate_terminal_metadata_cache(terminal_id)
         return True
 
 
@@ -3326,6 +3339,7 @@ def set_terminal_worktree_info(terminal_id: str, info: Dict[str, str]) -> None:
         if terminal.worktree_info is None:
             terminal.worktree_info = encoded
             db.commit()
+            invalidate_terminal_metadata_cache(terminal_id)
         elif terminal.worktree_info == encoded:
             # Identical retry -- idempotent no-op.
             pass
@@ -3471,10 +3485,9 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
     """List all terminals in a tmux session (F351: TTL-cached)."""
     now = time.monotonic()
     cache_key = f"__session__{tmux_session}"
-    with _terminal_metadata_cache_lock:
-        entry = _terminal_metadata_cache.get(cache_key)
-        if entry is not None and (now - entry[0]) < _TERMINAL_METADATA_TTL_S:
-            return entry[1]
+    entry = _terminal_metadata_cache.get(cache_key)
+    if entry is not None and (now - entry[0]) < _TERMINAL_METADATA_TTL_S:
+        return entry[1]
 
     with SessionLocal() as db:
         terminals = db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).all()
@@ -3521,8 +3534,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 # ObjectDeletedError (or similar) instead of crashing the pass
                 logger.debug("list_terminals_by_session: skipping stale row: %s", exc)
                 continue
-    with _terminal_metadata_cache_lock:
-        _terminal_metadata_cache[cache_key] = (now, results)
+    _terminal_metadata_cache[cache_key] = (now, results)
     return results
 
 
@@ -3533,6 +3545,7 @@ def update_last_active(terminal_id: str) -> bool:
         if terminal:
             terminal.last_active = _utcnow()
             db.commit()
+            invalidate_terminal_metadata_cache(terminal_id)
             return True
         return False
 
@@ -3544,6 +3557,7 @@ def update_terminal_shell_command(terminal_id: str, shell_command: str) -> bool:
         if terminal:
             terminal.shell_command = shell_command
             db.commit()
+            invalidate_terminal_metadata_cache(terminal_id)
             return True
         return False
 
@@ -3556,6 +3570,7 @@ def update_terminal_resolved_model(terminal_id: str, resolved_model: str) -> boo
         if terminal:
             terminal.resolved_model = resolved_model
             db.commit()
+            invalidate_terminal_metadata_cache(terminal_id)
             return True
         return False
 
@@ -3582,6 +3597,7 @@ def update_terminal_tmux_window(terminal_id: str, new_tmux_window: str) -> bool:
             return False
         terminal.tmux_window = new_tmux_window
         db.commit()
+        invalidate_terminal_metadata_cache(terminal_id)
         return True
 
 
@@ -3593,7 +3609,9 @@ def update_terminal_provider_session_id_if_null(terminal_id: str, session_uuid: 
             TerminalModel.provider_session_id.is_(None),
         ).update({TerminalModel.provider_session_id: session_uuid}, synchronize_session=False)
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
-        return terminal.provider_session_id if terminal else None
+        result = terminal.provider_session_id if terminal else None
+    invalidate_terminal_metadata_cache(terminal_id)
+    return result
 
 
 def update_terminal_provider_session_id(terminal_id: str, session_uuid: str) -> bool:
@@ -3604,7 +3622,8 @@ def update_terminal_provider_session_id(terminal_id: str, session_uuid: str) -> 
             .filter(TerminalModel.id == terminal_id)
             .update({TerminalModel.provider_session_id: session_uuid}, synchronize_session=False)
         )
-        return changed > 0
+    invalidate_terminal_metadata_cache(terminal_id)
+    return changed > 0
 
 
 def update_terminal_runtime_identity(
@@ -3637,7 +3656,8 @@ def update_terminal_runtime_identity(
                 TerminalModel.provider_session_id == session_uuid,
                 TerminalModel.id != terminal_id,
             ).update({"provider_session_id": None}, synchronize_session=False)
-        return True
+    invalidate_terminal_metadata_cache(terminal_id)
+    return True
 
 
 def _reactivate_parked_rows_in_db(
@@ -3966,7 +3986,9 @@ def settle_terminal_fallback(old_terminal_id: str, new_terminal_id: str) -> int:
             TerminalModel.provider_session_id == new.provider_session_id,
             TerminalModel.id != new_terminal_id,
         ).update({"provider_session_id": None}, synchronize_session=False)
-        return changed
+    invalidate_terminal_metadata_cache(old_terminal_id)
+    invalidate_terminal_metadata_cache(new_terminal_id)
+    return changed
 
 
 def has_unsettled_delivery_attempt(terminal_id: str) -> bool:
@@ -4762,6 +4784,7 @@ def mark_terminal_init_ready(
                 _clear_progress_fence(progress_fence, terminal_id)
                 progress_fence = None
             db.info.pop(_READY_COMMIT_CALLBACK, None)
+        invalidate_terminal_metadata_cache(terminal_id)
         return changed
 
 
@@ -4843,6 +4866,7 @@ def claim_deferred_init_failure(
                 _mark_barrier_member_gone_in_db(db, terminal_id)
                 db.flush()
                 db.commit()
+                invalidate_terminal_metadata_cache(terminal_id)
                 return {"status": status, "init_state": row.init_state, "token": failure_token}
             except OperationalError as exc:
                 db.rollback()
@@ -4956,7 +4980,8 @@ def f160_rearm_deferred_init(terminal_id: str, expected_started_at: datetime | N
         if abs((current - expected).total_seconds()) > 0.001:
             return False
         row.init_started_at = _utcnow()
-        return True
+    invalidate_terminal_metadata_cache(terminal_id)
+    return True
 
 
 def begin_teardown_intent(workspace_id: str, session_name: str) -> Dict[str, Any]:
