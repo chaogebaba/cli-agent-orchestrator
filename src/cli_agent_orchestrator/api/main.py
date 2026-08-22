@@ -1972,6 +1972,79 @@ async def health_check():
     return payload
 
 
+# ---------------------------------------------------------------------------
+# WPDT W1: WebSocket doorbell plane for supervisor callback wake
+# ---------------------------------------------------------------------------
+
+
+@app.websocket("/ws/supervisor/{terminal_id}")
+async def ws_supervisor_doorbell(websocket: WebSocket, terminal_id: str):
+    """W1: Advisory doorbell WebSocket for supervisor terminals.
+
+    Pushes a text frame when an inbox row targets this terminal while the
+    connection is live. Auth: same terminal token as X-CAO-Terminal-Token.
+    Returns 503 when supervisor.wake.ws_monitor is False (AC3).
+    """
+    from cli_agent_orchestrator.services.ws_doorbell import (
+        is_ws_monitor_enabled,
+        register_connection,
+        unregister_connection,
+    )
+
+    # AC3: flag gate — 503 when disabled
+    if not is_ws_monitor_enabled():
+        await websocket.close(code=4503, reason="ws_monitor disabled")
+        return
+
+    # Auth: validate terminal token from query param or header
+    token = websocket.query_params.get("token")
+    if not token:
+        auth_header = websocket.headers.get("authorization")
+        if auth_header and auth_header.lower().startswith("bearer "):
+            token = auth_header[7:]
+    if not token:
+        token = websocket.headers.get("x-cao-terminal-token")
+
+    if not token:
+        await websocket.close(code=4401, reason="Missing terminal token")
+        return
+
+    # Validate token against stored terminal token
+    from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata:
+        await websocket.close(code=4404, reason="Terminal not found")
+        return
+
+    stored_token = metadata.get("terminal_token")
+    if not stored_token or not _constant_time_compare(token, stored_token):
+        await websocket.close(code=4401, reason="Invalid terminal token")
+        return
+
+    await websocket.accept()
+
+    # Register this connection for doorbell pushes
+    await register_connection(terminal_id, websocket)
+    try:
+        # Keep alive — wait for client disconnect or server shutdown
+        while True:
+            try:
+                # Consume any client frames (keepalive pings etc); we don't act on them
+                await websocket.receive_text()
+            except WebSocketDisconnect:
+                break
+    finally:
+        await unregister_connection(terminal_id, websocket)
+
+
+def _constant_time_compare(a: str, b: str) -> bool:
+    """Constant-time string comparison to prevent timing attacks."""
+    import hmac
+
+    return hmac.compare_digest(a.encode(), b.encode())
+
+
 def _mcp_apps_enabled() -> bool:
     """Whether the MCP Apps HTTP surface (event stream + widget) is enabled.
 
@@ -7316,6 +7389,20 @@ async def create_inbox_message_endpoint(
         request_delivery(inbox_msg.receiver_id)
     except Exception:
         pass  # best-effort; deliver_pending below is the fallback
+
+    # WPDT W1: Push advisory doorbell frame via WS if armed
+    try:
+        from cli_agent_orchestrator.services.ws_doorbell import push_doorbell_frame_sync
+
+        preview = message.split("\n", 1)[0] if message else ""
+        push_doorbell_frame_sync(
+            inbox_msg.receiver_id,
+            inbox_msg.id,
+            sender_id[:8],
+            preview,
+        )
+    except Exception:
+        pass  # advisory-only, never blocks
 
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.
