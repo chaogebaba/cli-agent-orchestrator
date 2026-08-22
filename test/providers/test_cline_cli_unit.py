@@ -81,6 +81,65 @@ class TestDispatcherScript:
         )
         assert "_cao_msg_n=$((_cao_msg_n + 1))" in script
 
+    def test_env_exports_prepended_to_script(self):
+        """env_exports parameter is prepended before the loop."""
+        exports = 'export MCP_CONNECT_TIMEOUT_MS="30000"\n'
+        script = _build_dispatcher_script(
+            CLINE_BINARY,
+            "/data/msgs",
+            "t1234567",
+            f"{CLINE_BINARY} --auto-approve true",
+            env_exports=exports,
+        )
+        # Export appears before the loop variable init
+        export_idx = script.index("MCP_CONNECT_TIMEOUT_MS")
+        loop_idx = script.index("_cao_msg_n=0")
+        assert export_idx < loop_idx
+
+    def test_env_exports_empty_by_default(self):
+        """Without env_exports the script starts directly with the loop."""
+        script = _build_dispatcher_script(
+            CLINE_BINARY, "/data/msgs", "t1234567", f"{CLINE_BINARY} --auto-approve true"
+        )
+        assert script.startswith("_cao_msg_n=0")
+
+
+# ─── F345: MCP connect timeout env export ────────────────────────────────────
+
+
+class TestMcpConnectTimeoutEnv:
+    """Tests for _build_env_exports (F345 MCP_CONNECT_TIMEOUT_MS setdefault)."""
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
+    @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
+    def test_mcp_connect_timeout_set_when_absent(self, mock_load, mock_defaults, monkeypatch):
+        """MCP_CONNECT_TIMEOUT_MS is exported when not in environment."""
+        mock_load.side_effect = FileNotFoundError("no profile")
+        mock_defaults.return_value = {}
+        monkeypatch.delenv("MCP_CONNECT_TIMEOUT_MS", raising=False)
+
+        provider = ClineCliProvider("t1234567", "sess", "win0")
+        exports = provider._build_env_exports()
+
+        assert "MCP_CONNECT_TIMEOUT_MS" in exports
+        assert "30000" in exports
+        assert exports.startswith("export ")
+
+    @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
+    @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
+    def test_mcp_connect_timeout_not_clobbered_when_preset(
+        self, mock_load, mock_defaults, monkeypatch
+    ):
+        """MCP_CONNECT_TIMEOUT_MS is NOT overridden when already set by operator."""
+        mock_load.side_effect = FileNotFoundError("no profile")
+        mock_defaults.return_value = {}
+        monkeypatch.setenv("MCP_CONNECT_TIMEOUT_MS", "60000")
+
+        provider = ClineCliProvider("t1234567", "sess", "win0")
+        exports = provider._build_env_exports()
+
+        assert "MCP_CONNECT_TIMEOUT_MS" not in exports
+
 
 # ─── Command construction (base args) ────────────────────────────────────────
 

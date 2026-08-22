@@ -115,12 +115,19 @@ ABORT_LINE = "[abort] aborted by another client"
 # How far back in the pane tail to look for ABORT_LINE.
 _ABORT_SCAN_LINES = 40
 
+# F345: Default MCP connect timeout (ms) for cline workers.  The cline CLI
+# uses MCP_CONNECT_TIMEOUT_MS to bound the MCP server initialization handshake.
+# Under concurrent worker load, cao-mcp-server can exceed the default timeout
+# (Python startup + HTTP round-trip to CAO API).  30 s is generous but bounded.
+_DEFAULT_MCP_CONNECT_TIMEOUT_MS = "30000"
+
 
 def _build_dispatcher_script(
     cline_binary: str,
     msg_dir: str,
     terminal_id: str,
     base_args: str,
+    env_exports: str = "",
 ) -> str:
     """Build the shell dispatcher loop that runs in the tmux pane.
 
@@ -144,7 +151,7 @@ def _build_dispatcher_script(
     # The script uses a heredoc-style delimiter: text up to a line containing
     # only __CAO_MSG_END__ is captured as the message.
     return f"""\
-_cao_msg_n=0
+{env_exports}_cao_msg_n=0
 while true; do
   _cao_msg_n=$((_cao_msg_n + 1))
   _cao_msgfile="{msg_dir}/{terminal_id}_${{_cao_msg_n}}.txt"
@@ -448,6 +455,21 @@ class ClineCliProvider(BaseProvider):
             command,
         )
 
+    def _build_env_exports(self) -> str:
+        """Build shell export statements for the dispatcher pane (setdefault semantics).
+
+        Environment variables are exported only if not already present in the
+        process environment, so operator overrides are respected.
+        """
+        lines: list[str] = []
+        # F345: Widen MCP connect timeout so cao-mcp-server has time to init
+        # under concurrent worker load.
+        if not os.environ.get("MCP_CONNECT_TIMEOUT_MS"):
+            lines.append(f'export MCP_CONNECT_TIMEOUT_MS="{_DEFAULT_MCP_CONNECT_TIMEOUT_MS}"')
+        if lines:
+            return "\n".join(lines) + "\n"
+        return ""
+
     def _build_base_args(self) -> str:
         """Build the cline base argument string (everything except the message).
 
@@ -573,8 +595,13 @@ class ClineCliProvider(BaseProvider):
         base_args = self._build_base_args()
         msg_dir = str(self._msg_dir())
 
+        # F345: Build env exports for the dispatcher shell (setdefault semantics).
+        env_exports = self._build_env_exports()
+
         # Launch the dispatcher loop script in the pane.
-        dispatcher = _build_dispatcher_script(CLINE_BINARY, msg_dir, self.terminal_id, base_args)
+        dispatcher = _build_dispatcher_script(
+            CLINE_BINARY, msg_dir, self.terminal_id, base_args, env_exports
+        )
         status_monitor.notify_input_sent(self.terminal_id)
         get_backend().send_keys(self.session_name, self.window_name, dispatcher)
 
