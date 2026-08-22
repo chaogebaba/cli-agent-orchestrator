@@ -707,6 +707,50 @@ def convergence_tick() -> None:
     # undelivered, at a bounded cadence (once per escalate_after_s).
     _reresolve_escalated(escalate_after_s)
 
+    # WPDT W5: Late-bind watcher for native UDS gate
+    _check_uds_late_bind()
+
+
+# ---------------------------------------------------------------------------
+# WPDT W5: Late-bind watcher for native UDS messaging gate
+# ---------------------------------------------------------------------------
+
+# Per-process state: logs state transition once (id+revision style, not spam)
+_uds_gate_observed: bool = False
+
+
+def _check_uds_late_bind() -> None:
+    """W5: Cheap periodic check for UDS socket-dir existence.
+
+    Logs a debug line once when the [uds-messaging] directory appears (F191/F194
+    parked-with-watcher). Does not activate any delivery path — only observes.
+    """
+    global _uds_gate_observed
+
+    if _uds_gate_observed:
+        return  # Already logged the transition, no repeat
+
+    try:
+        from cli_agent_orchestrator.services.cc_session_registry import _sessions_dir
+
+        sessions_dir = _sessions_dir()
+        if sessions_dir is None or not sessions_dir.exists():
+            return
+
+        # Look for any session dir with a socket file
+        import glob
+
+        socket_files = glob.glob(str(sessions_dir / "*" / "*.sock"))
+        if socket_files:
+            _uds_gate_observed = True
+            logger.debug(
+                "[uds-messaging] socket-dir detected: %s (%d sockets)",
+                sessions_dir,
+                len(socket_files),
+            )
+    except Exception:
+        pass
+
 
 def _oneshot_rearm_boundaries() -> None:
     """F203 D6: Oneshot re-arm for all terminals with tracked boundary state.
@@ -1002,6 +1046,30 @@ def _escalate(
             age_s,
             obl.attempts,
         )
+        # F206a/H3: Arm re-resolve cadence
+        from cli_agent_orchestrator.services.config_service import ConfigService
+        from datetime import timedelta
+
+        eas = float(ConfigService.get("delivery.escalate_after_s", 120.0))
+        obl.next_attempt_at = now + timedelta(seconds=eas)
+        return
+
+    # WPDT W4: Supervisor targets NEVER receive rung2 composer injection at escalation.
+    # Delete the re-entry path for supervisor targets — the rung2 body stays
+    # dead-by-policy per f210 D14 (D10 knob retained for non-supervisor targets).
+    if _is_supervisor_role_target(target):
+        obl.state = "ESCALATED"
+        obl.terminal_at = now
+        obl.terminal_reason = "supervisor_role_exempt"
+        emit_trace_or_collapse(obl.inbox_row_id, "escalate", "settle", "supervisor_role_exempt", db)
+        logger.error(
+            "fx191_escalated inbox=%d reason=supervisor_role_exempt age=%.0fs attempts=%d",
+            obl.inbox_row_id,
+            age_s,
+            obl.attempts,
+        )
+        # F206b: fire display-message floor for supervisor targets
+        _fire_escalation_display_message(target, obl.inbox_row_id)
         # F206a/H3: Arm re-resolve cadence
         from cli_agent_orchestrator.services.config_service import ConfigService
         from datetime import timedelta
@@ -1393,6 +1461,38 @@ def _reresolve_escalated(escalate_after_s: float) -> None:
                 target = resolve_supervisor_target(obl.mailbox_id, db)
                 if target.terminal_id is None or target.tmux_session is None:
                     # No live target — keep ESCALATED, bump next_attempt_at
+                    obl.next_attempt_at = now + timedelta(seconds=escalate_after_s)
+                    db.commit()
+                    continue
+
+                # F219/WPDT W4: extend abandonment to escalation re-resolve
+                if getattr(target, "liveness", "presumed_live") == "confirmed_dead":
+                    obl.state = "SETTLED_TARGET_DEAD"
+                    obl.terminal_at = now
+                    obl.terminal_reason = "target_confirmed_dead"
+                    emit_trace_or_collapse(
+                        obl.inbox_row_id, "f206_reresolve", "settle", "target_confirmed_dead", db
+                    )
+                    db.commit()
+                    continue
+
+                # WPDT W4: supervisor targets skip rung2 — only display-message floor
+                if _is_supervisor_role_target(target):
+                    # F206b: re-trigger display-message for supervisor targets
+                    from sqlalchemy import func as _func
+
+                    esc_count = (
+                        db.query(_func.count(DeliveryObligationModel.inbox_row_id))
+                        .filter(
+                            DeliveryObligationModel.state == "ESCALATED",
+                            DeliveryObligationModel.mailbox_id == obl.mailbox_id,
+                        )
+                        .scalar()
+                    ) or 1
+                    _fire_escalation_display_message(target, obl.inbox_row_id, esc_count)
+                    emit_trace_or_collapse(
+                        obl.inbox_row_id, "f206_reresolve", "defer", "supervisor_role_exempt", db
+                    )
                     obl.next_attempt_at = now + timedelta(seconds=escalate_after_s)
                     db.commit()
                     continue
