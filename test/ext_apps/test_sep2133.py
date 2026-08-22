@@ -54,41 +54,69 @@ class _FakeLowLevel:
         return {"experimental": caps}
 
 
+class _FakeExtension:
+    """Captures the extension registered via add_extension."""
+
+    def __init__(self) -> None:
+        self.identifier: Optional[str] = None
+        self.settings_result: Optional[Dict[str, Any]] = None
+
+    def store(self, ext: Any) -> None:
+        self.identifier = ext.identifier
+        self.settings_result = ext.settings()
+
+
 class _FakeMcp:
     def __init__(self) -> None:
         self._mcp_server = _FakeLowLevel()
+        self.experimental_capabilities: Dict[str, Any] = {}
+        self._registered_extensions: List[Any] = []
+
+    def add_extension(self, ext: Any) -> None:
+        self._registered_extensions.append(ext)
 
 
 class TestAdvertiseCapability:
     def test_noop_when_disabled(self, disabled: None) -> None:
         mcp = _FakeMcp()
         advertise_capability(mcp)
-        mcp._mcp_server.create_initialization_options(experimental_capabilities={})
-        assert EXTENSION_ID not in mcp._mcp_server.received[-1]
+        # Neither extension registered nor experimental set
+        assert len(mcp._registered_extensions) == 0
+        assert EXTENSION_ID not in mcp.experimental_capabilities
 
     def test_advertises_extension_when_enabled(self, enabled: None) -> None:
         mcp = _FakeMcp()
         advertise_capability(mcp)
-        mcp._mcp_server.create_initialization_options(experimental_capabilities={})
-        received = mcp._mcp_server.received[-1]
-        assert EXTENSION_ID in received
-        assert received[EXTENSION_ID]["mimeTypes"] == ["text/html;profile=mcp-app"]
+        # Extension registered via add_extension
+        assert len(mcp._registered_extensions) == 1
+        ext = mcp._registered_extensions[0]
+        assert ext.identifier == EXTENSION_ID
+        assert ext.settings() == {"mimeTypes": ["text/html;profile=mcp-app"]}
+
+    def test_mirrors_to_experimental_when_enabled(self, enabled: None) -> None:
+        mcp = _FakeMcp()
+        advertise_capability(mcp)
+        # Legacy fallback: experimental_capabilities dict updated
+        assert EXTENSION_ID in mcp.experimental_capabilities
+        assert mcp.experimental_capabilities[EXTENSION_ID]["mimeTypes"] == [
+            "text/html;profile=mcp-app"
+        ]
 
     def test_preserves_existing_experimental_caps(self, enabled: None) -> None:
         mcp = _FakeMcp()
+        mcp.experimental_capabilities["some.other/ext"] = {"x": 1}
         advertise_capability(mcp)
-        mcp._mcp_server.create_initialization_options(
-            experimental_capabilities={"some.other/ext": {"x": 1}}
-        )
-        received = mcp._mcp_server.received[-1]
-        assert received["some.other/ext"] == {"x": 1}
-        assert EXTENSION_ID in received
+        assert mcp.experimental_capabilities["some.other/ext"] == {"x": 1}
+        assert EXTENSION_ID in mcp.experimental_capabilities
 
-    def test_no_mcp_server_does_not_raise(self, enabled: None) -> None:
-        class _NoServer:
-            pass
+    def test_no_add_extension_does_not_raise(self, enabled: None) -> None:
+        class _NoExtensionSupport:
+            experimental_capabilities: Dict[str, Any] = {}
 
-        advertise_capability(_NoServer())  # must not raise
+        # No add_extension method — should not raise, just log
+        advertise_capability(_NoExtensionSupport())  # type: ignore[arg-type]
+        # Fallback to experimental still works
+        assert EXTENSION_ID in _NoExtensionSupport.experimental_capabilities
 
 
 class _Caps:

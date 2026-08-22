@@ -19,11 +19,12 @@ classifiers = [
 ]
 dependencies = [
     "fastapi>=0.104.0",
-    # Upper bound: ext_apps/sep2133.advertise_capability monkey-patches a FastMCP
-    # internal (create_initialization_options); cap the major to avoid silent
-    # breakage on a new major release. Tested against 3.x.
-    "fastmcp>=2.14.0,<4.0.0",
-    "mcp>=1.23.0",
+    # FastMCP 4 (beta) — supports mcp 2.x / protocol revision 2026-07-28.
+    # The old <4.0.0 cap guarded the sep2133 monkey-patch; that patch is now
+    # replaced with FastMCP 4's supported capability advertisement path
+    # (FastMCP.add_extension — see ext_apps/sep2133.py).
+    "fastmcp>=4.0.0b3,<5",
+    "mcp>=2,<3",
     "pydantic>=2.10.6",
     "apscheduler>=3.10.4",
     "sqlalchemy>=2.0.0",

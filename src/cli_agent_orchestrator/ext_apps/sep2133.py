@@ -12,11 +12,12 @@ Two complementary surfaces are provided:
     capabilities. Returns ``{}`` (a no-op) when disabled.
 
   ``advertise_capability(mcp)``
-    Push model — wraps the FastMCP server's ``create_initialization_options`` so
-    the ``initialize`` response always advertises ``io.modelcontextprotocol/ui``
-    in ``experimental_capabilities``. Call once at server startup. No-op when
-    disabled. SEP-1865 hosts use this during the handshake to discover the
-    surface before invoking UI-capable tools.
+    Push model — registers a SEP-2133 server extension with FastMCP 4 so
+    ``io.modelcontextprotocol/ui`` is advertised in
+    ``capabilities.extensions`` (for 2026-07-28 clients) AND mirrors the
+    capability into ``experimental_capabilities`` (for legacy clients on
+    protocol revisions that lack the ``extensions`` field). No-op when
+    ``CAO_MCP_APPS_ENABLED`` is unset.
 
   ``client_supports_mcp_apps(mcp)``
     Returns True if the *current* MCP request context shows the connected client
@@ -48,9 +49,8 @@ _CAPABILITIES: Dict[str, Any] = {
     },
 }
 
-# Capability block injected into the server's ``initialize`` response by
-# :func:`advertise_capability`. The host reads the declared MIME so it knows the
-# ``ui://cao/*`` resource bodies are MCP App HTML, not arbitrary documents.
+# Capability block advertised under capabilities.extensions[EXTENSION_ID]
+# and mirrored into experimental_capabilities for legacy clients.
 SERVER_EXTENSION_CAPABILITY: Dict[str, Any] = {
     EXTENSION_ID: {
         "mimeTypes": ["text/html;profile=mcp-app"],
@@ -82,46 +82,72 @@ def negotiate_capabilities(client_capabilities: Any = None) -> Dict[str, Any]:
 
 
 def advertise_capability(mcp: Any) -> None:
-    """Inject the SEP-2133 extension into the server's initialize response.
+    """Advertise ``io.modelcontextprotocol/ui`` via dual-location strategy.
 
-    Wraps ``mcp._mcp_server.create_initialization_options`` to append
-    ``io.modelcontextprotocol/ui`` to ``experimental_capabilities``. No-op when
-    ``CAO_MCP_APPS_ENABLED`` is unset, and best-effort otherwise (a FastMCP build
-    that exposes no ``_mcp_server`` is logged and skipped rather than crashing
-    startup).
+    Under FastMCP 4 / mcp 2.0:
 
-    Spec/SDK note: SEP-1865 (Final) advertises the capability under
-    ``capabilities.extensions``. The installed MCP SDK's ``ServerCapabilities``
-    has no ``extensions`` field (only ``experimental``), so we use the
-    ``experimental`` extension point — the sanctioned place for vendor
-    capabilities on this SDK. ``client_supports_mcp_apps`` accepts either
-    location, so a host on a newer SDK that advertises under ``extensions`` is
-    still recognized. Switch the advertise side to ``extensions`` once the SDK
-    exposes it.
+    1. **capabilities.extensions** — registers a proper ``ServerExtension``
+       so the identifier and settings are advertised in the ``server/discover``
+       response and the ``initialize`` response for 2026-07-28 clients.
+       FastMCP 4 also advertises the bare identifier natively; our extension
+       registration overrides that with our settings (``mimeTypes``).
+
+    2. **experimental_capabilities** — injects the same capability map into
+       the FastMCP instance's ``experimental_capabilities`` dict so legacy
+       clients (protocol ≤2025-11-25, e.g. cline 3.0.56) still see it in
+       ``ServerCapabilities.experimental``. The SDK strips ``extensions`` for
+       pre-2026 protocol versions, so ``experimental`` is the only fallback
+       that reaches them.
+
+    No-op when ``CAO_MCP_APPS_ENABLED`` is unset.
     """
     if not _is_enabled():
         return
 
-    low_level = getattr(mcp, "_mcp_server", None)
-    if low_level is None:
-        logger.warning("SEP-2133: cannot find _mcp_server on %r; skipping advertisement", mcp)
-        return
+    # --- Strategy 1: capabilities.extensions via ServerExtension ---
+    try:
+        from fastmcp.server.extensions import ServerExtension
 
-    _original = low_level.create_initialization_options
+        class McpAppsExtension(ServerExtension):
+            """SEP-2133 extension for MCP Apps (io.modelcontextprotocol/ui)."""
+            identifier = EXTENSION_ID
 
-    def _patched(
-        notification_options: Any = None, experimental_capabilities: Any = None, **kw: Any
-    ) -> Any:
-        caps: Dict[str, Any] = dict(experimental_capabilities or {})
-        caps.update(SERVER_EXTENSION_CAPABILITY)
-        return _original(
-            notification_options=notification_options,
-            experimental_capabilities=caps,
-            **kw,
+            def settings(self) -> Dict[str, Any]:
+                return {"mimeTypes": ["text/html;profile=mcp-app"]}
+
+        mcp.add_extension(McpAppsExtension())
+        logger.info(
+            "SEP-2133: registered %s extension (capabilities.extensions)", EXTENSION_ID
+        )
+    except Exception:
+        logger.warning(
+            "SEP-2133: failed to register ServerExtension for %s; "
+            "extensions advertisement may be limited to experimental only",
+            EXTENSION_ID,
+            exc_info=True,
         )
 
-    low_level.create_initialization_options = _patched
-    logger.info("SEP-2133: advertised %s in server initialize response", EXTENSION_ID)
+    # --- Strategy 2: experimental_capabilities fallback for legacy clients ---
+    try:
+        experimental = getattr(mcp, "experimental_capabilities", None)
+        if experimental is not None:
+            experimental.update(SERVER_EXTENSION_CAPABILITY)
+            logger.info(
+                "SEP-2133: mirrored %s into experimental_capabilities", EXTENSION_ID
+            )
+        else:
+            # FastMCP instance has no experimental_capabilities attribute;
+            # fall back to the legacy monkey-patch if _mcp_server is available
+            logger.debug(
+                "SEP-2133: no experimental_capabilities attr on %r; "
+                "legacy clients may not see the advertisement", mcp
+            )
+    except Exception:
+        logger.warning(
+            "SEP-2133: failed to set experimental_capabilities fallback for %s",
+            EXTENSION_ID,
+            exc_info=True,
+        )
 
 
 def client_supports_mcp_apps(mcp: Any) -> bool:
@@ -147,7 +173,7 @@ def client_supports_mcp_apps(mcp: Any) -> bool:
         if capabilities is None:
             return False
         # SEP-1865 advertises under capabilities.extensions (per SEP-1724); the
-        # installed SDK only exposes `experimental`. Accept either so both
+        # installed SDK also exposes `experimental`. Accept either so both
         # current- and future-SDK hosts are recognized.
         experimental = getattr(capabilities, "experimental", None) or {}
         extensions = getattr(capabilities, "extensions", None) or {}
