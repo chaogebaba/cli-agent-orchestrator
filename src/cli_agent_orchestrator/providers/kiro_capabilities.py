@@ -300,14 +300,33 @@ def probe_kiro_capabilities(
     """
     root_help_result = _run(runner, ("kiro-cli", "--help"), timeout, engine)
     root_help_output = (root_help_result.stdout or "") + "\n" + (root_help_result.stderr or "")
-    chat_help_result = _run(
-        runner,
-        ("kiro-cli", "chat", "--help"),
-        chat_help_timeout,
-        engine,
-        stdin=subprocess.DEVNULL,
-    )
-    chat_help_output = (chat_help_result.stdout or "") + "\n" + (chat_help_result.stderr or "")
+    try:
+        chat_help_result = _run(
+            runner,
+            ("kiro-cli", "chat", "--help"),
+            chat_help_timeout,
+            engine,
+            stdin=subprocess.DEVNULL,
+        )
+        chat_help_output = (chat_help_result.stdout or "") + "\n" + (chat_help_result.stderr or "")
+    except KiroCapabilityError as exc:
+        if exc.kind == "malformed_output":
+            # kiro-cli dispatches `chat` to a companion binary (kiro-cli-chat).
+            # If that binary is missing the subcommand exits non-zero but the
+            # wrapper itself is fine. Fall back to --help-all which is handled
+            # by the wrapper directly, then let the downstream required-flag
+            # check produce a precise "missing capability" error.
+            try:
+                all_help_result = _run(
+                    runner, ("kiro-cli", "--help-all"), timeout, engine
+                )
+                chat_help_output = (
+                    (all_help_result.stdout or "") + "\n" + (all_help_result.stderr or "")
+                )
+            except KiroCapabilityError:
+                chat_help_output = ""
+        else:
+            raise
     flags = _flags_from_help(root_help_output) | _flags_from_help(chat_help_output)
     agent_engines = _agent_engines_from_help(chat_help_output)
 

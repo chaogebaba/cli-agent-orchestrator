@@ -429,6 +429,10 @@ _PROVIDER_HOME_SYMLINKS: tuple[str, ...] = (
     ".bun",
     # kiro_cli: KIRO_AGENTS_DIR = Path.home() / ".kiro" / "agents"
     ".kiro",
+    # kiro_cli: KAS runtime + node/bun binaries for `kiro-cli chat` subprocess.
+    # Without this, `kiro-cli chat --help` fails with "No such file or directory"
+    # because the chat subcommand is backed by a JS runtime in this directory.
+    ".local/share/kiro-cli",
     # cline_cli: _CLINE_USER_DATA = Path.home() / ".cline" / "data"
     ".cline",
     # grok_cli: GROK_BINARY = Path.home() / ".grok" / "bin" / "grok"
@@ -476,6 +480,7 @@ def _seed_provider_home_prerequisites(home_dir: Path) -> None:
         source = real_home / dotdir
         target = home_dir / dotdir
         if source.exists() and not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
             target.symlink_to(source)
 
 
