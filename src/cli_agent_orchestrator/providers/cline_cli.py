@@ -101,6 +101,20 @@ ERROR_PATTERN = (
     r")$"
 )
 
+# Cline prints this when a run ends with finishReason "aborted" and the CLI
+# process itself did not request the abort.  In the shipped bundle the text is
+# the *fallback* branch of:
+#     if (timedOut)       -> "aborted after timeout"
+#     else if (aborted)   -> "aborted"
+#     else                -> "aborted by another client"
+# so the wording is a guess, not a detection — there is no other client.  What
+# it does reliably mean is that the run produced no answer, so the terminal must
+# not be reported COMPLETED.
+ABORT_LINE = "[abort] aborted by another client"
+
+# How far back in the pane tail to look for ABORT_LINE.
+_ABORT_SCAN_LINES = 40
+
 
 def _build_dispatcher_script(
     cline_binary: str,
@@ -206,6 +220,36 @@ class ClineCliProvider(BaseProvider):
         """Short delay before Enter."""
         return 0.1
 
+    def _pane_cmd(self) -> str:
+        """Current foreground command in the worker pane ('' if unavailable)."""
+        try:
+            return get_backend().get_pane_current_command(self.session_name, self.window_name) or ""
+        except Exception as exc:  # backend hiccup must never break delivery
+            logger.debug("cline worker %s: pane command read failed: %s", self.terminal_id, exc)
+            return ""
+
+    async def wait_until_input_ready(self, timeout: float = 5.0) -> bool:
+        """Only accept a paste when the dispatcher is at its ``cat`` read.
+
+        A paste delivered while ``cline`` is running does not reach the
+        dispatcher at all — it lands on the tty of whatever ``run_commands``
+        child is executing, and the message is lost.
+        """
+        import asyncio
+
+        deadline = time.time() + float(timeout)
+        while time.time() < deadline:
+            if self._pane_cmd() == DISPATCHER_IDLE_CMD:
+                return True
+            await asyncio.sleep(0.2)
+        logger.warning(
+            "cline worker %s: pane still busy (%s) after %.1fs; paste may be lost",
+            self.terminal_id,
+            self._pane_cmd(),
+            timeout,
+        )
+        return False
+
     def _after_dispatch_commit_locked(self) -> None:
         """After message paste + Enter, send Ctrl-D (EOF) to close the cat read."""
         self._task_dispatched_flag = True
@@ -216,13 +260,25 @@ class ClineCliProvider(BaseProvider):
         # This must happen AFTER the paste + enter, so cat writes the file.
         import threading
 
-        def _send_eof():
+        def _send_eof() -> None:
             import time as _time
+
             _time.sleep(0.2)  # Small delay to let Enter propagate
-            try:
-                get_backend().send_special_key(
-                    self.session_name, self.window_name, "C-d"
+            # Only the dispatcher's `cat` may be given EOF.  If cline is still
+            # running, this Ctrl-D would close stdin on its `run_commands`
+            # child instead (e.g. an `ssh` invoked without -n), corrupting that
+            # tool call.  Skip rather than damage a live run.
+            pane_cmd = self._pane_cmd()
+            if pane_cmd != DISPATCHER_IDLE_CMD:
+                logger.warning(
+                    "cline worker %s: suppressing EOF, pane is running %r "
+                    "(message likely not delivered)",
+                    self.terminal_id,
+                    pane_cmd,
                 )
+                return
+            try:
+                get_backend().send_special_key(self.session_name, self.window_name, "C-d")
             except Exception as exc:
                 logger.debug("Failed to send EOF to dispatcher: %s", exc)
 
@@ -352,6 +408,7 @@ class ClineCliProvider(BaseProvider):
             env_block["CAO_TERMINAL_TOKEN"] = terminal_token
         # Forward endpoint so MCP server can reach the API
         from cli_agent_orchestrator.utils.http import resolve_endpoint
+
         env_block["CAO_ENDPOINT"] = resolve_endpoint()
         instance_id = os.environ.get("CAO_INSTANCE_ID", "")
         if instance_id:
@@ -461,9 +518,7 @@ class ClineCliProvider(BaseProvider):
             logger.debug("Correlated cline session ID: %s", session_id)
             return session_id
         elif len(new_ids) > 1:
-            logger.warning(
-                "Ambiguous cline session correlation: %d new IDs found", len(new_ids)
-            )
+            logger.warning("Ambiguous cline session correlation: %d new IDs found", len(new_ids))
             return None
         else:
             logger.debug("No new cline session ID found in history")
@@ -509,9 +564,7 @@ class ClineCliProvider(BaseProvider):
         msg_dir = str(self._msg_dir())
 
         # Launch the dispatcher loop script in the pane.
-        dispatcher = _build_dispatcher_script(
-            CLINE_BINARY, msg_dir, self.terminal_id, base_args
-        )
+        dispatcher = _build_dispatcher_script(CLINE_BINARY, msg_dir, self.terminal_id, base_args)
         status_monitor.notify_input_sent(self.terminal_id)
         get_backend().send_keys(self.session_name, self.window_name, dispatcher)
 
@@ -528,9 +581,7 @@ class ClineCliProvider(BaseProvider):
                 break
             await asyncio.sleep(0.5)
         else:
-            raise TimeoutError(
-                f"Cline dispatcher initialization timed out after {init_timeout}s"
-            )
+            raise TimeoutError(f"Cline dispatcher initialization timed out after {init_timeout}s")
 
         self._initialized = True
         return True
@@ -541,6 +592,7 @@ class ClineCliProvider(BaseProvider):
         Status mapping:
           - pane_current_command == "cat" → IDLE (dispatcher waiting) or
             COMPLETED (after task)
+          - dispatcher idle but the tail shows ABORT_LINE → ERROR
           - pane_current_command contains "cline" → PROCESSING
           - pane_current_command == shell_baseline → ERROR (dispatcher crashed)
           - Otherwise → PROCESSING (transitioning)
@@ -552,13 +604,24 @@ class ClineCliProvider(BaseProvider):
         if not self._initialized:
             return TerminalStatus.UNKNOWN
 
-        current_cmd = get_backend().get_pane_current_command(
-            self.session_name, self.window_name
-        )
+        current_cmd = self._pane_cmd()
 
         # Dispatcher idle: cat is waiting for input.
         if current_cmd == DISPATCHER_IDLE_CMD:
             if self._task_dispatched_flag:
+                # A run that printed ABORT_LINE produced no answer.  The pane
+                # looks identical to a clean completion, so scan the tail —
+                # otherwise a dead lane is reported COMPLETED and its abort
+                # notice is handed to the supervisor as the worker's reply.
+                tail = strip_terminal_escapes(output or "").splitlines()
+                if any(ABORT_LINE in line for line in tail[-_ABORT_SCAN_LINES:]):
+                    logger.warning(
+                        "cline worker %s: run aborted (cline reported %r); "
+                        "no answer was produced",
+                        self.terminal_id,
+                        ABORT_LINE,
+                    )
+                    return TerminalStatus.ERROR
                 # Correlate session ID on first completion detection.
                 if self._session_id is None and self._message_count > 0:
                     self._session_id = self._correlate_session_id()
@@ -602,7 +665,7 @@ class ClineCliProvider(BaseProvider):
 
         # Extract content after the cline command line, up to next dispatcher prompt.
         content_lines = []
-        for line in lines[cline_line_idx + 1:]:
+        for line in lines[cline_line_idx + 1 :]:
             stripped = line.strip()
             # Stop at the next dispatcher idle indicator.
             if "cat >" in line or line.strip().startswith("_cao_msg_n="):
