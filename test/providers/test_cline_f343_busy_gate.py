@@ -49,72 +49,60 @@ class TestEofSuppression:
         mock_backend = MagicMock()
         mock_backend.get_pane_current_command.return_value = DISPATCHER_IDLE_CMD
 
-        patcher_be = patch(
-            "cli_agent_orchestrator.providers.cline_cli.get_backend",
-            return_value=mock_backend,
-        )
-        patcher_sub = patch(
-            "cli_agent_orchestrator.providers.cline_cli.subprocess.run",
-            return_value=MagicMock(returncode=1, stderr=""),
-        )
-        patcher_be.start()
-        patcher_sub.start()
-        try:
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli.get_backend",
+                return_value=mock_backend,
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli.subprocess.run",
+                return_value=MagicMock(returncode=1, stderr=""),
+            ),
+        ):
             provider._after_dispatch_commit_locked()
             # Give the daemon thread time to execute.
             time.sleep(0.5)
             mock_backend.send_special_key.assert_called_once_with(
                 "test-session", "test-window", "C-d"
             )
-        finally:
-            patcher_sub.stop()
-            patcher_be.stop()
 
     def test_eof_suppressed_when_pane_busy(self, provider: ClineCliProvider) -> None:
         """EOF is NOT sent when pane is running cline (busy)."""
         mock_backend = MagicMock()
         mock_backend.get_pane_current_command.return_value = "cline"
 
-        patcher_be = patch(
-            "cli_agent_orchestrator.providers.cline_cli.get_backend",
-            return_value=mock_backend,
-        )
-        patcher_sub = patch(
-            "cli_agent_orchestrator.providers.cline_cli.subprocess.run",
-            return_value=MagicMock(returncode=1, stderr=""),
-        )
-        patcher_be.start()
-        patcher_sub.start()
-        try:
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli.get_backend",
+                return_value=mock_backend,
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli.subprocess.run",
+                return_value=MagicMock(returncode=1, stderr=""),
+            ),
+        ):
             provider._after_dispatch_commit_locked()
             time.sleep(0.5)
             mock_backend.send_special_key.assert_not_called()
-        finally:
-            patcher_sub.stop()
-            patcher_be.stop()
 
     def test_eof_suppressed_when_pane_ssh(self, provider: ClineCliProvider) -> None:
         """EOF is NOT sent when pane shows an ssh child running."""
         mock_backend = MagicMock()
         mock_backend.get_pane_current_command.return_value = "ssh"
 
-        patcher_be = patch(
-            "cli_agent_orchestrator.providers.cline_cli.get_backend",
-            return_value=mock_backend,
-        )
-        patcher_sub = patch(
-            "cli_agent_orchestrator.providers.cline_cli.subprocess.run",
-            return_value=MagicMock(returncode=1, stderr=""),
-        )
-        patcher_be.start()
-        patcher_sub.start()
-        try:
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli.get_backend",
+                return_value=mock_backend,
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli.subprocess.run",
+                return_value=MagicMock(returncode=1, stderr=""),
+            ),
+        ):
             provider._after_dispatch_commit_locked()
             time.sleep(0.5)
             mock_backend.send_special_key.assert_not_called()
-        finally:
-            patcher_sub.stop()
-            patcher_be.stop()
 
 
 # ─── Defect 1 (continued): pre_paste_gate ─────────────────────────────────────

@@ -754,49 +754,72 @@ class TestClineCliProperties:
 class TestClineCliEofDispatch:
     """Tests for the Ctrl-D EOF dispatch in _after_dispatch_commit_locked."""
 
-    @patch("cli_agent_orchestrator.providers.cline_cli.get_backend")
-    @patch("cli_agent_orchestrator.providers.cline_cli.subprocess.run")
-    def test_after_dispatch_sends_eof(self, mock_subprocess, mock_backend):
+    def test_after_dispatch_sends_eof(self):
         """_after_dispatch_commit_locked spawns a thread that sends C-d."""
         import time
 
-        # Mock subprocess for history snapshot
-        mock_subprocess.return_value = MagicMock(returncode=0, stdout="[]")
+        mock_backend = MagicMock()
         mock_backend.return_value.get_pane_current_command.return_value = "cat"
 
-        provider = ClineCliProvider("t1234567", "sess", "win0")
-        provider._after_dispatch_commit_locked()
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli.get_backend",
+                mock_backend,
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli.subprocess.run",
+                return_value=MagicMock(returncode=0, stdout="[]"),
+            ),
+        ):
+            provider = ClineCliProvider("t1234567", "sess", "win0")
+            provider._after_dispatch_commit_locked()
 
-        # Wait for the thread to execute
-        time.sleep(0.5)
+            # Wait for the thread to execute
+            time.sleep(0.5)
 
-        mock_backend.return_value.send_special_key.assert_called_once_with("sess", "win0", "C-d")
+            mock_backend.return_value.send_special_key.assert_called_once_with(
+                "sess", "win0", "C-d"
+            )
 
-    @patch("cli_agent_orchestrator.providers.cline_cli.get_backend")
-    @patch("cli_agent_orchestrator.providers.cline_cli.subprocess.run")
-    def test_after_dispatch_sets_flags(self, mock_subprocess, mock_backend):
+    def test_after_dispatch_sets_flags(self):
         """_after_dispatch_commit_locked sets task_dispatched and increments count."""
-        mock_subprocess.return_value = MagicMock(returncode=0, stdout="[]")
+        import time
 
-        provider = ClineCliProvider("t1234567", "sess", "win0")
-        assert provider._task_dispatched_flag is False
-        assert provider._message_count == 0
+        with (
+            patch("cli_agent_orchestrator.providers.cline_cli.get_backend"),
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli.subprocess.run",
+                return_value=MagicMock(returncode=0, stdout="[]"),
+            ),
+        ):
+            provider = ClineCliProvider("t1234567", "sess", "win0")
+            assert provider._task_dispatched_flag is False
+            assert provider._message_count == 0
 
-        provider._after_dispatch_commit_locked()
+            provider._after_dispatch_commit_locked()
 
-        assert provider._task_dispatched_flag is True
-        assert provider._message_count == 1
+            assert provider._task_dispatched_flag is True
+            assert provider._message_count == 1
+            # Wait for daemon thread to finish within patch scope.
+            time.sleep(0.5)
 
-    @patch("cli_agent_orchestrator.providers.cline_cli.get_backend")
-    @patch("cli_agent_orchestrator.providers.cline_cli.subprocess.run")
-    def test_after_dispatch_snapshots_history(self, mock_subprocess, mock_backend):
+    def test_after_dispatch_snapshots_history(self):
         """_after_dispatch_commit_locked snapshots history for correlation."""
-        mock_subprocess.return_value = MagicMock(
-            returncode=0,
-            stdout=json.dumps([{"sessionId": "existing_1"}]),
-        )
+        import time
 
-        provider = ClineCliProvider("t1234567", "sess", "win0")
-        provider._after_dispatch_commit_locked()
+        with (
+            patch("cli_agent_orchestrator.providers.cline_cli.get_backend"),
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli.subprocess.run",
+                return_value=MagicMock(
+                    returncode=0,
+                    stdout=json.dumps([{"sessionId": "existing_1"}]),
+                ),
+            ),
+        ):
+            provider = ClineCliProvider("t1234567", "sess", "win0")
+            provider._after_dispatch_commit_locked()
 
-        assert provider._pre_run_history_ids == {"existing_1"}
+            assert provider._pre_run_history_ids == {"existing_1"}
+            # Wait for daemon thread to finish within patch scope.
+            time.sleep(0.5)
