@@ -1345,6 +1345,7 @@ async def create_terminal(
 
         # Step 2: Issue per-terminal auth token (F332) and create tmux session or window
         import secrets as _secrets
+
         terminal_token = _secrets.token_urlsafe(32)
 
         if new_session:
@@ -4459,6 +4460,8 @@ def send_input(
         status_monitor.bind_dispatch_provider(terminal_id, provider)
         dispatch_txn: DispatchTxn = status_monitor.begin_dispatch(terminal_id)
         try:
+            if provider:
+                provider.pre_paste_gate()
             backend.send_keys(
                 metadata["tmux_session"],
                 metadata["tmux_window"],

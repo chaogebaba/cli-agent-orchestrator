@@ -539,6 +539,17 @@ class BaseProvider(ABC):
     def _after_dispatch_commit_locked(self) -> None:
         """Provider hook for load-bearing post-dispatch state."""
 
+    def pre_paste_gate(self) -> None:
+        """Provider hook called immediately before send_keys pastes a message.
+
+        Providers that need to verify the pane is ready for input (e.g., the
+        cline dispatcher must be at its ``cat`` read) override this to poll
+        and raise ``TerminalInputBlockedError`` if the pane remains busy,
+        causing the inbox to retry delivery later.
+
+        The default implementation is a no-op (always allows the paste).
+        """
+
     def _restore_dispatch_locked(self, snapshot: dict[str, float | bool]) -> None:
         self._task_dispatched = bool(snapshot["task_dispatched"])
         self._last_dispatch_time = float(snapshot["last_dispatch_time"])

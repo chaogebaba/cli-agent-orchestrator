@@ -228,27 +228,37 @@ class ClineCliProvider(BaseProvider):
             logger.debug("cline worker %s: pane command read failed: %s", self.terminal_id, exc)
             return ""
 
-    async def wait_until_input_ready(self, timeout: float = 5.0) -> bool:
-        """Only accept a paste when the dispatcher is at its ``cat`` read.
+    def pre_paste_gate(self) -> None:
+        """Block the paste until the dispatcher is at its ``cat`` read.
 
-        A paste delivered while ``cline`` is running does not reach the
-        dispatcher at all — it lands on the tty of whatever ``run_commands``
-        child is executing, and the message is lost.
+        Polls ``_pane_cmd()`` at ~0.1 s intervals for up to ~10 s.  If the
+        pane remains busy (cline still running), raises
+        ``TerminalInputBlockedError`` so the inbox retries delivery later
+        rather than pasting into a child process where the message would be
+        lost.
         """
-        import asyncio
+        from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError
 
-        deadline = time.time() + float(timeout)
-        while time.time() < deadline:
-            if self._pane_cmd() == DISPATCHER_IDLE_CMD:
-                return True
-            await asyncio.sleep(0.2)
-        logger.warning(
-            "cline worker %s: pane still busy (%s) after %.1fs; paste may be lost",
-            self.terminal_id,
-            self._pane_cmd(),
-            timeout,
-        )
-        return False
+        timeout = 10.0
+        interval = 0.1
+        deadline = time.time() + timeout
+        while True:
+            cmd = self._pane_cmd()
+            if cmd in (DISPATCHER_IDLE_CMD, ""):
+                return  # pane ready — allow paste
+            if time.time() >= deadline:
+                logger.warning(
+                    "cline worker %s: pane still busy (%r) after %.1fs; "
+                    "refusing paste so inbox retries later",
+                    self.terminal_id,
+                    cmd,
+                    timeout,
+                )
+                raise TerminalInputBlockedError(
+                    f"cline worker {self.terminal_id}: pane busy ({cmd!r}), "
+                    f"paste refused after {timeout}s"
+                )
+            time.sleep(interval)
 
     def _after_dispatch_commit_locked(self) -> None:
         """After message paste + Enter, send Ctrl-D (EOF) to close the cat read."""

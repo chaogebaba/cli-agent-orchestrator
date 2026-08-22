@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import shlex
 from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -28,7 +28,6 @@ from cli_agent_orchestrator.providers.cline_cli import (
     ClineCliProvider,
     _build_dispatcher_script,
 )
-
 
 # ─── Dispatcher script generation ────────────────────────────────────────────
 
@@ -49,7 +48,7 @@ class TestDispatcherScript:
         assert "_cao_msg_n=" in script
         assert "t1234567" in script
         assert "/data/cao-scratch/cline-msgs" in script
-        assert '--auto-approve true' in script
+        assert "--auto-approve true" in script
 
     def test_script_uses_cat_for_idle(self):
         """Script uses cat as the blocking read (idle sentinel)."""
@@ -61,8 +60,10 @@ class TestDispatcherScript:
     def test_script_invokes_cline_with_cat_substitution(self):
         """Script invokes cline with $(cat <file>) for safe escaping."""
         script = _build_dispatcher_script(
-            CLINE_BINARY, "/data/msgs", "t1234567",
-            f"{CLINE_BINARY} --auto-approve true -P cline-pass --thinking high"
+            CLINE_BINARY,
+            "/data/msgs",
+            "t1234567",
+            f"{CLINE_BINARY} --auto-approve true -P cline-pass --thinking high",
         )
         assert '"$(cat "$_cao_msgfile")"' in script
 
@@ -119,9 +120,7 @@ class TestClineCliBaseArgs:
         mock_load.side_effect = FileNotFoundError("no profile")
         mock_defaults.return_value = {"api_provider": "cline-pass"}
 
-        provider = ClineCliProvider(
-            "t1234567", "sess", "win0", model="deepseek/deepseek-chat"
-        )
+        provider = ClineCliProvider("t1234567", "sess", "win0", model="deepseek/deepseek-chat")
         args = provider._build_base_args()
         parts = shlex.split(args)
 
@@ -158,7 +157,9 @@ class TestClineCliBaseArgs:
         mock_load.return_value = profile
 
         provider = ClineCliProvider(
-            "t1234567", "sess", "win0",
+            "t1234567",
+            "sess",
+            "win0",
             agent_profile="agent",
             skill_prompt="Extra skill instructions.",
         )
@@ -198,9 +199,7 @@ class TestClineCliModelResolution:
         """Explicit model kwarg takes precedence over everything."""
         mock_load.side_effect = FileNotFoundError("no profile")
 
-        provider = ClineCliProvider(
-            "t1234567", "sess", "win0", model="deepseek/deepseek-r1"
-        )
+        provider = ClineCliProvider("t1234567", "sess", "win0", model="deepseek/deepseek-r1")
         result = provider._resolve_model()
 
         assert result == "deepseek/deepseek-r1"
@@ -232,9 +231,7 @@ class TestClineCliModelResolution:
         mock_load.side_effect = FileNotFoundError("no profile")
         mock_defaults.return_value = {"api_provider": "cline-pass"}
 
-        provider = ClineCliProvider(
-            "t1234567", "sess", "win0", model="deepseek/deepseek-v4-flash"
-        )
+        provider = ClineCliProvider("t1234567", "sess", "win0", model="deepseek/deepseek-v4-flash")
         provider._build_base_args()
 
         assert provider.resolved_model == "deepseek/deepseek-v4-flash"
@@ -293,7 +290,9 @@ class TestClineCliThinking:
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_profile_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.resolve_provider_string_option")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
-    def test_explicit_empty_suppresses_thinking(self, mock_load, mock_resolve, mock_prof, mock_defaults):
+    def test_explicit_empty_suppresses_thinking(
+        self, mock_load, mock_resolve, mock_prof, mock_defaults
+    ):
         """Explicit empty string in providers.toml suppresses the --thinking flag."""
         mock_load.side_effect = FileNotFoundError("no profile")
         mock_defaults.return_value = {"thinking": ""}
@@ -307,7 +306,9 @@ class TestClineCliThinking:
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_profile_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults")
     @patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile")
-    def test_empty_thinking_omits_flag_from_base_args(self, mock_load, mock_defaults, mock_prof, mock_resolve):
+    def test_empty_thinking_omits_flag_from_base_args(
+        self, mock_load, mock_defaults, mock_prof, mock_resolve
+    ):
         """Empty thinking value results in no --thinking flag in base args."""
         mock_load.side_effect = FileNotFoundError("no profile")
         mock_defaults.return_value = {"api_provider": "cline-pass"}
@@ -423,10 +424,12 @@ class TestClineCliSessionCorrelation:
         """Successful history snapshot returns session IDs."""
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout=json.dumps([
-                {"sessionId": "sess_001", "status": "completed"},
-                {"sessionId": "sess_002", "status": "completed"},
-            ]),
+            stdout=json.dumps(
+                [
+                    {"sessionId": "sess_001", "status": "completed"},
+                    {"sessionId": "sess_002", "status": "completed"},
+                ]
+            ),
         )
         provider = self._make_provider()
         ids = provider._snapshot_history_ids()
@@ -444,6 +447,7 @@ class TestClineCliSessionCorrelation:
     def test_snapshot_history_ids_timeout(self, mock_run):
         """Timeout returns empty set."""
         import subprocess
+
         mock_run.side_effect = subprocess.TimeoutExpired("cline", 10)
         provider = self._make_provider()
         ids = provider._snapshot_history_ids()
@@ -490,11 +494,15 @@ class TestClineCliEscaping:
     def test_script_handles_quotes_in_base_args(self):
         """System prompt with quotes is properly escaped in base_args."""
         provider = ClineCliProvider("t1234567", "sess", "win0")
-        with patch("cli_agent_orchestrator.providers.cline_cli.get_provider_defaults") as mock_defaults:
+        with patch(
+            "cli_agent_orchestrator.providers.cline_cli.get_provider_defaults"
+        ) as mock_defaults:
             mock_defaults.return_value = {"api_provider": "cline-pass"}
-            with patch("cli_agent_orchestrator.providers.cline_cli.load_agent_profile") as mock_load:
+            with patch(
+                "cli_agent_orchestrator.providers.cline_cli.load_agent_profile"
+            ) as mock_load:
                 profile = MagicMock()
-                profile.system_prompt = 'Say "hello" and \'goodbye\''
+                profile.system_prompt = "Say \"hello\" and 'goodbye'"
                 profile.model = None
                 profile.name = "quotey"
                 mock_load.return_value = profile
@@ -524,8 +532,7 @@ class TestClineCliEscaping:
         # The dispatcher script template uses fixed paths — message goes to cat's stdin.
         # Verify the script doesn't try to inline-escape the message.
         script = _build_dispatcher_script(
-            CLINE_BINARY, "/data/msgs", "tESCAPE1",
-            f"{CLINE_BINARY} --auto-approve true"
+            CLINE_BINARY, "/data/msgs", "tESCAPE1", f"{CLINE_BINARY} --auto-approve true"
         )
         # The script should NOT contain any message content — it reads from stdin.
         assert difficult_message not in script
@@ -546,7 +553,7 @@ class TestClineCliExtraction:
         """Extract response between cline invocation and next dispatcher prompt."""
         provider = self._make_provider()
         script = (
-            f"{CLINE_BINARY} --auto-approve true \"$(cat /data/msgs/t1234567_1.txt)\"\n"
+            f'{CLINE_BINARY} --auto-approve true "$(cat /data/msgs/t1234567_1.txt)"\n'
             "The answer is 42.\n"
             "\n"
         )
@@ -557,7 +564,7 @@ class TestClineCliExtraction:
         """Multi-line response is extracted correctly."""
         provider = self._make_provider()
         script = (
-            f"{CLINE_BINARY} --auto-approve true \"$(cat /data/msgs/t1234567_1.txt)\"\n"
+            f'{CLINE_BINARY} --auto-approve true "$(cat /data/msgs/t1234567_1.txt)"\n'
             "Line one.\n"
             "Line two.\n"
             "Line three.\n"
@@ -570,7 +577,7 @@ class TestClineCliExtraction:
         """Extraction stops at next dispatcher cat > line."""
         provider = self._make_provider()
         script = (
-            f"{CLINE_BINARY} --auto-approve true \"$(cat /data/msgs/t1234567_1.txt)\"\n"
+            f'{CLINE_BINARY} --auto-approve true "$(cat /data/msgs/t1234567_1.txt)"\n'
             "Response text here.\n"
             "cat > /data/msgs/t1234567_2.txt\n"
             "This should not be included.\n"
@@ -590,7 +597,7 @@ class TestClineCliExtraction:
     def test_empty_response_raises(self):
         """Empty response after cline invocation raises ValueError."""
         provider = self._make_provider()
-        script = f"{CLINE_BINARY} --auto-approve true \"$(cat /data/msgs/t1234567_1.txt)\"\n\n"
+        script = f'{CLINE_BINARY} --auto-approve true "$(cat /data/msgs/t1234567_1.txt)"\n\n'
         with pytest.raises(ValueError, match="Empty Cline response"):
             provider.extract_last_message_from_script(script)
 
@@ -695,9 +702,8 @@ class TestClineCliEofDispatch:
         import time
 
         # Mock subprocess for history snapshot
-        mock_subprocess.return_value = MagicMock(
-            returncode=0, stdout="[]"
-        )
+        mock_subprocess.return_value = MagicMock(returncode=0, stdout="[]")
+        mock_backend.return_value.get_pane_current_command.return_value = "cat"
 
         provider = ClineCliProvider("t1234567", "sess", "win0")
         provider._after_dispatch_commit_locked()
@@ -705,9 +711,7 @@ class TestClineCliEofDispatch:
         # Wait for the thread to execute
         time.sleep(0.5)
 
-        mock_backend.return_value.send_special_key.assert_called_once_with(
-            "sess", "win0", "C-d"
-        )
+        mock_backend.return_value.send_special_key.assert_called_once_with("sess", "win0", "C-d")
 
     @patch("cli_agent_orchestrator.providers.cline_cli.get_backend")
     @patch("cli_agent_orchestrator.providers.cline_cli.subprocess.run")

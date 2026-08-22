@@ -117,15 +117,14 @@ class TestEofSuppression:
             patcher_be.stop()
 
 
-# ─── Defect 1 (continued): wait_until_input_ready ─────────────────────────────
+# ─── Defect 1 (continued): pre_paste_gate ─────────────────────────────────────
 
 
-class TestWaitUntilInputReady:
-    """wait_until_input_ready gates paste on the dispatcher being at cat."""
+class TestPrePasteGate:
+    """pre_paste_gate blocks paste when the dispatcher pane is busy."""
 
-    @pytest.mark.asyncio
-    async def test_returns_true_immediately_when_idle(self, provider: ClineCliProvider) -> None:
-        """Returns True immediately if pane is already at cat."""
+    def test_returns_immediately_when_idle(self, provider: ClineCliProvider) -> None:
+        """No exception when pane is already at cat."""
         mock_backend = MagicMock()
         mock_backend.get_pane_current_command.return_value = DISPATCHER_IDLE_CMD
 
@@ -133,46 +132,57 @@ class TestWaitUntilInputReady:
             "cli_agent_orchestrator.providers.cline_cli.get_backend",
             return_value=mock_backend,
         ):
-            result = await provider.wait_until_input_ready(timeout=1.0)
+            provider.pre_paste_gate()  # should not raise
 
-        assert result is True
+    def test_raises_on_timeout(self, provider: ClineCliProvider) -> None:
+        """Raises TerminalInputBlockedError when pane stays busy."""
+        from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError
 
-    @pytest.mark.asyncio
-    async def test_returns_false_on_timeout(self, provider: ClineCliProvider) -> None:
-        """Returns False when pane stays busy beyond timeout."""
         mock_backend = MagicMock()
         mock_backend.get_pane_current_command.return_value = "cline"
 
-        with patch(
-            "cli_agent_orchestrator.providers.cline_cli.get_backend",
-            return_value=mock_backend,
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli.get_backend",
+                return_value=mock_backend,
+            ),
+            patch("cli_agent_orchestrator.providers.cline_cli.time.sleep"),
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli.time.time",
+                side_effect=[
+                    0.0,  # deadline = 0 + 10 = 10
+                    11.0,  # first check: past deadline
+                ],
+            ),
+            pytest.raises(TerminalInputBlockedError, match="pane busy"),
         ):
-            start = time.time()
-            result = await provider.wait_until_input_ready(timeout=0.5)
-            elapsed = time.time() - start
+            provider.pre_paste_gate()
 
-        assert result is False
-        assert elapsed >= 0.4  # Waited close to the timeout
-
-    @pytest.mark.asyncio
-    async def test_returns_true_when_pane_becomes_idle(self, provider: ClineCliProvider) -> None:
-        """Returns True once pane transitions from busy to idle."""
+    def test_succeeds_when_pane_becomes_idle(self, provider: ClineCliProvider) -> None:
+        """Returns once pane transitions from busy to idle."""
         mock_backend = MagicMock()
-        # First 2 calls: busy, then idle.
         mock_backend.get_pane_current_command.side_effect = [
             "cline",
             "cline",
             DISPATCHER_IDLE_CMD,
-            DISPATCHER_IDLE_CMD,
         ]
 
-        with patch(
-            "cli_agent_orchestrator.providers.cline_cli.get_backend",
-            return_value=mock_backend,
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli.get_backend",
+                return_value=mock_backend,
+            ),
+            patch("cli_agent_orchestrator.providers.cline_cli.time.sleep"),
+            patch(
+                "cli_agent_orchestrator.providers.cline_cli.time.time",
+                side_effect=[
+                    0.0,  # deadline = 0 + 10 = 10
+                    1.0,  # first loop iteration: not expired
+                    2.0,  # second loop iteration: not expired
+                ],
+            ),
         ):
-            result = await provider.wait_until_input_ready(timeout=5.0)
-
-        assert result is True
+            provider.pre_paste_gate()  # should not raise
 
 
 # ─── Defect 2: Abort-status detection ─────────────────────────────────────────
