@@ -4208,6 +4208,23 @@ from cli_agent_orchestrator.plugins.registry import register_mcp_server_surfaces
 register_mcp_server_surfaces(mcp)
 
 
+# --- Deterministic tools/list ordering (MCP 2026-07-28: servers SHOULD return
+# tools/list in deterministic order for prompt-cache stability) ---
+from fastmcp.server.middleware import Middleware as _Middleware  # noqa: E402
+from typing import Sequence as _Seq  # noqa: E402
+
+
+class _DeterministicToolOrder(_Middleware):
+    """Sort tools/list responses alphabetically by name."""
+
+    async def on_list_tools(self, context, call_next):  # type: ignore[override]
+        tools = await call_next(context)
+        return sorted(tools, key=lambda t: t.name)
+
+
+mcp.add_middleware(_DeterministicToolOrder())
+
+
 def main():
     """Main entry point for the MCP server."""
     mcp.run()
