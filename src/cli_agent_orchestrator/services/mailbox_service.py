@@ -10,6 +10,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Literal, cast, overload
 
 from sqlalchemy import and_, exists, func, or_, text
@@ -28,6 +29,7 @@ from cli_agent_orchestrator.clients.database import (
     _inbox_message_from_row,
     _insert_routed_inbox_row,
     _stamp_enqueue_generation,
+    _utcnow,
     resolve_inbox_receiver,
 )
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
@@ -94,6 +96,100 @@ def _address_ids(db: Any, mailbox_id: str) -> list[str]:
         .filter_by(mailbox_id=mailbox_id)
         .all()
     ]
+
+
+def is_supervisor_mailbox_pull_terminal(terminal_id: str) -> bool:
+    """Check if terminal_id is the current incarnation of a supervisor mailbox with pull enabled.
+
+    Returns True only when:
+    - CAO_SUPERVISOR_MAILBOX_PULL / supervisor.mailbox_pull is truthy
+    - terminal_id resolves to a mailbox with role == "supervisor"
+    - mailbox.current_terminal_id == terminal_id (current incarnation)
+    - mailbox.schema_version is compatible (== 1)
+    """
+    from cli_agent_orchestrator.services.config_service import ConfigService
+
+    if not ConfigService.get("supervisor.mailbox_pull"):
+        return False
+    with SessionLocal() as db:
+        mailbox: Any = (
+            db.query(MailboxModel).filter_by(current_terminal_id=terminal_id).one_or_none()
+        )
+        if mailbox is None:
+            return False
+        if mailbox.role != "supervisor":
+            return False
+        if mailbox.current_terminal_id != terminal_id:
+            return False
+        schema_version = getattr(mailbox, "schema_version", 1)
+        if schema_version != 1:
+            return False
+        return True
+
+
+def is_supervisor_role_terminal(terminal_id: str, db: Any | None = None) -> bool:
+    """F210 D2: True when terminal_id is the current incarnation of a supervisor mailbox.
+
+    Same query shape as :func:`is_supervisor_mailbox_pull_terminal`, minus every
+    precondition that could re-arm composer injection against a supervisor pane:
+    ``supervisor.mailbox_pull`` (a config flag must not defeat the exemption) and
+    ``schema_version`` (a schema-mismatched supervisor is still a supervisor).
+    """
+
+    def _check(session: Any) -> bool:
+        mailbox: Any = (
+            session.query(MailboxModel).filter_by(current_terminal_id=terminal_id).one_or_none()
+        )
+        if mailbox is None:
+            return False
+        return bool(mailbox.role == "supervisor")
+
+    if db is not None:
+        return _check(db)
+    with SessionLocal() as session:
+        return _check(session)
+
+
+def get_current_supervisor_terminal_id() -> str | None:
+    """F138: Return the terminal_id of the current live supervisor mailbox, or None.
+
+    Handles multiple historical supervisor rows by selecting the most recently
+    updated mailbox whose current_terminal_id refers to an existing terminal.
+    Falls back to most-recently-updated with a non-null current_terminal_id if
+    no terminal row match is found (defensive: DB may lag).
+    """
+    with SessionLocal() as db:
+        # Prefer the supervisor mailbox whose terminal still exists in the DB
+        mailbox: Any = (
+            db.query(MailboxModel)
+            .filter(
+                MailboxModel.role == "supervisor",
+                MailboxModel.current_terminal_id.isnot(None),
+            )
+            .join(
+                TerminalModel,
+                TerminalModel.id == MailboxModel.current_terminal_id,
+            )
+            .order_by(MailboxModel.updated_at.desc())
+            .first()
+        )
+        if mailbox is None:
+            # Fallback: most recently updated with non-null terminal_id
+            mailbox = (
+                db.query(MailboxModel)
+                .filter(
+                    MailboxModel.role == "supervisor",
+                    MailboxModel.current_terminal_id.isnot(None),
+                )
+                .order_by(MailboxModel.updated_at.desc())
+                .first()
+            )
+        if mailbox is None:
+            return None
+        current_terminal_id = getattr(mailbox, "current_terminal_id", None)
+        if not current_terminal_id:
+            return None
+        return str(current_terminal_id)
 
 
 def _park_owner_generation(
@@ -248,7 +344,7 @@ def publish_supervisor_incarnation(claim: MailboxClaim, terminal_id: str) -> dic
                     return result
                 raise MailboxDomainError("mailbox_conflict", "mailbox publication conflict")
 
-            now = datetime.now()
+            now = _utcnow()
             if claim.mailbox_id is None:
                 mailbox = MailboxModel(
                     id=f"mb_{uuid.uuid4().hex[:8]}",
@@ -357,7 +453,7 @@ def publish_supervisor_incarnation(claim: MailboxClaim, terminal_id: str) -> dic
             for barrier in historical_barriers:
                 barrier.state = "DIGESTED_REBIND"
                 barrier.close_reason = "supervisor_rebind"
-                barrier.fired_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                barrier.fired_at = _utcnow()
                 historical_held.extend(
                     db.query(InboxModel)
                     .filter(
@@ -457,7 +553,7 @@ def digest_stale_pending_for_terminal(
         return result(len(stale), generation)
 
 
-def create_logical_inbox_message(
+def _create_logical_inbox_message_inner(
     *,
     sender_id: str,
     mailbox_id: str,
@@ -466,7 +562,7 @@ def create_logical_inbox_message(
     orchestration_type: OrchestrationType = OrchestrationType.SEND_MESSAGE,
     dispatch_barrier: dict[str, Any] | None = None,
     park_warm: bool = False,
-) -> InboxMessage:
+) -> tuple[InboxMessage, str | None]:
     """Holder (d): resolve, guard, and insert one logical row under one authority."""
     with SessionLocal() as db:
         mailbox: Any = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
@@ -502,16 +598,256 @@ def create_logical_inbox_message(
                     dispatch_barrier=dispatch_barrier,
                     park_warm=park_warm,
                 )
+                db.flush()  # ensure row.id is assigned before obligation
+                # F192: obligation creation moved to the choke point
+                # (_create_inbox_message_unfenced in database.py) — removed
+                # from here to guarantee exactly one creation site.
                 db.commit()
                 db.refresh(row)
                 result = _inbox_message_from_row(row)
-                if result.status == MessageStatus.HELD:
+
+                # F136-D7: signal delivery after commit (replaces F123-P0 direct append).
+                # The callback runner handles actual file writes.
+
+                if result.barrier_id is not None and result.barrier_member_key is not None:
                     stalled_callback_watchdog.record_callback_if_to_caller(
                         sender_id, logical_receiver_id or receiver_cache
                     )
-                return result
+                _signal_terminal = (
+                    receiver_cache
+                    if (receiver_cache and not receiver_cache.startswith("mb_"))
+                    else None
+                )
+                return result, _signal_terminal
     finally:
         lock.release()
+
+
+def create_logical_inbox_message(
+    *,
+    sender_id: str,
+    mailbox_id: str,
+    message: str,
+    refresh_ingest: bool = False,
+    orchestration_type: OrchestrationType = OrchestrationType.SEND_MESSAGE,
+    dispatch_barrier: dict[str, Any] | None = None,
+    park_warm: bool = False,
+) -> InboxMessage:
+    """Public wrapper: insert + signal delivery (D7)."""
+    result, signal_terminal = _create_logical_inbox_message_inner(
+        sender_id=sender_id,
+        mailbox_id=mailbox_id,
+        message=message,
+        refresh_ingest=refresh_ingest,
+        orchestration_type=orchestration_type,
+        dispatch_barrier=dispatch_barrier,
+        park_warm=park_warm,
+    )
+    # D7: signal after commit and lock release
+    if signal_terminal and result.status == MessageStatus.PENDING:
+        from cli_agent_orchestrator.services.inbox_service import request_delivery
+
+        request_delivery(signal_terminal)
+
+    # WPDT W1: Push advisory WS doorbell frame for supervisor targets
+    if signal_terminal:
+        try:
+            from cli_agent_orchestrator.services.ws_doorbell import push_doorbell_frame_sync
+
+            preview = message.split("\n", 1)[0] if message else ""
+            push_doorbell_frame_sync(
+                signal_terminal,
+                result.id,
+                sender_id[:8],
+                preview,
+            )
+        except Exception:
+            pass  # advisory-only, never blocks
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# F136-D6: Routed producer helper
+# ---------------------------------------------------------------------------
+
+
+def create_routed_inbox_message(
+    sender_id: str,
+    receiver_terminal_id: str,
+    message: str,
+    *,
+    orchestration_type: OrchestrationType = OrchestrationType.SEND_MESSAGE,
+    park_warm: bool = False,
+    dispatch_barrier: dict[str, Any] | None = None,
+) -> InboxMessage:
+    """D6: Route a message to either logical mailbox or raw terminal inbox.
+
+    Resolves whether receiver_terminal_id is the current terminal of a
+    supervisor mailbox. If so, creates a logical row. Otherwise, creates
+    a raw row and signals delivery.
+    """
+    from cli_agent_orchestrator.clients.database import create_inbox_message
+
+    # Check if receiver is a supervisor mailbox terminal
+    with SessionLocal() as db:
+        inc = (
+            db.query(MailboxIncarnationModel)
+            .filter_by(terminal_id=receiver_terminal_id)
+            .one_or_none()
+        )
+        if inc is not None:
+            mailbox: Any = db.query(MailboxModel).filter_by(id=inc.mailbox_id).one_or_none()
+            if (
+                mailbox is not None
+                and mailbox.role == "supervisor"
+                and mailbox.current_terminal_id == receiver_terminal_id
+            ):
+                # Supervisor mailbox: use logical path
+                return create_logical_inbox_message(
+                    sender_id=sender_id,
+                    mailbox_id=str(mailbox.id),
+                    message=message,
+                    orchestration_type=orchestration_type,
+                    park_warm=park_warm,
+                    dispatch_barrier=dispatch_barrier,
+                )
+
+    # Non-supervisor terminal: raw insert then request_delivery
+    result = create_inbox_message(
+        sender_id,
+        receiver_terminal_id,
+        message,
+        orchestration_type=orchestration_type,
+        park_warm=park_warm,
+        dispatch_barrier=dispatch_barrier,
+    )
+    from cli_agent_orchestrator.services.inbox_service import request_delivery
+
+    request_delivery(receiver_terminal_id)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# F136-D5: Path update protocol
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PathUpdateResult:
+    kind: str  # "updated", "unchanged", "stale_authority", "retryable_failure"
+    path_version: int
+    reason: str = ""
+
+
+def set_supervisor_callback_inbox_path(
+    *,
+    mailbox_id: str,
+    terminal_id: str,
+    generation: int,
+    path: str | None,
+) -> PathUpdateResult:
+    """D5: Atomically update the canonical callback inbox path for a mailbox.
+
+    Uses delivery -> authority lock order. On path change, enqueues current
+    PENDING rows at/below cursor for replay into the new path.
+    """
+    from cli_agent_orchestrator.clients.database import enqueue_callback_replay
+    from cli_agent_orchestrator.services.inbox_service import get_delivery_lock, request_delivery
+
+    delivery_lock = get_delivery_lock(terminal_id)
+    if not delivery_lock.acquire(timeout=30.0):
+        return PathUpdateResult(
+            kind="retryable_failure", path_version=0, reason="delivery_lock_timeout"
+        )
+
+    # Resolve authority lock
+    with SessionLocal() as db:
+        mailbox: Any = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
+        if mailbox is None:
+            delivery_lock.release()
+            return PathUpdateResult(
+                kind="stale_authority", path_version=0, reason="unknown_mailbox"
+            )
+        session_name = str(mailbox.session_name)
+        role = str(mailbox.role)
+
+    authority_lock = get_mailbox_authority_lock(session_name, role)
+    if not authority_lock.acquire(timeout=30.0):
+        delivery_lock.release()
+        return PathUpdateResult(
+            kind="retryable_failure", path_version=0, reason="authority_lock_timeout"
+        )
+
+    try:
+        from sqlalchemy import text as sa_text
+
+        with SessionLocal() as db:
+            db.execute(sa_text("BEGIN IMMEDIATE"))
+
+            mailbox = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
+            if mailbox is None:
+                return PathUpdateResult(
+                    kind="stale_authority", path_version=0, reason="unknown_mailbox"
+                )
+
+            if mailbox.current_terminal_id != terminal_id or int(mailbox.generation) != generation:
+                return PathUpdateResult(
+                    kind="stale_authority",
+                    path_version=int(mailbox.cc_inbox_path_version),
+                    reason="terminal_or_generation_mismatch",
+                )
+
+            current_path = mailbox.cc_inbox_path
+            if current_path == path:
+                # No change
+                db.commit()
+                return PathUpdateResult(
+                    kind="unchanged",
+                    path_version=int(mailbox.cc_inbox_path_version),
+                )
+
+            # Update path and increment version
+            mailbox.cc_inbox_path = path
+            mailbox.cc_inbox_path_version = int(mailbox.cc_inbox_path_version) + 1
+            new_version = int(mailbox.cc_inbox_path_version)
+
+            # Replay: enqueue current PENDING rows at/below cursor
+            cursor = mailbox.callback_notified_through_id
+            if cursor is not None and path is not None:
+                below_cursor_ids = [
+                    row_id
+                    for (row_id,) in db.query(InboxModel.id)
+                    .filter(
+                        InboxModel.logical_receiver_id == mailbox_id,
+                        InboxModel.receiver_id == terminal_id,
+                        InboxModel.enqueue_generation == generation,
+                        InboxModel.status == MessageStatus.PENDING.value,
+                        InboxModel.id <= cursor,
+                    )
+                    .all()
+                ]
+                if below_cursor_ids:
+                    enqueue_callback_replay(
+                        db, mailbox_id=mailbox_id, inbox_row_ids=below_cursor_ids
+                    )
+
+            mailbox.updated_at = _utcnow()
+            db.commit()
+
+        # Signal delivery after all locks released (below)
+        return PathUpdateResult(kind="updated", path_version=new_version)
+    finally:
+        authority_lock.release()
+        delivery_lock.release()
+        # D5 step 6: signal delivery after release
+        if path is not None:
+            from cli_agent_orchestrator.services.inbox_service import request_delivery
+
+            try:
+                request_delivery(terminal_id)
+            except Exception:
+                pass
 
 
 def acquire_logical_sender_authority(
@@ -562,7 +898,7 @@ def _attempt_outcome(db: Any, message_id: int) -> str:
             evidence = {}
         return (
             "confirmed_unverified"
-            if evidence.get("kind") == "send_returned_unverified"
+            if evidence.get("kind") in {"send_returned_unverified", "binding_presumed_stale"}
             else "confirmed_hit"
         )
     return (
@@ -608,7 +944,15 @@ def list_messages(
             )
         else:
             query = query.filter(InboxModel.receiver_id == receiver)
+        # D1 (fx157): clamp the default lower bound to the consumption cursor
+        if receiver.startswith("mb_") and after_id is None and not audit_browse:
+            query = query.filter(InboxModel.id > int(mailbox.consumed_through_id))
         if since is not None:
+            # Normalize since to aware-UTC unconditionally.
+            if since.tzinfo is None:
+                since = since.replace(tzinfo=timezone.utc)
+            else:
+                since = since.astimezone(timezone.utc)
             query = query.filter(InboxModel.created_at >= since)
         if after_id is not None:
             query = query.filter(InboxModel.id > after_id)
@@ -727,22 +1071,185 @@ def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
                 .update(
                     {
                         MailboxModel.consumed_through_id: up_to_id,
-                        MailboxModel.updated_at: datetime.now(),
+                        MailboxModel.updated_at: _utcnow(),
                     },
                     synchronize_session=False,
                 )
             )
             if changed != 1:
                 raise MailboxDomainError("not_current_incarnation", "terminal is not current")
+            # --- WP-MAILBOX-CHANNEL: settle drained PENDING rows to DELIVERED ---
+            address_scope = or_(
+                InboxModel.logical_receiver_id == mailbox.id,
+                InboxModel.receiver_id.in_(addresses),
+            )
+            settled_count = (
+                db.query(InboxModel)
+                .filter(
+                    InboxModel.id <= up_to_id,
+                    InboxModel.status == MessageStatus.PENDING.value,
+                    address_scope,
+                )
+                .update(
+                    {
+                        InboxModel.status: MessageStatus.DELIVERED.value,
+                        InboxModel.failure_reason: "mailbox_pull_acked",
+                    },
+                    synchronize_session=False,
+                )
+            )
+            # AC#9 safety net: settle any prior open push-era attempts on acked rows.
+            open_attempts = (
+                db.query(InboxDeliveryAttemptModel)
+                .join(
+                    InboxDeliveryAttemptMemberModel,
+                    InboxDeliveryAttemptMemberModel.attempt_uuid
+                    == InboxDeliveryAttemptModel.attempt_uuid,
+                )
+                .join(
+                    InboxModel,
+                    InboxModel.id == InboxDeliveryAttemptMemberModel.message_id,
+                )
+                .filter(
+                    InboxDeliveryAttemptModel.settled_at.is_(None),
+                    InboxModel.id <= up_to_id,
+                    address_scope,
+                )
+                .all()
+            )
+            now = _utcnow()
+            for attempt in open_attempts:
+                attempt.outcome = "confirmed"
+                attempt.reason = "mailbox_pull_acked"
+                attempt.settled_at = now
+                attempt.last_at = now
+            # --- end WP-MAILBOX-CHANNEL settlement ---
             prior = mailbox.consumed_through_id
+            # F178: collect acked row IDs and CC inbox path before commit
+            _f178_cc_inbox_path = mailbox.cc_inbox_path
+            _f178_mailbox_id = str(mailbox.id)
+            _f178_prior = int(prior) if prior else 0
+            _f178_acked_row_ids: list[int] = []
+            if _f178_cc_inbox_path and up_to_id > _f178_prior:
+                _f178_acked_row_ids = [
+                    row_id
+                    for (row_id,) in db.query(InboxModel.id)
+                    .filter(
+                        InboxModel.id <= up_to_id,
+                        InboxModel.id > _f178_prior,
+                        address_scope,
+                    )
+                    .all()
+                ]
+            # FX191: settle delivery obligations for acked messages
+            from cli_agent_orchestrator.clients.database import DeliveryObligationModel as _DObl
+
+            _obligations_settled = db.query(_DObl).filter(
+                _DObl.inbox_row_id <= up_to_id,
+                _DObl.state == "OPEN",
+                _DObl.mailbox_id == _f178_mailbox_id,
+            ).update(
+                {
+                    _DObl.state: "ACKED",
+                    _DObl.terminal_at: _utcnow(),
+                    _DObl.terminal_reason: "consumed",
+                },
+                synchronize_session=False,
+            )
+            # F193(a): surface obligation rowcount so ack settles obligations
+            # synchronously — stops the floor from re-ringing a busy supervisor
+            # whose consumption cursor already advanced.
+            settled_count += _obligations_settled
             db.commit()
+            # FX193: disarm nudge on cursor advance (eager cancellation)
+            try:
+                from cli_agent_orchestrator.services.nudge_discipline import nudge_discipline
+
+                nudge_discipline.on_cursor_advance(terminal_id, _f178_mailbox_id)
+            except Exception:
+                pass
+            # F203 D5: boundary notify primary producer — on the reachable
+            # cursor-advance path (no episode precondition).  The watchdog
+            # secondary producer stays as a fallback.
+            try:
+                from cli_agent_orchestrator.services.boundary_pull_service import (
+                    boundary_pull_service,
+                )
+
+                boundary_pull_service.notify_boundary(terminal_id, _f178_mailbox_id)
+            except Exception:
+                pass
+            # F123: re-evaluate supervisor-pending sentinel after ack settlement.
+            if settled_count > 0:
+                from cli_agent_orchestrator.clients.database import (
+                    _remove_supervisor_pending_flag_if_drained,
+                )
+
+                _remove_supervisor_pending_flag_if_drained()
+            # F178: mark correlated CC inbox entries as read (post-commit, best-effort)
+            if _f178_cc_inbox_path and _f178_acked_row_ids:
+                from cli_agent_orchestrator.services.teammate_push_service import (
+                    mark_cc_inbox_entries_read,
+                )
+
+                try:
+                    mark_cc_inbox_entries_read(
+                        inbox_path=Path(_f178_cc_inbox_path),
+                        mailbox_id=_f178_mailbox_id,
+                        acked_row_ids=_f178_acked_row_ids,
+                    )
+                except Exception as exc:
+                    logger.debug("f178: best-effort cc_inbox mark-read failed: %s", exc)
             return {
                 "mailbox_id": mailbox.id,
                 "consumed_through_id": up_to_id,
                 "changed": prior != up_to_id,
+                "settled_count": settled_count,
             }
     finally:
         lock.release()
+
+
+def quarantine_malformed_mailbox_rows(mailbox_id: str) -> int:
+    """Settle malformed PENDING rows as DELIVERY_FAILED (quarantine sweep).
+
+    Called inside reconcile_orphaned_messages on the daemon heartbeat.
+    A row is malformed if its message body is not valid UTF-8 or is empty.
+    """
+    with SessionLocal() as db:
+        db.execute(text("BEGIN IMMEDIATE"))
+        addresses = _address_ids(db, mailbox_id)
+        address_scope = or_(
+            InboxModel.logical_receiver_id == mailbox_id,
+            InboxModel.receiver_id.in_(addresses),
+        )
+        pending_rows = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                address_scope,
+            )
+            .all()
+        )
+        quarantined = 0
+        for row in pending_rows:
+            try:
+                if not row.message or not isinstance(row.message, str):
+                    raise ValueError("empty or non-string message body")
+                row.message.encode("utf-8")
+            except (ValueError, UnicodeEncodeError):
+                row.status = MessageStatus.DELIVERY_FAILED.value
+                row.failure_reason = "mailbox_payload_malformed"
+                quarantined += 1
+        db.commit()
+    # F123: re-evaluate supervisor-pending sentinel after quarantine settlement.
+    if quarantined > 0:
+        from cli_agent_orchestrator.clients.database import (
+            _remove_supervisor_pending_flag_if_drained,
+        )
+
+        _remove_supervisor_pending_flag_if_drained()
+    return quarantined
 
 
 def list_mailboxes() -> dict[str, Any]:

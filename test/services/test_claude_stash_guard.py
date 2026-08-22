@@ -17,6 +17,7 @@ class StashProvider:
     blocks_orchestrated_input_while_waiting_user_answer = True
     paste_enter_count = 1
     paste_submit_delay = 0.3
+    assume_processing_on_dispatch = False
 
     def read_composer_draft(self, lines):
         for index, line in enumerate(lines):
@@ -196,7 +197,7 @@ def test_send_input_default_does_not_defer_on_dialog(monkeypatch, tmp_path):
     monkeypatch.setattr(terminal_service, "update_last_active", lambda _: None)
     monkeypatch.setattr(terminal_service.status_monitor, "notify_input_sent", lambda _: None)
     monkeypatch.setattr(
-        terminal_service.status_monitor, "clear_rolling_buffer", lambda _: None
+        terminal_service.status_monitor, "clear_rolling_buffer", lambda _tid, _p=None: None
     )
 
     with pytest.raises(draft_guard.DeliveryDeferredError):

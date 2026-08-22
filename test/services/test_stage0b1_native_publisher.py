@@ -18,8 +18,8 @@ from cli_agent_orchestrator.kernel.receiver_state import (
 from cli_agent_orchestrator.models.native_publish import NativePublishRequest
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import NativeResolution
-from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
 from cli_agent_orchestrator.services import receiver_state_view, terminal_service
+from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
 from cli_agent_orchestrator.services.status_monitor import (
     IdentityProof,
     SettlementEntry,
@@ -110,15 +110,31 @@ def test_pure_native_wire_mapping(wire, expected):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("wire_name", ["pane.agent_status_changed", "pane_agent_status_changed"])
-async def test_both_real_wire_spellings_publish(wire_name):
+@pytest.mark.parametrize(
+    ("wire_name", "data"),
+    [
+        (
+            "pane.agent_status_changed",
+            {"pane_id": "p1", "agent_status": "blocked", "agent": "kiro"},
+        ),
+        (
+            "pane_agent_status_changed",
+            {"pane_id": "p1", "agent_status": "blocked", "agent": "kiro"},
+        ),
+        (
+            "pane_updated",
+            {"pane": {"pane_id": "p1", "agent_status": "blocked", "agent": "kiro"}},
+        ),
+    ],
+)
+async def test_real_wire_spellings_publish(wire_name, data):
     published = []
     service = HerdrInboxService(native_publish_callback=published.append)
     service._publisher_enabled = True
     service._register_terminal_locked("t1", "p1", False)
     event = {
         "event": wire_name,
-        "data": {"pane_id": "p1", "agent_status": "blocked", "agent": "kiro"},
+        "data": data,
     }
     service._reader = asyncio.StreamReader()
     service._reader.feed_data((json.dumps(event) + "\n").encode())
@@ -140,6 +156,7 @@ class _Provider:
         self.composer_stash_keys = None
         self.paste_enter_count = 1
         self.paste_submit_delay = 0.0
+        self.assume_processing_on_dispatch = False
 
     def resolve_native_status(self, native):
         return NativeResolution(native, None, None)
@@ -165,6 +182,9 @@ class _Provider:
         self._last_dispatch_time = snapshot["last_dispatch_time"]
         self._done_first_detected = snapshot["done_first_detected"]
         self._idle_first_detected = snapshot["idle_first_detected"]
+
+    def mark_input_received(self):
+        self._task_dispatched = True
 
 
 @pytest.fixture
@@ -279,11 +299,13 @@ def test_send_failure_aborts_dispatch_and_restores_all_provider_flush_fields(
         terminal_service.provider_manager, "get_provider", lambda _terminal: provider
     )
     monkeypatch.setattr(terminal_service, "preserve_draft_before_send", lambda *_args: None)
-    monkeypatch.setattr(terminal_service, "inject_memory_context", lambda message, *_a, **_k: message)
+    monkeypatch.setattr(
+        terminal_service, "inject_memory_context", lambda message, *_a, **_k: message
+    )
     monkeypatch.setattr(terminal_service, "update_last_active", lambda _terminal: None)
     monkeypatch.setattr(monitor, "get_status", lambda _terminal: TerminalStatus.IDLE)
     monkeypatch.setattr(monitor, "notify_input_sent", lambda _terminal: None)
-    monkeypatch.setattr(monitor, "clear_rolling_buffer", lambda _terminal: None)
+    monkeypatch.setattr(monitor, "clear_rolling_buffer", lambda _terminal, _provider=None: None)
 
     try:
         with pytest.raises(RuntimeError, match="backend send failed"):
@@ -365,9 +387,7 @@ def test_native_poll_cooldown_suppresses_second_poll(monkeypatch):
     backend.fetch_native_status.return_value = NativeFetch(
         "working", TerminalStatus.PROCESSING, None
     )
-    provider = SimpleNamespace(
-        capabilities=SimpleNamespace(native_status_source="herdr")
-    )
+    provider = SimpleNamespace(capabilities=SimpleNamespace(native_status_source="herdr"))
     monitor = MagicMock()
     monitor.prove_terminal_identity.return_value = IdentityProof("t1", "native", 10.0, None)
     monitor.publish_native_poll.return_value = ("epoch", 10.1)

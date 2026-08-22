@@ -1,0 +1,42 @@
+     434              "codex --yolo --no-alt-screen --disable shell_snapshot"
+     435 +            " -c features.multi_agent=false"
+     436              " -c check_for_update_on_startup=false"
+     452 ->>>>>>> upstream/main
+     437          )
+         ⋮
+    2600          mock_wait_status.assert_called_once()
+    2627 -
+    2628 -    @pytest.mark.asyncio
+    2629 -    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    2630 -    async def test_handle_trust_then_late_update_dialog(self, mock_tmux):
+    2631 -        """Multi-frame: trust dismissed → transitional banner (no dialog yet) → update dialog → dismissed."""
+    2632 -        # Frame 1: trust prompt visible
+    2633 -        frame_trust = (
+    2634 -            "Note: You're in a subdirectory of a Git project. Trusting will apply\n"
+    2635 -            "to the repository root: /Users/test/project\n"
+    2636 -            "\n"
+    2637 -            "Do you trust the contents of this directory?\n"
+    2638 -            "\n"
+    2639 -            "› 1. Yes, continue\n"
+    2640 -            "  2. No, quit\n"
+    2641 -            "\n"
+    2642 -            "Press enter to continue\n"
+    2643 -        )
+    2644 -        # Frame 2: trust dismissed, welcome banner visible but NO idle prompt yet
+    2645 -        # (transitional state before update dialog renders)
+    2646 -        frame_transitional = "OpenAI Codex (v0.142.5)\n"
+    2647 -        # Frame 3: update dialog renders
+    2648 -        frame_update = (
+    2649 -            "OpenAI Codex (v0.142.5)\n"
+    2650 -            "✨ Update available! 0.142.5 -> 0.144.5\n"
+    2651 -            "1. Update now (runs npm install -g @openai/codex)\n"
+    2652 -            "2. Skip\n"
+    2653 -            "3. Skip until next version\n"
+    2654 -            "Press enter to continue\n"
+    2655 -        )
+    2656 -        # Frame 4: update dismissed, idle prompt visible
+    2657 -        frame_idle = "OpenAI Codex (v0.142.5)\n› "
+
+› Run /review on my current changes
+
+  ~/VScode_projects/cli-subagents · master · gpt-5.6-sol high · Context 62% left

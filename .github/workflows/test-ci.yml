@@ -1,0 +1,309 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'cao/**'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      census:
+        description: 'Run per-test resource census (F259)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # AC3.9: least-privilege — id-token + attestations at JOB level only.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # AC3.2: compute tree hash as the deterministic identity key.
+      - name: Compute tree hash
+        id: tree
+        run: |
+          TREE=$(git rev-parse HEAD^{tree})
+          echo "hash=$TREE" >> "$GITHUB_OUTPUT"
+          echo "Tree hash: $TREE"
+
+      # AC3.5/AC3.5b: build the deterministic suite-identity.json.
+      - name: Build suite identity
+        id: identity
+        run: |
+          # AC3.5b: vocabulary_version = sha256 over the four vocabulary files.
+          # S1 fix: no 2>/dev/null — a missing vocab file must fail the step loudly.
+          VOCAB_VERSION=$(cat \
+            pyproject.toml \
+            test/plugins/env_capabilities.py \
+            test/plugins/quarantine.py \
+            test/quarantine.toml \
+            | sha256sum | cut -d' ' -f1)
+
+          # Deterministic JSON — keys in sorted order, no trailing newline variation.
+          # This file must be byte-for-byte reproducible from the tree alone.
+          printf '{"deselect_count":0,"marker_expr":"not live and not e2e","tree":"%s","vocabulary_version":"%s","workers":4}\n' \
+            "${{ steps.tree.outputs.hash }}" "$VOCAB_VERSION" > suite-identity.json
+
+          echo "vocab_version=$VOCAB_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Suite identity:"
+          cat suite-identity.json
+          echo "sha256: $(sha256sum suite-identity.json | cut -d' ' -f1)"
+
+      # AC3.3/AC3.4/AC3.8: attestation lookup — short-circuit on verified hit.
+      - name: Check attestation cache
+        id: cache_check
+        # AC3.7: skip lookup on pull_request from forks (no OIDC token available).
+        # F259 D15: skip lookup when census is requested (census must always execute).
+        if: |
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+          inputs.census != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e  # AC3.4: any error = miss, never a pass.
+
+          # Attempt verification — fuses lookup with signature check (AC3.3).
+          RESULT=$(gh attestation verify suite-identity.json \
+            --repo "${{ github.repository }}" \
+            --signer-workflow "${{ github.repository }}/.github/workflows/test-ci.yml" \
+            --format json 2>&1)
+          EXIT_CODE=$?
+
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+            echo "Cache miss (exit $EXIT_CODE): lookup failed or no matching attestation."
+            exit 0
+          fi
+
+          # AC3.8: reject attestations older than 30 days.
+          ATTEST_TS=$(echo "$RESULT" | jq -r '.[0].verificationResult.statement.predicate.timestamp // empty' 2>/dev/null)
+          if [ -n "$ATTEST_TS" ]; then
+            ATTEST_EPOCH=$(date -d "$ATTEST_TS" +%s 2>/dev/null || echo 0)
+            NOW_EPOCH=$(date +%s)
+            AGE_DAYS=$(( (NOW_EPOCH - ATTEST_EPOCH) / 86400 ))
+            if [ "$AGE_DAYS" -gt 30 ]; then
+              echo "hit=false" >> "$GITHUB_OUTPUT"
+              echo "Cache miss: attestation is ${AGE_DAYS} days old (limit: 30)."
+              exit 0
+            fi
+          fi
+
+          # AC3.6: check evidence_kind — if derived, verify the direct root too.
+          # N2: this branch is forward-looking dead code today. The workflow only
+          # mints "direct" attestations; derived would only exist if a future
+          # short-circuit run chose to mint (currently it does not — it just skips).
+          EVIDENCE_KIND=$(echo "$RESULT" | jq -r '.[0].verificationResult.statement.predicate.evidence_kind // "direct"' 2>/dev/null)
+          if [ "$EVIDENCE_KIND" = "derived" ]; then
+            DERIVED_FROM=$(echo "$RESULT" | jq -r '.[0].verificationResult.statement.predicate.derived_from // empty' 2>/dev/null)
+            if [ -z "$DERIVED_FROM" ]; then
+              echo "hit=false" >> "$GITHUB_OUTPUT"
+              echo "Cache miss: derived attestation lacks derived_from pointer."
+              exit 0
+            fi
+            echo "evidence_kind=derived" >> "$GITHUB_OUTPUT"
+            echo "derived_from=$DERIVED_FROM" >> "$GITHUB_OUTPUT"
+          else
+            echo "evidence_kind=direct" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Extract results triple from the predicate.
+          TESTS=$(echo "$RESULT" | jq -r '.[0].verificationResult.statement.predicate.tests // empty' 2>/dev/null)
+          SKIPPED=$(echo "$RESULT" | jq -r '.[0].verificationResult.statement.predicate.skipped // empty' 2>/dev/null)
+          FAILURES=$(echo "$RESULT" | jq -r '.[0].verificationResult.statement.predicate.failures // empty' 2>/dev/null)
+          DIGEST=$(echo "$RESULT" | jq -r '.[0].verificationResult.signature.certificateFingerprint // "unknown"' 2>/dev/null)
+
+          # Only accept if failures == 0 (mirrors doctrine rule AC3.14(c)).
+          if [ "${FAILURES:-1}" != "0" ]; then
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+            echo "Cache miss: attestation reports failures=$FAILURES."
+            exit 0
+          fi
+
+          echo "hit=true" >> "$GITHUB_OUTPUT"
+          echo "tests=$TESTS" >> "$GITHUB_OUTPUT"
+          echo "skipped=$SKIPPED" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Cache HIT at tree ${{ steps.tree.outputs.hash }}, evidence=$DIGEST"
+
+      # AC3.3: on cache hit, skip the suite and write summary.
+      - name: Short-circuit summary
+        if: steps.cache_check.outputs.hit == 'true'
+        run: |
+          {
+            echo "## Test Results (cache hit)"
+            echo ""
+            echo ":zap: **Short-circuited** — verified attestation for tree \`${{ steps.tree.outputs.hash }}\`"
+            echo ""
+            echo "- Tests: ${{ steps.cache_check.outputs.tests }}"
+            echo "- Skipped: ${{ steps.cache_check.outputs.skipped }}"
+            echo "- Evidence: \`${{ steps.cache_check.outputs.digest }}\`"
+            echo "- Kind: ${{ steps.cache_check.outputs.evidence_kind }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # AC3.13: no junit-results.xml produced on short-circuit.
+
+      - name: Install uv
+        if: steps.cache_check.outputs.hit != 'true'
+        uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          version: "latest"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        if: steps.cache_check.outputs.hit != 'true'
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        if: steps.cache_check.outputs.hit != 'true'
+        run: uv sync
+
+      - name: Run test-ci suite
+        if: steps.cache_check.outputs.hit != 'true'
+        id: suite
+        shell: bash
+        env:
+          CAO_TEST_CENSUS: ${{ inputs.census == true && '1' || '' }}
+        run: |
+          set -o pipefail
+          # -n 4 is safe here: the runner has 16 GB RAM (vs the laptop's 15 GB
+          # where pyproject's -n 2 was tuned to stay under 1.9 GiB MemAvailable).
+          # 4 workers peak at ~6 GB on the suite, well within the runner's headroom.
+          uv run pytest \
+            -m "not live and not e2e" \
+            -n 4 \
+            --dist loadgroup \
+            --strict-markers \
+            -p no:randomly \
+            --timeout=30 \
+            --timeout-method=thread \
+            --junitxml=junit-results.xml \
+            --tb=short \
+            -q \
+            2>&1 | tee pytest-output.log
+
+      - name: Write step summary
+        if: always() && steps.cache_check.outputs.hit != 'true'
+        run: |
+          {
+            echo "## Test Results"
+            echo ""
+            if [ -f junit-results.xml ]; then
+              tests=$(grep -oP 'tests="\K[^"]+' junit-results.xml | head -1)
+              failures=$(grep -oP 'failures="\K[^"]+' junit-results.xml | head -1)
+              errors=$(grep -oP 'errors="\K[^"]+' junit-results.xml | head -1)
+              skipped=$(grep -oP 'skipped="\K[^"]+' junit-results.xml | head -1)
+              if [ "${failures:-0}" = "0" ] && [ "${errors:-0}" = "0" ]; then
+                echo ":white_check_mark: **${tests} passed**, ${skipped} skipped"
+              else
+                echo ":x: **${failures} failed**, ${errors} errors out of ${tests} tests (${skipped} skipped)"
+              fi
+            else
+              echo ":warning: No junit-results.xml found"
+            fi
+            echo ""
+            echo "<details><summary>Suite tail (last 40 lines)</summary>"
+            echo ""
+            echo '```'
+            tail -40 pytest-output.log 2>/dev/null || echo "no output log"
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # AC6.2: append performance ledger (top-10 slowest files) to step summary.
+          if [ -f junit-results.xml ]; then
+            python3 scripts/suite-ledger.py --github-summary junit-results.xml >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload test artifacts
+        if: always() && steps.cache_check.outputs.hit != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-results
+          path: |
+            junit-results.xml
+            pytest-output.log
+          retention-days: 14
+
+      # F259 D15: upload resource census JSON as a separate artifact.
+      - name: Upload resource census
+        if: always() && inputs.census == true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: resource-census
+          path: tmp/orch/resource-census.json
+          retention-days: 14
+
+      # Extract suite results into env for the attestation predicate.
+      - name: Extract suite results
+        if: steps.cache_check.outputs.hit != 'true' && success()
+        run: |
+          if [ -f junit-results.xml ]; then
+            echo "SUITE_TESTS=$(grep -oP 'tests="\K[^"]+' junit-results.xml | head -1)" >> "$GITHUB_ENV"
+            echo "SUITE_FAILURES=$(grep -oP 'failures="\K[^"]+' junit-results.xml | head -1)" >> "$GITHUB_ENV"
+            echo "SUITE_SKIPPED=$(grep -oP 'skipped="\K[^"]+' junit-results.xml | head -1)" >> "$GITHUB_ENV"
+            # N1 fix: parse real wall time from junit XML root element's time= attribute.
+            WALL_TIME=$(grep -oP 'time="\K[^"]+' junit-results.xml | head -1)
+            echo "SUITE_WALL_TIME=${WALL_TIME:-0}" >> "$GITHUB_ENV"
+          else
+            echo "SUITE_TESTS=0" >> "$GITHUB_ENV"
+            echo "SUITE_FAILURES=1" >> "$GITHUB_ENV"
+            echo "SUITE_SKIPPED=0" >> "$GITHUB_ENV"
+            echo "SUITE_WALL_TIME=0" >> "$GITHUB_ENV"
+          fi
+          echo "SUITE_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      # AC3.5/AC3.6/AC3.7/AC3.9: mint attestation on successful direct run.
+      # Minting is the LAST step — nothing else runs while id-token is hot.
+      # F259 D15: census runs do NOT mint (timing-poisoned wall_time_seconds).
+      - name: Mint suite attestation
+        # AC3.7: only mint when OIDC token is available (not on fork PRs).
+        if: |
+          steps.cache_check.outputs.hit != 'true' &&
+          success() &&
+          inputs.census != true &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/attest@ce27ba3b4a9a139d9a20a4a07d69fabb52f1e5bc # v2
+        with:
+          subject-path: suite-identity.json
+          predicate-type: "https://cao.dev/attestations/suite-result/v1"
+          predicate: |
+            {
+              "tree": "${{ steps.tree.outputs.hash }}",
+              "commit": "${{ github.sha }}",
+              "marker_expr": "not live and not e2e",
+              "deselect_count": 0,
+              "workers": 4,
+              "vocabulary_version": "${{ steps.identity.outputs.vocab_version }}",
+              "evidence_kind": "direct",
+              "tests": "${{ env.SUITE_TESTS }}",
+              "skipped": "${{ env.SUITE_SKIPPED }}",
+              "failures": "${{ env.SUITE_FAILURES }}",
+              "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "runner_image": "ubuntu-latest",
+              "python_version": "3.14",
+              "wall_time_seconds": "${{ env.SUITE_WALL_TIME }}",
+              "timestamp": "${{ env.SUITE_TIMESTAMP }}"
+            }

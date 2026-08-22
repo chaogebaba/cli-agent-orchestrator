@@ -26,6 +26,7 @@ CONSUMER_MODULES = (
     "src/cli_agent_orchestrator/services/inbox_service.py",
     "src/cli_agent_orchestrator/services/stalled_callback_watchdog.py",
 )
+TRACE_MANIFEST_PATH = Path("src/cli_agent_orchestrator/kernel/receiver_state/trace_manifest.txt")
 
 
 def generate_manifest(repo_root: Path | None = None) -> str:
@@ -48,6 +49,37 @@ def generate_manifest(repo_root: Path | None = None) -> str:
             if symbol in TRACE_SYMBOLS:
                 rows.append(f"{relative_path}:{node.lineno}:{symbol}")
     return "\n".join(sorted(rows)) + "\n"
+
+
+def regenerate_manifest(repo_root: Path | None = None) -> tuple[int, int, bool]:
+    """Regenerate the trace manifest and return hits, touched files, and change state."""
+
+    root = Path(__file__).parents[4] if repo_root is None else repo_root
+    manifest_path = root / TRACE_MANIFEST_PATH
+    generated = generate_manifest(root)
+    committed = manifest_path.read_text(encoding="utf-8") if manifest_path.exists() else ""
+
+    def rows_by_path(manifest: str) -> dict[str, list[str]]:
+        grouped: dict[str, list[str]] = {}
+        for row in manifest.splitlines():
+            if not row:
+                continue
+            path, _, _ = row.rsplit(":", 2)
+            grouped.setdefault(path, []).append(row)
+        return grouped
+
+    committed_by_path = rows_by_path(committed)
+    generated_by_path = rows_by_path(generated)
+    touched_files = sum(
+        committed_by_path.get(path) != generated_by_path.get(path)
+        for path in committed_by_path.keys() | generated_by_path.keys()
+    )
+    changed = committed != generated
+    if changed:
+        manifest_path.write_text(generated, encoding="utf-8")
+
+    hit_count = len([row for row in generated.splitlines() if row])
+    return hit_count, touched_files, changed
 
 
 if __name__ == "__main__":

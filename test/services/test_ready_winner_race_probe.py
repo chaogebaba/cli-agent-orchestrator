@@ -45,6 +45,7 @@ def _pending(terminal_id: str) -> None:
     )
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_200_real_thread_ready_winner_races(isolated_db):
     outcomes: list[tuple[str, bool, str]] = []
 

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.utils.persona_context import PersonaPlan
 
 IDENTITY_ENV_KEYS = ("CAO_TERMINAL_ID", "CAO_INSTANCE_ID", "CAO_ENDPOINT")
 
@@ -45,6 +48,10 @@ def bind_mcp_server_identity(config: dict[str, Any], terminal_id: str) -> dict[s
         "CAO_INSTANCE_ID": os.environ.get("CAO_INSTANCE_ID", ""),
         "CAO_ENDPOINT": resolve_endpoint(),
     }
+    # F332: Forward CAO_TERMINAL_TOKEN so MCP servers can authenticate callbacks
+    terminal_token = os.environ.get("CAO_TERMINAL_TOKEN", "")
+    if terminal_token:
+        expected["CAO_TERMINAL_TOKEN"] = terminal_token
     for key, value in expected.items():
         supplied = env.get(key)
         if supplied is not None and supplied != value:
@@ -54,7 +61,13 @@ def bind_mcp_server_identity(config: dict[str, Any], terminal_id: str) -> dict[s
     return result
 
 
-def bind_pane_identity(environment: dict[str, str] | None, terminal_id: str) -> dict[str, str]:
+def bind_pane_identity(
+    environment: dict[str, str] | None,
+    terminal_id: str,
+    *,
+    plan: "PersonaPlan | None" = None,
+    incarnation_token: str | None = None,
+) -> dict[str, str]:
     """Force immutable terminal/instance affinity into a pane environment."""
     result = dict(environment or {})
     from cli_agent_orchestrator.utils.http import resolve_endpoint
@@ -64,11 +77,22 @@ def bind_pane_identity(environment: dict[str, str] | None, terminal_id: str) -> 
         "CAO_INSTANCE_ID": os.environ.get("CAO_INSTANCE_ID", ""),
         "CAO_ENDPOINT": resolve_endpoint(),
     }
+    # F138: inject incarnation token for process-bearing providers
+    if incarnation_token is not None:
+        expected["CAO_PROCESS_INCARNATION"] = incarnation_token
     for key, value in expected.items():
         supplied = result.get(key)
         if supplied is not None and supplied != value:
             raise ValueError(f"pane environment may not override {key}")
         result[key] = value
+    if plan is not None and plan.provider == "codex":
+        if plan.codex_home is None:
+            raise ValueError("persona codex plan has no CODEX_HOME")
+        expected_codex_home = str(plan.codex_home)
+        supplied = result.get("CODEX_HOME")
+        if supplied is not None and supplied != expected_codex_home:
+            raise ValueError("pane environment may not override CODEX_HOME")
+        result["CODEX_HOME"] = expected_codex_home
     if is_sandbox():
         from cli_agent_orchestrator.utils.provider_plane import provider_plane_environment
 

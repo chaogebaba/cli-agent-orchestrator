@@ -14,8 +14,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.services.agent_step import (
+    StepCancelledError,
     StepExecutionError,
     _CompletionOutcome,
     _wait_for_completion,
@@ -37,6 +39,8 @@ def _patch_terminal_layer(
     *,
     created_id="abc12345",
     wait_results=(True, True),
+    ready=True,
+    status_sequence=None,
     final_status=TerminalStatus.COMPLETED,
     output="the answer",
     get_wd_return=None,
@@ -45,6 +49,8 @@ def _patch_terminal_layer(
     """Context-manager bundle patching the terminal layer for run_agent_step.
 
     wait_results: side_effect list for wait_until_status calls (ready, complete).
+    ready: single-bool form used by upstream #409 tests (overrides wait_results).
+    status_sequence: side_effect list for status_monitor.get_status polls.
     get_wd_*: patch for terminal_service.get_working_directory (CWD inheritance #423).
     """
     create = patch(
@@ -55,11 +61,20 @@ def _patch_terminal_layer(
     delete = patch(f"{_MODULE}.terminal_service.delete_terminal", return_value=True)
     get_output = patch(f"{_MODULE}.terminal_service.get_output", return_value=output)
     exit_cli = patch(f"{_MODULE}.terminal_service.exit_terminal_cli", return_value=None)
-    wait = patch(
-        f"{_MODULE}.wait_until_status",
-        new=AsyncMock(side_effect=list(wait_results)),
-    )
-    status = patch(f"{_MODULE}.status_monitor.get_status", return_value=final_status)
+    if wait_results != (True, True):
+        wait = patch(
+            f"{_MODULE}.wait_until_status",
+            new=AsyncMock(side_effect=list(wait_results)),
+        )
+    else:
+        # Upstream #409 helper form: single readiness bool.
+        wait = patch(f"{_MODULE}.wait_until_status", new=AsyncMock(return_value=ready))
+    if status_sequence is not None:
+        status = patch(
+            f"{_MODULE}.status_monitor.get_status", side_effect=list(status_sequence)
+        )
+    else:
+        status = patch(f"{_MODULE}.status_monitor.get_status", return_value=final_status)
     get_wd = patch(
         f"{_MODULE}.terminal_service.get_working_directory",
         return_value=get_wd_return,
@@ -125,9 +140,7 @@ class TestHappyPath:
         ):
             with pytest.raises(StepExecutionError) as exc_info:
                 asyncio.run(
-                    run_agent_step(
-                        "kiro_cli", "dev", "x", teardown=False, cancel_signal=signal
-                    )
+                    run_agent_step("kiro_cli", "dev", "x", teardown=False, cancel_signal=signal)
                 )
         assert exc_info.value.kind == "cancelled"
         m_delete.assert_not_called()
@@ -159,6 +172,10 @@ class TestHappyPath:
                 f"{_MODULE}._wait_for_completion",
                 new=AsyncMock(side_effect=_completion),
             ),
+            patch(
+                f"{_MODULE}.terminal_service.get_terminal_metadata",
+                return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
+            ),
         ):
             if cancelled:
                 with pytest.raises(StepExecutionError) as exc_info:
@@ -181,9 +198,7 @@ class TestHappyPath:
         m_delete.assert_not_called()
         # A reused terminal is owned by the caller — no graceful exit either.
         m_exit.assert_not_called()
-        m_send.assert_called_once_with(
-            "reuse99", "x", orchestration_type=OrchestrationType.HANDOFF
-        )
+        m_send.assert_called_once_with("reuse99", "x", orchestration_type=OrchestrationType.HANDOFF)
 
     def test_dialog_block_surfaces_structured_non_retryable_error(self):
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
@@ -202,9 +217,7 @@ class TestHappyPath:
             m_send.side_effect = TerminalInputBlockedError("dialog")
             m_status.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
             with pytest.raises(StepExecutionError) as exc_info:
-                asyncio.run(
-                    run_agent_step("codex", "dev", "x", reuse_terminal_id="reuse99")
-                )
+                asyncio.run(run_agent_step("codex", "dev", "x", reuse_terminal_id="reuse99"))
 
         assert exc_info.value.kind == "input_blocked"
         assert exc_info.value.terminal_id == "reuse99"
@@ -218,9 +231,7 @@ class TestHappyPath:
         with create, send as m_send, delete, get_output, exit_cli, wait, status:
             m_send.side_effect = DeliveryDeferredError("composer unstable")
             with pytest.raises(StepExecutionError) as exc_info:
-                asyncio.run(
-                    run_agent_step("claude_code", "dev", "x", reuse_terminal_id="reuse99")
-                )
+                asyncio.run(run_agent_step("claude_code", "dev", "x", reuse_terminal_id="reuse99"))
         assert exc_info.value.kind == "delivery_deferred"
         assert exc_info.value.terminal_id == "reuse99"
 
@@ -252,11 +263,158 @@ class TestHappyPath:
             asyncio.run(run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99"))
         assert events == ["send", "gen"]
 
+    @pytest.mark.parametrize("engine", [KiroEngine.V2, "v2"])
+    def test_reuse_matching_explicit_v2(self, engine):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with (
+            create as m_create,
+            send as m_send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.get_terminal_metadata",
+                return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
+            ),
+        ):
+            result = asyncio.run(
+                run_agent_step(
+                    "kiro_cli",
+                    "dev",
+                    "x",
+                    reuse_terminal_id="reuse99",
+                    engine=engine,
+                )
+            )
+
+        assert result.terminal_id == "reuse99"
+        m_create.assert_not_awaited()
+        m_send.assert_called_once_with(
+            "reuse99", "x", orchestration_type=OrchestrationType.HANDOFF
+        )
+
+    def test_reuse_conflicting_kas_uses_engine_mismatch_before_send(self):
+        """A7 flip: KAS is allowed; engine mismatch still fails closed."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with (
+            create as m_create,
+            send as m_send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.get_terminal_metadata",
+                return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
+            ),
+            pytest.raises(ValueError, match="engine mismatch"),
+        ):
+            asyncio.run(
+                run_agent_step(
+                    "kiro_cli",
+                    "dev",
+                    "x",
+                    reuse_terminal_id="reuse99",
+                    engine=KiroEngine.KAS,
+                )
+            )
+
+        m_create.assert_not_awaited()
+        m_send.assert_not_called()
+
+    def test_reuse_rejects_engine_for_non_kiro_terminal_before_send(self):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with (
+            create,
+            send as m_send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.get_terminal_metadata",
+                return_value={"id": "reuse99", "provider": "codex", "engine": None},
+            ),
+            pytest.raises(ValueError, match="only valid for provider 'kiro_cli'"),
+        ):
+            asyncio.run(
+                run_agent_step(
+                    "codex",
+                    "dev",
+                    "x",
+                    reuse_terminal_id="reuse99",
+                    engine=KiroEngine.V2,
+                )
+            )
+
+        m_send.assert_not_called()
+
+    def test_reuse_rejects_provider_mismatch_before_send(self):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with (
+            create,
+            send as m_send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.get_terminal_metadata",
+                return_value={"id": "reuse99", "provider": "codex", "engine": None},
+            ),
+            pytest.raises(ValueError, match="Provider mismatch"),
+        ):
+            asyncio.run(run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99"))
+
+        m_send.assert_not_called()
+
     def test_working_directory_forwarded_to_create(self):
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
         with create as m_create, send, delete, get_output, exit_cli, get_wd, wait, status:
             asyncio.run(run_agent_step("kiro_cli", "dev", "x", working_directory="/tmp/wd"))
         assert m_create.await_args.kwargs["working_directory"] == "/tmp/wd"
+
+    def test_model_forwarded_to_create(self):
+        """handoff's own `model` parameter reaches terminal_service.create_terminal
+        for a freshly created terminal."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with create as m_create, send, delete, get_output, exit_cli, wait, status:
+            asyncio.run(run_agent_step("kiro_cli", "dev", "x", model="fable-5"))
+        assert m_create.await_args.kwargs["model"] == "fable-5"
+
+    def test_omitted_model_forwards_none_to_create(self):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with create as m_create, send, delete, get_output, exit_cli, wait, status:
+            asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
+        assert m_create.await_args.kwargs["model"] is None
+
+    def test_reused_terminal_never_passes_model_to_create(self):
+        """Reusing a terminal skips create_terminal entirely -- model has
+        nothing to apply to and must not be silently expected to retarget an
+        already-running provider."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with (
+            create as m_create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.get_terminal_metadata",
+                return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
+            ),
+        ):
+            asyncio.run(
+                run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99", model="fable-5")
+            )
+        m_create.assert_not_awaited()
 
     def test_no_session_name_creates_new_session(self):
         """Regression: session_name=None must create a NEW tmux session
@@ -277,9 +435,7 @@ class TestHappyPath:
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
         with create as m_create, send, delete, get_output, exit_cli, get_wd, wait, status:
             asyncio.run(
-                run_agent_step(
-                    "kiro_cli", "dev", "x", session_name="cao-sup", env_vars=env_vars
-                )
+                run_agent_step("kiro_cli", "dev", "x", session_name="cao-sup", env_vars=env_vars)
             )
         assert m_create.await_args.kwargs["new_session"] is False
         assert m_create.await_args.kwargs["session_name"] == "cao-sup"
@@ -530,14 +686,13 @@ class TestTypedCompletionWait:
             ),
             patch(f"{_MODULE}.status_monitor.get_status_gen", return_value=7),
         ):
-            outcome = await _wait_for_completion(
-                "t1", input_gen=7, timeout=1.0, polling_interval=0
-            )
+            outcome = await _wait_for_completion("t1", input_gen=7, timeout=1.0, polling_interval=0)
 
         assert outcome == _CompletionOutcome.COMPLETED
 
     @pytest.mark.asyncio
     async def test_cancel_interrupts_completion_wait_within_two_polls(self):
+        """#409b: cancel raises StepCancelledError promptly (not a CANCELLED return)."""
         signal = asyncio.Event()
         polls = 0
 
@@ -549,14 +704,15 @@ class TestTypedCompletionWait:
             return TerminalStatus.PROCESSING
 
         with patch(f"{_MODULE}.status_monitor.get_status", side_effect=_status):
-            outcome = await _wait_for_completion(
-                "t1",
-                input_gen=1,
-                timeout=60,
-                polling_interval=0,
-                cancel_signal=signal,
-            )
-        assert outcome == _CompletionOutcome.CANCELLED
+            with pytest.raises(StepCancelledError) as exc_info:
+                await _wait_for_completion(
+                    "t1",
+                    input_gen=1,
+                    timeout=60,
+                    polling_interval=0,
+                    cancel_signal=signal,
+                )
+        assert exc_info.value.terminal_id == "t1"
         assert polls <= 2
 
     def test_stale_idle_redraw_is_not_admitted(self, caplog):
@@ -645,9 +801,7 @@ class TestTypedCompletionWait:
                 TerminalStatus.COMPLETED,
             ]
             result = asyncio.run(
-                run_agent_step(
-                    "kiro_cli", "dev", "x", reuse_terminal_id="reuse99", timeout=3600
-                )
+                run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99", timeout=3600)
             )
         assert result.status == TerminalStatus.COMPLETED
         m_sleep.assert_awaited_once()
@@ -665,7 +819,7 @@ class TestCancellationPhaseTable:
             ("waiting_user_input", False),
             ("input_blocked", False),
             ("send_raw", False),
-            ("extraction_raw", False),
+            ("extraction_raw", True),
         ],
     )
     def test_owned_terminal_phase_table(self, case, should_cleanup):
@@ -708,9 +862,7 @@ class TestCancellationPhaseTable:
                 assert result.status == TerminalStatus.COMPLETED
             else:
                 expected = (
-                    RuntimeError
-                    if case in {"send_raw", "extraction_raw"}
-                    else StepExecutionError
+                    RuntimeError if case in {"send_raw", "extraction_raw"} else StepExecutionError
                 )
                 with pytest.raises(expected) as exc_info:
                     asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
@@ -771,9 +923,7 @@ class TestCancellationPhaseTable:
             ),
         ):
             (m_send if phase == "send" else m_output).side_effect = _block_then_raise
-            task = asyncio.create_task(
-                run_agent_step("kiro_cli", "dev", "x", cancel_signal=signal)
-            )
+            task = asyncio.create_task(run_agent_step("kiro_cli", "dev", "x", cancel_signal=signal))
             assert await asyncio.to_thread(started.wait, 5)
             signal.set()
             release.set()
@@ -809,9 +959,7 @@ class TestCancellationPhaseTable:
             status,
         ):
             m_send.side_effect = _block_then_raise
-            task = asyncio.create_task(
-                run_agent_step("kiro_cli", "dev", "x", cancel_signal=signal)
-            )
+            task = asyncio.create_task(run_agent_step("kiro_cli", "dev", "x", cancel_signal=signal))
             assert await asyncio.to_thread(started.wait, 5)
             signal.set()
             release.set()
@@ -850,9 +998,7 @@ class TestCancellationPhaseTable:
             ),
         ):
             m_output.side_effect = _block_then_succeed
-            task = asyncio.create_task(
-                run_agent_step("kiro_cli", "dev", "x", cancel_signal=signal)
-            )
+            task = asyncio.create_task(run_agent_step("kiro_cli", "dev", "x", cancel_signal=signal))
             assert await asyncio.to_thread(started.wait, 5)
             signal.set()
             release.set()
@@ -861,6 +1007,7 @@ class TestCancellationPhaseTable:
         assert result.last_message == "finished"
         m_exit.assert_called_once()
         m_delete.assert_called_once()
+
 
 class TestTeardownIsBestEffort:
     def test_teardown_failure_does_not_fail_successful_step(self):
@@ -890,18 +1037,257 @@ class TestTeardownIsBestEffort:
         # Exit failed but delete still ran.
         m_delete.assert_called_once_with("abc12345", registry=None)
 
-    def test_on_terminal_created_callback_failure_does_not_fail_step(self):
-        """F9(b): a raising ``on_terminal_created`` callback (BR-31 sweep
-        bookkeeping) must never propagate into ``run_agent_step`` — it is
-        best-effort, logged and swallowed, and the step still completes."""
+    def test_on_step_terminal_ready_callback_failure_does_not_fail_step(self):
+        """F9(b): a raising ``on_step_terminal_ready`` callback (BR-31 sweep
+        bookkeeping + issue #583's durable RUNNING row) must never propagate into
+        ``run_agent_step`` — it is best-effort, logged and swallowed, and the step
+        still completes.
+
+        Renamed from ``on_terminal_created`` by issue #583's ``settlement-rewire``:
+        the hook now fires on the terminal-REUSE path too, which made the old name
+        false, and it now carries a second argument (the call fingerprint).
+        """
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
 
-        def _boom_callback(terminal_id):
+        def _boom_callback(terminal_id, call_fingerprint):
             raise RuntimeError("sweep bookkeeping boom")
 
         with create, send, delete, get_output, exit_cli, get_wd, wait, status:
             result = asyncio.run(
-                run_agent_step("kiro_cli", "dev", "x", on_terminal_created=_boom_callback)
+                run_agent_step("kiro_cli", "dev", "x", on_step_terminal_ready=_boom_callback)
             )
         assert result.status == TerminalStatus.COMPLETED
         assert result.last_message == "the answer"
+
+
+@pytest.mark.slow  # F254 D19: exceeds unit budget
+class TestIdleCompletionSignal:
+    """#409a: a post-input IDLE (after the agent worked) resolves as done, so a
+    provider that settles IDLE instead of emitting COMPLETED no longer hangs."""
+
+    def test_idle_after_working_resolves_as_completed(self):
+        """codex-style: PROCESSING (working) then stable IDLE -> COMPLETED,
+        not a hang. The step must extract output and succeed."""
+        # readiness IDLE is NOT part of this sequence — the readiness wait is the
+        # patched wait_until_status(True); get_status is only the completion poll.
+        seq = [
+            TerminalStatus.PROCESSING,  # observed working
+            TerminalStatus.IDLE,  # 1st idle
+            TerminalStatus.IDLE,  # 2nd idle
+            TerminalStatus.IDLE,  # 3rd idle -> stable -> done
+        ]
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            status_sequence=seq,
+        )
+        with create, send, delete, get_output as m_out, exit_cli, wait, status:
+            result = asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
+        assert result.status == TerminalStatus.COMPLETED
+        assert result.last_message == "the answer"
+        m_out.assert_called_once_with("abc12345", OutputMode.LAST)
+
+    def test_completed_marker_still_resolves_immediately(self):
+        """A COMPLETED marker resolves on the first poll (no observed-working
+        gate needed) — the original completion signal is preserved."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            final_status=TerminalStatus.COMPLETED,
+        )
+        with create, send, delete, get_output, exit_cli, wait, status:
+            result = asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
+        assert result.status == TerminalStatus.COMPLETED
+
+    def test_idle_before_any_work_does_not_resolve_early(self):
+        """A bare IDLE with NO prior working state is the pre-pickup window, not
+        done: it must NOT resolve. Here IDLE persists but the agent was never
+        observed working, so the wait times out rather than returning empty."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            final_status=TerminalStatus.IDLE,  # idle forever, never worked
+        )
+        with create, send, delete, get_output, exit_cli, wait, status:
+            with pytest.raises(StepExecutionError, match="did not complete") as exc_info:
+                asyncio.run(run_agent_step("kiro_cli", "dev", "x", timeout=0))
+        assert exc_info.value.kind == "timeout"
+
+    def test_error_still_raises_even_after_working(self):
+        """ERROR during the poll still raises kind='error' (not masked by the new
+        IDLE path) even once the agent had been observed working."""
+        seq = [TerminalStatus.PROCESSING, TerminalStatus.ERROR]
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            status_sequence=seq,
+        )
+        with create, send, delete, get_output, exit_cli, wait, status:
+            with pytest.raises(StepExecutionError, match="ERROR status") as exc_info:
+                asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
+        assert exc_info.value.kind == "error"
+
+
+class TestInterruptibleCancel:
+    """#409b: an in-flight completion wait is interruptible via cancel_event, so a
+    hung step (never settling) becomes cancellable rather than boundary-only."""
+
+    def test_wait_interrupted_when_event_already_set(self):
+        """_wait_for_completion raises StepCancelledError promptly if the event is
+        already set — the interrupt is checked at the top of the poll loop."""
+        from cli_agent_orchestrator.services.agent_step import (
+            StepCancelledError,
+            _wait_for_completion,
+        )
+
+        async def _run():
+            ev = asyncio.Event()
+            ev.set()
+            with patch(
+                f"{_MODULE}.status_monitor.get_status",
+                return_value=TerminalStatus.PROCESSING,
+            ):
+                await _wait_for_completion("term-hung", timeout=600, cancel_event=ev)
+
+        with pytest.raises(StepCancelledError) as exc_info:
+            asyncio.run(_run())
+        assert exc_info.value.terminal_id == "term-hung"
+
+    def test_wait_interrupted_mid_poll_by_event(self):
+        """A hung terminal (always PROCESSING) whose cancel_event is set after the
+        wait starts is interrupted promptly, not left to run out the timeout."""
+        from cli_agent_orchestrator.services.agent_step import (
+            StepCancelledError,
+            _wait_for_completion,
+        )
+
+        async def _run():
+            ev = asyncio.Event()
+
+            async def _cancel_soon():
+                # Fire the event while the wait is parked on its poll interval.
+                await asyncio.sleep(0.05)
+                ev.set()
+
+            with patch(
+                f"{_MODULE}.status_monitor.get_status",
+                return_value=TerminalStatus.PROCESSING,  # never settles
+            ):
+                waiter = asyncio.ensure_future(
+                    _wait_for_completion("term-hung", timeout=600, cancel_event=ev)
+                )
+                await _cancel_soon()
+                await waiter
+
+        with pytest.raises(StepCancelledError):
+            asyncio.run(_run())
+
+    def test_run_agent_step_cancel_tears_down_created_terminal(self):
+        """When the wait is cancelled, run_agent_step raises StepCancelledError and
+        tears down the terminal it created (exit-then-delete), never masking it."""
+        from cli_agent_orchestrator.services.agent_step import StepCancelledError
+
+        cancel_event = asyncio.Event()
+        cancel_event.set()  # cancel before the completion poll even begins
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            final_status=TerminalStatus.PROCESSING,
+        )
+        with (
+            create,
+            send,
+            delete as m_delete,
+            get_output as m_out,
+            exit_cli as m_exit,
+            wait,
+            status,
+        ):
+            with pytest.raises(StepCancelledError) as exc_info:
+                asyncio.run(
+                    run_agent_step("kiro_cli", "dev", "x", cancel_event=cancel_event, timeout=600)
+                )
+        assert exc_info.value.terminal_id == "abc12345"
+        # Cancelled step is not a success: no output extraction.
+        m_out.assert_not_called()
+        # A terminal this call created is reclaimed exactly like the success path.
+        m_exit.assert_called_once_with("abc12345")
+        m_delete.assert_called_once_with("abc12345", registry=None)
+
+    def test_reused_terminal_not_torn_down_on_cancel(self):
+        """A cancelled step must NOT delete a terminal it did not create — the
+        caller owns a reused terminal's lifecycle."""
+        from cli_agent_orchestrator.services.agent_step import StepCancelledError
+
+        cancel_event = asyncio.Event()
+        cancel_event.set()
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            final_status=TerminalStatus.PROCESSING,
+        )
+        with (
+            create,
+            send,
+            delete as m_delete,
+            get_output,
+            exit_cli as m_exit,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.get_terminal_metadata",
+                return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
+            ),
+        ):
+            with pytest.raises(StepCancelledError):
+                asyncio.run(
+                    run_agent_step(
+                        "kiro_cli",
+                        "dev",
+                        "x",
+                        reuse_terminal_id="reuse99",
+                        cancel_event=cancel_event,
+                        timeout=600,
+                    )
+                )
+        m_delete.assert_not_called()
+        m_exit.assert_not_called()
+
+
+class TestOutputExtractionTeardown:
+    def test_extraction_failure_tears_down_created_terminal(self):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            final_status=TerminalStatus.COMPLETED,
+        )
+        with (
+            create,
+            send,
+            delete as m_delete,
+            patch(
+                f"{_MODULE}.terminal_service.get_output",
+                side_effect=ValueError("No completion marker found after last user message"),
+            ) as m_out,
+            exit_cli as m_exit,
+            wait,
+            status,
+        ):
+            with pytest.raises(ValueError, match="No completion marker found"):
+                asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
+        m_out.assert_called_once_with("abc12345", OutputMode.LAST)
+        # A terminal this call created is reclaimed exactly like the success path.
+        m_exit.assert_called_once_with("abc12345")
+        m_delete.assert_called_once_with("abc12345", registry=None)
+
+    def test_extraction_failure_does_not_tear_down_reused_terminal(self):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            final_status=TerminalStatus.COMPLETED,
+        )
+        with (
+            create,
+            send,
+            delete as m_delete,
+            patch(
+                f"{_MODULE}.terminal_service.get_output",
+                side_effect=ValueError("No completion marker found after last user message"),
+            ) as m_out,
+            exit_cli as m_exit,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.get_terminal_metadata",
+                return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
+            ),
+        ):
+            with pytest.raises(ValueError, match="No completion marker found"):
+                asyncio.run(run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99"))
+        m_out.assert_called_once_with("reuse99", OutputMode.LAST)
+        m_delete.assert_not_called()
+        m_exit.assert_not_called()

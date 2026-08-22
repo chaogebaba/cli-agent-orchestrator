@@ -16,7 +16,7 @@ touch -r "$auth" "$mtime_ref"
 trap 'touch -r "$mtime_ref" "$auth"' EXIT
 
 cao session manifest --session "$CAO_WP2S1_SCRATCH_SESSION" --json >"$out/manifest-before.json"
-fifo="${CAO_HOME:-$HOME/.cao}/fifos/${CAO_WP2S1_SCRATCH_TERMINAL}.fifo"
+fifo="${CAO_HOME_DIR:-$HOME/.cao}/fifos/${CAO_WP2S1_SCRATCH_TERMINAL}.fifo"
 [[ -p "$fifo" ]]
 stat -Lc '%d:%i:%F' "$fifo" >"$out/fifo-before.txt"
 

@@ -974,11 +974,16 @@ def test_probe_15_prior_hit_suppression_precedes_every_open_kind():
 
 
 def test_probe_16_frozen_drain_sql_fixture_ratios():
-    root = Path(__file__).parents[3]
+    from test.conftest import ROOT_REPO
+    if ROOT_REPO is None:
+        pytest.skip("root repo not found (worktree without .git context)")
+    root = ROOT_REPO
+    if not (root / "orchestrator" / "blueprints" / "wave4-drain-metric-fixture.sql").exists():
+        pytest.skip("wave4-drain-metric-fixture.sql not found in root repo orchestrator/blueprints/")
     command = [
         "sqlite3",
         "-cmd",
-        ".read blueprints/wave4-drain-metric-fixture.sql",
+        ".read orchestrator/blueprints/wave4-drain-metric-fixture.sql",
         "-cmd",
         ".parameter init",
         "-cmd",
@@ -986,7 +991,7 @@ def test_probe_16_frozen_drain_sql_fixture_ratios():
         "-cmd",
         ".parameter set :end '2026-07-16T00:00:00Z'",
         ":memory:",
-        ".read blueprints/wave4-drain-metric.sql",
+        ".read orchestrator/blueprints/wave4-drain-metric.sql",
     ]
     output = subprocess.run(command, cwd=root, check=True, text=True, capture_output=True).stdout
     assert "claude_code|2|1|1|1|0|0.5|0.5|0.5|0.0" in output
@@ -1152,10 +1157,11 @@ def test_livefix_p2_fresh_capture_failure_fails_closed(wave4_db, capture_result)
     assert screen.display == incremental_rows
 
 
+@pytest.mark.local_fixture(str(Path(__file__).parent.parent / "fixtures/drain-wave4/p17-pane-final.txt"))
 def test_livefix_p3_grok_live_shape_completes_and_delivery_opens(wave4_db):
-    root = Path(__file__).parents[3]
+    fixture_dir = Path(__file__).parent.parent / "fixtures/drain-wave4"
     screen = (
-        (root / "tmp/orch/drain-2026-07-16-wave4/p17-pane-final.txt")
+        (fixture_dir / "p17-pane-final.txt")
         .read_text(encoding="utf-8")
         .splitlines()
     )
@@ -1215,10 +1221,11 @@ def test_livefix_p3_grok_live_shape_completes_and_delivery_opens(wave4_db):
     assert incremental_screen.display == screen
 
 
+@pytest.mark.local_fixture(str(Path(__file__).parent.parent / "fixtures/drain-wave4/f16-tmux-tail.txt"))
 def test_livefix_p4_f16_live_pane_remains_processing():
-    root = Path(__file__).parents[3]
+    fixture_dir = Path(__file__).parent.parent / "fixtures/drain-wave4"
     screen = (
-        (root / "tmp/orch/drain-2026-07-16-wave4/f16-tmux-tail.txt")
+        (fixture_dir / "f16-tmux-tail.txt")
         .read_text(encoding="utf-8")
         .splitlines()
     )

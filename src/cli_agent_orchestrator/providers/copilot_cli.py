@@ -71,6 +71,11 @@ class CopilotCliProvider(BaseProvider):
         self._copilot_help_text_cache: Optional[str] = None
 
     @property
+    def resolved_model(self) -> Optional[str]:
+        """Return the effective model (direct, no TOML chain)."""
+        return self._model
+
+    @property
     def paste_enter_count(self) -> int:
         return 1
 
@@ -114,14 +119,25 @@ class CopilotCliProvider(BaseProvider):
                 self._copilot_help_text_cache = ""
         return flag in self._copilot_help_text_cache
 
-    def _wait_for_shell_ready(self, timeout: float = 30.0, polling_interval: float = 0.5) -> bool:
-        """Wait for a stable non-empty shell screen using provider-safe history reads."""
+    async def _wait_for_shell_ready(
+        self, timeout: float = 30.0, polling_interval: float = 0.5
+    ) -> bool:
+        """Wait for a stable non-empty shell screen using provider-safe history reads.
+
+        issue #494: real coroutine, not sync code called from an async
+        caller (initialize()) -- the blocking history read is offloaded via
+        asyncio.to_thread and the poll delay is asyncio.sleep, so this no
+        longer blocks the shared event loop while waiting.
+        """
         start_time = time.time()
         previous_output: Optional[str] = None
         stable_reads = 0
+        max_iterations = max(1, int(timeout / polling_interval * 3))
+        iterations = 0
 
-        while time.time() - start_time < timeout:
-            output = self._history(tail_lines=120)
+        while time.time() - start_time < timeout and iterations < max_iterations:
+            iterations += 1
+            output = await asyncio.to_thread(self._history, tail_lines=120)
             if output and output.strip():
                 if previous_output is not None and output == previous_output:
                     stable_reads += 1
@@ -131,8 +147,12 @@ class CopilotCliProvider(BaseProvider):
                     stable_reads = 0
 
             previous_output = output
-            time.sleep(polling_interval)
+            await asyncio.sleep(polling_interval)
 
+        if iterations >= max_iterations:
+            logger.warning(
+                "_wait_for_shell_ready: iteration cap reached (%d), exiting", max_iterations
+            )
         return False
 
     def _command(self) -> str:
@@ -199,10 +219,26 @@ class CopilotCliProvider(BaseProvider):
     def _send_key(self, key: str) -> None:
         get_backend().send_special_key(self.session_name, self.window_name, key)
 
-    def _accept_trust_prompts(self, timeout: float = 30.0) -> None:
+    async def _accept_trust_prompts(self, timeout: float = 30.0) -> None:
+        """Poll the pane and auto-accept Copilot's folder-trust dialogs.
+
+        issue #494: real coroutine, not sync code called from an async
+        caller. Re-entered from initialize()'s polling loop (see its
+        WAITING_USER_ANSWER branch) -- that re-entrant contract is unchanged,
+        only the blocking mechanics are: ``_history`` and the ``_send_enter``/
+        ``_send_key`` backend calls are offloaded via ``asyncio.to_thread``
+        (the two helpers themselves stay sync -- they are also called
+        directly from tests and other contexts, so wrapping happens at each
+        call site here rather than making them coroutines) and every poll
+        delay is ``asyncio.sleep``, so this no longer blocks the shared event
+        loop while polling.
+        """
         start = time.time()
-        while time.time() - start < timeout:
-            raw_content = self._history(tail_lines=120)
+        max_iterations = max(1, int(timeout / 1.0 * 3))
+        iterations = 0
+        while time.time() - start < timeout and iterations < max_iterations:
+            iterations += 1
+            raw_content = await asyncio.to_thread(self._history, tail_lines=120)
             content = raw_content.lower()
 
             if (
@@ -212,8 +248,8 @@ class CopilotCliProvider(BaseProvider):
             ):
                 # The first option is pre-selected; Enter is the most reliable
                 # accept action across Copilot builds.
-                self._send_enter()
-                time.sleep(1)
+                await asyncio.to_thread(self._send_enter)
+                await asyncio.sleep(1)
                 continue
 
             if (
@@ -222,37 +258,41 @@ class CopilotCliProvider(BaseProvider):
             ) and re.search(r"\b1\.\s*yes\b", content):
                 # Option 1 is selected by default in the trust dialog; Enter is
                 # the most reliable way to accept across Copilot builds.
-                self._send_enter()
-                time.sleep(1)
+                await asyncio.to_thread(self._send_enter)
+                await asyncio.sleep(1)
                 continue
 
             if "do you trust all the actions in this folder" in content:
-                self._send_key("y")
-                self._send_enter()
-                time.sleep(1)
+                await asyncio.to_thread(self._send_key, "y")
+                await asyncio.to_thread(self._send_enter)
+                await asyncio.sleep(1)
                 continue
 
             if re.search(r"\[\s*y\s*/\s*n\s*]", content):
-                self._send_key("y")
-                self._send_enter()
-                time.sleep(1)
+                await asyncio.to_thread(self._send_key, "y")
+                await asyncio.to_thread(self._send_enter)
+                await asyncio.sleep(1)
                 continue
 
             if "confirm folder trust" in content or "press enter to continue" in content:
-                self._send_enter()
-                time.sleep(1)
+                await asyncio.to_thread(self._send_enter)
+                await asyncio.sleep(1)
                 continue
 
             if re.search(WAITING_PROMPT_PATTERN, content, re.IGNORECASE):
                 # Generic waiting prompt fallback: confirm with Enter.
-                self._send_enter()
-                time.sleep(1)
+                await asyncio.to_thread(self._send_enter)
+                await asyncio.sleep(1)
                 continue
 
             if self._has_idle_prompt_near_end(raw_content.splitlines()):
                 return
-            time.sleep(1)
+            await asyncio.sleep(1)
 
+        if iterations >= max_iterations:
+            logger.warning(
+                "_accept_trust_prompts: iteration cap reached (%d), exiting", max_iterations
+            )
         logger.warning(
             "Trust prompt handler timed out for %s:%s",
             self.session_name,
@@ -260,6 +300,17 @@ class CopilotCliProvider(BaseProvider):
         )
 
     async def initialize(self) -> bool:
+        """Initialize the Copilot CLI provider by starting ``copilot``.
+
+        issue #494: ``self._command()`` does two blocking things --
+        ``_supports_flag`` runs a cached blocking ``subprocess.run(["copilot",
+        "--help"])`` and ``get_backend().get_pane_working_directory`` is a
+        blocking subprocess call -- and ``get_backend().send_keys`` is
+        likewise blocking. All three are offloaded via ``asyncio.to_thread``
+        so building and sending the launch command can't block the shared
+        event loop under concurrent session creation. ``status_monitor.
+        get_status`` stays inline -- it is in-memory only, no blocking I/O.
+        """
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         try:
@@ -273,19 +324,25 @@ class CopilotCliProvider(BaseProvider):
                 exc,
             )
             init_timeout = get_server_settings()["provider_init_timeout"]
-            shell_ready = self._wait_for_shell_ready(timeout=init_timeout)
+            shell_ready = await self._wait_for_shell_ready(timeout=init_timeout)
 
         if not shell_ready:
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
-        get_backend().send_keys(self.session_name, self.window_name, self._command())
+        command = await asyncio.to_thread(self._command)
+        await asyncio.to_thread(
+            get_backend().send_keys, self.session_name, self.window_name, command
+        )
 
         deadline = time.time() + 60.0
-        self._accept_trust_prompts(timeout=10.0)
-        while time.time() < deadline:
+        await self._accept_trust_prompts(timeout=10.0)
+        max_iterations = max(1, int(60.0 / 1.0 * 3))
+        iterations = 0
+        while time.time() < deadline and iterations < max_iterations:
+            iterations += 1
             status = status_monitor.get_status(self.terminal_id)
             if status == TerminalStatus.WAITING_USER_ANSWER:
-                self._accept_trust_prompts(timeout=5.0)
+                await self._accept_trust_prompts(timeout=5.0)
                 await asyncio.sleep(1.0)
                 continue
             if status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
@@ -297,6 +354,8 @@ class CopilotCliProvider(BaseProvider):
                 return True
             await asyncio.sleep(1.0)
 
+        if iterations >= max_iterations:
+            logger.warning("initialize: iteration cap reached (%d), exiting", max_iterations)
         raise TimeoutError("Copilot initialization timed out after 60 seconds")
 
     @staticmethod
@@ -488,6 +547,8 @@ class CopilotCliProvider(BaseProvider):
         return TerminalStatus.COMPLETED
 
     def get_idle_pattern_for_log(self) -> str:
+        from cli_agent_orchestrator.utils.tombstones import tombstone
+        tombstone("TS-0002g")
         return IDLE_PROMPT_PATTERN_LOG
 
     def extract_last_message_from_script(self, script_output: str) -> str:

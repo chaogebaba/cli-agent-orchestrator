@@ -18,10 +18,14 @@ from cli_agent_orchestrator.plugins import (
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.session_service import create_session, delete_session
 from cli_agent_orchestrator.services.terminal_service import (
+    _delete_terminal_core as delete_terminal,
+)
+from cli_agent_orchestrator.services.terminal_service import (
     create_terminal,
-    delete_terminal,
     send_input,
 )
+
+pytestmark = pytest.mark.usefixtures("isolated_memory_db")
 
 
 def _registry_mock() -> MagicMock:
@@ -143,6 +147,7 @@ class TestTerminalPluginEvents:
     """Verify terminal lifecycle events are emitted correctly."""
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog", return_value="")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
@@ -167,6 +172,7 @@ class TestTerminalPluginEvents:
         mock_load_agent_profile,
         mock_build_skill_catalog,
         mock_log_dir,
+        mock_delete_terminals_by_session,
     ):
         """Terminal creation should emit only after persistence and startup complete."""
         registry = _registry_mock()
@@ -227,6 +233,8 @@ class TestTerminalPluginEvents:
         assert event.provider == "kiro_cli"
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog", return_value="")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
@@ -251,6 +259,8 @@ class TestTerminalPluginEvents:
         mock_load_agent_profile,
         mock_build_skill_catalog,
         mock_log_dir,
+        mock_delete_terminals_by_session,
+        mock_db_delete_terminal,
     ):
         """Terminal creation failures must not emit post_create_terminal."""
         registry = _registry_mock()
@@ -302,8 +312,7 @@ class TestTerminalPluginEvents:
         }
         mock_provider_manager.cleanup_provider.side_effect = lambda *_: call_order.append("cleanup")
         mock_db_delete_terminal.side_effect = lambda *_a, **_k: (
-            call_order.append("db_delete") or
-            {"terminal_deleted": True, "intent_deleted": False}
+            call_order.append("db_delete") or {"terminal_deleted": True, "intent_deleted": False}
         )
         registry.dispatch.side_effect = record_dispatch
 
@@ -344,6 +353,8 @@ class TestMessagePluginEvents:
     """Verify message delivery emits the correct event payloads."""
 
     @pytest.mark.parametrize("orchestration_type", ["send_message", "assign", "handoff"])
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
@@ -354,10 +365,13 @@ class TestMessagePluginEvents:
         mock_provider_manager,
         mock_tmux,
         mock_update_last_active,
+        mock_status_monitor,
+        mock_memory_service,
         orchestration_type,
     ):
         """Every successful delivery should emit one post_send_message event."""
         registry = _registry_mock()
+        mock_memory_service.return_value.get_curated_memory_context.return_value = ""
         call_order: list[str] = []
 
         async def record_dispatch(*_args):
@@ -394,11 +408,18 @@ class TestMessagePluginEvents:
         assert event.message == "Hello from supervisor"
         assert event.orchestration_type == orchestration_type
 
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_input_does_not_dispatch_on_failure(
-        self, mock_get_metadata, mock_provider_manager, mock_tmux
+        self,
+        mock_get_metadata,
+        mock_provider_manager,
+        mock_tmux,
+        mock_status_monitor,
+        mock_memory_service,
     ):
         """Message delivery failures must not emit post_send_message."""
         registry = _registry_mock()
@@ -422,12 +443,32 @@ class TestMessagePluginEvents:
 
         registry.dispatch.assert_not_awaited()
 
-    @patch("cli_agent_orchestrator.services.inbox_service.confirm_delivery", return_value=("unverified", {"kind": "send_returned_unverified"}))
-    @patch("cli_agent_orchestrator.services.inbox_service.get_message_trace", return_value={"attempts": [{"attempt_uuid": "attempt-1", "started_at": "2026-07-11T00:00:00+00:00", "evidence": {}}]})
-    @patch("cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt", return_value="attempt-1")
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.confirm_delivery",
+        return_value=("unverified", {"kind": "send_returned_unverified"}),
+    )
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.get_message_trace",
+        return_value={
+            "attempts": [
+                {
+                    "attempt_uuid": "attempt-1",
+                    "started_at": "2026-07-11T00:00:00+00:00",
+                    "evidence": {},
+                }
+            ]
+        },
+    )
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt",
+        return_value="attempt-1",
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.list_message_attempts", return_value=[])
     @patch("cli_agent_orchestrator.services.inbox_service.count_ambiguous_attempts", return_value=0)
-    @patch("cli_agent_orchestrator.services.inbox_service.get_terminal_metadata", return_value={"provider": "event"})
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.get_terminal_metadata",
+        return_value={"provider": "event"},
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.settle_delivery_attempt")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
@@ -471,6 +512,4 @@ class TestMessagePluginEvents:
             defer_on_dialog=True,
         )
         mock_settle.assert_called_once()
-        assert mock_settle.call_args.args[:3] == (
-            "attempt-1", MessageStatus.DELIVERED, "confirmed"
-        )
+        assert mock_settle.call_args.args[:3] == ("attempt-1", MessageStatus.DELIVERED, "confirmed")

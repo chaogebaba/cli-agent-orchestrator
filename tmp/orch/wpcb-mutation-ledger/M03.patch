@@ -1,0 +1,14 @@
+diff --git a/src/cli_agent_orchestrator/providers/cline_cli.py b/src/cli_agent_orchestrator/providers/cline_cli.py
+index 532726bc..f75714dc 100644
+--- a/src/cli_agent_orchestrator/providers/cline_cli.py
++++ b/src/cli_agent_orchestrator/providers/cline_cli.py
+@@ -416,7 +416,8 @@ class ClineCliProvider(BaseProvider):
+             command_parts.extend(["-s", system_prompt])
+ 
+         # D1/D3: sandbox mode via --data-dir
+-        command_parts.extend(["--data-dir", str(self._data_dir())])
++        # M3: env var instead of flag
++        import os; os.environ["CLINE_DATA_DIR"] = str(self._data_dir())
+ 
+         return shlex.join(command_parts)
+ 

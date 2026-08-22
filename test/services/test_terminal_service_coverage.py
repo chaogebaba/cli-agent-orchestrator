@@ -8,13 +8,90 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.models.agent_profile import AgentProfile, ContextPolicy
+
+
+class TestPersonaPlanningSeam:
+    @pytest.mark.asyncio
+    async def test_composition_failure_happens_before_any_pane(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ):
+        from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.utils.persona_context import PersonaContextError
+
+        profile = AgentProfile(
+            name="persona",
+            description="persona",
+            provider="claude_code",
+            contextPolicy=ContextPolicy(scope="persona"),
+        )
+        backend = MagicMock()
+        monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+        monkeypatch.setattr(terminal_service, "load_agent_profile", lambda name: profile)
+        monkeypatch.setattr(terminal_service, "generate_terminal_id", lambda: "persona-terminal")
+        monkeypatch.setattr(terminal_service, "is_sandbox", lambda: False)
+        with patch(
+            "cli_agent_orchestrator.utils.persona_context.compose_persona_plan",
+            side_effect=PersonaContextError("sabotaged persona root"),
+        ):
+            with pytest.raises(PersonaContextError, match="sabotaged"):
+                await terminal_service.create_terminal(
+                    "claude_code",
+                    "persona",
+                    session_name="cao-persona",
+                    new_session=True,
+                    working_directory=str(tmp_path),
+                )
+        backend.create_session.assert_not_called()
+        backend.create_window.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sandbox_precedence_skips_persona_with_one_warning(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, caplog
+    ):
+        from cli_agent_orchestrator.services import terminal_service
+
+        profile = AgentProfile(
+            name="persona",
+            description="persona",
+            provider="claude_code",
+            contextPolicy=ContextPolicy(scope="persona"),
+        )
+        backend = MagicMock()
+        backend.session_exists.return_value = True
+        bind = MagicMock(return_value={})
+        monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
+        monkeypatch.setattr(terminal_service, "load_agent_profile", lambda name: profile)
+        monkeypatch.setattr(terminal_service, "generate_terminal_id", lambda: "persona-terminal")
+        monkeypatch.setattr(terminal_service, "is_sandbox", lambda: True)
+        monkeypatch.setattr(terminal_service, "bind_pane_identity", bind)
+        with patch("cli_agent_orchestrator.utils.persona_context.compose_persona_plan") as compose:
+            with pytest.raises(ValueError, match="already exists"):
+                await terminal_service.create_terminal(
+                    "claude_code",
+                    "persona",
+                    session_name="cao-persona",
+                    new_session=True,
+                    working_directory=str(tmp_path),
+                )
+        compose.assert_not_called()
+        # F138: bind_pane_identity(env_vars, terminal_id, plan=None, incarnation_token=<token>)
+        bind.assert_called_once()
+        args, kwargs = bind.call_args
+        assert args == (None, "persona-terminal")
+        assert kwargs["plan"] is None
+        assert "incarnation_token" in kwargs and isinstance(kwargs["incarnation_token"], str)
+        warnings = [record for record in caplog.records if "shared-auth" in record.message]
+        assert len(warnings) == 1
+
+pytestmark = pytest.mark.usefixtures("isolated_memory_db")
 
 
 class TestCreateTerminalCleanup:
     """Test error cleanup paths in create_terminal."""
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
@@ -42,6 +119,7 @@ class TestCreateTerminalCleanup:
         mock_log_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
     ):
         """When provider.initialize() fails, cleanup should kill session, cleanup
         provider, AND roll back the DB terminal row."""
@@ -235,6 +313,7 @@ class TestCreateTerminalCleanup:
         mock_tmux.kill_window.assert_called_once_with("cao-existing", "w1")
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
@@ -262,6 +341,7 @@ class TestCreateTerminalCleanup:
         mock_log_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
     ):
         """Cleanup errors should be swallowed, original error re-raised. The DB
         rollback still runs after cleanup_provider raises, and its own error is
@@ -293,6 +373,7 @@ class TestCreateTerminalCleanup:
         mock_db_delete.assert_called_once_with("tid1", preserve_warm_intent=False)
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
@@ -318,6 +399,7 @@ class TestCreateTerminalCleanup:
         mock_log_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
     ):
         """New sessions without the prefix get it added automatically."""
         from cli_agent_orchestrator.services.terminal_service import create_terminal
@@ -357,6 +439,7 @@ class TestCreateTerminalSessionCleanupGuard:
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch(
         "cli_agent_orchestrator.services.terminal_service.generate_window_name", return_value="w1"
@@ -372,6 +455,7 @@ class TestCreateTerminalSessionCleanupGuard:
         mock_tid,
         mock_wname,
         mock_db_create,
+        mock_db_delete,
         mock_pm,
         mock_tmux,
         mock_log_dir,
@@ -395,11 +479,13 @@ class TestCreateTerminalSessionCleanupGuard:
         mock_tmux.kill_session.assert_not_called()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_and_warm_intent")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch(
         "cli_agent_orchestrator.services.terminal_service.generate_window_name", return_value="w1"
@@ -415,11 +501,13 @@ class TestCreateTerminalSessionCleanupGuard:
         mock_tid,
         mock_wname,
         mock_db_create,
+        mock_db_delete,
         mock_pm,
         mock_tmux,
         mock_log_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        mock_delete_terminals_by_session,
     ):
         """When we successfully created the session but a later step fails, cleanup SHOULD kill it."""
         from cli_agent_orchestrator.services.terminal_service import create_terminal
@@ -457,7 +545,9 @@ class TestDeleteTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_delete_terminal_full_path(self, mock_meta, mock_tmux, mock_pm, mock_db_del):
         """Delete should stop pipe-pane, kill window, cleanup provider, delete DB record."""
-        from cli_agent_orchestrator.services.terminal_service import delete_terminal
+        from cli_agent_orchestrator.services.terminal_service import (
+            _delete_terminal_core as delete_terminal,
+        )
 
         mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
 
@@ -479,7 +569,9 @@ class TestDeleteTerminal:
         self, mock_meta, mock_tmux, mock_pm, mock_db_del
     ):
         """Pipe-pane failure should be logged and not block deletion."""
-        from cli_agent_orchestrator.services.terminal_service import delete_terminal
+        from cli_agent_orchestrator.services.terminal_service import (
+            _delete_terminal_core as delete_terminal,
+        )
 
         mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
         mock_tmux.stop_pipe_pane.side_effect = Exception("pipe error")
@@ -500,7 +592,9 @@ class TestDeleteTerminal:
         self, mock_meta, mock_tmux, mock_pm, mock_db_del
     ):
         """Kill-window failure should be logged and not block deletion."""
-        from cli_agent_orchestrator.services.terminal_service import delete_terminal
+        from cli_agent_orchestrator.services.terminal_service import (
+            _delete_terminal_core as delete_terminal,
+        )
 
         mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
         mock_tmux.kill_window.side_effect = Exception("kill error")
@@ -516,7 +610,9 @@ class TestDeleteTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_delete_terminal_db_failure_raises(self, mock_meta, mock_tmux, mock_pm, mock_db_del):
         """DB delete failure should propagate."""
-        from cli_agent_orchestrator.services.terminal_service import delete_terminal
+        from cli_agent_orchestrator.services.terminal_service import (
+            _delete_terminal_core as delete_terminal,
+        )
 
         mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
         mock_db_del.side_effect = Exception("DB error")

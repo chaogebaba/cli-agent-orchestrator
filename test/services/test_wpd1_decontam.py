@@ -644,6 +644,7 @@ def test_cpa_proposals_are_locally_resolved_and_replacement_is_ignored(monkeypat
     assert result.spans[0].replacement_policy == service.NEUTRAL_REPLACEMENT_POLICY
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_cpa_candidate_caps_force_human_gate():
     candidates = [(1, ("payload", "message"), "x" * 9000)] * 513
     rows, truncated = service._candidate_payload(candidates)

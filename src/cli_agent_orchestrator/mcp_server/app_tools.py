@@ -150,11 +150,18 @@ def _post_json(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     ``/terminals/*/key``, ``/terminals/*/inbox/messages``) take their arguments as
     query parameters, mirroring how ``mcp_server/server.py`` already calls them.
     """
+    import os
+
+    headers = _auth_headers() or {}
+    # F332: Attach terminal token header for sender authentication
+    terminal_token = os.environ.get("CAO_TERMINAL_TOKEN")
+    if terminal_token:
+        headers["X-CAO-Terminal-Token"] = terminal_token
 
     response = cao_http.post(
         f"{path}",
         params={k: v for k, v in (params or {}).items() if v is not None} or None,
-        headers=_auth_headers() or None,
+        headers=headers or None,
         timeout=MCP_REQUEST_TIMEOUT,
     )
     response.raise_for_status()

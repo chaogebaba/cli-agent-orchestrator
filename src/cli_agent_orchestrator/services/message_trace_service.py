@@ -17,9 +17,12 @@ from typing import Any, Literal
 from urllib.parse import quote
 
 from cli_agent_orchestrator.clients.database import (
+    TRANSCRIPT_HOOK_BINDING_SOURCES,
     get_current_transcript_binding,
+    get_latest_hook_transcript_binding,
     update_terminal_provider_session_id_if_null,
 )
+from cli_agent_orchestrator.utils import provider_plane
 from cli_agent_orchestrator.utils.provider_plane import provider_home
 
 logger = logging.getLogger(__name__)
@@ -28,6 +31,15 @@ _unresolved_warned_lock = threading.Lock()
 _binding_staleness_lock = threading.Lock()
 
 FileTriple = tuple[int, int, int]
+
+
+def _resolved_codex_home(terminal_id: str | None) -> Path:
+    from cli_agent_orchestrator.utils.persona_context import resolve_codex_home
+
+    resolved = resolve_codex_home(terminal_id)
+    if resolved == provider_plane.provider_home("codex").home:
+        return provider_home("codex").home
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -49,6 +61,7 @@ class BindingStalenessObservation:
 
 
 _binding_staleness: dict[str, BindingStalenessBundle] = {}
+_declared_presumed_stale: set[str] = set()
 
 NORMALIZED_CONFIRMATION_MIN_CHARS = 48
 REDELIVERY_TAG_BANNER_PATTERN = re.compile(
@@ -91,6 +104,65 @@ class TranscriptResolution:
 def clear_binding_staleness_state(terminal_id: str) -> None:
     with _binding_staleness_lock:
         _binding_staleness.pop(terminal_id, None)
+        _declared_presumed_stale.discard(terminal_id)
+
+
+def binding_presumed_stale(terminal_id: str) -> bool:
+    """Read-only: True after the two-absence predicate has already declared stale."""
+    with _binding_staleness_lock:
+        return terminal_id in _declared_presumed_stale
+
+
+# Derived from TRANSCRIPT_BINDING_SOURCES — do not retype (N2).
+_HOOK_BINDING_SOURCES = TRANSCRIPT_HOOK_BINDING_SOURCES
+
+
+def _binding_authority_rank(row: dict[str, Any]) -> tuple[int, Any, int]:
+    """Provider-hook epochs outrank server-inferred recovery; then epoch order."""
+    tier = 1 if str(row.get("source") or "") in _HOOK_BINDING_SOURCES else 0
+    row_id = row.get("id")
+    return (tier, row.get("received_at"), row_id if type(row_id) is int else 0)
+
+
+def binding_for_transcript_confirm(terminal_id: str) -> dict[str, Any] | None:
+    """Binding used for confirm/staleness: follow the newest provider-hook rotation.
+
+    ``get_current_transcript_binding`` is newest-by-time across all sources, so a
+    later ``server_recovery`` can outrank a provider-attested hook under plain
+    epoch order. Prefer the latest *hook-tier* epoch (startup/resume/clear/compact)
+    when its authority rank is at least the current row's — so a newer resume
+    beats an older compact, and both beat server_recovery. If the hook path is
+    gone from disk, keep current (N3). If the current path is gone, fall back to
+    the hook row.
+    """
+    current = get_current_transcript_binding(terminal_id)
+    hook = get_latest_hook_transcript_binding(terminal_id)
+    if hook is None:
+        return current
+    if current is None:
+        return hook
+    if hook.get("id") == current.get("id"):
+        return current
+    hook_path = str(hook.get("transcript_path") or "")
+    current_path = str(current.get("transcript_path") or "")
+    if not hook_path or hook_path == current_path:
+        return current
+
+    # N3: missing hook file must not outrank a live current path.
+    try:
+        if not Path(hook_path).exists():
+            return current
+    except OSError:
+        return current
+
+    if _binding_authority_rank(hook) >= _binding_authority_rank(current):
+        return hook
+    try:
+        if not Path(current_path).exists():
+            return hook
+    except OSError:
+        return hook
+    return current
 
 
 def _direct_jsonl_triples(directory: Path) -> dict[Path, FileTriple] | None:
@@ -156,7 +228,7 @@ def _capture_staleness_bundle(binding_id: int, path: Path) -> BindingStalenessBu
 def observe_binding_absence(metadata: dict[str, Any]) -> BindingStalenessObservation | None:
     """Advance the per-terminal two-absence stale predicate and candidate set."""
     terminal_id = str(metadata.get("id") or "")
-    binding = get_current_transcript_binding(terminal_id)
+    binding = binding_for_transcript_confirm(terminal_id)
     if not terminal_id or binding is None or type(binding.get("id")) is not int:
         return None
     path = Path(str(binding.get("transcript_path") or "")).resolve(strict=False)
@@ -179,24 +251,32 @@ def observe_binding_absence(metadata: dict[str, Any]) -> BindingStalenessObserva
             replacement = _capture_staleness_bundle(binding_id, path)
             if replacement is None:
                 _binding_staleness.pop(terminal_id, None)
+                _declared_presumed_stale.discard(terminal_id)
                 return None
             _binding_staleness[terminal_id] = replacement
+            _declared_presumed_stale.discard(terminal_id)
             return BindingStalenessObservation(binding_id, path, False, ())
         assert prior is not None
         baseline = prior.baseline
 
     if baseline is None:
+        with _binding_staleness_lock:
+            _declared_presumed_stale.add(terminal_id)
         return BindingStalenessObservation(binding_id, path, True, ())
     current = _direct_jsonl_triples(path.parent)
     if current is None:
+        with _binding_staleness_lock:
+            _declared_presumed_stale.add(terminal_id)
         return BindingStalenessObservation(binding_id, path, True, ())
     if _binding_snapshot(path) != (inode, size, content_hash):
         with _binding_staleness_lock:
             replacement = _capture_staleness_bundle(binding_id, path)
             if replacement is None:
                 _binding_staleness.pop(terminal_id, None)
+                _declared_presumed_stale.discard(terminal_id)
                 return None
             _binding_staleness[terminal_id] = replacement
+            _declared_presumed_stale.discard(terminal_id)
         return BindingStalenessObservation(binding_id, path, False, ())
     candidates = [
         candidate
@@ -204,6 +284,8 @@ def observe_binding_absence(metadata: dict[str, Any]) -> BindingStalenessObserva
         if candidate != path and (candidate not in baseline or baseline[candidate] != triple)
     ]
     candidates.sort(key=lambda candidate: current[candidate][1], reverse=True)
+    with _binding_staleness_lock:
+        _declared_presumed_stale.add(terminal_id)
     return BindingStalenessObservation(binding_id, path, True, tuple(candidates[:8]))
 
 
@@ -259,7 +341,7 @@ def _fd_codex_session(metadata: dict) -> str | None:
         from cli_agent_orchestrator.services.fork_context_service import _descendants, pane_pid
 
         candidates = set()
-        sessions_root = provider_home("codex").sessions.resolve()
+        sessions_root = (_resolved_codex_home(metadata.get("id")) / "sessions").resolve()
         for pid in _descendants(pane_pid(metadata["tmux_session"], metadata["tmux_window"])):
             for fd in Path(f"/proc/{pid}/fd").iterdir():
                 try:
@@ -337,7 +419,7 @@ def _validate_binding(
 def resolve_session_transcript(metadata: dict) -> TranscriptResolution | None:
     provider = metadata.get("provider")
     session_id = metadata.get("provider_session_id")
-    binding = get_current_transcript_binding(str(metadata.get("id") or ""))
+    binding = binding_for_transcript_confirm(str(metadata.get("id") or ""))
     stale_note = None
     excluded: set[Path] = set()
     screen_fallback = False
@@ -410,7 +492,9 @@ def resolve_session_transcript(metadata: dict) -> TranscriptResolution | None:
             )
         return None
     if provider == "codex":
-        matches = list(provider_home("codex").sessions.glob(f"**/*{session_id}*.jsonl"))
+        matches = list(
+            (_resolved_codex_home(metadata.get("id")) / "sessions").glob(f"**/*{session_id}*.jsonl")
+        )
         return candidate(matches[0], "uuid_glob") if len(matches) == 1 else None
     cwd = metadata.get("working_directory") or metadata.get("cwd")
     if not cwd:

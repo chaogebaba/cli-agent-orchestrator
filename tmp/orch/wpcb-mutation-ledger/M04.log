@@ -1,0 +1,6 @@
+/home/chao/VScode_projects/cli-subagents/cli-agent-orchestrator/.cao/worktrees/9b0f21a0/test/providers/test_cline_sandbox_isolation.py:151: AssertionError: Expected symlink at /data/cao-scratch/pytest-tmp/popen-gw0/test_symlink_allowlist_creates0/cline-home/ac6test1/db
+=========================== short test summary info ============================
+FAILED test/providers/test_cline_sandbox_isolation.py::TestAC6_AllowlistPreservesAuth::test_symlink_allowlist_creates_valid_links
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+!!!!!!!!!!!! xdist.dsession.Interrupted: stopping after 1 failures !!!!!!!!!!!!!
+1 failed in 3.11s

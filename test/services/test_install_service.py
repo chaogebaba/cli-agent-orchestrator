@@ -60,7 +60,7 @@ def install_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, 
         path.mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.install_service.LOCAL_AGENT_STORE_DIR",
+        "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR",
         local_store_dir,
     )
     monkeypatch.setattr(
@@ -299,6 +299,51 @@ class TestInstallAgent:
         entry = kiro_config["mcpServers"]["cao-mcp-server"]
         # persisted=True prefers the stable PATH launcher.
         assert entry["command"] == "/home/u/.local/bin/cao-mcp-server"
+
+    def test_install_allows_kas_profile_without_v2_only_fields(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """A8 flip: KAS profiles install when toolsSettings/hooks are absent."""
+        profile_path = install_paths["local_store_dir"] / "kas-agent.md"
+        profile_path.write_text(
+            "---\n"
+            "name: kas-agent\n"
+            "description: KAS agent\n"
+            "engine: kas\n"
+            "allowedTools: [fs_read]\n"
+            "---\n"
+            "KAS profile.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("kas-agent", "kiro_cli")
+
+        assert result.success is True
+        assert (install_paths["kiro_dir"] / "kas-agent.json").exists()
+
+    def test_install_rejects_kas_profile_with_v2_only_fields(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """A8: toolsSettings/hooks remain forbidden on KAS profiles."""
+        profile_path = install_paths["local_store_dir"] / "kas-hooks.md"
+        profile_path.write_text(
+            "---\n"
+            "name: kas-hooks\n"
+            "description: KAS with hooks\n"
+            "engine: kas\n"
+            "hooks:\n"
+            "  agentSpawn:\n"
+            "    - command: echo hi\n"
+            "---\n"
+            "KAS profile with v2-only hooks.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("kas-hooks", "kiro_cli")
+
+        assert result.success is False
+        assert "toolsSettings" in result.message or "hooks" in result.message
+        assert not (install_paths["kiro_dir"] / "kas-hooks.json").exists()
 
     def test_install_sets_env_vars_before_profile_loading(
         self, install_paths: dict[str, Path]
@@ -727,7 +772,7 @@ class TestInstallSkillCatalogBaking:
             d.mkdir()
 
         monkeypatch.setattr(
-            "cli_agent_orchestrator.services.install_service.LOCAL_AGENT_STORE_DIR",
+            "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR",
             local_store_dir,
         )
         monkeypatch.setattr(
@@ -1124,3 +1169,140 @@ class TestInjectKiroMcpTimeout:
 
         assert _inject_kiro_mcp_timeout(None) is None
         assert _inject_kiro_mcp_timeout({}) == {}
+
+
+class TestInstallKASPermissions:
+    """F113 AC2: permissions handling in the KAS install branch."""
+
+    def test_kas_no_permissions_writes_default_rules(self, install_paths: dict[str, Path]) -> None:
+        """KAS profile without permissions gets the standard default rules."""
+        profile_path = install_paths["local_store_dir"] / "kas-dev.md"
+        profile_path.write_text(
+            "---\n"
+            "name: kas-dev\n"
+            "description: KAS developer\n"
+            "engine: kas\n"
+            "---\n"
+            "KAS profile.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("kas-dev", "kiro_cli")
+
+        assert result.success is True
+        kiro_config = json.loads((install_paths["kiro_dir"] / "kas-dev.json").read_text())
+        assert kiro_config["permissions"] == {
+            "rules": [
+                {"capability": "shell", "effect": "allow"},
+                {"capability": "web_fetch", "effect": "allow"},
+                {
+                    "capability": "mcp",
+                    "match": ["builtin/*", "cao-mcp-server/*"],
+                    "effect": "allow",
+                },
+            ]
+        }
+
+    def test_kas_explicit_permissions_written_verbatim(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """KAS profile with explicit permissions passes them through verbatim."""
+        profile_path = install_paths["local_store_dir"] / "kas-custom.md"
+        profile_path.write_text(
+            "---\n"
+            "name: kas-custom\n"
+            "description: KAS custom\n"
+            "engine: kas\n"
+            "permissions:\n"
+            "  rules:\n"
+            "    - capability: shell\n"
+            "      effect: deny\n"
+            "---\n"
+            "KAS custom profile.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("kas-custom", "kiro_cli")
+
+        assert result.success is True
+        kiro_config = json.loads((install_paths["kiro_dir"] / "kas-custom.json").read_text())
+        assert kiro_config["permissions"] == {"rules": [{"capability": "shell", "effect": "deny"}]}
+
+    def test_v2_no_permissions_writes_no_key(self, install_paths: dict[str, Path]) -> None:
+        """v2-engine profile without permissions omits the key entirely."""
+        profile_path = install_paths["local_store_dir"] / "v2-agent.md"
+        profile_path.write_text(
+            "---\n"
+            "name: v2-agent\n"
+            "description: v2 agent\n"
+            "engine: v2\n"
+            "---\n"
+            "v2 profile.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("v2-agent", "kiro_cli")
+
+        assert result.success is True
+        kiro_config = json.loads((install_paths["kiro_dir"] / "v2-agent.json").read_text())
+        assert "permissions" not in kiro_config
+
+    def test_kas_empty_permissions_written_verbatim(self, install_paths: dict[str, Path]) -> None:
+        """KAS profile with permissions: {} writes empty dict verbatim (D1)."""
+        profile_path = install_paths["local_store_dir"] / "kas-empty.md"
+        profile_path.write_text(
+            "---\n"
+            "name: kas-empty\n"
+            "description: KAS empty perms\n"
+            "engine: kas\n"
+            "permissions: {}\n"
+            "---\n"
+            "KAS empty permissions profile.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("kas-empty", "kiro_cli")
+
+        assert result.success is True
+        kiro_config = json.loads((install_paths["kiro_dir"] / "kas-empty.json").read_text())
+        assert kiro_config["permissions"] == {}
+
+    def test_v2_with_permissions_logs_warning(
+        self, install_paths: dict[str, Path], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """D2 tripwire: v2 profile with permissions logs a warning."""
+        profile_path = install_paths["local_store_dir"] / "v2-perms.md"
+        profile_path.write_text(
+            "---\n"
+            "name: v2-perms\n"
+            "description: v2 with perms\n"
+            "engine: v2\n"
+            "permissions:\n"
+            "  rules:\n"
+            "    - capability: shell\n"
+            "      effect: allow\n"
+            "---\n"
+            "v2 profile with permissions.\n",
+            encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = install_agent("v2-perms", "kiro_cli")
+
+        assert result.success is True
+        assert "v2 tolerance of this key is unverified" in caplog.text
+        # Still passes through when declared (pass-through-if-declared)
+        kiro_config = json.loads((install_paths["kiro_dir"] / "v2-perms.json").read_text())
+        assert kiro_config["permissions"] == {"rules": [{"capability": "shell", "effect": "allow"}]}
+
+
+def test_install_omp_writes_context_only(install_paths: dict[str, Path]) -> None:
+    profile = install_paths["local_store_dir"] / "omp-agent.md"
+    profile.write_text(_profile_text(name="omp-agent"), encoding="utf-8")
+
+    result = install_agent("omp-agent", "omp")
+
+    assert result.success is True
+    assert result.provider == "omp"
+    assert result.agent_file is None
+    assert (install_paths["context_dir"] / "omp-agent.md").exists()

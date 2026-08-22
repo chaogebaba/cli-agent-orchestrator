@@ -396,7 +396,7 @@ def _configure_prepared_send(monkeypatch, state: str, events: list[str]):
     monkeypatch.setattr(
         terminal_service.status_monitor,
         "clear_rolling_buffer",
-        lambda _terminal: events.append("clear"),
+        lambda _terminal, _provider=None: events.append("clear"),
     )
     observation = BoundaryObservation("wpq10", TerminalStatus.IDLE, 1, 1, 1, 1, 1)
     monkeypatch.setattr(

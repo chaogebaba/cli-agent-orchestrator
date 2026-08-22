@@ -6,6 +6,8 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from tzlocal import get_localzone
+
 from cli_agent_orchestrator.clients.database import (
     CallbackBarrierMemberModel,
     CallbackBarrierModel,
@@ -15,6 +17,7 @@ from cli_agent_orchestrator.clients.database import (
     SessionLocal,
     TerminalModel,
     delete_terminal_and_warm_intent,
+    _utcnow,
 )
 from cli_agent_orchestrator.constants import (
     LOG_DIR,
@@ -22,6 +25,8 @@ from cli_agent_orchestrator.constants import (
     RETENTION_DAYS,
     TERMINAL_LOG_DIR,
 )
+from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.memory_format import parse_index_entry
 from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -32,7 +37,7 @@ logger = logging.getLogger(__name__)
 def cleanup_old_data():
     """Clean up terminals, inbox messages, and log files older than RETENTION_DAYS."""
     try:
-        cutoff_date = datetime.now() - timedelta(days=RETENTION_DAYS)
+        cutoff_date = _utcnow() - timedelta(days=RETENTION_DAYS)
         logger.info(
             f"Starting cleanup of data older than {RETENTION_DAYS} days (before {cutoff_date})"
         )
@@ -47,9 +52,43 @@ def cleanup_old_data():
                 )
                 .all()
             )
+            # D10+D14 (F202): pane liveness RESETS the idle clock — a live pane
+            # is never reclaimed by idle-age retention alone, but a dead one still is.
+            from cli_agent_orchestrator.backends.registry import get_backend
+
+            backend = get_backend()
+            reclaimable = []
+            retained_terminal_ids: set[str] = set()
             for terminal in old_terminals:
+                liveness = backend.window_liveness(terminal.tmux_session, terminal.tmux_window)
+                if liveness == "live":
+                    # D14: reset idle clock so it doesn't re-appear until another
+                    # RETENTION_DAYS pass without activity.
+                    terminal.last_active = _utcnow()
+                    logger.info(
+                        "retention_survivor_reset terminal=%s session=%s window=%s",
+                        terminal.id,
+                        terminal.tmux_session,
+                        terminal.tmux_window,
+                    )
+                else:
+                    reclaimable.append(terminal)
+            db.commit()
+
+            for terminal in reclaimable:
                 fifo_manager.stop_reader(terminal.id)
                 status_monitor.clear_terminal(terminal.id)
+                # A stale Grok terminal can still own a private GROK_HOME. An
+                # explicit deferred cleanup is its retry handle, so retention
+                # housekeeping must not bulk-delete that row underneath it.
+                if (
+                    getattr(terminal, "provider", None) == ProviderType.GROK_CLI.value
+                    and provider_manager.cleanup_provider(terminal.id) is False
+                ):
+                    retained_terminal_ids.add(terminal.id)
+                    logger.warning(
+                        "Retaining stale Grok terminal %s while cleanup is deferred", terminal.id
+                    )
             skipped = (
                 db.query(TerminalModel)
                 .filter(
@@ -63,7 +102,8 @@ def cleanup_old_data():
                 terminal.id,
                 preserve_warm_intent=False,
             )["terminal_deleted"]
-            for terminal in old_terminals
+            for terminal in reclaimable
+            if terminal.id not in retained_terminal_ids
         )
         logger.info(f"Deleted {deleted_terminals} old terminals from database")
         if skipped:
@@ -109,7 +149,9 @@ def cleanup_old_data():
                 .all()
             )
             exempt_batches = 0
-            now_cutoff = cutoff_date.replace(tzinfo=timezone.utc)
+            now_cutoff = cutoff_date.replace(tzinfo=get_localzone(), fold=0).astimezone(
+                timezone.utc
+            )
             for key, attempts in attempts_by_batch.items():
                 rows = db.query(InboxModel).filter(InboxModel.id.in_(key)).all()
                 if len(rows) != len(key):

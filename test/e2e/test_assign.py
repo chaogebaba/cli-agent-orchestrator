@@ -45,6 +45,7 @@ from test.e2e.conftest import (
     get_terminal_status,
     wait_for_status,
 )
+from test.e2e.statusline_leak import assert_no_codex_statusline_leak
 
 import pytest
 import requests
@@ -168,6 +169,7 @@ def _run_assign_test(provider: str, agent_profile: str, task_message: str, conte
         # No TUI chrome leaking
         assert "? for shortcuts" not in output, "TUI footer leaked into output"
         assert "context left" not in output, "TUI status bar leaked into output"
+        assert_no_codex_statusline_leak(output)
 
         output_lower = output.lower()
         matched = [kw for kw in content_keywords if kw.lower() in output_lower]
@@ -651,3 +653,84 @@ class TestAntigravityCliAssign:
     def test_assign_with_callback(self, require_antigravity):
         """Antigravity CLI full round-trip: worker completes → sends result → supervisor receives."""
         _run_assign_with_callback_test(provider="antigravity_cli")
+
+
+@pytest.mark.e2e
+class TestOmpAssign:
+    """OMP workers use the CAO MCP extension for assign and callbacks."""
+
+    def test_assign_data_analyst(self, require_omp):
+        _run_assign_test(
+            provider="omp",
+            agent_profile="data_analyst",
+            task_message=DATA_ANALYST_TASK,
+            content_keywords=DATA_ANALYST_KEYWORDS
+            + ["analysis", "send_message", "CAO_TERMINAL_ID"],
+        )
+
+    def test_assign_report_generator(self, require_omp):
+        _run_assign_test(
+            provider="omp",
+            agent_profile="report_generator",
+            task_message=REPORT_GENERATOR_TASK,
+            content_keywords=REPORT_GENERATOR_KEYWORDS,
+        )
+
+    def test_assign_with_callback(self, require_omp):
+        _run_assign_with_callback_test(provider="omp")
+
+
+# ---------------------------------------------------------------------------
+# Grok Build CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestGrokCliAssign:
+    """E2E assign tests for Grok using the examples/assign profiles."""
+
+    def test_assign_data_analyst(self, require_grok):
+        """Grok honors the data_analyst profile and analyzes the dataset."""
+        _run_assign_test(
+            provider="grok_cli",
+            agent_profile="data_analyst",
+            task_message=DATA_ANALYST_TASK,
+            content_keywords=DATA_ANALYST_KEYWORDS,
+        )
+
+    def test_assign_report_generator(self, require_grok):
+        """Grok honors the report_generator profile and emits report sections."""
+        _run_assign_test(
+            provider="grok_cli",
+            agent_profile="report_generator",
+            task_message=REPORT_GENERATOR_TASK,
+            content_keywords=REPORT_GENERATOR_KEYWORDS,
+        )
+
+    def test_assign_with_callback(self, require_grok):
+        """A Grok worker sends its result back to the supervisor inbox."""
+        _run_assign_with_callback_test(provider="grok_cli")
+
+
+@pytest.mark.e2e
+class TestMiniMaxCodeAssign:
+    """E2E assign tests for MiniMax Code using the examples/assign profiles."""
+
+    def test_assign_data_analyst(self, require_minimax_code):
+        _run_assign_test(
+            provider="mcode",
+            agent_profile="data_analyst",
+            task_message=DATA_ANALYST_TASK,
+            content_keywords=DATA_ANALYST_KEYWORDS,
+        )
+
+    def test_assign_report_generator(self, require_minimax_code):
+        _run_assign_test(
+            provider="mcode",
+            agent_profile="report_generator",
+            task_message=REPORT_GENERATOR_TASK,
+            content_keywords=REPORT_GENERATOR_KEYWORDS,
+        )
+
+    def test_assign_with_callback(self, require_minimax_code):
+        _run_assign_with_callback_test(provider="mcode")

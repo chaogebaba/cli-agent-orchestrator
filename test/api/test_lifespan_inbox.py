@@ -29,7 +29,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.api.main import app, lifespan
+from cli_agent_orchestrator.api.main import app, health_check, lifespan
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.plugins import PluginRegistry
 
@@ -113,10 +113,16 @@ def _patched_lifespan(backend: object, tasks: list):
         inbox = patch_main("inbox_service")
         inbox.recover_stale_deliveries.return_value = None
         inbox.reconcile_pending_orphans.return_value = None
-        stack.enter_context(
+        purge = stack.enter_context(
             patch(
                 "cli_agent_orchestrator.api.main.terminal_service.purge_stale_terminal_records",
                 return_value=0,
+            )
+        )
+        stack.enter_context(
+            patch(
+                "cli_agent_orchestrator.api.main.terminal_service.rearm_fifo_readers_at_startup",
+                return_value={"rearmed": 0, "skipped_gone": 0, "skipped_existing": 0},
             )
         )
         stack.enter_context(
@@ -133,6 +139,7 @@ def _patched_lifespan(backend: object, tasks: list):
         namespace = SimpleNamespace(
             get_backend=patch_main("get_backend", return_value=backend),
             herdr_cls=patch_main("HerdrInboxService"),
+            purge=purge,
             set_svc=patch_main("set_herdr_inbox_service"),
             load=stack.enter_context(patch.object(PluginRegistry, "load", new_callable=AsyncMock)),
             teardown=stack.enter_context(
@@ -225,3 +232,79 @@ class TestLifespanInboxWiring:
             # Assert (shutdown — after context exit): no herdr task was created.
             mocks.herdr_cls.assert_not_called()
             assert _find_task(tasks, mocks.herdr_cls.return_value.start.return_value) is None
+
+
+class TestLifespanBarrierSweepResilience:
+    """A stale callback barrier must never prevent the server from booting.
+
+    Live incident 2026-07-25: an OPEN barrier (`drill-r2-brainstorm`) outlived
+    its owner terminal `8494ddf1`. Every boot the startup sweep tried to enqueue
+    the combined callback to that deleted receiver, `_stamp_enqueue_generation`
+    raised `pending_receiver_generation_unavailable`, and the lifespan aborted:
+    `ERROR: Application startup failed. Exiting.` systemd restarted it 634 times
+    over two hours and `cao launch` failed with `Connection refused` on :9889 —
+    one orphaned DB row made the whole fleet unlaunchable.
+
+    Raw evidence:
+    probes/error-pane-samples/2026-07-25-cao-server-crashloop-barrier-owner-gone.txt
+
+    The barrier-side fix lives in `clients/database.py`; this pins the second
+    line of defence, which is what turns "server will not start" into "one
+    logged warning". Boot resilience is a SEPARATE property from barrier
+    correctness: any future raise in that sweep must also not brick startup.
+    """
+
+    @pytest.mark.asyncio
+    async def test_startup_barrier_sweep_failure_does_not_block_boot(self) -> None:
+        """Startup completes even when fire_due_barriers raises."""
+        # Arrange
+        tasks: list = []
+        backend = MagicMock()
+
+        # Act
+        with _patched_lifespan(backend, tasks) as mocks:
+            with patch(
+                "cli_agent_orchestrator.api.main.fire_due_barriers",
+                side_effect=ValueError("pending_receiver_generation_unavailable"),
+            ) as sweep:
+                async with lifespan(app):
+                    # Assert: the sweep was attempted and it did raise...
+                    sweep.assert_called_once()
+                    # ...and startup still got past it to the plugin registry.
+                    mocks.load.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_startup_barrier_sweep_still_runs_on_the_happy_path(self) -> None:
+        """The guard must not silently skip the sweep it is protecting.
+
+        Kills the mutant where boot resilience is 'achieved' by not sweeping.
+        """
+        # Arrange
+        tasks: list = []
+        backend = MagicMock()
+
+        # Act
+        with _patched_lifespan(backend, tasks):
+            with patch(
+                "cli_agent_orchestrator.api.main.fire_due_barriers", return_value=[]
+            ) as sweep:
+                async with lifespan(app):
+                    # Assert
+                    sweep.assert_called_once()
+
+
+class TestLifespanTerminalPurgeResilience:
+    """Terminal enumeration failures must not prevent readiness."""
+
+    @pytest.mark.asyncio
+    async def test_ac13b_startup_purge_failure_still_serves_health(self) -> None:
+        tasks: list = []
+        backend = MagicMock()
+
+        with _patched_lifespan(backend, tasks) as mocks:
+            mocks.purge.side_effect = RuntimeError("terminal listing failed")
+
+            async with lifespan(app):
+                mocks.purge.assert_called_once()
+                mocks.load.assert_awaited_once()
+                assert (await health_check())["status"] == "ok"

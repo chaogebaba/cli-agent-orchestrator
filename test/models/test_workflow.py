@@ -490,4 +490,6 @@ class TestBolt3AdditiveModelChanges:
             "cancelled",
             "skipped",
             "completed_unvalidated",
+            "rerun_authorized",
+            "replay_authorized",
         }

@@ -1,0 +1,4 @@
+$ uv run pytest test/api/test_security.py test/api/test_lifespan_inbox.py test/backends/ test/providers/test_base_provider.py -q --tb=no
+# Source: git checkout e5ca47f8 -- src/ (base source, branch tests)
+# Commit: e5ca47f8
+247 passed in 6.87s

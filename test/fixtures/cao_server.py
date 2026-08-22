@@ -50,6 +50,7 @@ import importlib
 import json
 import os
 import pkgutil
+import shutil
 import signal
 import socket
 import socketserver
@@ -184,6 +185,17 @@ def _subprocess_env(
     for leaked in ("AUTH0_DOMAIN", "AUTH0_AUDIENCE", "CAO_AUTH_JWKS_URI"):
         env.pop(leaked, None)
 
+    # CAO_HOME_DIR OUTRANKS the HOME redirect below: constants.py reads it
+    # first and only falls back to $HOME/.aws/... when it is unset. test/
+    # conftest.py exports it (pointing at a cao-pytest-* tmp dir) to keep the
+    # suite off the production DB, and subprocess env is inherited -- so the
+    # child ignored home_dir entirely and wrote its logs under conftest's dir.
+    # That is what made test_home_isolated fail. CAO_HOME is the pre-2026-07-27
+    # spelling of the same var; strip both so stale exporters cannot resurrect
+    # the bug. Pre-existing, found while absorbing upstream ccbb8160.
+    for home_override in ("CAO_HOME_DIR", "CAO_HOME"):
+        env.pop(home_override, None)
+
     env.update(
         {
             "HOME": str(home_dir),
@@ -192,6 +204,9 @@ def _subprocess_env(
             "CAO_A2A_DISABLED": "true",
             "OTEL_SDK_DISABLED": "true",
             "PYTHONUNBUFFERED": "1",
+            # F334 (#190): Test-spawned sessions carry a distinctive prefix
+            # so incident triage can distinguish them from production sessions.
+            "CAO_SESSION_PREFIX": "cao-test-",
         }
     )
     if extra:
@@ -334,6 +349,11 @@ class _JWKSServer:
         return f"http://{self._host}:{self.port}{self._JWKS_PATH}"
 
 
+# Provider name -> the executable that must exist on PATH before we are
+# willing to boot it. Only needed where the two differ.
+_PROVIDER_BINARIES = {"kiro_cli": "kiro-cli", "claude_code": "claude", "codex": "codex"}
+
+
 # ---------------------------------------------------------------------------
 # Core spawn helper (exposed for self-tests)
 # ---------------------------------------------------------------------------
@@ -367,6 +387,98 @@ def _seed_packaged_skills(home_dir: Path) -> None:
             shutil.copy2(entry, target)
 
 
+def _seed_omp_e2e_state(home_dir: Path) -> None:
+    """Seed non-secret OMP setup state and assign profiles for real OMP E2E tests.
+
+    OMP stores a first-run completion marker under HOME. The managed server
+    deliberately redirects HOME, so without this marker OMP opens its setup
+    wizard and cannot reach a CAO-ready terminal. Authentication remains in
+    normal environment-based providers; this writes no credential material.
+    """
+    import shutil
+
+    omp_config = home_dir / ".omp" / "agent" / "config.yml"
+    omp_config.parent.mkdir(parents=True, exist_ok=True)
+    if not omp_config.exists():
+        omp_config.write_text("setupVersion: 1\n", encoding="utf-8")
+
+    examples_dir = Path(__file__).resolve().parents[2] / "examples" / "assign"
+    store_dir = home_dir / ".aws" / "cli-agent-orchestrator" / "agent-store"
+    store_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("data_analyst", "report_generator", "analysis_supervisor"):
+        target = store_dir / f"{name}.md"
+        if not target.exists():
+            shutil.copy2(examples_dir / f"{name}.md", target)
+
+
+# ---------------------------------------------------------------------------
+# Provider HOME prerequisites seeding (F347 #202)
+# ---------------------------------------------------------------------------
+
+# Provider classes resolve binaries and config from Path.home() — which returns
+# the redirected HOME in e2e. This registry maps each dot-directory under the
+# real HOME to its purpose. A symlink is created from <redirected-HOME>/<rel>
+# to <real-HOME>/<rel> for each entry whose source exists.
+#
+# Only directories/files needed at PROVIDER BOOT time belong here (binaries,
+# agent JSON, auth). Per-session sandbox state must NOT be shared.
+
+_PROVIDER_HOME_SYMLINKS: tuple[str, ...] = (
+    # cline_cli: CLINE_BINARY = Path.home() / ".bun" / "bin" / "cline"
+    # Also needed by codex, claude, gemini, firecrawl binaries installed via bun.
+    ".bun",
+    # kiro_cli: KIRO_AGENTS_DIR = Path.home() / ".kiro" / "agents"
+    ".kiro",
+    # cline_cli: _CLINE_USER_DATA = Path.home() / ".cline" / "data"
+    ".cline",
+    # grok_cli: GROK_BINARY = Path.home() / ".grok" / "bin" / "grok"
+    # Also grok auth.json (already seeded by require_grok fixture, but the
+    # symlink here is idempotent and makes grok work without the fixture too).
+    ".grok",
+    # copilot_cli: config_dir = Path.home() / ".copilot"
+    ".copilot",
+    # kimi_cli: Path.home() / ".kimi"
+    ".kimi",
+    # minimax_code: Path.home() / ".minimax"
+    ".minimax",
+    # antigravity_cli (gemini): Path.home() / ".gemini"
+    ".gemini",
+)
+
+
+def _seed_provider_home_prerequisites(home_dir: Path) -> None:
+    """Symlink provider-required dot-directories from real HOME into the redirected HOME.
+
+    Provider modules resolve binaries and config via ``Path.home()`` at module
+    scope or during ``initialize()``. When the e2e fixture redirects HOME, those
+    paths resolve against the empty scratch dir — causing FileNotFoundError at
+    runtime.
+
+    This function creates symlinks from ``<home_dir>/<dotdir>`` →
+    ``<real_home>/<dotdir>`` for every provider prerequisite that exists on the
+    host. Symlinks are preferred over copies: they stay current if the developer
+    updates a binary/config between test runs, and they don't duplicate large
+    node_modules trees.
+
+    Only dot-directories needed at provider boot are linked. Per-session mutable
+    state (sandbox dirs, session DBs) is intentionally NOT shared.
+    """
+    # Resolve the REAL home — not the redirected one. The subprocess hasn't
+    # started yet, and this code runs in the pytest process whose HOME is still
+    # the developer's real home. But in case HOME was already overridden in the
+    # pytest env (e.g. by an outer fixture), fall back to /etc/passwd.
+    _env_home = os.environ.get("_CAO_REAL_HOME", "").strip()
+    real_home = Path(_env_home) if _env_home else Path.home()
+    if not real_home.is_dir():
+        return
+
+    for dotdir in _PROVIDER_HOME_SYMLINKS:
+        source = real_home / dotdir
+        target = home_dir / dotdir
+        if source.exists() and not target.exists():
+            target.symlink_to(source)
+
+
 def _start_cao_server(
     home_dir: Path,
     port: int,
@@ -381,7 +493,9 @@ def _start_cao_server(
     ``stop`` callable.
     """
     home_dir.mkdir(parents=True, exist_ok=True)
+    _seed_provider_home_prerequisites(home_dir)
     _seed_packaged_skills(home_dir)
+    _seed_omp_e2e_state(home_dir)
     log_path = home_dir / "server.log"
     log_handle = open(log_path, "ab")  # noqa: SIM115 — handle lifetime is in stop()
 
@@ -547,6 +661,24 @@ def cao_terminal(
     provider = params.get("provider", "kiro_cli")
     profile = params.get("agent_profile", "developer")
     session_name = f"caotest-{uuid.uuid4().hex[:12]}"
+
+    # PRE-FLIGHT, before POST /sessions. Booting a real provider CLI that is
+    # installed but unauthenticated makes it start its OWN login flow -- kiro
+    # opens a browser at the developer's real account (observed 2026-07-27:
+    # an `-m "e2e or slow"` run popped Firefox asking the user to log in to
+    # kiro). The 5xx skip below is too late: by the time the API answers, the
+    # browser is already open. A consuming test's own shutil.which() guard is
+    # also too late -- fixtures resolve before the test body runs.
+    #
+    # Same gate every other live-provider test uses (see
+    # test/providers/test_kiro_cli_integration.py).
+    if not request.config.getoption("--run-live", default=False):
+        pytest.skip(
+            f"cao_terminal boots the real {provider!r} CLI, which may start an "
+            "interactive login. Use --run-live to enable."
+        )
+    if shutil.which(_PROVIDER_BINARIES.get(provider, provider)) is None:
+        pytest.skip(f"provider CLI for {provider!r} is not on PATH")
 
     resp = requests.post(
         f"{cao_server.url}/sessions",

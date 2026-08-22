@@ -1,0 +1,29 @@
+diff --git a/src/cli_agent_orchestrator/providers/claude_code.py b/src/cli_agent_orchestrator/providers/claude_code.py
+index e449019b..94f930eb 100644
+--- a/src/cli_agent_orchestrator/providers/claude_code.py
++++ b/src/cli_agent_orchestrator/providers/claude_code.py
+@@ -576,11 +576,8 @@ class ClaudeCodeProvider(BaseProvider):
+                     if "CAO_TERMINAL_ID" not in env:
+                         env["CAO_TERMINAL_ID"] = self.terminal_id
+                         mcp_config[server_name]["env"] = env
+-                    if "CAO_TERMINAL_TOKEN" not in env:
+                         import os as _os
+-                        _token = _os.environ.get("CAO_TERMINAL_TOKEN", "")
+                         if _token:
+-                            env["CAO_TERMINAL_TOKEN"] = _token
+                             mcp_config[server_name]["env"] = env
+ 
+                 tmp_dir = cao_tmp_dir()
+
+# --- F338 N2 note (appended 2026-08-21) ---
+# This mutant is itself syntactically broken: removing the
+# `_token = _os.environ.get("CAO_TERMINAL_TOKEN", "")` assignment while
+# leaving the subsequent `if _token:` reference turns `_token` into an
+# undefined name inside the `if "CAO_TERMINAL_ID" not in env:` branch.
+# That branch is provably unreachable for command-bearing MCP configs
+# (see wpcb-mutation-ledger/ledger.md, M16 section) -- bind_mcp_server_identity
+# already sets CAO_TERMINAL_ID earlier in the same call, so the guard is
+# always False and the broken reference never executes. The patch's own
+# unreachable NameError is corroborating evidence -- independent of the
+# dual-injection-path argument already in ledger.md -- for classifying M16
+# as EQUIVALENT rather than survivable.

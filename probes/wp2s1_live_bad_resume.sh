@@ -9,7 +9,7 @@ root="$(git rev-parse --show-toplevel)"
 out="$root/tmp/orch/drain-wp2s1/bad-${CAO_WP2S1_SCRATCH_TERMINAL}"
 mkdir -p "$out"
 cao session manifest --session "$CAO_WP2S1_SCRATCH_SESSION" --json >"$out/manifest-before.json"
-fifo="${CAO_HOME:-$HOME/.cao}/fifos/${CAO_WP2S1_SCRATCH_TERMINAL}.fifo"
+fifo="${CAO_HOME_DIR:-$HOME/.cao}/fifos/${CAO_WP2S1_SCRATCH_TERMINAL}.fifo"
 stat -Lc '%d:%i:%F' "$fifo" >"$out/fifo-before.txt"
 
 cao session recover "$CAO_WP2S1_SCRATCH_SESSION" --reason provider-reauth \

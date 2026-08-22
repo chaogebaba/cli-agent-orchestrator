@@ -129,7 +129,7 @@ def test_wpq5_a_matching_challenge_reply_settles_open_attempt_and_records_event(
     message = create_inbox_message("sender", "receiver", _wrapped("run command"))
     wires: list[str] = []
 
-    def confirm(*_args):
+    def confirm(*_args, **_kwargs):
         raw = re.search(rf"mid {message.id}:([0-9a-f]{{32}})", wires[-1]).group(1)
         create_inbox_message("receiver", "sender", f"ACK mid {message.id}:{raw}")
         return "absent", {"kind": "screen_unconfirmed"}
@@ -262,7 +262,7 @@ def test_wpq5_g_wire_last_suffix_absence_and_durable_bytes_are_exact(wpq5_db, mo
     wires: list[str] = []
     _delivery_fakes(
         monkeypatch,
-        confirm_callback=lambda *_args: ("absent", {}),
+        confirm_callback=lambda *_args, **_kwargs: ("absent", {}),
         wires=wires,
     )
     InboxService().deliver_pending("receiver")
@@ -280,7 +280,7 @@ def test_wpq5_g_trailing_wrapper_prefix_quote_stays_eventless_and_retryable(wpq5
     monkeypatch.setattr(inbox_module.secrets, "token_hex", lambda _size: "a" * 32)
     _delivery_fakes(
         monkeypatch,
-        confirm_callback=lambda *_args: ("absent", {}),
+        confirm_callback=lambda *_args, **_kwargs: ("absent", {}),
         wires=wires,
     )
 
@@ -382,7 +382,7 @@ def test_wpq5_p_logical_row_challenge_is_cap_confirmable(wpq5_db, monkeypatch):
     wires: list[str] = []
     _delivery_fakes(
         monkeypatch,
-        confirm_callback=lambda *_args: ("absent", {}),
+        confirm_callback=lambda *_args, **_kwargs: ("absent", {}),
         wires=wires,
     )
     service = InboxService()
@@ -414,7 +414,7 @@ def test_wpq5_q_two_message_batch_is_unchanged_eventless_and_retryable(wpq5_db, 
     wires: list[str] = []
     _delivery_fakes(
         monkeypatch,
-        confirm_callback=lambda *_args: ("absent", {}),
+        confirm_callback=lambda *_args, **_kwargs: ("absent", {}),
         wires=wires,
     )
     InboxService().deliver_pending("receiver", num_messages=0)

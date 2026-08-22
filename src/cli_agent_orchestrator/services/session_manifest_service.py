@@ -10,12 +10,15 @@ from typing import Any, Callable
 import frontmatter
 
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
+from cli_agent_orchestrator.services.fleet_service import _compute_init_health
 from cli_agent_orchestrator.services.fork_context_service import list_bases
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.verification_service import deployment_status
 from cli_agent_orchestrator.services.workflow_spec_service import list_workflows
 from cli_agent_orchestrator.utils.agent_profiles import (
-    list_agent_profiles, parse_agent_profile_text, read_agent_profile_source,
+    list_agent_profiles,
+    parse_agent_profile_text,
+    read_agent_profile_source,
 )
 from cli_agent_orchestrator.utils.skills import list_skills
 
@@ -31,20 +34,22 @@ def _charter_projection(name: str) -> dict[str, Any]:
     if not digest:
         digest = next((line.strip() for line in body.splitlines() if line.strip()), "")
     return {
-        "name": profile.name, "description": profile.description,
-        "provider": profile.provider, "role": profile.role,
-        "skills": profile.skills or [], "message_contract": profile.messageContract,
-        "charter_digest": digest[:140], "charter": body,
+        "name": profile.name,
+        "description": profile.description,
+        "provider": profile.provider,
+        "role": profile.role,
+        "skills": profile.skills or [],
+        "message_contract": profile.messageContract,
+        "charter_digest": digest[:140],
         "session_brief": profile.sessionBrief,
     }
 
 
-def build_session_manifest(session_name: str, terminal_id: str | None = None) -> dict[str, Any]:
+def build_session_manifest(session_name: str, terminal_id: str | None = None, _now: datetime | None = None) -> dict[str, Any]:
+    _manifest_now = _now or datetime.now(timezone.utc)
     sections = {
         name: "ok"
-        for name in (
-            "profiles", "ready_bases", "skills", "workflows", "terminals", "activation"
-        )
+        for name in ("profiles", "ready_bases", "skills", "workflows", "terminals", "activation")
     }
     sections.update({"tools": "not_collected", "ledger": "not_collected"})
     errors: list[dict[str, str]] = []
@@ -71,9 +76,39 @@ def build_session_manifest(session_name: str, terminal_id: str | None = None) ->
     if not raw_terminals and sections["terminals"] == "ok":
         raise ValueError(f"Session '{session_name}' not found")
 
+    # Filter out terminals whose pane is dead (D1: dead-pane exclusion)
+    # Only filter when the tmux session exists but the specific window is gone.
+    try:
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        backend = get_backend()
+        live_terminals: list[dict[str, Any]] = []
+        _session_alive_cache: dict[str, bool] = {}
+        for item in raw_terminals:
+            tmux_session = item.get("tmux_session", "")
+            window = item.get("tmux_window", "")
+            if tmux_session and window:
+                if tmux_session not in _session_alive_cache:
+                    try:
+                        _session_alive_cache[tmux_session] = backend.session_exists(tmux_session)
+                    except Exception:
+                        _session_alive_cache[tmux_session] = False
+                if _session_alive_cache.get(tmux_session, False):
+                    try:
+                        liveness = backend.window_liveness(tmux_session, window)
+                    except Exception:
+                        liveness = "error"
+                    if liveness == "gone":
+                        continue  # dead pane — exclude from manifest
+            live_terminals.append(item)
+        raw_terminals = live_terminals
+    except Exception:
+        pass  # backend unavailable — skip dead-pane filter
+
     def terminals() -> list[dict[str, Any]]:
         rows = []
         from cli_agent_orchestrator.services.terminal_service import get_working_directory
+
         for item in raw_terminals:
             role = roles.get(item.get("agent_profile"))
             started_at = auth_mtime = None
@@ -81,6 +116,7 @@ def build_session_manifest(session_name: str, terminal_id: str | None = None) ->
             try:
                 from cli_agent_orchestrator.providers.manager import provider_manager
                 from cli_agent_orchestrator.services.fork_context_service import pane_pid
+
                 provider = provider_manager.get_provider(item["id"])
                 pid = pane_pid(item["tmux_session"], item["tmux_window"])
                 started_at = provider.provider_process_started_at(pid)
@@ -91,104 +127,202 @@ def build_session_manifest(session_name: str, terminal_id: str | None = None) ->
                         auth_staleness = "stale" if started_at < auth_mtime else "current"
             except Exception:
                 pass
-            rows.append({
-                "id": item["id"], "profile": item.get("agent_profile"),
-                "provider": item.get("provider"),
-                "status": status_monitor.get_status(item["id"]).value,
-                "caller_id": item.get("caller_id"),
-                "cwd": get_working_directory(item["id"]),
-                "kind": "supervisor" if role == "supervisor" else ("worker" if role in {"developer", "reviewer", "worker"} else "unknown"),
-                "recovery_state": item.get("recovery_state"),
-                "recovery_error": item.get("recovery_error"),
-                "fallback_terminal_id": item.get("fallback_terminal_id"),
-                "provider_process_started_at": started_at,
-                "auth_state_mtime": auth_mtime,
-                "auth_staleness": auth_staleness,
-            })
+            status = status_monitor.get_status(item["id"]).value
+            init_health = _compute_init_health(item, _manifest_now)
+            if init_health == "failed":
+                status = "error"
+            rows.append(
+                {
+                    "id": item["id"],
+                    "profile": item.get("agent_profile"),
+                    "provider": item.get("provider"),
+                    "status": status,
+                    "caller_id": item.get("caller_id"),
+                    "cwd": get_working_directory(item["id"]),
+                    "kind": (
+                        "supervisor"
+                        if role == "supervisor"
+                        else (
+                            "worker" if role in {"developer", "reviewer", "worker"} else "unknown"
+                        )
+                    ),
+                    "init_state": item.get("init_state"),
+                    "init_health": init_health,
+                    "recovery_state": item.get("recovery_state"),
+                    "recovery_error": item.get("recovery_error"),
+                    "fallback_terminal_id": item.get("fallback_terminal_id"),
+                    "provider_process_started_at": started_at,
+                    "auth_state_mtime": auth_mtime,
+                    "auth_staleness": auth_staleness,
+                }
+            )
         return sorted(rows, key=lambda r: r["id"])
 
     terminal_rows = collect("terminals", terminals, [])
-    base_rows = collect("ready_bases", lambda: sorted([{
-        "name": b["name"], "provider": b["provider"], "profile": b.get("agent_profile"),
-        "source_terminal_id": b.get("source_terminal_id"), "cwd": b.get("cwd"),
-        "git_sha": b.get("git_sha"), "staleness_count": b.get("staleness_count", 0),
-        "status": b.get("status"), "kind": b.get("kind", "base"),
-        "updated_at": b.get("updated_at"),
-    } for b in list_bases()], key=lambda r: r["name"]), [])
-    skill_rows = collect("skills", lambda: [{"name": s.name, "description": s.description} for s in list_skills()], [])
-    workflow_rows = collect("workflows", lambda: sorted([{"name": w.name, "description": w.description, "source": w.source_path} for w in list_workflows()], key=lambda r: r["name"]), [])
+    base_rows = collect(
+        "ready_bases",
+        lambda: sorted(
+            [
+                {
+                    "name": b["name"],
+                    "provider": b["provider"],
+                    "profile": b.get("agent_profile"),
+                    "source_terminal_id": b.get("source_terminal_id"),
+                    "cwd": b.get("cwd"),
+                    "git_sha": b.get("git_sha"),
+                    "staleness_count": b.get("staleness_count", 0),
+                    "status": b.get("status"),
+                    "kind": b.get("kind", "base"),
+                    "updated_at": b.get("updated_at"),
+                }
+                for b in list_bases()
+            ],
+            key=lambda r: r["name"],
+        ),
+        [],
+    )
+    skill_rows = collect(
+        "skills",
+        lambda: [{"name": s.name, "description": s.description} for s in list_skills()],
+        [],
+    )
+    workflow_rows = collect(
+        "workflows",
+        lambda: sorted(
+            [
+                {"name": w.name, "description": w.description, "source": w.source_path}
+                for w in list_workflows()
+            ],
+            key=lambda r: r["name"],
+        ),
+        [],
+    )
     source_root = os.environ.get("CAO_SOURCE_REPO")
     if source_root:
         activation = collect(
-            "activation", lambda: deployment_status(Path(source_root)),
-            {"cli_path": "unknown", "differing_files": None, "server": "unknown", "source_root": source_root},
+            "activation",
+            lambda: deployment_status(Path(source_root)),
+            {
+                "cli_path": "unknown",
+                "differing_files": None,
+                "server": "unknown",
+                "source_root": source_root,
+            },
         )
     else:
-        activation = {"cli_path": "unknown", "differing_files": None, "server": "unknown", "source_root": None}
+        activation = {
+            "cli_path": "unknown",
+            "differing_files": None,
+            "server": "unknown",
+            "source_root": None,
+        }
         sections["activation"] = "error"
-        errors.append({"section": "activation", "code": "source_root_unconfigured", "message": "CAO_SOURCE_REPO is not set"})
+        errors.append(
+            {
+                "section": "activation",
+                "code": "source_root_unconfigured",
+                "message": "CAO_SOURCE_REPO is not set",
+            }
+        )
     from cli_agent_orchestrator.clients.database import get_session_epoch
+
     epoch_row = get_session_epoch(session_name)
     supervisor_ids = sorted(
-        item["id"]
-        for item in raw_terminals
-        if roles.get(item.get("agent_profile")) == "supervisor"
+        item["id"] for item in raw_terminals if roles.get(item.get("agent_profile")) == "supervisor"
     )
     return {
-        "schema_version": SCHEMA_VERSION, "generated_at": datetime.now(timezone.utc).isoformat(),
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "complete": all(state == "ok" for state in sections.values()),
-        "errors": errors, "sections": sections,
-        "session": {"name": session_name,
-                    "supervisors": supervisor_ids,
-                    "supervisor_terminal_id": supervisor_ids[0] if len(supervisor_ids) == 1 else None,
-                    "epoch": epoch_row["count"] if epoch_row else 0,
-                    "epoch_started_at": epoch_row["last_epoch_at"] if epoch_row else None},
-        "profiles": profile_rows, "ready_bases": base_rows, "skills": skill_rows,
-        "workflows": workflow_rows, "tools": None, "terminals": terminal_rows,
-        "ledger": {"pending_rows": None}, "activation": activation,
+        "errors": errors,
+        "sections": sections,
+        "session": {
+            "name": session_name,
+            "supervisors": supervisor_ids,
+            "supervisor_terminal_id": supervisor_ids[0] if len(supervisor_ids) == 1 else None,
+            "epoch": epoch_row["count"] if epoch_row else 0,
+            "epoch_started_at": epoch_row["last_epoch_at"] if epoch_row else None,
+        },
+        "profiles": profile_rows,
+        "ready_bases": base_rows,
+        "skills": skill_rows,
+        "workflows": workflow_rows,
+        "tools": None,
+        "terminals": terminal_rows,
+        "ledger": {"pending_rows": None},
+        "activation": activation,
     }
 
 
 def render_session_brief(manifest: dict[str, Any], thin: bool = False) -> str:
-    lines = ["## CAO Live Session Inventory", f"generated_at: {manifest['generated_at']}", f"complete: {str(manifest['complete']).lower()}"]
+    lines = [
+        "## CAO Live Session Inventory",
+        f"generated_at: {manifest['generated_at']}",
+        f"complete: {str(manifest['complete']).lower()}",
+    ]
     names = ", ".join(p["name"] for p in manifest["profiles"])
     errors = manifest.get("errors", [])
     section_states = manifest.get("sections")
     if isinstance(section_states, dict):
-        incomplete = [
-            (name, state)
-            for name, state in section_states.items()
-            if state != "ok"
-        ]
+        incomplete = [(name, state) for name, state in section_states.items() if state != "ok"]
     else:
         # Additive-v1 compatibility for callers holding a pre-lattice snapshot.
         incomplete = [(error["section"], "error") for error in errors]
     error_codes = {error["section"]: error["code"] for error in errors}
 
     def incomplete_line(name: str, state: str, separator: str) -> str:
-        suffix = (
-            f" ({error_codes[name]})"
-            if state == "error" and name in error_codes
-            else ""
-        )
+        suffix = f" ({error_codes[name]})" if state == "error" and name in error_codes else ""
         return f"{name}{separator}{state}{suffix}"
 
     if thin:
-        compact = [
-            "non-ok sections: "
-            + "; ".join(incomplete_line(name, state, "=") for name, state in incomplete)
-        ] if incomplete else []
-        return "\n".join(lines + [f"profiles: {names}"] + compact + ["run `cao session manifest --brief` for full"])
+        compact = (
+            [
+                "non-ok sections: "
+                + "; ".join(incomplete_line(name, state, "=") for name, state in incomplete)
+            ]
+            if incomplete
+            else []
+        )
+        return "\n".join(
+            lines
+            + [f"profiles: {names}"]
+            + compact
+            + ["run `cao session manifest --brief` for full"]
+        )
     lines += [f"session: {manifest['session']['name']}", "", "### Profiles"]
     for p in manifest["profiles"]:
-        lines.append(f"- {p['name']} — role={p.get('role') or 'unknown'}, provider={p.get('provider') or 'default'}, skills={','.join(p['skills']) or '(none)'}; {p['charter_digest']}")
+        lines.append(
+            f"- {p['name']} — role={p.get('role') or 'unknown'}, provider={p.get('provider') or 'default'}, skills={','.join(p['skills']) or '(none)'}; {p['charter_digest']}"
+        )
     lines += ["", "### Ready bases"]
-    lines += [f"- {b['name']} — {b['provider']}/{b.get('profile')}, stale={b['staleness_count']}" for b in manifest["ready_bases"]] or ["- (none)"]
-    lines += ["", "### Skills", *(f"- {s['name']} — {s['description']}" for s in manifest["skills"])]
-    lines += ["", "### Workflows", *(f"- {w['name']} — {w['description']}" for w in manifest["workflows"])]
-    lines += ["", "### Terminals", *(f"- {t['id']} — {t.get('profile')} ({t.get('provider')}, {t.get('status')}, {t.get('kind')})" for t in manifest["terminals"])]
+    lines += [
+        f"- {b['name']} — {b['provider']}/{b.get('profile')}, stale={b['staleness_count']}"
+        for b in manifest["ready_bases"]
+    ] or ["- (none)"]
+    lines += [
+        "",
+        "### Skills",
+        *(f"- {s['name']} — {s['description']}" for s in manifest["skills"]),
+    ]
+    lines += [
+        "",
+        "### Workflows",
+        *(f"- {w['name']} — {w['description']}" for w in manifest["workflows"]),
+    ]
+    lines += [
+        "",
+        "### Terminals",
+        *(
+            f"- {(t.get('profile') + '-' + t['id']) if t.get('profile') else t['id']} — {t.get('profile')} ({t.get('provider')}, {t.get('status')}, {t.get('kind')})"
+            for t in manifest["terminals"]
+        ),
+    ]
     a = manifest["activation"]
-    lines += ["", "### Activation", f"- cli_path={a.get('cli_path')}, differing_files={a.get('differing_files')}, server={a.get('server')}, source_root={a.get('source_root')}"]
+    lines += [
+        "",
+        "### Activation",
+        f"- cli_path={a.get('cli_path')}, differing_files={a.get('differing_files')}, server={a.get('server')}, source_root={a.get('source_root')}",
+    ]
     if incomplete:
         lines += ["", "### Incomplete sections"]
         for name, state in incomplete:

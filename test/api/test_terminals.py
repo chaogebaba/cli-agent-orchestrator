@@ -10,6 +10,11 @@ from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.api.main import CreateTerminalBody, app
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.constants import (
+    TERMINAL_GROUP_ELEMENT_MAX_LEN,
+    TERMINAL_GROUP_MAX_ELEMENTS,
+    TERMINAL_METADATA_MAX_BYTES,
+)
 from cli_agent_orchestrator.models.terminal import Terminal
 
 
@@ -427,7 +432,12 @@ class TestTerminalProtection:
             ) as lookup,
             patch("cli_agent_orchestrator.api.main.terminal_service") as service,
         ):
-            service.delete_terminal.return_value = True
+            service.delete_terminal.return_value = {
+                "reaped": [{"id": "abcd1234", "status": "reaped"}],
+                "skipped": [],
+                "uncertain": [],
+                "unattempted": [],
+            }
             response = client.delete("/terminals/abcd1234", params={"force": "true"})
 
         assert response.status_code == 200
@@ -442,6 +452,8 @@ class TestWorkingDirectoryEndpoint:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.get_working_directory.return_value = "/home/user/project"
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.get("/terminals/abcd1234/working-directory")
 
             assert response.status_code == 200
@@ -454,6 +466,8 @@ class TestWorkingDirectoryEndpoint:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.get_working_directory.return_value = None
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.get("/terminals/abcd1234/working-directory")
 
             assert response.status_code == 200
@@ -463,6 +477,8 @@ class TestWorkingDirectoryEndpoint:
         """Test 404 when terminal doesn't exist."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.get_working_directory.side_effect = ValueError("Terminal 'abcd5678' not found")
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.get("/terminals/abcd5678/working-directory")
 
@@ -474,6 +490,8 @@ class TestWorkingDirectoryEndpoint:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.get_working_directory.side_effect = Exception("TMux error")
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.get("/terminals/abcd1234/working-directory")
 
             assert response.status_code == 500
@@ -483,6 +501,8 @@ class TestWorkingDirectoryEndpoint:
         """Test 500 when internal error occurs."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.get_working_directory.side_effect = RuntimeError("Internal service error")
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.get("/terminals/abcd1234/working-directory")
 
@@ -570,6 +590,8 @@ class TestTerminalCreationWithWorkingDirectory:
                 )
             )
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
@@ -593,6 +615,8 @@ class TestTerminalCreationWithWorkingDirectory:
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
         ):
             mock_svc.create_terminal = AsyncMock(side_effect=ValueError(detail))
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
@@ -624,6 +648,8 @@ class TestTerminalCreationWithWorkingDirectory:
                 )
             )
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
@@ -638,6 +664,137 @@ class TestTerminalCreationWithWorkingDirectory:
             assert call_kwargs.get("caller_id") == "dcba8765"
             assert response.json()["caller_id"] == "dcba8765"
 
+    def test_create_terminal_passes_model(self, client):
+        """model query param threads through to the service -- explicit
+        per-call model override for MCP handoff/assign."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                return_value=Terminal(
+                    id="abcd5678",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="claude_code",
+                    agent_profile="analyst",
+                )
+            )
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "claude_code",
+                    "agent_profile": "analyst",
+                    "model": "fable-5",
+                },
+            )
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs.get("model") == "fable-5"
+
+    def test_create_terminal_omitted_model_forwards_none(self, client):
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                return_value=Terminal(
+                    id="abcd5678",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="kiro_cli",
+                    agent_profile="analyst",
+                )
+            )
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+            )
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs.get("model") is None
+
+    def test_create_terminal_rejects_malformed_model(self, client):
+        """PR #501 review: a malformed model (control char/newline/shell
+        metacharacter) must 400 at the request boundary rather than either
+        reaching terminal_service unvalidated or -- if it later raised
+        ValueError there -- being mismapped to a misleading 404 (this
+        endpoint's ValueError handler means "session/window not found")."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                    "model": "fable-5\nrm -rf /",
+                },
+            )
+
+            assert response.status_code == 400
+            mock_svc.create_terminal.assert_not_called()
+
+    def test_create_terminal_capability_refusal_maps_to_400_not_404(self, client):
+        """A Kiro capability refusal is a bad request, not a missing resource.
+
+        KiroCapabilityError subclasses ValueError, and this endpoint's generic
+        ValueError arm means "session/window not found" -- so without a narrower
+        arm ordered first, a capability rejection reports 404. POST /sessions
+        already returns 400 for the identical failure.
+        """
+        from cli_agent_orchestrator.models.kiro_engine import KiroEngine
+        from cli_agent_orchestrator.providers.kiro_capabilities import KiroCapabilityError
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=KiroCapabilityError(
+                    "unsupported_capability",
+                    KiroEngine.KAS,
+                    "Kiro engine 'kas' requires wrapper flag '--v3'",
+                    capability="--v3",
+                )
+            )
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                    "engine": "kas",
+                },
+            )
+
+        assert response.status_code == 400
+
     def test_create_terminal_rejects_malformed_caller_id(self, client):
         """caller_id is validated against the TerminalId pattern — IDs arrive
         from agent input and must not be persisted unvalidated."""
@@ -648,6 +805,8 @@ class TestTerminalCreationWithWorkingDirectory:
             ),
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
         ):
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
@@ -679,6 +838,8 @@ class TestTerminalCreationWithWorkingDirectory:
                 )
             )
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
@@ -692,6 +853,100 @@ class TestTerminalCreationWithWorkingDirectory:
             call_kwargs = mock_svc.create_terminal.call_args.kwargs
             assert call_kwargs.get("working_directory") == "/session/path"
 
+    def test_create_terminal_in_session_forwards_use_worktree_true(self, client):
+        """issue #100 Phase 1: the use_worktree query param reaches
+        terminal_service.create_terminal unchanged."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                return_value=Terminal(
+                    id="abcd5678",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="kiro_cli",
+                    agent_profile="analyst",
+                )
+            )
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                    "use_worktree": "true",
+                },
+            )
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs.get("use_worktree") is True
+
+    def test_create_terminal_in_session_defaults_use_worktree_false(self, client):
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                return_value=Terminal(
+                    id="abcd5678",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="kiro_cli",
+                    agent_profile="analyst",
+                )
+            )
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+            )
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs.get("use_worktree") is False
+
+    def test_create_terminal_in_session_worktree_error_maps_to_400(self, client):
+        """A working_directory that isn't a git repo is a client-input
+        problem, not a server crash."""
+        from cli_agent_orchestrator.services.worktree_service import WorktreeError
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=WorktreeError("'/tmp/x' is not inside a git repository")
+            )
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                    "use_worktree": "true",
+                },
+            )
+
+            assert response.status_code == 400
+            assert "not inside a git repository" in response.json()["detail"]
+
     def test_create_terminal_rejects_initial_message_without_defer_init(self, client):
         """initial_message is only delivered on the deferred-init path; sending
         it with defer_init=false must 400 rather than silently drop the payload."""
@@ -703,6 +958,8 @@ class TestTerminalCreationWithWorkingDirectory:
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
         ):
             mock_svc.create_terminal = AsyncMock()
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.post(
                 "/sessions/test-session/terminals",
@@ -754,6 +1011,8 @@ class TestExitTerminalEndpoint:
     def test_exit_terminal_delegates_and_returns_success(self, client):
         """A successful exit delegates to exit_terminal_cli and returns 200."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post("/terminals/abcd1234/exit")
 
             assert response.status_code == 200
@@ -765,6 +1024,8 @@ class TestExitTerminalEndpoint:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.exit_terminal_cli.side_effect = ValueError("Provider not found for terminal x")
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post("/terminals/deadbeef/exit")
 
             assert response.status_code == 404
@@ -774,6 +1035,8 @@ class TestExitTerminalEndpoint:
         """An unexpected error maps to 500."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.exit_terminal_cli.side_effect = RuntimeError("TMux error")
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.post("/terminals/abcd1234/exit")
 
@@ -787,32 +1050,102 @@ class TestDeleteTerminalEndpoint:
     def test_delete_terminal_success(self, client):
         """DELETE /terminals/{terminal_id} deletes and returns success."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.delete_terminal.return_value = True
+            mock_svc.delete_terminal.return_value = {
+                "reaped": [{"id": "abcd1234", "status": "reaped"}],
+                "skipped": [],
+                "uncertain": [],
+                "unattempted": [],
+            }
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.delete("/terminals/abcd1234")
 
             assert response.status_code == 200
-            assert response.json() == {"success": True}
+            assert response.json() == {
+                "success": True,
+                "reaped": [{"id": "abcd1234", "status": "reaped"}],
+                "skipped": [],
+                "uncertain": [],
+                "unattempted": [],
+            }
             mock_svc.delete_terminal.assert_called_once_with("abcd1234", registry=ANY)
 
+    def test_delete_terminal_forwards_orphan_true(self, client):
+        """The public opt-out reaches the cascade service as a true value."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.delete_terminal.return_value = {
+                "reaped": [{"id": "abcd1234", "status": "reaped"}],
+                "skipped": [{"id": "child123", "reason": "orphan_requested"}],
+                "uncertain": [],
+                "unattempted": [],
+            }
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.delete("/terminals/abcd1234", params={"orphan": "true"})
+
+        assert response.status_code == 200
+        mock_svc.delete_terminal.assert_called_once_with("abcd1234", registry=ANY, orphan=True)
+
     def test_delete_terminal_not_found(self, client):
-        """DELETE /terminals/{terminal_id} returns 404 for missing terminal."""
+        """DELETE /terminals/{terminal_id} returns 200 with already_absent (D13)."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.delete_terminal.side_effect = ValueError("Terminal not found")
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.delete("/terminals/deadbeef")
 
-            assert response.status_code == 404
+            assert response.status_code == 200
+            assert response.json()["already_absent"] is True
 
     def test_delete_terminal_server_error(self, client):
-        """DELETE /terminals/{terminal_id} returns 500 on internal error."""
+        """DELETE /terminals/{terminal_id} returns 500 with typed detail (D12)."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.delete_terminal.side_effect = Exception("TMux error")
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.delete("/terminals/abcd1234")
 
             assert response.status_code == 500
-            assert "Failed to delete terminal" in response.json()["detail"]
+            detail = response.json()["detail"]
+            assert "Exception" in detail
+            assert "TMux error" in detail
+
+
+class TestFleetEndpoint:
+    def test_fleet_serializes_orphan_and_depth_values_in_one_response(self, client):
+        payload = {
+            "session_name": "cao-test",
+            "terminals": [
+                {
+                    "id": "child123",
+                    "profile": "developer",
+                    "provider": "codex",
+                    "window_index": "2",
+                    "window_name": "worker",
+                    "parent_id": "deadbeef",
+                    "depth": 2,
+                    "orphan": True,
+                    "status": "idle",
+                    "since_last_input": 1.0,
+                    "lifecycle": "ephemeral",
+                    "reparented_from": None,
+                }
+            ],
+        }
+        with patch(
+            "cli_agent_orchestrator.services.fleet_service.build_fleet",
+            return_value=payload,
+        ) as build:
+            response = client.get("/sessions/cao-test/fleet")
+
+        assert response.status_code == 200
+        assert response.json()["terminals"][0]["orphan"] is True
+        assert response.json()["terminals"][0]["depth"] == 2
+        build.assert_called_once_with("cao-test")
 
 
 class TestCreateInboxMessageEndpoint:
@@ -849,7 +1182,8 @@ class TestCreateInboxMessageEndpoint:
             ),
             patch("cli_agent_orchestrator.api.main.get_backend") as backend,
             patch(
-                "cli_agent_orchestrator.api.main.create_inbox_message", return_value=mock_msg
+                "cli_agent_orchestrator.api.main.create_inbox_message",
+                return_value=mock_msg,
             ) as create,
             patch("cli_agent_orchestrator.api.main.inbox_service"),
         ):
@@ -877,12 +1211,14 @@ class TestCreateInboxMessageEndpoint:
                 return_value={"tmux_session": "cao-test", "tmux_window": "worker"},
             ),
             patch("cli_agent_orchestrator.api.main.get_backend") as mock_backend,
-            patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
+            patch(
+                "cli_agent_orchestrator.api.main.create_inbox_message",
+                return_value=mock_msg,
+            ) as mock_create,
             patch("cli_agent_orchestrator.api.main.inbox_service") as mock_inbox,
         ):
             mock_backend.return_value.session_exists.return_value = True
             mock_backend.return_value.get_history.return_value = ""
-            mock_create.return_value = mock_msg
 
             response = client.post(
                 "/terminals/abcd1234/inbox/messages",
@@ -914,31 +1250,31 @@ class TestCreateInboxMessageEndpoint:
                 return_value={"tmux_session": "cao-test", "tmux_window": "worker"},
             ),
             patch("cli_agent_orchestrator.api.main.get_backend") as backend,
-            patch("cli_agent_orchestrator.api.main.create_inbox_message") as create,
+            patch(
+                "cli_agent_orchestrator.api.main.create_inbox_message",
+                return_value=mock_msg,
+            ) as create,
             patch("cli_agent_orchestrator.api.main.inbox_service"),
         ):
             backend.return_value.session_exists.return_value = True
             backend.return_value.get_history.return_value = ""
-            create.return_value = mock_msg
             response = client.post(
                 "/terminals/abcd1234/inbox/messages",
                 params={"sender_id": "sender1", "message": "park", "park_warm": True},
             )
 
         assert response.status_code == 200
-        create.assert_called_once_with(
-            "sender1", "abcd1234", "park", park_warm=True
-        )
+        create.assert_called_once_with("sender1", "abcd1234", "park", park_warm=True)
 
     def test_logical_inbox_threads_park_warm_through_delivery_entry(self, client):
         row = MagicMock(id=3, sender_id="sender1", receiver_id="abcd1234")
         row.created_at.isoformat.return_value = "2026-07-20T12:00:00"
+        row.status = "pending"
         with (
             patch(
                 "cli_agent_orchestrator.services.mailbox_service.create_logical_inbox_message",
                 return_value=row,
             ) as create,
-            patch("cli_agent_orchestrator.api.main.inbox_service") as inbox,
         ):
             response = client.post(
                 "/terminals/mb_aaaaaaaa/inbox/messages",
@@ -953,7 +1289,6 @@ class TestCreateInboxMessageEndpoint:
             refresh_ingest=False,
             park_warm=True,
         )
-        inbox.deliver_pending.assert_called_once()
 
     @pytest.mark.parametrize(
         ("barrier_field", "value"),
@@ -998,12 +1333,14 @@ class TestCreateInboxMessageEndpoint:
                 return_value={"tmux_session": "cao-test", "tmux_window": "worker"},
             ),
             patch("cli_agent_orchestrator.api.main.get_backend") as mock_backend,
-            patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
+            patch(
+                "cli_agent_orchestrator.api.main.create_inbox_message",
+                return_value=mock_msg,
+            ),
             patch("cli_agent_orchestrator.api.main.inbox_service") as mock_inbox,
         ):
             mock_backend.return_value.session_exists.return_value = True
             mock_backend.return_value.get_history.return_value = ""
-            mock_create.return_value = mock_msg
             mock_inbox.deliver_pending.side_effect = Exception("TMux busy")
 
             response = client.post(
@@ -1080,11 +1417,13 @@ class TestCreateInboxMessageEndpoint:
                 return_value={"tmux_session": "cao-test", "tmux_window": "worker"},
             ),
             patch("cli_agent_orchestrator.api.main.get_backend") as mock_backend,
-            patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
+            patch(
+                "cli_agent_orchestrator.api.main.create_inbox_message",
+                side_effect=Exception("DB error"),
+            ),
         ):
             mock_backend.return_value.session_exists.return_value = True
             mock_backend.return_value.get_history.return_value = ""
-            mock_create.side_effect = Exception("DB error")
 
             response = client.post(
                 "/terminals/abcd1234/inbox/messages",
@@ -1118,6 +1457,7 @@ class TestWebSocketLocalhostRestriction:
 
         ws = MagicMock()
         ws.client = MagicMock(host="172.17.0.1")  # Docker bridge IP, simulating issue #149
+        ws.headers = {}  # non-browser client: no Origin header, passes the Origin gate
         ws.accept = AsyncMock()
         ws.close = AsyncMock()
 
@@ -1173,6 +1513,7 @@ class TestWebSocketLocalhostRestriction:
 
         ws = MagicMock()
         ws.client = MagicMock(host="127.0.0.1")
+        ws.headers = {}
         ws.accept = AsyncMock()
         ws.close = AsyncMock()
 
@@ -1194,6 +1535,285 @@ class TestWebSocketLocalhostRestriction:
         kwargs = ws.close.call_args.kwargs
         assert kwargs.get("code") == 4003
         assert "Invalid tmux target name" in kwargs.get("reason", "")
+
+    @pytest.mark.asyncio
+    async def test_websocket_rejects_cross_site_origin(self):
+        """CWE-1385: a loopback peer carrying a foreign browser Origin (the
+        cross-site WebSocket hijacking scenario) is closed with 4403 before
+        any accept — even though its IP passes ``WS_ALLOWED_CLIENTS``.
+        """
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="127.0.0.1")  # browser connects from loopback
+        # Attacker page: its Origin is its own site, but the socket's Host is
+        # the CAO server it targets (browser sets Host, script cannot forge it).
+        ws.headers = {"origin": "http://evil.example.com", "host": "localhost:9889"}
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS",
+                ["127.0.0.1", "::1", "localhost"],
+            ),
+            patch(
+                "cli_agent_orchestrator.constants.CORS_ORIGINS",
+                ["http://localhost:9889", "http://127.0.0.1:9889"],
+            ),
+            patch("cli_agent_orchestrator.constants.WS_ALLOWED_ORIGINS", []),
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        # Origin authority (evil.example.com) != Host (localhost:9889) and not
+        # in any allowlist → rejected before accept, no PTY spun up.
+        ws.accept.assert_not_called()
+        ws.close.assert_awaited_once()
+        kwargs = ws.close.call_args.kwargs
+        assert kwargs.get("code") == 4403
+
+    @pytest.mark.asyncio
+    async def test_websocket_admits_same_origin_via_host_match(self):
+        """The bundled viewer is served by cao-server, so its Origin authority
+        equals the request Host. That must pass EVEN WHEN the origin is absent
+        from ``CORS_ORIGINS`` — the imported-app deployment
+        (``uvicorn ...:app``) never runs ``add_local_cors_origins``, so the
+        same-origin match on Host is what keeps its viewer working.
+        """
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="127.0.0.1")
+        ws.headers = {"origin": "http://localhost:9889", "host": "localhost:9889"}
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS",
+                ["127.0.0.1", "::1", "localhost"],
+            ),
+            # Deliberately empty: proves the pass is via Host-match, not CORS.
+            patch("cli_agent_orchestrator.constants.CORS_ORIGINS", []),
+            patch("cli_agent_orchestrator.constants.WS_ALLOWED_ORIGINS", []),
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value=None,
+            ),
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        # Same-origin → accept happened; terminal lookup None → 4004 (not 4403).
+        ws.accept.assert_awaited_once()
+        ws.close.assert_awaited_once()
+        assert ws.close.call_args.kwargs.get("code") == 4004
+
+    @pytest.mark.asyncio
+    async def test_websocket_admits_proxied_https_same_origin(self):
+        """Codespaces / reverse-proxy: the viewer loads over HTTPS at a dynamic
+        forwarded hostname and the WSS handshake carries a matching Host. The
+        same-origin match must accept it without the operator pre-registering
+        the (unpredictable) origin.
+        """
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        proxied = "myspace-9889.app.github.dev"
+        ws = MagicMock()
+        ws.client = MagicMock(host="10.0.0.7")  # the forwarding proxy's peer IP
+        ws.headers = {"origin": f"https://{proxied}", "host": proxied}
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with (
+            # Codespaces doc sets CAO_WS_ALLOWED_CLIENTS="*".
+            patch("cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS", ["*"]),
+            patch("cli_agent_orchestrator.constants.CORS_ORIGINS", []),
+            patch("cli_agent_orchestrator.constants.WS_ALLOWED_ORIGINS", []),
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value=None,
+            ),
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        ws.accept.assert_awaited_once()
+        assert ws.close.call_args.kwargs.get("code") == 4004
+
+    @pytest.mark.asyncio
+    async def test_websocket_admits_cross_origin_via_allowlist(self):
+        """A genuinely cross-origin viewer (Origin authority != Host) still
+        works when the operator lists it in ``CAO_WS_ALLOWED_ORIGINS``.
+        """
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="127.0.0.1")
+        ws.headers = {"origin": "https://viewer.example.dev", "host": "localhost:9889"}
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS",
+                ["127.0.0.1", "::1", "localhost"],
+            ),
+            patch("cli_agent_orchestrator.constants.CORS_ORIGINS", []),
+            patch(
+                "cli_agent_orchestrator.constants.WS_ALLOWED_ORIGINS",
+                ["https://viewer.example.dev"],
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value=None,
+            ),
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        ws.accept.assert_awaited_once()
+        assert ws.close.call_args.kwargs.get("code") == 4004
+
+    @pytest.mark.asyncio
+    async def test_websocket_admits_non_browser_client_without_origin(self):
+        """Native (non-browser) clients — CLI, the ``websockets`` lib, tests —
+        send no Origin header. The CSRF threat is browser-only, so a missing
+        Origin passes the guard (still gated by the loopback IP allowlist).
+        """
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="127.0.0.1")
+        ws.headers = {}  # no Origin
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS",
+                ["127.0.0.1", "::1", "localhost"],
+            ),
+            patch("cli_agent_orchestrator.constants.CORS_ORIGINS", []),
+            patch("cli_agent_orchestrator.constants.WS_ALLOWED_ORIGINS", []),
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value=None,
+            ),
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        ws.accept.assert_awaited_once()
+        assert ws.close.call_args.kwargs.get("code") == 4004
+
+
+class TestWebSocketOriginIntegration:
+    """End-to-end Origin-guard coverage through the real ASGI middleware stack
+    (TrustedHostMiddleware + CORSMiddleware + the route), not a mock WebSocket.
+
+    Starlette's ``TestClient.websocket_connect`` performs a genuine ASGI
+    handshake: a 4403 policy close surfaces as ``WebSocketDisconnect`` when the
+    client tries to receive, while an admitted connection proceeds past accept.
+    The TestClient's peer host is ``testclient``, so admit it in
+    ``WS_ALLOWED_CLIENTS`` to isolate the Origin behavior under test.
+    """
+
+    def _client(self):
+        from test.api.conftest import TestClientWithHost
+
+        app.state.plugin_registry = None
+        return TestClientWithHost(app)
+
+    def _trust_host(self, host):
+        """Add ``host`` to the live ``ALLOWED_HOSTS`` list so a fresh
+        ``TrustedHostMiddleware`` (built when the TestClient constructs its
+        stack) trusts it — the reverse-proxy case the documented Codespaces
+        ``CAO_ALLOWED_HOSTS`` / ``add_local_cors_origins`` flow handles at
+        runtime. ``add_middleware`` captured the list by reference, and the
+        middleware copies it at build time, so mutating it in place before the
+        client builds is what takes effect. Returns a restore callback.
+        """
+        import cli_agent_orchestrator.api.main as main_mod
+
+        added = host not in main_mod.ALLOWED_HOSTS
+        if added:
+            main_mod.ALLOWED_HOSTS.append(host)
+        # The app is a module singleton whose middleware_stack is built and
+        # cached on first request; drop it so the next connect rebuilds the
+        # TrustedHostMiddleware from the now-extended ALLOWED_HOSTS list.
+        app.middleware_stack = None
+
+        def restore():
+            if added and host in main_mod.ALLOWED_HOSTS:
+                main_mod.ALLOWED_HOSTS.remove(host)
+            app.middleware_stack = None
+
+        return restore
+
+    def _connect(self, origin, host="localhost", cors=None, extra_origins=None, trust_host=False):
+        """Open a WS handshake with the given Origin/Host and return the close
+        code (or None if the socket was admitted, then closed cleanly)."""
+        from starlette.websockets import WebSocketDisconnect
+
+        headers = {"Host": host}
+        if origin is not None:
+            headers["Origin"] = origin
+
+        restore = self._trust_host(host) if trust_host else (lambda: None)
+        try:
+            with (
+                patch(
+                    "cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS",
+                    ["testclient", "127.0.0.1", "::1", "localhost"],
+                ),
+                patch("cli_agent_orchestrator.constants.CORS_ORIGINS", cors or []),
+                patch(
+                    "cli_agent_orchestrator.constants.WS_ALLOWED_ORIGINS",
+                    extra_origins or [],
+                ),
+                # Admitted path stops at terminal lookup so no PTY is spawned.
+                patch(
+                    "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                    return_value=None,
+                ),
+            ):
+                client = self._client()
+                try:
+                    with client.websocket_connect("/terminals/abcd1234/ws", headers=headers) as ws:
+                        # Admitted → accept happened; server then closes with
+                        # 4004 (terminal not found). Receiving surfaces that.
+                        try:
+                            ws.receive_text()
+                        except WebSocketDisconnect as exc:
+                            return exc.code
+                        return None
+                except WebSocketDisconnect as exc:
+                    # Pre-accept policy close (4403 Origin / 4003 IP).
+                    return exc.code
+        finally:
+            restore()
+
+    def test_bundled_same_origin_viewer_is_admitted(self):
+        """The imported-app deployment (``uvicorn ...:app``) never runs
+        ``add_local_cors_origins``; with empty CORS the bundled viewer at the
+        server's own origin must still be admitted via the Host match."""
+        code = self._connect("http://localhost:9889", host="localhost:9889", cors=[])
+        assert code == 4004  # admitted, then terminal-not-found
+
+    def test_proxied_https_same_origin_is_admitted(self):
+        """Codespaces / reverse proxy: HTTPS viewer at a dynamic forwarded
+        hostname, handshake Host matches, admitted with no allowlist entry."""
+        proxied = "myspace-9889.app.github.dev"
+        code = self._connect(f"https://{proxied}", host=proxied, cors=[], trust_host=True)
+        assert code == 4004
+
+    def test_cross_site_origin_is_rejected(self):
+        """CWE-1385: a foreign Origin whose authority differs from the Host is
+        closed with 4403 before accept, through the real stack."""
+        code = self._connect("http://evil.example.com", host="localhost:9889", cors=[])
+        assert code == 4403
+
+    def test_no_origin_is_admitted(self):
+        """Non-browser client: no Origin header, admitted (IP-gated only)."""
+        code = self._connect(None, host="localhost", cors=[])
+        assert code == 4004
 
 
 class TestBuildPtyEnv:
@@ -1271,6 +1891,7 @@ class TestWebSocketSubprocessTerm:
 
         ws = MagicMock()
         ws.client = MagicMock(host="127.0.0.1")
+        ws.headers = {}
         ws.accept = AsyncMock()
         ws.close = AsyncMock()
 
@@ -1321,6 +1942,7 @@ class TestWebSocketSubprocessTerm:
 
         ws = MagicMock()
         ws.client = MagicMock(host="127.0.0.1")
+        ws.headers = {}
         ws.accept = AsyncMock()
         ws.close = AsyncMock()
 
@@ -1360,6 +1982,7 @@ class TestWebSocketSubprocessTerm:
 
         ws = MagicMock()
         ws.client = MagicMock(host="127.0.0.1")
+        ws.headers = {}
         ws.accept = AsyncMock()
         ws.close = AsyncMock()
 
@@ -1406,6 +2029,8 @@ class TestCrossProviderResolution:
                 )
             )
 
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
@@ -1437,6 +2062,8 @@ class TestCrossProviderResolution:
                     agent_profile="reviewer",
                 )
             )
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.post(
                 "/sessions/test-session/terminals",
@@ -1498,3 +2125,439 @@ class TestCrossProviderResolution:
 
             assert response.status_code == 500
             assert "Failed to create terminal" in response.json()["detail"]
+
+
+def _terminal_dict(**overrides: Dict) -> Dict:
+    base = {
+        "id": "abcd1234",
+        "name": "test-window",
+        "provider": "kiro_cli",
+        "session_name": "test-session",
+        "agent_profile": "developer",
+        "caller_id": None,
+        "allowed_tools": None,
+        "shell_command": None,
+        "group": None,
+        "metadata": None,
+        "status": "idle",
+        "last_active": None,
+    }
+    base.update(overrides)
+    return base
+
+
+class TestCreateSessionWithGroupAndMetadata:
+    """#432: POST /sessions accepts group/metadata in the JSON body."""
+
+    def test_group_and_metadata_forwarded_to_session_service(self, client):
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(
+                return_value=Terminal(**_terminal_dict(group=["tenant_1", "project_5"]))
+            )
+
+            response = client.post(
+                "/sessions",
+                params={"provider": "kiro_cli", "agent_profile": "developer"},
+                json={"group": ["tenant_1", "project_5"], "metadata": {"task": "bootstrap"}},
+            )
+
+            assert response.status_code == 201
+            assert response.json()["group"] == ["tenant_1", "project_5"]
+            call_kwargs = mock_svc.create_session.call_args.kwargs
+            assert call_kwargs["group"] == ["tenant_1", "project_5"]
+            assert call_kwargs["metadata"] == {"task": "bootstrap"}
+
+    def test_omitted_group_and_metadata_default_to_none(self, client):
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=Terminal(**_terminal_dict()))
+
+            response = client.post(
+                "/sessions",
+                params={"provider": "kiro_cli", "agent_profile": "developer"},
+            )
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_session.call_args.kwargs
+            assert call_kwargs["group"] is None
+            assert call_kwargs["metadata"] is None
+
+
+class TestUpdateTerminalGroupEndpoint:
+    """#432: PATCH /terminals/{id}/group."""
+
+    def test_update_group_success(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(group=["tenant_1", "project_9"])
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.patch(
+                "/terminals/abcd1234/group", json={"group": ["tenant_1", "project_9"]}
+            )
+
+            assert response.status_code == 200
+            assert response.json()["group"] == ["tenant_1", "project_9"]
+            mock_svc.update_group.assert_called_once_with("abcd1234", ["tenant_1", "project_9"])
+
+    def test_update_group_clears_with_empty_list(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(group=None)
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.patch("/terminals/abcd1234/group", json={"group": []})
+
+            assert response.status_code == 200
+            mock_svc.update_group.assert_called_once_with("abcd1234", [])
+
+    def test_update_group_terminal_not_found(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.return_value = False
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.patch("/terminals/deadbeef/group", json={"group": ["tenant_1"]})
+
+            assert response.status_code == 404
+
+    def test_update_group_server_error(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.side_effect = Exception("db exploded")
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.patch("/terminals/abcd1234/group", json={"group": ["tenant_1"]})
+
+            assert response.status_code == 500
+            assert "Failed to update terminal group" in response.json()["detail"]
+
+    def test_update_group_omitted_field_rejected_not_treated_as_clear(self, client):
+        """Copilot review, PR #433: an omitted ``group`` field must be
+        rejected (422) rather than silently treated the same as an explicit
+        ``null`` (which clears the group) -- a partial/empty body must never
+        accidentally clear data."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.patch("/terminals/abcd1234/group", json={})
+
+            assert response.status_code == 422
+            mock_svc.update_group.assert_not_called()
+
+    def test_update_group_explicit_null_still_clears(self, client):
+        """The omitted-field fix must not break the pre-existing explicit-null
+        clearing path."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(group=None)
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.patch("/terminals/abcd1234/group", json={"group": None})
+
+            assert response.status_code == 200
+            mock_svc.update_group.assert_called_once_with("abcd1234", None)
+
+
+class TestUpdateTerminalMetadataEndpoint:
+    """#432: PATCH /terminals/{id}/metadata (also called by the update_metadata MCP tool)."""
+
+    def test_update_metadata_success(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_metadata.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(metadata={"task": "writing tests"})
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.patch(
+                "/terminals/abcd1234/metadata", json={"metadata": {"task": "writing tests"}}
+            )
+
+            assert response.status_code == 200
+            assert response.json()["metadata"] == {"task": "writing tests"}
+            mock_svc.update_metadata.assert_called_once_with("abcd1234", {"task": "writing tests"})
+
+    def test_update_metadata_terminal_not_found(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_metadata.return_value = False
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.patch(
+                "/terminals/deadbeef/metadata", json={"metadata": {"task": "x"}}
+            )
+
+            assert response.status_code == 404
+
+    def test_update_metadata_omitted_field_rejected_not_treated_as_clear(self, client):
+        """Copilot review, PR #433: same omitted-vs-null fix as ``group`` --
+        an omitted ``metadata`` field must be rejected (422), not silently
+        treated as an explicit clearing ``null``."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.patch("/terminals/abcd1234/metadata", json={})
+
+            assert response.status_code == 422
+            mock_svc.update_metadata.assert_not_called()
+
+    def test_update_metadata_explicit_null_still_clears(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_metadata.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(metadata=None)
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.patch("/terminals/abcd1234/metadata", json={"metadata": None})
+
+            assert response.status_code == 200
+            mock_svc.update_metadata.assert_called_once_with("abcd1234", None)
+
+
+class TestListSiblingsEndpoint:
+    """#432: GET /terminals/{id}/siblings.
+
+    ``terminal_id`` in the URL is the caller's own resolved identity (the MCP
+    ``list_siblings`` tool passes its own CAO_TERMINAL_ID here) -- this
+    endpoint only ever compares against that terminal's own persisted group.
+    """
+
+    def test_list_siblings_success(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.return_value = _terminal_dict(group=["tenant_1"])
+            mock_svc.list_siblings.return_value = [
+                {"id": "sib-1", "group": ["tenant_1"], "metadata": {"task": "x"}}
+            ]
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.get("/terminals/abcd1234/siblings")
+
+            assert response.status_code == 200
+            assert response.json() == [
+                {"id": "sib-1", "group": ["tenant_1"], "metadata": {"task": "x"}}
+            ]
+            mock_svc.list_siblings.assert_called_once_with(
+                "abcd1234", depth=None, cross_session=False
+            )
+
+    def test_list_siblings_passes_depth_through(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.return_value = _terminal_dict(group=["tenant_1", "project_5"])
+            mock_svc.list_siblings.return_value = []
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.get("/terminals/abcd1234/siblings", params={"depth": 2})
+
+            assert response.status_code == 200
+            mock_svc.list_siblings.assert_called_once_with("abcd1234", depth=2, cross_session=False)
+
+    def test_list_siblings_cross_session_defaults_to_false(self, client):
+        """Issue #432 design discussion: session-scoped by default."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.return_value = _terminal_dict(group=["tenant_1"])
+            mock_svc.list_siblings.return_value = []
+
+            client.get("/terminals/abcd1234/siblings")
+
+            mock_svc.list_siblings.assert_called_once_with(
+                "abcd1234", depth=None, cross_session=False
+            )
+
+    def test_list_siblings_cross_session_true_is_forwarded(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.return_value = _terminal_dict(group=["tenant_1"])
+            mock_svc.list_siblings.return_value = []
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.get("/terminals/abcd1234/siblings", params={"cross_session": "true"})
+
+            assert response.status_code == 200
+            mock_svc.list_siblings.assert_called_once_with(
+                "abcd1234", depth=None, cross_session=True
+            )
+
+    def test_list_siblings_depth_zero_rejected(self, client):
+        """#432: depth can never be 0 (an unscoped, all-terminals query) --
+        rejected at the API boundary rather than silently reinterpreted."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.return_value = _terminal_dict(group=["tenant_1"])
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.get("/terminals/abcd1234/siblings", params={"depth": 0})
+
+            assert response.status_code == 422
+            mock_svc.list_siblings.assert_not_called()
+
+    def test_list_siblings_negative_depth_rejected(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.return_value = _terminal_dict(group=["tenant_1"])
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.get("/terminals/abcd1234/siblings", params={"depth": -1})
+
+            assert response.status_code == 422
+            mock_svc.list_siblings.assert_not_called()
+
+    def test_list_siblings_terminal_not_found(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.side_effect = ValueError("Terminal 'deadbeef' not found")
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.get("/terminals/deadbeef/siblings")
+
+            assert response.status_code == 404
+            mock_svc.list_siblings.assert_not_called()
+
+    def test_list_siblings_no_group_returns_empty_not_error(self, client):
+        """A terminal that exists but has no group set finds no siblings --
+        this is a 200 with an empty list, not an error (#432)."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.return_value = _terminal_dict(group=None)
+            mock_svc.list_siblings.return_value = []
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.get("/terminals/abcd1234/siblings")
+
+            assert response.status_code == 200
+            assert response.json() == []
+
+
+class TestGroupSizeCap:
+    """call-me-ram, PR #433 review: group elements/count are agent-writable
+    (via update_group) and must be capped -- an uncapped array lets a worker
+    grow the terminals.group TEXT column arbitrarily, amplified into every
+    sibling's list_siblings response."""
+
+    def test_group_at_cap_accepted(self, client):
+        group = [f"g{i}" for i in range(TERMINAL_GROUP_MAX_ELEMENTS)]
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(group=group)
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.patch("/terminals/abcd1234/group", json={"group": group})
+
+            assert response.status_code == 200
+            mock_svc.update_group.assert_called_once_with("abcd1234", group)
+
+    def test_group_over_element_count_cap_rejected(self, client):
+        group = [f"g{i}" for i in range(TERMINAL_GROUP_MAX_ELEMENTS + 1)]
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.patch("/terminals/abcd1234/group", json={"group": group})
+
+            assert response.status_code == 422
+            mock_svc.update_group.assert_not_called()
+
+    def test_group_element_at_length_cap_accepted(self, client):
+        element = "x" * TERMINAL_GROUP_ELEMENT_MAX_LEN
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(group=[element])
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.patch("/terminals/abcd1234/group", json={"group": [element]})
+
+            assert response.status_code == 200
+
+    def test_group_element_over_length_cap_rejected(self, client):
+        element = "x" * (TERMINAL_GROUP_ELEMENT_MAX_LEN + 1)
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.patch("/terminals/abcd1234/group", json={"group": [element]})
+
+            assert response.status_code == 422
+            mock_svc.update_group.assert_not_called()
+
+    def test_empty_group_not_subject_to_caps(self, client):
+        """Clearing the group ([]/null) must never be rejected by the caps
+        meant for growth, not clearing."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(group=None)
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.patch("/terminals/abcd1234/group", json={"group": []})
+
+            assert response.status_code == 200
+
+    def test_create_session_group_over_cap_rejected_with_422(self, client):
+        group = [f"g{i}" for i in range(TERMINAL_GROUP_MAX_ELEMENTS + 1)]
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={"provider": "kiro_cli", "agent_profile": "developer"},
+                json={"group": group},
+            )
+
+            assert response.status_code == 422
+            mock_svc.create_session.assert_not_called()
+
+
+class TestMetadataSizeCap:
+    """call-me-ram, PR #433 review: metadata is a raw agent-writable
+    Dict[str, Any] (via update_metadata) and must be capped by encoded
+    bytes, following the WORKFLOW_MAX_SPEC_BYTES precedent."""
+
+    def test_metadata_at_byte_cap_accepted(self, client):
+        # Reserve room for the JSON envelope (quotes, braces, key) so the
+        # encoded dict lands at (not under) the cap.
+        padding = "x" * (TERMINAL_METADATA_MAX_BYTES - len('{"k": ""}'))
+        metadata = {"k": padding}
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_metadata.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(metadata=metadata)
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.patch("/terminals/abcd1234/metadata", json={"metadata": metadata})
+
+            assert response.status_code == 200
+
+    def test_metadata_over_byte_cap_rejected(self, client):
+        padding = "x" * TERMINAL_METADATA_MAX_BYTES
+        metadata = {"k": padding}
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.patch("/terminals/abcd1234/metadata", json={"metadata": metadata})
+
+            assert response.status_code == 422
+            mock_svc.update_metadata.assert_not_called()
+
+    def test_empty_metadata_not_subject_to_cap(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_metadata.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(metadata=None)
+
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+
+            response = client.patch("/terminals/abcd1234/metadata", json={"metadata": {}})
+
+            assert response.status_code == 200
+
+    def test_create_session_metadata_over_cap_rejected_with_422(self, client):
+        metadata = {"k": "x" * TERMINAL_METADATA_MAX_BYTES}
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={"provider": "kiro_cli", "agent_profile": "developer"},
+                json={"metadata": metadata},
+            )
+
+            assert response.status_code == 422
+            mock_svc.create_session.assert_not_called()

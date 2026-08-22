@@ -75,9 +75,116 @@ def generate_terminal_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
-def generate_window_name(agent_profile: str) -> str:
-    """Generate window name from agent profile with unique suffix."""
+def generate_window_name(agent_profile: str, terminal_id: str | None = None) -> str:
+    """Generate window name from agent profile with unique suffix.
+
+    When *terminal_id* is provided the window name is
+    ``{agent_profile}-{terminal_id}`` (fx155 — the visible suffix *is* the
+    terminal id). If the composed name would exceed 64 chars the **profile**
+    is truncated; the id is never shortened.
+
+    Without a *terminal_id* the legacy ``{agent_profile}-{uuid4_hex[:4]}``
+    format is used (backwards-compatible default for callers that don't yet
+    pass the id).
+
+    Raises:
+        ValueError: If *agent_profile* is empty (either on entry or after
+            truncation for the terminal_id path).
+    """
+    if not agent_profile:
+        raise ValueError("agent_profile must not be empty")
+
+    if terminal_id is not None:
+        max_profile_len = 64 - 1 - len(terminal_id)
+        truncated_profile = agent_profile[:max_profile_len]
+        if not truncated_profile:
+            raise ValueError("agent_profile must not be empty")
+        return validate_tmux_name(f"{truncated_profile}-{terminal_id}", "window_name")
+
     return validate_tmux_name(f"{agent_profile}-{uuid.uuid4().hex[:4]}", "window_name")
+
+
+# ─── F172: display_name + input resolver ───────────────────────────────────
+
+_RAW_TERMINAL_ID_RE = re.compile(r"^[a-f0-9]{8}$")
+
+
+def display_name(terminal_id: str, profile: str | None = None) -> str:
+    """Return the user-visible display form for a terminal.
+
+    The display form is ``<profile>-<id>`` — the same string the tmux status
+    bar shows.  When *profile* is not supplied, the DB is consulted (best-
+    effort; falls back to bare id on failure).
+    """
+    if profile:
+        return f"{profile}-{terminal_id}"
+    try:
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+        metadata = get_terminal_metadata(terminal_id)
+        if metadata:
+            prof = metadata.get("agent_profile")
+            if prof:
+                return f"{prof}-{terminal_id}"
+    except Exception:
+        pass
+    return terminal_id
+
+
+def resolve_terminal_id(value: str) -> str:
+    """Resolve a user-supplied terminal identifier to a raw 8-char hex id.
+
+    Accepts:
+      - A raw 8-char hex id (``[a-f0-9]{8}``): returned as-is.
+      - A display form (``<profile>-<suffix>``): the trailing 8-char hex
+        segment after the last hyphen is extracted and validated against the
+        DB. If the suffix is a known terminal id, it is returned.
+      - Anything else: returned unchanged (the API will reject it with a
+        proper 404/400 if invalid).
+
+    Raises:
+      ValueError: with a descriptive message when a display-form pattern is
+        detected (trailing 8-hex after last dash) but the terminal doesn't
+        exist or the profile prefix conflicts.
+    """
+    value = value.strip()
+    # Fast path: already a raw id.
+    if _RAW_TERMINAL_ID_RE.fullmatch(value):
+        return value
+
+    # Display-form path: extract the trailing 8-hex-char suffix.
+    last_dash = value.rfind("-")
+    if last_dash < 1:
+        # Not a display form — pass through (could be a mailbox id or other).
+        return value
+    candidate_id = value[last_dash + 1:]
+    if not _RAW_TERMINAL_ID_RE.fullmatch(candidate_id):
+        # Suffix isn't a valid hex id — not a display form, pass through.
+        return value
+    # Validate the candidate exists and the profile prefix matches.
+    try:
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+        metadata = get_terminal_metadata(candidate_id)
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot resolve terminal identifier {value!r}: database lookup failed ({exc})."
+        ) from exc
+    if not metadata:
+        raise ValueError(
+            f"Cannot resolve terminal identifier {value!r}: no terminal with id "
+            f"{candidate_id!r} exists."
+        )
+    expected_profile = value[:last_dash]
+    actual_profile = metadata.get("agent_profile") or ""
+    if actual_profile and expected_profile and actual_profile != expected_profile:
+        # Allow truncated profile (from generate_window_name's 64-char cap).
+        if not actual_profile.startswith(expected_profile):
+            raise ValueError(
+                f"Cannot resolve terminal identifier {value!r}: terminal {candidate_id} "
+                f"has profile {actual_profile!r}, not {expected_profile!r}."
+            )
+    return candidate_id
 
 
 def _resolve_window(terminal_id: str) -> "tuple[str, str] | None":

@@ -32,12 +32,20 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 logger = logging.getLogger(__name__)
+
+
+def _ar_display_name(terminal_id: str, metadata: Dict[str, Any]) -> str:
+    """F172: Return display form for auto-responder messages."""
+    profile = metadata.get("agent_profile") or metadata.get("profile")
+    if profile:
+        return f"{profile}-{terminal_id}"
+    return terminal_id
 
 AUTO_ANSWER_DIR = CAO_HOME_DIR / "auto-answers"
 AUTO_ANSWER_LOG_DIR = CAO_HOME_DIR / "logs" / "auto-answers"
@@ -49,6 +57,20 @@ KEY_DELAY_S = 0.1
 UNKNOWN_DIALOG_PUSH_FLOOR_S = 300.0
 UNKNOWN_DIALOG_PAYLOAD_CHARS = 600
 DIALOG_PROXIMITY_CHARS = 200
+DIALOG_REGION_LINES = 15
+
+# F86: Known permission/AskUserQuestion patterns — these are interactive prompts
+# from the host CLI (claude_code, kiro) that should NOT trigger unknown-dialog
+# escalation. The auto-responder returns WAITING_USER_ANSWER without pushing.
+_PERMISSION_PROMPT_PATTERNS = (
+    re.compile(r"Select an option", re.IGNORECASE),
+    re.compile(r"Use arrow keys", re.IGNORECASE),
+    re.compile(r"[↑↓].*to navigate.*[↵⏎].*to select", re.IGNORECASE),
+    re.compile(r"Yes, I trust this folder"),
+    re.compile(r"Yes, I accept"),
+    re.compile(r"Allow (?:once|always)", re.IGNORECASE),
+    re.compile(r"\[y/n(?:/t)?\]"),
+)
 
 # Seed rule files, created only if absent -- never overwritten. Keys are the
 # provider filename (``<provider>.yaml``); values are the verbatim YAML from
@@ -84,6 +106,24 @@ def normalize_screen(lines: List[str]) -> str:
     """
     text = " ".join(lines)
     return re.sub(r"\s+", " ", text).strip()
+
+
+@dataclass(frozen=True)
+class DialogRegion:
+    rows: tuple[str, ...]
+    normalized: str
+
+
+def dialog_region(screen: List[str]) -> DialogRegion:
+    """Return the rendered dialog-bearing tail without normalizing provider input."""
+    end = len(screen)
+    while end and not screen[end - 1].strip():
+        end -= 1
+    rows = tuple(screen[max(0, end - DIALOG_REGION_LINES) : end])
+    return DialogRegion(rows=rows, normalized=normalize_screen(list(rows)))
+
+
+TerminalIncarnation = tuple[int, int, str, str]
 
 
 def _rules_path(provider: str) -> Path:
@@ -212,6 +252,8 @@ class AutoResponder:
         self._unknown_state: Dict[str, _UnknownDialogState] = {}
         self._wait_rule_active: Dict[str, tuple[str, float]] = {}
         self._retry_exhausted: set[str] = set()
+        self._terminal_generation: Dict[str, int] = {}
+        self._exit_suppressed: set[str] = set()
 
     def _waiting_gate_locked(self, terminal_id: str) -> str | tuple[str, str] | None:
         state = self._unknown_state.get(terminal_id)
@@ -259,10 +301,39 @@ class AutoResponder:
                 pass
 
     def clear_terminal(self, terminal_id: str) -> None:
+        """Clear engine state without acquiring the non-reentrant delivery lock."""
         with self._lock:
+            self._terminal_generation[terminal_id] = (
+                self._terminal_generation.get(terminal_id, 0) + 1
+            )
             self._wait_rule_active.pop(terminal_id, None)
             self._retry_exhausted.discard(terminal_id)
             self._unknown_state.pop(terminal_id, None)
+            self._exit_suppressed.discard(terminal_id)
+            for key in [key for key in self._rule_state if key[0] == terminal_id]:
+                self._rule_state.pop(key, None)
+
+    def mark_exit_suppress(self, terminal_id: str) -> None:
+        """Suppress all on_screen effects for a terminal that is exiting (Layer B).
+
+        Called from exit_terminal_cli after successfully sending the exit command.
+        Cleared on re-register (rebind) or clear_terminal (delete).
+        """
+        with self._lock:
+            self._exit_suppressed.add(terminal_id)
+
+    def unmark_exit_suppress(self, terminal_id: str) -> None:
+        """Remove exit suppression, e.g. after rebind re-register.
+
+        Allows a rebound terminal to resume receiving auto-responder scans.
+        """
+        with self._lock:
+            self._exit_suppressed.discard(terminal_id)
+
+    def is_exit_suppressed(self, terminal_id: str) -> bool:
+        """Check if a terminal is exit-suppressed (for testing)."""
+        with self._lock:
+            return terminal_id in self._exit_suppressed
 
     def _clear_wait_rule(self, terminal_id: str) -> None:
         with self._lock:
@@ -299,6 +370,11 @@ class AutoResponder:
         from cli_agent_orchestrator.clients.database import get_terminal_metadata
         from cli_agent_orchestrator.services.session_env import get_session_env
 
+        # Layer B (F115): suppress all on_screen effects after exit.
+        with self._lock:
+            if terminal_id in self._exit_suppressed:
+                return None
+
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             self._clear_wait_rule(terminal_id)
@@ -320,42 +396,55 @@ class AutoResponder:
             return None
 
         provider_name = metadata["provider"]
-        normalized = normalize_screen(lines)
-        if not normalized:
+        region = dialog_region(lines)
+        if not region.normalized:
             self._clear_wait_rule(terminal_id)
             return None
+        supplied_status = self._classify_region(terminal_id, provider, region)
+        incarnation = self._snapshot_incarnation(terminal_id, metadata)
 
         for rule in _store.get_rules(provider_name):
-            if not rule.matches(normalized):
+            if not rule.matches(region.normalized):
                 continue
             if rule.is_wait:
                 fresh = self._capture_for_analysis(metadata, lines, terminal_id, provider)
                 if fresh is None:
                     return None
-                if isinstance(fresh, AutoResponderDecision):
-                    fresh_normalized = fresh.normalized
-                    fresh_status = fresh.status
-                else:
-                    fresh_normalized, fresh_lines = fresh
-                    try:
-                        fresh_status = provider.get_status_from_screen(fresh_lines)
-                    except Exception:
-                        return None
-                if not rule.matches(fresh_normalized) or fresh_status == TerminalStatus.UNKNOWN:
+                fresh_region = self._region_from_capture(fresh)
+                if not rule.matches(fresh_region.normalized):
                     return None
                 with self._lock:
                     self._wait_rule_active[terminal_id] = (rule.name, time.monotonic())
                 return TerminalStatus.WAITING_USER_ANSWER
+            if self._busy_veto(supplied_status):
+                continue
+            if not self._corroborates_fire(region, supplied_status):
+                continue
             self._clear_wait_rule(terminal_id)
             state = self._state_for(terminal_id, rule.name)
             if time.monotonic() < state.cooldown_until:
                 return None  # redraw double-fire guard
-            self._fire(terminal_id, metadata, provider, rule, normalized, state)
+            self._fire(
+                terminal_id,
+                metadata,
+                provider,
+                rule,
+                region.normalized,
+                state,
+                incarnation,
+            )
             return None
 
         self._clear_wait_rule(terminal_id)
         return self._check_unknown(
-            terminal_id, metadata, provider_name, provider, lines, normalized
+            terminal_id,
+            metadata,
+            provider_name,
+            provider,
+            lines,
+            region,
+            supplied_status,
+            incarnation,
         )
 
     # ----- rule firing ---------------------------------------------------
@@ -377,15 +466,17 @@ class AutoResponder:
         rule: Rule,
         normalized: str,
         state: _RuleState,
+        incarnation: TerminalIncarnation,
     ) -> bool:
         if not self._effect_barrier(terminal_id, metadata, provider, rule):
             return False
-        self._send_answer(metadata, rule)
+        if not self._send_answer(terminal_id, metadata, rule, incarnation):
+            return False
         self._log(terminal_id, rule, "fired", normalized)
         state.cooldown_until = time.monotonic() + COOLDOWN_S
         threading.Thread(
             target=self._verify_and_retry,
-            args=(terminal_id, metadata, provider, rule, state),
+            args=(terminal_id, metadata, provider, rule, state, incarnation),
             daemon=True,
         ).start()
         return True
@@ -397,42 +488,63 @@ class AutoResponder:
         provider: Any,
         rule: Rule,
         state: _RuleState,
+        incarnation: TerminalIncarnation,
     ) -> None:
         """Runs off the event-loop thread: 1s-later recheck, retry <=3 total fires."""
         for attempt in range(2, RETRY_MAX + 1):
             time.sleep(RETRY_DELAY_S)
-            normalized = self._current_normalized(terminal_id)
-            if normalized is None or not rule.matches(normalized):
+            if not self._incarnation_is_current(terminal_id, incarnation):
+                return
+            region = self._current_normalized(terminal_id)
+            if region is None or not rule.matches(region.normalized):
                 return
             if not self._effect_barrier(terminal_id, metadata, provider, rule):
                 return
-            self._send_answer(metadata, rule)
-            self._log(terminal_id, rule, f"retry-{attempt}", normalized)
+            if not self._send_answer(terminal_id, metadata, rule, incarnation):
+                return
+            self._log(terminal_id, rule, f"retry-{attempt}", region.normalized)
             state.cooldown_until = time.monotonic() + COOLDOWN_S
 
         time.sleep(RETRY_DELAY_S)
-        normalized = self._current_normalized(terminal_id)
-        if normalized is not None and rule.matches(normalized):
-            self._surface_retry_exhausted(terminal_id, metadata, rule, provider)
+        if not self._incarnation_is_current(terminal_id, incarnation):
+            return
+        region = self._current_normalized(terminal_id)
+        if region is not None and rule.matches(region.normalized):
+            self._surface_retry_exhausted(terminal_id, metadata, rule, provider, incarnation)
 
     @staticmethod
-    def _current_normalized(terminal_id: str) -> Optional[str]:
+    def _current_normalized(terminal_id: str) -> Optional[DialogRegion]:
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         lines = status_monitor.get_rendered_screen(terminal_id)
         if lines is None:
             return None
-        return normalize_screen(lines)
+        return dialog_region(lines)
 
-    @staticmethod
-    def _send_answer(metadata: Dict[str, Any], rule: Rule) -> None:
+    def _send_answer(
+        self,
+        terminal_id: str,
+        metadata: Dict[str, Any],
+        rule: Rule,
+        incarnation: TerminalIncarnation,
+    ) -> bool:
         from cli_agent_orchestrator.backends.registry import get_backend
 
         backend = get_backend()
         for i, key in enumerate(rule.answer):
             if i > 0:
                 time.sleep(KEY_DELAY_S)
-            backend.send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
+
+            def send_key(key: str = key) -> None:
+                backend.send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
+
+            if not self._run_fenced_effect(
+                terminal_id,
+                incarnation,
+                send_key,
+            ):
+                return False
+        return True
 
     @staticmethod
     def _log(terminal_id: str, rule: Rule, event: str, normalized: str) -> None:
@@ -452,19 +564,27 @@ class AutoResponder:
         metadata: Dict[str, Any],
         rule: Rule,
         provider: Any = None,
+        incarnation: TerminalIncarnation | None = None,
     ) -> None:
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
+        incarnation = incarnation or self._snapshot_incarnation(terminal_id, metadata)
         if not self._effect_barrier(terminal_id, metadata, provider, rule):
             return
-        status_monitor.force_status(terminal_id, TerminalStatus.WAITING_USER_ANSWER)
-        with self._lock:
-            self._retry_exhausted.add(terminal_id)
+
+        def surface() -> None:
+            status_monitor.force_status(terminal_id, TerminalStatus.WAITING_USER_ANSWER)
+            with self._lock:
+                self._retry_exhausted.add(terminal_id)
+
+        if not self._run_fenced_effect(terminal_id, incarnation, surface):
+            return
         self._push(
             terminal_id,
             metadata,
-            f"[auto-responder] rule '{rule.name}' fired {RETRY_MAX}x on terminal "
-            f"{terminal_id} but the dialog persists. Manual attention needed.",
+            f"[auto-responder] rule '{rule.name}' fired {RETRY_MAX}x on "
+            f"{_ar_display_name(terminal_id, metadata)} but the dialog persists. Manual attention needed.",
+            incarnation,
         )
 
     # ----- unknown-dialog heuristic ---------------------------------------
@@ -476,59 +596,49 @@ class AutoResponder:
         provider_name: str,
         provider: Any,
         lines: List[str],
-        normalized: str,
+        region: DialogRegion,
+        supplied_status: TerminalStatus | None,
+        incarnation: TerminalIncarnation,
     ) -> Optional[TerminalStatus]:
-        is_suspect = self._looks_like_dialog(normalized, provider_name)
-        if is_suspect:
-            try:
-                status = provider.get_status_from_screen(lines)
-                is_suspect = status in (
+        # F86: exempt known permission/AskUserQuestion prompts — return
+        # WAITING_USER_ANSWER without escalating to the supervisor.
+        if any(pat.search(region.normalized) for pat in _PERMISSION_PROMPT_PATTERNS):
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        shape_suspect = self._looks_like_dialog(region.normalized, provider_name)
+        is_suspect = supplied_status == TerminalStatus.WAITING_USER_ANSWER or (
+            shape_suspect
+            and (
+                supplied_status is None
+                or supplied_status
+                in (
                     TerminalStatus.WAITING_USER_ANSWER,
                     TerminalStatus.UNKNOWN,
                     TerminalStatus.ERROR,
                 )
-            except Exception:
-                logger.debug(
-                    "auto-responder: provider status parse failed for %s",
-                    terminal_id,
-                    exc_info=True,
-                )
+            )
+        )
 
         if not is_suspect:
+            if shape_suspect:
+                return self._record_unknown_nonclean_tick(terminal_id)
             return self._record_unknown_clean_tick(terminal_id)
 
         fresh = self._capture_for_analysis(metadata, lines, terminal_id, provider)
         if fresh is None:
             return None
-        if isinstance(fresh, AutoResponderDecision):
-            fresh_normalized = fresh.normalized
-            fresh_lines = list(fresh.lines)
-            fresh_status = fresh.status
-        else:
-            fresh_normalized, fresh_lines = fresh
-            fresh_status = None
-        is_suspect = self._looks_like_dialog(fresh_normalized, provider_name)
-        if is_suspect:
-            try:
-                status = (
-                    fresh_status
-                    if fresh_status is not None
-                    else provider.get_status_from_screen(fresh_lines)
-                )
-                is_suspect = status in (
-                    TerminalStatus.WAITING_USER_ANSWER,
-                    TerminalStatus.ERROR,
-                )
-            except Exception:
-                logger.debug(
-                    "auto-responder: fresh provider status parse failed for %s",
-                    terminal_id,
-                    exc_info=True,
-                )
-                is_suspect = False
+        fresh_region = self._region_from_capture(fresh)
+        fresh_status = self._classify_region(terminal_id, provider, fresh_region)
+        fresh_shape_suspect = self._looks_like_dialog(fresh_region.normalized, provider_name)
+        is_suspect = fresh_status == TerminalStatus.WAITING_USER_ANSWER or (
+            fresh_shape_suspect
+            and fresh_status in (TerminalStatus.WAITING_USER_ANSWER, TerminalStatus.ERROR)
+        )
         if not is_suspect:
+            if fresh_shape_suspect:
+                return self._record_unknown_nonclean_tick(terminal_id)
             return self._record_unknown_clean_tick(terminal_id)
-        normalized = fresh_normalized
+        normalized = fresh_region.normalized
 
         now = time.monotonic()
         with self._lock:
@@ -544,18 +654,41 @@ class AutoResponder:
                 state.last_push_at = now
 
         if should_push:
+            # Layer A (F115): last-line recheck before push — validate metadata
+            # still present, terminal not suppressed, and incarnation current.
+            from cli_agent_orchestrator.clients.database import get_terminal_metadata as _get_meta
+
+            recheck_meta = _get_meta(terminal_id)
+            if recheck_meta is None:
+                return TerminalStatus.WAITING_USER_ANSWER
+            with self._lock:
+                if terminal_id in self._exit_suppressed:
+                    return TerminalStatus.WAITING_USER_ANSWER
+            recheck_incarnation = self._snapshot_incarnation(terminal_id, recheck_meta)
+            if recheck_incarnation != incarnation:
+                return TerminalStatus.WAITING_USER_ANSWER
+
             dialog_text = self._payload_excerpt(normalized)
             self._push(
                 terminal_id,
                 metadata,
-                "[auto-responder] unknown blocking dialog on terminal "
-                f"{terminal_id} (provider={provider_name}); no rule matched, the "
+                f"[auto-responder] unknown blocking dialog on "
+                f"{_ar_display_name(terminal_id, metadata)} (provider={provider_name}); no rule matched, the "
                 "worker is stalled. Ask the user how to answer it (auto-answer "
                 "default / other keys / always wait), then append a rule to "
                 f"~/.aws/cli-agent-orchestrator/auto-answers/{provider_name}.yaml.\n\n"
                 f"Dialog text (normalized): {dialog_text}",
+                incarnation,
             )
         return TerminalStatus.WAITING_USER_ANSWER
+
+    def _record_unknown_nonclean_tick(self, terminal_id: str) -> Optional[TerminalStatus]:
+        """Suppress a non-WAITING shaped frame without counting it as clean."""
+        with self._lock:
+            state = self._unknown_state.get(terminal_id)
+            if state and state.episode_open:
+                return TerminalStatus.WAITING_USER_ANSWER
+        return None
 
     def _record_unknown_clean_tick(self, terminal_id: str) -> Optional[TerminalStatus]:
         """Apply the existing two-clean-tick close rule to a confirmed clean frame."""
@@ -693,30 +826,116 @@ class AutoResponder:
             return self._capture_fresh(metadata, lines, terminal_id, provider)
         return self._capture_fresh(metadata, lines)
 
-    @classmethod
     def _effect_barrier(
-        cls,
+        self,
         terminal_id: str,
         metadata: Dict[str, Any],
         provider: Any,
         rule: Rule,
     ) -> bool:
-        from cli_agent_orchestrator.backends.registry import get_backend
-        from cli_agent_orchestrator.services.seam_activation import receiver_state_active
-
-        if (
-            not receiver_state_active("auto_responder.frame_classify")
-            or get_backend().supports_event_inbox()
-        ):
-            return True
         if provider is None:
             return False
-        fresh = cls._capture_fresh(metadata, [], terminal_id, provider)
+        fresh = self._capture_for_analysis(metadata, [], terminal_id, provider)
+        if fresh is None:
+            return False
+        region = self._region_from_capture(fresh)
+        status = self._classify_region(terminal_id, provider, region)
         return (
-            isinstance(fresh, AutoResponderDecision)
-            and rule.matches(fresh.normalized)
-            and fresh.status != TerminalStatus.UNKNOWN
+            rule.matches(region.normalized)
+            and not self._busy_veto(status)
+            and self._corroborates_fire(region, status)
         )
+
+    @staticmethod
+    def _region_from_capture(
+        capture: tuple[str, List[str]] | AutoResponderDecision,
+    ) -> DialogRegion:
+        if isinstance(capture, AutoResponderDecision):
+            return dialog_region(list(capture.lines))
+        return dialog_region(capture[1])
+
+    @staticmethod
+    def _classify_region(
+        terminal_id: str, provider: Any, region: DialogRegion
+    ) -> TerminalStatus | None:
+        try:
+            status = provider.get_status_from_screen(list(region.rows))
+            return status if isinstance(status, TerminalStatus) else None
+        except Exception:
+            logger.debug(
+                "auto-responder: provider region status parse failed for %s",
+                terminal_id,
+                exc_info=True,
+            )
+            return None
+
+    @classmethod
+    def _corroborates_fire(cls, region: DialogRegion, status: TerminalStatus | None) -> bool:
+        return status == TerminalStatus.WAITING_USER_ANSWER or cls._has_dialog_proximity(
+            region.normalized
+        )
+
+    @staticmethod
+    def _busy_veto(status: TerminalStatus | None) -> bool:
+        return status == TerminalStatus.PROCESSING
+
+    def _snapshot_incarnation(
+        self, terminal_id: str, metadata: Dict[str, Any]
+    ) -> TerminalIncarnation:
+        with self._lock:
+            engine_generation = self._terminal_generation.get(terminal_id, 0)
+        return (
+            engine_generation,
+            int(metadata.get("lifecycle_generation", 0)),
+            str(metadata["tmux_session"]),
+            str(metadata["tmux_window"]),
+        )
+
+    def _incarnation_matches_under_delivery_lock(
+        self, terminal_id: str, expected: TerminalIncarnation
+    ) -> bool:
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+        metadata = get_terminal_metadata(terminal_id)
+        if metadata is None:
+            return False
+        with self._lock:
+            engine_generation = self._terminal_generation.get(terminal_id, 0)
+        current = (
+            engine_generation,
+            int(metadata.get("lifecycle_generation", 0)),
+            str(metadata["tmux_session"]),
+            str(metadata["tmux_window"]),
+        )
+        return current == expected
+
+    def _incarnation_is_current(self, terminal_id: str, expected: TerminalIncarnation) -> bool:
+        from cli_agent_orchestrator.services.inbox_service import get_delivery_lock
+
+        delivery_lock = get_delivery_lock(terminal_id)
+        delivery_lock.acquire()
+        try:
+            return self._incarnation_matches_under_delivery_lock(terminal_id, expected)
+        finally:
+            delivery_lock.release()
+
+    def _run_fenced_effect(
+        self,
+        terminal_id: str,
+        expected: TerminalIncarnation,
+        effect: Callable[[], None],
+    ) -> bool:
+        from cli_agent_orchestrator.services.inbox_service import get_delivery_lock
+
+        delivery_lock = get_delivery_lock(terminal_id)
+        delivery_lock.acquire()
+        try:
+            if not self._incarnation_matches_under_delivery_lock(terminal_id, expected):
+                return False
+            effect()
+            return True
+        finally:
+            delivery_lock.release()
 
     @staticmethod
     def _payload_excerpt(normalized: str) -> str:
@@ -731,6 +950,10 @@ class AutoResponder:
 
             if re.search(WAITING_PROMPT_PATTERN, normalized):
                 return True
+        return AutoResponder._has_dialog_proximity(normalized)
+
+    @staticmethod
+    def _has_dialog_proximity(normalized: str) -> bool:
         numbered_options = list(_NUMBERED_OPTION_PATTERN.finditer(normalized))
         for press_enter in _PRESS_ENTER_PATTERN.finditer(normalized):
             candidates = [
@@ -747,16 +970,47 @@ class AutoResponder:
 
     @staticmethod
     def _find_supervisor(session_name: str) -> Optional[str]:
+        """F203 D19: Role-based supervisor identity resolver.
+
+        Returns the terminal_id of the supervisor-role terminal in the session.
+        Uses agent_profile (role marker) instead of the fragile provider-first
+        heuristic that breaks with multiple claude_code terminals (F196/F205).
+
+        Falls back to provider == "claude_code" only if no role-marked terminal
+        exists (backward compat for sessions created before role tagging).
+        """
         from cli_agent_orchestrator.clients.database import list_terminals_by_session
 
-        for terminal in list_terminals_by_session(session_name):
+        terminals = list_terminals_by_session(session_name)
+
+        # Primary: role-based lookup
+        supervisor_profiles = {"supervisor", "code_supervisor", "chao_supervisor"}
+        for terminal in terminals:
+            profile = terminal.get("agent_profile", "")
+            if profile in supervisor_profiles:
+                return terminal["id"]
+
+        # Fallback: first terminal with no caller_id and provider claude_code
+        # (a supervisor has no caller; workers always have one)
+        for terminal in terminals:
+            if terminal.get("caller_id") is None and terminal["provider"] == "claude_code":
+                return terminal["id"]
+
+        # Legacy fallback: first claude_code terminal
+        for terminal in terminals:
             if terminal["provider"] == "claude_code":
                 return terminal["id"]
+
         return None
 
-    def _push(self, terminal_id: str, metadata: Dict[str, Any], message: str) -> None:
-        from cli_agent_orchestrator.clients.database import create_inbox_message
-        from cli_agent_orchestrator.services.inbox_service import inbox_service
+    def _push(
+        self,
+        terminal_id: str,
+        metadata: Dict[str, Any],
+        message: str,
+        incarnation: TerminalIncarnation | None = None,
+    ) -> None:
+        from cli_agent_orchestrator.services.mailbox_service import create_routed_inbox_message
 
         supervisor_id = self._find_supervisor(metadata["tmux_session"])
         if not supervisor_id:
@@ -769,9 +1023,18 @@ class AutoResponder:
         if supervisor_id == terminal_id:
             logger.warning("auto-responder: refusing to push terminal %s to itself", terminal_id)
             return
+        incarnation = incarnation or self._snapshot_incarnation(terminal_id, metadata)
         try:
-            create_inbox_message(terminal_id, supervisor_id, message)
-            inbox_service.deliver_pending(supervisor_id, registry=None)
+
+            def publish() -> None:
+                # F136-D6/D17: routed supervisor push (no inline deliver_pending)
+                create_routed_inbox_message(terminal_id, supervisor_id, message)
+
+            self._run_fenced_effect(
+                terminal_id,
+                incarnation,
+                publish,
+            )
         except Exception:
             logger.exception("auto-responder: failed to push to supervisor %s", supervisor_id)
 

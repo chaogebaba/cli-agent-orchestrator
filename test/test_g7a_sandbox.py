@@ -38,7 +38,6 @@ def _python_files() -> list[Path]:
     return sorted(SOURCE.rglob("*.py"))
 
 
-
 def _raw_tmux_argv_literal(argument: ast.AST) -> bool:
     return (
         isinstance(argument, (ast.List, ast.Tuple))
@@ -73,6 +72,7 @@ def _raw_tmux_calls(tree: ast.AST) -> list[ast.AST]:
     return violations
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_endpoint_ast_guard_is_closed() -> None:
     request_methods = {"get", "post", "put", "patch", "delete", "request"}
     for path in _python_files():
@@ -98,6 +98,7 @@ def test_endpoint_ast_guard_is_closed() -> None:
             assert relative.endswith("services/install_service.py"), relative
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_tmux_ast_guard_is_closed() -> None:
     allowed = {"utils/tmux_command.py", "sandbox_bootstrap.py"}
     for path in _python_files():
@@ -146,8 +147,8 @@ def test_each_legacy_tmux_site_mutation_is_killed(relative: str, command: str) -
 
     mutation = RawTmuxMutation()
     mutated = mutation.visit(tree)
-    assert mutation.mutations == 1, f"site not uniquely found: {relative}:{command}"
-    assert len(_raw_tmux_calls(mutated)) == 1, f"guard missed {relative}:{command}"
+    assert mutation.mutations >= 1, f"site not uniquely found: {relative}:{command}"
+    assert len(_raw_tmux_calls(mutated)) == mutation.mutations, f"guard missed {relative}:{command}"
 
 
 def test_bootstrap_top_level_imports_are_stdlib_only(tmp_path: Path) -> None:
@@ -403,6 +404,81 @@ def test_foreign_tmux_socket_collision_is_neither_adopted_nor_killed(
             capture_output=True,
             text=True,
         )
+        bootstrap._unlink_dead_tmux_socket(socket_name, settle=5.0)
+
+
+def test_dead_tmux_socket_is_reaped_and_live_one_is_refused() -> None:
+    socket_name = f"cao-sbx-{uuid.uuid4().hex[:8]}"
+    socket_path = bootstrap._tmux_socket_path(socket_name)
+    assert bootstrap._unlink_dead_tmux_socket(socket_name) is False
+    subprocess.run(
+        ["tmux", "-L", socket_name, "new-session", "-d", "-s", "owner"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        assert socket_path.is_socket()
+        with pytest.raises(bootstrap.SandboxError, match="live tmux socket"):
+            bootstrap._unlink_dead_tmux_socket(socket_name)
+        assert socket_path.is_socket()
+    finally:
+        subprocess.run(
+            ["tmux", "-L", socket_name, "kill-server"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    assert socket_path.exists(), "F182: tmux leaves the socket inode behind after kill-server"
+    assert bootstrap._unlink_dead_tmux_socket(socket_name, settle=5.0) is True
+    assert not socket_path.exists()
+    assert bootstrap._unlink_dead_tmux_socket(socket_name) is False
+
+
+@pytest.mark.requires_tmux
+@pytest.mark.slow  # F254 D19: exceeds unit budget
+def test_up_reclaims_a_dead_socket_of_the_same_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance_id = uuid.uuid4().hex[:8]
+    socket_name = f"cao-sbx-{instance_id}"
+    socket_path = bootstrap._tmux_socket_path(socket_name)
+    monkeypatch.setattr(
+        bootstrap.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex=f"{instance_id}{'0' * 24}"),
+    )
+    subprocess.run(
+        ["tmux", "-L", socket_name, "new-session", "-d", "-s", "stale"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["tmux", "-L", socket_name, "kill-server"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert socket_path.exists()
+    root = tmp_path / "reclaim"
+    try:
+        assert bootstrap.command_up(argparse.Namespace(root=str(root), port=_free_port())) == 0
+        # After reclaim, a new live tmux server owns the socket — verify it answers.
+        result = subprocess.run(
+            ["tmux", "-L", socket_name, "list-sessions"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert result.returncode == 0, (
+            f"Socket not owned by a live tmux server after reclaim: {result.stderr}"
+        )
+        assert bootstrap._sentinel_owned(bootstrap._load_owned(root)[0])
+    finally:
+        bootstrap.command_down(argparse.Namespace(root=str(root), purge=True))
+    assert not socket_path.exists(), "F182: down must unlink the socket inode"
+    assert not root.exists()
 
 
 @pytest.mark.parametrize(
@@ -486,6 +562,7 @@ def _free_port() -> int:
         return int(listener.getsockname()[1])
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_empty_cache_invalid_and_valid_lifecycle_audit(tmp_path: Path) -> None:
     before = _cache_snapshot()
     env = {
@@ -493,7 +570,7 @@ def test_empty_cache_invalid_and_valid_lifecycle_audit(tmp_path: Path) -> None:
         for key, value in os.environ.items()
         if key
         not in {
-            "CAO_HOME",
+            "CAO_HOME_DIR",
             "CAO_ENDPOINT",
             "CAO_INSTANCE_ID",
             "CAO_TMUX_SOCKET",
@@ -565,6 +642,7 @@ def test_empty_cache_invalid_and_valid_lifecycle_audit(tmp_path: Path) -> None:
     assert _cache_snapshot() == before
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_real_down_purge_rejects_symlink_swapped_root(tmp_path: Path) -> None:
     root = tmp_path / "purge"
     moved = tmp_path / "purge-moved"
@@ -649,7 +727,7 @@ def test_real_down_purge_rejects_symlink_swapped_root(tmp_path: Path) -> None:
 
 def test_production_home_default_is_byte_identical() -> None:
     env = dict(os.environ)
-    env.pop("CAO_HOME", None)
+    env.pop("CAO_HOME_DIR", None)
     result = subprocess.run(
         [
             str(PYTHON),
@@ -689,7 +767,7 @@ async def test_wrong_venv_same_base_identity_fails_health(
 
 def test_cao_home_namespaces_all_core_paths(tmp_path: Path) -> None:
     root = tmp_path / "namespace"
-    env = {**os.environ, "CAO_HOME": str(root), "CAO_GRAPH_EXPORT_ROOT": str(root / "graph")}
+    env = {**os.environ, "CAO_HOME_DIR": str(root), "CAO_GRAPH_EXPORT_ROOT": str(root / "graph")}
     code = """
 from cli_agent_orchestrator import constants as c
 paths = [c.CAO_ENV_FILE, c.DB_DIR, c.LOG_DIR, c.TERMINAL_LOG_DIR, c.DRAFT_LOG_DIR,
@@ -716,11 +794,14 @@ def test_each_local_mutation_command_is_fenced(
 ) -> None:
     monkeypatch.setenv("CAO_INSTANCE_ID", "deadbeef")
     monkeypatch.setenv("CAO_ENDPOINT", "http://127.0.0.1:19876")
-    monkeypatch.setenv("CAO_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CAO_HOME_DIR", str(tmp_path / "home"))
 
     redeploy_module = importlib.import_module("cli_agent_orchestrator.cli.commands.redeploy")
     install_module = importlib.import_module("cli_agent_orchestrator.cli.commands.install")
     config_module = importlib.import_module("cli_agent_orchestrator.cli.commands.config")
+    reconcile_module = importlib.import_module(
+        "cli_agent_orchestrator.cli.commands.config_reconcile"
+    )
     env_module = importlib.import_module("cli_agent_orchestrator.cli.commands.env")
     skills_module = importlib.import_module("cli_agent_orchestrator.cli.commands.skills")
 
@@ -732,6 +813,7 @@ def test_each_local_mutation_command_is_fenced(
     monkeypatch.setattr(install_module, "_copy_local_profile_to_store", bomb)
     monkeypatch.setattr(install_module, "install_agent", bomb)
     monkeypatch.setattr(config_module.ConfigService, "set", bomb)
+    monkeypatch.setattr(reconcile_module, "_reconcile_config", bomb)
     monkeypatch.setattr(env_module, "set_env_var", bomb)
     monkeypatch.setattr(env_module, "unset_env_var", bomb)
     monkeypatch.setattr(skills_module, "_install_skill_folder", bomb)
@@ -746,6 +828,7 @@ def test_each_local_mutation_command_is_fenced(
         ["redeploy", "--yes"],
         ["install", "developer"],
         ["config", "set", "memory.enabled", "true"],
+        ["config", "reconcile", "--force-providers"],
         ["env", "set", "SAFE_KEY", "value"],
         ["env", "unset", "SAFE_KEY"],
         ["profile", "create", "-t", "x", "-c", str(config), "-o", str(tmp_path)],

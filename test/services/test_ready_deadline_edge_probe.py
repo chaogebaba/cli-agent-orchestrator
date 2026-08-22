@@ -36,11 +36,13 @@ def isolated_db(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 async def test_ready_completion_at_deadline_has_one_lawful_owner(
     isolated_db, monkeypatch,
 ):
     original_do_commit = isolated_db.dialect.do_commit
     outcomes: list[str] = []
+    monkeypatch.setattr(terminals, "_confirm_launch_health", AsyncMock())
 
     for iteration in range(60):
         terminal_id = f"ready-edge-{iteration}"

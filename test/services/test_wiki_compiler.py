@@ -854,3 +854,39 @@ class TestNFRLatency:
         elapsed_ms.sort()
         p95 = elapsed_ms[int(0.95 * (N - 1))]
         assert p95 < 5_000, f"compile() p95={p95}ms exceeds 5s target (samples={elapsed_ms})"
+
+
+
+# ===========================================================================
+# F277 — background model pin
+# ===========================================================================
+
+
+class TestF277BackgroundModelPin:
+    """Assert that every CLI backend in _CLI_BACKENDS includes --model flag
+    pointing to the cheap-tier constant (_F277_BACKGROUND_MODEL)."""
+
+    def test_claude_code_argv_contains_model_flag(self):
+        backend = wiki_compiler._CLI_BACKENDS["claude_code"]
+        argv = backend.build_argv("hello", None)
+        assert "--model" in argv, f"claude_code argv missing --model: {argv}"
+        idx = argv.index("--model")
+        assert argv[idx + 1] == wiki_compiler._F277_BACKGROUND_MODEL
+
+    def test_codex_argv_contains_model_flag(self):
+        backend = wiki_compiler._CLI_BACKENDS["codex"]
+        argv = backend.build_argv("hello", "/tmp/out.txt")
+        assert "--model" in argv, f"codex argv missing --model: {argv}"
+        idx = argv.index("--model")
+        assert argv[idx + 1] == wiki_compiler._F277_BACKGROUND_MODEL
+
+    def test_kiro_cli_argv_contains_model_flag(self):
+        backend = wiki_compiler._CLI_BACKENDS["kiro_cli"]
+        argv = backend.build_argv("hello", None)
+        assert "--model" in argv, f"kiro_cli argv missing --model: {argv}"
+        idx = argv.index("--model")
+        assert argv[idx + 1] == wiki_compiler._F277_BACKGROUND_MODEL
+
+    def test_background_model_constant_is_sonnet(self):
+        """The constant must stay on the cheap tier (dario maps sonnet→DeepSeek)."""
+        assert wiki_compiler._F277_BACKGROUND_MODEL == "claude-sonnet-5"

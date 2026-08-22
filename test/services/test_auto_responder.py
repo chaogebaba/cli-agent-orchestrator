@@ -27,6 +27,22 @@ class UnknownProvider(FakeProvider):
         return TerminalStatus.UNKNOWN
 
 
+class IdleProvider(FakeProvider):
+    def get_status_from_screen(self, _lines):
+        return TerminalStatus.IDLE
+
+
+class DialogAwareProvider(FakeProvider):
+    def get_status_from_screen(self, lines):
+        normalized = ar.normalize_screen(lines)
+        if "Press enter" in normalized or "Enter:submit" in normalized:
+            return TerminalStatus.WAITING_USER_ANSWER
+        return TerminalStatus.IDLE
+
+
+REAL_THREAD = threading.Thread
+
+
 class SyncThread:
     """Drop-in for threading.Thread that runs the target synchronously.
 
@@ -97,6 +113,15 @@ def _wire_common(monkeypatch, metadata=None, session_env=None, sent_keys=None):
         lambda session: [],
     )
     return metadata
+
+
+def _set_fresh_screen(monkeypatch, engine, lines):
+    fresh_lines = list(lines)
+    monkeypatch.setattr(
+        engine,
+        "_capture_fresh",
+        lambda _metadata, _lines: (ar.normalize_screen(fresh_lines), fresh_lines),
+    )
 
 
 # ----- normalization / line-break trap ------------------------------------
@@ -174,7 +199,12 @@ def test_matched_rule_fires_answer_keys(monkeypatch, _reset_engine):
         ],
     )
     # dismiss on first check so the background retry thread returns immediately
-    monkeypatch.setattr(ar.AutoResponder, "_current_normalized", staticmethod(lambda tid: ""))
+    _set_fresh_screen(monkeypatch, _reset_engine, ["Do you trust", "Yes, continue"])
+    monkeypatch.setattr(
+        ar.AutoResponder,
+        "_current_normalized",
+        staticmethod(lambda tid: ar.dialog_region(["gone"])),
+    )
 
     result = _reset_engine.on_screen("term1", FakeProvider(), ["Do you trust", "Yes, continue"])
     assert result is None  # firing doesn't override — falls through to normal detection
@@ -189,7 +219,12 @@ def test_cooldown_suppresses_immediate_refire(monkeypatch, _reset_engine):
         "get_rules",
         lambda provider: [ar.Rule("r", True, "contains", "trust", ["ok"], ["Enter"])],
     )
-    monkeypatch.setattr(ar.AutoResponder, "_current_normalized", staticmethod(lambda tid: ""))
+    _set_fresh_screen(monkeypatch, _reset_engine, ["trust ok"])
+    monkeypatch.setattr(
+        ar.AutoResponder,
+        "_current_normalized",
+        staticmethod(lambda tid: ar.dialog_region(["gone"])),
+    )
 
     _reset_engine.on_screen("term1", FakeProvider(), ["trust ok"])
     assert len(sent) == 1
@@ -208,7 +243,12 @@ def test_retry_stops_once_dialog_dismissed(monkeypatch, _reset_engine):
         lambda provider: [ar.Rule("r", True, "contains", "trust", ["ok"], ["Enter"])],
     )
     # First recheck already shows the dialog gone.
-    monkeypatch.setattr(ar.AutoResponder, "_current_normalized", staticmethod(lambda tid: "gone"))
+    _set_fresh_screen(monkeypatch, _reset_engine, ["trust ok"])
+    monkeypatch.setattr(
+        ar.AutoResponder,
+        "_current_normalized",
+        staticmethod(lambda tid: ar.dialog_region(["gone"])),
+    )
 
     _reset_engine.on_screen("term1", FakeProvider(), ["trust ok"])
     assert len(sent) == 1  # only the initial fire, no retries
@@ -223,8 +263,11 @@ def test_retry_cap_surfaces_waiting_and_pushes(monkeypatch, _reset_engine):
         lambda provider: [ar.Rule("r", True, "contains", "trust", ["ok"], ["Enter"])],
     )
     # Dialog never goes away.
+    _set_fresh_screen(monkeypatch, _reset_engine, ["trust ok"])
     monkeypatch.setattr(
-        ar.AutoResponder, "_current_normalized", staticmethod(lambda tid: "trust ok")
+        ar.AutoResponder,
+        "_current_normalized",
+        staticmethod(lambda tid: ar.dialog_region(["trust ok"])),
     )
 
     forced = []
@@ -239,7 +282,7 @@ def test_retry_cap_surfaces_waiting_and_pushes(monkeypatch, _reset_engine):
     pushed = []
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.create_inbox_message",
-        lambda sender, receiver, msg: pushed.append((sender, receiver, msg)),
+        lambda sender, receiver, msg, **kwargs: pushed.append((sender, receiver, msg)),
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",
@@ -257,6 +300,8 @@ def test_retry_cap_surfaces_waiting_and_pushes(monkeypatch, _reset_engine):
 
 def test_retry_exhausted_respects_self_push_guard(monkeypatch, _reset_engine):
     metadata = _metadata(id="sup1", provider="claude_code")
+    _wire_common(monkeypatch, metadata=metadata)
+    _set_fresh_screen(monkeypatch, _reset_engine, ["trust ok"])
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.status_monitor.status_monitor.force_status",
         lambda tid, status: None,
@@ -268,7 +313,7 @@ def test_retry_exhausted_respects_self_push_guard(monkeypatch, _reset_engine):
     pushed = []
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.create_inbox_message",
-        lambda sender, receiver, msg: pushed.append((sender, receiver, msg)),
+        lambda sender, receiver, msg, **kwargs: pushed.append((sender, receiver, msg)),
     )
 
     _reset_engine._surface_retry_exhausted(
@@ -315,7 +360,9 @@ def _grok_provider():
 def _capture_pushes(monkeypatch):
     pushed = []
     monkeypatch.setattr(ar._store, "get_rules", lambda provider: [])
-    monkeypatch.setattr(ar.AutoResponder, "_push", lambda self, tid, meta, msg: pushed.append(msg))
+    monkeypatch.setattr(
+        ar.AutoResponder, "_push", lambda self, tid, meta, msg, *args: pushed.append(msg)
+    )
     return pushed
 
 
@@ -393,7 +440,7 @@ def test_numbered_option_at_least_201_chars_before_press_enter_is_not_suspect(
     screen = ["1. Continue" + "x" * 201 + "Press enter"]
 
     assert not ar.AutoResponder._looks_like_dialog(ar.normalize_screen(screen), "other")
-    assert _reset_engine.on_screen("term1", FakeProvider(), screen) is None
+    assert _reset_engine.on_screen("term1", IdleProvider(), screen) is None
     assert pushed == []
 
 
@@ -534,7 +581,7 @@ def test_open_episode_closes_after_two_ready_grok_frames(monkeypatch, _reset_eng
     _wire_common(monkeypatch, metadata=_metadata(provider="grok_cli"))
     pushed = _capture_pushes(monkeypatch)
     provider = _grok_provider()
-    ready = ["1. Document row", "Press enter to read", "❯", "always-approve"]
+    ready = ["ordinary completed output", "❯", "always-approve"]
 
     _reset_engine._unknown_state["term1"] = ar._UnknownDialogState(episode_open=True)
     assert provider.get_status_from_screen(ready) == TerminalStatus.IDLE
@@ -557,7 +604,7 @@ def test_supervisor_terminal_is_excluded_from_unknown_detection(monkeypatch, _re
     pushed = []
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.create_inbox_message",
-        lambda sender, receiver, msg: pushed.append((sender, receiver, msg)),
+        lambda sender, receiver, msg, **kwargs: pushed.append((sender, receiver, msg)),
     )
 
     result = _reset_engine.on_screen(
@@ -580,7 +627,7 @@ def test_push_refuses_to_send_to_source_terminal(monkeypatch, _reset_engine):
     delivered = []
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.create_inbox_message",
-        lambda sender, receiver, msg: pushed.append((sender, receiver, msg)),
+        lambda sender, receiver, msg, **kwargs: pushed.append((sender, receiver, msg)),
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",
@@ -598,7 +645,9 @@ def test_unknown_dialog_detected_and_pushed_once(monkeypatch, _reset_engine):
     monkeypatch.setattr(ar._store, "get_rules", lambda provider: [])
 
     pushed = []
-    monkeypatch.setattr(ar.AutoResponder, "_push", lambda self, tid, meta, msg: pushed.append(msg))
+    monkeypatch.setattr(
+        ar.AutoResponder, "_push", lambda self, tid, meta, msg, *args: pushed.append(msg)
+    )
 
     screen = ["Some new prompt", "1. Yes, continue", "2. No, quit", "Press enter to continue"]
     r1 = _reset_engine.on_screen("term1", FakeProvider(), screen)
@@ -613,7 +662,9 @@ def test_unknown_dialog_screen_mutations_do_not_repush_open_episode(monkeypatch,
     _wire_common(monkeypatch)
     monkeypatch.setattr(ar._store, "get_rules", lambda provider: [])
     pushed = []
-    monkeypatch.setattr(ar.AutoResponder, "_push", lambda self, tid, meta, msg: pushed.append(msg))
+    monkeypatch.setattr(
+        ar.AutoResponder, "_push", lambda self, tid, meta, msg, *args: pushed.append(msg)
+    )
 
     for tick in range(5):
         _reset_engine.on_screen(
@@ -636,43 +687,37 @@ def test_unknown_episode_closes_then_respects_cross_episode_push_floor(monkeypat
     now = [1000.0]
     monkeypatch.setattr(ar.time, "monotonic", lambda: now[0])
     pushed = []
-    monkeypatch.setattr(ar.AutoResponder, "_push", lambda self, tid, meta, msg: pushed.append(msg))
+    monkeypatch.setattr(
+        ar.AutoResponder, "_push", lambda self, tid, meta, msg, *args: pushed.append(msg)
+    )
+    provider = DialogAwareProvider()
     screen = ["Prompt", "1. Yes, continue", "2. No, quit", "Press enter to continue"]
 
-    assert (
-        _reset_engine.on_screen("term1", FakeProvider(), screen)
-        == TerminalStatus.WAITING_USER_ANSWER
-    )
+    assert _reset_engine.on_screen("term1", provider, screen) == TerminalStatus.WAITING_USER_ANSWER
     assert len(pushed) == 1
 
     now[0] = 1001.0
     assert (
-        _reset_engine.on_screen("term1", FakeProvider(), ["ordinary output"])
+        _reset_engine.on_screen("term1", provider, ["ordinary output"])
         == TerminalStatus.WAITING_USER_ANSWER
     )
     now[0] = 1002.0
-    assert _reset_engine.on_screen("term1", FakeProvider(), ["ordinary output"]) is None
+    assert _reset_engine.on_screen("term1", provider, ["ordinary output"]) is None
 
     now[0] = 1100.0
-    assert (
-        _reset_engine.on_screen("term1", FakeProvider(), screen)
-        == TerminalStatus.WAITING_USER_ANSWER
-    )
+    assert _reset_engine.on_screen("term1", provider, screen) == TerminalStatus.WAITING_USER_ANSWER
     assert len(pushed) == 1
 
     now[0] = 1101.0
     assert (
-        _reset_engine.on_screen("term1", FakeProvider(), ["ordinary output"])
+        _reset_engine.on_screen("term1", provider, ["ordinary output"])
         == TerminalStatus.WAITING_USER_ANSWER
     )
     now[0] = 1102.0
-    assert _reset_engine.on_screen("term1", FakeProvider(), ["ordinary output"]) is None
+    assert _reset_engine.on_screen("term1", provider, ["ordinary output"]) is None
 
     now[0] = 1301.0
-    assert (
-        _reset_engine.on_screen("term1", FakeProvider(), screen)
-        == TerminalStatus.WAITING_USER_ANSWER
-    )
+    assert _reset_engine.on_screen("term1", provider, screen) == TerminalStatus.WAITING_USER_ANSWER
     assert len(pushed) == 2
 
 
@@ -680,7 +725,9 @@ def test_unknown_dialog_payload_caps_dialog_text(monkeypatch, _reset_engine):
     _wire_common(monkeypatch)
     monkeypatch.setattr(ar._store, "get_rules", lambda provider: [])
     pushed = []
-    monkeypatch.setattr(ar.AutoResponder, "_push", lambda self, tid, meta, msg: pushed.append(msg))
+    monkeypatch.setattr(
+        ar.AutoResponder, "_push", lambda self, tid, meta, msg, *args: pushed.append(msg)
+    )
     long_text = "x" * 2000
 
     _reset_engine.on_screen(
@@ -699,7 +746,7 @@ def test_ordinary_screen_is_not_flagged_as_dialog(monkeypatch, _reset_engine):
     monkeypatch.setattr(ar._store, "get_rules", lambda provider: [])
 
     result = _reset_engine.on_screen(
-        "term1", FakeProvider(), ["just some regular assistant output", "no options here"]
+        "term1", IdleProvider(), ["just some regular assistant output", "no options here"]
     )
     assert result is None
 
@@ -803,12 +850,12 @@ class TestWaitingGate:
         )
 
         assert (
-            _reset_engine.on_screen("term1", FakeProvider(), ["danger zone"])
+            _reset_engine.on_screen("term1", IdleProvider(), ["danger zone"])
             == TerminalStatus.WAITING_USER_ANSWER
         )
         assert _reset_engine.waiting_gate("term1") == ("wait_rule", "r")
 
-        _reset_engine.on_screen("term1", FakeProvider(), ["ordinary output"])
+        _reset_engine.on_screen("term1", IdleProvider(), ["ordinary output"])
         assert _reset_engine.waiting_gate("term1") is None
 
     def test_unknown_episode_open_and_closed_reflects_gate(self, monkeypatch, _reset_engine):
@@ -817,17 +864,20 @@ class TestWaitingGate:
         monkeypatch.setattr(ar.AutoResponder, "_push", lambda self, *args: None)
         suspect = ["1. Continue", "2. Cancel", "Press enter to choose"]
 
-        _reset_engine.on_screen("term1", FakeProvider(), suspect)
+        provider = DialogAwareProvider()
+        _reset_engine.on_screen("term1", provider, suspect)
         assert _reset_engine.waiting_gate("term1") == "unknown_dialog"
-        _reset_engine.on_screen("term1", FakeProvider(), ["ordinary output"])
+        _reset_engine.on_screen("term1", provider, ["ordinary output"])
         assert _reset_engine.waiting_gate("term1") == "unknown_dialog"
-        _reset_engine.on_screen("term1", FakeProvider(), ["ordinary output"])
+        _reset_engine.on_screen("term1", provider, ["ordinary output"])
         assert _reset_engine.waiting_gate("term1") is None
 
     def test_retry_exhausted_gate_clears_only_on_published_non_waiting(
         self, monkeypatch, _reset_engine
     ):
         metadata = _metadata()
+        _wire_common(monkeypatch, metadata=metadata)
+        _set_fresh_screen(monkeypatch, _reset_engine, ["trust ok"])
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.status_monitor.status_monitor.force_status",
             lambda tid, status: None,
@@ -835,7 +885,7 @@ class TestWaitingGate:
         monkeypatch.setattr(ar.AutoResponder, "_push", lambda self, *args: None)
         rule = ar.Rule("r", True, "contains", "trust", ["ok"], ["Enter"])
 
-        _reset_engine._surface_retry_exhausted("term1", metadata, rule)
+        _reset_engine._surface_retry_exhausted("term1", metadata, rule, FakeProvider())
         assert _reset_engine.waiting_gate("term1") == "retry_exhausted"
         _reset_engine.record_published_status("term1", TerminalStatus.WAITING_USER_ANSWER)
         assert _reset_engine.waiting_gate("term1") == "retry_exhausted"
@@ -905,7 +955,7 @@ def test_wpq1_unknown_dialog_fresh_disagreement_suppresses_without_push(monkeypa
     )
 
     result = _reset_engine.on_screen(
-        "term1", FakeProvider(), ["1. Continue", "2. Cancel", "Press enter to choose"]
+        "term1", DialogAwareProvider(), ["1. Continue", "2. Cancel", "Press enter to choose"]
     )
 
     assert result is None
@@ -972,11 +1022,17 @@ def test_wpq1_production_fresh_capture_suppresses_unusable_frames_without_mutati
     backend.capture_viewport.side_effect = capture
     monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
     try:
-        assert engine.on_screen("term1", provider, initial) is None
+        result = engine.on_screen("term1", provider, initial)
+        if branch == "wait_rule" and fresh_outcome == "unknown":
+            assert result == TerminalStatus.WAITING_USER_ANSWER
+            assert engine.waiting_gate("term1") == ("wait_rule", "wait-update")
+        else:
+            assert result is None
         assert captures == [True]
         assert pushed == []
         assert engine._unknown_state == before_unknown
-        assert engine._wait_rule_active == before_wait
+        if not (branch == "wait_rule" and fresh_outcome == "unknown"):
+            assert engine._wait_rule_active == before_wait
         assert status_monitor._screens["term1"] is screen_sentinel
     finally:
         status_monitor._screens.pop("term1", None)

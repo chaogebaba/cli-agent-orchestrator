@@ -31,9 +31,74 @@
       "type": "string",
       "description": "Agent role. Built-in values: supervisor, developer, reviewer. Custom roles are also supported via settings.json."
     },
+    "protected": {
+      "type": "boolean"
+    },
     "provider": {
       "type": "string",
       "description": "Provider override (e.g. claude_code, kiro_cli, codex)."
+    },
+    "lifecycle": {
+      "type": "string",
+      "enum": ["ephemeral", "sticky"]
+    },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "provider_init_timeout": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "container": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path_maps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["host", "guest"],
+            "properties": {
+              "host": {"type": "string", "minLength": 1},
+              "guest": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    },
+    "contextPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope"],
+      "properties": {
+        "scope": {"const": "persona"},
+        "memoryTypes": {
+          "type": "array",
+          "items": {"enum": ["user", "feedback", "project", "reference"]},
+          "default": []
+        },
+        "memoryNames": {
+          "type": "array",
+          "items": {"type": "string"},
+          "default": []
+        },
+        "globalClaudeMd": {"type": "boolean", "default": false},
+        "extraLeaves": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^(?!(?:CLAUDE\\.md|\\.credentials\\.json|settings\\.json|persona-manifest\\.json)$)(?!\\.{1,2}$)[^/\\\\\\u0000]+$"
+          },
+          "default": []
+        }
+      }
+    },
+    "engine": {
+      "type": "string",
+      "enum": ["v2", "kas"],
+      "description": "Kiro engine selection."
     },
     "allowedTools": {
       "type": "array",
@@ -94,9 +159,17 @@
     "codexConfig": {
       "type": "object"
     },
+    "claudeConfig": {
+      "type": "object"
+    },
     "hermesProfile": {
       "type": "string",
       "minLength": 1
+    },
+    "grokNativeWorkflows": {
+      "type": "boolean",
+      "default": false,
+      "description": "Grok Build only. Explicitly permits Grok-native subagents, workflows, and /goal in this CAO terminal."
     },
     "skills": {
       "type": "array",

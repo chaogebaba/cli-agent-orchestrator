@@ -1,0 +1,35 @@
+# F254 D18 G2: subprocess/requests baseline (shrink-only ratchet).
+# Files listed here are exempt from the subprocess.*/requests.* AST guard
+# in unit-tier tests. Remove entries as tests are migrated to contract tier.
+# Format: one relative file path per line (from repo root).
+test/cli/commands/test_config_reconcile.py
+test/cli/commands/test_install_preflight_ordering.py
+test/mcp_server/test_workdir_dispatch.py
+test/models/test_observation.py
+test/probes/test_base_refresh_observer.py
+test/providers/test_codex_provider_unit.py
+test/providers/test_kiro_f114_proper.py
+test/providers/test_mock_cli_unit.py
+test/scripts/test_verify_resolved_python.py
+test/services/test_f138_r6_production_authority.py
+test/services/test_fork_context_service.py
+test/services/test_fx167_mutant_kills.py
+test/services/test_herdr_inbox_registry.py
+test/services/test_offline_base_registration.py
+test/services/test_project_identity.py
+test/services/test_seam_parity_promotion.py
+test/services/test_session_manifest_service.py
+test/services/test_wave3b_supervisor_mailbox.py
+test/services/test_wave4_delivery_state.py
+test/services/test_worktree_branch_integrity.py
+test/services/test_worktree_service.py
+test/services/test_wpctx2_nested_repo_exclusion.py
+test/services/test_wpm4e_fork_refresh.py
+test/telemetry/test_optional_extra.py
+test/telemetry/test_orchestration_instrumentation.py
+test/test_f139_fixture_provider.py
+test/test_g7a_sandbox.py
+test/test_g7b_sandbox.py
+test/test_gitleaks_config.py
+test/test_no_ffi_guard.py
+test/transcript_scrub/test_engine.py

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import time
@@ -21,8 +22,24 @@ from cli_agent_orchestrator.clients.database import (
     retire_provider_session,
     update_terminal_provider_session_id,
 )
+from cli_agent_orchestrator.utils import provider_plane
+from cli_agent_orchestrator.utils.persona_context import resolve_codex_home
 from cli_agent_orchestrator.utils.provider_plane import provider_home
 from cli_agent_orchestrator.utils.tmux_command import tmux_argv
+
+logger = logging.getLogger(__name__)
+
+
+def _resolved_codex_home(terminal_id: str | None) -> Path:
+    resolved = resolve_codex_home(terminal_id)
+    if resolved == provider_plane.provider_home("codex").home:
+        return provider_home("codex").home
+    return resolved
+
+
+def _resolved_grok_sessions() -> Path:
+    """Return the grok sessions root via the provider plane (F189)."""
+    return provider_home("grok_cli").home / "sessions"
 
 
 class ForkContextError(ValueError):
@@ -75,12 +92,7 @@ class SnapshotDelta:
 
     def dirty_hashes(self) -> str:
         values = {
-            entry.path: (
-                entry.value
-                if entry.state == "sha256"
-                else None
-            )
-            for entry in self.entries
+            entry.path: (entry.value if entry.state == "sha256" else None) for entry in self.entries
         }
         return json.dumps(values, sort_keys=True, separators=(",", ":"))
 
@@ -139,6 +151,34 @@ def _source_path(path: str) -> bool:
     return not (path == "tmp/orch/digests" or path.startswith("tmp/orch/digests/"))
 
 
+def _nested_repo(cwd: str, path: str, memo: dict[Path, bool]) -> bool:
+    """Return whether a lexical path component below cwd carries a .git marker."""
+    if not path or Path(path).is_absolute():
+        return False
+    lexical_path = path[:-1] if path.endswith("/") else path
+    raw_components = lexical_path.split("/")
+    if any(component in {"", ".", ".."} for component in raw_components):
+        return False
+    current = Path(cwd)
+    for component in raw_components:
+        current = current / component
+        if current in memo:
+            if memo[current]:
+                return True
+            continue
+        try:
+            (current / ".git").stat()
+        except (FileNotFoundError, NotADirectoryError):
+            memo[current] = False
+        except OSError:
+            memo[current] = False
+            return False
+        else:
+            memo[current] = True
+            return True
+    return False
+
+
 def _hash(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -161,6 +201,24 @@ def _entry_for_path(cwd: str, path_name: str) -> SnapshotEntry:
         return SnapshotEntry(path_name, "unhashable")
 
 
+def assert_cwd_live(cwd: str, *, error_factory):
+    """F26: fail directed when ``cwd`` is not a live directory before a git seam
+    consumes it.
+
+    ``get_pane_working_directory`` resolves a deleted pane cwd to ``None`` (its
+    existing "unknown" contract), but ``None`` alone still collapses to the
+    opaque ``snapshot_git-failure`` / generic "not inside a git repository"
+    mystery. This helper converts that into a named, actionable error at the
+    two git-consuming seams (fork dispatch, worktree resolution) instead — the
+    worker deleted its own cwd, so the failure is a directed verdict, never a
+    silent rescue (D3).
+    """
+    if not os.path.exists(cwd):
+        raise error_factory(
+            f"worker deleted its own cwd: {cwd} " f"(pane_current_path reported ' (deleted)')"
+        )
+
+
 def snapshot(cwd: str) -> SnapshotDelta:
     try:
         sha = _run_git_bytes(cwd, "rev-parse", "HEAD").decode("utf-8", "strict").strip()
@@ -178,6 +236,15 @@ def snapshot(cwd: str) -> SnapshotDelta:
             )
             if _source_path(path)
         )
+        nested_memo: dict[Path, bool] = {}
+        excluded = {path for path in dirty if _nested_repo(cwd, path, nested_memo)}
+        dirty.difference_update(excluded)
+        if excluded:
+            logger.info(
+                "nested_repo_excluded count=%d paths=%s",
+                len(excluded),
+                ", ".join(sorted(excluded)[:10]),
+            )
         return SnapshotDelta(
             sha,
             tuple(_entry_for_path(cwd, path) for path in sorted(dirty)),
@@ -213,6 +280,8 @@ def staleness(row: dict[str, Any]) -> StalenessResult:
             "git-failure",
         )
     try:
+        nested_memo: dict[Path, bool] = {}
+        excluded: set[str] = set()
         candidates = {
             path
             for path in _decode_git_paths(
@@ -227,9 +296,23 @@ def staleness(row: dict[str, Any]) -> StalenessResult:
             )
             if _source_path(path)
         )
+        git_excluded = {path for path in candidates if _nested_repo(cwd, path, nested_memo)}
+        excluded.update(git_excluded)
+        candidates.difference_update(git_excluded)
         for p in manifest:
-            if _source_path(p) and not (Path(cwd) / p).exists():
+            if not _source_path(p):
+                continue
+            if _nested_repo(cwd, p, nested_memo):
+                excluded.add(p)
+                candidates.discard(p)
+            elif not (Path(cwd) / p).exists():
                 candidates.add(p)
+        if excluded:
+            logger.info(
+                "nested_repo_excluded count=%d paths=%s",
+                len(excluded),
+                ", ".join(sorted(excluded)[:10]),
+            )
         changed: list[SnapshotEntry] = []
         for p in sorted(candidates):
             path = Path(cwd) / p
@@ -330,9 +413,53 @@ def pane_pid(session: str, window: str) -> int:
     return int(out.strip())
 
 
+# F124 S3: module-level proc root — tests monkeypatch this to a synthetic tree.
+_PROC_ROOT = Path("/proc")
+
+# F139: tracks whether the one-shot fixture runtime configuration has fired.
+_FIXTURE_RUNTIME_CONFIGURED = False
+
+
+def configure_sandbox_fixture_runtime(manifest: dict[str, Any] | None) -> None:
+    """F139 D11: one-shot process-local _PROC_ROOT configuration for procfs-unavailable variant.
+
+    Must be called exactly once during server lifespan, after sandbox validation
+    and DB fence assertion, but before init_db/background tasks. Production and
+    default sandboxes are a no-op.
+    """
+    global _PROC_ROOT, _FIXTURE_RUNTIME_CONFIGURED
+    if _FIXTURE_RUNTIME_CONFIGURED:
+        return  # idempotent — already ran
+    _FIXTURE_RUNTIME_CONFIGURED = True
+    if manifest is None:
+        return  # production — no-op
+    fixture_providers = manifest.get("fixture_providers")
+    if not isinstance(fixture_providers, dict):
+        return  # default sandbox without fixture — no-op
+    row = fixture_providers.get("mock_cli")
+    if not isinstance(row, dict):
+        return
+    variant = row.get("variant", "")
+    if variant != "procfs-unavailable":
+        return  # only this variant mutates _PROC_ROOT
+    state_dir = Path(str(row["state_dir"]))
+    missing_proc = state_dir / "missing-proc"
+    # Assert: path is beneath state_dir, target is absent
+    if missing_proc.exists():
+        raise RuntimeError("F139: missing-proc path unexpectedly exists")
+    if not missing_proc.is_relative_to(state_dir):
+        raise RuntimeError("F139: missing-proc path escape")
+    _PROC_ROOT = missing_proc
+
+
+def _procfs_available() -> bool:
+    """Return whether procfs is accessible (F124 S3)."""
+    return (_PROC_ROOT / "self" / "stat").is_file()
+
+
 def _descendants(root: int) -> list[int]:
     children: dict[int, list[int]] = {}
-    for entry in Path("/proc").iterdir():
+    for entry in _PROC_ROOT.iterdir():
         if not entry.name.isdigit():
             continue
         try:
@@ -360,8 +487,10 @@ def pane_launch_epoch(pid: int) -> float:
     return btime + start_ticks / os.sysconf("SC_CLK_TCK")
 
 
-def capture_codex_uuid(root_pid: int, launch_time: float, cwd: str) -> str:
-    sessions_root = provider_home("codex").sessions.resolve()
+def capture_codex_uuid(
+    root_pid: int, launch_time: float, cwd: str, terminal_id: str | None = None
+) -> str:
+    sessions_root = (_resolved_codex_home(terminal_id) / "sessions").resolve()
     for attempt in range(3):
         candidates: set[Path] = set()
         try:
@@ -381,20 +510,25 @@ def capture_codex_uuid(root_pid: int, launch_time: float, cwd: str) -> str:
                 p = candidates.pop()
                 first = json.loads(p.open().readline())
                 sid = first["payload"]["id"]
-                if first["type"] == "session_meta" and sid in p.name:
+                if first["type"] == "session_meta" and isinstance(sid, str) and sid in p.name:
                     return sid
                 raise ForkContextError("session_capture_mismatch")
         except OSError:
             pass
         if attempt < 2:
             time.sleep(1)
-    matches = []
+    matches: list[tuple[Path, str]] = []
     now = time.time()
-    for p in provider_home("codex").sessions.glob("**/rollout-*.jsonl"):
+    for p in (_resolved_codex_home(terminal_id) / "sessions").glob("**/rollout-*.jsonl"):
         try:
             meta = json.loads(p.open().readline())["payload"]
-            if meta.get("cwd") == cwd and launch_time <= p.stat().st_mtime <= now:
-                matches.append((p, meta["id"]))
+            session_id = meta.get("id")
+            if (
+                meta.get("cwd") == cwd
+                and isinstance(session_id, str)
+                and launch_time <= p.stat().st_mtime <= now
+            ):
+                matches.append((p, session_id))
         except (OSError, KeyError, json.JSONDecodeError):
             pass
     if len(matches) != 1:
@@ -411,7 +545,7 @@ def _registration_error(code: str, message: str) -> NoReturn:
 
 def _grok_artifact_mismatch(session_uuid: str, cwd: str) -> str | None:
     """Classify a missing expected Grok artifact against artifacts in other cwd roots."""
-    root = Path.home() / ".grok" / "sessions"
+    root = _resolved_grok_sessions()
     expected = root / quote(cwd, safe="") / session_uuid / "chat_history.jsonl"
     matches = [
         path
@@ -435,6 +569,7 @@ def validate_base_source(
     cwd: str,
     name: str | None = None,
     agent_profile: str | None = None,
+    source_terminal_id: str | None = None,
 ) -> dict[str, str]:
     """Validate stored provider history under an explicit strict or legacy mode.
 
@@ -446,11 +581,13 @@ def validate_base_source(
         if provider == "codex":
             found = any(
                 session_uuid in path.name
-                for path in provider_home("codex").sessions.glob("**/rollout-*.jsonl")
+                for path in (_resolved_codex_home(source_terminal_id) / "sessions").glob(
+                    "**/rollout-*.jsonl"
+                )
             )
         else:
             found = (
-                Path.home() / ".grok" / "sessions" / quote(cwd, safe="") / session_uuid
+                _resolved_grok_sessions() / quote(cwd, safe="") / session_uuid
             ).exists()
         if not found:
             raise ForkContextError("session_file_missing")
@@ -502,7 +639,7 @@ def validate_base_source(
 
     validator = provider_manager.construct_provider(
         provider,
-        "offline-base",
+        source_terminal_id or "offline-base",
         "offline-base",
         "offline-base",
         agent_profile=agent_profile,
@@ -533,7 +670,11 @@ def validate_base_source(
         )
 
     if provider == "codex":
-        matches = list(provider_home("codex").sessions.glob(f"**/rollout-*{session_uuid}*.jsonl"))
+        matches = list(
+            (_resolved_codex_home(source_terminal_id) / "sessions").glob(
+                f"**/rollout-*{session_uuid}*.jsonl"
+            )
+        )
         try:
             with matches[0].open(encoding="utf-8") as stream:
                 payload_cwd = json.loads(stream.readline()).get("payload", {}).get("cwd")
@@ -633,20 +774,50 @@ def mark_ready(
         cwd = get_backend().get_pane_working_directory(
             terminal["tmux_session"], terminal["tmux_window"]
         )
+    if not isinstance(cwd, str) or not cwd:
+        raise ForkContextError("terminal_cwd_unavailable")
+    session_uuid: str
     provider = terminal["provider"]
     if provider == "codex":
         pid = pane_pid(terminal["tmux_session"], terminal["tmux_window"])
-        session_uuid = capture_codex_uuid(pid, pane_launch_epoch(pid), cwd)
+        session_uuid = capture_codex_uuid(pid, pane_launch_epoch(pid), cwd, terminal_id=terminal_id)
     elif provider == "grok_cli":
-        session_uuid = terminal.get("provider_session_id")
-        if not session_uuid:
+        candidate_uuid = terminal.get("provider_session_id")
+        if not isinstance(candidate_uuid, str) or not candidate_uuid:
             raise ForkContextError("base_session_unset")
+        session_uuid = candidate_uuid
     else:
         raise ForkContextError("provider_lacks_fork_capability")
+    assert_cwd_live(cwd, error_factory=ForkContextError)
     captured = snapshot(cwd)
     sha, hashes = captured.git_sha, captured.dirty_hashes()
     if captured.acquisition_error or not sha:
         raise ForkContextError(f"snapshot_{captured.acquisition_error or 'git-failure'}")
+    from cli_agent_orchestrator.services.base_digest_service import (
+        MAX_DIGEST_BYTES,
+        projected_manifest_bytes,
+    )
+
+    entry_count = len(captured.entries)
+    manifest_bytes = projected_manifest_bytes(captured.entries)
+
+    if entry_count > 0:
+        logger.warning(
+            "base_registered_dirty base=%s dirty_files=%d projected_manifest=%d",
+            name,
+            entry_count,
+            manifest_bytes,
+        )
+
+    if manifest_bytes > MAX_DIGEST_BYTES * 0.8:
+        logger.warning(
+            "base_manifest_near_cap base=%s manifest_bytes=%d cap=%d dirty_files=%d "
+            "— consider .gitignoring noisy paths",
+            name,
+            manifest_bytes,
+            MAX_DIGEST_BYTES,
+            entry_count,
+        )
     row = register_provider_session(
         name=name,
         provider=provider,
@@ -661,7 +832,11 @@ def mark_ready(
         session_name=terminal["tmux_session"],
     )
     update_terminal_provider_session_id(terminal_id, session_uuid)
-    return row
+    return dict(
+        row,
+        _entry_count=entry_count,
+        _projected_manifest_bytes=manifest_bytes,
+    )
 
 
 def list_bases() -> list[dict[str, Any]]:
@@ -671,6 +846,12 @@ def list_bases() -> list[dict[str, Any]]:
             continue
         stale = staleness(row)
         row["staleness_count"] = stale.changed_count
+        if stale.changed_count is not None and stale.changed_count >= 100:
+            logger.warning(
+                "base '%s' staleness=%d exceeds threshold (100) — consider refreshing",
+                row.get("name", "?"),
+                stale.changed_count,
+            )
         result.append(row)
     return result
 

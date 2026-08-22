@@ -2,14 +2,22 @@
 
 import logging
 import os
+import re
+import shlex
 import subprocess
 import time
 import uuid
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, TypeVar
 
 import libtmux
+from libtmux.pane import Pane
+from libtmux.session import Session
+from libtmux.window import Window
 
-from cli_agent_orchestrator.constants import TMUX_HISTORY_LINES
+from cli_agent_orchestrator.constants import (
+    BRACKETED_PASTE_INCOMPATIBLE_SHELLS,
+    TMUX_HISTORY_LINES,
+)
 from cli_agent_orchestrator.utils.path_validation import (
     BLOCKED_SYSTEM_DIRECTORIES,
     resolve_and_validate_path,
@@ -19,6 +27,38 @@ from cli_agent_orchestrator.utils.tmux_command import tmux_argv, tmux_socket_nam
 
 logger = logging.getLogger(__name__)
 
+# F26: tmux's literal suffix for a pane whose current working directory was
+# deleted (probe 2026-08-09). Pinned here as a single constant so a platform
+# format change is a one-line fix, not a hunt (R2).
+_DELETED_CWD_SUFFIX = " (deleted)"
+
+_T = TypeVar("_T")
+
+
+class TmuxLookupError(RuntimeError):
+    """A tmux listing could not be read, so the answer is UNKNOWN — not "absent".
+
+    libtmux >= 0.53.1 parses ``list-sessions`` / ``list-windows`` / ``list-panes``
+    output with ``dict(zip(formats, values, strict=True))`` (``libtmux/neo.py``,
+    ``parse_output``) against a fixed 125-name format list, stripping only ONE
+    trailing empty field. Any row that yields fewer than 125 values — a
+    session/window/pane that disappears mid-listing, or a trailing field this
+    tmux build simply omits — raises ``ValueError('zip() argument 2 is shorter
+    than argument 1')`` instead of degrading. Under load (many concurrent CAO
+    sessions polling the same tmux server) that race fires constantly.
+
+    This exception exists so the failure cannot masquerade as a missing session.
+    Everything else in this module signals a *genuine* absence with a plain
+    ``ValueError`` (or ``None`` / ``False`` / ``[]`` for the query-style
+    methods), so a caller that needs to tell "the session is really gone" from
+    "we could not look" catches ``TmuxLookupError`` explicitly. It is
+    deliberately NOT a subclass of ``ValueError``: an ``except ValueError``
+    written for the not-found case must not swallow it.
+
+    Treat it as transient and retryable — ``TmuxClient`` already retries the
+    read once before raising.
+    """
+
 
 class TmuxClient:
     """Simplified tmux client for basic operations."""
@@ -26,6 +66,195 @@ class TmuxClient:
     def __init__(self) -> None:
         socket_name = tmux_socket_name()
         self.server = libtmux.Server(socket_name=socket_name) if socket_name else libtmux.Server()
+
+    # ── libtmux listing boundary ─────────────────────────────────────────
+    #
+    # Every read that makes libtmux shell out to `list-sessions` /
+    # `list-windows` / `list-panes` goes through _read_listing() below, so a
+    # transient parse failure (see TmuxLookupError) becomes a distinct,
+    # retryable, non-fatal condition instead of a raw ValueError that reads
+    # like "not found" one layer up.
+
+    # Short pause before the single retry so the mid-listing race (a pane or
+    # session vanishing between tmux's enumeration and its output) has settled.
+    # Deliberately tiny: get_history() is called from the FIFO pipe-liveness
+    # watchdog loop, which must not be stalled by a slow retry.
+    _LISTING_RETRY_DELAY_S = 0.05
+
+    @classmethod
+    def _read_listing(cls, description: str, read: Callable[[], _T]) -> _T:
+        """Run one libtmux listing read, retrying ONCE on a parse failure.
+
+        ``read`` must contain nothing but libtmux attribute access / query
+        calls. That invariant is what lets us classify *any* ``ValueError``
+        escaping it as a libtmux parse failure rather than matching on
+        CPython's ``zip()`` message text (which is not part of any contract).
+        Callers therefore raise their own "not found" ``ValueError``s outside
+        the callable, never inside it.
+
+        Args:
+            description: What was being read, for the log/error message.
+            read: The libtmux read to perform.
+
+        Returns:
+            Whatever ``read`` returns.
+
+        Raises:
+            TmuxLookupError: The read failed to parse twice in a row.
+        """
+        try:
+            return read()
+        except ValueError as first_error:
+            logger.warning(
+                "tmux listing parse failed (%s): %s — retrying once", description, first_error
+            )
+
+        time.sleep(cls._LISTING_RETRY_DELAY_S)
+        try:
+            return read()
+        except ValueError as second_error:
+            raise TmuxLookupError(
+                f"Could not read tmux listing ({description}): {second_error}. "
+                "The tmux server output failed to parse twice; this is transient "
+                "and says nothing about whether the target still exists."
+            ) from second_error
+
+    def _find_session(self, session_name: str) -> Optional[Session]:
+        """Return the named session, or None if it is genuinely absent.
+
+        ``default=None`` is passed explicitly: libtmux's ``QueryList.get()``
+        raises ``ObjectDoesNotExist`` when nothing matches and no default is
+        given, and that exception type moved between libtmux releases
+        (``libtmux._internal.query_list`` on 0.51, ``libtmux.exc`` on 0.62).
+        Asking for ``None`` keeps genuine absence version-stable and keeps the
+        ``if not session:`` checks below meaningful.
+
+        Raises:
+            TmuxLookupError: The session listing could not be parsed.
+        """
+        return self._read_listing(
+            f"list-sessions for session '{session_name}'",
+            lambda: self.server.sessions.get(session_name=session_name, default=None),
+        )
+
+    def _find_window(
+        self, session: Session, session_name: str, window_name: str
+    ) -> Optional[Window]:
+        """Return the named window in ``session``, or None if genuinely absent.
+
+        Raises:
+            TmuxLookupError: The window listing could not be parsed.
+        """
+        return self._read_listing(
+            f"list-windows for '{session_name}:{window_name}'",
+            lambda: session.windows.get(window_name=window_name, default=None),
+        )
+
+    def _find_active_pane(
+        self, window: Window, session_name: str, window_name: str
+    ) -> Optional[Pane]:
+        """Return the window's active pane. ``Window.active_pane`` lists panes.
+
+        Raises:
+            TmuxLookupError: The pane listing could not be parsed.
+        """
+        return self._read_listing(
+            f"list-panes for '{session_name}:{window_name}'",
+            lambda: window.active_pane,
+        )
+
+    def _find_first_pane(self, window: Window, session_name: str, window_name: str) -> Pane:
+        """Return the window's first pane. ``Window.panes`` lists panes.
+
+        Raises:
+            TmuxLookupError: The pane listing could not be parsed.
+        """
+        return self._read_listing(
+            f"list-panes for '{session_name}:{window_name}'",
+            lambda: window.panes[0],
+        )
+
+    @staticmethod
+    def _kill_via_cli(session_name: str, window_name: Optional[str] = None) -> bool:
+        """Kill a session (or a single window) straight through the tmux CLI.
+
+        Deliberately bypasses libtmux: no listing is parsed, so this still
+        works when ``parse_output`` cannot read the server's output. That is
+        what stops a launch aborted by a parse failure from leaving a live
+        tmux session behind — the operator's retry would otherwise be blocked
+        by "Session already exists" with no usable terminal to attach to.
+
+        The target uses tmux's ``=`` exact-match prefix so a prefix collision
+        can never kill a *different* session.
+
+        Returns:
+            True if tmux reported the kill succeeded, False otherwise.
+        """
+        try:
+            target = f"={validate_tmux_name(session_name, 'session_name')}"
+            if window_name is not None:
+                target = f"{target}:{validate_tmux_name(window_name, 'window_name')}"
+        except ValueError as e:
+            logger.error("Cannot build tmux kill target: %s", e)
+            return False
+
+        command = "kill-window" if window_name is not None else "kill-session"
+        try:
+            # Must go through tmux_argv (G7A closed-world socket choke point):
+            # raw ["tmux", ...] would hit the default server and bypass
+            # CAO_TMUX_SOCKET sandbox isolation.
+            result = subprocess.run(
+                tmux_argv(command, "-t", target),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as e:
+            logger.error("Failed to run `tmux %s -t %s`: %s", command, target, e)
+            return False
+
+        if result.returncode == 0:
+            logger.info("Killed %s via tmux CLI: %s", command.split("-")[1], target)
+            return True
+        logger.warning(
+            "`tmux %s -t %s` failed (rc=%s): %s",
+            command,
+            target,
+            result.returncode,
+            (result.stderr or "").strip(),
+        )
+        return False
+
+    @staticmethod
+    def _has_session_via_cli(session_name: str) -> Optional[bool]:
+        """Parse-free ``tmux has-session`` probe used when a listing won't parse.
+
+        Returns:
+            True/False when tmux answered, None when we could not even ask
+            (invalid name, or the tmux binary is unavailable) — in which case
+            the caller must keep reporting "unknown" rather than "gone".
+        """
+        try:
+            target = f"={validate_tmux_name(session_name, 'session_name')}"
+        except ValueError as e:
+            logger.error("Cannot build tmux has-session target: %s", e)
+            return None
+        try:
+            # Socket-aware argv via tmux_argv — same G7A choke point as every
+            # other product tmux execution (has-session is read-only, but must
+            # still probe the sandbox server, not the default one).
+            result = subprocess.run(
+                tmux_argv("has-session", "-t", target),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as e:
+            logger.error("Failed to run `tmux has-session -t %s`: %s", target, e)
+            return None
+        # tmux exits non-zero both for "no such session" and "no server
+        # running"; both mean the session does not exist.
+        return result.returncode == 0
 
     # Kept as an alias so existing callers/tests referencing the class
     # attribute keep working; the canonical set lives in
@@ -142,6 +371,7 @@ class TmuxClient:
         terminal_id: str,
         working_directory: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        terminal_token: Optional[str] = None,
     ) -> str:
         """Create detached tmux session with initial window and return window name."""
         try:
@@ -181,6 +411,8 @@ class TmuxClient:
             # value. See issue #248.
             self._merge_extra_env(environment, extra_env)
             environment["CAO_TERMINAL_ID"] = terminal_id
+            if terminal_token:
+                environment["CAO_TERMINAL_TOKEN"] = terminal_token
 
             # Explicit 220x50 pane size avoids the default 80x24 that tmux
             # assigns to detached sessions. kiro-cli 2.1.x's TUI v2 fails to
@@ -189,21 +421,62 @@ class TmuxClient:
             # silently dropped. Starting at a larger size makes the attach
             # resize a no-op/shrink, which kiro handles correctly. All other
             # providers tolerate wider panes. See issue #216.
-            session = self.server.new_session(
-                session_name=session_name,
-                window_name=window_name,
-                start_directory=working_directory,
-                detach=True,
-                environment=environment,
-                x=220,
-                y=50,
-            )
+            try:
+                session = self.server.new_session(
+                    session_name=session_name,
+                    window_name=window_name,
+                    start_directory=working_directory,
+                    detach=True,
+                    environment=environment,
+                    x=220,
+                    y=50,
+                )
+            except ValueError as e:
+                # new_session() lists the server to build its Session object,
+                # so it can fail to PARSE output for a session tmux has
+                # ALREADY created (see TmuxLookupError). tmux refusing a
+                # duplicate name raises LibTmuxException, not ValueError, so a
+                # ValueError here means "our session may exist but we cannot
+                # see it". Tear it down through the parse-free CLI: otherwise
+                # the caller's rollback never fires (it only knows the session
+                # was created once this method RETURNS) and the retry is
+                # blocked by "Session already exists" with a dead pane.
+                logger.error(
+                    f"tmux listing failed while creating session {session_name}: {e} — "
+                    "removing any session tmux created before re-raising"
+                )
+                self._kill_via_cli(session_name)
+                raise TmuxLookupError(
+                    f"Could not read tmux listing while creating session "
+                    f"'{session_name}': {e}. Any partially created session has "
+                    "been removed; the launch can be retried with the same name."
+                ) from e
+
             logger.info(
                 f"Created tmux session: {session_name} with window: {window_name} in directory: {working_directory}"
             )
-            window_name_result = session.windows[0].name
-            if window_name_result is None:
-                raise ValueError(f"Window name is None for session {session_name}")
+            try:
+                window_name_result = self._read_listing(
+                    f"list-windows for new session '{session_name}'",
+                    lambda: session.windows[0].name,
+                )
+                if window_name_result is None:
+                    raise ValueError(f"Window name is None for session {session_name}")
+            except TmuxLookupError:
+                # Same half-state, one step later: the session is up but we
+                # cannot confirm its window. Use the parse-free CLI here too —
+                # session.kill() would need the very listing that just failed.
+                self._kill_via_cli(session_name)
+                raise
+            except Exception:
+                # Any other post-creation failure: the session exists and this
+                # method is about to raise, so nothing downstream will ever
+                # learn it needs cleaning up. Kill it here.
+                try:
+                    session.kill()
+                except Exception as kill_error:  # pragma: no cover - best effort
+                    logger.warning(f"Failed to roll back session {session_name}: {kill_error}")
+                raise
             return window_name_result
         except Exception as e:
             logger.error(f"Failed to create session {session_name}: {e}")
@@ -217,6 +490,7 @@ class TmuxClient:
         working_directory: Optional[str] = None,
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        terminal_token: Optional[str] = None,
     ) -> str:
         """Create window in session and return window name.
 
@@ -227,13 +501,15 @@ class TmuxClient:
         try:
             working_directory = self._resolve_and_validate_working_directory(working_directory)
 
-            session = self.server.sessions.get(session_name=session_name)
+            session = self._find_session(session_name)
             if not session:
                 raise ValueError(f"Session '{session_name}' not found")
 
             window_env: dict[str, str] = {}
             self._merge_extra_env(window_env, extra_env)
             window_env["CAO_TERMINAL_ID"] = terminal_id
+            if terminal_token:
+                window_env["CAO_TERMINAL_TOKEN"] = terminal_token
 
             kwargs: dict = {
                 "window_name": window_name,
@@ -256,6 +532,70 @@ class TmuxClient:
             logger.error(f"Failed to create window in session {session_name}: {e}")
             raise
 
+    def set_window_parent(self, session_name: str, window_name: str, parent_id: str | None) -> None:
+        """Write the denormalized parent cache and per-window display format."""
+        session = self.server.sessions.get(session_name=session_name)
+        if not session:
+            raise ValueError(f"Session '{session_name}' not found")
+        window = session.windows.get(window_name=window_name)
+        if not window:
+            raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
+        window.set_option("@cao_parent", parent_id or "")
+        window.set_option(
+            "window-status-format",
+            "#{?#{!=:#{@cao_parent},},  └─ ,}#I:#W#{?window_flags,#{window_flags},}",
+        )
+
+    # tmux >= 3.7 passes pasted buffer content through vis(3) sanitization
+    # (hardening against bracket-end injection): raw ESC (0x1b) bytes loaded
+    # into a buffer arrive in the pane as the literal two characters "^[".
+    # Older tmux passes buffer bytes through unchanged. Cached per process —
+    # the tmux server version cannot change under a running CAO server.
+    _paste_buffer_sanitizes: Optional[bool] = None
+
+    @classmethod
+    def _tmux_sanitizes_paste_buffers(cls) -> bool:
+        """Return True when this host's tmux (>= 3.7) vis(3)-sanitizes pasted buffers."""
+        if cls._paste_buffer_sanitizes is None:
+            try:
+                out = subprocess.run(
+                    tmux_argv("-V"), capture_output=True, text=True, check=True
+                ).stdout
+                match = re.search(r"(\d+)\.(\d+)", out)
+                if match:
+                    version = (int(match.group(1)), int(match.group(2)))
+                    cls._paste_buffer_sanitizes = version >= (3, 7)
+                else:
+                    # "tmux master" / unparseable: assume a modern build that
+                    # sanitizes. Raw content + -p never renders garbage on any
+                    # version; a wrongly hand-crafted wrap on a sanitizing
+                    # tmux does (issue #413), so this is the safe default.
+                    cls._paste_buffer_sanitizes = True
+            except Exception:
+                cls._paste_buffer_sanitizes = True
+        return cls._paste_buffer_sanitizes
+
+    def _pane_is_bracketed_paste_incompatible(self, session_name: str, window_name: str) -> bool:
+        """Whether the pane's live foreground command is a known shell.
+
+        Used by ``send_keys(force_bracketed_paste=True)`` to avoid gluing
+        bracketed-paste escape sequences onto a bare shell prompt that
+        doesn't understand them (see BRACKETED_PASTE_INCOMPATIBLE_SHELLS'
+        own docstring for the failure mode). Reuses the same
+        ``#{pane_current_command}`` probe already trusted elsewhere in this
+        codebase for an equivalent "has the TUI exited back to a shell?"
+        check (``codex.py``/``kiro_cli.py``'s own ``shell_baseline``
+        comparison in ``get_status()``).
+
+        Fails closed to "compatible" (returns False) on any lookup failure
+        or an unrecognized command name -- an unknown foreground process is
+        assumed to be a real TUI expecting bracketed paste, preserving the
+        existing behavior for every case this function can't positively
+        rule out.
+        """
+        command = self.get_pane_current_command(session_name, window_name)
+        return command is not None and command in BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+
     def send_keys(
         self,
         session_name: str,
@@ -269,10 +609,9 @@ class TmuxClient:
 
         Uses load-buffer + paste-buffer instead of chunked send-keys to avoid
         slow character-by-character input and special character interpretation.
-        The -p flag lets tmux add real bracketed-paste markers if and only if
-        the pane application requested DECSET 2004. tmux 3.7 and newer sanitize
-        buffer content via vis(3), so hand-crafted ESC wrappers render literally
-        and must not be reintroduced.
+        Bracketed-paste framing keeps multi-line content as a single input
+        rather than submitting on each newline; how it is applied depends on
+        the tmux version (see force_bracketed_paste below).
 
         Args:
             session_name: Name of tmux session
@@ -281,8 +620,43 @@ class TmuxClient:
             enter_count: Number of Enter keys to send after pasting (default 1).
                 Some TUIs enter multi-line mode after bracketed paste,
                 requiring 2 Enters to submit.
-            force_bracketed_paste: Retained for backend-interface compatibility;
-                the herdr backend honors it, but it is a no-op for tmux.
+            force_bracketed_paste: If True, guarantee bracketed-paste framing
+                for message delivery to TUIs -- UNLESS the pane's live
+                foreground command (per #{pane_current_command}) is a known
+                shell (see BRACKETED_PASTE_INCOMPATIBLE_SHELLS), in which
+                case the wrap is skipped entirely and the content is
+                delivered as plain keystrokes instead. A bare shell doesn't
+                understand the escape sequences and glues them onto the
+                first token of the command, corrupting it -- the caller
+                asking for bracketed delivery does not always know the
+                target TUI has already exited (e.g. via its own `/exit`)
+                and left the pane at a shell prompt, so this is checked
+                fresh on every call rather than trusted from the caller's
+                own intent.
+
+                For a pane that IS running a real TUI, how the wrap is
+                applied depends on the tmux version: on tmux < 3.7 this
+                wraps the buffer in hand-crafted \x1b[200~...\x1b[201~
+                markers and pastes with -r (no LF->CR conversion) —
+                required because paste-buffer -p only emits markers when
+                the pane enabled DECSET 2004, and some TUIs (e.g. kiro-cli)
+                never do, so under -p their multi-line messages would
+                submit per-line (#230). On tmux >= 3.7 the hand-crafted wrap
+                is impossible: pasted buffer content passes through vis(3)
+                sanitization (hardening against bracket-end injection),
+                turning each raw ESC into the literal two characters "^["
+                — hand-crafted markers render as visible "^[[200~" garbage
+                in the receiving TUI (issue #413). There we paste raw
+                content with -p, which emits genuine 0x1b markers
+                conditionally on the pane's DECSET 2004 state; non-2004
+                panes receive raw text and multi-line content submits
+                per-line (tmux-sanctioned paste semantics — nothing better
+                exists on >= 3.7 without -S, which is deliberately NOT used
+                because it bypasses the vis(3) hardening and would let
+                worker-authored message bytes smuggle control sequences
+                into a receiving TUI). Do NOT set for shell commands sent
+                to bash during initialization (bash 4.x would receive the
+                literal escape sequences on tmux < 3.7).
         """
         # Defence-in-depth: re-validate at the sink even though callers
         # validate at the API/MCP boundary. Both halves flow into a
@@ -301,19 +675,56 @@ class TmuxClient:
             # prompts. This matches send_keys_via_paste, which logs only
             # the text length at INFO. Full content additionally remains
             # available here at DEBUG for local delivery troubleshooting.
-            # (upstream #427; fork retains ours paste path: force_bracketed_paste
-            # is a no-op for tmux — herdr honors it.)
             logger.info(f"send_keys: {target} - keys length: {len(keys)}")
             logger.debug(f"send_keys: {target} - keys: {keys}")
-            buf_content = keys.encode()
-            paste_flag = "-p"
+            if force_bracketed_paste and self._pane_is_bracketed_paste_incompatible(
+                validated_session, validated_window
+            ):
+                # The pane's live foreground command is a known shell (see
+                # BRACKETED_PASTE_INCOMPATIBLE_SHELLS) -- it won't reliably
+                # understand bracketed-paste escapes, so don't ask tmux to
+                # add them, on ANY tmux version. Deliberately omitting -p
+                # here too, not just the manual \x1b[200~ wrap used below
+                # for a real TUI on tmux < 3.7: -p's own bracket-emitting
+                # decision is driven by tmux's per-pane ?2004h tracking,
+                # which can itself be stale (the very TUI that used to run
+                # in this pane can leave it "on" without ever sending
+                # ?2004l on exit) -- so -p is not a safe fallback here
+                # either. Sending with no paste flag at all never adds
+                # escape sequences regardless of that tracked state; \n
+                # still becomes Enter (no -r), the correct behavior for a
+                # plain shell prompt.
+                buf_content = keys.encode()
+                paste_args = []
+            elif force_bracketed_paste and not self._tmux_sanitizes_paste_buffers():
+                # A real TUI, tmux < 3.7: buffer bytes pass through
+                # paste-buffer unmodified, so keep the legacy unconditional
+                # wrap + -r (no LF->CR conversion). paste-buffer -p only
+                # emits markers when the pane enabled DECSET 2004, and some
+                # TUIs (e.g. kiro-cli) never do — under -p their multi-line
+                # messages would submit per-line (#230). No pane-level
+                # bracketed-paste state format exists on these versions
+                # (verified empirically on 3.4), so the wrap stays
+                # unconditional here.
+                buf_content = b"\x1b[200~" + keys.encode() + b"\x1b[201~"
+                paste_args = ["-r"]
+            else:
+                # Either force_bracketed_paste=False, or a real TUI on
+                # tmux >= 3.7 which vis(3)-sanitizes pasted buffer content:
+                # raw ESC bytes in the buffer would render as literal
+                # "^[[200~" in the receiving TUI (issue #413). Load ONLY the
+                # raw message bytes and let tmux emit genuine markers via
+                # -p, conditionally on the pane's DECSET 2004 state. -S is
+                # deliberately NOT used: it bypasses the vis(3) hardening.
+                buf_content = keys.encode()
+                paste_args = ["-p"]
             subprocess.run(
                 tmux_argv("load-buffer", "-b", buf_name, "-"),
                 input=buf_content,
                 check=True,
             )
             subprocess.run(
-                tmux_argv("paste-buffer", paste_flag, "-b", buf_name, "-t", target),
+                tmux_argv("paste-buffer", *paste_args, "-b", buf_name, "-t", target),
                 check=True,
             )
             # Delay to let the TUI process the bracketed paste end sequence before
@@ -361,15 +772,15 @@ class TmuxClient:
                 f"send_keys_via_paste: {session_name}:{window_name} - text length: {len(text)}"
             )
 
-            session = self.server.sessions.get(session_name=session_name)
+            session = self._find_session(session_name)
             if not session:
                 raise ValueError(f"Session '{session_name}' not found")
 
-            window = session.windows.get(window_name=window_name)
+            window = self._find_window(session, session_name, window_name)
             if not window:
                 raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
 
-            pane = window.active_pane
+            pane = self._find_active_pane(window, session_name, window_name)
             if pane:
                 buf_name = "cao_paste"
 
@@ -411,15 +822,15 @@ class TmuxClient:
         try:
             logger.info(f"send_special_key: {session_name}:{window_name} - key: {key}")
 
-            session = self.server.sessions.get(session_name=session_name)
+            session = self._find_session(session_name)
             if not session:
                 raise ValueError(f"Session '{session_name}' not found")
 
-            window = session.windows.get(window_name=window_name)
+            window = self._find_window(session, session_name, window_name)
             if not window:
                 raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
 
-            pane = window.active_pane
+            pane = self._find_active_pane(window, session_name, window_name)
             if pane:
                 pane.send_keys(key, enter=False)
                 logger.debug(f"Sent special key to {session_name}:{window_name}")
@@ -443,18 +854,28 @@ class TmuxClient:
             tail_lines: Number of lines to capture from end (default: TMUX_HISTORY_LINES)
             strip_escapes: If True, capture plain text without ANSI escape sequences
             full_history: If True, capture entire scrollback buffer (overrides tail_lines)
+
+        Raises:
+            ValueError: The session or window is genuinely gone.
+            TmuxLookupError: The tmux listing could not be parsed, so we cannot
+                say whether it is gone. This is the hot path for the parse race
+                — the FIFO pipe-liveness watchdog probes panes through here on
+                every tick, from every concurrent CAO session. The distinction
+                matters: the watchdog must not conclude a worker's pane has
+                stopped producing output (and a supervisor must not conclude
+                the worker finished) because a listing failed to parse.
         """
         try:
-            session = self.server.sessions.get(session_name=session_name)
+            session = self._find_session(session_name)
             if not session:
                 raise ValueError(f"Session '{session_name}' not found")
 
-            window = session.windows.get(window_name=window_name)
+            window = self._find_window(session, session_name, window_name)
             if not window:
                 raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
 
             # Use cmd to run capture-pane with -e (escape sequences) and -p (print) flags
-            pane = window.panes[0]
+            pane = self._find_first_pane(window, session_name, window_name)
             if full_history:
                 # "-S -" captures from the start of the scrollback buffer
                 flags = ["-p", "-S", "-"]
@@ -489,8 +910,15 @@ class TmuxClient:
             raise
 
     def list_sessions(self) -> List[Dict[str, str]]:
-        """List all tmux sessions."""
-        try:
+        """List all tmux sessions.
+
+        Raises:
+            TmuxLookupError: The listing could not be parsed. Deliberately NOT
+                degraded to an empty list — "we could not read the tmux server"
+                must never look like "there are no sessions".
+        """
+
+        def read() -> List[Dict[str, str]]:
             sessions: List[Dict[str, str]] = []
             for session in self.server.sessions:
                 # Check if session has attached clients
@@ -504,98 +932,192 @@ class TmuxClient:
                         "status": "active" if is_attached else "detached",
                     }
                 )
-
             return sessions
+
+        try:
+            return self._read_listing("list-sessions", read)
+        except TmuxLookupError:
+            raise
         except Exception as e:
             logger.error(f"Failed to list sessions: {e}")
             return []
 
     def get_session_windows(self, session_name: str) -> List[Dict[str, str]]:
-        """Get all windows in a session."""
+        """Get all windows in a session.
+
+        Returns an empty list when the session is genuinely absent.
+
+        Raises:
+            TmuxLookupError: The listing could not be parsed — not the same
+                thing as a session with no windows.
+        """
         try:
-            session = self.server.sessions.get(session_name=session_name)
+            session = self._find_session(session_name)
             if not session:
                 return []
 
-            windows: List[Dict[str, str]] = []
-            for window in session.windows:
-                window_name = window.name if window.name is not None else ""
-                windows.append({"name": window_name, "index": str(window.index)})
+            def read() -> List[Dict[str, str]]:
+                windows: List[Dict[str, str]] = []
+                for window in session.windows:
+                    window_name = window.name if window.name is not None else ""
+                    windows.append({"name": window_name, "index": str(window.index)})
+                return windows
 
-            return windows
+            return self._read_listing(f"list-windows for session '{session_name}'", read)
+        except TmuxLookupError:
+            raise
         except Exception as e:
             logger.error(f"Failed to get windows for session {session_name}: {e}")
             return []
 
     def kill_session(self, session_name: str) -> bool:
-        """Kill tmux session."""
+        """Kill tmux session.
+
+        Returns:
+            True if a session was killed, False if there was nothing to kill
+            (or the kill itself failed).
+
+        A listing parse failure does NOT return False here: "we could not look"
+        is not "nothing to kill", and swallowing it is exactly how a failed
+        launch leaves a live session that blocks the retry. The kill is retried
+        through the parse-free tmux CLI instead.
+        """
         try:
-            session = self.server.sessions.get(session_name=session_name)
-            if session:
-                session.kill()
-                logger.info(f"Killed tmux session: {session_name}")
-                return True
-            return False
+            session = self._find_session(session_name)
+            if session is None:
+                return False
+            self._read_listing(f"kill-session '{session_name}'", session.kill)
+            logger.info(f"Killed tmux session: {session_name}")
+            return True
+        except TmuxLookupError as e:
+            logger.warning(
+                f"tmux listing failed while killing session {session_name}: {e} — "
+                "falling back to the tmux CLI"
+            )
+            return self._kill_via_cli(session_name)
         except Exception as e:
             logger.error(f"Failed to kill session {session_name}: {e}")
             return False
 
     def kill_window(self, session_name: str, window_name: str) -> bool:
-        """Kill a specific tmux window within a session."""
+        """Kill a specific tmux window within a session.
+
+        Like ``kill_session``, a listing parse failure falls back to the
+        parse-free tmux CLI rather than reporting "nothing to kill".
+        """
         try:
-            session = self.server.sessions.get(session_name=session_name)
+            session = self._find_session(session_name)
             if not session:
                 return False
-            window = session.windows.get(window_name=window_name)
-            if window:
-                window.kill()
-                logger.info(f"Killed tmux window: {session_name}:{window_name}")
-                return True
-            return False
+            window = self._find_window(session, session_name, window_name)
+            if window is None:
+                return False
+            self._read_listing(f"kill-window '{session_name}:{window_name}'", window.kill)
+            logger.info(f"Killed tmux window: {session_name}:{window_name}")
+            return True
+        except TmuxLookupError as e:
+            logger.warning(
+                f"tmux listing failed while killing window {session_name}:{window_name}: {e} — "
+                "falling back to the tmux CLI"
+            )
+            return self._kill_via_cli(session_name, window_name)
         except Exception as e:
             logger.error(f"Failed to kill window {session_name}:{window_name}: {e}")
             return False
 
     def session_exists(self, session_name: str) -> bool:
-        """Check if session exists."""
+        """Check if session exists.
+
+        A listing parse failure must not answer False: callers use this both to
+        decide a session is gone AND to guard against creating a duplicate, so
+        a wrong False is the worst possible answer. On a parse failure we ask
+        tmux directly (``has-session``), which needs no listing parse.
+
+        Raises:
+            TmuxLookupError: The listing could not be parsed AND the direct
+                probe could not answer either — genuinely unknown.
+        """
         try:
-            session = self.server.sessions.get(session_name=session_name)
-            return session is not None
+            return self._find_session(session_name) is not None
+        except TmuxLookupError:
+            logger.warning(
+                "tmux listing failed for session %s — probing with `tmux has-session`",
+                session_name,
+            )
+            exists = self._has_session_via_cli(session_name)
+            if exists is None:
+                raise
+            return exists
         except Exception:
             return False
 
     def get_pane_working_directory(self, session_name: str, window_name: str) -> Optional[str]:
-        """Get the current working directory of a pane."""
+        """Get the current working directory of a pane.
+
+        Returns None when it cannot be determined — including on a listing
+        parse failure. None already means "unknown" for this method (it is what
+        an absent session/window returns too), so there is no "gone" claim to
+        get wrong; the failure is logged rather than raised.
+
+        A trailing literal ``" (deleted)"`` in the raw tmux ``pane_current_path``
+        is the platform's signal that the pane's cwd was deleted (F26). It is
+        resolved here so every consumer either sees a clean path or ``None`` —
+        never a dangling literal:
+        1. no suffix → return unchanged, ``os.path.exists`` never called (fast path);
+        2. suffix + the full literal exists → a real dir legally named
+           ``" (deleted)"`` → return it unchanged (never suffix-strip a legal name);
+        3. suffix + the stripped path exists → deleted-then-recreated; the shell's
+           cwd is still the freed inode → ``None`` (never misstate the live dir);
+        4. otherwise → genuinely deleted → ``None``.
+        """
         try:
-            session = self.server.sessions.get(session_name=session_name)
+            session = self._find_session(session_name)
             if not session:
                 return None
 
-            window = session.windows.get(window_name=window_name)
+            window = self._find_window(session, session_name, window_name)
             if not window:
                 return None
 
-            pane = window.active_pane
+            pane = self._find_active_pane(window, session_name, window_name)
             if pane:
                 # Get pane_current_path from tmux
                 result = pane.cmd("display-message", "-p", "#{pane_current_path}")
                 if result.stdout:
-                    return result.stdout[0].strip()
+                    raw = result.stdout[0].strip()
+                    if not raw.endswith(_DELETED_CWD_SUFFIX):
+                        return raw
+                    full = raw
+                    stripped = full[: -len(_DELETED_CWD_SUFFIX)]
+                    if os.path.exists(full):
+                        return full
+                    if os.path.exists(stripped):
+                        logger.warning("cwd_deleted_recreated cwd=%s", stripped)
+                        return None
+                    logger.warning("cwd_deleted cwd=%s", stripped)
+                    return None
             return None
         except Exception as e:
             logger.error(f"Failed to get working directory for {session_name}:{window_name}: {e}")
             return None
 
     def get_pane_current_command(self, session_name: str, window_name: str) -> Optional[str]:
-        """Get the current foreground command running in a pane."""
+        """Get the current foreground command running in a pane.
+
+        Returns None when it cannot be determined, including on a listing parse
+        failure. Its only caller
+        (``_pane_is_bracketed_paste_incompatible``) already treats None as
+        "assume a real TUI", the pre-existing safe default — so there is no
+        "gone" claim to get wrong here either.
+        """
         try:
-            session = self.server.sessions.get(session_name=session_name)
+            session = self._find_session(session_name)
             if not session:
                 return None
-            window = session.windows.get(window_name=window_name)
+            window = self._find_window(session, session_name, window_name)
             if not window:
                 return None
-            pane = window.active_pane
+            pane = self._find_active_pane(window, session_name, window_name)
             if pane:
                 result = pane.cmd("display-message", "-p", "#{pane_current_command}")
                 if result.stdout:
@@ -632,19 +1154,25 @@ class TmuxClient:
             session_name: Tmux session name
             window_name: Tmux window name
             file_path: Absolute path to log file
+
+        Raises:
+            ValueError: The session or window is genuinely gone.
+            TmuxLookupError: The tmux listing could not be parsed. Raised rather
+                than swallowed so the pipe-liveness watchdog's re-arm is retried
+                instead of being recorded as a permanent failure.
         """
         try:
-            session = self.server.sessions.get(session_name=session_name)
+            session = self._find_session(session_name)
             if not session:
                 raise ValueError(f"Session '{session_name}' not found")
 
-            window = session.windows.get(window_name=window_name)
+            window = self._find_window(session, session_name, window_name)
             if not window:
                 raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
 
-            pane = window.active_pane
+            pane = self._find_active_pane(window, session_name, window_name)
             if pane:
-                pane.cmd("pipe-pane", "-o", f"cat >> {file_path}")
+                pane.cmd("pipe-pane", "-o", f"cat >> {shlex.quote(str(file_path))}")
                 logger.info(f"Started pipe-pane for {session_name}:{window_name} to {file_path}")
         except Exception as e:
             logger.error(f"Failed to start pipe-pane for {session_name}:{window_name}: {e}")
@@ -656,17 +1184,21 @@ class TmuxClient:
         Args:
             session_name: Tmux session name
             window_name: Tmux window name
+
+        Raises:
+            ValueError: The session or window is genuinely gone.
+            TmuxLookupError: The tmux listing could not be parsed.
         """
         try:
-            session = self.server.sessions.get(session_name=session_name)
+            session = self._find_session(session_name)
             if not session:
                 raise ValueError(f"Session '{session_name}' not found")
 
-            window = session.windows.get(window_name=window_name)
+            window = self._find_window(session, session_name, window_name)
             if not window:
                 raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
 
-            pane = window.active_pane
+            pane = self._find_active_pane(window, session_name, window_name)
             if pane:
                 pane.cmd("pipe-pane")
                 logger.info(f"Stopped pipe-pane for {session_name}:{window_name}")

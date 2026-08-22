@@ -6,7 +6,18 @@ Core services depend only on this ABC, never on a concrete backend directly.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
+
+
+@dataclass(frozen=True)
+class ScopeProbe:
+    """F218-a D2: Result of a positive re-probe to classify loss scope."""
+
+    scope: Literal["window_gone", "session_gone", "unknown"]
+    session_present: bool | None  # None = could not ask (_has_session_via_cli semantics)
+    sibling_windows: tuple[str, ...] | None
+    samples: int
+    evidence: tuple[str, ...]  # verbatim rc/stderr, oldest→newest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
@@ -89,6 +100,7 @@ class TerminalBackend(ABC):
         terminal_id: str,
         working_directory: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        terminal_token: Optional[str] = None,
     ) -> str:
         """Create a new terminal session with an initial window.
 
@@ -97,6 +109,7 @@ class TerminalBackend(ABC):
             window_name: Name for the initial window/tab
             terminal_id: Unique terminal identifier to inject into the environment
             working_directory: Optional starting directory
+            terminal_token: Optional per-terminal auth token to inject into the environment
 
         Returns:
             The actual window name assigned by the backend
@@ -146,6 +159,44 @@ class TerminalBackend(ABC):
         """Return live, gone, or error without collapsing backend failures."""
         return "error"
 
+    def enumerate_windows(
+        self, session_name: str
+    ) -> tuple[Literal["ok", "error"], List[Dict[str, object]] | None]:
+        """Enumerate windows via subprocess. Classifies its own failure.
+
+        Returns ("ok", [...]) on success, ("ok", []) when the session is
+        genuinely absent, or ("error", None) when the read itself failed.
+        """
+        return ("error", None)
+
+    def session_scope_probe(
+        self,
+        session_name: str,
+        *,
+        window_name: str,
+        samples: int = 2,
+        timeout_s: float = 5.0,
+    ) -> ScopeProbe:
+        """F218-a D2: Classify scope of a confirmed-gone terminal.
+
+        Determines whether the window alone is gone (session still alive with
+        siblings) or the entire session is gone. Returns ``unknown`` when the
+        answer cannot be determined reliably.
+
+        The default implementation always returns ``unknown``.
+        """
+        return ScopeProbe(
+            scope="unknown",
+            session_present=None,
+            sibling_windows=None,
+            samples=0,
+            evidence=("default_backend_no_probe",),
+        )
+
+    def get_session_windows(self, session_name: str) -> List[Dict[str, object]]:
+        """Return the windows visible in a session, or an empty inventory."""
+        return []
+
     @abstractmethod
     def create_window(
         self,
@@ -155,6 +206,7 @@ class TerminalBackend(ABC):
         working_directory: Optional[str] = None,
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        terminal_token: Optional[str] = None,
     ) -> str:
         """Create a new window/tab in an existing session.
 
@@ -164,6 +216,7 @@ class TerminalBackend(ABC):
             terminal_id: Unique terminal identifier to inject into the environment
             working_directory: Optional starting directory
             window_shell: Optional shell command to run instead of default shell
+            terminal_token: Optional per-terminal auth token to inject into the environment
 
         Returns:
             The actual window name assigned by the backend
@@ -206,7 +259,14 @@ class TerminalBackend(ABC):
             window_name: Target window
             keys: Text to send
             enter_count: Number of Enter keys to send after the text
-            force_bracketed_paste: If True, wrap in bracketed paste sequences
+            force_bracketed_paste: If True, request bracketed-paste delivery.
+                The herdr backend wraps content in \\x1b[200~...\\x1b[201~
+                itself (it writes raw bytes to the pty, no sanitization). The
+                tmux backend hand-crafts the same wrap on tmux < 3.7 but must
+                delegate to ``paste-buffer -p`` on >= 3.7, where pasted
+                buffers are vis(3)-sanitized and raw ESC bytes would arrive
+                as literal "^[[200~" (issue #413); -p emits markers only when
+                the pane enabled DECSET 2004.
             submit_delay: Seconds to wait after pasting before sending Enter, so
                 a TUI (e.g. Claude Code's Ink renderer) finishes processing the
                 paste before submission. Backends without a paste step may ignore.

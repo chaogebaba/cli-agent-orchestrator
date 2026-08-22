@@ -34,7 +34,9 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     "hermes",
     "kimi_cli",
     "kiro_cli",
+    "mcode",
     "opencode_cli",
+    "omp",
 }
 
 # Validation constraints for ``--env`` forwarded vars (mirrored server-side
@@ -107,6 +109,13 @@ def _parse_env_pairs(pairs):
     help=f"Provider to use (default: profile provider or {DEFAULT_PROVIDER})",
 )
 @click.option(
+    "--engine",
+    "engine",
+    type=click.Choice(["v2", "kas"], case_sensitive=True),
+    default=None,
+    help="Explicit Kiro engine (default: profile engine or v2).",
+)
+@click.option(
     "--allowed-tools",
     multiple=True,
     help="Override allowedTools (CAO format: execute_bash, fs_read, @cao-mcp-server). Repeatable.",
@@ -161,6 +170,7 @@ def launch(
     headless,
     is_async,
     provider,
+    engine,
     allowed_tools,
     auto_approve,
     yolo,
@@ -293,6 +303,8 @@ def launch(
         }
         if explicit_provider:
             params["provider"] = provider
+        if engine is not None:
+            params["engine"] = engine
         if session_name:
             params["session_name"] = session_name
         if resolved_allowed_tools:

@@ -146,6 +146,82 @@ async def test_e1_real_git_planted_token_refresh_resets_row_fresh(
 
 
 @pytest.mark.asyncio
+async def test_e1_two_covered_cycles_with_persistent_dirty_file_advance_lineage(
+    tmp_path, monkeypatch,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "test")
+    token_file = repo / "token.txt"
+    token_file.write_text("BASE\n", encoding="utf-8")
+    _git(repo, "add", "token.txt")
+    _git(repo, "commit", "-qm", "base")
+    captured = terminals.fork_snapshot(str(repo))
+    row = {
+        "id": 9, "name": "base", "kind": "base", "source_terminal_id": "base-term",
+        "session_uuid": "uuid", "cwd": str(repo), "git_sha": captured.git_sha,
+        "dirty_hashes": captured.dirty_hashes(), "digest_head": None,
+    }
+
+    async def inline(_terminal, _generation, _kind, _operation, function, *args,
+                     deadline=None, **kwargs):
+        return function(*args, **kwargs), time.monotonic()
+
+    async def ready(*_args, **_kwargs):
+        return True
+
+    def update(_row_id, *, git_sha, dirty_hashes, digest_head=None):
+        row.update(git_sha=git_sha, dirty_hashes=dirty_hashes, digest_head=digest_head)
+        return dict(row)
+
+    dispatches = []
+    terminals._fork_refresh_locks.clear()
+    monkeypatch.setattr(terminals, "_tracked_blocking", inline)
+    monkeypatch.setattr(terminals, "get_ready_provider_session", lambda _name: dict(row))
+    monkeypatch.setattr(terminals, "update_provider_session_snapshot", update)
+    monkeypatch.setattr(
+        terminals,
+        "_dispatch_base_refresh",
+        lambda _terminal_id, prompt, **_kwargs: dispatches.append(prompt) or True,
+    )
+    monkeypatch.setattr(terminals, "_wait_for_base_ready", ready)
+    monkeypatch.setattr(terminals.status_monitor, "get_input_gen", lambda _id: 1)
+
+    token_file.write_text("DIRTY-A\n", encoding="utf-8")
+    first_delta = terminals.fork_staleness(row).delta
+    first_artifact = base_digest_service.publish(
+        base="base", cwd=str(repo), parent_artifact_sha=None,
+        delta=first_delta, body="cycle A", round_number=1,
+    )
+    first_preamble = await terminals._prepare_fork_refresh(
+        "worker-a", "g-a", "base", "[STALE-A]", None, {}
+    )
+
+    assert first_preamble.startswith("[FRESH]")
+    assert row["digest_head"] == first_artifact.artifact_sha
+    assert terminals.fork_staleness(row).changed_count == 0
+
+    (repo / "alpha.txt").write_text("DIRTY-B\n", encoding="utf-8")
+    second_delta = terminals.fork_staleness(row).delta
+    assert second_delta.paths == ("alpha.txt",)
+    second_artifact = base_digest_service.publish(
+        base="base", cwd=str(repo), parent_artifact_sha=row["digest_head"],
+        delta=second_delta, body="cycle B", round_number=2,
+    )
+    second_preamble = await terminals._prepare_fork_refresh(
+        "worker-b", "g-b", "base", "[STALE-B]", None, {}
+    )
+
+    assert second_preamble.startswith("[FRESH]")
+    assert row["digest_head"] == second_artifact.artifact_sha
+    assert terminals.fork_staleness(row).changed_count == 0
+    assert set(terminals.fork_snapshot(str(repo)).paths) == {"alpha.txt", "token.txt"}
+    assert len(dispatches) == 2
+
+
+@pytest.mark.asyncio
 async def test_e1_two_concurrent_stale_forks_dispatch_once_and_reset_baseline(monkeypatch):
     terminals._fork_refresh_locks.clear()
     state = {"fresh": False, "dispatches": 0, "writes": 0}
@@ -180,7 +256,10 @@ async def test_e1_two_concurrent_stale_forks_dispatch_once_and_reset_baseline(mo
     monkeypatch.setattr(terminals, "get_ready_provider_session", lambda _name: dict(row))
     monkeypatch.setattr(terminals, "fork_staleness", compare)
     monkeypatch.setattr(terminals, "fork_snapshot", lambda _cwd: SnapshotDelta("new"))
-    monkeypatch.setattr(terminals.base_digest_service, "evaluate", lambda *_a: _covered())
+    token_entry = SnapshotEntry("token.txt", "sha256", "a" * 64)
+    monkeypatch.setattr(
+        terminals.base_digest_service, "evaluate", lambda *_a: _covered((token_entry,))
+    )
     monkeypatch.setattr(terminals, "update_provider_session_snapshot", update)
     monkeypatch.setattr(terminals, "_dispatch_base_refresh", dispatch)
     monkeypatch.setattr(terminals, "_wait_for_base_ready", ready)
@@ -263,9 +342,13 @@ async def test_e1_post_dispatch_delta_mismatch_preserves_snapshot_and_lineage(mo
 
     monkeypatch.setattr(terminals, "_tracked_blocking", inline)
     monkeypatch.setattr(terminals, "get_ready_provider_session", lambda _name: dict(row))
-    monkeypatch.setattr(
-        terminals, "fork_staleness", lambda _row: _stale(("old.py",))
+    comparisons = iter(
+        (
+            _stale(("old.py",)),
+            StalenessResult(SnapshotDelta("old", (new_entry,)), "[STALE]", 1),
+        )
     )
+    monkeypatch.setattr(terminals, "fork_staleness", lambda _row: next(comparisons))
     monkeypatch.setattr(
         terminals.base_digest_service, "evaluate", lambda *_a: _covered((old_entry,))
     )
@@ -295,6 +378,104 @@ async def test_e1_post_dispatch_delta_mismatch_preserves_snapshot_and_lineage(mo
     assert (row["git_sha"], row["dirty_hashes"], row["digest_head"]) == (
         "old", '{"old.py":"baseline"}', "c" * 64,
     )
+
+
+@pytest.mark.asyncio
+async def test_ac8c_evaluate_unobservable_sends_no_pending_notice(monkeypatch, caplog):
+    terminals._fork_refresh_locks.clear()
+    delta = SnapshotDelta(None, acquisition_error="git-failure")
+    row = {
+        "id": 7, "name": "base", "kind": "base", "source_terminal_id": "base-term",
+        "session_uuid": "uuid", "cwd": "/repo",
+    }
+    notices = []
+    dispatches = []
+
+    async def inline(_terminal, _generation, _kind, _operation, function, *args,
+                     deadline=None, **kwargs):
+        return function(*args, **kwargs), time.monotonic()
+
+    async def ready(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(terminals, "_tracked_blocking", inline)
+    monkeypatch.setattr(terminals, "get_ready_provider_session", lambda _name: row)
+    monkeypatch.setattr(
+        terminals, "fork_staleness", lambda _row: StalenessResult(delta, "[STALE]", 1)
+    )
+    monkeypatch.setattr(terminals, "_wait_for_base_ready", ready)
+    monkeypatch.setattr(
+        terminals, "create_digest_pending_notice",
+        lambda *_args, **_kwargs: notices.append(True),
+    )
+    monkeypatch.setattr(
+        terminals, "_dispatch_base_refresh",
+        lambda *_args, **_kwargs: dispatches.append(True),
+    )
+    caplog.set_level("WARNING")
+
+    preamble = await terminals._prepare_fork_refresh(
+        "worker", "g", "base", "[STALE]", None, {"caller_id": "caller"}
+    )
+
+    assert preamble == "[STALE]"
+    assert notices == []
+    assert dispatches == []
+    assert "digest_refresh_unobservable base=base reason=apparatus_unavailable" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ac8c_post_dispatch_acquisition_gap_uses_coverage_and_logs_reason(
+    monkeypatch, caplog
+):
+    terminals._fork_refresh_locks.clear()
+    entry = SnapshotEntry("old.py", "sha256", "a" * 64)
+    row = {
+        "id": 7, "name": "base", "kind": "base", "source_terminal_id": "base-term",
+        "session_uuid": "uuid", "cwd": "/repo", "git_sha": "old",
+        "dirty_hashes": "{}",
+    }
+    writes = []
+
+    async def inline(_terminal, _generation, _kind, _operation, function, *args,
+                     deadline=None, **kwargs):
+        return function(*args, **kwargs), time.monotonic()
+
+    async def ready(*_args, **_kwargs):
+        return True
+
+    comparisons = iter(
+        (
+            _stale(("old.py",)),
+            StalenessResult(
+                SnapshotDelta(None, (entry,), acquisition_error="git-failure"),
+                "[STALE]", 1,
+            ),
+        )
+    )
+    monkeypatch.setattr(terminals, "_tracked_blocking", inline)
+    monkeypatch.setattr(terminals, "get_ready_provider_session", lambda _name: row)
+    monkeypatch.setattr(terminals, "fork_staleness", lambda _row: next(comparisons))
+    monkeypatch.setattr(
+        terminals.base_digest_service, "evaluate", lambda *_args: _covered((entry,))
+    )
+    monkeypatch.setattr(terminals, "_wait_for_base_ready", ready)
+    monkeypatch.setattr(terminals, "_dispatch_base_refresh", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(terminals, "fork_snapshot", lambda _cwd: SnapshotDelta("new"))
+    monkeypatch.setattr(terminals.status_monitor, "get_input_gen", lambda _id: 1)
+    monkeypatch.setattr(
+        terminals, "update_provider_session_snapshot",
+        lambda *_args, **kwargs: writes.append(kwargs),
+    )
+    caplog.set_level("WARNING")
+
+    preamble = await terminals._prepare_fork_refresh(
+        "worker", "g", "base", "[STALE]", None, {}
+    )
+
+    assert preamble == "[STALE]"
+    assert writes == []
+    assert "digest_post_dispatch_unobservable base=base reason=apparatus_unavailable" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -368,6 +549,7 @@ async def test_e1_hung_refresh_dispatch_completes_with_stale_preamble(monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 async def test_e1_deferred_schedule_returns_while_refresh_is_running(monkeypatch):
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -388,6 +570,8 @@ async def test_e1_deferred_schedule_returns_while_refresh_is_running(monkeypatch
     monkeypatch.setattr(terminals, "_prepare_fork_refresh", refresh)
     monkeypatch.setattr(terminals, "send_input", lambda _id, message, **_kw: sent.append(message))
     monkeypatch.setattr(terminals, "mark_terminal_init_ready", lambda *_a, **_k: True)
+    # Synthetic provider has no process tree; F124 launch-health check would raise.
+    monkeypatch.setattr(terminals, "_confirm_launch_health", AsyncMock())
     snapshot = {
         "caller_id": "caller", "agent_profile": "dev", "provider": "codex",
         "init_deadline_s": 1.0,

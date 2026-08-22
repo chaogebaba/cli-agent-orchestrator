@@ -22,7 +22,4 @@ class KiroAgentConfig(BaseModel):
     toolsSettings: Optional[Dict[str, Any]] = None
     hooks: Optional[Dict[str, Any]] = None
     model: Optional[str] = None
-
-    class Config:
-        # Exclude None values when serializing to JSON
-        exclude_none = True
+    permissions: Optional[Dict[str, Any]] = None

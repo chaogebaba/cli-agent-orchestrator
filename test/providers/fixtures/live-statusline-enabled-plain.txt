@@ -1,0 +1,40 @@
+codex -c 'tui.status_line=["current-dir","git-branch","model-with-reasoning","context-remaining","five-hour-limit"]'
+
+cli-agent-orchestrator on  quirks-merge-train [$] is 📦 v2.3.0 via 🐍 v3.14.6 on ☁️  user@example.com 
+❯ codex -c 'tui.status_line=["current-dir","git-branch","model-with-reasoning","context-remaining","five-hour-limit"]'
+╭─────────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.145.0)                          │
+│                                                     │
+│ model:     gpt-5.6-sol high   /model to change      │
+│ directory: ~/…/cli-subagents/cli-agent-orchestrator │
+╰─────────────────────────────────────────────────────╯
+
+  Tip: Use /permissions to control when Codex asks for confirmation.
+
+
+› Explain this codebase
+
+  ~/VScode_projects/cli-subagents/cli-agent-orchestrator · quirks-merge-train · gpt-5.6-sol high · Context 100% left
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

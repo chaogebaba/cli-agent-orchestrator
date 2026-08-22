@@ -1,0 +1,8 @@
+# F115 sample #3 — auto-responder "unknown blocking dialog" fired on a LIVE, actively-THINKING terminal
+# Terminal: 4fdd6618 (grok_dev, grok_cli), cao-claude-orch5, 2026-08-08 ~03:1x
+# Worker was mid-investigation (spinner + "Thinking…" visible); NOT stalled, NOT a dialog.
+# Distinct subclass from the exited-terminal samples: false positive on a BUSY pane whose
+# scrollback contained dialog-looking content the worker itself was reading/quoting.
+# Alert payload (dialog text as normalized by the scanner), verbatim:
+
+fx15-draft-guard-failclosed.md fx6-codex-waiting-gap.md fx7-stuck-worker-alert.md ─── pre_tool_use ✓ project/settings:pre_tool_use[0].hooks[0] (131ms) ┃◆ Thinking… ┃ ┃Now I have a clear picture of the race. Let me also check dialog_region - maybe the final report has "1. " and something that looks like press ┃enter, or WAITING status from "Enter:submit" in footer. ┃ ┃... ⠙ Thinking… 2.7s 1m19s ⇣74.7k ❯ CPA relay (high) · always-approve · 74K / 500K (15%) · ctrl+o transcript

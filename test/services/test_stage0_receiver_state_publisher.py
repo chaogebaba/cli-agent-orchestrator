@@ -314,6 +314,7 @@ def test_reset_buffer_invalidates_pre_reset_receiver_observation(monkeypatch) ->
     )
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_receiver_store_publisher_is_closed_to_other_modules() -> None:
     root = Path(__file__).parents[2] / "src" / "cli_agent_orchestrator"
     violations: list[str] = []

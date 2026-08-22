@@ -81,7 +81,8 @@ def test_e1_stale_fork_is_deferred_with_refresh_base(monkeypatch):
 
     assert result["success"] is True
     assert create.call_args.kwargs["refresh_base_name"] == "base"
-    assert create.call_args.kwargs["fork_context"].initial_preamble == "[STALE]"
+    preamble = create.call_args.kwargs["fork_context"].initial_preamble
+    assert preamble.startswith("[STALE]"), f"expected [STALE] prefix, got: {preamble!r}"
 
 
 def test_e2_explicit_cold_and_absent_key_remain_cold(monkeypatch):

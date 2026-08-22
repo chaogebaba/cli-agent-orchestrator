@@ -9,10 +9,13 @@ import shlex
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.utils.persona_context import PersonaPlan
 
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.constants import BLOCKED_WAIT_CAP_S
+from cli_agent_orchestrator.constants import BLOCKED_WAIT_CAP_S, CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
 from cli_agent_orchestrator.providers.base import (
     BaseProvider,
@@ -30,7 +33,9 @@ from cli_agent_orchestrator.services.settings_service import (
     get_server_settings,
     resolve_provider_string_option,
 )
+from cli_agent_orchestrator.utils import provider_plane
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.binary_resolution import resolve_provider_binary
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.provider_plane import provider_home
 from cli_agent_orchestrator.utils.sandbox_guard import bind_mcp_server_identity
@@ -42,6 +47,16 @@ from cli_agent_orchestrator.utils.terminal import (
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
+
+
+def _resolved_codex_home(terminal_id: str | None) -> Path:
+    from cli_agent_orchestrator.utils.persona_context import resolve_codex_home
+
+    resolved = resolve_codex_home(terminal_id)
+    if resolved == provider_plane.provider_home("codex").home:
+        return provider_home("codex").home
+    return resolved
+
 
 # Regex patterns for Codex output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
@@ -115,13 +130,27 @@ TRANSIENT_ERROR_EXCLUSIONS = (
 )
 
 # Codex TUI footer indicators (status bar below the idle prompt).
-# Used to detect when the bottom lines contain TUI chrome rather than user input.
-# v0.110 and earlier: "? for shortcuts" and "N% context left"
-# v0.111+: "model · N% left · path" (PR #13202 restored draft footer hints)
-# v0.136+: "model · path" (the "N% left" segment was removed)
-# The "·\s+[~/]" alternative anchors on the path component of the footer,
-# which is shared across v0.111 and v0.136 status bars.
-TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])"
+# Keep this case-insensitive: status_line labels and model names vary by version.
+_TUI_CONTEXT_RE = r"(?:context\s+\d+%\s+left|\d+%\s+(?:context\s+)?left)"
+_TUI_LIMIT_RE = (
+    r"(?:(?:\d+\s*h(?:\s+\d+\s*m)?(?:\s+\d+\s*s)?)|" r"(?:\d+\s*m(?:\s+\d+\s*s)?))\s+left"
+)
+_TUI_MODEL_EFFORT_RE = r"[^·\n]+?\s+(?:minimal|low|medium|high|xhigh|max|ultra)"
+TUI_FOOTER_PATTERN = (
+    r"(?i)^\s*(?:\?\s+for shortcuts(?:\s+.*)?|"
+    + _TUI_CONTEXT_RE
+    + r"|"
+    + _TUI_LIMIT_RE
+    + r"|[^›\n]+·\s+[~/][^\n]*)\s*$"
+)
+_TUI_PATH_WITH_KNOWN_TAIL_RE = re.compile(
+    rf"^[~/][^\n›]*\s+·\s+{_TUI_MODEL_EFFORT_RE}"
+    rf"(?:\s+·\s+(?:{_TUI_CONTEXT_RE}|{_TUI_LIMIT_RE}))?$",
+    re.IGNORECASE,
+)
+_TUI_PATH_BRANCH_ONLY_RE = re.compile(r"^[~/][^\n›]*\s+·\s+\S[^\n]*$")
+_TUI_PATH_ONLY_RE = re.compile(r"^[~/][^\n›]*$")
+_TUI_PATH_TRUNCATED_RE = re.compile(r"^[~/][^\n›]*…$")
 # Codex TUI progress spinner: "• Working (0s • esc to interrupt)",
 # "• Thinking (3m 39s ...)",
 # "• Starting script creation (1h 2m 3s • esc to interrupt)".
@@ -146,11 +175,228 @@ DIALOG_ACTION_FOOTER_PATTERN = re.compile(
     r"left/right\s+group\s+.*enter\s+edit shortcut.*esc\s+close)",
     re.IGNORECASE,
 )
+# Shared footer used by trust-v2 / login menu bottom-anchored matches.
+TRUST_PROMPT_FOOTER = r"Press enter to continue"
+
+# First-run auth menu (no credentials). Cannot be auto-dismissed — operator task.
+# Bottom-anchored with footer to avoid scrollback false matches. See initialize()
+# WAITING_USER_ANSWER target set and blocks_orchestrated_input_while_waiting_user_answer.
+LOGIN_MENU_PATTERN = r"Sign in with ChatGPT"
+LOGIN_MENU_FOOTER = TRUST_PROMPT_FOOTER
+
+# Startup "Update available!" dialog. Codex shows this at startup when a newer
+# release exists, with a numbered menu whose cursor default is option 1:
+#   ✨ Update available! 0.142.5 -> 0.144.5
+#   1. Update now (runs npm install -g @openai/codex)
+#   2. Skip
+#   3. Skip until next version
+#   Press enter to continue
+# A blind Enter would run a GLOBAL npm install that swaps the codex binary under
+# every other running CAO worker. We suppress with
+# -c check_for_update_on_startup=false at launch AND detect+dismiss with
+# '3'+Enter as defense-in-depth.
+UPDATE_DIALOG_PATTERN = r"Update available!\s+\S+\s+->\s+\S+"
+UPDATE_DIALOG_MENU_PATTERN = r"Skip until next version"
+UPDATE_DIALOG_FOOTER = r"Press enter to continue"
+_UPDATE_DIALOG_ROW_PATTERNS = (
+    re.compile(rf"^(?:✨\s*)?{UPDATE_DIALOG_PATTERN}$", re.IGNORECASE),
+    re.compile(r"^(?:›\s*)?1\.\s+Update now(?:\s+\(.*\))?$", re.IGNORECASE),
+    re.compile(r"^(?:›\s*)?2\.\s+Skip$", re.IGNORECASE),
+    re.compile(rf"^(?:›\s*)?3\.\s+{UPDATE_DIALOG_MENU_PATTERN}$", re.IGNORECASE),
+    re.compile(rf"^{UPDATE_DIALOG_FOOTER}$", re.IGNORECASE),
+)
+STARTUP_PROMPT_BOTTOM_LINES = 15
+STARTUP_ACTIVITY_PATTERN = r"^\s*•[^\S\n]+\S"
+_MCP_INTERRUPT_PATTERN = re.compile(r"MCP startup interrupted", re.IGNORECASE)
+# Codex's runtime approval prompt as actually rendered by codex-cli 0.147.0,
+# verified against a live tmux capture (test/providers/fixtures/
+# codex_approval_modal_raw.txt):
+#
+#     Would you like to run the following command?
+#
+#     Environment: local
+#
+#     $ mkdir -p /private/tmp/codex-work-567
+#
+#   › 1. Yes, proceed (y)
+#     2. Yes, and don't ask again for commands that start with `mkdir -p ...` (p)
+#     3. No, and tell Codex what to do differently (esc)
+#
+#     Press enter to confirm or esc to cancel
+#
+# It is NOT a box-drawn modal and carries no "[a] Accept"/"[d] Decline" keys: it
+# is a numbered menu with a `›` selection cursor and a confirm footer.
+#
+# THE TITLE IS NOT THE HOOK. An earlier revision of this detector required one of
+# three enumerated question titles inside a fixed-height bottom window, and both
+# halves of that were wrong:
+#
+#   * The enumeration is incomplete, and cannot be completed. `strings` over the
+#     0.147.0 native binary turns up at least two more approval titles driving the
+#     same menu -- `Do you want to approve network access to "<host>"?` (emitted
+#     when features.network_proxy is on, with its own `Yes, and allow this host in
+#     ...` / `No, and block this host in the future` options) and `Approve app tool
+#     call?` -- so any title list is a list of the variants someone happened to
+#     have already seen.
+#   * The fixed window fails OPEN. The command preview between the title and the
+#     menu is the verbatim command, untruncated by the renderer, so a multi-line
+#     heredoc pushes the title out of any fixed row budget; the detector then found
+#     no title and returned IDLE for a hard-blocked pane, which is the dangerous
+#     direction to be wrong in.
+#
+# So detection is structural and bottom-up instead -- see
+# :func:`_has_approval_prompt_in_bottom`. These title patterns survive only as the
+# permissive NEGATIVE gate in STARTUP_BLOCKING_INPUT_PATTERN below, where an extra
+# match merely keeps the startup poll going and is therefore free; the network
+# title is folded in there for the same reason. Nothing positive is classified off
+# a title any more.
+APPROVAL_PROMPT_PATTERN = (
+    r"(?:Would you like to (?:run the following command"
+    r"|make the following edits"
+    r"|grant these permissions)\?"
+    r"|Do you want to approve network access to)"
+)
+# The footer under a blocking list menu is OPTIONAL CORROBORATION, not an
+# anchor: both list actions are unbindable (`tui.keymap.list.accept = []` --
+# an empty list explicitly unbinds; config/src/tui_keymap.rs at rust-v0.147.0),
+# and accept_cancel_hint_line (tui/src/bottom_pane/popup_consts.rs) renders one
+# of FOUR shapes accordingly:
+#   both bound     -> "Press <a> to confirm or <c> to cancel"
+#   accept unbound -> "Press <c> to cancel"
+#   cancel unbound -> "Press <a> to confirm"
+#   both unbound   -> no footer line at all
+# The approval overlay may append " or <k> to open thread"
+# (approval_overlay.rs), which is also the WHOLE line when both list actions
+# are unbound, and the generic popups (model picker) say "to go back" where
+# the approval says "to cancel". So this pattern's job is only to recognise a
+# footer line as part of the menu block wherever one is rendered.
+#
+# The key labels are emitted as separately styled spans -- the sentence is not
+# one literal in the binary -- and a label is NOT a single token: a two-stroke
+# chord such as "ctrl-x ctrl-s" renders via ShortcutHint::display_label() as
+# `ctrl + x ctrl + s` (strokes joined by a space, modifiers by " + ";
+# key_hint.rs). Worst legal label is a chord whose strokes each carry
+# ctrl+shift+alt: 7 tokens per stroke, 14 in total, so a label is matched as
+# 1-15 whitespace-separated tokens. The bound keeps a same-line prose sentence
+# from bridging an unrelated "Press" to a distant "to confirm".
+APPROVAL_PROMPT_FOOTER = (
+    r"Press \S+(?:[^\S\n]+\S+){0,14} to (?:confirm|cancel|go back|open thread)\b"
+)
+# One numbered menu option: "› 1. Yes, proceed (y)", "  2. No, ... (esc)". The
+# selection cursor is optional here because it sits on exactly one option at a
+# time and moves as the operator arrows around.
+APPROVAL_MENU_OPTION_PATTERN = r"^[^\S\n]*(?:›[^\S\n]+)?\d+\.[^\S\n]+\S"
+# The selected option with its cursor flush at column 0, which is where Codex
+# draws every transcript gutter marker. This is the same left-margin argument
+# _modal_line_content makes for the boxed modal: quoted or continuation prose is
+# indented under its bullet, so a menu the model merely PASTED into its own reply
+# carries its cursor at column >= 2 and fails this while a live one passes.
+APPROVAL_MENU_CURSOR_PATTERN = r"^›[^\S\n]+\d+\.[^\S\n]+\S"
+# A wrapped option's continuation row. ListSelectionView renders wrapped rows by
+# default (SelectionRowDisplay::Wrapped, list_selection_view.rs at
+# rust-v0.147.0), and word_wrap_line indents every continuation to the option
+# TEXT column -- the width of the "{prefix} {n}. " gutter, so 5 columns for a
+# single-digit menu and one more per extra digit (build_rows sets wrap_indent to
+# the prefix width; wrap_standard_row feeds it to subsequent_indent). The
+# question, command preview, and footer rows all sit at 2 columns of indent, so
+# >= 5 columns directly under an option row is the menu's own wrapping, never
+# new content. Only honoured while inside an option (see the below-anchor scan)
+# -- indented prose elsewhere still disqualifies the block.
+APPROVAL_MENU_CONTINUATION_PATTERN = r"^[^\S\n]{5,}\S"
+# Minimum numbered options required above the footer. Two is the floor for a
+# genuine approval (accept and decline); requiring specific option COPY instead
+# would reintroduce exactly the enumeration fragility described above.
+APPROVAL_MENU_MIN_OPTIONS = 2
+
+# Codex's boxed command-approval modal:
+#   ╭─ Command Approval Required ─╮
+#   │ [a] Accept  [d] Decline     │
+#   ╰─────────────────────────────╯
+# WARNING: this copy is NOT emitted by codex-cli 0.147.0. `strings` over the
+# vendored native binary finds zero occurrences of "Command Approval Required",
+# "] Accept", or "] Decline" -- the live prompt is APPROVAL_PROMPT_PATTERN above.
+# The two patterns are kept because this copy predates the numbered menu and is
+# already load-bearing in STARTUP_BLOCKING_INPUT_PATTERN below, so dropping them
+# would silently un-guard whichever older Codex builds still render it. Treat
+# _has_approval_modal_in_bottom as legacy/defensive: APPROVAL_PROMPT_PATTERN is
+# what fires on current Codex.
+#
+# Split into header and choice-key halves because the two paths that consume
+# them need different strictness. The startup path (_has_startup_idle_composer)
+# uses the permissive OR below as a NEGATIVE gate — any one token vetoes
+# "ready", and a false veto merely keeps polling, so over-matching is free.
+# get_status() uses them as a POSITIVE classifier where over-matching would
+# strand a healthy pane in WAITING_USER_ANSWER, so it corroborates the two
+# halves separately (see _has_approval_modal_in_bottom). Box-drawing characters
+# are deliberately NOT required: the frame chrome has changed across Codex
+# releases while this copy has not.
+APPROVAL_MODAL_HEADER_PATTERN = r"Command Approval Required"
+APPROVAL_MODAL_CHOICE_PATTERN = r"(?:\[[aA]\]\s+Accept\b|\[[dD]\]\s+Decline\b)"
+# Box-drawing frame and padding stripped from a modal line before matching, so a
+# framed line ("│ [a] Accept  [d] Decline     │") reduces to its text content.
+# Stripped as a character SET from both ends, hence no ordering assumption about
+# corner/edge glyphs. Light, heavy, and double variants are all covered because
+# only light glyphs have been observed and the frame style is not contractual.
+#
+# ASCII frame characters (+ - |) are deliberately EXCLUDED. They are markdown
+# table syntax, so including them would let a table the model wrote in its own
+# reply ("| Command Approval Required |" / "| [a] Accept | [d] Decline |")
+# reduce to the exact modal shape. No Codex release has been observed using
+# ASCII frames, so that trade buys a hypothetical false negative at the cost of
+# a plausible false positive.
+#
+# Note this set also strips leading whitespace, so an INDENTED plain-text quote
+# reduces to the modal shape too. That look-alike is excluded positionally
+# instead — see _has_approval_modal_in_bottom.
+MODAL_FRAME_CHARS = "─│╭╮╰╯├┤━┃┏┓┗┛┣┫═║╔╗╚╝╠╣ \t"
+# The same set minus padding, used to tell "this line began with box chrome"
+# from "this line began with a prose indent".
+MODAL_FRAME_GLYPHS = frozenset(MODAL_FRAME_CHARS) - frozenset(" \t")
+STARTUP_BLOCKING_INPUT_PATTERN = (
+    rf"(?:{APPROVAL_MODAL_HEADER_PATTERN}|{APPROVAL_MODAL_CHOICE_PATTERN}|"
+    rf"{APPROVAL_PROMPT_PATTERN}|{APPROVAL_PROMPT_FOOTER}|{TRUST_PROMPT_FOOTER})"
+)
+# MERGE NOTE (upstream bfc4d71f). Upstream's `_has_startup_idle_composer` reuses
+# TUI_FOOTER_PATTERN, which upstream defines UNANCHORED
+# (r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])") so it matches
+# anywhere in a line. THIS FORK deliberately anchored TUI_FOOTER_PATTERN with
+# ^...$ to stop mid-line prose from latching a footer. Codex 0.145 renders the
+# status bar as "  gpt-5.6-sol medium · Context 100% left" — model name FIRST —
+# so our anchored pattern does not match it and upstream's helper returned False
+# for every placeholder (10 test failures on merge).
+#
+# Resolved by giving the STARTUP path its own footer predicate rather than
+# loosening TUI_FOOTER_PATTERN, whose anchoring guards the runtime status
+# classifier that F29/F31 hardened. Startup readiness and runtime status are
+# different questions and now have different predicates.
+STARTUP_FOOTER_PATTERN = (
+    r"(?i)(?:\?\s+for shortcuts|context\s+\d+%\s+left|\d+%\s+(?:context\s+)?left|·\s+[~/])"
+)
+STARTUP_IDLE_PLACEHOLDER_PATTERN = (
+    rf"^\s*{IDLE_PROMPT_PATTERN}[^\S\n]+(?:"
+    r"Explain this codebase|"
+    r"Summarize recent commits|"
+    r"Implement \{feature\}|"
+    r"Find and fix a bug in @filename|"
+    r"Write tests for @filename|"
+    r"Improve documentation in @filename|"
+    r"Run /review on my current changes|"
+    r"Use /skills to list available skills"
+    r")\s*$"
+)
+
 # Codex welcome banner indicating normal startup (no trust prompt)
 CODEX_WELCOME_PATTERN = r"OpenAI Codex"
 CODEX_EMPTY_COMPOSER_PLACEHOLDERS = {
     "Explain this codebase",
     "Ask Codex to do anything",
+    "Find and fix a bug in @filename",
+    "Implement {feature}",
+    "Improve documentation in @filename",
+    "Run /review on my current changes",
+    "Summarize recent commits",
+    "Use /skills to list available skills",
+    "Write tests for @filename",
 }
 # CSI SGR sequences only (colour/intensity). Used to walk dim state on
 # escape-preserving capture-pane (-e) lines without treating cursor CSI as text.
@@ -241,7 +487,7 @@ def _composer_body_is_dim_ghost(raw_body: str) -> bool:
     return saw_text and not saw_undimmed
 
 
-def _compute_tui_footer_cutoff(all_lines: list) -> int:
+def _compute_tui_footer_cutoff(all_lines: list[str]) -> int:
     """Compute the character position where the TUI footer area starts.
 
     Scans backward from the last line to find the TUI footer status bar
@@ -254,30 +500,181 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
     footer is found.
     """
     n = len(all_lines)
-    footer_start_idx = n
+    last_nonempty = next(
+        (i for i in range(n - 1, -1, -1) if all_lines[i].strip()),
+        -1,
+    )
+    footer_start_idx = _find_tui_footer_index(all_lines)
 
-    # Find the status bar line (last TUI_FOOTER_PATTERN match in the bottom area)
-    for i in range(n - 1, max(n - IDLE_PROMPT_TAIL_LINES - 1, -1), -1):
-        if re.search(TUI_FOOTER_PATTERN, all_lines[i]):
-            footer_start_idx = i
-            break
+    if footer_start_idx is None:
+        # A five-hour-only config can render no status row at all. In that
+        # case, recognize Codex's dim suggestion text as chrome so it cannot
+        # become a false user message in status or extraction parsing.
+        if last_nonempty >= 0 and _is_known_composer_placeholder(all_lines[last_nonempty]):
+            footer_start_idx = last_nonempty
+        else:
+            return len("\n".join(all_lines))
 
-    if footer_start_idx == n:
-        return len("\n".join(all_lines))
-
-    # Scan upward from the status bar to include blank lines and the
-    # suggestion hint (› with text) that are part of the TUI footer chrome.
-    for j in range(footer_start_idx - 1, max(footer_start_idx - 4, -1), -1):
+    # Scan upward from the status bar to include both chrome rows when present:
+    # the shortcuts hint and the suggestion prompt. The old walk stopped at
+    # the shortcuts row, leaving a ghost prompt above the cutoff.
+    for j in range(footer_start_idx - 1, max(footer_start_idx - 7, -1), -1):
         line = all_lines[j]
         if not line.strip():
             footer_start_idx = j
         elif re.match(rf"\s*{IDLE_PROMPT_PATTERN}", line):
             footer_start_idx = j
-            break
+        elif re.search(r"\?\s+for shortcuts", line, re.IGNORECASE):
+            footer_start_idx = j
         else:
             break
 
     return len("\n".join(all_lines[:footer_start_idx]))
+
+
+def _tui_footer_candidate_strength(line: str) -> str | None:
+    """Return ``strong``/``weak`` for a whole-row footer candidate."""
+    clean = strip_terminal_escapes(line).strip()
+    if (
+        not clean
+        or len(clean) > 240
+        or "›" in clean
+        or re.match(ASSISTANT_PREFIX_PATTERN, clean, re.IGNORECASE)
+        or re.match(USER_PREFIX_PATTERN, clean, re.IGNORECASE)
+    ):
+        return None
+    if re.fullmatch(r"\?\s+for shortcuts(?:\s+.*)?", clean, re.IGNORECASE):
+        return "strong"
+    if re.fullmatch(TUI_FOOTER_PATTERN, clean):
+        legacy_path_last = bool(re.search(r"·\s+[~/]", clean))
+        return "strong" if legacy_path_last else "weak"
+    # Anchor multi-segment status rows from the known right-hand grammar. Do
+    # not split on middle dots: paths and branch names may contain them.
+    if _TUI_PATH_WITH_KNOWN_TAIL_RE.fullmatch(clean):
+        return "strong"
+    if _TUI_PATH_BRANCH_ONLY_RE.fullmatch(clean):
+        return "strong"
+    if _TUI_PATH_TRUNCATED_RE.fullmatch(clean):
+        return "weak"
+    if _TUI_PATH_ONLY_RE.fullmatch(clean):
+        return "weak"
+    return None
+
+
+def _find_composer_anchor_index(all_lines: list[str], footer_idx: int) -> int | None:
+    """Return the composer row corroborating a footer candidate, if any."""
+    saw_blank = False
+    saw_shortcuts = False
+    lower_bound = max(0, footer_idx - IDLE_PROMPT_TAIL_LINES)
+    for index in range(footer_idx - 1, lower_bound - 1, -1):
+        clean = strip_terminal_escapes(all_lines[index]).strip()
+        if not clean:
+            saw_blank = True
+            continue
+        if re.fullmatch(r"\?\s+for shortcuts(?:\s+.*)?", clean, re.IGNORECASE):
+            saw_shortcuts = True
+            continue
+        if re.match(rf"{IDLE_PROMPT_SCREEN_PATTERN}", clean, re.IGNORECASE):
+            if re.fullmatch(IDLE_PROMPT_STRICT_PATTERN, clean, re.IGNORECASE) is not None:
+                return index
+            # Non-empty composer rows are content-shaped. This adjacency is
+            # sufficient for semantic status, while extraction and draft
+            # handling apply their own conservative ambiguity policies.
+            previous_is_boundary = (
+                index == 0 or not strip_terminal_escapes(all_lines[index - 1]).strip()
+            )
+            return index if saw_shortcuts or (saw_blank and previous_is_boundary) else None
+        # Every candidate strength uses the same adjacency rule: arbitrary
+        # assistant/user content between the composer and footer rejects it.
+        return None
+    return None
+
+
+def _has_composer_anchor(all_lines: list[str], footer_idx: int) -> bool:
+    """Tie a footer candidate to adjacent, corroborated composer chrome."""
+    return _find_composer_anchor_index(all_lines, footer_idx) is not None
+
+
+def _find_ambiguous_footer_region(
+    all_lines: list[str], *, minimum_prompt_index: int = 0
+) -> tuple[int, int] | None:
+    """Find content-shaped composer/footer rows below assistant output.
+
+    Such rows are useful semantic chrome evidence, but rendered cells cannot
+    prove whether Codex or the assistant owns them. Extraction therefore uses
+    this only to preserve the whole ambiguous region, never as a cutoff.
+    """
+    for footer_idx, line in enumerate(all_lines):
+        if _tui_footer_candidate_strength(line) is None:
+            continue
+        prompt_idx = _find_composer_anchor_index(all_lines, footer_idx)
+        if prompt_idx is None or prompt_idx < minimum_prompt_index:
+            continue
+        prompt = strip_terminal_escapes(all_lines[prompt_idx]).strip()
+        if re.fullmatch(IDLE_PROMPT_STRICT_PATTERN, prompt, re.IGNORECASE):
+            # An empty prompt contributes no answer text and is safe to trim.
+            continue
+        if any(
+            re.match(
+                ASSISTANT_PREFIX_PATTERN,
+                strip_terminal_escapes(candidate).strip(),
+                re.IGNORECASE,
+            )
+            for candidate in all_lines[:prompt_idx]
+        ):
+            return prompt_idx, footer_idx
+    return None
+
+
+def _find_tui_footer_index(all_lines: list[str]) -> int | None:
+    """Return the structurally anchored bottom footer row, if present."""
+    last_nonempty = next(
+        (i for i in range(len(all_lines) - 1, -1, -1) if all_lines[i].strip()),
+        -1,
+    )
+    if last_nonempty < 0:
+        return None
+    strength = _tui_footer_candidate_strength(all_lines[last_nonempty])
+    if strength is None:
+        return None
+    if not _has_composer_anchor(all_lines, last_nonempty):
+        return None
+    return last_nonempty
+
+
+def _is_known_composer_placeholder(line: str) -> bool:
+    """Recognize a Codex suggestion row after ANSI escapes are removed."""
+    clean = strip_terminal_escapes(line).strip()
+    match = re.fullmatch(r"(?:›|❯|codex>)\s*(.*)", clean)
+    return match is not None and match.group(1) in CODEX_EMPTY_COMPOSER_PLACEHOLDERS
+
+
+def _has_known_composer_placeholder_at_bottom(all_lines: list[str]) -> bool:
+    last_nonempty = next(
+        (i for i in range(len(all_lines) - 1, -1, -1) if all_lines[i].strip()),
+        -1,
+    )
+    return last_nonempty >= 0 and _is_known_composer_placeholder(all_lines[last_nonempty])
+
+
+def _has_tui_footer_in_tail(all_lines: list[str]) -> bool:
+    """Detect footer chrome only within the configured pane-tail window."""
+    last_nonempty = next(
+        (i for i in range(len(all_lines) - 1, -1, -1) if all_lines[i].strip()),
+        -1,
+    )
+    if last_nonempty < 0:
+        return False
+    trailing_rows = len(all_lines) - last_nonempty - 1
+    last_clean = strip_terminal_escapes(all_lines[last_nonempty]).strip()
+    legacy_path_last = bool(re.search(r"·\s+[~/]", last_clean)) and not last_clean.startswith(
+        ("/", "~")
+    )
+    if trailing_rows >= IDLE_PROMPT_TAIL_LINES and legacy_path_last:
+        # Preserve the historical full-screen capture behavior: old path-last
+        # fixtures with a large blank viewport tail did not activate cutoff.
+        return False
+    return _find_tui_footer_index(all_lines) is not None
 
 
 def _toml_scalar(value: Any) -> str:
@@ -363,7 +760,7 @@ def _toml_override(key: str, value: Any) -> str:
 
 
 def _resolved_codex_profile_config(
-    profile, profile_name: str | None = None
+    profile: Any, profile_name: str | None = None
 ) -> tuple[str | None, dict[str, Any]]:
     """Single model/config resolver shared by interactive and seed launches."""
     defaults = get_provider_defaults("codex")
@@ -390,6 +787,303 @@ def _resolved_codex_profile_config(
     return model, config
 
 
+def _has_update_dialog_in_bottom(clean_output: str) -> bool:
+    """Return True for an ordered update-menu block in the bottom region."""
+    expected = 0
+    border_chars = frozenset("╭╮╰╯│─┌┐└┘├┤┬┴┼")
+    for raw_row in clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:]:
+        row = raw_row.strip()
+        if len(row) >= 2 and row.startswith("│") and row.endswith("│"):
+            row = row[1:-1].strip()
+        if not row or set(row) <= border_chars:
+            continue
+        if _UPDATE_DIALOG_ROW_PATTERNS[expected].fullmatch(row):
+            expected += 1
+            if expected == len(_UPDATE_DIALOG_ROW_PATTERNS):
+                return True
+            continue
+        expected = 1 if _UPDATE_DIALOG_ROW_PATTERNS[0].fullmatch(row) else 0
+    return False
+
+
+def _modal_line_content(line: str) -> Optional[str]:
+    """Reduce one line to its modal text, or None if the line reads as prose.
+
+    Strips frame glyphs and padding so ``"│ [a] Accept  [d] Decline   │"``
+    reduces to ``"[a] Accept  [d] Decline"``. Returns None when the leading run
+    removed was whitespace ONLY while being non-empty — i.e. the line is
+    indented plain text.
+
+    That indent test is the discriminator against the model quoting a modal
+    transcript back in its own reply:
+
+        • The terminal output showed:
+            Command Approval Required
+            [a] Accept  [d] Decline
+          so it was waiting on approval.
+
+    Those quoted lines reproduce the modal's per-line structure exactly, so
+    line structure alone cannot separate them. Position can: Codex draws the
+    modal box flush at the left margin, whereas quoted or continuation prose is
+    indented under its bullet. So a leading run of frame glyphs is accepted, a
+    leading run of spaces/tabs is not, and column 0 is accepted either way
+    (an unframed modal would still start there).
+    """
+    content = line.strip(MODAL_FRAME_CHARS)
+    if not content:
+        return None
+    lead = line[: len(line) - len(line.lstrip(MODAL_FRAME_CHARS))]
+    if lead and not (MODAL_FRAME_GLYPHS & set(lead)):
+        return None
+    return content
+
+
+def _is_frame_padding(line: str) -> bool:
+    """Return True when ``line`` carries nothing but frame glyphs and padding.
+
+    True of a box's top/bottom rule ("╰────╯"), of an empty interior row
+    ("│      │"), and of a blank line (space is in ``MODAL_FRAME_CHARS``).
+    """
+    return not line.strip(MODAL_FRAME_CHARS)
+
+
+def _is_chrome_only(line: str) -> bool:
+    """Return True when ``line`` is frame or TUI chrome rather than content.
+
+    The union of what may legitimately sit BELOW a live modal: the box's own
+    closing rule and interior padding, blank filler, the empty composer line
+    ("›" with nothing typed), and the status-bar footer. Anything else -- a
+    prose bullet, a spinner, a typed draft -- is content, which means the
+    modal is no longer the bottom of the pane.
+
+    The empty-composer and footer cases are matched explicitly rather than
+    folded into :func:`_is_frame_padding` because neither ``›`` nor the footer
+    text reduces to empty under ``MODAL_FRAME_CHARS``.
+    """
+    if _is_frame_padding(line):
+        return True
+    if re.fullmatch(rf"\s*{IDLE_PROMPT_PATTERN}\s*", line):
+        return True
+    return re.search(TUI_FOOTER_PATTERN, line) is not None
+
+
+def _is_transcript_marker(line: str) -> bool:
+    """Return True when ``line`` opens a new transcript cell (``›`` user / ``•`` bullet).
+
+    Used as the upward bound on the header search: Codex draws the modal as ONE
+    cell, so a user line or an assistant bullet is a hard boundary that the box
+    cannot span. This replaces a fixed line count, which could not express
+    "same box" and therefore failed open on a modal taller than the window.
+    """
+    return bool(
+        re.match(USER_PREFIX_PATTERN, line, re.IGNORECASE)
+        or re.match(ASSISTANT_PREFIX_PATTERN, line, re.IGNORECASE)
+    )
+
+
+def _has_approval_modal_in_bottom(clean_output: str) -> bool:
+    """Return True when Codex's boxed command-approval modal is active at the bottom.
+
+    NOTE: this detects the LEGACY "Command Approval Required" / "[a] Accept"
+    modal, which codex-cli 0.147.0 does not render — see
+    APPROVAL_MODAL_HEADER_PATTERN's comment and
+    :func:`_has_approval_prompt_in_bottom` for the copy that is live today.
+
+    Anchored BOTTOM-UP on the last choice line, because the thing being tested
+    is an invariant about the bottom of the pane, not about a region of it: a
+    live modal blocks the TUI, so it must BE the bottom, with only frame rows
+    and footer chrome after it. Four guards:
+
+    1. **Anchor.** The LAST line that reduces to a choice key. Taking the last
+       rather than the first is what lets an already-answered modal sitting in
+       scrollback above a live one be ignored instead of vetoing it.
+    2. **Nothing but chrome below the anchor.** See :func:`_is_chrome_only`.
+       This subsumes the older spinner test (a spinner is not chrome) and also
+       rejects a modal transcript the model quoted mid-reply, since the reply
+       continues below the quote. It replaces "footer must NOT appear below",
+       which would have false-negatived every real modal: with
+       ``--no-alt-screen`` the footer renders at the bottom regardless.
+    3. **Corroborating header above the anchor,** found by walking up and
+       stopping at the first :func:`_is_transcript_marker` — the box is one
+       transcript cell, so the header must be inside it. No fixed window, so an
+       arbitrarily tall modal still resolves; previously a >15-line modal lost
+       its header and failed open to COMPLETED.
+    4. **Line structure and left-margin position.** Each half must own its line
+       (header an exact match, choice line a prefix match) and sit at the box's
+       margin rather than under a prose indent — see :func:`_modal_line_content`.
+
+    Known residual: a framed modal quote that ENDS a reply, with only the empty
+    composer and footer after it, satisfies all four guards and reads as live.
+    Distinguishing it needs semantics this detector does not have; it costs a
+    spurious WAITING_USER_ANSWER (work withheld) rather than a COMPLETED (work
+    pasted into a blocked pane), which is the safe direction to be wrong in.
+    """
+    lines = clean_output.splitlines()
+
+    choice_idx = None
+    for index in range(len(lines) - 1, -1, -1):
+        content = _modal_line_content(lines[index])
+        if content is not None and re.match(APPROVAL_MODAL_CHOICE_PATTERN, content, re.IGNORECASE):
+            choice_idx = index
+            break
+    if choice_idx is None:
+        return False
+
+    if not all(_is_chrome_only(line) for line in lines[choice_idx + 1 :]):
+        return False
+
+    for index in range(choice_idx - 1, -1, -1):
+        line = lines[index]
+        content = _modal_line_content(line)
+        if content is not None and re.fullmatch(
+            APPROVAL_MODAL_HEADER_PATTERN, content, re.IGNORECASE
+        ):
+            return True
+        if _is_transcript_marker(line):
+            return False
+    return False
+
+
+def _has_approval_prompt_in_bottom(clean_output: str) -> bool:
+    """Return True when Codex's runtime approval prompt is active at the bottom.
+
+    This is the prompt codex-cli 0.147.0 actually renders (verified against three
+    live captures). Detection is STRUCTURAL and bottom-up — the numbered menu
+    itself, not the question title and not the footer — because none of the
+    alternatives can be relied on: the title list cannot be completed, a fixed
+    row budget fails open on a long command preview (see
+    APPROVAL_PROMPT_PATTERN), and the footer is absent entirely when the list
+    actions are unbound (`tui.keymap.list.accept = []` renders the same blocking
+    menu with only "Press esc to cancel", or with no footer line at all — see
+    APPROVAL_PROMPT_FOOTER).
+
+    Three guards, in the order they are cheapest to refute:
+
+    1. **Menu-cursor anchor.** The LAST line whose selection cursor sits flush
+       at column 0 (APPROVAL_MENU_CURSOR_PATTERN). Taking the last, not the
+       first, lets an already-answered prompt in scrollback be ignored rather
+       than shadow a live one below it. Column 0 is where Codex draws every
+       transcript gutter marker, so quoted or continuation prose — a menu the
+       model merely PASTED into a reply — carries its cursor at column >= 2 and
+       fails this.
+    2. **Nothing below the anchor but the rest of the menu block**: the
+       remaining (non-cursor) option rows — each an option-start row plus any
+       wrapped continuation rows at the option text column
+       (APPROVAL_MENU_CONTINUATION_PATTERN; the renderer wraps long options by
+       default, so a narrow pane splits one option across lines) — at most one
+       footer hint in any of its rendered forms, and chrome
+       (:func:`_is_chrome_only`, shared with the boxed-modal detector).
+       Continuations are honoured only while inside an option; indented prose
+       after the footer or after blank filler still disqualifies. A live
+       prompt blocks the TUI, so its menu must BE the bottom of the pane. This
+       is the guard that rejects an ordinary COMPLETED reply which quotes the
+       menu while a live composer and more prose sit underneath — the sticky
+       WAITING_USER_ANSWER that case used to latch would wedge a ready worker.
+    3. **Menu size.** At least APPROVAL_MENU_MIN_OPTIONS option-START rows
+       counted contiguously around the anchor, stepping over wrapped
+       continuation rows (a genuine approval always offers accept and
+       decline). Contiguity matters: counting across the question or the
+       command preview would let a numbered list INSIDE a quoted command
+       inflate the tally.
+
+    Deliberately NOT required: any particular question title, any particular
+    option copy, and the footer. The footer, when present in any of its four
+    rendered shapes, is accepted as part of the block; its absence proves
+    nothing because unbinding the accept action removes it while the menu still
+    blocks. Firing on Codex's other blocking numbered menus (the model picker,
+    for one) is correct rather than tolerated — those panes are equally blocked
+    on a keystroke, and WAITING_USER_ANSWER is the right answer for them too.
+
+    Residual risks, disclosed:
+
+    - The column-0 cursor test is what separates a live menu from one pasted
+      into a reply, so a future renderer that indents the cursor would fail
+      open to IDLE. The live captures in test/providers/fixtures/
+      (codex_approval_{modal,edits,long_preview}_raw.txt) pin the current
+      rendering against that.
+    - A USER message that is itself a numbered list ("1. foo\\n2. bar") renders
+      with the same column-0 gutter marker ("› 1. foo" over "  2. bar"), so if
+      it is the last transcript cell with only the idle composer below — codex
+      interrupted before replying, say — it now reads WAITING rather than IDLE.
+      That errs toward withholding work, never toward pasting into a blocked
+      pane, and clears as soon as codex renders any activity below the cell.
+      The footer-anchored version rejected this shape, but only by failing open
+      to IDLE on every unbound-keymap approval, which is the dangerous
+      direction to be wrong in.
+    """
+    lines = clean_output.splitlines()
+
+    anchor = None
+    for index in range(len(lines) - 1, -1, -1):
+        if re.match(APPROVAL_MENU_CURSOR_PATTERN, lines[index]):
+            anchor = index
+            break
+    if anchor is None:
+        return False
+
+    options = 1  # the anchor row
+    footer_seen = False
+    in_option = True  # the anchor row itself may wrap onto the next line
+    for line in lines[anchor + 1 :]:
+        if not footer_seen and re.match(APPROVAL_MENU_OPTION_PATTERN, line):
+            options += 1
+            in_option = True
+            continue
+        if in_option and re.match(APPROVAL_MENU_CONTINUATION_PATTERN, line):
+            continue
+        if not footer_seen and re.search(APPROVAL_PROMPT_FOOTER, line):
+            footer_seen = True
+            in_option = False
+            continue
+        if _is_chrome_only(line):
+            in_option = False
+            continue
+        return False
+
+    for index in range(anchor - 1, -1, -1):
+        line = lines[index]
+        if re.match(APPROVAL_MENU_OPTION_PATTERN, line):
+            options += 1
+            continue
+        if re.match(APPROVAL_MENU_CONTINUATION_PATTERN, line):
+            # Walking up, a continuation belongs to the option row above it;
+            # step over it and let that row (or anything else) decide.
+            continue
+        break
+
+    return options >= APPROVAL_MENU_MIN_OPTIONS
+
+
+def _has_startup_idle_composer(clean_output: str) -> bool:
+    """Return True when the bottom of the pane shows Codex's idle composer."""
+    all_lines = clean_output.splitlines()
+    tail_lines = all_lines[-STARTUP_PROMPT_BOTTOM_LINES:]
+    tail_output = "\n".join(tail_lines)
+
+    # Filter out known informational MCP messages before activity check
+    active_lines = [line for line in tail_lines if not _MCP_INTERRUPT_PATTERN.search(line)]
+    active_tail = "\n".join(active_lines)
+
+    if re.search(STARTUP_ACTIVITY_PATTERN, active_tail, re.MULTILINE):
+        return False
+    if re.search(WAITING_PROMPT_PATTERN, tail_output, re.IGNORECASE | re.MULTILINE):
+        return False
+    if re.search(STARTUP_BLOCKING_INPUT_PATTERN, tail_output, re.IGNORECASE):
+        return False
+
+    legacy_tail = all_lines[-IDLE_PROMPT_TAIL_LINES:]
+    if any(re.match(IDLE_PROMPT_STRICT_PATTERN, line) for line in legacy_tail):
+        return True
+
+    # Codex 0.145 renders placeholder text inside the idle composer instead of
+    # an empty prompt. Match only known placeholder copy and require its status
+    # footer below it so typed drafts and ordinary output are not treated as ready.
+    for index in range(len(tail_lines) - 1, -1, -1):
+        if re.match(STARTUP_IDLE_PLACEHOLDER_PATTERN, tail_lines[index]):
+            return any(re.search(STARTUP_FOOTER_PATTERN, line) for line in tail_lines[index + 1 :])
+    return False
+
+
 def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
     """Find the first ASSISTANT_PREFIX_PATTERN match in ``text`` whose line
     is not an MCP tool-call marker.
@@ -411,6 +1105,63 @@ def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
             continue
         return m
     return None
+
+
+def _find_response_marker(text: str) -> Optional[re.Match[str]]:
+    """Find the first model-reply marker after a structural activity prelude.
+
+    Native Codex activity cells have a ``•`` summary followed by a ``└`` tree
+    continuation.  Require at least two complete cells before advancing the
+    response boundary: a single tree-formatted group may be a legitimate
+    answer, while two consecutive cells are strong evidence of TUI activity.
+    Compact bullet groups remain ambiguous and are preserved.  This trades a
+    rare false positive for avoiding silent truncation of ordinary replies and
+    deliberately avoids matching English verbs such as ``Read`` or ``Called``.
+    """
+
+    def line_end(start: int) -> int:
+        newline = text.find("\n", start)
+        return len(text) if newline == -1 else newline
+
+    matches = []
+    for match in re.finditer(ASSISTANT_PREFIX_PATTERN, text, re.IGNORECASE | re.MULTILINE):
+        if not re.match(MCP_TOOL_CALL_PATTERN, text[match.start() : line_end(match.start())]):
+            matches.append(match)
+
+    if not matches:
+        return None
+
+    complete_cells = []
+    prose_start = None
+    for index, match in enumerate(matches):
+        next_start = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        cell_tail = text[line_end(match.start()) : next_start]
+        continuation = re.search(r"^[^\S\n]*└[^\n]*(?:\n|$)", cell_tail, re.MULTILINE)
+        contains_mcp_call = re.search(MCP_TOOL_CALL_PATTERN, cell_tail, re.MULTILINE)
+        if continuation and not contains_mcp_call:
+            complete_cells.append(index)
+            if index == len(matches) - 1:
+                remaining = cell_tail[continuation.end() :]
+                separator = re.search(r"^[^\S\n]*\n", remaining, re.MULTILINE)
+                following = re.search(r"\S", remaining[separator.end() :]) if separator else None
+                if separator and following:
+                    candidate = (
+                        line_end(match.start())
+                        + continuation.end()
+                        + separator.end()
+                        + following.start()
+                    )
+                    if text[candidate] != "›":
+                        prose_start = candidate
+
+    if len(complete_cells) >= 2:
+        last_cell = complete_cells[-1]
+        if last_cell + 1 < len(matches):
+            return matches[last_cell + 1]
+        if prose_start is not None:
+            return re.compile("").match(text, prose_start)
+
+    return matches[0]
 
 
 class ProviderError(Exception):
@@ -436,9 +1187,11 @@ class CodexProvider(BaseProvider):
         session_name: str,
         window_name: str,
         agent_profile: Optional[str] = None,
-        allowed_tools: Optional[list] = None,
+        allowed_tools: Optional[list[str]] = None,
         skill_prompt: Optional[str] = None,
         fork_context: Optional[ForkContext] = None,
+        persona_plan: Optional["PersonaPlan"] = None,
+        model: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(
@@ -446,18 +1199,23 @@ class CodexProvider(BaseProvider):
         )
         self._initialized = False
         self._agent_profile = agent_profile
+        self._persona_plan = persona_plan
+        # Explicit per-call override for the existing profile/providers.toml
+        # model chain, see _build_codex_command.
+        self._model = model
 
     @classmethod
     def seed_resume_identity(cls, cwd: str, agent_profile: str) -> str:
         """Create and validate a native Codex rollout without CAO coordinates."""
         profile = load_agent_profile(agent_profile)
-        argv = ["codex", "exec", "--skip-git-repo-check", "-C", cwd]
+        argv = [resolve_provider_binary("codex"), "exec", "--skip-git-repo-check", "-C", cwd]
         model, config = _resolved_codex_profile_config(profile, agent_profile)
         if isinstance(model, str) and model:
             argv.extend(["--model", model])
         for key, value in config.items():
             argv.extend(["-c", _toml_override(key, value)])
         argv.append("Reply exactly: SEED_OK then stop.")
+        logger.info(f"codex seed_resume_identity: starting seed for {agent_profile} in {cwd}")
         try:
             completed = subprocess.run(
                 argv,
@@ -468,12 +1226,15 @@ class CodexProvider(BaseProvider):
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
+            logger.error(f"codex seed_resume_identity: TIMEOUT after 90s for {agent_profile}")
             raise RuntimeError("seed_timeout") from exc
         except OSError as exc:
+            logger.error(f"codex seed_resume_identity: exec failed: {exc}")
             raise RuntimeError("seed_exec_failed") from exc
+        logger.info(f"codex seed_resume_identity: completed rc={completed.returncode}")
         if completed.returncode != 0:
             raise RuntimeError("seed_exec_failed")
-        matches = set(
+        matches: set[str] = set(
             re.findall(
                 r"(?im)^\s*session id:\s*([0-9a-f]{8}-[0-9a-f-]{27,})\s*$",
                 completed.stdout or "",
@@ -481,13 +1242,22 @@ class CodexProvider(BaseProvider):
         )
         if len(matches) != 1:
             raise RuntimeError("seed_uuid_unparseable")
-        session_uuid = next(iter(matches))
+        session_uuid: str = next(iter(matches))
         validator = cls("seed", "seed", "seed", agent_profile)
         try:
             validator.validate_session_artifact(session_uuid, cwd)
         except Exception as exc:
             raise RuntimeError("seed_artifact_invalid") from exc
-        return session_uuid
+        return str(session_uuid)
+
+    def _developer_instructions_file_path(self) -> Path:
+        """Path of this terminal's developer_instructions temp file.
+
+        Single source of truth for the path -- both `_build_codex_command` (which
+        writes it) and `cleanup` (which removes it) call this instead of each
+        re-deriving the same path independently.
+        """
+        return CAO_HOME_DIR / "tmp" / f"{self.terminal_id}.codex_developer_instructions"
 
     def _build_codex_command(self) -> str:
         """Build Codex command with agent profile if provided.
@@ -512,18 +1282,36 @@ class CodexProvider(BaseProvider):
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
         if profile and profile.codexProfile and not yolo:
-            command_parts = ["codex", "--profile", profile.codexProfile]
+            command_parts: list[str] = [
+                resolve_provider_binary("codex"),
+                "--profile",
+                profile.codexProfile,
+            ]
         else:
-            command_parts = ["codex", "--yolo"]
+            command_parts = [resolve_provider_binary("codex"), "--yolo"]
         command_parts.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
 
         model, codex_config = _resolved_codex_profile_config(profile, self._agent_profile)
-        if isinstance(model, str) and model:
-            command_parts.extend(["--model", model])
+        resolved_model = self._model if self._model is not None else model
+        self._resolved_model = resolved_model if resolved_model else None
+        if resolved_model:
+            command_parts.extend(["--model", resolved_model])
+
+        # Set below, only when there is a non-empty system_prompt to inject -- appended, raw and
+        # deliberately unquoted by shlex, after the shlex.join() of everything else at the very
+        # end of this method. See the long comment at its assignment site for why.
+        developer_instructions_fragment: Optional[str] = None
 
         if profile is not None:
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
             system_prompt = self._apply_skill_prompt(system_prompt)
+            if self._persona_plan is not None and self._persona_plan.memory_instructions:
+                persona_memory = self._persona_plan.memory_instructions.rstrip()
+                system_prompt = (
+                    f"{system_prompt.rstrip()}\n\n{persona_memory}"
+                    if system_prompt
+                    else persona_memory
+                )
 
             # Prepend security constraints for soft enforcement (Codex has no
             # native tool restriction mechanism). Only applied when tool
@@ -541,9 +1329,76 @@ class CodexProvider(BaseProvider):
                 # Escape backslashes, double quotes, and newlines for TOML basic string.
                 # Newlines must become literal \n to prevent tmux send_keys from
                 # splitting the command across multiple lines.
-                command_parts.extend(
-                    ["-c", f"developer_instructions={_toml_scalar(system_prompt)}"]
+                #
+                # The escaped value is written to a CAO-owned temp file and referenced via a
+                # shell command substitution ($(cat <file>)) instead of being inlined directly,
+                # so the LAUNCH LINE ITSELF (what actually gets typed/pasted into the tmux pane)
+                # stays short regardless of how long the instructions text is. A real profile
+                # combining a security preamble, the caller's own system prompt, and the full
+                # skill-list prompt (see _apply_skill_prompt) commonly produces several KB of
+                # escaped text -- observed live at 8+KB. At launch time the pane is still a bare
+                # shell (codex has not started yet), which correctly does not get bracketed-paste
+                # framing (see clients/tmux.py's BRACKETED_PASTE_INCOMPATIBLE_SHELLS) since a bare
+                # shell does not understand those escape sequences. But WITHOUT that framing, a
+                # single pasted/typed line longer than the tty's canonical-mode line-length limit
+                # (MAX_CANON, 4096 bytes on Linux) is silently truncated/dropped by the kernel's
+                # tty line discipline before the shell ever sees a complete, valid command --
+                # this manifests as the shell hanging at an unclosed-quote continuation prompt
+                # forever (confirmed live: zero codex process ever spawned under the pane's shell,
+                # even after an explicit trailing Enter), until CAO's own init-timeout eventually
+                # fires with a generic "Codex initialization timed out" that gives no hint of the
+                # real cause. $(cat <file>) is expanded internally by the shell BEFORE exec'ing
+                # codex -- that internal expansion is not subject to the tty's per-line INPUT
+                # limit at all, only the typed/pasted command line is. Wrapped in double quotes
+                # (not left bare, not single-quoted) so the substitution still happens (command
+                # substitution is disabled inside single quotes) while word-splitting/globbing of
+                # the substituted content is suppressed (it is not inside single quotes either).
+                # The file's own content is `_toml_scalar`'s output verbatim, already including
+                # its own surrounding TOML double-quotes -- appended as a raw, deliberately
+                # UNquoted-by-shlex fragment after the main shlex.join() below (shlex.join would
+                # otherwise single-quote the whole "developer_instructions=$(cat ...)" fragment as
+                # one opaque token, disabling the substitution it depends on).
+                #
+                # Same underlying instructions/skills length problem does not affect Claude Code
+                # or Kimi CLI providers -- both already write the system prompt to a temp file and
+                # pass a short file-path flag instead of inlining it (see claude_code.py's
+                # --append-system-prompt-file, kimi_cli.py's system_prompt_path: YAML field).
+                # Codex has no direct equivalent of that "arbitrary absolute path" flag (its only
+                # file-loading mechanism, --profile, resolves names relative to $CODEX_HOME, which
+                # this provider has no reliable way to resolve per-account from here) -- this
+                # command-substitution approach reaches the same practical outcome (a short launch
+                # line) without needing that.
+                #
+                # Deliberate, documented shell-scope trade-off (not an oversight): $(...) command
+                # substitution is POSIX and works identically on every shell CAO's own
+                # BRACKETED_PASTE_INCOMPATIBLE_SHELLS (constants.py) already tracks as a shell
+                # class *except* csh/tcsh, which use `cmd` backticks instead and do not recognize
+                # `$(` as substitution syntax at all -- launching codex from a pane whose bare
+                # shell is csh/tcsh would break outright with this fragment malformed/rejected by
+                # the shell, not merely degrade. bash/zsh/dash/sh/ksh/mksh/ash/fish are all fine.
+                # No code here detects or special-cases the pane's shell before writing this
+                # fragment (unlike BRACKETED_PASTE_INCOMPATIBLE_SHELLS' own runtime
+                # #{pane_current_command} probe) -- csh/tcsh support, if ever needed, is scoped
+                # out of this fix rather than silently assumed to already work.
+                #
+                # Not covering here (disclosed, not silently assumed away): the other -c overrides
+                # below (per-MCP-server config, codexConfig) are NOT routed through this same
+                # mechanism and remain inlined directly -- they are typically far smaller than
+                # developer_instructions, but a profile configuring many MCP servers could in
+                # theory still accumulate enough inline -c overrides to hit the same limit. Left
+                # as a known, scoped-out follow-up rather than expanding this fix's surface.
+                developer_instructions_file = self._developer_instructions_file_path()
+                developer_instructions_file.parent.mkdir(parents=True, exist_ok=True)
+                # Open with mode 0o600 baked into the O_CREAT call itself (rather than
+                # write_text() followed by a separate chmod()) so the file is never
+                # briefly world/group-readable between creation and permission-tightening --
+                # the permissions are correct from the very first byte written.
+                fd = os.open(
+                    developer_instructions_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
                 )
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(_toml_scalar(system_prompt))
+                developer_instructions_fragment = f'-c "developer_instructions=$(cat {shlex.quote(str(developer_instructions_file))})"'
 
             # Add MCP servers via -c config overrides (per-session, no global config changes).
             # Each server field is set via dotted path: mcp_servers.<name>.<field>=<value>
@@ -584,6 +1439,8 @@ class CodexProvider(BaseProvider):
                     env_vars = cfg.get("env_vars", [])
                     if "CAO_TERMINAL_ID" not in env_vars:
                         env_vars = list(env_vars) + ["CAO_TERMINAL_ID"]
+                    if "CAO_TERMINAL_TOKEN" not in env_vars:
+                        env_vars = list(env_vars) + ["CAO_TERMINAL_TOKEN"]
                     env_vars_toml = "[" + ", ".join(_toml_scalar(v) for v in env_vars) + "]"
                     command_parts.extend(["-c", f"{prefix}.env_vars={env_vars_toml}"])
                     # Set a generous tool timeout for MCP calls like handoff, which
@@ -608,15 +1465,26 @@ class CodexProvider(BaseProvider):
 
         command_parts.extend(["-c", "features.multi_agent=false"])
 
+        # Suppress the startup update dialog at the source. This follows all
+        # profile overrides so it wins, but stays before a fork/resume UUID,
+        # which Codex requires as the final positional argument.
+        command_parts.extend(["-c", "check_for_update_on_startup=false"])
+
         if self._fork_context:
             mode = self._fork_context.mode
-            prefix = ["codex", mode]
-            rest = command_parts[1:]
-            rest = [
-                "--dangerously-bypass-approvals-and-sandbox" if x == "--yolo" else x for x in rest
+            command_prefix = ["codex", mode]
+            command_rest = command_parts[1:]
+            command_rest = [
+                "--dangerously-bypass-approvals-and-sandbox" if x == "--yolo" else x
+                for x in command_rest
             ]
-            command_parts = prefix + rest + [self._fork_context.session_uuid]
-        return shlex.join(command_parts)
+            command_parts = command_prefix + command_rest + [self._fork_context.session_uuid]
+        # Fragment stays AFTER fork/resume argv rewrite so shlex.join does not
+        # single-quote the $(cat ...) substitution away (upstream 0e7b70bb).
+        command = shlex.join(command_parts)
+        if developer_instructions_fragment is not None:
+            command = f"{command} {developer_instructions_fragment}"
+        return command
 
     def build_fork_command(
         self, session_uuid: str, new_session_uuid: Optional[str] = None
@@ -651,7 +1519,7 @@ class CodexProvider(BaseProvider):
     def capture_session_uuid(self, pane_pid: int, launch_time: float, cwd: str) -> str:
         from cli_agent_orchestrator.services.fork_context_service import capture_codex_uuid
 
-        return capture_codex_uuid(pane_pid, launch_time, cwd)
+        return capture_codex_uuid(pane_pid, launch_time, cwd, terminal_id=self.terminal_id)
 
     def resume_session_uuid(self) -> str | None:
         if self._fork_context is not None and self._fork_context.mode == "resume":
@@ -659,7 +1527,11 @@ class CodexProvider(BaseProvider):
         return None
 
     def validate_session_artifact(self, session_uuid: str, cwd: str) -> None:
-        matches = list(provider_home("codex").sessions.glob(f"**/rollout-*{session_uuid}*.jsonl"))
+        matches = list(
+            (_resolved_codex_home(getattr(self, "terminal_id", None)) / "sessions").glob(
+                f"**/rollout-*{session_uuid}*.jsonl"
+            )
+        )
         if not matches:
             raise RetryableArtifactValidation("session_artifact_missing")
         if len(matches) > 1:
@@ -673,7 +1545,7 @@ class CodexProvider(BaseProvider):
             raise TerminalArtifactValidation("session_artifact_identity_invalid")
 
     def auth_state_path(self) -> Path | None:
-        return provider_home("codex").home / "auth.json"
+        return _resolved_codex_home(getattr(self, "terminal_id", None)) / "auth.json"
 
     def provider_process_started_at(self, pane_pid: int) -> float | None:
         from cli_agent_orchestrator.services.fork_context_service import _descendants
@@ -697,22 +1569,31 @@ class CodexProvider(BaseProvider):
         return btime + float(stat[21]) / os.sysconf(os.sysconf_names["SC_CLK_TCK"])
 
     async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
-        """Auto-accept the workspace trust prompt if it appears.
+        """Dismiss a workspace-trust or update dialog that blocks readiness.
 
-        Codex shows a folder approval dialog when opening a new directory.
-        This sends Enter to accept the default option (allow Codex to work).
-        CAO assumes the user trusts the working directory since they confirmed
-        workspace access during the launch command.
+        Workspace trust is accepted with Enter. An update dialog is dismissed
+        with '3'+Enter so CAO never selects the default global-install action.
         """
         start_time = time.time()
-        while time.time() - start_time < timeout:
+        # Iteration cap: prevents unbounded spin when asyncio.sleep is mocked
+        # (wall-clock guard alone is defeated by instant-return mocks).
+        max_iterations = int(timeout * 3)
+        iterations = 0
+        while time.time() - start_time < timeout and iterations < max_iterations:
+            iterations += 1
             output = get_backend().get_history(self.session_name, self.window_name)
             if not output:
                 await asyncio.sleep(1.0)
                 continue
 
-            # Clean ANSI codes for reliable text matching
-            clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+            # Cheap pre-check: skip the expensive regex chain when output is
+            # already clean (no ESC, no CR, no C1 CSI opener).  Covers ~100% of
+            # mocked-test iterations and many real iterations after startup.
+            if "\x1b" not in output and "\r" not in output and "\x9b" not in output:
+                clean_output = output
+            else:
+                clean_output = strip_terminal_escapes(re.sub(ANSI_CODE_PATTERN, "", output))
+            bottom_region = "\n".join(clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
 
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -722,9 +1603,35 @@ class CodexProvider(BaseProvider):
                 get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 return
 
-            # Check if Codex has fully started (welcome banner visible)
-            if re.search(CODEX_WELCOME_PATTERN, clean_output):
-                logger.info("Codex started without trust prompt")
+            if _has_update_dialog_in_bottom(clean_output):
+                from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                logger.info(
+                    "Codex update-available dialog detected, selecting " "'Skip until next version'"
+                )
+                status_monitor.notify_input_sent(self.terminal_id)
+                get_backend().send_keys(self.session_name, self.window_name, "3", enter_count=0)
+                # TUI rendering latency: '3' highlights the menu item, Enter confirms.
+                await asyncio.sleep(0.3)
+                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                return
+
+            # Exit when the bottom region shows the idle composer prompt AND no
+            # dialog is active. The welcome banner alone is insufficient — it
+            # renders as normal startup chrome BEFORE a late update dialog appears.
+            has_idle = _has_startup_idle_composer(clean_output)
+            # MERGE NOTE (upstream bfc4d71f): upstream tests
+            # TRUST_PROMPT_PATTERN and a separate TRUST_PROMPT_PATTERN_V2 +
+            # TRUST_PROMPT_FOOTER pair. Neither V2 symbol exists in this fork —
+            # our TRUST_PROMPT_PATTERN (:164) already unions BOTH trust texts
+            # ("allow Codex to work in this folder" | "Do you trust the contents
+            # of this directory"), so the V2 clause is redundant here rather than
+            # dropped. Transcribing it verbatim raised NameError in 14 tests.
+            has_dialog = re.search(TRUST_PROMPT_PATTERN, bottom_region) or (
+                _has_update_dialog_in_bottom(clean_output)
+            )
+            if has_idle and not has_dialog:
+                logger.info("Codex started — idle prompt visible, no blocking dialog")
                 return
 
             await asyncio.sleep(1.0)
@@ -736,8 +1643,8 @@ class CodexProvider(BaseProvider):
         except Exception:
             pass
         logger.error(
-            "Codex trust prompt handler timed out; no trust dialog or welcome "
-            "banner detected. Pane tail:\n%s",
+            "Codex startup prompt handler timed out; no prompt or welcome banner detected. "
+            "Pane tail:\n%s",
             pane_tail,
         )
 
@@ -745,7 +1652,7 @@ class CodexProvider(BaseProvider):
         self,
         *,
         coordinates: tuple[str, str] | None = None,
-        provider_override=None,
+        provider_override: Any = None,
         raw_status: bool = False,
     ) -> bool:
         """Initialize Codex provider by starting codex command."""
@@ -799,9 +1706,12 @@ class CodexProvider(BaseProvider):
             blocked_cap_s=BLOCKED_WAIT_CAP_S,
             on_first_blocked=notify_blocked,
         )
+        # WAITING_USER_ANSWER: first-run login menu is a successful init (upstream
+        # 0e7b70bb); blocks_orchestrated_input_while_waiting_user_answer prevents
+        # assign/handoff paste into the live menu.
         ready = await wait_until_status(
             self.terminal_id,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.WAITING_USER_ANSWER},
             timeout=init_timeout,
             polling_interval=1.0,
             provider_override=provider_override,
@@ -840,6 +1750,14 @@ class CodexProvider(BaseProvider):
         # herdr never pushes a buffer (pipe_pane is a no-op there); read live
         # pane content instead of falling through to "no output" on every call.
         output = self._resolve_buffer(output)
+        # Rendered cells do not carry widget ownership. Any assistant/tool frame
+        # whose bottom cells (including retained SGR) equal a valid dialog frame
+        # is snapshot-indistinguishable from that dialog. Codex owns the update
+        # prompt only during startup, so lifecycle state is the external signal:
+        # fail closed while INITIALIZING, preserve the same rows as content once
+        # RUNNING. The startup handler remains responsible for dismissal.
+        if not self._initialized and _has_update_dialog_in_bottom(strip_terminal_escapes(output)):
+            return TerminalStatus.WAITING_USER_ANSWER
         return self._get_screen_local_status(output)
 
     @staticmethod
@@ -862,10 +1780,9 @@ class CodexProvider(BaseProvider):
         # Only apply the cutoff when TUI footer indicators are actually present
         # to avoid over-excluding in short outputs or test fixtures.
         all_lines = clean_output.splitlines()
-        tui_footer_detected = any(
-            re.search(TUI_FOOTER_PATTERN, line) for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]
-        )
-        if tui_footer_detected:
+        if _has_tui_footer_in_tail(all_lines) or _has_known_composer_placeholder_at_bottom(
+            all_lines
+        ):
             cutoff_pos = _compute_tui_footer_cutoff(all_lines)
         else:
             cutoff_pos = len(clean_output)
@@ -892,6 +1809,55 @@ class CodexProvider(BaseProvider):
                 and clean_output[trust.end() : selector.start()].count("\n") <= 4
             ):
                 return TerminalStatus.WAITING_USER_ANSWER
+
+        # First-run login/auth menu (no credentials). Bottom-anchored with footer.
+        bottom_region = "\n".join(clean_output.splitlines()[-15:])
+        if re.search(LOGIN_MENU_PATTERN, bottom_region) and re.search(
+            LOGIN_MENU_FOOTER, bottom_region
+        ):
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        # Boxed command-approval modal ("Command Approval Required" / "[a] Accept"
+        # / "[d] Decline"). Reuses the copy that STARTUP_BLOCKING_INPUT_PATTERN
+        # already vetoes readiness on at startup — the same modal can appear at
+        # RUNTIME under any approval-prompting codexProfile, and only the startup
+        # path used to notice it.
+        #
+        # Bottom-anchored like trust-v2 and the update dialog, and placed BEFORE
+        # the idle/COMPLETED classification for the same reason: the TUI composer
+        # and status bar keep rendering while the modal is up, so the idle-prompt
+        # check below would otherwise report COMPLETED (or PROCESSING when the
+        # composer has scrolled off) for a pane that is hard-blocked on a
+        # keystroke. A COMPLETED there is the dangerous case — it tells the
+        # conductor the agent is free and invites more work into a dead pane.
+        #
+        # NOT gated on `not assistant_after_last_user` (unlike WAITING_PROMPT_PATTERN
+        # below): the modal is raised mid-turn, after the model has already emitted
+        # bullets, so that gate would suppress every real occurrence. Prose that
+        # merely quotes the copy is excluded structurally instead — see
+        # _has_approval_modal_in_bottom.
+        if _has_approval_modal_in_bottom(clean_output):
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        # Runtime approval prompt as codex-cli 0.147.0 actually renders it -- a
+        # numbered menu, not the boxed modal above. This is the check that fires on
+        # a current-Codex approval; without it a live prompt classified as IDLE
+        # (verified against the live capture in
+        # test/providers/fixtures/codex_approval_modal_raw.txt), because the
+        # prompt's own "› 1. Yes, proceed (y)" cursor line is both the last
+        # USER_PREFIX_PATTERN match and an idle-prompt match, so the classification
+        # below saw a user message with no reply after it. IDLE is as dangerous as
+        # COMPLETED here: both tell the conductor the pane is free.
+        #
+        # Placed after the legacy modal check and before the idle classification,
+        # for the same reason: the composer and status bar keep rendering while the
+        # prompt is up, so the idle-prompt check cannot see the block.
+        #
+        # Structural, not title-driven: see _has_approval_prompt_in_bottom. Both
+        # this buffer path and get_status_from_screen's rendered-screen path reach
+        # it through this one call, so the two cannot disagree.
+        if _has_approval_prompt_in_bottom(clean_output):
+            return TerminalStatus.WAITING_USER_ANSWER
 
         # Check bottom of captured output for idle prompt.
         # With --no-alt-screen, scrollback contains history so we can't anchor
@@ -944,7 +1910,7 @@ class CodexProvider(BaseProvider):
             # No user-message marker in the cleaned buffer. Two cases:
             # - Fresh init: no assistant content either → IDLE.
             # - Long-running response: the › user marker has been evicted from
-            #   the 8KB rolling buffer by the time the response settles, but an
+            #   the rolling state buffer by the time the response settles, but an
             #   assistant bullet is still visible. Without this branch we'd
             #   return IDLE forever and ``wait_for_status(completed)`` in the
             #   e2e tests would time out.
@@ -970,6 +1936,11 @@ class CodexProvider(BaseProvider):
     supports_screen_detection = True
 
     @property
+    def resolved_model(self) -> Optional[str]:
+        """Return the effective model resolved during command build."""
+        return getattr(self, '_resolved_model', None)
+
+    @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
         """Block orchestrated input while Codex is showing an interactive dialog."""
         return True
@@ -993,6 +1964,7 @@ class CodexProvider(BaseProvider):
         clean = strip_terminal_escapes(joined)
         rows = clean.splitlines()
         legacy_status = self._get_screen_local_status(joined)
+        startup_update_dialog = not self._initialized and _has_update_dialog_in_bottom(clean)
         chrome_rows = [
             index
             for index, row in enumerate(rows)
@@ -1008,13 +1980,29 @@ class CodexProvider(BaseProvider):
             -1,
         )
         signals: list[ScreenSignal] = []
+        if startup_update_dialog:
+            dialog_footer_index = next(
+                (
+                    index
+                    for index in range(len(rows) - 1, -1, -1)
+                    if _UPDATE_DIALOG_ROW_PATTERNS[-1].fullmatch(rows[index].strip())
+                ),
+                max(len(rows) - 1, 0),
+            )
+            signals.append(
+                ScreenSignal(
+                    "waiting",
+                    "DIALOG_ACTION_FOOTER_PATTERN",
+                    dialog_footer_index,
+                )
+            )
         for index, row in enumerate(rows):
             progress = re.search(TUI_PROGRESS_PATTERN, row) is not None
             if progress:
                 signals.append(
                     ScreenSignal("progress", "TUI_PROGRESS_PATTERN", index, row, "corroborable")
                 )
-            if TRUST_SELECTOR_PATTERN.search(row):
+            if legacy_status == TerminalStatus.WAITING_USER_ANSWER and TRUST_SELECTOR_PATTERN.search(row):
                 signals.append(ScreenSignal("waiting", "TRUST_SELECTOR_PATTERN", index))
             if (
                 not progress_rows
@@ -1093,18 +2081,27 @@ class CodexProvider(BaseProvider):
         self, rows: list[str], classification: ScreenClassificationResult
     ) -> str | None:
         clean_rows = [strip_terminal_escapes(row) for row in rows]
+        footer_index = _find_tui_footer_index(clean_rows)
+        strong_footer_indices = {
+            index
+            for index, row in enumerate(clean_rows)
+            if _tui_footer_candidate_strength(row) == "strong"
+            and bool(re.search(r"·\s+[~/]|\?\s+for shortcuts", row, re.IGNORECASE))
+        }
         state = "neutral"
         banner_rows: list[str] = []
 
-        for row in clean_rows:
+        for index, row in enumerate(clean_rows):
             if re.search(USER_PREFIX_PATTERN, row):
                 state = "user"
                 continue
             if re.search(ASSISTANT_PREFIX_PATTERN, row):
                 state = "assistant"
                 continue
-            if re.search(TUI_FOOTER_PATTERN, row) or re.search(
-                IDLE_PROMPT_STRICT_PATTERN, row, re.IGNORECASE
+            if (
+                index == footer_index
+                or index in strong_footer_indices
+                or re.search(IDLE_PROMPT_STRICT_PATTERN, row, re.IGNORECASE)
             ):
                 state = "neutral"
                 continue
@@ -1170,11 +2167,13 @@ class CodexProvider(BaseProvider):
         # widths where useful, then we strip SGR from the final draft.
         plain_lines = [strip_terminal_escapes(line).rstrip() for line in raw_lines]
 
-        footer_idx = len(plain_lines)
-        for i in range(len(plain_lines) - 1, -1, -1):
-            if re.search(TUI_FOOTER_PATTERN, plain_lines[i]):
-                footer_idx = i
-                break
+        last_nonempty = next(
+            (i for i in range(len(plain_lines) - 1, -1, -1) if plain_lines[i].strip()),
+            -1,
+        )
+        footer_idx = _find_tui_footer_index(plain_lines)
+        if footer_idx is None:
+            footer_idx = len(plain_lines)
 
         search_end = footer_idx
         while search_end > 0 and not plain_lines[search_end - 1].strip():
@@ -1210,8 +2209,23 @@ class CodexProvider(BaseProvider):
             return ""
 
         segments = [first_plain]
-        for line in plain_lines[prompt_idx + 1 : search_end]:
+        draft_region_has_assistant = any(
+            re.match(
+                ASSISTANT_PREFIX_PATTERN,
+                strip_terminal_escapes(candidate_line).strip(),
+                re.IGNORECASE,
+            )
+            for candidate_line in plain_lines[prompt_idx + 1 : last_nonempty]
+        )
+        for offset, line in enumerate(
+            plain_lines[prompt_idx + 1 : search_end], start=prompt_idx + 1
+        ):
             text = line.strip()
+            # Defense in depth: a status_line row must never become draft text,
+            # even if a future footer variant misses the primary detector.
+            candidate = _tui_footer_candidate_strength(line)
+            if offset == last_nonempty and candidate is not None and not draft_region_has_assistant:
+                continue
             if not text:
                 segments.append("")
                 continue
@@ -1225,6 +2239,18 @@ class CodexProvider(BaseProvider):
         # Join using plain line widths (escape-stripped); matches previous
         # behavior for wrap detection on capture-pane plain or pyte screens.
         draft = self._join_composer_segments(plain_lines, prompt_idx, prompt_pos, segments)
+        if draft and any(
+            re.match(
+                ASSISTANT_PREFIX_PATTERN,
+                strip_terminal_escapes(candidate).strip(),
+                re.IGNORECASE,
+            )
+            for candidate in plain_lines[:prompt_idx]
+        ):
+            # A non-empty composer-shaped row below assistant output has no
+            # snapshot-only ownership proof. Returning None makes draft_guard
+            # defer injection instead of clearing/restoring uncertain text.
+            return None
         if draft.strip() in CODEX_EMPTY_COMPOSER_PLACEHOLDERS:
             return ""
         return draft
@@ -1309,13 +2335,13 @@ class CodexProvider(BaseProvider):
         # Primary: find last user message, extract response between it and idle prompt.
         # Exclude the Codex TUI footer from user-message matching when detected.
         all_lines = clean_output.splitlines()
-        tui_footer_detected = any(
-            re.search(TUI_FOOTER_PATTERN, line) for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]
-        )
-        if tui_footer_detected:
+        if _has_tui_footer_in_tail(all_lines) or _has_known_composer_placeholder_at_bottom(
+            all_lines
+        ):
             cutoff_pos = _compute_tui_footer_cutoff(all_lines)
         else:
             cutoff_pos = len(clean_output)
+        tui_chrome_detected = cutoff_pos < len(clean_output)
 
         user_matches = [
             m
@@ -1323,15 +2349,43 @@ class CodexProvider(BaseProvider):
             if m.start() < cutoff_pos
         ]
 
+        # Preserve ambiguous composer/footer-shaped content only when it belongs
+        # to the final turn. An older pair followed by a later user boundary must
+        # not preempt the normal last-user extraction path.
+        minimum_prompt_index = (
+            clean_output.count("\n", 0, user_matches[-1].start()) if user_matches else 0
+        )
+        ambiguous_footer = _find_ambiguous_footer_region(
+            all_lines, minimum_prompt_index=minimum_prompt_index
+        )
+        if ambiguous_footer is not None:
+            prompt_idx, _footer_idx = ambiguous_footer
+            prompt_pos = len("\n".join(all_lines[:prompt_idx]))
+            if prompt_idx:
+                prompt_pos += 1
+            prior_users = [match for match in user_matches if match.start() < prompt_pos]
+            if prior_users:
+                last_user = prior_users[-1]
+                assistant = _find_assistant_marker(clean_output[last_user.start() : prompt_pos])
+                if assistant is not None:
+                    response_start = last_user.start() + assistant.start()
+                    response_text = clean_output[response_start:].strip()
+                    response_text = re.sub(
+                        r"^(?:assistant|codex|agent)\s*:\s*",
+                        "",
+                        response_text,
+                        count=1,
+                        flags=re.IGNORECASE,
+                    )
+                    return response_text.strip()
+
         if user_matches:
             last_user = user_matches[-1]
 
-            # Find the first assistant response marker (• or assistant:) after
-            # the user message, skipping "• Called <server>.<tool>(...)" MCP
-            # tool call markers — those are followed by tool output, not the
-            # model's reply. Anchoring on a tool call marker would pull tool
-            # output (e.g. skill body text) into the extracted response.
-            asst_after_user = _find_assistant_marker(clean_output[last_user.start() :])
+            # Extraction uses a stricter anchor than status detection: skip MCP
+            # calls and at least two complete native activity cells before the
+            # model's actual reply, while preserving ambiguous compact groups.
+            asst_after_user = _find_response_marker(clean_output[last_user.start() :])
 
             if asst_after_user:
                 response_start = last_user.start() + asst_after_user.start()
@@ -1352,7 +2406,7 @@ class CodexProvider(BaseProvider):
             )
             if idle_after:
                 end_pos = response_start + idle_after.start()
-            elif tui_footer_detected:
+            elif tui_chrome_detected:
                 end_pos = cutoff_pos
             else:
                 end_pos = len(clean_output)
@@ -1415,3 +2469,11 @@ class CodexProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up Codex CLI provider."""
         self._initialized = False
+        # Remove the developer_instructions temp file written by _build_codex_command, if any --
+        # same convention claude_code.py's own cleanup() uses for its analogous .prompt file.
+        # Path comes from _developer_instructions_file_path() (single source of truth shared
+        # with _build_codex_command) so the write site and the cleanup site can't drift apart.
+        try:
+            self._developer_instructions_file_path().unlink(missing_ok=True)
+        except OSError:
+            pass

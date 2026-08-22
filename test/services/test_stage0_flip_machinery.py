@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import ast
+import concurrent.futures
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +27,12 @@ from cli_agent_orchestrator.kernel.receiver_state.trace_manifest import (
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import ProviderCapabilities
 from cli_agent_orchestrator.services import receiver_state_view, seam_activation
+
+TRACE_MANIFEST_REGEN_HINT = "trace manifest is stale; run: cao verify manifest --regen"
+
+
+def _assert_trace_manifest_current(repo_root: Path, expected: str) -> None:
+    assert generate_manifest(repo_root) == expected, TRACE_MANIFEST_REGEN_HINT
 
 
 @pytest.fixture
@@ -493,14 +499,27 @@ def test_view_reads_incremental_slot_only(monkeypatch) -> None:
     )
 
 
-def test_trace_manifest_is_byte_exact_and_has_37_hits() -> None:
+def test_trace_manifest_is_byte_exact_and_has_36_hits() -> None:
     manifest_path = (
         Path(__file__).parents[2]
         / "src/cli_agent_orchestrator/kernel/receiver_state/trace_manifest.txt"
     )
     expected = manifest_path.read_text(encoding="utf-8")
-    assert generate_manifest(Path(__file__).parents[2]) == expected
-    assert len([line for line in expected.splitlines() if line]) == 37
+    _assert_trace_manifest_current(Path(__file__).parents[2], expected)
+    assert len([line for line in expected.splitlines() if line]) == 38
+
+
+def test_trace_manifest_failure_names_regen_command(tmp_path: Path) -> None:
+    for index, relative_path in enumerate(CONSUMER_MODULES):
+        source_path = tmp_path / relative_path
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(
+            'get_status("t1")\n' if index == 0 else "pass\n",
+            encoding="utf-8",
+        )
+
+    with pytest.raises(AssertionError, match="cao verify manifest --regen"):
+        _assert_trace_manifest_current(tmp_path, "stale\n")
 
 
 def test_trace_manifest_matches_bare_name_calls(tmp_path) -> None:

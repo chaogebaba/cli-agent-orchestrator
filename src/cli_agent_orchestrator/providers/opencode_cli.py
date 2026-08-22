@@ -99,9 +99,28 @@ class OpenCodeCliProvider(BaseProvider):
         self._initialized = False
 
     @property
+    def resolved_model(self) -> Optional[str]:
+        """Return the effective model (direct, no TOML chain)."""
+        return self._model
+
+    @property
     def paste_enter_count(self) -> int:
         """OpenCode TUI submits on a single Enter after bracketed paste."""
         return 1
+
+    @property
+    def paste_submit_delay(self) -> float:
+        """OpenCode's TUI can swallow an Enter sent too soon after the bracketed-paste
+        end marker. 1.0s (matching kiro_cli) is conservative and avoids the
+        deferred-init "never started processing" race (see #479)."""
+        return 1.0
+
+    # Opt-in for the deferred-init direct status probe (capture-pane bypass).
+    # OpenCode's get_status() detector is line-oriented and works correctly on a
+    # rendered capture-pane snapshot. Providers whose get_status() relies on
+    # dispatch bookkeeping (e.g. kiro_cli, antigravity_cli, cursor_cli) must NOT
+    # set this flag — their COMPLETED/IDLE split is not screen-detectable.
+    supports_direct_status_probe = True
 
     @property
     def extraction_tail_lines(self) -> int:
@@ -439,6 +458,8 @@ class OpenCodeCliProvider(BaseProvider):
 
     def get_idle_pattern_for_log(self) -> str:
         """Return pattern matching the idle footer in log file output."""
+        from cli_agent_orchestrator.utils.tombstones import tombstone
+        tombstone("TS-0002f")
         return IDLE_FOOTER_PATTERN
 
     def exit_cli(self) -> str:

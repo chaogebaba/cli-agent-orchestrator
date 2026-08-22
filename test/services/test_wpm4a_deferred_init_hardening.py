@@ -1086,9 +1086,17 @@ async def test_external_delete_waits_for_deferred_future_before_core(monkeypatch
     )
     monkeypatch.setattr(
         terminals,
-        "_delete_terminal_core",
-        lambda *_a, **_k: core_called.set() or True,
+        "_delete_terminal_under_lease",
+        lambda *_a, **_k: core_called.set() or {"terminal_deleted": True},
     )
+    metadata = {
+        "id": "delete-worker",
+        "tmux_session": "s",
+        "tmux_window": "worker",
+        "caller_id": None,
+    }
+    monkeypatch.setattr(terminals, "get_terminal_metadata", lambda _tid: metadata)
+    monkeypatch.setattr(terminals, "list_terminals_by_session", lambda _session: [metadata])
     terminals._schedule_deferred_init(
         provider,
         "delete-worker",
@@ -1108,7 +1116,8 @@ async def test_external_delete_waits_for_deferred_future_before_core(monkeypatch
     await asyncio.sleep(0.03)
     assert not core_called.is_set()
     release.set()
-    assert await deleting is True
+    result = await deleting
+    assert result["reaped"] == [{"id": "delete-worker", "status": "reaped"}]
     assert core_called.is_set()
 
 

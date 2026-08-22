@@ -2,9 +2,46 @@
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 
 PermissionMode = Literal["default", "acceptEdits", "plan", "auto", "bypassPermissions"]
+MemoryType = Literal["user", "feedback", "project", "reference"]
+
+_RESERVED_PERSONA_LEAVES = {
+    "CLAUDE.md",
+    ".credentials.json",
+    "settings.json",
+    "persona-manifest.json",
+}
+
+
+class ContextPolicy(BaseModel):
+    """Profile-declared native context isolation policy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scope: Literal["persona"]
+    memoryTypes: List[MemoryType] = Field(default_factory=list)
+    memoryNames: List[str] = Field(default_factory=list)
+    globalClaudeMd: bool = False
+    extraLeaves: List[str] = Field(default_factory=list)
+
+    @field_validator("extraLeaves")
+    @classmethod
+    def validate_extra_leaves(cls, leaves: List[str]) -> List[str]:
+        for leaf in leaves:
+            if (
+                not leaf
+                or leaf in {".", ".."}
+                or leaf in _RESERVED_PERSONA_LEAVES
+                or "/" in leaf
+                or "\\" in leaf
+                or "\x00" in leaf
+            ):
+                raise ValueError(f"invalid persona extra leaf: {leaf!r}")
+        return leaves
 
 
 class McpServer(BaseModel):
@@ -39,6 +76,8 @@ class AgentProfile(BaseModel):
     system_prompt: Optional[str] = None  # The markdown content
     role: Optional[str] = None  # "supervisor", "developer", "reviewer"
     protected: Optional[bool] = None  # Refuse MCP deletion unless force=true
+    lifecycle: Optional[Literal["ephemeral", "sticky"]] = None
+    engine: Optional[KiroEngine] = None  # Kiro v2/KAS selection; omitted resolves to v2.
 
     # CAO-native. Per-agent skill-catalog scope: when set, only skills whose name
     # matches one of these patterns (exact name or fnmatch glob, e.g. "ads-*") are
@@ -64,6 +103,10 @@ class AgentProfile(BaseModel):
     # profiles to declare longer init times (e.g., 180s) without changing global config.
     provider_init_timeout: Optional[int] = None
 
+    # CAO-native. When present, launch the provider with a frozen, terminal-scoped
+    # view of native provider context instead of shared user/project instruction files.
+    contextPolicy: Optional[ContextPolicy] = None
+
     # Q CLI agent fields (all optional, will be passed through to JSON)
     prompt: Optional[str] = None
     mcpServers: Optional[Dict[str, Any]] = None
@@ -76,6 +119,7 @@ class AgentProfile(BaseModel):
     toolsSettings: Optional[Dict[str, Any]] = None
     resources: Optional[List[str]] = None
     hooks: Optional[Dict[str, Any]] = None
+    permissions: Optional[Dict[str, Any]] = None
     useLegacyMcpJson: Optional[bool] = None
     model: Optional[str] = None
     # Generic model-effort hint; consumed by grok_cli and claude_code.
@@ -106,3 +150,19 @@ class AgentProfile(BaseModel):
     # example one created by `hermes profile alias <profile>`). When omitted,
     # the Hermes provider launches the default `hermes` command.
     hermesProfile: Optional[str] = Field(default=None, min_length=1)
+
+    # Claude Code-only. Per-agent Claude Code knobs mapped to CLI flags at
+    # launch: {"effort": "<low|medium|high|xhigh>"} -> `--effort <level>` and
+    # {"fallback_model": "<model>"} -> `--fallback-model <model>`. Lets a
+    # profile set per-agent reasoning effort without relying on the
+    # machine-global `effortLevel` in ~/.claude/settings.json. This is the
+    # Claude analog of codexConfig for the codex provider; the top-level
+    # `model` field still maps to `--model`.
+    claudeConfig: Optional[Dict[str, Any]] = None
+
+    # Grok-only. Explicitly permits Grok's own subagents, workflows, and /goal
+    # engine in this CAO terminal. Omission remains ``None`` so existing profile
+    # API responses do not gain a new false-valued field; Grok resolves None as
+    # disabled because those workers are outside CAO's profile, callback, and
+    # terminal-accounting boundaries.
+    grokNativeWorkflows: Optional[bool] = None

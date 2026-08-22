@@ -22,16 +22,19 @@ import concurrent.futures
 import logging
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, Optional, Protocol, cast
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Protocol, assert_never, cast
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
+    _utcnow,
     claim_deferred_init_failure,
     create_digest_pending_notice,
     create_inbox_message,
@@ -40,12 +43,15 @@ from cli_agent_orchestrator.clients.database import create_terminal as db_create
 from cli_agent_orchestrator.clients.database import (
     create_terminal_with_warm_intent,
     delete_terminal_and_warm_intent,
+    delete_terminals_by_session,
     get_ready_provider_session,
     get_terminal_metadata,
 )
 from cli_agent_orchestrator.clients.database import list_all_terminals as db_list_all_terminals
 from cli_agent_orchestrator.clients.database import (
+    list_deferred_init_overdue_pending_rows,
     list_deferred_init_recovery_rows,
+    list_siblings_by_group_prefix,
     list_terminals_by_provider_session_id,
     list_terminals_by_session,
     mark_terminal_init_ready,
@@ -53,7 +59,11 @@ from cli_agent_orchestrator.clients.database import (
     terminal_exists,
     update_last_active,
     update_provider_session_snapshot,
+    update_terminal_group,
+    update_terminal_metadata,
+    update_terminal_resolved_model,
     update_terminal_shell_command,
+    update_terminal_tmux_window,
 )
 from cli_agent_orchestrator.constants import (
     FIFO_DIR,
@@ -62,10 +72,17 @@ from cli_agent_orchestrator.constants import (
     SESSION_PREFIX,
     TERMINAL_LOG_DIR,
 )
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.native_publish import DispatchTxn, NativePublishRequest
 from cli_agent_orchestrator.models.provider import ProviderType
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
+from cli_agent_orchestrator.models.terminal import (
+    RecoveryState,
+    Terminal,
+    TerminalInputBlockedError,
+    TerminalStatus,
+)
 from cli_agent_orchestrator.plugins import (
     PluginRegistry,
     PostCreateTerminalEvent,
@@ -73,10 +90,17 @@ from cli_agent_orchestrator.plugins import (
     PostSendMessageEvent,
 )
 from cli_agent_orchestrator.providers.base import (
+    OutputExtractionError,
     RetryableArtifactValidation,
     TerminalArtifactValidation,
 )
+from cli_agent_orchestrator.providers.kiro_capabilities import (
+    KiroCapabilities,
+    probe_kiro_capabilities,
+    requested_kiro_capabilities,
+)
 from cli_agent_orchestrator.providers.manager import get_provider_class, provider_manager
+from cli_agent_orchestrator.services import base_digest_service, worktree_service
 from cli_agent_orchestrator.services.deferred_dispatcher import (
     DeferredCall,
     DeferredExecutorSaturated,
@@ -92,7 +116,6 @@ from cli_agent_orchestrator.services.draft_guard import (
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.fork_context_service import snapshot as fork_snapshot
 from cli_agent_orchestrator.services.fork_context_service import staleness as fork_staleness
-from cli_agent_orchestrator.services import base_digest_service
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
@@ -101,12 +124,22 @@ from cli_agent_orchestrator.services.session_env import (
     get_session_env,
     set_session_env,
 )
+from cli_agent_orchestrator.services.settings_service import (
+    get_provider_defaults,
+    get_provider_profile_defaults,
+    resolve_provider_string_option,
+)
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor, status_monitor
+from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
 from cli_agent_orchestrator.utils.provider_auth import ProviderAuthRefreshFailed
 from cli_agent_orchestrator.utils.provider_plane import NativeHomeIsolationUnavailable
-from cli_agent_orchestrator.utils.sandbox_guard import bind_pane_identity, require_provider_admitted
+from cli_agent_orchestrator.utils.sandbox_guard import (
+    bind_pane_identity,
+    is_sandbox,
+    require_provider_admitted,
+)
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
@@ -116,6 +149,23 @@ from cli_agent_orchestrator.utils.terminal import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class IdentityAmbiguousError(RuntimeError):
+    """Raised when purge_stale_terminal_records finds multiple windows claiming the same terminal ID.
+
+    D11 (F202): this is a loud structured error — the sane path (D6 explicit kill)
+    makes this state unreachable, so reaching it means an invariant broke.
+    """
+
+    def __init__(self, terminal_id: str, session: str, incarnations: List[str]) -> None:
+        self.terminal_id = terminal_id
+        self.session = session
+        self.incarnations = incarnations
+        super().__init__(
+            f"purge_identity_ambiguous: terminal {terminal_id} in session {session!r} "
+            f"has {len(incarnations)} incarnations: {incarnations}"
+        )
 
 
 class _LegacyCreateTerminalPublisher(Protocol):
@@ -158,6 +208,15 @@ class _LegacyWarmTerminalPublisher(Protocol):
     ) -> Dict[str, Any]: ...
 
 
+# Upper bound (bytes) on a single offset-ranged read of a terminal log
+# (U5 / #504, BR-2). ``read_output_range`` clamps its ``length`` to this so a
+# caller (playback fetching output around a selected event) can never trigger
+# an unbounded read of a large log file. 1 MiB is a defensible ceiling: it is
+# far larger than any realistic per-event output window (the rolling
+# STATE_BUFFER_MAX is only 8 KiB) yet bounds the worst-case allocation and
+# response size to a fixed, predictable amount regardless of on-disk log size.
+TERMINAL_RANGE_MAX_LENGTH = 1024 * 1024
+
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
 _memory_injected_lock = threading.Lock()
@@ -170,9 +229,16 @@ _deferred_init_tasks: set = set()
 _deferred_reconciler_tasks: set[asyncio.Task] = set()
 _deferred_tasks_lock = threading.Lock()
 
+# F160-a: terminals whose deferred init has already been granted its one
+# watchdog re-arm. In-memory by design — a server restart settles every
+# surviving init_pending row through the H5 startup sweep, so no row can
+# outlive this set and collect a second retry.
+_f160_retried_terminals: set[str] = set()
+
 POLL_INTERVAL = 2.0
 DEFERRED_TASK_QUIESCE_S = 10.0
 FORK_REFRESH_WAIT_BUDGET = 120.0
+DISK_SPACE_FLOOR_GB = 3.0
 SERVER_INIT_OWNER_EPOCH = str(uuid.uuid4())
 
 
@@ -190,25 +256,38 @@ _deferred_tasks_by_terminal: dict[str, _DeferredTaskRecord] = {}
 _fork_refresh_locks: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock] = {}
 
 
-class TerminalInputBlockedError(Exception):
-    """Raised when orchestrated input would answer an active interactive prompt."""
+def _preflight_disk_space(path: str, floor_gb: float = DISK_SPACE_FLOOR_GB) -> None:
+    """Raise RuntimeError if free disk on *path*'s filesystem is below *floor_gb*."""
+    usage = shutil.disk_usage(path)
+    free_gb = usage.free / (1024**3)
+    if free_gb < floor_gb:
+        raise RuntimeError(
+            f"disk_space_low: {free_gb:.1f}GB free on {path} "
+            f"(floor: {floor_gb}GB). Refusing to create terminal — free disk space first."
+        )
 
 
-def seed_resume_bootstrap(agent_profile: str, provider_name: str, cwd: str):
+async def seed_resume_bootstrap(agent_profile: str, provider_name: str, cwd: str):
     """Return an authoritative resume ForkContext for seed-capable providers."""
     provider_class = get_provider_class(provider_name)
     if provider_class.supports_seed_resume_identity is not True:
         return None
-    from cli_agent_orchestrator.models.terminal import ForkContext
+    try:
+        from cli_agent_orchestrator.models.terminal import ForkContext
 
-    session_uuid = provider_class.seed_resume_identity(cwd, agent_profile)
-    return ForkContext(
-        mode="resume",
-        session_uuid=session_uuid,
-        base_name="seed",
-        provider=provider_name,
-        initial_preamble="",
-    )
+        session_uuid = await asyncio.to_thread(
+            provider_class.seed_resume_identity, cwd, agent_profile
+        )
+        return ForkContext(
+            mode="resume",
+            session_uuid=session_uuid,
+            base_name="seed",
+            provider=provider_name,
+            initial_preamble="",
+        )
+    except Exception as exc:
+        logger.error(f"seed_resume_bootstrap failed for {agent_profile}/{provider_name}: {exc}")
+        raise
 
 
 def has_deferred_init(terminal_id: str) -> bool:
@@ -246,6 +325,12 @@ def _prepare_provider_runtime_identity(
     cwd = get_backend().get_pane_working_directory(
         metadata["tmux_session"], metadata["tmux_window"]
     )
+    if cwd is None:
+        # F26 D5: a deleted/unavailable pane cwd must fail through this site's
+        # own failure channel (a recognized _PERSIST_FAILURE_CODES code), never
+        # escape as a TypeError from quote(None) inside capture_session_uuid /
+        # validate_session_artifact.
+        raise RuntimeError("terminal_cwd_unavailable")
     allocated = getattr(provider_instance, "allocated_session_uuid", None)
     try:
         hint = provider_instance.resume_session_uuid()
@@ -292,6 +377,43 @@ def _commit_provider_runtime_identity(
         raise RuntimeError("terminal_identity_persist_failed")
 
 
+def _wait_for_session_artifact_sync(
+    provider_instance,
+    session_uuid: str,
+    cwd: str,
+    *,
+    deadline_s: float = 5.0,
+    poll_interval: float = 0.4,
+    liveness_check: "Callable[[], bool] | None" = None,
+) -> None:
+    """F311: Single shared bounded retry for artifact validation.
+
+    Used by BOTH the synchronous create path (directly) and the deferred-init
+    path (offloaded via _tracked_blocking).  Retries on RetryableArtifactValidation
+    until the deadline; re-raises the last if the bound expires (genuine inert).
+
+    If liveness_check is provided and returns False, raises _DeferredInitFailure
+    (deferred-init path uses this for worker-vanished detection).
+    """
+    import time as _time
+
+    origin = _time.monotonic()
+    deadline = origin + deadline_s
+    while True:
+        try:
+            provider_instance.validate_session_artifact(session_uuid, cwd)
+            return
+        except RetryableArtifactValidation:
+            if _time.monotonic() >= deadline:
+                raise
+            if liveness_check is not None and not liveness_check():
+                raise _DeferredInitFailure("worker_vanished")
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                raise
+            _time.sleep(min(poll_interval, remaining))
+
+
 def _persist_provider_runtime_identity(
     provider_instance,
     terminal_id: str,
@@ -306,8 +428,95 @@ def _persist_provider_runtime_identity(
     )
     if prepared is None:
         return
-    provider_instance.validate_session_artifact(prepared.session_uuid, prepared.cwd)
+    _wait_for_session_artifact_sync(provider_instance, prepared.session_uuid, prepared.cwd)
     _commit_provider_runtime_identity(terminal_id, prepared)
+
+
+def rearm_fifo_readers_at_startup() -> dict:
+    """D9 (F202): re-create FIFO readers and re-arm pipe-pane for surviving terminals.
+
+    Called at lifespan startup after purge_stale_terminal_records. For each DB
+    terminal row with init_state='ready' whose backend window is still live,
+    creates a FIFO reader and re-arms pipe-pane — reusing the same arming
+    pattern as creation-time (terminal_service.py:1251-1284).
+
+    Idempotent: if a reader already exists for a terminal (early return inside
+    fifo_manager.create_reader), it is not duplicated. Rows whose window is
+    gone get nothing.
+
+    Returns a dict with counts: {rearmed: int, skipped_gone: int, skipped_existing: int}.
+    """
+    backend = get_backend()
+    if backend.supports_event_inbox():
+        # Event-inbox backends (herdr) deliver via their own socket; no FIFO needed.
+        return {"rearmed": 0, "skipped_gone": 0, "skipped_existing": 0}
+
+    rearmed = 0
+    skipped_gone = 0
+    skipped_existing = 0
+
+    for metadata in db_list_all_terminals():
+        terminal_id = metadata["id"]
+        if metadata.get("init_state") != "ready":
+            continue
+
+        session_name = metadata["tmux_session"]
+        window_name = metadata["tmux_window"]
+
+        # Check if the pane is still alive
+        state = backend.window_liveness(session_name, window_name)
+        if state != "live":
+            skipped_gone += 1
+            continue
+
+        # Already has a reader? Idempotent — skip.
+        if fifo_manager.has_reader(terminal_id):
+            skipped_existing += 1
+            continue
+
+        fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+
+        def _probe_pane(s=session_name, w=window_name) -> str:
+            return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+
+        def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
+            get_backend().stop_pipe_pane(s, w)
+            get_backend().pipe_pane(s, w, p)
+
+        try:
+            fifo_manager.create_reader(
+                terminal_id,
+                pane_probe=_probe_pane,
+                rearm=_rearm_pipe,
+                terminal_generation=None,
+                incarnation_id=None,
+            )
+        except Exception:
+            logger.warning("startup_rearm_fifo_failed terminal=%s", terminal_id, exc_info=True)
+            continue
+
+        # Re-arm pipe-pane so tmux streams output into the FIFO again.
+        try:
+            backend.pipe_pane(session_name, window_name, str(fifo_path))
+        except Exception:
+            logger.warning("startup_rearm_pipe_pane_failed terminal=%s", terminal_id, exc_info=True)
+            continue
+
+        rearmed += 1
+        logger.info(
+            "startup_rearm_fifo terminal=%s session=%s window=%s",
+            terminal_id,
+            session_name,
+            window_name,
+        )
+
+    logger.info(
+        "startup_rearm_fifo_complete rearmed=%d skipped_gone=%d skipped_existing=%d",
+        rearmed,
+        skipped_gone,
+        skipped_existing,
+    )
+    return {"rearmed": rearmed, "skipped_gone": skipped_gone, "skipped_existing": skipped_existing}
 
 
 def purge_stale_terminal_records() -> int:
@@ -324,12 +533,72 @@ def purge_stale_terminal_records() -> int:
             )
             continue
         try:
-            backend.get_history(
-                metadata["tmux_session"],
-                metadata["tmux_window"],
-                tail_lines=1,
-            )
-        except Exception:
+            tmux_session = metadata["tmux_session"]
+            tmux_window = metadata["tmux_window"]
+            state = backend.window_liveness(tmux_session, tmux_window)
+            if state == "live":
+                continue
+            if state == "error":
+                continue
+            if getattr(backend, "supports_identity_readback", False) is not True:
+                continue
+
+            enum_state, windows = backend.enumerate_windows(tmux_session)
+            enumeration_failed = enum_state == "error"
+            if enumeration_failed:
+                windows = []  # type narrowing — loop won't execute
+
+            matches: list[str] = []
+            unreadable: list[str] = []
+            for window in windows:  # type: ignore[union-attr]
+                name = str(window["name"])
+                result = backend.read_pane_identity(tmux_session, name)
+                if result.reason in {
+                    "read_error",
+                    "pane_cardinality",
+                    "incarnation_changed",
+                }:
+                    unreadable.append(name)
+                    continue
+                if result.identity == terminal_id:
+                    matches.append(name)
+            if len(matches) > 1:
+                raise IdentityAmbiguousError(
+                    terminal_id=terminal_id,
+                    session=tmux_session,
+                    incarnations=matches,
+                )
+            match = matches[0] if matches else None
+            if match is not None:
+                if not update_terminal_tmux_window(terminal_id, match):
+                    logger.warning(
+                        "purge_rename_conflict terminal=%s window=%s", terminal_id, match
+                    )
+                else:
+                    logger.info(
+                        "purge_reconciled_rename terminal=%s old=%s new=%s",
+                        terminal_id,
+                        tmux_window,
+                        match,
+                    )
+                continue
+            if enumeration_failed or unreadable:
+                logger.warning(
+                    "purge_inconclusive terminal=%s session=%s enumeration_failed=%s unreadable=%d",
+                    terminal_id,
+                    tmux_session,
+                    enumeration_failed,
+                    len(unreadable),
+                )
+                continue
+            # F296: Attempt provider cleanup before purging the row. This
+            # handles cleanup_deferred zombies whose escaped processes have
+            # since died. Best-effort — if cleanup still defers, proceed with
+            # DB delete anyway (window confirmed gone, row must not persist).
+            try:
+                provider_manager.cleanup_provider(terminal_id)
+            except Exception:
+                pass
             if delete_terminal_and_warm_intent(terminal_id, preserve_warm_intent=False)[
                 "terminal_deleted"
             ]:
@@ -343,6 +612,11 @@ def purge_stale_terminal_records() -> int:
                     metadata["tmux_session"],
                     metadata["tmux_window"],
                 )
+        except IdentityAmbiguousError:
+            raise
+        except Exception:
+            logger.exception("purge_row_failed terminal=%s", terminal_id)
+            continue
     return purged
 
 
@@ -394,6 +668,10 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.GROK_CLI.value,
     ProviderType.KIMI_CLI.value,
     ProviderType.ANTIGRAVITY_CLI.value,
+    ProviderType.OMP.value,
+    ProviderType.CLINE_CLI.value,
+    ProviderType.GROK_CLI.value,
+    ProviderType.MINIMAX_CODE.value,
 }
 
 SESSION_BRIEF_MARKER = "SESSION BRIEF UNAVAILABLE — world-model incomplete"
@@ -409,6 +687,26 @@ def _rollback_terminal_creation(
     db_created: bool,
 ) -> None:
     """Single rollback seam preserving pipe-pane -> FIFO -> window/session order."""
+    # F138: Abandon the incarnation on creation failure
+    try:
+        from cli_agent_orchestrator.clients.database import (
+            ProcessIncarnationModel,
+            SessionLocal,
+            f138_abandon_incarnation,
+        )
+
+        with SessionLocal() as db:
+            inc = (
+                db.query(ProcessIncarnationModel)
+                .filter_by(terminal_id=terminal_id, state="launching")
+                .order_by(ProcessIncarnationModel.created_at.desc())
+                .first()
+            )
+            if inc is not None:
+                f138_abandon_incarnation(inc.id)
+    except Exception:
+        pass
+
     if db_created:
         try:
             delete_terminal_and_warm_intent(terminal_id, preserve_warm_intent=False)
@@ -496,6 +794,9 @@ SOFT_ENFORCEMENT_PROVIDERS = {
     ProviderType.KIMI_CLI.value,
     ProviderType.CODEX.value,
     ProviderType.ANTIGRAVITY_CLI.value,
+    ProviderType.CLINE_CLI.value,
+    ProviderType.OMP.value,
+    ProviderType.MINIMAX_CODE.value,
 }
 
 MAX_PEEK_TERMINAL_LINES = 200
@@ -598,6 +899,36 @@ def _acquire_resume_creation_authority(
         raise
 
 
+def _capture_f138_issuance_context() -> tuple[int | None, str | None]:
+    """D18: Capture issuance context for pre-issuance fence.
+
+    Returns (issuance_ticks, issuance_boot_id).
+    issuance_ticks: integer clock ticks since boot (CLOCK_BOOTTIME * SC_CLK_TCK).
+    issuance_boot_id: current kernel boot_id string.
+    """
+    issuance_boot_id: str | None = None
+    issuance_ticks: int | None = None
+    try:
+        issuance_boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        pass
+    try:
+        issuance_ticks = int(time.clock_gettime(time.CLOCK_BOOTTIME) * os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError, AttributeError):
+        pass
+    return issuance_ticks, issuance_boot_id
+
+
+def _resolve_working_directory(working_directory: Optional[str]) -> str:
+    """Resolve launch cwd exactly as the tmux backend does before creation."""
+    return resolve_and_validate_path(
+        working_directory if working_directory is not None else os.getcwd(),
+        allow_create=False,
+        allow_file=False,
+        description="Working directory",
+    )
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -623,6 +954,14 @@ async def create_terminal(
     fallback_source_lease_token=None,
     dispatch_barrier: dict[str, object] | None = None,
     park_warm: bool = False,
+    engine: Optional[KiroEngine | str] = None,
+    kiro_capability_probe: Optional[Callable[[KiroEngine, set[str]], KiroCapabilities]] = None,
+    model: Optional[str] = None,
+    lifecycle: str | None = None,
+    use_worktree: bool = False,
+    group: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    authority_files: Optional[List[Dict[str, str]]] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -652,6 +991,28 @@ async def create_terminal(
             via handoff/assign. Recorded so send_message can route callbacks
             structurally instead of parsing IDs out of message text (issue #284).
             None for operator-launched terminals.
+        engine: Explicit Kiro engine. For Kiro, it must agree with the selected
+            profile's engine when both are present; omitted resolves to v2.
+        kiro_capability_probe: Optional test seam for the bounded wrapper probe.
+        model: Explicit per-call model override, forwarded to the provider
+            (where supported -- see each provider's own __init__) ahead of
+            the provider's existing profile/providers.toml resolution. Lets a
+            caller (e.g. MCP handoff/assign's own `model` parameter) pin a
+            specific model for one worker without needing a dedicated agent profile.
+            None leaves that existing resolution chain unchanged.
+        use_worktree: If True, provision an isolated ``git worktree`` (issue
+            #100) for this terminal instead of using ``working_directory`` as
+            given -- resolves the repo root from ``working_directory`` (or the
+            server's own cwd when unset), creates a fresh worktree on its own
+            branch there, and overrides ``working_directory`` to the new
+            worktree path before the tmux session/window is created. Requires
+            the resolved directory to actually be inside a git repository.
+            Default False = behavior unchanged.
+        group: Ordered, general-to-specific grouping array for list_siblings
+            discovery (#432). None = this terminal opts out of discovery.
+        metadata: Free-form JSON describing what this terminal is doing.
+            Also updatable later by the running agent via the
+            ``update_metadata`` MCP tool.
 
     Returns:
         Terminal object with all metadata populated
@@ -662,17 +1023,17 @@ async def create_terminal(
     """
     require_provider_admitted(provider)
     if working_directory is not None:
-        if not os.path.isabs(os.path.expanduser(working_directory)):
-            raise ValueError(
-                f"invalid_working_directory: Working directory must be an absolute path: "
-                f"{working_directory}"
-            )
+        # Expand and resolve early so the preflight disk-space check and
+        # worktree path-override see an absolute, canonical path. Relative
+        # paths (e.g. ".") are resolved via os.getcwd() at this point.
+        expanded = os.path.realpath(os.path.abspath(os.path.expanduser(working_directory)))
         try:
-            working_directory = resolve_and_validate_path(
-                working_directory, description="Working directory"
-            )
+            working_directory = resolve_and_validate_path(expanded, description="Working directory")
         except ValueError as exc:
             raise ValueError(f"invalid_working_directory: {exc}") from exc
+    else:
+        working_directory = resolve_and_validate_path(os.getcwd(), description="Working directory")
+    _preflight_disk_space(working_directory)
     provider_class = get_provider_class(provider)
     if provider_class.supports_seed_resume_identity is True and fork_context is None:
         raise RuntimeError("seed_required")
@@ -715,6 +1076,31 @@ async def create_terminal(
             raise ValueError(
                 f"sessionBrief requires a runtime-context provider; resolved provider={provider}"
             )
+        profile_lifecycle = getattr(early_profile, "lifecycle", None)
+        if profile_lifecycle not in {"ephemeral", "sticky"}:
+            profile_lifecycle = None
+        resolved_lifecycle = lifecycle or profile_lifecycle or "ephemeral"
+        if resolved_lifecycle not in {"ephemeral", "sticky"}:
+            raise ValueError("invalid_terminal_lifecycle")
+
+        # Existing-session managed creates take shared authority before any
+        # create_window call. The direct CLI restore path is intentionally
+        # unmanaged and does not pass through this function.
+        if not new_session and session_lifecycle_lease_token is None:
+            from cli_agent_orchestrator.services.session_lifecycle_lease import (
+                acquire_session_lifecycle_shared,
+            )
+
+            session_lifecycle_lease_token = acquire_session_lifecycle_shared(session_name)
+            if session_lifecycle_lease_token is None:
+                raise RuntimeError("resume_in_progress")
+            owned_lifecycle_lease = True
+        elif not new_session and not resume_uuid:
+            from cli_agent_orchestrator.services.session_lifecycle_lease import (
+                validate_session_lifecycle_shared,
+            )
+
+            validate_session_lifecycle_shared(session_name, session_lifecycle_lease_token)
     except Exception:
         if owned_uuid_lease:
             from cli_agent_orchestrator.services.provider_session_lease import (
@@ -730,22 +1116,276 @@ async def create_terminal(
             release_session_lifecycle_lease(session_lifecycle_lease_token)
         raise
 
+    persona_plan = None
     session_created = False  # tracks whether THIS call created the tmux session
     window_created = False
     fifo_attached = False
     db_created = False
+    # Reassigned to the resolved repo root once a worktree is actually created
+    # below (Step 1b), so the failure-cleanup path (the `except` block) knows
+    # whether there is a worktree to roll back too. Still None if Step 1b never
+    # ran (use_worktree=False) or itself failed before create_worktree returned.
+    worktree_repo_root: Optional[str] = None
     try:
+        # Resolve profile policy and Kiro engine BEFORE allocating any backend
+        # resource. Capability probe runs first so a missing wrapper flag fails
+        # closed with no window, database row, FIFO, Herdr registration, or
+        # provider process (F107: KAS is enabled once the probe accepts it).
+        try:
+            profile = load_agent_profile(agent_profile)
+        except FileNotFoundError:
+            profile = None
+        # Production loaders return AgentProfile. Treat a test double or an
+        # otherwise malformed object as no selected profile rather than
+        # accepting arbitrary attributes as configuration.
+        if profile is not None and not isinstance(profile, AgentProfile):
+            profile = None
+
+        if provider == ProviderType.KIRO_CLI.value:
+            resolved_engine = resolve_kiro_engine(
+                explicit=engine,
+                profile=getattr(profile, "engine", None),
+            )
+            if allowed_tools is None and profile is not None:
+                from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+                mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+                allowed_tools = resolve_allowed_tools(
+                    profile.allowedTools, profile.role, mcp_server_names
+                )
+            # Kiro runs headlessly, so current CAO behavior always bypasses its
+            # interactive approval prompt. Profile/MCP policy remains enforced
+            # by CAO, while unrestricted profiles additionally force legacy UI.
+            # F107 B2 (build-gate r1 B1): resolve the effective model ONCE via
+            # the same seam as launch (spawn override > providers.toml >
+            # profile field) BEFORE the pre-allocation probe, and pass that
+            # value to BOTH requested_kiro_capabilities and create_provider.
+            # Probing only `model or profile.model` would let a toml-only
+            # model = "auto" allocate then fail at argv construction.
+            if model:
+                resolved_model = model
+            else:
+                provider_defaults = get_provider_defaults("kiro_cli")
+                profile_name = getattr(profile, "name", None) or agent_profile
+                profile_defaults = get_provider_profile_defaults(provider_defaults, profile_name)
+                resolved_model = resolve_provider_string_option(
+                    profile_defaults,
+                    provider_defaults,
+                    profile,
+                    "model",
+                    "model",
+                )
+            model = resolved_model
+            requested = requested_kiro_capabilities(
+                resolved_engine,
+                model=model,
+                yolo=True,
+            )
+            probe = kiro_capability_probe or probe_kiro_capabilities
+            await asyncio.to_thread(probe, resolved_engine, requested)
+        else:
+            if engine is not None:
+                raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
+            resolved_engine = None
+
+        # Resolve tool policy before persistence for non-Kiro providers too.
+        if allowed_tools is None and profile is not None:
+            from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+            mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+            allowed_tools = resolve_allowed_tools(
+                profile.allowedTools, profile.role, mcp_server_names
+            )
+
         # Step 1: Generate unique identifiers
         terminal_id = terminal_id or generate_terminal_id()
-        env_vars = bind_pane_identity(env_vars, terminal_id)
+        assert terminal_id is not None
         if lease_token is not None:
             from cli_agent_orchestrator.services.rebind_lease import validate_rebind_lease
 
             validate_rebind_lease(terminal_id, lease_token)
 
-        window_name = generate_window_name(agent_profile)
+        from cli_agent_orchestrator.models.agent_profile import ContextPolicy
 
-        # Step 2: Create tmux session or window
+        context_policy = getattr(early_profile, "contextPolicy", None)
+        if isinstance(context_policy, ContextPolicy):
+            if is_sandbox():
+                logger.warning(
+                    "Terminal %s profile %s requested contextPolicy in a sandbox; "
+                    "shared-auth provider isolation takes precedence",
+                    terminal_id,
+                    agent_profile,
+                )
+            else:
+                from cli_agent_orchestrator.utils.persona_context import compose_persona_plan
+
+                persona_plan = compose_persona_plan(
+                    terminal_id,
+                    provider,
+                    agent_profile,
+                    context_policy,
+                    working_directory,
+                )
+        # F295 Half 2 Step 1a: Preflight the provider's launch route BEFORE any
+        # resource allocation (D1, S1). Raises RelayPreflightFailed on a dead relay.
+        _preflight_provider_cls = get_provider_class(provider)
+        _preflight_hook = getattr(_preflight_provider_cls, "preflight_launch", None)
+        if _preflight_hook is not None:
+            await _preflight_hook(agent_profile=agent_profile, model=model)
+
+        # F138: Reserve process incarnation token before window creation.
+        # Process-less providers (has_process_child=False) skip this entirely.
+        _f138_incarnation_id: str | None = None
+        _f138_token: str | None = None
+        _f138_generation: int = 0
+        _has_process_child = True
+        try:
+            _provider_cls = get_provider_class(provider)
+            _has_process_child = getattr(_provider_cls, "has_process_child", True)
+        except Exception:
+            pass
+
+        # F138-R6 D24: sandbox fixture variant override — manifest is authoritative
+        # for process-less determination before reservation (class attr is too late).
+        if _has_process_child and provider == "mock_cli":
+            try:
+                from cli_agent_orchestrator.utils.provider_plane import (
+                    load_active_fixture_provider,
+                )
+
+                _fixture_cap = load_active_fixture_provider("mock_cli")
+                if _fixture_cap.variant == "process-less":
+                    _has_process_child = False
+            except Exception:
+                pass  # Non-sandbox or manifest read failure → class attr stands
+
+        if _has_process_child:
+            from cli_agent_orchestrator.clients.database import f138_reserve_incarnation
+            from cli_agent_orchestrator.services.orphan_reconcile_service import (
+                generate_incarnation_token,
+                hash_token,
+            )
+
+            _f138_token = generate_incarnation_token()
+            _f138_token_hash = hash_token(_f138_token)
+            # Get current lifecycle_generation from the terminal_id's existing row
+            # (for new terminals it will be incremented by the create call below)
+            _f138_generation = 0
+            try:
+                _existing_meta = get_terminal_metadata(terminal_id)
+                if _existing_meta:
+                    _f138_generation = int(_existing_meta.get("lifecycle_generation", 0)) + 1
+                else:
+                    _f138_generation = 1  # new terminal starts at gen 1
+            except Exception:
+                _f138_generation = 1
+
+            # D18: Capture issuance context for pre-issuance fence.
+            _f138_issuance_ticks, _f138_issuance_boot_id = _capture_f138_issuance_context()
+
+            _f138_incarnation_id = f138_reserve_incarnation(
+                terminal_id=terminal_id,
+                terminal_generation=_f138_generation,
+                token=_f138_token,
+                token_hash=_f138_token_hash,
+                owner_uid=os.getuid(),
+                provider=provider,
+                issuance_ticks=_f138_issuance_ticks,
+                issuance_boot_id=_f138_issuance_boot_id,
+            )
+
+        env_vars = bind_pane_identity(
+            env_vars, terminal_id, plan=persona_plan, incarnation_token=_f138_token
+        )
+
+        # WPDT W3 (F152): Derive and set cc_team_inbox_path at pane creation
+        # for claude_code supervisor terminals with teammate_push enabled.
+        from cli_agent_orchestrator.services.config_service import ConfigService as _CS
+
+        if (
+            provider == "claude_code"
+            and _CS.get("supervisor.teammate_push", default=False)
+            and not metadata
+        ):
+            _wd = working_directory or os.getcwd()
+            try:
+                from cli_agent_orchestrator.services.teammate_push_service import (
+                    _derive_cc_team_inbox_path,
+                )
+
+                _inbox_path = _derive_cc_team_inbox_path(_wd)
+                if _inbox_path is not None:
+                    metadata = {"cc_team_inbox_path": str(_inbox_path)}
+            except Exception:
+                pass
+        elif (
+            provider == "claude_code"
+            and _CS.get("supervisor.teammate_push", default=False)
+            and metadata is not None
+            and "cc_team_inbox_path" not in metadata
+        ):
+            _wd = working_directory or os.getcwd()
+            try:
+                from cli_agent_orchestrator.services.teammate_push_service import (
+                    _derive_cc_team_inbox_path,
+                )
+
+                _inbox_path = _derive_cc_team_inbox_path(_wd)
+                if _inbox_path is not None:
+                    metadata["cc_team_inbox_path"] = str(_inbox_path)
+            except Exception:
+                pass
+
+        window_name = generate_window_name(agent_profile, terminal_id)
+
+        # Step 1b: Provision an isolated git worktree (issue #100, Phase 1) before
+        # the tmux session/window below consumes `working_directory` -- the
+        # worktree's own path REPLACES whatever `working_directory` was given
+        # (explicit or caller-inherited), so the terminal always launches inside
+        # its own isolated checkout rather than the shared one it would
+        # otherwise have used.
+        if use_worktree:
+            # `find_repo_root`/`create_worktree` are synchronous `subprocess.run`
+            # calls (a full worktree checkout can take seconds to tens of
+            # seconds on a large repo); `create_terminal` is awaited directly on
+            # the shared event loop, so running them in-line here would freeze
+            # every other cao-server request (status monitor ticks, inbox
+            # delivery, unrelated terminal calls) for the duration. Offload to a
+            # thread, same posture as `delete_terminal`'s own blocking subprocess
+            # work (see its `run_in_executor` call site in api/main.py).
+            worktree_repo_root = await asyncio.to_thread(
+                worktree_service.find_repo_root, working_directory or os.getcwd()
+            )
+            working_directory = await asyncio.to_thread(
+                worktree_service.create_worktree, worktree_repo_root, terminal_id
+            )
+            # F121: Build the CAO-owned authority record for branch integrity
+            # verification. Written in the same INSERT as the terminal row below.
+            from datetime import datetime as _dt
+            from datetime import timezone as _tz
+
+            _worktree_info_dict: dict[str, str] | None = {
+                "repo_root": worktree_repo_root,
+                "worktree_path": working_directory,
+                "expected_branch": worktree_service.branch_for(terminal_id),
+                "terminal_id": terminal_id,
+                "provisioned_at": _dt.now(_tz.utc).isoformat(),
+            }
+        else:
+            _worktree_info_dict = None
+
+        # Resolve AFTER the worktree block, not before: when `use_worktree` is set
+        # the block above REPLACES `working_directory` with the new worktree path,
+        # so resolving earlier would both launch tmux in the pre-worktree directory
+        # (defeating the isolation #100 provides) and persist that stale path as the
+        # terminal's working_directory. This is the effective launch cwd either way.
+        resolved_working_directory = _resolve_working_directory(working_directory)
+
+        # Step 2: Issue per-terminal auth token (F332) and create tmux session or window
+        import secrets as _secrets
+
+        terminal_token = _secrets.token_urlsafe(32)
+
         if new_session:
             # Ensure session name has the CAO prefix for identification
             # Prevent duplicate sessions
@@ -761,11 +1401,13 @@ async def create_terminal(
                 session_name,
                 window_name,
                 terminal_id,
-                working_directory,
+                resolved_working_directory,
                 extra_env=env_vars,
+                terminal_token=terminal_token,
             )
             session_created = True  # only set after successful creation
             window_created = True
+            delete_terminals_by_session(session_name)
 
             # Persist forwarded env only after the tmux session actually
             # exists; the failure path below clears it if a later step
@@ -786,8 +1428,9 @@ async def create_terminal(
                     session_name,
                     window_name,
                     terminal_id,
-                    working_directory,
+                    resolved_working_directory,
                     extra_env=extra_env,
+                    terminal_token=terminal_token,
                 )
             except Exception as exc:
                 if lease_token is not None:
@@ -795,15 +1438,14 @@ async def create_terminal(
                 raise
             window_created = True
 
-        # Step 3: Load the profile once for allowed tool resolution before
-        # provider initialization. The skill catalog is computed only for
-        # providers that consume it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
-        try:
-            profile = load_agent_profile(agent_profile)
-        except FileNotFoundError:
-            profile = None
+        parent_writer = getattr(get_backend(), "set_window_parent", None)
+        if callable(parent_writer):
+            parent_writer(session_name, window_name, caller_id)
+
+        # Step 3: Build a runtime skill catalog only for providers that consume
+        # it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
         skill_prompt = (
-            build_skill_catalog(profile.skills if profile else None)
+            build_skill_catalog(profile.skills if profile else None, provider=provider)
             if provider in RUNTIME_SKILL_PROMPT_PROVIDERS
             else None
         )
@@ -826,7 +1468,7 @@ async def create_terminal(
                 f"Terminal {terminal_id}: provider '{provider}' cannot enforce tool "
                 f"restrictions (soft/prompt-level only) but profile '{agent_profile}' "
                 f"requests {allowed_tools}. Treat this worker as unrestricted; for "
-                f"enforced restrictions use claude_code, kiro_cli, or "
+                f"enforced restrictions use claude_code, grok_cli, kiro_cli, or "
                 f"copilot_cli."
             )
 
@@ -847,12 +1489,13 @@ async def create_terminal(
                 get_backend().pipe_pane(s, w, p)
 
             try:
-                try:
-                    fifo_manager.create_reader(
-                        terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe
-                    )
-                except TypeError:
-                    fifo_manager.create_reader(terminal_id)
+                fifo_manager.create_reader(
+                    terminal_id,
+                    pane_probe=_probe_pane,
+                    rearm=_rearm_pipe,
+                    terminal_generation=_f138_generation,
+                    incarnation_id=_f138_incarnation_id,
+                )
                 fifo_attached = True
             except Exception as exc:
                 if lease_token is not None:
@@ -896,6 +1539,12 @@ async def create_terminal(
                     "init_owner_epoch": SERVER_INIT_OWNER_EPOCH,
                     "init_deadline_s": float(get_server_settings()["artifact_validate_deadline_s"]),
                 }
+            # F127: for kiro_cli, resolved_model is known pre-init; persist at creation
+            if provider == "kiro_cli" and model:
+                init_fields["resolved_model"] = model
+            # F129: Pass authority_files through to the DB publication function
+            if authority_files:
+                init_fields["authority_files"] = authority_files
             delivery_authority = get_delivery_lock(terminal_id)
             mailbox_authority = get_mailbox_authority_lock(session_name, "supervisor")
             with delivery_authority:
@@ -913,8 +1562,21 @@ async def create_terminal(
                                 agent_profile=agent_profile,
                                 allowed_tools=allowed_tools,
                                 caller_id=caller_id,
+                                **(
+                                    {"lifecycle": resolved_lifecycle}
+                                    if resolved_lifecycle != "ephemeral"
+                                    else {}
+                                ),
                                 parent_base_name=fork_context.base_name,
                                 fork_mode=fork_context.mode,
+                                engine=(
+                                    resolved_engine.value if resolved_engine is not None else None
+                                ),
+                                group=group,
+                                metadata=metadata,
+                                worktree_info=_worktree_info_dict,
+                                working_directory=resolved_working_directory,
+                                auth_token=terminal_token,
                                 **init_fields,
                             )
                         else:
@@ -926,9 +1588,22 @@ async def create_terminal(
                                 agent_profile=agent_profile,
                                 allowed_tools=allowed_tools,
                                 caller_id=caller_id,
+                                **(
+                                    {"lifecycle": resolved_lifecycle}
+                                    if resolved_lifecycle != "ephemeral"
+                                    else {}
+                                ),
                                 parent_base_name=fork_context.base_name,
                                 fork_mode=fork_context.mode,
                                 dispatch_barrier=dispatch_barrier,
+                                engine=(
+                                    resolved_engine.value if resolved_engine is not None else None
+                                ),
+                                group=group,
+                                metadata=metadata,
+                                worktree_info=_worktree_info_dict,
+                                working_directory=resolved_working_directory,
+                                auth_token=terminal_token,
                                 **init_fields,
                             )
                     else:
@@ -943,7 +1618,22 @@ async def create_terminal(
                                     agent_profile,
                                     allowed_tools,
                                     caller_id=caller_id,
+                                    **(
+                                        {"lifecycle": resolved_lifecycle}
+                                        if resolved_lifecycle != "ephemeral"
+                                        else {}
+                                    ),
                                     provider_session_id=attempted_resume_uuid,
+                                    engine=(
+                                        resolved_engine.value
+                                        if resolved_engine is not None
+                                        else None
+                                    ),
+                                    group=group,
+                                    metadata=metadata,
+                                    worktree_info=_worktree_info_dict,
+                                    working_directory=resolved_working_directory,
+                                    auth_token=terminal_token,
                                     **init_fields,
                                 )
                             else:
@@ -955,8 +1645,23 @@ async def create_terminal(
                                     agent_profile,
                                     allowed_tools,
                                     caller_id=caller_id,
+                                    **(
+                                        {"lifecycle": resolved_lifecycle}
+                                        if resolved_lifecycle != "ephemeral"
+                                        else {}
+                                    ),
                                     provider_session_id=attempted_resume_uuid,
                                     dispatch_barrier=dispatch_barrier,
+                                    engine=(
+                                        resolved_engine.value
+                                        if resolved_engine is not None
+                                        else None
+                                    ),
+                                    group=group,
+                                    metadata=metadata,
+                                    worktree_info=_worktree_info_dict,
+                                    working_directory=resolved_working_directory,
+                                    auth_token=terminal_token,
                                     **init_fields,
                                 )
                         else:
@@ -969,6 +1674,21 @@ async def create_terminal(
                                     agent_profile,
                                     allowed_tools,
                                     caller_id=caller_id,
+                                    **(
+                                        {"lifecycle": resolved_lifecycle}
+                                        if resolved_lifecycle != "ephemeral"
+                                        else {}
+                                    ),
+                                    engine=(
+                                        resolved_engine.value
+                                        if resolved_engine is not None
+                                        else None
+                                    ),
+                                    group=group,
+                                    metadata=metadata,
+                                    worktree_info=_worktree_info_dict,
+                                    working_directory=resolved_working_directory,
+                                    auth_token=terminal_token,
                                     **init_fields,
                                 )
                             else:
@@ -980,13 +1700,36 @@ async def create_terminal(
                                     agent_profile,
                                     allowed_tools,
                                     caller_id=caller_id,
+                                    **(
+                                        {"lifecycle": resolved_lifecycle}
+                                        if resolved_lifecycle != "ephemeral"
+                                        else {}
+                                    ),
                                     dispatch_barrier=dispatch_barrier,
+                                    engine=(
+                                        resolved_engine.value
+                                        if resolved_engine is not None
+                                        else None
+                                    ),
+                                    group=group,
+                                    metadata=metadata,
+                                    worktree_info=_worktree_info_dict,
+                                    working_directory=resolved_working_directory,
+                                    auth_token=terminal_token,
                                     **init_fields,
                                 )
         except Exception as exc:
             if lease_token is not None:
                 raise RuntimeError("db_publish_failed") from exc
             raise
+        if not resume_uuid and owned_lifecycle_lease:
+            from cli_agent_orchestrator.services.session_lifecycle_lease import (
+                release_session_lifecycle_lease,
+            )
+
+            release_session_lifecycle_lease(session_lifecycle_lease_token)
+            owned_lifecycle_lease = False
+            session_lifecycle_lease_token = None
         db_created = True
 
         # The live snapshot is transactional launch context. Build it only after
@@ -1044,8 +1787,10 @@ async def create_terminal(
                 agent_profile,
                 allowed_tools,
                 skill_prompt=skill_prompt,
-                model=profile.model if profile else None,
+                model=model,
                 fork_context=fork_context,
+                persona_plan=persona_plan,
+                engine=resolved_engine,
             )
         except Exception as exc:
             if lease_token is not None:
@@ -1054,6 +1799,7 @@ async def create_terminal(
         allocated_uuid = getattr(provider_instance, "allocated_session_uuid", None)
         if not isinstance(allocated_uuid, str):
             allocated_uuid = None
+            engine = (resolved_engine,)
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
         # block on `provider.initialize()`. The remaining initialize + input
@@ -1066,6 +1812,15 @@ async def create_terminal(
             shell_command = None  # unknown until initialize() runs
             if fork_context and initial_message and refresh_base_name is None:
                 initial_message = f"{fork_context.initial_preamble}\n\n{initial_message}"
+            # F129: Prepend [FROZEN-AUTHORITY-PINS] block so worker can
+            # identify pinned files for verify_pin at task start
+            if authority_files and initial_message:
+                from cli_agent_orchestrator.services.authority_pin_service import (
+                    build_frozen_authority_block,
+                )
+
+                pins_block = build_frozen_authority_block(authority_files)
+                initial_message = f"{pins_block}\n\n{initial_message}"
             published_snapshot = get_terminal_metadata(terminal_id)
             if published_snapshot is None:
                 raise RuntimeError("terminal_metadata_missing")
@@ -1088,8 +1843,11 @@ async def create_terminal(
                 fork_context=fork_context,
                 refresh_base_name=refresh_base_name,
                 park_warm=park_warm,
+                f138_incarnation_id=_f138_incarnation_id,
             )
         else:
+            # D21: Exposure boundary = pane+token already bound before initialize
+            _f138_sync_exposure_crossed = _f138_incarnation_id is not None
             try:
                 await provider_instance.initialize()
             except (NativeHomeIsolationUnavailable, ProviderAuthRefreshFailed):
@@ -1100,6 +1858,21 @@ async def create_terminal(
                 if lease_token is not None:
                     raise RuntimeError("initialize_failed") from exc
                 raise
+            # F138 D21: strict activation in sync path (after launch health)
+            if _f138_incarnation_id is not None:
+                await _confirm_launch_health(terminal_id, provider_instance)
+                from cli_agent_orchestrator.clients.database import (
+                    f138_strict_activate,
+                )
+
+                _sync_act = f138_strict_activate(_f138_incarnation_id)
+                if _sync_act.outcome in ("activated", "already_active"):
+                    pass  # expected — continue
+                elif _sync_act.outcome == "needs_settlement":
+                    raise RuntimeError("incarnation_needs_settlement")
+                else:
+                    # "missing" with non-null pinned ID = non-durable
+                    raise RuntimeError("incarnation_non_durable_missing")
             try:
                 _persist_provider_runtime_identity(
                     provider_instance,
@@ -1141,10 +1914,14 @@ async def create_terminal(
             session_name=session_name,
             agent_profile=agent_profile,
             caller_id=caller_id,
+            lifecycle=resolved_lifecycle,
             allowed_tools=allowed_tools,
+            engine=resolved_engine,
             shell_command=shell_command,
+            group=group,
+            metadata=metadata,
             status=initial_status,
-            last_active=datetime.now(),
+            last_active=_utcnow(),
             provider_session_id=resume_uuid or allocated_uuid,
         )
 
@@ -1190,6 +1967,54 @@ async def create_terminal(
     except Exception as e:
         # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
+
+        # D23: Post-exposure sync settlement — if exposure boundary was crossed,
+        # force-reconcile first. Only durable proof allows teardown; non-durable
+        # must retain pane/row/FIFO/provider, quarantine, attention, re-raise.
+        _sync_exposed = locals().get("_f138_sync_exposure_crossed", False)
+        _sync_inc_id = locals().get("_f138_incarnation_id")
+        if _sync_exposed and _sync_inc_id is not None:
+            from cli_agent_orchestrator.clients.database import (
+                f138_emit_attention_message,
+                f138_force_reconcile_incarnation,
+                set_terminal_recovery_state,
+            )
+
+            try:
+                fr_result = f138_force_reconcile_incarnation(
+                    _sync_inc_id, source="sync_post_exposure"
+                )
+            except Exception:
+                fr_result = None
+                logger.exception("f138_sync_post_exposure_force_failed terminal=%s", terminal_id)
+
+            durable = fr_result is not None and fr_result.outcome in (
+                "created",
+                "job_already_exists",
+                "reconciled_proven",
+            )
+
+            if not durable:
+                # Non-durable: retain physical resources, quarantine, attention, re-raise
+                quarantine_ok = False
+                try:
+                    quarantine_ok = set_terminal_recovery_state(
+                        terminal_id,
+                        "rollback_kill_uncertain",
+                        error=f"sync_post_exposure_non_durable: {repr(e)[:150]}",
+                    )
+                except Exception:
+                    logger.exception("f138_sync_quarantine_failed terminal=%s", terminal_id)
+                f138_emit_attention_message(
+                    terminal_id,
+                    f"[F138] Terminal {terminal_id} sync post-exposure failure "
+                    f"with non-durable reconcile "
+                    f"(quarantine={'persisted' if quarantine_ok else 'FAILED'}). "
+                    f"Physical resources retained. Manual review needed.",
+                )
+                raise  # re-raise original exception without rollback fallthrough
+
+        # --- Ordinary rollback (pre-exposure or durable-proven) ---
         quiesce_error = None
         if defer_init and has_deferred_init(terminal_id):
             try:
@@ -1242,11 +2067,54 @@ async def create_terminal(
                 status_monitor.clear_terminal(terminal_id)
             except Exception:
                 pass  # Ignore cleanup errors
+        if persona_plan is not None:
+            try:
+                from cli_agent_orchestrator.utils.persona_context import cleanup_persona
+
+                cleanup_persona(terminal_id)
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "Failed to clean persona after terminal creation rollback %s: %s",
+                    terminal_id,
+                    cleanup_exc,
+                )
+        # The process-owning tmux session/window must be stopped before a
+        # provider releases private on-disk state.  In particular Grok can
+        # have an updater still writing $GROK_HOME while its initialization
+        # fails; its cleanup verifies that no such process remains.
+        cleanup_complete = True
         if not ((resume_uuid or lease_token is not None) and db_created):
             try:
-                provider_manager.cleanup_provider(terminal_id)
+                cleanup_complete = provider_manager.cleanup_provider(terminal_id) is not False
             except Exception:
-                pass
+                cleanup_complete = True
+        if not cleanup_complete and terminal_id is not None:
+            logger.warning(
+                "Create rollback deferred Grok cleanup for %s; retaining terminal metadata for retry",
+                terminal_id,
+            )
+        # F314: force-remove the provisioned GROK_HOME on create failure.
+        # This terminal never ran successfully, so no legitimate grok child
+        # should be using it.  Only remove the exact home provisioned this call.
+        if terminal_id is not None:
+            try:
+                from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
+
+                _rollback_provider = provider_manager.get_provider(terminal_id)
+                if isinstance(_rollback_provider, GrokCliProvider):
+                    _rollback_home = _rollback_provider._home_path()
+                    if _rollback_home.exists() and _rollback_provider._is_managed_home(
+                        _rollback_home
+                    ):
+                        import shutil as _shutil
+
+                        _shutil.rmtree(_rollback_home, ignore_errors=True)
+                        logger.info(
+                            "F314: removed stranded GROK_HOME on create rollback: %s",
+                            _rollback_home,
+                        )
+            except Exception as _f314_exc:
+                logger.debug("F314: GROK_HOME rollback cleanup failed: %s", _f314_exc)
         if resume_uuid and uuid_lease_token is not None and owned_uuid_lease:
             from cli_agent_orchestrator.services.provider_session_lease import (
                 release_provider_session_lease,
@@ -1256,7 +2124,7 @@ async def create_terminal(
                 release_provider_session_lease(uuid_lease_token)
             except RuntimeError:
                 pass
-        if resume_uuid and session_lifecycle_lease_token is not None and owned_lifecycle_lease:
+        if session_lifecycle_lease_token is not None and owned_lifecycle_lease:
             from cli_agent_orchestrator.services.session_lifecycle_lease import (
                 release_session_lifecycle_lease,
             )
@@ -1267,6 +2135,18 @@ async def create_terminal(
                 pass
         if settlement_error:
             raise RuntimeError(settlement_error) from e
+        if worktree_repo_root is not None and terminal_id is not None:
+            # A worktree WAS created (Step 1b succeeded) before some later step
+            # failed -- roll it back too, same best-effort posture as everything
+            # else in this block. Without this, a provider-init timeout (or any
+            # later failure) on a worktree-backed terminal would leave an orphan
+            # worktree + branch behind with no CAO-side record pointing at it.
+            # Offloaded to a thread for the same reason Step 1b's create is:
+            # `git worktree remove` is a blocking subprocess call and this
+            # `except` block still runs on the shared event loop.
+            await asyncio.to_thread(
+                worktree_service.remove_worktree, worktree_repo_root, terminal_id
+            )
         raise
 
 
@@ -1275,6 +2155,8 @@ _PERSIST_FAILURE_CODES = {
     "identity_persist_failed",
     "shell_baseline_unavailable",
     "terminal_identity_persist_failed",
+    "terminal_cwd_unavailable",
+    "provider_launch_failed",
 }
 
 
@@ -1282,6 +2164,14 @@ class _DeferredInitFailure(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+class ProviderLaunchFailed(_DeferredInitFailure):
+    """F124 S6: provider process tree confirmed dead immediately after initialize()."""
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__("provider_launch_failed")
+        self.detail = detail
 
 
 def _failure_code(exc: BaseException) -> str:
@@ -1304,6 +2194,7 @@ def _notice_text(
     worker: str,
     profile: str,
     provider: str,
+    reason: str = "",
 ) -> str:
     fields = (code, token, worker, profile, provider)
     if any(
@@ -1316,9 +2207,51 @@ def _notice_text(
         for value in fields
     ):
         raise ValueError("deferred_notice_identifier_invalid")
-    return (
+    base = (
         f"code={code} deadline_s={repr(float(deadline_s))} token={token} "
         f"worker={worker} profile={profile} provider={provider}"
+    )
+    if reason:
+        base += f" reason={reason}"
+    # F124 S7: append actionable hint based on pre/post delivery classification
+    hint = _notice_action_hint(code)
+    if hint:
+        base += f" | {hint}"
+    return base
+
+
+# F124 S7: pre-delivery failure codes — task was NOT delivered to the worker
+_PRE_DELIVERY_CODES = frozenset(
+    {
+        "provider_launch_failed",
+        "identity_persist_failed",
+        "terminal_cwd_unavailable",
+        "shell_baseline_unavailable",
+        "terminal_metadata_missing",
+    }
+)
+
+# F124 S7: unknown-delivery codes — watchdog fired but delivery state is ambiguous
+_UNKNOWN_DELIVERY_CODES = frozenset(
+    {
+        "deferred_init_watchdog_deadline",
+    }
+)
+
+
+def _notice_action_hint(code: str) -> str:
+    """F124 S7: return a plain-text actionable hint for the failure code."""
+    if code in _PRE_DELIVERY_CODES:
+        return "The assigned task was NOT delivered. " "Re-dispatch with assign if needed."
+    if code in _UNKNOWN_DELIVERY_CODES:
+        return (
+            "Worker initialization timed out; task delivery state is unknown. "
+            "Inspect the terminal before re-dispatching."
+        )
+    # Post-delivery or unclassified code — task MAY have been delivered
+    return (
+        "Task delivery was attempted but the worker died before confirming receipt. "
+        "Re-dispatch with assign if needed."
     )
 
 
@@ -1515,39 +2448,30 @@ async def _validate_deferred_artifact(
     generation: str,
     deadline_s: float,
 ) -> None:
-    origin = time.monotonic()
-    deadline = origin + deadline_s
-    while True:
-        try:
-            _result, _grant = await _tracked_blocking(
-                terminal_id,
-                generation,
-                "abandonable",
-                "validate",
-                provider_instance.validate_session_artifact,
-                prepared.session_uuid,
-                prepared.cwd,
-                deadline=deadline,
-            )
-            return
-        except RetryableArtifactValidation as exc:
-            if time.monotonic() >= deadline:
-                raise exc
-            live, _ = await _tracked_blocking(
-                terminal_id,
-                generation,
-                "abandonable",
-                "metadata_read",
-                _deferred_worker_live,
-                terminal_id,
-                deadline=deadline,
-            )
-            if not live:
-                raise _DeferredInitFailure("worker_vanished")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise exc
-            await asyncio.sleep(min(POLL_INTERVAL, remaining))
+    """Async artifact wait for deferred-init path.
+
+    F311: delegates to the shared _wait_for_session_artifact_sync helper
+    (offloaded to a thread via _tracked_blocking) with a liveness check
+    so worker-vanished is detected between retries.
+    """
+
+    def _liveness() -> bool:
+        return _deferred_worker_live(terminal_id)
+
+    await _tracked_blocking(
+        terminal_id,
+        generation,
+        "abandonable",
+        "validate",
+        _wait_for_session_artifact_sync,
+        provider_instance,
+        prepared.session_uuid,
+        prepared.cwd,
+        deadline_s=deadline_s,
+        poll_interval=POLL_INTERVAL,
+        liveness_check=_liveness,
+        deadline=time.monotonic() + deadline_s,
+    )
 
 
 def _delete_terminal_core(
@@ -1606,6 +2530,7 @@ async def _claim_and_settle_deferred_failure(
     uuid_lease_token=None,
     *,
     fatal_claim_failure: bool = False,
+    reason: str = "",
 ) -> None:
     token = str(uuid.uuid4())
     owner_epoch = snapshot.get("init_owner_epoch")
@@ -1682,6 +2607,7 @@ async def _claim_and_settle_deferred_failure(
             worker=terminal_id,
             profile=snapshot.get("agent_profile"),
             provider=snapshot.get("provider"),
+            reason=reason,
         )
     except ValueError:
         notice = (
@@ -2007,6 +2933,133 @@ async def recover_deferred_inits(
                 logger.exception("deferred_init_settlement_failed terminal=%s", terminal_id)
 
 
+def _f160_retry_once(row: dict) -> bool:
+    """F160-a: grant one extra deadline window to a still-running deferred init.
+
+    Returns True when the row was re-armed and must NOT be settled by this
+    sweep. The retry fires at most once per terminal and only when *no partial
+    delivery can have occurred*, because ``deferred_init_watchdog_deadline`` is
+    a `_UNKNOWN_DELIVERY_CODES` member — the row alone cannot tell us whether
+    the initial message went out. Three conditions establish that:
+
+    1. ``shell_command`` is still unset. The deferred path leaves it NULL at
+       create and only persists it after ``provider.initialize()`` returns, so
+       NULL means initialize() never completed — delivery is strictly later.
+    2. F138 exposure has not crossed: no incarnation row for this lifecycle
+       generation, or one still in ``launching`` (``f138_strict_activate`` runs
+       immediately after initialize()/launch health, so ``active`` means the
+       process-bearing pane is live and re-arming could shadow real work).
+    3. The background init task is still alive. A dead task cannot make
+       progress, so extending its deadline would only delay the notice; and
+       re-scheduling a fresh init over a pane whose task may merely have been
+       abandoned (quiesce timeout) is the respawn problem, not this one.
+    """
+    tid = row["id"]
+    if tid in _f160_retried_terminals:
+        return False
+    if row.get("shell_command"):
+        return False
+
+    from cli_agent_orchestrator.clients.database import (
+        f138_get_incarnation_by_terminal_generation,
+        f160_rearm_deferred_init,
+    )
+
+    try:
+        incarnation = f138_get_incarnation_by_terminal_generation(
+            tid, int(row.get("lifecycle_generation") or 0)
+        )
+    except Exception:
+        logger.exception("f160_incarnation_lookup_failed terminal=%s", tid)
+        return False
+    if incarnation is not None and incarnation.get("state") != "launching":
+        return False
+
+    with _deferred_tasks_lock:
+        record = _deferred_tasks_by_terminal.get(tid)
+    if record is None or record.task.done() or record.abandoned:
+        return False
+
+    if not f160_rearm_deferred_init(tid, row.get("init_started_at")):
+        return False
+    _f160_retried_terminals.add(tid)
+    logger.info(
+        "f160_deferred_init_retry terminal=%s retry 1/1 deadline_s=%s",
+        tid,
+        row.get("init_deadline_s"),
+    )
+    return True
+
+
+async def _quiesce_before_watchdog_settle(terminal_id: str) -> bool:
+    """F160-a: stand the live deferred-init task down before the watchdog settles it.
+
+    The watchdog settles out of band, under its own ``watchdog-<epoch>``
+    claimant, so every ``_tracked_blocking`` call it makes is refused while a
+    live ``_DeferredTaskRecord`` for another generation is registered. That
+    guard is correct — a stale claimant must not mutate a terminal whose init
+    task is still driving it — so the fix is to end the init task first, the
+    same order the creation-rollback path uses (quiesce, then settle, and
+    retain rather than settle if quiescence fails).
+
+    Returns True when settlement may proceed.
+    """
+    with _deferred_tasks_lock:
+        record = _deferred_tasks_by_terminal.get(terminal_id)
+    if record is None:
+        return True
+    try:
+        await quiesce_deferred_terminal(terminal_id)
+    except Exception as exc:
+        logger.error("deferred_init_watchdog_quiesce_failed terminal=%s code=%s", terminal_id, exc)
+        return False
+    # A record whose task has finished is spent; the scheduler's done-callback
+    # normally pops it, but the watchdog must not depend on callback ordering.
+    with _deferred_tasks_lock:
+        record = _deferred_tasks_by_terminal.get(terminal_id)
+        if record is not None and record.task.done():
+            _deferred_tasks_by_terminal.pop(terminal_id, None)
+    return True
+
+
+async def sweep_overdue_deferred_inits(registry: PluginRegistry | None = None) -> int:
+    """Settle init_pending rows whose deadline has elapsed (runtime watchdog body).
+
+    Returns the number of rows for which settlement was attempted. Rows granted
+    the F160-a one-shot re-arm are not counted — they were not settled.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    overdue = list_deferred_init_overdue_pending_rows(now)
+    if not overdue:
+        return 0
+
+    async def _settle_overdue(row: dict) -> bool:
+        tid = row["id"]
+        try:
+            if _f160_retry_once(row):
+                return False
+            if not await _quiesce_before_watchdog_settle(tid):
+                return True
+            await _claim_and_settle_deferred_failure(
+                tid,
+                f"watchdog-{SERVER_INIT_OWNER_EPOCH}",
+                row,
+                "deferred_init_watchdog_deadline",
+                registry,
+                reason="watchdog_deadline_elapsed",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("deferred_init_watchdog_settle_failed terminal=%s", tid)
+        return True
+
+    results = await asyncio.gather(*[_settle_overdue(row) for row in overdue])
+    return sum(1 for settled in results if settled)
+
+
 def _fork_refresh_lock(base_name: str) -> asyncio.Lock:
     loop = asyncio.get_running_loop()
     key = (loop, base_name)
@@ -2043,7 +3096,10 @@ async def _wait_for_base_ready(
     *,
     input_gen: int | None = None,
 ) -> bool:
-    while time.monotonic() < deadline:
+    max_iterations = max(1, int((deadline - time.monotonic()) / 0.1 * 3))
+    iterations = 0
+    while time.monotonic() < deadline and iterations < max_iterations:
+        iterations += 1
         status = status_monitor.get_status(base_terminal_id)
         if status == TerminalStatus.ERROR:
             return False
@@ -2056,6 +3112,8 @@ async def _wait_for_base_ready(
             if status_gen is None or status_gen >= input_gen:
                 return True
         await asyncio.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    if iterations >= max_iterations:
+        logger.warning("_wait_for_base_ready: iteration cap reached (%d), exiting", max_iterations)
     return False
 
 
@@ -2133,8 +3191,13 @@ async def _prepare_fork_refresh(
                         caller_id,
                         base_name,
                         base_digest_service.state_key(decision.delta),
-                        "A covered digest artifact is required before refresh.",
+                        (
+                            "A covered digest artifact is required before refresh."
+                            if row.get("digest_head")
+                            else "Base has never published a digest."
+                        ),
                         deadline=deadline,
+                        genesis=row.get("digest_head") is None,
                     )
                 except Exception:
                     logger.exception("digest_pending_notice_failed base=%s", base_name)
@@ -2142,6 +3205,13 @@ async def _prepare_fork_refresh(
         if isinstance(decision, base_digest_service.DigestInvalid):
             logger.warning("digest_refresh_invalid base=%s reason=%s", base_name, decision.reason)
             return stale_preamble
+        if isinstance(decision, base_digest_service.DigestUnobservable):
+            logger.warning(
+                "digest_refresh_unobservable base=%s reason=%s", base_name, decision.reason
+            )
+            return stale_preamble
+        if not isinstance(decision, base_digest_service.DigestCovered):
+            assert_never(decision)
         dispatched, _ = await _tracked_blocking(
             terminal_id,
             generation,
@@ -2179,8 +3249,28 @@ async def _prepare_fork_refresh(
         captured = snapshot_result
         if captured.acquisition_error or not captured.git_sha:
             return stale_preamble
-        if not base_digest_service.covers(decision.artifact, captured):
+        post_dispatch, _ = await _tracked_blocking(
+            terminal_id,
+            generation,
+            "abandonable",
+            "fork_refresh_compare",
+            fork_staleness,
+            row,
+            deadline=deadline,
+        )
+        coverage = base_digest_service.coverage(decision.artifact, post_dispatch.delta)
+        if isinstance(coverage, base_digest_service.Disproven):
+            logger.warning("digest_post_dispatch_mismatch base=%s", base_name)
             return stale_preamble
+        if isinstance(coverage, base_digest_service.Unobservable):
+            logger.warning(
+                "digest_post_dispatch_unobservable base=%s reason=%s",
+                base_name,
+                coverage.reason,
+            )
+            return stale_preamble
+        if not isinstance(coverage, base_digest_service.Proven):
+            assert_never(coverage)
         current, _ = await _tracked_blocking(
             terminal_id,
             generation,
@@ -2269,6 +3359,46 @@ def _normalized_composer_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.lower())
 
 
+def _worker_is_started_direct(terminal_id: str, provider: Any) -> bool:
+    """Direct visible-screen status check bypassing the event-driven status cache.
+
+    The deferred-init retry loop polls ``status_monitor.get_status()`` which
+    returns the **cached** status updated only by the event-driven pipeline
+    (pyte screener at rising-edge/quiescence edges). When that lags behind
+    reality the cached status stays IDLE even though the worker already
+    transitioned to PROCESSING.
+
+    This function does a live ``capture-pane`` to grab the visible screen
+    (not the 8 KB rolling buffer, which is too small to reliably hold the
+    footer) and calls ``provider.get_status()`` directly, catching the real
+    state so the retry loop doesn't re-deliver into a working terminal.
+
+    Only providers that set ``supports_direct_status_probe = True`` should
+    be passed to this function; the ``get_status()`` contract for other
+    providers (e.g. kiro_cli, antigravity_cli, cursor_cli) relies on
+    dispatch bookkeeping and cannot distinguish IDLE from COMPLETED on a
+    rendered capture-pane snapshot.
+    """
+    try:
+        metadata = get_terminal_metadata(terminal_id)
+        if not metadata:
+            return False
+        session_name = metadata.get("tmux_session")
+        window_name = metadata.get("tmux_window")
+        if not session_name or not window_name:
+            return False
+        output = get_backend().get_history(session_name, window_name, tail_lines=200)
+        status = provider.get_status(output)
+    except Exception:
+        logger.debug(
+            "Direct status probe for %s failed (falling through to cached path)",
+            terminal_id,
+            exc_info=True,
+        )
+        return False
+    return status in _DEFERRED_STARTED_STATUSES
+
+
 def _message_visible_in_box(terminal_id: str, message: str) -> bool:
     """Return whether the provider parser sees exactly the expected task draft."""
     expected = _normalized_composer_text(message)
@@ -2298,6 +3428,7 @@ async def _confirm_worker_started_or_resubmit(
     sender_id: str | None,
     orchestration_type: OrchestrationType | None,
     *,
+    provider: Any = None,
     generation: str | None = None,
     park_warm: bool = False,
 ) -> bool:
@@ -2325,6 +3456,14 @@ async def _confirm_worker_started_or_resubmit(
     ):
         return True
 
+    # F139 D10: a process-less fixture provider has no child and no pane
+    # composer, so status stays IDLE and _message_visible_in_box can never
+    # confirm. The provider reports a stable IDLE immediately after init and
+    # its send path already recorded the sandbox receipt — treat as started.
+    _fixture_cap = getattr(provider, "_fixture_capability", None)
+    if _fixture_cap is not None and getattr(_fixture_cap, "variant", None) == "process-less":
+        return True
+
     for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
         current_status = status_monitor.get_status(terminal_id)
         if current_status == TerminalStatus.WAITING_USER_ANSWER:
@@ -2333,6 +3472,19 @@ async def _confirm_worker_started_or_resubmit(
             )
         if current_status == TerminalStatus.ERROR:
             return False
+
+        # The cached status can lag behind the visible provider screen. Providers
+        # must opt in because only some get_status implementations are safe on a
+        # direct capture. This is a fast path inside the existing WPM4a guarded
+        # confirmation loop; Codex inherits the default False capability.
+        if provider is not None and getattr(provider, "supports_direct_status_probe", False):
+            if await run_blocking(
+                "deferred_submit_direct_status",
+                _worker_is_started_direct,
+                terminal_id,
+                provider,
+            ):
+                return True
 
         task_is_stable = await run_blocking(
             "deferred_submit_probe", _message_visible_in_box, terminal_id, message
@@ -2384,6 +3536,128 @@ async def _confirm_worker_started_or_resubmit(
     return False
 
 
+# --- F124 S5/S6: launch health probe -----------------------------------------
+
+
+async def _provider_child_alive(terminal_id: str, provider) -> bool | None:
+    """F124 S5: prove provider process tree is not an empty/dead pane.
+
+    Returns:
+        True  — alive (descendants found or exec-replaced or no-process provider)
+        False — confirmed dead (empty shell, vanished pane)
+        None  — inconclusive (missing procfs/baseline) → degrade to F110 watchdog
+    """
+    from cli_agent_orchestrator.services.fork_context_service import (
+        _PROC_ROOT,
+        _descendants,
+        _procfs_available,
+    )
+
+    # Step 1: process-less provider short-circuits without procfs access
+    if not getattr(provider, "has_process_child", True):
+        return True
+
+    # Step 1b (F139 r5 D15): provider confirmed fixture child death during
+    # initialize — deterministic False without procfs/tmux race.
+    if provider.launch_health_failure_confirmed:
+        return False
+
+    # Step 2: procfs availability
+    if not _procfs_available():
+        logger.warning(
+            "f124_procfs_unavailable terminal=%s — degrading to F110 watchdog",
+            terminal_id,
+        )
+        return None
+
+    # Step 3: resolve pane PID
+    metadata = get_terminal_metadata(terminal_id)
+    if metadata is None:
+        return False
+
+    from cli_agent_orchestrator.services.fork_context_service import pane_pid as _pane_pid
+
+    try:
+        pid = _pane_pid(metadata["tmux_session"], metadata["tmux_window"])
+    except Exception:
+        return False
+
+    # Verify the pane PID's /proc entry exists
+    if not (_PROC_ROOT / str(pid) / "stat").exists():
+        return False
+
+    # Step 4: full descendant tree
+    descendants = _descendants(pid)
+    if len(descendants) > 1:
+        return True
+
+    # Step 5: exec-replacement check (pane command != shell baseline)
+    baseline = getattr(provider, "shell_baseline", None) or getattr(
+        provider, "_shell_baseline", None
+    )
+    try:
+        from cli_agent_orchestrator.backends.registry import get_backend as _get_backend
+
+        current_command = _get_backend().get_pane_current_command(
+            metadata["tmux_session"], metadata["tmux_window"]
+        )
+    except Exception:
+        current_command = None
+
+    if not baseline or not current_command:
+        # Cannot compare — inconclusive
+        return None
+
+    if current_command != baseline:
+        # Shell was exec-replaced by the provider binary
+        return True
+
+    # Step 6: current command equals baseline → confirmed empty shell
+    return False
+
+
+# F163-a: module-level constants for _confirm_launch_health retry loop.
+# Tests override these to avoid burning ~5s per deadline test.
+CONFIRM_LAUNCH_HEALTH_POLL_INTERVAL = 0.5  # seconds between probes
+CONFIRM_LAUNCH_HEALTH_DEADLINE = 5.0  # total wall-clock budget for retry loop
+
+
+async def _confirm_launch_health(terminal_id: str, provider) -> None:
+    """F124 S6 + F163-a: confirm provider is alive after initialize(); raise on confirmed death.
+
+    Polls _provider_child_alive every ~CONFIRM_LAUNCH_HEALTH_POLL_INTERVAL s
+    for up to ~CONFIRM_LAUNCH_HEALTH_DEADLINE s total to tolerate
+    slow shell forks (e.g. large command lines in zsh). Returns immediately
+    on True or None (inconclusive stays non-fatal). Raises ProviderLaunchFailed
+    only if the final probe at deadline still returns False.
+    """
+    import asyncio as _asyncio
+
+    grace = max(0.0, float(getattr(provider, "launch_health_grace_s", 0.0)))
+    if grace:
+        await _asyncio.sleep(grace)
+
+    import time as _time
+
+    deadline = _time.monotonic() + CONFIRM_LAUNCH_HEALTH_DEADLINE
+
+    while True:
+        alive = await _provider_child_alive(terminal_id, provider)
+        if alive is not False:
+            # True (alive) or None (inconclusive) — non-fatal, return immediately
+            return
+
+        # alive is False — check if we still have budget to retry
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            break
+
+        await _asyncio.sleep(min(CONFIRM_LAUNCH_HEALTH_POLL_INTERVAL, remaining))
+
+    # Final probe returned False and deadline exhausted
+    raise ProviderLaunchFailed(f"provider process tree is empty/dead for terminal {terminal_id}")
+
+
 def _schedule_deferred_init(
     provider_instance,
     terminal_id: str,
@@ -2399,6 +3673,7 @@ def _schedule_deferred_init(
     fork_context=None,
     refresh_base_name: str | None = None,
     park_warm: bool = False,
+    f138_incarnation_id: str | None = None,
 ) -> None:
     """Kick off provider.initialize() in the background and, on success,
     deliver the initial message via send_input.
@@ -2461,6 +3736,10 @@ def _schedule_deferred_init(
         )
 
     async def _run() -> None:
+        # D21: Exposure boundary = pane+token already bound by the time _run starts.
+        # If we have a pinned incarnation_id, the process-bearing token is in the
+        # live pane — ANY exception from here on must enter force settlement.
+        _f138_exposure_crossed = f138_incarnation_id is not None
         try:
             provider_instance.blocked_wait_notifier = _notify_blocked_wait
             prepared_message = await _prepare_fork_message(
@@ -2473,6 +3752,23 @@ def _schedule_deferred_init(
                 snapshot,
             )
             await provider_instance.initialize()
+            # F124 S6: confirm provider process is alive before proceeding
+            await _confirm_launch_health(terminal_id, provider_instance)
+            # F138 D21: strict activation with pinned incarnation ID
+            if f138_incarnation_id is not None:
+                from cli_agent_orchestrator.clients.database import (
+                    ActivationResult,
+                    f138_strict_activate,
+                )
+
+                _act_result = f138_strict_activate(f138_incarnation_id)
+                if _act_result.outcome in ("activated", "already_active"):
+                    pass  # expected — continue
+                elif _act_result.outcome == "needs_settlement":
+                    raise _DeferredInitFailure("incarnation_needs_settlement")
+                else:
+                    # "missing" with non-null pinned ID = non-durable, not process-less
+                    raise _DeferredInitFailure("incarnation_activation_missing")
             prepared, _ = await _tracked_blocking(
                 terminal_id,
                 generation,
@@ -2483,10 +3779,22 @@ def _schedule_deferred_init(
                 terminal_id,
                 settlement_form=settlement_form,
             )
+            # Round-3 review fix (upstream PR #539, call-me-ram): a raw POST /sessions
+            # caller that supplies initial_message with no orchestration_type previously
+            # sailed straight past send_input's WAITING_USER_ANSWER guard entirely -- the
+            # guard only fires for OrchestrationType.ASSIGN/HANDOFF, so an unstated type
+            # meant no protection at all against pasting the initial task into a live
+            # choice prompt. Every call that reaches THIS function is by construction an
+            # unattended initial-task delivery (never an interactive human answer -- those
+            # go through answer_user_prompt's own separate /terminals/{id}/input call,
+            # which never routes through _schedule_deferred_init), so defaulting an
+            # unstated orchestration_type to ASSIGN here is always correct and cannot
+            # affect answer_user_prompt. Applies to the resubmit path below too.
+            effective_orchestration_type = orchestration_type or OrchestrationType.ASSIGN
             send_kwargs = {
                 "registry": registry,
                 "sender_id": snapshot.get("caller_id"),
-                "orchestration_type": orchestration_type,
+                "orchestration_type": effective_orchestration_type,
             }
             if park_warm:
                 send_kwargs["expect_callback"] = False
@@ -2518,29 +3826,62 @@ def _schedule_deferred_init(
                     terminal_id,
                     shell_command,
                 )
-            if prepared_message:
-                # For assign/handoff the sender is the CALLER (the supervisor),
-                # not this MCP server. But the deferred path is used only via
-                # /assign, and _assign_impl on the MCP-server side already
-                # embedded the callback instructions into initial_message.
-                # We still pass sender_id=caller_id if present in DB metadata
-                # so plugin events see it.
+            # F127: persist resolved_model post-initialize
+            _f127_resolved = getattr(provider_instance, "resolved_model", None)
+            if _f127_resolved is not None:
                 await _tracked_blocking(
                     terminal_id,
                     generation,
                     "abandonable",
-                    "send_input",
-                    send_input,
+                    "capture_persist",
+                    update_terminal_resolved_model,
                     terminal_id,
-                    prepared_message,
-                    **send_kwargs,
+                    _f127_resolved,
                 )
+            if prepared_message:
+                # For assign/handoff the sender is the CALLER (the supervisor),
+                # not this MCP server; _assign_impl on the MCP-server side already
+                # embedded the callback instructions into initial_message. The
+                # deferred path is also reached from POST /sessions?initial_message=
+                # (session_service.create_session), which has no supervisor and no
+                # orchestration_type requirement on its caller.
+                # We still pass sender_id=caller_id if present in DB metadata
+                # so plugin events see it.
+                _DEFERRED_DELIVERY_MAX_RETRIES = 3
+                _DEFERRED_DELIVERY_RETRY_DELAY = 2.0
+                for _attempt in range(_DEFERRED_DELIVERY_MAX_RETRIES):
+                    try:
+                        await _tracked_blocking(
+                            terminal_id,
+                            generation,
+                            "abandonable",
+                            "send_input",
+                            send_input,
+                            terminal_id,
+                            prepared_message,
+                            **send_kwargs,
+                        )
+                        break
+                    except DeliveryDeferredError:
+                        if _attempt == _DEFERRED_DELIVERY_MAX_RETRIES - 1:
+                            raise  # falls to outer handler → teardown
+                        logger.warning(
+                            "deferred_init_delivery_deferred terminal=%s attempt=%d/%d",
+                            terminal_id,
+                            _attempt + 1,
+                            _DEFERRED_DELIVERY_MAX_RETRIES,
+                        )
+                        await asyncio.sleep(_DEFERRED_DELIVERY_RETRY_DELAY)
                 started = await _confirm_worker_started_or_resubmit(
                     terminal_id,
                     prepared_message,
                     registry,
                     snapshot.get("caller_id"),
-                    orchestration_type,
+                    # Same guard-eligible default as the initial send_input above --
+                    # a resubmit is still an unattended initial-task delivery, so it
+                    # must not silently drop back to the unguarded original type.
+                    effective_orchestration_type,
+                    provider=provider_instance,
                     generation=generation,
                     park_warm=park_warm,
                 )
@@ -2620,26 +3961,113 @@ def _schedule_deferred_init(
                 except Exception:
                     logger.exception("Deferred blocked notice failed terminal=%s", terminal_id)
         except asyncio.CancelledError:
+            # Log the cancellation (making this path non-silent — the original
+            # F110 seam). Actual settlement is deferred to the periodic watchdog
+            # (§2) rather than inline, because the CancelledError may arrive
+            # while the dispatcher thread still holds the DB slot from the
+            # in-flight operation that was interrupted — inline settlement via
+            # _tracked_blocking would deadlock.
+            logger.warning(
+                "Deferred init for terminal %s cancelled before completion; "
+                "watchdog will settle if row remains init_pending.",
+                terminal_id,
+                exc_info=True,
+            )
             raise
         except Exception as e:
             # exc_info=True preserves the traceback for debugging; {e!r} avoids
             # newline/control-character injection into logs and the inbox message
             # (the exception text can contain provider-supplied content).
             logger.error(
-                "Deferred init for terminal %s failed: %r. "
-                "Notifying caller and tearing down worker.",
+                "Deferred init for terminal %s failed: %r. " "exposure_crossed=%s",
                 terminal_id,
                 e,
+                _f138_exposure_crossed,
                 exc_info=True,
             )
-            await _claim_and_settle_deferred_failure(
-                terminal_id,
-                generation,
-                snapshot,
-                _failure_code(e),
-                registry,
-                uuid_lease_token,
-            )
+            if not _f138_exposure_crossed or f138_incarnation_id is None:
+                # Pre-exposure or process-less: ordinary rollback path
+                await _claim_and_settle_deferred_failure(
+                    terminal_id,
+                    generation,
+                    snapshot,
+                    _failure_code(e),
+                    registry,
+                    uuid_lease_token,
+                    reason=repr(e)[:200],
+                )
+            else:
+                # D23: Post-exposure — force reconcile, then check durability
+                from cli_agent_orchestrator.clients.database import (
+                    f138_emit_attention_message,
+                    f138_force_reconcile_incarnation,
+                    set_terminal_recovery_state,
+                )
+
+                try:
+                    fr_result = f138_force_reconcile_incarnation(
+                        f138_incarnation_id, source="deferred_post_exposure"
+                    )
+                except Exception:
+                    fr_result = None
+                    logger.exception(
+                        "f138_post_exposure_force_reconcile_failed terminal=%s",
+                        terminal_id,
+                    )
+
+                # Durable = force created a job OR proved reconciliation complete
+                durable = fr_result is not None and fr_result.outcome in (
+                    "created",
+                    "job_already_exists",
+                    "reconciled_proven",
+                )
+
+                if durable:
+                    # Durable: teardown allowed — bare delete (no abandon)
+                    logger.info(
+                        "f138_post_exposure_durable terminal=%s outcome=%s — teardown",
+                        terminal_id,
+                        fr_result.outcome,
+                    )
+                    await _claim_and_settle_deferred_failure(
+                        terminal_id,
+                        generation,
+                        snapshot,
+                        _failure_code(e),
+                        registry,
+                        uuid_lease_token,
+                        reason=repr(e)[:200],
+                    )
+                else:
+                    # Non-durable: fail closed — retain pane/row/FIFO/provider.
+                    # Attempt quarantine marker; if THAT fails, still retain
+                    # physical resources and emit best-effort attention.
+                    logger.error(
+                        "f138_post_exposure_non_durable terminal=%s fr_outcome=%s — "
+                        "retaining as rollback_kill_uncertain",
+                        terminal_id,
+                        fr_result.outcome if fr_result else "db_error",
+                    )
+                    quarantine_persisted = False
+                    try:
+                        quarantine_persisted = set_terminal_recovery_state(
+                            terminal_id,
+                            "rollback_kill_uncertain",
+                            error=f"post_exposure_non_durable: {repr(e)[:150]}",
+                        )
+                    except Exception:
+                        logger.exception("f138_quarantine_commit_failed terminal=%s", terminal_id)
+
+                    # Shared DB-only one-shot attention (works even without caller_id)
+                    detail = f"quarantine={'persisted' if quarantine_persisted else 'FAILED'}"
+                    f138_emit_attention_message(
+                        terminal_id,
+                        f"[F138] Terminal {terminal_id} post-exposure failure "
+                        f"with non-durable reconcile ({detail}). "
+                        f"Physical resources retained. Manual review needed.",
+                    )
+                    # Return without teardown — finally block releases leases only
+                    return
         finally:
             if owns_uuid_lease and uuid_lease_token is not None:
                 from cli_agent_orchestrator.services.provider_session_lease import (
@@ -2664,6 +4092,10 @@ def _schedule_deferred_init(
         loop = asyncio.get_running_loop()
     except RuntimeError:
         logger.error(f"Deferred init for {terminal_id}: no running event loop; init skipped")
+        try:
+            _settle_deferred_failure_sync(terminal_id, registry)
+        except Exception:
+            logger.exception("Deferred init no-loop settlement failed terminal=%s", terminal_id)
         return
     task = loop.create_task(_run())
     _deferred_init_tasks.add(task)
@@ -2677,6 +4109,7 @@ def _schedule_deferred_init(
 
     def _done(completed):
         _deferred_init_tasks.discard(completed)
+        _f160_retried_terminals.discard(terminal_id)
         with _deferred_tasks_lock:
             record = _deferred_tasks_by_terminal.get(terminal_id)
             if (
@@ -2685,6 +4118,27 @@ def _schedule_deferred_init(
                 and (record.current_call is None or record.current_call.future.done())
             ):
                 _deferred_tasks_by_terminal.pop(terminal_id, None)
+
+        # §1a: if the task did not complete normally and the row is still
+        # init_pending, log a warning. The periodic watchdog (§2) will settle
+        # the row on its next sweep. We avoid inline settlement here because
+        # the done-callback fires after task teardown and the dispatcher may
+        # still hold the old task's thread slot — inline re-entry through
+        # _tracked_blocking would deadlock the single-threaded dispatcher.
+        if not completed.cancelled() and completed.exception() is None:
+            # Normal completion — init committed ready (or the task body already
+            # settled via _claim_and_settle_deferred_failure). Nothing to do.
+            return
+        if loop.is_closed():
+            return
+        meta = get_terminal_metadata(terminal_id)
+        if meta is not None and meta.get("init_state") == "init_pending":
+            logger.warning(
+                "Deferred init done-callback detected unsettled init_pending for "
+                "terminal %s (cancelled=%s); watchdog will settle on next sweep.",
+                terminal_id,
+                completed.cancelled(),
+            )
 
     task.add_done_callback(_done)
 
@@ -2700,7 +4154,7 @@ def get_terminal(terminal_id: str) -> Dict:
         input_gen = status_monitor.get_input_gen(terminal_id)
         status_gen = status_monitor.get_status_gen(terminal_id)
 
-        return {
+        result = {
             "id": metadata["id"],
             "name": metadata["tmux_window"],
             "provider": metadata["provider"],
@@ -2710,15 +4164,129 @@ def get_terminal(terminal_id: str) -> Dict:
             "caller_mailbox_id": metadata.get("caller_mailbox_id"),
             "allowed_tools": metadata.get("allowed_tools"),
             "provider_session_id": metadata.get("provider_session_id"),
+            "engine": metadata.get("engine"),
+            "resolved_model": metadata.get("resolved_model"),
+            "group": metadata.get("group"),
+            "metadata": metadata.get("metadata"),
             "status": status,
             "input_gen": input_gen,
             "status_gen": 0 if status_gen is None else status_gen,
             "last_active": metadata["last_active"],
         }
 
+        # F121: pull-based branch integrity verification for worktree-backed terminals
+        _wt_info = metadata.get("worktree_info")
+        if _wt_info is not None:
+            from dataclasses import asdict as _asdict
+
+            try:
+                live_cwd = get_backend().get_pane_working_directory(
+                    metadata["tmux_session"], metadata["tmux_window"]
+                )
+            except Exception:
+                live_cwd = None
+            if live_cwd:
+                from cli_agent_orchestrator.services.worktree_service import (
+                    verify_worktree_integrity,
+                )
+
+                integrity = verify_worktree_integrity(live_cwd, _wt_info)
+                result["branch_integrity"] = _asdict(integrity)
+            else:
+                from cli_agent_orchestrator.services.worktree_service import (
+                    WorktreeIntegrityResult,
+                )
+
+                result["branch_integrity"] = _asdict(
+                    WorktreeIntegrityResult(
+                        ok=False,
+                        expected_branch=_wt_info["expected_branch"],
+                        expected_worktree_path=_wt_info["worktree_path"],
+                        error="cwd_unavailable",
+                    )
+                )
+
+        return result
+
     except Exception as e:
         logger.error(f"Failed to get terminal {terminal_id}: {e}")
         raise
+
+
+def update_group(terminal_id: str, group: Optional[List[str]]) -> bool:
+    """Replace a terminal's group array.
+
+    Used by consumers whose own grouping can change after a terminal already
+    exists (e.g. harness-control folder/project reassignment) so ``group``
+    doesn't go stale (#432). ``None``/``[]`` opts the terminal back out of
+    discovery.
+
+    Returns:
+        False if the terminal does not exist, True otherwise.
+    """
+    return update_terminal_group(terminal_id, group)
+
+
+def update_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]]) -> bool:
+    """Replace a terminal's free-form metadata dict.
+
+    Whole-dict replace, not a merge: concurrent calls are last-write-wins
+    (tedswinyar, PR #433 review). Acceptable for this field -- callers should
+    re-send the full intended dict each time rather than assuming a partial
+    update accumulates on top of a prior one.
+
+    Returns:
+        False if the terminal does not exist, True otherwise.
+    """
+    return update_terminal_metadata(terminal_id, metadata)
+
+
+def list_siblings(
+    caller_id: str, depth: Optional[int] = None, cross_session: bool = False
+) -> List[Dict[str, Any]]:
+    """Resolve ``caller_id``'s own group and return matching sibling terminals.
+
+    Depth is clamped server-side to ``[1, len(caller_group)]`` (#432): it can
+    never be widened past the caller's own group length, and an explicit 0 is
+    rejected by the API layer's query-param validation before this is ever
+    called (never silently reinterpreted as an unscoped, all-terminals
+    query). ``depth=None`` defaults to the caller's full own group length —
+    the widest scope the caller is allowed to see.
+
+    A caller with no group set finds no siblings (participates in no
+    discovery, per #432) rather than erroring.
+
+    Session-scoped by default (issue #432 design discussion): results are
+    additionally filtered to the caller's own ``tmux_session`` unless
+    ``cross_session=True`` is explicitly passed — see
+    ``list_siblings_by_group_prefix``'s own docstring for the full rationale.
+
+    Returns:
+        List of ``{id, group, metadata, status}`` dicts for every OTHER
+        terminal whose group shares the resolved prefix. ``status`` is a
+        live, point-in-time snapshot (tedswinyar, PR #433 review): a handoff
+        terminal that has COMPLETED can still delete itself between this
+        call returning and a caller's follow-up ``send_message`` to it, so a
+        discovered sibling is never a guarantee it's still reachable --
+        ``status`` lets a caller skip an obviously-finished sibling
+        proactively, but callers should still expect sends to occasionally
+        fail against a sibling that disappeared in that window.
+    """
+    caller_metadata = get_terminal_metadata(caller_id)
+    caller_group = caller_metadata.get("group") if caller_metadata else None
+    if not caller_group:
+        return []
+    caller_session = caller_metadata.get("tmux_session") if caller_metadata else None
+    max_depth = len(caller_group)
+    effective_depth = max_depth if depth is None else depth
+    effective_depth = max(1, min(effective_depth, max_depth))
+    prefix = caller_group[:effective_depth]
+    siblings = list_siblings_by_group_prefix(
+        caller_id, prefix, caller_session=caller_session, cross_session=cross_session
+    )
+    for sibling in siblings:
+        sibling["status"] = status_monitor.get_status(sibling["id"]).value
+    return siblings
 
 
 def get_working_directory(terminal_id: str) -> Optional[str]:
@@ -2749,6 +4317,67 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
         raise
 
 
+def _is_coroutine_function(value: Any) -> bool:
+    """Return whether ``value`` is an async coroutine function.
+
+    ``asyncio.iscoroutinefunction`` is deprecated in Python 3.16; use the
+    inspect equivalent, which handles both ``def async`` and partial-wrapped
+    coroutines identically for the fixture send-override check.
+    """
+    import inspect
+
+    return inspect.iscoroutinefunction(value)
+
+
+def _fixture_send_input_override(provider, message: str) -> bool:
+    """F139 D9/D10/D11: dispatch a sandbox fixture provider's send_input override.
+
+    Returns True when the provider is a sandbox fixture provider whose
+    manifest-pinned variant requires fixture-specific send behavior
+    (process-less receipt, post-send-death receipt+raise, procfs-unavailable
+    block). The override is an async coroutine; it runs on a fresh event loop
+    in this thread (the module send paths run in a dispatcher/executor thread
+    with no running loop). Production providers never define a fixture
+    capability and are untouched.
+    """
+    if provider is None:
+        return False
+    capability = getattr(provider, "_fixture_capability", None)
+    if capability is None:
+        return False
+    variant = getattr(capability, "variant", None)
+    if variant in (None, "healthy", "empty-shell"):
+        # healthy uses the ordinary paste path; empty-shell never reaches
+        # delivery (F124 launch-health settles it first).
+        return False
+    override = getattr(provider, "send_input", None)
+    if not callable(override) or not _is_coroutine_function(override):
+        return False
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(override(message))
+    else:
+        # Running inside an event-loop thread — run the override on a fresh
+        # daemon thread so we never block the server loop.
+        import threading as _threading
+
+        exc_holder: list[BaseException] = []
+
+        def _run() -> None:
+            try:
+                asyncio.run(override(message))
+            except BaseException as exc:  # noqa: BLE001 - re-raised in caller
+                exc_holder.append(exc)
+
+        thread = _threading.Thread(target=_run, daemon=True)
+        thread.start()
+        thread.join()
+        if exc_holder:
+            raise exc_holder[0]
+    return True
+
+
 def send_input(
     terminal_id: str,
     message: str,
@@ -2758,6 +4387,7 @@ def send_input(
     defer_on_dialog: bool = False,
     *,
     expect_callback: bool = True,
+    _lifecycle_internal: bool = False,
 ) -> bool:
     """Send input to terminal via tmux paste buffer.
 
@@ -2765,6 +4395,13 @@ def send_input(
     of Enter keys sent after pasting is determined by the provider's
     ``paste_enter_count`` property (e.g., some TUIs need 2 Enters because
     bracketed paste triggers multi-line mode).
+
+    Args:
+        _lifecycle_internal: When True, bypass the pre-send status check.
+            Reserved for internal lifecycle operations (exit_terminal_cli)
+            that must send input while the terminal is in a recovery state
+            that would otherwise block public callers.  Never expose this
+            to API callers or orchestration endpoints.
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
@@ -2777,7 +4414,11 @@ def send_input(
             if isinstance(orchestration_type, OrchestrationType)
             else str(orchestration_type or "")
         )
-        if provider:
+        # F139 D9/D10/D11: fixture providers with a manifest-pinned non-healthy
+        # variant intercept the entire send path (receipt / block / raise).
+        if _fixture_send_input_override(provider, message):
+            return True
+        if provider and not _lifecycle_internal:
             current_status = status_monitor.get_status(terminal_id)
             # Pre-paste guard order: dead-provider ERROR, interactive WAITING,
             # then the existing draft guard immediately before injection.
@@ -2821,7 +4462,10 @@ def send_input(
         # IDLE/COMPLETED). Without this, sticky ready-status would block
         # the genuine PROCESSING signal that arrives once the agent starts
         # working on the new message.
-        status_monitor.notify_input_sent(terminal_id)
+        if provider and provider.assume_processing_on_dispatch is True:
+            status_monitor.notify_input_sent(terminal_id, assume_processing=True)
+        else:
+            status_monitor.notify_input_sent(terminal_id)
 
         # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
         # prompts from BEFORE the input can't trigger a false COMPLETED
@@ -2835,7 +4479,10 @@ def send_input(
         # uses clear_rolling_buffer (byte-only), which preserves the sticky-latch
         # arm set by notify_input_sent above; reset_buffer would wipe the arm and
         # latch-block the IDLE→PROCESSING transition for the whole turn.
-        status_monitor.clear_rolling_buffer(terminal_id)
+        # Give stateful providers the same explicit generation boundary as the
+        # rolling byte buffer.  Grok uses this to distinguish a new,
+        # byte-identical completion from a retained completion screen.
+        status_monitor.clear_rolling_buffer(terminal_id, provider)
 
         backend = get_backend()
         if isinstance(getattr(provider, "composer_stash_keys", None), list):
@@ -2851,6 +4498,8 @@ def send_input(
         status_monitor.bind_dispatch_provider(terminal_id, provider)
         dispatch_txn: DispatchTxn = status_monitor.begin_dispatch(terminal_id)
         try:
+            if provider:
+                provider.pre_paste_gate()
             backend.send_keys(
                 metadata["tmux_session"],
                 metadata["tmux_window"],
@@ -2864,15 +4513,11 @@ def send_input(
             raise
         else:
             status_monitor.commit_dispatch(dispatch_txn)
-            if not isinstance(status_monitor, StatusMonitor) and provider is not None:
+            if provider:
                 provider.mark_input_received()
         if preserved_draft is not None:
             preserved_draft.restore(backend)
 
-        # Notify the provider that external input was received.
-        # This allows providers to adjust status
-        # detection — specifically to stop reporting IDLE for the post-init
-        # state and resume normal COMPLETED detection after a real task.
         update_last_active(terminal_id)
         if (
             expect_callback
@@ -3009,6 +4654,9 @@ def send_prepared_input(
             )
             raise PaneIdentityMismatchError(identity_failure)
     provider = provider_manager.get_provider(terminal_id)
+    # F139 D9/D10/D11: fixture providers intercept the send path.
+    if _fixture_send_input_override(provider, message):
+        return None
     enter_count = provider.paste_enter_count if provider else 1
     prepared_stash = None
     if isinstance(getattr(provider, "composer_stash_keys", None), list):
@@ -3018,7 +4666,7 @@ def send_prepared_input(
             defer_on_dialog=defer_on_dialog,
         )
     status_monitor.notify_input_sent(terminal_id)
-    status_monitor.clear_rolling_buffer(terminal_id)
+    status_monitor.clear_rolling_buffer(terminal_id, provider)
     if prepared_stash is not None:
         if apply_prepared_native_stash(prepared_stash):
             enter_count = 1
@@ -3043,8 +4691,6 @@ def send_prepared_input(
         raise
     else:
         status_monitor.commit_dispatch(dispatch_txn)
-        if not isinstance(status_monitor, StatusMonitor) and provider is not None:
-            provider.mark_input_received()
     injection_observation = status_monitor.mark_injection_completed(terminal_id)
     if on_submitted is not None:
         on_submitted(injection_observation)
@@ -3126,7 +4772,14 @@ def exit_terminal_cli(terminal_id: str) -> None:
     if exit_command.startswith(("C-", "M-")):
         send_special_key(terminal_id, exit_command)
     else:
-        send_input(terminal_id, exit_command)
+        send_input(terminal_id, exit_command, _lifecycle_internal=True)
+
+    # Layer B (F115): suppress auto-responder scans on this terminal after exit.
+    # Exit residue (final report table + exit chrome) should not trigger unknown
+    # dialog alerts. Cleared on re-register (rebind) or clear_terminal (delete).
+    from cli_agent_orchestrator.services.auto_responder import auto_responder
+
+    auto_responder.mark_exit_suppress(terminal_id)
 
 
 def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
@@ -3134,8 +4787,9 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
 
     ``FULL`` mode returns the StatusMonitor rolling buffer (the streamed output
     accumulated from the FIFO pipeline), which is bounded to the most recent
-    ``STATE_BUFFER_MAX`` bytes (8KB); it falls back to a tmux history capture
-    only when that buffer is empty. This is a deliberate trade-off in the
+    ``state_buffer_max`` bytes (server setting, see settings_service.py; 32KB
+    default); it falls back to a tmux history capture only when that buffer
+    is empty. This is a deliberate trade-off in the
     event-driven architecture (instant, no tmux call) — it is *not* unbounded
     scrollback, so very long sessions are truncated to the tail. Use the
     on-disk ``{id}.log`` (LogWriter) or the delete-time ``{id}.scrollback``
@@ -3209,7 +4863,11 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                             terminal_id,
                             exc,
                         )
-                raise last_err  # type: ignore[misc]
+                # Re-raise as the narrower type: the terminal and provider both
+                # resolved, so this is a missing response marker, not a bad
+                # reference. Keeps the API boundary from reporting it as 404
+                # (issue #570).
+                raise OutputExtractionError(str(last_err)) from last_err
 
             # Escalating fetch: try progressively larger capture windows until
             # the response marker is found or we hit the cap.
@@ -3292,6 +4950,91 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
         raise
 
 
+def read_output_range(terminal_id: str, offset: int, length: int) -> str:
+    """Read a byte range from a terminal's append-only on-disk log (U5 / #504).
+
+    This is a SEPARATE read path from ``get_output``: that function returns the
+    bounded rolling buffer / tmux tail, whereas this reads an exact byte window
+    from ``TERMINAL_LOG_DIR / f"{terminal_id}.log"`` — the append-only,
+    monotonic file LogWriter maintains (BR-1). Playback (FR-4.3 / FR-7.3) uses
+    the ``terminal_offset_start`` / ``terminal_offset_len`` an event carries to
+    fetch exactly the output produced around that event, without copying the
+    log into the journal (BR-3).
+
+    Args:
+        terminal_id: The terminal whose log to read. Validated against the
+            workflow name/id charset before it is joined into the log path, so
+            a value containing ``/`` / ``..`` / a NUL can never escape
+            ``TERMINAL_LOG_DIR`` (path-traversal defense; reuses
+            ``_validate_key_part``).
+        offset: Byte offset to seek to. Must be ``>= 0``. An offset at or beyond
+            EOF is not an error — the read simply returns the available tail
+            (empty string when nothing follows the offset) so playback degrades
+            gracefully (BR-4).
+        length: Maximum number of bytes to read. Clamped to
+            ``TERMINAL_RANGE_MAX_LENGTH`` (BR-2) to bound the read.
+
+    Returns:
+        The decoded slice, ``bytes.decode("utf-8", errors="replace")`` so a
+        range that starts or ends mid-multibyte-sequence never raises (BR-5,
+        matching LogWriter's write encoding). Returns ``""`` for a valid
+        terminal whose log does not exist yet (nothing has been logged) — a
+        missing log is NOT a playback-breaking error (BR-4).
+
+    Raises:
+        ValueError: ``terminal_id`` fails id validation, or ``offset`` is
+            negative. Translated to a 400 at the request boundary.
+        OSError: A genuine file I/O failure (e.g. a permission error, or the
+            path exists but is unreadable). Surfaced to the caller, NOT
+            swallowed into an empty string — "nothing logged yet" (return "")
+            and "the read failed" (raise) are deliberately distinct outcomes
+            (BR-4 / construction error-handling guardrail).
+    """
+    # Path-traversal defense: reject any id that is not a plain key BEFORE it is
+    # joined into the log path. Reuses the workflow key/id validator so the
+    # charset rule is defined once (rejects "/", "..", ".", NUL, whitespace).
+    _validate_key_part(terminal_id, "terminal_id")
+
+    if offset < 0:
+        raise ValueError(f"offset must be >= 0, got {offset}")
+
+    # Clamp the read window (BR-2). A non-positive length reads nothing rather
+    # than raising — the route enforces length >= 1, so this is defense in depth.
+    capped_length = max(0, min(length, TERMINAL_RANGE_MAX_LENGTH))
+
+    log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
+
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(offset)  # seeking past EOF is legal; the read below yields b""
+            data = f.read(capped_length)
+    except FileNotFoundError:
+        # Valid terminal that has not logged anything yet (or whose log has been
+        # cleaned up): an empty range, never an error (BR-4).
+        logger.debug(
+            "read_output_range: no log file for terminal %s (offset=%d, length=%d) — "
+            "returning empty range",
+            terminal_id,
+            offset,
+            capped_length,
+        )
+        return ""
+    except OSError as e:
+        # A genuine I/O failure (permission, etc.) is NOT the same as "nothing
+        # logged" — surface it rather than masking a real fault as empty output.
+        logger.error(
+            "read_output_range: I/O error reading log for terminal %s "
+            "(offset=%d, length=%d): %s",
+            terminal_id,
+            offset,
+            capped_length,
+            e,
+        )
+        raise
+
+    return data.decode("utf-8", errors="replace")
+
+
 def peek_terminal(terminal_id: str, lines: int = 40) -> str:
     """Return the rendered pane tail for a terminal through the active backend."""
     metadata = get_terminal_metadata(terminal_id)
@@ -3317,9 +5060,394 @@ def provider_session_owner(session_uuid: str) -> dict:
     return {"state": "error" if saw_error else "gone", "terminal_id": None}
 
 
-def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
-    quiesce_deferred_terminal_sync(terminal_id)
-    return _delete_terminal_core(terminal_id, registry=registry)
+def _cascade_plan(
+    terminals: list[dict[str, Any]],
+    root_id: str,
+    *,
+    orphan: bool,
+    force: bool,
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Return children-before-parents reap order and named survivors."""
+    from cli_agent_orchestrator.services.terminal_guard_service import classify_deletion
+
+    children: dict[str, list[str]] = {}
+    by_id = {row["id"]: row for row in terminals}
+    for row in terminals:
+        parent = row.get("caller_id")
+        if parent:
+            children.setdefault(parent, []).append(row["id"])
+    for child_ids in children.values():
+        child_ids.sort()
+
+    reaped: list[str] = []
+    skipped: list[dict[str, str]] = []
+
+    def skip_subtree(node_id: str, reason: str) -> None:
+        skipped.append({"id": node_id, "reason": reason})
+        for child_id in children.get(node_id, []):
+            skip_subtree(child_id, f"ancestor_skipped:{node_id}")
+
+    def visit(node_id: str, depth: int) -> None:
+        if depth >= 32:
+            skip_subtree(node_id, "depth_cap")
+            return
+        classification = classify_deletion(node_id, force=force)
+        if not classification.allowed:
+            skip_subtree(node_id, classification.reason or "protected")
+            return
+        for child_id in children.get(node_id, []):
+            if child_id in by_id:
+                visit(child_id, depth + 1)
+        reaped.append(node_id)
+
+    if orphan:
+        for child_id in children.get(root_id, []):
+            skip_subtree(child_id, "orphan_requested")
+    else:
+        for child_id in children.get(root_id, []):
+            visit(child_id, 1)
+    reaped.append(root_id)
+    return reaped, skipped
+
+
+def _recovery_state_is_active(state: RecoveryState) -> bool:
+    """Return True if *state* represents an in-progress recovery.
+
+    Uses assert_never so mypy flags unhandled variants when the Literal expands.
+    """
+    if state == "rebind_starting":
+        return True
+    if state == "rebind_exiting":
+        return True
+    if state == "fallback_starting":
+        return True
+    if state == "fallback_ready":
+        return True
+    if state == "rebound":
+        return False
+    if state == "rebind_failed":
+        return False
+    assert_never(state)
+
+
+_ACTIVE_RECOVERY_STATES: frozenset[str] = frozenset(
+    s for s in ("rebind_starting", "rebind_exiting", "fallback_starting", "fallback_ready")
+)
+
+
+def _owner_root_is_dead(
+    terminals: list[dict[str, Any]],
+    terminal_id: str,
+) -> bool:
+    """Return True if the root of terminal_id's caller chain has a dead window.
+
+    Uses window_liveness (tmux_backend) — the same primitive that
+    fleet_service.py uses for its parent_dead/orphan projection.
+    Fail-closed: returns False on any error or ambiguity.
+    """
+    by_id = {row["id"]: row for row in terminals}
+    current = terminal_id
+    seen: set[str] = set()
+    while current in by_id:
+        if current in seen:
+            return False  # cycle — fail closed
+        seen.add(current)
+        parent = by_id[current].get("caller_id")
+        if not parent or parent not in by_id:
+            break  # current is the root
+        current = parent
+
+    root = by_id.get(current)
+    if not root:
+        return False
+
+    # A supervisor mid-restart has its window briefly absent but is NOT dead.
+    # If the root row carries an active recovery/respawn state, treat as alive.
+    recovery = root.get("recovery_state")
+    if recovery is not None and recovery in _ACTIVE_RECOVERY_STATES:
+        return False  # restart in progress — fail closed
+
+    tmux_session = root.get("tmux_session")
+    tmux_window = root.get("tmux_window")
+    if not tmux_session or not tmux_window:
+        return False
+    try:
+        liveness = get_backend().window_liveness(tmux_session, tmux_window)
+        return liveness == "gone"
+    except Exception:
+        return False  # fail closed
+
+
+def _caller_owns_target(terminals: list[dict[str, Any]], caller_id: str, target_id: str) -> bool:
+    if caller_id == target_id:
+        return False
+    by_id = {row["id"]: row for row in terminals}
+    current = by_id.get(target_id)
+    seen: set[str] = set()
+    while current and current.get("caller_id"):
+        parent_id = current["caller_id"]
+        if parent_id == caller_id:
+            return True
+        if parent_id in seen:
+            return False
+        seen.add(parent_id)
+        current = by_id.get(parent_id)
+    return False
+
+
+def _surviving_ancestor(by_id: dict[str, dict[str, Any]], node_id: str, reap_set: set[str]) -> str:
+    current = by_id.get(node_id, {}).get("caller_id")
+    seen: set[str] = set()
+    while current:
+        if current in seen:
+            return ""
+        seen.add(current)
+        row = by_id.get(current)
+        if row is None:
+            return ""
+        if current not in reap_set and row.get("recovery_state") != "fallback_ready":
+            return current
+        current = row.get("caller_id")
+    return ""
+
+
+def delete_terminal(
+    terminal_id: str,
+    registry: PluginRegistry | None = None,
+    *,
+    force: bool = False,
+    orphan: bool = False,
+    caller_id: str | None = None,
+) -> dict[str, Any]:
+    """Cascade-delete a terminal's managed descendant tree."""
+    from cli_agent_orchestrator.services.rebind_lease import (
+        acquire_rebind_lease,
+        release_rebind_lease,
+    )
+    from cli_agent_orchestrator.services.session_lifecycle_lease import (
+        acquire_session_lifecycle_exclusive,
+        release_session_lifecycle_lease,
+    )
+    from cli_agent_orchestrator.services.terminal_guard_service import (
+        TerminalProtectionError,
+        require_delete_allowed,
+    )
+
+    root = get_terminal_metadata(terminal_id)
+    if root is None:
+        raise ValueError(f"Terminal '{terminal_id}' not found")
+    require_delete_allowed(terminal_id, force=force)
+    session_name = root["tmux_session"]
+
+    # D16: Open teardown intent BEFORE any tmux call. Committed immediately.
+    from cli_agent_orchestrator.clients.database import SessionLocal
+    from cli_agent_orchestrator.services.config_service import ConfigService
+    from cli_agent_orchestrator.services.teardown_intent_service import (
+        close_intent as _f218_close_intent,
+    )
+    from cli_agent_orchestrator.services.teardown_intent_service import (
+        open_intent as _f218_open_intent,
+    )
+
+    ttl_s = float(ConfigService.get("teardown.intent_ttl_s", 300.0))
+    _f218_intent_id: str | None = None
+    try:
+        with SessionLocal() as _intent_db:
+            _f218_intent_id = _f218_open_intent(
+                scope_kind="terminal",
+                scope_key=terminal_id,
+                requested_by=caller_id,
+                ttl_s=ttl_s,
+                db=_intent_db,
+            )
+    except Exception as e:
+        logger.warning("f218_teardown_intent_open_failed terminal=%s: %s", terminal_id, e)
+
+    # F167 D2 step 1: Pre-lease, unleased pre-plan quiesce (subtree only).
+    try:
+        return _delete_terminal_inner(
+            terminal_id=terminal_id,
+            session_name=session_name,
+            root=root,
+            registry=registry,
+            force=force,
+            orphan=orphan,
+            caller_id=caller_id,
+        )
+    finally:
+        # D16: Close intent in finally — runs on success, failure, exception alike
+        if _f218_intent_id is not None:
+            try:
+                with SessionLocal() as _intent_db:
+                    _f218_close_intent(_f218_intent_id, _intent_db)
+            except Exception as e:
+                logger.warning("f218_teardown_intent_close_failed: %s", e)
+
+
+def _delete_terminal_inner(
+    terminal_id: str,
+    session_name: str,
+    root: dict,
+    registry: "PluginRegistry | None",
+    force: bool,
+    orphan: bool,
+    caller_id: str | None,
+) -> dict[str, Any]:
+    """Inner delete logic, called within D16 teardown intent bracketing."""
+    from cli_agent_orchestrator.services.rebind_lease import (
+        acquire_rebind_lease,
+        release_rebind_lease,
+    )
+    from cli_agent_orchestrator.services.session_lifecycle_lease import (
+        acquire_session_lifecycle_exclusive,
+        release_session_lifecycle_lease,
+    )
+    from cli_agent_orchestrator.services.terminal_guard_service import (
+        TerminalProtectionError,
+        require_delete_allowed,
+    )
+
+    # F167 D2 step 1: Pre-lease, unleased pre-plan quiesce (subtree only).
+    _quiesce_cascade_subtree_pre_plan(session_name, terminal_id, orphan=orphan, force=force)
+
+    lifecycle_lease = acquire_session_lifecycle_exclusive(session_name)
+    if lifecycle_lease is None:
+        raise RuntimeError("resume_in_progress")
+    try:
+        terminals = list_terminals_by_session(session_name)
+        if caller_id is not None and not _caller_owns_target(terminals, caller_id, terminal_id):
+            # Bypass: allow force-delete when the target's root owner is dead
+            if force and _owner_root_is_dead(terminals, terminal_id):
+                logger.info("dead-owner bypass: force-deleting %s (root owner gone)", terminal_id)
+            else:
+                raise TerminalProtectionError("cascade_outside_caller_subtree")
+        order, skipped = _cascade_plan(
+            terminals,
+            terminal_id,
+            orphan=orphan,
+            force=force,
+        )
+
+        # F167 D2 steps 3-4: Bounded fixed-point re-plan under lease.
+        CASCADE_QUIESCE_ROUNDS = 3
+        for _round in range(CASCADE_QUIESCE_ROUNDS):
+            deferred_in_plan = [nid for nid in order if has_deferred_init(nid)]
+            if not deferred_in_plan:
+                break
+            for nid in deferred_in_plan:
+                quiesce_deferred_terminal_sync(nid)
+            order, skipped = _cascade_plan(
+                terminals,
+                terminal_id,
+                orphan=orphan,
+                force=force,
+            )
+        else:
+            # After all rounds, check if any deferred-bearing node remains.
+            deferred_in_plan = [nid for nid in order if has_deferred_init(nid)]
+            if deferred_in_plan:
+                raise RuntimeError("cascade_quiesce_unstable")
+        by_id = {row["id"]: row for row in terminals}
+        reap_set = set(order)
+        reaped: list[dict[str, str]] = []
+        for index, node_id in enumerate(order):
+            token = acquire_rebind_lease(node_id)
+            if token is None:
+                raise RuntimeError("rebind_in_progress")
+            try:
+                observation = status_monitor.get_boundary_observation(node_id)
+                busy = observation.status == TerminalStatus.PROCESSING
+                target_id = _surviving_ancestor(by_id, node_id, reap_set)
+                result = _delete_terminal_under_lease(
+                    node_id,
+                    token,
+                    registry=registry,
+                    require_confirmed_death=True,
+                    quarantine_session_uuid=by_id.get(node_id, {}).get("provider_session_id"),
+                    reparent_target_id=target_id,
+                )
+            finally:
+                release_rebind_lease(token)
+            if result.get("rollback_kill_uncertain"):
+                return {
+                    "reaped": reaped,
+                    "skipped": skipped,
+                    "uncertain": [{"id": node_id, "reason": "rollback_kill_uncertain"}],
+                    "unattempted": order[index + 1 :],
+                }
+            if result.get("cleanup_deferred"):
+                # F296: Window confirmed dead but provider home cleanup deferred
+                # (escaped processes). Non-blocking — cascade continues.
+                reaped.append({"id": node_id, "status": "cleanup_deferred"})
+                continue
+            disposition = "killed_while_busy" if busy else "reaped"
+            reaped.append({"id": node_id, "status": disposition})
+            parent_writer = getattr(get_backend(), "set_window_parent", None)
+            if callable(parent_writer):
+                for child in terminals:
+                    if child.get("caller_id") == node_id and child["id"] not in reap_set:
+                        parent_writer(session_name, child["tmux_window"], target_id or None)
+        return {
+            "reaped": reaped,
+            "skipped": skipped,
+            "uncertain": [],
+            "unattempted": [],
+        }
+    finally:
+        release_session_lifecycle_lease(lifecycle_lease)
+
+
+def _quiesce_cascade_subtree_pre_plan(
+    session_name: str,
+    terminal_id: str,
+    *,
+    orphan: bool,
+    force: bool,
+) -> None:
+    """F167 D2 step 1: Quiesce the provisional cascade subtree before the lease.
+
+    Reads the session's terminals and computes the subtree that delete_terminal
+    would cascade into (using the same orphan/force arguments). Quiesces only
+    those IDs — non-subtree siblings are never cancelled.
+
+    The pre-plan is used ONLY to cancel tasks; it never authorizes a deletion.
+    A too-small pre-plan is corrected by the re-plan under the lease (D2 step 3).
+    A too-large pre-plan cannot occur because caller_id is write-once.
+    """
+    from cli_agent_orchestrator.services.terminal_guard_service import classify_deletion
+
+    terminals = list_terminals_by_session(session_name)
+    children: dict[str, list[str]] = {}
+    by_id = {row["id"]: row for row in terminals}
+    for row in terminals:
+        parent = row.get("caller_id")
+        if parent:
+            children.setdefault(parent, []).append(row["id"])
+    for child_ids in children.values():
+        child_ids.sort()
+
+    subtree_ids: list[str] = []
+
+    def collect(node_id: str, depth: int) -> None:
+        if depth >= 32:
+            return
+        classification = classify_deletion(node_id, force=force)
+        if not classification.allowed:
+            return
+        for child_id in children.get(node_id, []):
+            if child_id in by_id:
+                collect(child_id, depth + 1)
+        subtree_ids.append(node_id)
+
+    if orphan:
+        subtree_ids.append(terminal_id)
+    else:
+        for child_id in children.get(terminal_id, []):
+            collect(child_id, 1)
+        subtree_ids.append(terminal_id)
+
+    for nid in subtree_ids:
+        quiesce_deferred_terminal_sync(nid)
 
 
 def quiesce_deferred_terminals_sync(terminals: list[dict]) -> None:
@@ -3365,8 +5493,18 @@ def _delete_terminal_under_lease(
     require_confirmed_death: bool = False,
     quarantine_session_uuid: str | None = None,
     uuid_lease_token=None,
+    persona_retention_intent=None,
+    reparent_target_id: str | None = None,
 ) -> Dict:
     """Delete terminal and kill its tmux window."""
+    # Layer C (F115): early auto_responder.clear_terminal at start of delete.
+    # Bumps generation + wipes episode state so any in-flight _check_unknown
+    # that already read metadata will fail the incarnation fence on _push.
+    # The late clear (~:4299 under delivery lock) is kept as idempotent belt.
+    from cli_agent_orchestrator.services.auto_responder import auto_responder
+
+    auto_responder.clear_terminal(terminal_id)
+
     from cli_agent_orchestrator.services.rebind_lease import validate_rebind_lease
 
     validate_rebind_lease(terminal_id, lease_token)
@@ -3406,10 +5544,11 @@ def _delete_terminal_under_lease(
         except Exception as exc:
             logger.warning(f"Failed to stop FIFO reader for {terminal_id}: {exc}")
         try:
-            status_monitor.clear_terminal(terminal_id)
+            status_monitor.unregister(terminal_id)
         except Exception as exc:
             logger.warning(f"Failed to clear state detector for {terminal_id}: {exc}")
 
+    persona_retention_error = None
     try:
         if not require_confirmed_death:
             svc = get_herdr_inbox_service()
@@ -3425,6 +5564,22 @@ def _delete_terminal_under_lease(
         metadata = provisional
 
         if metadata:
+            # Read the pane's live working directory BEFORE kill_window below
+            # destroys the pane. Single read, reused for two purposes: the
+            # scrollback snapshot below, and issue #100 Phase 1's worktree
+            # cleanup (recognizing a worktree-backed terminal from its live
+            # cwd alone -- there is no separate CAO-side record of which
+            # terminals are worktree-backed). Best-effort: a read failure
+            # means the snapshot's working_directory field is None and no
+            # worktree cleanup runs below.
+            live_working_directory = None
+            try:
+                live_working_directory = get_backend().get_pane_working_directory(
+                    metadata["tmux_session"], metadata["tmux_window"]
+                )
+            except Exception as e:
+                logger.warning(f"Failed to read working directory for {terminal_id}: {e}")
+
             # Snapshot scrollback + metadata before killing (for debugging/restore)
             try:
                 # Capture plain text full scrollback (no -e, no line cap)
@@ -3445,12 +5600,40 @@ def _delete_terminal_under_lease(
                     "window_name": metadata["tmux_window"],
                     "agent_profile": metadata.get("agent_profile"),
                     "provider": metadata["provider"],
-                    "working_directory": get_backend().get_pane_working_directory(
-                        metadata["tmux_session"], metadata["tmux_window"]
-                    ),
+                    "working_directory": live_working_directory,
                     "allowed_tools": metadata.get("allowed_tools"),
                     "caller_id": metadata.get("caller_id"),
                 }
+
+                # F121: worktree branch integrity check at teardown
+                _teardown_worktree_info = metadata.get("worktree_info")
+                if _teardown_worktree_info and live_working_directory:
+                    from dataclasses import asdict as _asdict
+
+                    from cli_agent_orchestrator.services.worktree_service import (
+                        verify_worktree_integrity,
+                    )
+
+                    _integrity = verify_worktree_integrity(
+                        live_working_directory, _teardown_worktree_info
+                    )
+                    snapshot["worktree_branch_integrity"] = _asdict(_integrity)
+                    if not _integrity.ok:
+                        logger.warning(
+                            "F121 branch integrity ESCAPE detected at teardown for "
+                            "terminal %s: expected_branch=%s, actual_branch=%s, "
+                            "expected_worktree_path=%s, actual_toplevel=%s, "
+                            "cwd_escaped=%s, branch_escaped=%s, error=%s",
+                            terminal_id,
+                            _integrity.expected_branch,
+                            _integrity.actual_branch,
+                            _integrity.expected_worktree_path,
+                            _integrity.actual_toplevel,
+                            _integrity.cwd_escaped,
+                            _integrity.branch_escaped,
+                            _integrity.error,
+                        )
+
                 snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
                 snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
             except Exception as e:
@@ -3494,8 +5677,71 @@ def _delete_terminal_under_lease(
                     }
                 detach_observation(metadata)
 
-        # Cleanup provider state and database record
-        provider_manager.cleanup_provider(terminal_id)
+        if persona_retention_intent is not None:
+            if metadata is None:
+                persona_retention_error = "retained_persona_terminal_missing"
+            else:
+                try:
+                    death = get_backend().window_liveness(
+                        metadata["tmux_session"], metadata["tmux_window"]
+                    )
+                except Exception:
+                    death = "error"
+                if death != "gone":
+                    persona_retention_error = "retained_persona_process_not_dead"
+                else:
+                    from cli_agent_orchestrator.utils.persona_context import (
+                        retain_codex_persona_home,
+                    )
+
+                    persona_retention_error = retain_codex_persona_home(
+                        terminal_id, persona_retention_intent
+                    )
+
+        # issue #100 Phase 1: if this terminal was worktree-backed (its live
+        # cwd matched the CAO-managed worktree path shape), remove the
+        # worktree + branch now that the process using it is gone.
+        # `remove_worktree` is itself best-effort/never-raises, matching
+        # every other step in this teardown.
+        #
+        # The parsed terminal_id MUST match the terminal actually being
+        # deleted here, not just "some" CAO worktree path. Without this
+        # guard: a worktree-backed terminal A (cwd
+        # .../.cao/worktrees/A) can spawn a non-worktree terminal B with
+        # working_directory explicitly set to A's cwd (handoff/assign
+        # both accept an explicit working_directory, and "here" -- the
+        # caller's own directory -- is a common choice). Deleting B --
+        # including handoff's automatic success teardown -- would then
+        # read B's pane cwd (== A's worktree path), parse terminal_id
+        # "A" out of it, and force-remove A's still-running worktree.
+        # Mismatched parses now fall through as a no-op leak (Phase 3
+        # territory) instead of destroying another terminal's checkout.
+        if metadata is not None:
+            parsed = worktree_service.parse_worktree_path(live_working_directory)
+            if parsed is not None:
+                worktree_repo_root, worktree_terminal_id = parsed
+                if worktree_terminal_id == terminal_id:
+                    worktree_service.remove_worktree(worktree_repo_root, worktree_terminal_id)
+
+        # Grok cleanup can be deferred when a private-home owner cannot yet be
+        # inspected/stopped.  Keep both the provider mapping and DB metadata so
+        # a subsequent DELETE can retry; reporting success here would turn a
+        # temporary process race into a permanent private-home leak.
+        if provider_manager.cleanup_provider(terminal_id) is False:
+            logger.warning(
+                "Terminal %s cleanup deferred; retaining metadata for a retry", terminal_id
+            )
+            return {
+                "terminal_deleted": False,
+                "intent_deleted": False,
+                "intent_error": None,
+                "intent_retain_reason": "cleanup_deferred",
+                "rollback_kill_uncertain": False,
+                "cleanup_deferred": True,
+            }
+        from cli_agent_orchestrator.utils.persona_context import cleanup_persona
+
+        cleanup_persona(terminal_id)
         with _memory_injected_lock:
             _memory_injected_terminals.discard(terminal_id)
         from cli_agent_orchestrator.services.inbox_service import (
@@ -3509,6 +5755,10 @@ def _delete_terminal_under_lease(
         delivery_lock = get_delivery_lock(terminal_id)
         delivery_lock.acquire()
         try:
+            try:
+                stalled_callback_watchdog.emit_pre_delete_notice(terminal_id)
+            except Exception as e:
+                logger.warning(f"Failed to emit pre-delete notice for {terminal_id}: {e}")
             stalled_callback_watchdog.clear_terminal(terminal_id)
             clear_terminal_delivery_state(terminal_id)
             try:
@@ -3522,10 +5772,76 @@ def _delete_terminal_under_lease(
             from cli_agent_orchestrator.services.memory_service import _curator_locks
 
             _curator_locks.pop(terminal_id, None)
-            deletion = delete_terminal_and_warm_intent(
-                terminal_id,
-                preserve_warm_intent=preserve_warm_intent,
-            )
+            # F138 D11/D24: Force-reconcile by exact terminal_id + persisted generation.
+            # No fallback lookup. Missing row or force failure = fail closed (prevent delete).
+            _f138_delete_authorized = True
+            _term_gen = metadata.get("lifecycle_generation") if metadata else None
+            if _term_gen is not None:
+                from cli_agent_orchestrator.clients.database import (
+                    f138_force_reconcile_incarnation,
+                    f138_get_incarnation_by_terminal_generation,
+                )
+
+                _inc_row = f138_get_incarnation_by_terminal_generation(terminal_id, _term_gen)
+                if _inc_row is not None:
+                    try:
+                        _fr = f138_force_reconcile_incarnation(
+                            _inc_row["id"], source="delete_terminal"
+                        )
+                        if _fr.outcome in (
+                            "non_durable_invariant",
+                            "non_durable_missing",
+                        ):
+                            # Non-durable: fail closed — prevent deletion
+                            _f138_delete_authorized = False
+                            logger.error(
+                                "f138_delete_non_durable terminal=%s outcome=%s — "
+                                "preventing delete",
+                                terminal_id,
+                                _fr.outcome,
+                            )
+                    except Exception:
+                        # DB error: fail closed — prevent deletion
+                        _f138_delete_authorized = False
+                        logger.error(
+                            "f138_delete_force_db_error terminal=%s — preventing delete",
+                            terminal_id,
+                            exc_info=True,
+                        )
+                # _inc_row is None with a known generation: process-less provider,
+                # no incarnation row exists — deletion is safe
+
+            if not _f138_delete_authorized:
+                from cli_agent_orchestrator.clients.database import (
+                    f138_emit_attention_message,
+                    set_terminal_recovery_state,
+                )
+
+                try:
+                    set_terminal_recovery_state(
+                        terminal_id,
+                        "rollback_kill_uncertain",
+                        error="delete_non_durable_force",
+                    )
+                except Exception:
+                    pass
+                f138_emit_attention_message(
+                    terminal_id,
+                    f"[F138] Delete of {terminal_id} blocked: force-reconcile "
+                    f"non-durable. Terminal retained for manual review.",
+                )
+                # Fake a "not deleted" result to preserve the terminal
+                deletion = {
+                    "terminal_deleted": False,
+                    "intent_deleted": False,
+                }
+            else:
+                deletion_kwargs: dict[str, Any] = {
+                    "preserve_warm_intent": preserve_warm_intent,
+                }
+                if reparent_target_id is not None:
+                    deletion_kwargs["reparent_target_id"] = reparent_target_id
+                deletion = delete_terminal_and_warm_intent(terminal_id, **deletion_kwargs)
         finally:
             delivery_lock.release()
         deleted = deletion["terminal_deleted"]
@@ -3548,6 +5864,7 @@ def _delete_terminal_under_lease(
             "intent_error": intent_error,
             "intent_retain_reason": "keep_bases" if preserve_warm_intent else None,
             "rollback_kill_uncertain": False,
+            "persona_retention_error": persona_retention_error,
         }
 
     except Exception as e:

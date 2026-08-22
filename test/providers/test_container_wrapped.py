@@ -23,7 +23,7 @@ All backends and subprocesses are mocked — no Docker/Podman/tmux required.
 """
 
 import shlex
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -186,9 +186,11 @@ def test_status_dead_launch_reports_unknown_not_false_idle(mock_backend):
     assert result not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
 
 
+@pytest.mark.asyncio
+@patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
 @patch("cli_agent_orchestrator.providers.claude_code.time")
 @patch(_BACKEND)
-def test_idle_timeout_prompt_handler(mock_backend, mock_time):
+async def test_idle_timeout_prompt_handler(mock_backend, mock_time, mock_sleep):
     """Tasks 3 + 4: the idle gap keeps polling for a LATE dialog inside the outer cap.
 
     A cold containerized start renders dialogs late and in sequence. The bypass
@@ -201,13 +203,13 @@ def test_idle_timeout_prompt_handler(mock_backend, mock_time):
     forwards from the per-profile provider_init_timeout — so no settings mock is
     needed and the Task 3<->Task 4 wiring is what is under test.
     """
-    mock_time.sleep = MagicMock()
     mock_time.monotonic.side_effect = [
         0.0,  # outer_deadline = 0 + 180 (per-profile init timeout)
         0.0,  # last_prompt_time = 0
         18.0,  # iter1: gap 18<20 and 18<180 -> bypass handled, timer reset
         18.0,  # last_prompt_time reset to 18
         35.0,  # iter2: gap 35-18=17<20 and 35<180 -> trust handled -> continue (composed law)
+        35.0,  # last_prompt_time reset to 35 (trust branch)
         36.0,  # iter3: welcome banner -> return (lawful settle after trust)
     ]
     mock_backend.get_history.side_effect = [
@@ -217,7 +219,7 @@ def test_idle_timeout_prompt_handler(mock_backend, mock_time):
     ]
 
     provider = ClaudeCodeProvider("t1", "sess", "win")
-    provider._handle_startup_prompts(idle_gap=20.0, outer_timeout=180.0)
+    await provider._handle_startup_prompts(idle_gap=20.0, outer_timeout=180.0)
 
     # Bypass: Down arrow (send_keys) + Enter (send_special_key). Trust: Enter.
     assert mock_backend.send_keys.call_count == 1
@@ -231,6 +233,7 @@ def test_idle_timeout_prompt_handler(mock_backend, mock_time):
 @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
 @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
 @patch(_BACKEND)
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 async def test_wrapped_provider_lifecycle(
     mock_backend, mock_wait_status, mock_wait_shell, mock_load, mock_build, mock_ensure
 ):
@@ -244,8 +247,13 @@ async def test_wrapped_provider_lifecycle(
     mock_load.return_value = AgentProfile(name="c", description="d", provider_init_timeout=180)
     mock_wait_shell.return_value = True
     mock_wait_status.return_value = True
-    # A workspace-trust dialog is showing at startup (handled by the prompt handler).
-    mock_backend.get_history.return_value = "Yes, I trust this folder"
+    # D6c: The trust dialog shows on the first buffer read; subsequent reads show
+    # the version banner so the idle-gap loop exits immediately instead of spinning
+    # for ~20s of real asyncio.sleep(1.0) calls (ledger: 25.04s → ~1s).
+    mock_backend.get_history.side_effect = [
+        "Yes, I trust this folder",
+        "Welcome to Claude Code v2.1.211",
+    ]
     # Wrapped exec -> native status is always unresolved; status is buffer-driven.
     mock_backend.get_native_status.return_value = None
 

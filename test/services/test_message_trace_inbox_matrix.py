@@ -620,7 +620,7 @@ def test_prepared_send_consumes_memory_before_backend_io_exception(monkeypatch):
     monkeypatch.setattr(terminal_service.provider_manager, "get_provider", lambda _id: provider)
     monkeypatch.setattr(terminal_service, "preserve_draft_before_send", lambda *_a: None)
     monkeypatch.setattr(terminal_service.status_monitor, "notify_input_sent", lambda _id: None)
-    monkeypatch.setattr(terminal_service.status_monitor, "clear_rolling_buffer", lambda _id: None)
+    monkeypatch.setattr(terminal_service.status_monitor, "clear_rolling_buffer", lambda _id, _p=None: None)
     backend = MagicMock()
     backend.send_keys.side_effect = RuntimeError("partial paste")
     monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)

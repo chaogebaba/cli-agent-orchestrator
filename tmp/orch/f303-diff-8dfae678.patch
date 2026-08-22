@@ -1,0 +1,101 @@
+diff --git a/test/clients/test_database.py b/test/clients/test_database.py
+index 35aad7bb..940fc0cb 100644
+--- a/test/clients/test_database.py
++++ b/test/clients/test_database.py
+@@ -661,6 +661,24 @@ class TestMessageTraceTransactions:
+         mock_terminal.provider = "kiro_cli"
+         mock_terminal.agent_profile = "developer"
+         mock_terminal.working_directory = "/workspace/project"
++        mock_terminal.allowed_tools = None
++        mock_terminal.shell_command = None
++        mock_terminal.caller_id = None
++        mock_terminal.caller_mailbox_id = None
++        mock_terminal.lifecycle = "ephemeral"
++        mock_terminal.reparented_from = None
++        mock_terminal.provider_session_id = None
++        mock_terminal.recovery_state = None
++        mock_terminal.recovery_error = None
++        mock_terminal.recovery_updated_at = None
++        mock_terminal.fallback_terminal_id = None
++        mock_terminal.init_state = None
++        mock_terminal.init_started_at = None
++        mock_terminal.init_owner_epoch = None
++        mock_terminal.init_failure_token = None
++        mock_terminal.init_deadline_s = None
++        mock_terminal.engine = None
++        mock_terminal.metadata_json = None
+         mock_terminal.last_active = datetime.now()
+ 
+         mock_query = MagicMock()
+diff --git a/test/clients/test_f264_database_hardening.py b/test/clients/test_f264_database_hardening.py
+index 8a04edf4..2e26021d 100644
+--- a/test/clients/test_f264_database_hardening.py
++++ b/test/clients/test_f264_database_hardening.py
+@@ -34,6 +34,7 @@ def test_list_terminals_by_session_skips_stale_rows():
+     good_terminal.init_failure_token = None
+     good_terminal.init_deadline_s = None
+     good_terminal.engine = None
++    good_terminal.metadata_json = None
+     good_terminal.last_active = None
+ 
+     stale_terminal = MagicMock()
+diff --git a/test/providers/test_resolved_model_echo.py b/test/providers/test_resolved_model_echo.py
+index 141bad72..616e1dea 100644
+--- a/test/providers/test_resolved_model_echo.py
++++ b/test/providers/test_resolved_model_echo.py
+@@ -49,6 +49,7 @@ class TestKiroCliResolvedModel:
+ 
+ 
+ class TestGrokCliResolvedModel:
++    @patch("cli_agent_orchestrator.providers.grok_cli.GrokCliProvider._rebuild_private_config")
+     @patch("cli_agent_orchestrator.providers.grok_cli.load_agent_profile", return_value=None)
+     @patch("cli_agent_orchestrator.providers.grok_cli.get_provider_defaults", return_value={})
+     @patch("cli_agent_orchestrator.providers.grok_cli.get_provider_profile_defaults", return_value={})
+diff --git a/test/quarantine.toml b/test/quarantine.toml
+index 87cc12f8..b6f6bd99 100644
+--- a/test/quarantine.toml
++++ b/test/quarantine.toml
+@@ -103,6 +103,7 @@ class     = "known_red"
+ reason    = "Env-dependent — working directory not created by git in temp fixture; fails serial"
+ owner     = "pre-existing"
+ filed     = "2026-08-18"
++expires   = "2026-09-17"
+ review_by = "2026-09-17"
+ 
+ [[entry]]
+@@ -111,6 +112,7 @@ class     = "known_red"
+ reason    = "Env-dependent — requires profiles/ directory with grok_base.md; absent in worktree layout"
+ owner     = "pre-existing"
+ filed     = "2026-08-18"
++expires   = "2026-09-17"
+ review_by = "2026-09-17"
+ 
+ # --- Re-quarantined: irreproducible under -n 2 (F262 verdict (d)) ---
+diff --git a/test/services/test_fx193_nudge_discipline.py b/test/services/test_fx193_nudge_discipline.py
+index 0d327de1..4721775d 100644
+--- a/test/services/test_fx193_nudge_discipline.py
++++ b/test/services/test_fx193_nudge_discipline.py
+@@ -937,12 +937,19 @@ class TestA1FullJitter:
+             delays_run1: list[float] = []
+             delays_run2: list[float] = []
+ 
++            # Patch time.monotonic to a fixed value so arm_or_coalesce is
++            # deterministic (it uses time.monotonic() for the initial
++            # visibility_timeout_at).
++            fixed_mono = 100000.0
++
+             for delays_list in (delays_run1, delays_run2):
+-                discipline = NudgeDiscipline(rng=SeededRNG(99))
+-                discipline.arm_or_coalesce("sup1", "mb1", 1, 50)
+-                discipline.record_status("sup1", TerminalStatus.IDLE)
++                with patch("cli_agent_orchestrator.services.nudge_discipline.time") as mock_time:
++                    mock_time.monotonic.return_value = fixed_mono
++                    discipline = NudgeDiscipline(rng=SeededRNG(99))
++                    discipline.arm_or_coalesce("sup1", "mb1", 1, 50)
++                    discipline.record_status("sup1", TerminalStatus.IDLE)
+ 
+-                now = 100000.0  # Fixed base avoids time.monotonic() divergence
++                now = fixed_mono  # Aligned with the patched monotonic value
+                 # Fire first
+                 discipline.collect_due(
+                     now=now, get_consumption_cursor=cursor_at_zero, get_pending_oldest=pending

@@ -65,6 +65,7 @@ class MemoryConfig(BaseModel):
     compile_mode: str = "llm"
     flush_threshold: float = 0.85
     compile_timeout_s: float = 120.0
+    lint_enabled: bool = True
 
 
 class TerminalConfig(BaseModel):
@@ -87,13 +88,15 @@ class NetworkConfig(BaseModel):
     Rewiring them through ConfigService would require either mutating those
     lists after settings.json changes (no invalidation mechanism exists yet)
     or restructuring the middleware wiring — out of scope for this PR. Only
-    the ``CAO_ALLOWED_HOSTS``/``CAO_CORS_ORIGINS``/``CAO_WS_ALLOWED_CLIENTS``
-    env vars are read (in ``constants.py``, not through this schema).
+    the ``CAO_ALLOWED_HOSTS``/``CAO_CORS_ORIGINS``/``CAO_WS_ALLOWED_CLIENTS``/
+    ``CAO_WS_ALLOWED_ORIGINS`` env vars are read (in ``constants.py``, not
+    through this schema).
     """
 
     allowed_hosts: List[str] = Field(default_factory=list)
     cors_origins: List[str] = Field(default_factory=list)
     ws_allowed_clients: List[str] = Field(default_factory=list)
+    ws_allowed_origins: List[str] = Field(default_factory=list)
 
 
 class AuthConfig(BaseModel):
@@ -158,6 +161,7 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
     "network.allowed_hosts": [],
     "network.cors_origins": [],
     "network.ws_allowed_clients": [],
+    "network.ws_allowed_origins": [],
 }
 
 # Env-var registry: every CAO_* var this schema recognizes, mapped to its
@@ -176,7 +180,9 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_ALLOWED_HOSTS": ("network.allowed_hosts", "list", []),
     "CAO_CORS_ORIGINS": ("network.cors_origins", "list", []),
     "CAO_WS_ALLOWED_CLIENTS": ("network.ws_allowed_clients", "list", []),
+    "CAO_WS_ALLOWED_ORIGINS": ("network.ws_allowed_origins", "list", []),
     "CAO_MEMORY_ENABLED": ("memory.enabled", "bool", True),
+    "CAO_MEMORY_LINT_ENABLED": ("memory.lint_enabled", "bool", True),
     "CAO_MEMORY_COMPILE_MODE": ("memory.compile_mode", "str", "llm"),
     "CAO_MEMORY_FLUSH_THRESHOLD": ("memory.flush_threshold", "float", 0.85),
     "CAO_MCP_REQUEST_TIMEOUT": ("server.mcp_request_timeout", "int", 30),
@@ -187,6 +193,53 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
         "int",
         20,
     ),
+    "CAO_STATE_BUFFER_MAX": ("server.state_buffer_max", "int", 32768),
+    "CAO_SUPERVISOR_MAILBOX_PULL": ("supervisor.mailbox_pull", "bool", False),
+    "CAO_W2M_TEAMMATE_PUSH": ("supervisor.teammate_push", "bool", False),
+    "CAO_SUPERVISOR_DOORBELL": ("supervisor.doorbell", "bool", True),
+    # FX170: native wake config paths (D11)
+    "CAO_SUPERVISOR_WAKE_NATIVE": ("supervisor.wake.native", "bool", True),
+    "CAO_SUPERVISOR_WAKE_MIN_VERSION": ("supervisor.wake.min_version", "str", "2.1.0"),
+    "CAO_SUPERVISOR_WAKE_MAX_VERSION": ("supervisor.wake.max_version", "str", "2.2.0"),
+    "CAO_SUPERVISOR_WAKE_PRIORITY": ("supervisor.wake.priority", "str", "next"),
+    "CAO_SUPERVISOR_WAKE_VERIFY_TIMEOUT_S": ("supervisor.wake.verify_timeout_s", "float", 5.0),
+    "CAO_SUPERVISOR_WAKE_MAX_RECORD_AGE_S": ("supervisor.wake.max_record_age_s", "float", 900.0),
+    # WPDT W1: WebSocket monitor doorbell (ship dark, enable after G7 round)
+    "CAO_SUPERVISOR_WAKE_WS_MONITOR": ("supervisor.wake.ws_monitor", "bool", False),
+    # FX181: quiescence watchdog config paths (D7)
+    "CAO_SUPERVISOR_WATCHDOG_QUIESCENCE": ("supervisor.watchdog.quiescence", "bool", False),
+    "CAO_SUPERVISOR_WATCHDOG_QUIESCENCE_GRACE_S": (
+        "supervisor.watchdog.quiescence_grace_s",
+        "float",
+        120.0,
+    ),
+    # F228-b: processing-no-progress watchdog config paths (D8)
+    "CAO_SUPERVISOR_WATCHDOG_NO_PROGRESS": ("supervisor.watchdog.no_progress", "bool", True),
+    "CAO_SUPERVISOR_WATCHDOG_NO_PROGRESS_GRACE_S": (
+        "supervisor.watchdog.no_progress_grace_s",
+        "float",
+        300.0,
+    ),
+    # FX191: convergent delivery config paths (D12)
+    "CAO_DELIVERY_PHASE": ("delivery.phase", "str", "shadow"),
+    "CAO_DELIVERY_TICK_S": ("delivery.tick_s", "float", 5.0),
+    "CAO_DELIVERY_ESCALATE_AFTER_S": ("delivery.escalate_after_s", "float", 120.0),
+    "CAO_DELIVERY_TRACE_RETENTION_H": ("delivery.trace_retention_h", "float", 168.0),
+    # F203: interrupt-before-escalation timer (D1); clamped at read time (D2)
+    "CAO_DELIVERY_INTERRUPT_AFTER_S": ("delivery.interrupt_after_s", "float", 30.0),
+    # F203 N2: transport ejection base duration
+    "CAO_DELIVERY_BASE_EJECTION_S": ("delivery.base_ejection_s", "float", 30.0),
+    # FX193-A1: jitter config (delivery.jitter=off restores deterministic ladder)
+    "CAO_DELIVERY_JITTER": ("delivery.jitter", "str", "on"),
+    # F210 D10: kill-switch for the whole rung2 send-keys nudge (hot-reloadable)
+    "CAO_DELIVERY_NUDGE_SENDKEYS_ENABLED": ("delivery.nudge_sendkeys_enabled", "bool", True),
+    # F218-a: dead-supervisor safety config
+    "CAO_LIVENESS_SESSION_CONFIRM_SAMPLES": ("liveness.session_confirm_samples", "int", 2),
+    "CAO_LIVENESS_SCOPE_PROBE_TIMEOUT_S": ("liveness.scope_probe_timeout_s", "float", 5.0),
+    "CAO_FORENSICS_TOMBSTONE_ENABLED": ("forensics.tombstone_enabled", "bool", True),
+    "CAO_FORENSICS_TOMBSTONE_RETENTION_DAYS": ("forensics.tombstone_retention_days", "int", 30),
+    "CAO_ALARM_DEGRADED_DISPLAY_MESSAGE": ("alarm.degraded_display_message", "bool", True),
+    "CAO_TEARDOWN_INTENT_TTL_S": ("teardown.intent_ttl_s", "float", 300.0),
 }
 
 # Reverse index: dotted path -> env var name, for get()'s env-precedence lookup.
@@ -329,6 +382,8 @@ def _get_owned_section(path: str, default: Any) -> Any:
     if section == "memory":
         if key == "enabled":
             return settings_service.is_memory_enabled()
+        if key == "lint_enabled":
+            return settings_service.is_memory_lint_enabled()
         if key == "compile_mode":
             return settings_service.get_compile_mode()
         if key == "compile_timeout_s":
@@ -350,6 +405,11 @@ def _get_value(path: str, default: Any = None, override: Optional[Any] = None) -
     """
     if override is not None:
         return override
+
+    if path == "memory.lint_enabled":
+        from cli_agent_orchestrator.services import settings_service
+
+        return settings_service.is_memory_lint_enabled()
 
     env_name = _PATH_TO_ENV.get(path)
     if env_name is not None:
@@ -442,9 +502,32 @@ _ALL_PATHS = sorted(
         "server.provider_init_timeout",
         "server.startup_prompt_handler_timeout",
         "memory.enabled",
+        "memory.lint_enabled",
         "memory.compile_mode",
         "memory.flush_threshold",
         "memory.compile_timeout_s",
+        "supervisor.mailbox_pull",
+        "supervisor.teammate_push",
+        "supervisor.doorbell",
+        "supervisor.watchdog.quiescence",
+        "supervisor.watchdog.quiescence_grace_s",
+        "supervisor.watchdog.no_progress",
+        "supervisor.watchdog.no_progress_grace_s",
+        "delivery.phase",
+        "delivery.tick_s",
+        "delivery.escalate_after_s",
+        "delivery.interrupt_after_s",
+        "delivery.nudge_sendkeys_enabled",
+        "delivery.base_ejection_s",
+        "delivery.trace_retention_h",
+        "delivery.jitter",
+        # F218-a: dead-supervisor safety config
+        "liveness.session_confirm_samples",
+        "liveness.scope_probe_timeout_s",
+        "forensics.tombstone_enabled",
+        "forensics.tombstone_retention_days",
+        "alarm.degraded_display_message",
+        "teardown.intent_ttl_s",
     }
 )
 
@@ -504,6 +587,7 @@ class ConfigService:
             ),
             memory=MemoryConfig(
                 enabled=_get_value("memory.enabled", default=True),
+                lint_enabled=_get_value("memory.lint_enabled", default=True),
                 compile_mode=_get_value("memory.compile_mode", default="llm"),
                 flush_threshold=_get_value("memory.flush_threshold", default=0.85),
                 compile_timeout_s=_get_value("memory.compile_timeout_s", default=120.0),

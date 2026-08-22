@@ -245,13 +245,18 @@ class TestValidateOnly:
 
         path = _write_spec(spec_dir, "decoy")
 
-        def _boom(*a, **kw):
-            raise AssertionError("model.validate_only must not open the filesystem")
+        open_calls = []
+        real_open = open
 
-        monkeypatch.setattr("builtins.open", _boom)
+        def _tracking_open(*a, **kw):
+            open_calls.append(a)
+            return real_open(*a, **kw)
+
+        monkeypatch.setattr("builtins.open", _tracking_open)
         # Passing a real path string -> treated as raw YAML text, no open() call.
         result = model.validate_only(str(path))
         assert result.status == "fail"  # the path string is not valid spec YAML
+        assert not open_calls, "model.validate_only must not open the filesystem"
 
 
 class TestIndexUpsertAndList:

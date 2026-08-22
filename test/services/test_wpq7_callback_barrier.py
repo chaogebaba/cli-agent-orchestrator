@@ -26,6 +26,7 @@ from cli_agent_orchestrator.clients.database import (
     MailboxModel,
     TerminalModel,
     _fire_open_barrier_in_db,
+    _maybe_fire_completed_barrier,
     callback_barrier_dispatch_allowed,
     callback_barrier_status,
     cancel_callback_barrier,
@@ -43,22 +44,40 @@ from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import callback_barrier_service
 from cli_agent_orchestrator.services import inbox_service as inbox_module
+from cli_agent_orchestrator.services import mailbox_service as mailbox_module
+from cli_agent_orchestrator.services import stalled_callback_watchdog as watchdog_module
 from cli_agent_orchestrator.services.inbox_service import InboxService
+from cli_agent_orchestrator.services.mailbox_service import create_logical_inbox_message
+from cli_agent_orchestrator.services.stalled_callback_watchdog import StalledCallbackWatchdog
 from cli_agent_orchestrator.services.status_monitor import BoundaryObservation
 
 
-@pytest.fixture
-def barrier_db(tmp_path, monkeypatch):
+def _barrier_sessions(tmp_path, monkeypatch, *, autoflush: bool, filename: str):
     engine = create_engine(
-        f"sqlite:///{tmp_path / 'wpq7.db'}",
+        f"sqlite:///{tmp_path / filename}",
         connect_args={"check_same_thread": False},
     )
     Base.metadata.create_all(engine)
-    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    sessions = sessionmaker(autocommit=False, autoflush=autoflush, bind=engine)
     monkeypatch.setattr(dbmod, "SessionLocal", sessions)
     monkeypatch.setattr("cli_agent_orchestrator.services.mailbox_service.SessionLocal", sessions)
     monkeypatch.setattr("cli_agent_orchestrator.services.cleanup_service.SessionLocal", sessions)
     return sessions
+
+
+@pytest.fixture
+def barrier_db(tmp_path, monkeypatch):
+    return _barrier_sessions(tmp_path, monkeypatch, autoflush=False, filename="wpq7.db")
+
+
+@pytest.fixture(params=[True, False], ids=["autoflush-true", "autoflush-false"])
+def completion_barrier_db(tmp_path, monkeypatch, request):
+    return _barrier_sessions(
+        tmp_path,
+        monkeypatch,
+        autoflush=request.param,
+        filename=f"wpq7-completion-{request.param}.db",
+    )
 
 
 def _terminal(db, terminal_id: str, *, caller: str | None = None, profile: str = "reviewer"):
@@ -86,6 +105,134 @@ def _dispatch_pair(label: str = "gate"):
     first = create_inbox_message("owner", "worker-a", "task a", dispatch_barrier={"label": label})
     second = create_inbox_message("owner", "worker-b", "task b", dispatch_barrier={"label": label})
     return first, second
+
+
+def _seed_mailbox_owner(sessions):
+    with sessions.begin() as db:
+        db.add(
+            MailboxModel(
+                id="mb_aaaaaaaa",
+                session_name="cao-wpq7",
+                role="supervisor",
+                current_terminal_id="owner",
+                generation=1,
+                consumed_through_id=0,
+            )
+        )
+        db.add(
+            MailboxIncarnationModel(
+                mailbox_id="mb_aaaaaaaa",
+                generation=1,
+                terminal_id="owner",
+                published_at=datetime.now(),
+            )
+        )
+
+
+def _install_f92_watchdog(monkeypatch, *, caller_mailbox_id: str | None = None):
+    service = StalledCallbackWatchdog(grace_seconds=3)
+    monkeypatch.setattr(watchdog_module, "stalled_callback_watchdog", service)
+    monkeypatch.setattr(
+        watchdog_module,
+        "get_terminal_metadata",
+        lambda terminal_id: {
+            "id": terminal_id,
+            "caller_id": "owner",
+            "caller_mailbox_id": caller_mailbox_id,
+            "provider": "grok_cli",
+            "tmux_session": "cao-wpq7",
+            "tmux_window": terminal_id,
+        },
+    )
+    return service
+
+
+def _orphan_owner(sessions, owner_id: str = "owner"):
+    """Delete the owner terminal, leaving its OPEN barrier behind.
+
+    Reproduces the LIVE shape from the 2026-07-25 crash-loop rather than an
+    invented one: the barrier row, its members and its held callbacks all
+    survive; only the owner terminal row is gone. Nothing in the public API can
+    produce this state, which is precisely why no existing test reached it —
+    the orphan is made by the DELETE path, not by the barrier path.
+
+    Raw evidence:
+    probes/error-pane-samples/2026-07-25-cao-server-crashloop-barrier-owner-gone.txt
+    """
+    with sessions.begin() as db:
+        deleted = db.query(TerminalModel).filter_by(id=owner_id).delete()
+    assert deleted == 1, "fixture must actually orphan the barrier"
+
+
+@pytest.fixture
+def orphaned_barrier_db(barrier_db):
+    """A DB holding exactly the row shape that crash-looped cao-server 634 times.
+
+    OPEN barrier, overdue timeout, every member ARRIVED, callback still held,
+    owner terminal deleted. Any sweep-side change should be run against this.
+
+    Note the members are stamped ARRIVED *raw*. Arriving through the public API
+    would fire the barrier COMPLETE on the last arrival — yet the live barrier
+    had all three members ARRIVED and was still OPEN. That combination is the
+    separate never-fires defect (F71, GOLDEN-TIPS 2026-07-25); it is what left
+    an owner-gone barrier sitting in the sweep set for hours. The fixture
+    reproduces the state as found, not the state the API can reach.
+    """
+    _seed_raw(barrier_db)
+    _dispatch_pair("drill-r2-brainstorm")
+    create_inbox_message("worker-a", "owner", "answer a")
+    with barrier_db.begin() as db:
+        # Stamp the remaining member ARRIVED without firing, as F71 left it.
+        for member in db.query(CallbackBarrierMemberModel).all():
+            member.state = "ARRIVED"
+    with barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "OPEN", "precondition: barrier must still be open"
+        assert barrier.combined_message_id is None
+        members = db.query(CallbackBarrierMemberModel).all()
+        assert [m.state for m in members] == ["ARRIVED", "ARRIVED"]
+        assert db.query(InboxModel).filter_by(status=MessageStatus.HELD.value).count() == 1
+    _orphan_owner(barrier_db)
+    return barrier_db
+
+
+@pytest.mark.parametrize("member_count", [1, 3])
+@pytest.mark.parametrize("mailbox_owner", [False, True])
+def test_last_arrival_fires_immediately_in_both_autoflush_modes(
+    completion_barrier_db, member_count, mailbox_owner
+):
+    workers = tuple(f"worker-{index}" for index in range(member_count))
+    _seed_raw(completion_barrier_db, workers=workers)
+    if mailbox_owner:
+        _seed_mailbox_owner(completion_barrier_db)
+
+    for worker in workers:
+        create_inbox_message(
+            "owner",
+            worker,
+            f"task for {worker}",
+            dispatch_barrier={"label": "live-shape"},
+        )
+    for worker in workers[:-1]:
+        create_inbox_message(worker, "owner", f"answer from {worker}")
+
+    with completion_barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "OPEN"
+        assert barrier.combined_message_id is None
+
+    final_worker = workers[-1]
+    create_inbox_message(final_worker, "owner", f"answer from {final_worker}")
+
+    with completion_barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "FIRED_COMPLETE"
+        combined_rows = db.query(InboxModel).filter_by(sender_id=f"barrier:{barrier.id}").all()
+        assert len(combined_rows) == 1
+        assert barrier.combined_message_id == combined_rows[0].id
+        assert combined_rows[0].message.startswith(
+            f"[callback barrier COMPLETE] live-shape — {member_count}/{member_count} in "
+        )
 
 
 def test_two_member_happy_path_holds_then_fires_one_combined(barrier_db):
@@ -128,6 +275,203 @@ def test_held_is_durable_callback_proof_and_not_delivery_pending(barrier_db):
     assert held.status == MessageStatus.HELD
     assert get_callback_status_since("worker-a", "owner", before) == MessageStatus.HELD
     assert held.id not in {row.id for row in get_pending_messages("owner")}
+
+
+@pytest.mark.parametrize("wrapper", ["raw-terminal", "logical-mailbox"])
+def test_f92_one_member_barrier_records_callback_through_creation_wrapper(
+    barrier_db, monkeypatch, wrapper
+):
+    _seed_raw(barrier_db, workers=("worker-a",))
+    caller_mailbox_id = None
+    callback_receiver = "owner"
+    if wrapper == "logical-mailbox":
+        _seed_mailbox_owner(barrier_db)
+        caller_mailbox_id = "mb_aaaaaaaa"
+        callback_receiver = caller_mailbox_id
+
+    watchdog = _install_f92_watchdog(
+        monkeypatch,
+        caller_mailbox_id=caller_mailbox_id,
+    )
+    watchdog.record_inbound_task("worker-a", "owner", "developer")
+    first_episode = watchdog._episodes["worker-a"]
+    create_inbox_message(
+        "owner",
+        "worker-a",
+        "task",
+        dispatch_barrier={"label": f"f92-{wrapper}"},
+    )
+
+    if wrapper == "raw-terminal":
+        callback = create_inbox_message("worker-a", callback_receiver, "answer")
+    else:
+        callback = create_logical_inbox_message(
+            sender_id="worker-a",
+            mailbox_id=callback_receiver,
+            message="answer",
+        )
+
+    assert callback.status == MessageStatus.DIGESTED
+    assert callback.barrier_id is not None
+    assert callback.barrier_member_key is not None
+    assert first_episode.callback_seen
+    with barrier_db() as db:
+        assert db.query(CallbackBarrierModel).one().state == "FIRED_COMPLETE"
+        assert db.query(CallbackBarrierMemberModel).one().state == "ARRIVED"
+
+    watchdog.record_status("worker-a", TerminalStatus.IDLE, now=10.0)
+    first_episode.last_screen_fp = "sample"
+    assert watchdog.collect_due_notifications(now=13.0) == []
+
+
+@pytest.mark.parametrize("wrapper", ["raw-terminal", "logical-mailbox"])
+def test_f92_creation_wrapper_ignores_row_without_complete_barrier_membership(
+    barrier_db, monkeypatch, wrapper
+):
+    _seed_raw(barrier_db, workers=("worker-a",))
+    callback_receiver = "owner"
+    insert_module = dbmod
+    create_callback = lambda: create_inbox_message("worker-a", callback_receiver, "half-populated")
+    if wrapper == "logical-mailbox":
+        _seed_mailbox_owner(barrier_db)
+        callback_receiver = "mb_aaaaaaaa"
+        insert_module = mailbox_module
+        create_callback = lambda: create_logical_inbox_message(
+            sender_id="worker-a",
+            mailbox_id=callback_receiver,
+            message="half-populated",
+        )
+
+    watchdog = _install_f92_watchdog(monkeypatch)
+    recorder = MagicMock()
+    monkeypatch.setattr(watchdog, "record_callback_if_to_caller", recorder)
+    original_insert = insert_module._insert_routed_inbox_row
+
+    def insert_half_populated_membership(db, *args, **kwargs):
+        row = original_insert(db, *args, **kwargs)
+        row.barrier_id = 8675309
+        row.barrier_member_key = None
+        return row
+
+    monkeypatch.setattr(
+        insert_module,
+        "_insert_routed_inbox_row",
+        insert_half_populated_membership,
+    )
+
+    callback = create_callback()
+
+    assert callback.barrier_id == 8675309
+    assert callback.barrier_member_key is None
+    recorder.assert_not_called()
+    with barrier_db() as db:
+        committed = db.query(InboxModel).filter_by(id=callback.id).one()
+        assert committed.barrier_id == 8675309
+        assert committed.barrier_member_key is None
+
+
+def test_f92_intermediate_mailbox_callback_records_before_barrier_fires(barrier_db, monkeypatch):
+    _seed_raw(barrier_db)
+    _seed_mailbox_owner(barrier_db)
+    watchdog = _install_f92_watchdog(monkeypatch, caller_mailbox_id="mb_aaaaaaaa")
+    watchdog.record_inbound_task("worker-a", "owner", "developer")
+    episode = watchdog._episodes["worker-a"]
+    _dispatch_pair("f92-intermediate")
+
+    callback = create_logical_inbox_message(
+        sender_id="worker-a",
+        mailbox_id="mb_aaaaaaaa",
+        message="answer",
+    )
+
+    assert callback.status == MessageStatus.HELD
+    assert episode.callback_seen
+    with barrier_db() as db:
+        assert db.query(CallbackBarrierModel).one().state == "OPEN"
+        states = {
+            member.terminal_id: member.state
+            for member in db.query(CallbackBarrierMemberModel).all()
+        }
+    assert states == {"worker-a": "ARRIVED", "worker-b": "AWAITING"}
+
+
+def test_f92_new_task_after_one_member_callback_starts_new_generation(barrier_db, monkeypatch):
+    _seed_raw(barrier_db, workers=("worker-a",))
+    watchdog = _install_f92_watchdog(monkeypatch)
+    watchdog.record_inbound_task("worker-a", "owner", "developer")
+    first_episode = watchdog._episodes["worker-a"]
+    create_inbox_message(
+        "owner",
+        "worker-a",
+        "task one",
+        dispatch_barrier={"label": "f92-generation"},
+    )
+    callback = create_inbox_message("worker-a", "owner", "answer one")
+    assert callback.status == MessageStatus.DIGESTED
+
+    # This arrives before any watchdog poll. Without the post-commit recorder,
+    # record_inbound_task joins the unanswered prior episode instead.
+    watchdog.record_inbound_task("worker-a", "owner", "developer")
+
+    replacement = watchdog._episodes["worker-a"]
+    assert replacement is not first_episode
+    assert replacement.generation == first_episode.generation + 1
+
+
+def test_f92_digested_callback_durably_suppresses_when_recorder_missed(barrier_db, monkeypatch):
+    _seed_raw(barrier_db, workers=("worker-a",))
+    watchdog = _install_f92_watchdog(monkeypatch)
+    watchdog.record_inbound_task("worker-a", "owner", "developer")
+    recorder = MagicMock()
+    monkeypatch.setattr(watchdog, "record_callback_if_to_caller", recorder)
+    create_inbox_message(
+        "owner",
+        "worker-a",
+        "task",
+        dispatch_barrier={"label": "f92-durable"},
+    )
+
+    callback = create_inbox_message("worker-a", "owner", "answer")
+
+    assert callback.status == MessageStatus.DIGESTED
+    recorder.assert_called_once_with("worker-a", "owner")
+    episode = watchdog._episodes["worker-a"]
+    assert not episode.callback_seen
+    watchdog.record_status("worker-a", TerminalStatus.IDLE, now=10.0)
+    episode.last_screen_fp = "sample"
+    assert watchdog.collect_due_notifications(now=13.0) == []
+    assert episode.callback_seen
+    assert not episode.fired
+
+
+def test_f92_combined_partial_barrier_row_does_not_clear_missing_worker(barrier_db, monkeypatch):
+    _seed_raw(barrier_db)
+    watchdog = _install_f92_watchdog(monkeypatch)
+    watchdog.record_inbound_task("worker-b", "owner", "developer")
+    _dispatch_pair("f92-partial")
+    create_inbox_message("worker-a", "owner", "answer")
+    fired = fire_due_barriers(datetime.now(timezone.utc) + timedelta(hours=1))
+    assert len(fired) == 1
+    with barrier_db() as db:
+        combined = db.query(InboxModel).filter_by(id=fired[0]).one()
+        assert combined.sender_id.startswith("barrier:")
+        assert "1/2" in combined.message
+
+    episode = watchdog._episodes["worker-b"]
+    watchdog.record_status("worker-b", TerminalStatus.IDLE, now=10.0)
+    episode.last_screen_fp = "sample"
+    monkeypatch.setattr(
+        watchdog,
+        "_fresh_frame_decides_running",
+        lambda _terminal_id: (False, None),
+    )
+
+    notices = watchdog.collect_due_notifications(now=13.0)
+
+    assert len(notices) == 1
+    assert notices[0].terminal_id == "worker-b"
+    assert episode.fired
+    assert not episode.callback_seen
 
 
 def test_terminal_settlement_selector_never_admits_held(barrier_db):
@@ -181,7 +525,8 @@ def test_timeout_zero_arrivals_and_cancel_release_are_lossless(barrier_db):
     with barrier_db() as db:
         combined = db.query(InboxModel).filter_by(id=fired[0]).one()
         assert "0/2" in combined.message
-        assert combined.message.count("[MISSING") == 2
+        # FAM-3: members are now terminalized as FAILED before render
+        assert combined.message.count("[FAILED: barrier_closed_timeout]") == 2
 
     _dispatch_pair("cancel")
     held = create_inbox_message("worker-a", "owner", "held before cancel")
@@ -313,10 +658,11 @@ def test_supervisor_only_dispatch_and_barrier_control_are_owner_scoped(barrier_d
 def test_mcp_supervisor_barrier_path_remains_functional_end_to_end(barrier_db, monkeypatch):
     _seed_raw(barrier_db, workers=("worker-a",))
     monkeypatch.setenv("CAO_TERMINAL_ID", "owner")
+    monkeypatch.setattr(mcp_server, "_current_terminal_id", lambda: "owner")
     post = MagicMock()
     deliver = MagicMock()
     monkeypatch.setattr(mcp_server.cao_http, "post", post)
-    monkeypatch.setattr(inbox_module.inbox_service, "deliver_pending", deliver)
+    monkeypatch.setattr(inbox_module, "request_delivery", deliver)
 
     result = mcp_server._send_message_impl(
         "worker-a",
@@ -326,7 +672,7 @@ def test_mcp_supervisor_barrier_path_remains_functional_end_to_end(barrier_db, m
         barrier_member_key="lane-a",
     )
 
-    assert result["success"] is True
+    assert result["success"] is True, result
     post.assert_not_called()
     deliver.assert_called_once_with("worker-a")
     with barrier_db() as db:
@@ -514,6 +860,7 @@ def test_utf8_cap_preserves_codepoint_and_points_to_durable_sources(barrier_db):
         assert "list_messages/message trace" in combined.message
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_composed_pending_writer_count_is_ten_after_digest_seats_retire(barrier_db):
     root = Path(__file__).parents[2] / "src" / "cli_agent_orchestrator"
     expected = {
@@ -631,6 +978,11 @@ def test_quota_rearm_completion_delivers_two_groups_and_only_combined_is_challen
             return {"success": True}
 
         monkeypatch.setenv("CAO_TERMINAL_ID", combined.sender_id)
+        monkeypatch.setattr(
+            mcp_server,
+            "_current_terminal_id",
+            lambda: combined.sender_id,
+        )
         monkeypatch.setattr(mcp_server, "ENABLE_SENDER_ID_INJECTION", True)
         monkeypatch.setattr(mcp_server, "_send_to_inbox", capture)
         assert mcp_server._send_message_impl("owner", combined.message) == {"success": True}
@@ -737,3 +1089,287 @@ def test_concurrent_first_tag_creates_one_open_barrier_for_each_owner_form(
     with barrier_db() as db:
         assert db.query(CallbackBarrierModel).count() == 1
         assert db.query(CallbackBarrierMemberModel).count() == 2
+
+
+def test_owner_gone_barrier_closes_instead_of_bricking_the_sweep(orphaned_barrier_db):
+    """The exact live crash: sweeping an owner-gone barrier must close, not raise.
+
+    Incident 2026-07-25: barrier 5 (`drill-r2-brainstorm`) outlived owner
+    `8494ddf1`. The startup sweep tried to enqueue its combined callback to the
+    deleted receiver, `_stamp_enqueue_generation` raised
+    `pending_receiver_generation_unavailable`, and cao-server crash-looped 634
+    times over two hours — `cao launch` failed `Connection refused` on :9889 and
+    the fleet could not start at all.
+
+    Raw evidence:
+    probes/error-pane-samples/2026-07-25-cao-server-crashloop-barrier-owner-gone.txt
+    """
+    fired = fire_due_barriers(datetime.now(timezone.utc) + timedelta(hours=1))
+
+    assert fired == []
+    with orphaned_barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "CANCELLED"
+        assert barrier.close_reason == "owner_gone"
+        assert barrier.combined_message_id is None
+        # No PENDING row may be minted for the receiver that does not exist.
+        assert (
+            db.query(InboxModel)
+            .filter_by(status=MessageStatus.PENDING.value, receiver_id="owner")
+            .count()
+            == 0
+        )
+        # Held callbacks are closed with a named reason, never left dangling.
+        held = db.query(InboxModel).filter_by(barrier_id=barrier.id).one()
+        assert held.status == MessageStatus.CANCELLED.value
+        assert held.failure_reason == "barrier_owner_gone"
+
+
+def test_owner_gone_sweep_is_idempotent_across_reboots(orphaned_barrier_db):
+    """Repeated sweeps must stay quiet — the crash-loop swept the same row 634x.
+
+    A fix that closes the barrier but re-raises (or re-fires) on the next boot
+    would still brick the server, just more slowly.
+    """
+    first = fire_due_barriers(datetime.now(timezone.utc) + timedelta(hours=1))
+    second = fire_due_barriers(datetime.now(timezone.utc) + timedelta(hours=2))
+    third = fire_due_barriers(datetime.now(timezone.utc) + timedelta(hours=3))
+
+    assert first == second == third == []
+    with orphaned_barrier_db() as db:
+        assert db.query(CallbackBarrierModel).one().state == "CANCELLED"
+
+
+def test_owner_gone_mailbox_barrier_also_closes(barrier_db):
+    """Same defect through the mailbox-owner branch, not just the terminal branch.
+
+    `_fire_open_barrier_in_db` resolved a mailbox owner with `.one()`, which
+    raises `NoResultFound` on a deleted mailbox — a different exception, the same
+    unbootable outcome. Bug-family sweep, not a second incident.
+    """
+    _seed_raw(barrier_db)
+    _seed_mailbox_owner(barrier_db)
+    _dispatch_pair("mailbox-orphan")
+    with barrier_db.begin() as db:
+        assert db.query(MailboxModel).filter_by(id="mb_aaaaaaaa").delete() == 1
+
+    fired = fire_due_barriers(datetime.now(timezone.utc) + timedelta(hours=1))
+
+    assert fired == []
+    with barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "CANCELLED"
+        assert barrier.close_reason == "owner_gone"
+
+
+def test_deleting_owner_closes_its_open_barriers(barrier_db):
+    """Delete-side sweep: an owner's OPEN barriers close when the owner is deleted.
+
+    `_mark_barrier_member_gone_in_db` only ever handled barriers the terminal was
+    a MEMBER of. A supervisor is an OWNER, never a member, so deleting it left an
+    orphaned OPEN barrier behind — the state that bricked the server.
+    """
+    _seed_raw(barrier_db)
+    _dispatch_pair("owned")
+    with barrier_db() as db:
+        assert db.query(CallbackBarrierModel).one().state == "OPEN"
+
+    delete_terminal_and_warm_intent("owner")
+
+    with barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "CANCELLED"
+        assert barrier.close_reason == "owner_gone"
+    # And the sweep over the now-clean table is a no-op rather than a raise.
+    assert fire_due_barriers(datetime.now(timezone.utc) + timedelta(hours=1)) == []
+
+
+def test_one_unfireable_barrier_does_not_wedge_the_others(barrier_db, monkeypatch):
+    """Per-barrier savepoint: a raise on one barrier must not abort the sweep.
+
+    Without isolation a single bad row aborts the whole transaction, and since
+    the sweep is retried unchanged every poll, NO barrier would ever fire again.
+    """
+    _seed_raw(barrier_db)
+    _dispatch_pair("poison")
+    _dispatch_pair("healthy")
+
+    real = dbmod._fire_open_barrier_in_db
+
+    def explode(db, barrier, **kwargs):
+        if barrier.label == "poison":
+            raise ValueError("pending_receiver_generation_unavailable")
+        return real(db, barrier, **kwargs)
+
+    monkeypatch.setattr(dbmod, "_fire_open_barrier_in_db", explode)
+    fired = fire_due_barriers(datetime.now(timezone.utc) + timedelta(hours=1))
+
+    assert len(fired) == 1
+    with barrier_db() as db:
+        states = {row.label: row.state for row in db.query(CallbackBarrierModel).all()}
+    assert states["healthy"] == "FIRED_TIMEOUT"
+    assert states["poison"] == "OPEN"
+
+
+# ---------------------------------------------------------------------------
+# F71 — sweep closing branch: completion-outranks-timeout (blueprint §1)
+# ---------------------------------------------------------------------------
+
+
+def _seed_all_arrived_barrier(sessions, *, timeout_at: datetime):
+    """Seed an all-ARRIVED barrier holding callback messages, never fired.
+
+    Reproduces the F71 live shape (barrier 5 `drill-r2-brainstorm`): every
+    member delivered its callback (held), all members stamped ARRIVED, but the
+    last-arrival `_maybe_fire_completed_barrier` call was skipped by a crash, so
+    the barrier sits OPEN. The sweep must close it FIRED_COMPLETE.
+    """
+    _seed_raw(sessions)
+    _dispatch_pair("f71")
+    create_inbox_message("worker-a", "owner", "answer a")
+    with sessions.begin() as db:
+        # Stamp every member ARRIVED without firing the last one, as F71 left it.
+        # (The second real callback would fire COMPLETE through the arrival path —
+        # the crash is exactly that `_maybe_fire_completed_barrier` call being
+        # skipped, so we reproduce the state as found, not as the API can reach.)
+        for member in db.query(CallbackBarrierMemberModel).all():
+            member.state = "ARRIVED"
+        db.query(CallbackBarrierModel).update(
+            {CallbackBarrierModel.timeout_at: timeout_at},
+            synchronize_session=False,
+        )
+    with sessions() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "OPEN", "precondition: barrier must still be open"
+        assert barrier.combined_message_id is None
+        # worker-a holds a callback; worker-b is stamped ARRIVED raw with none.
+        assert db.query(InboxModel).filter_by(status=MessageStatus.HELD.value).count() == 1
+
+
+@pytest.mark.parametrize("timeout_in_future", [False, True], ids=["expired", "not-yet-due"])
+def test_f71_sweep_closes_all_arrived_barrier_fired_complete(barrier_db, timeout_in_future):
+    """AC#1 + AC#2 — an all-ARRIVED barrier closes FIRED_COMPLETE on the sweep.
+
+    AC#1: timeout in the past (would previously have fired FIRED_TIMEOUT).
+    AC#2: timeout in the future — the exact live shape (barrier 5 all-ARRIVED at
+    06:28, never a timeout). Completion runs on every OPEN pass, not just
+    timed-out ones.
+    """
+    now = datetime.now(timezone.utc)
+    timeout_at = now + timedelta(hours=1) if timeout_in_future else now - timedelta(hours=1)
+    _seed_all_arrived_barrier(barrier_db, timeout_at=timeout_at)
+
+    fired = fire_due_barriers(now)
+
+    assert len(fired) == 1
+    with barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "FIRED_COMPLETE"
+        assert barrier.close_reason == "complete"
+        combined = db.query(InboxModel).filter_by(id=barrier.combined_message_id).one()
+        assert combined.status == MessageStatus.PENDING.value
+        assert combined.message.startswith("[callback barrier COMPLETE] f71 — 2/2 in ")
+        assert "answer a" in combined.message
+        assert db.query(InboxModel).filter(InboxModel.sender_id.like("barrier:%")).count() == 1
+
+
+def test_f71_sweep_leaves_incomplete_untimed_out_barrier_open(barrier_db):
+    """AC#3 — an incomplete, not-yet-timed-out barrier is untouched by the sweep."""
+    _seed_raw(barrier_db)
+    _dispatch_pair("f71-open")
+    create_inbox_message("worker-a", "owner", "answer a")  # worker-b still AWAITING
+
+    fired = fire_due_barriers(datetime.now(timezone.utc))
+
+    assert fired == []
+    with barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "OPEN"
+        assert barrier.combined_message_id is None
+
+
+def test_f71_completion_vs_sweep_race_has_exactly_one_winner(barrier_db):
+    """AC#4 — a concurrent completion-fire and sweep-fire yield one combined row.
+
+    The CAS in `_fire_open_barrier_in_db` is the single serialization point: the
+    winner fires, the loser no-ops. Completion-vs-sweep is structurally the same
+    interleaving as the existing arrival-vs-timeout race.
+    """
+    _seed_raw(barrier_db, workers=("worker-a",))
+    create_inbox_message("owner", "worker-a", "task", dispatch_barrier={"label": "f71-race"})
+    with barrier_db.begin() as db:
+        db.query(CallbackBarrierModel).update(
+            {CallbackBarrierModel.timeout_at: datetime.now() - timedelta(seconds=1)}
+        )
+    start = threading.Barrier(2)
+    errors = []
+
+    def complete():
+        try:
+            start.wait()
+            with barrier_db.begin() as db:
+                barrier = db.query(CallbackBarrierModel).one()
+                _maybe_fire_completed_barrier(db, barrier)
+        except Exception as exc:  # pragma: no cover - assertion reports the race
+            errors.append(exc)
+
+    def sweep():
+        try:
+            start.wait()
+            fire_due_barriers(datetime.now(timezone.utc))
+        except Exception as exc:  # pragma: no cover - assertion reports the race
+            errors.append(exc)
+
+    threads = [threading.Thread(target=complete), threading.Thread(target=sweep)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(3)
+
+    assert errors == []
+    with barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state in {"FIRED_COMPLETE", "FIRED_TIMEOUT"}
+        assert db.query(InboxModel).filter(InboxModel.sender_id.like("barrier:%")).count() == 1
+
+
+@pytest.fixture
+def completed_orphaned_barrier_db(barrier_db):
+    """All-ARRIVED barrier WITH held messages, then owner orphaned.
+
+    AC#5 sub-case: the existing `orphaned_barrier_db` holds 0 callback messages,
+    so it cannot prove that an owner-gone close wins over a COMPLETE fire when
+    held content is present. This fixture seeds the all-ARRIVED barrier with held
+    messages first, then orphans the owner AFTER seeding.
+    """
+    _seed_all_arrived_barrier(
+        barrier_db, timeout_at=datetime.now(timezone.utc) - timedelta(hours=1)
+    )
+    _orphan_owner(barrier_db)
+    return barrier_db
+
+
+def test_f71_owner_gone_wins_over_complete(completed_orphaned_barrier_db):
+    """AC#5 — an all-ARRIVED barrier whose owner is gone closes CANCELLED, not COMPLETE.
+
+    The owner-gone check in `_fire_open_barrier_in_db` runs before the CAS and
+    must win even for a complete barrier — delivering a combined callback to a
+    dead receiver would raise.
+    """
+    fired = fire_due_barriers(datetime.now(timezone.utc))
+
+    assert fired == []
+    with completed_orphaned_barrier_db() as db:
+        barrier = db.query(CallbackBarrierModel).one()
+        assert barrier.state == "CANCELLED"
+        assert barrier.close_reason == "owner_gone"
+        assert barrier.combined_message_id is None
+        assert (
+            db.query(InboxModel)
+            .filter_by(status=MessageStatus.PENDING.value, receiver_id="owner")
+            .count()
+            == 0
+        )
+        held = db.query(InboxModel).filter_by(barrier_id=barrier.id).all()
+        assert len(held) == 1
+        assert {row.status for row in held} == {MessageStatus.CANCELLED.value}

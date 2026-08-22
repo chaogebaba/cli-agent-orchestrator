@@ -17,6 +17,7 @@ from cli_agent_orchestrator.api.main import (
     inbox_reconciliation_daemon,
     opencode_inbox_delivery_daemon,
 )
+from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.utils.skills import SkillNameError
@@ -122,7 +123,7 @@ class TestAgentProviders:
 
         assert response.status_code == 200
         data = response.json()
-        assert len(data) == 10
+        assert len(data) == 12
         names = [p["name"] for p in data]
         assert "kiro_cli" in names
         assert "grok_cli" in names
@@ -134,6 +135,9 @@ class TestAgentProviders:
         assert "opencode_cli" in names
         assert "cursor_cli" in names
         assert "antigravity_cli" in names
+        assert "omp" in names
+        assert "grok_cli" in names
+        assert "mcode" in names
         for p in data:
             assert p["installed"] is True
 
@@ -166,6 +170,8 @@ class TestAgentProviders:
         assert providers_dict["kimi_cli"]["installed"] is False
         assert providers_dict["copilot_cli"]["installed"] is False
         assert providers_dict["opencode_cli"]["installed"] is False
+        assert providers_dict["grok_cli"]["installed"] is False
+        assert providers_dict["mcode"]["installed"] is False
 
     def test_list_providers_has_binary_field(self, client):
         """Each provider entry has correct binary name."""
@@ -182,6 +188,9 @@ class TestAgentProviders:
         assert providers_dict["copilot_cli"]["binary"] == "copilot"
         assert providers_dict["opencode_cli"]["binary"] == "opencode"
         assert providers_dict["antigravity_cli"]["binary"] == "agy"
+        assert providers_dict["omp"]["binary"] == "omp"
+        assert providers_dict["grok_cli"]["binary"] == "grok"
+        assert providers_dict["mcode"]["binary"] == "mcode"
 
 
 # ── Skills endpoint ──────────────────────────────────────────────────
@@ -296,7 +305,150 @@ class TestCreateSession:
             allowed_tools=None,
             registry=ANY,
             env_vars=None,
+            engine=None,
+            initial_message=None,
+            initial_message_orchestration_type=None,
+            model=None,
+            lifecycle=None,
+            group=None,
+            metadata=None,
         )
+
+    def test_create_session_passes_explicit_kiro_engine(self, client):
+        """An explicit engine reaches the session service and the response."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="kiro_cli",
+            agent_profile="developer",
+            engine="kas",
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={"provider": "kiro_cli", "agent_profile": "developer", "engine": "kas"},
+            )
+
+        assert response.status_code == 201
+        assert response.json()["engine"] == "kas"
+        assert mock_svc.create_session.call_args.kwargs["engine"] == "kas"
+
+    def test_create_session_passes_model_and_initial_message(self, client):
+        """The launch override and first task reach the session service, while
+        the task remains in the JSON body rather than the request URL."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="codex",
+            agent_profile="developer",
+        )
+        initial_message = "Review the current change"
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "codex",
+                    "agent_profile": "developer",
+                    "model": "gpt-5.1-codex",
+                },
+                json={
+                    "initial_message": initial_message,
+                    "initial_message_orchestration_type": "send_message",
+                },
+            )
+
+        assert response.status_code == 201
+        assert initial_message not in str(response.request.url)
+        call_kwargs = mock_svc.create_session.call_args.kwargs
+        assert call_kwargs["model"] == "gpt-5.1-codex"
+        assert call_kwargs["initial_message"] == initial_message
+        assert call_kwargs["initial_message_orchestration_type"] == OrchestrationType.SEND_MESSAGE
+
+    def test_create_session_preserves_env_vars_body_shape(self, client):
+        """Existing cao launch --env callers keep using {"env_vars": {...}}."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="kiro_cli",
+            agent_profile="developer",
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={"agent_profile": "developer"},
+                json={"env_vars": {"FEATURE_MODE": "enabled"}},
+            )
+
+        assert response.status_code == 201
+        assert mock_svc.create_session.call_args.kwargs["env_vars"] == {"FEATURE_MODE": "enabled"}
+
+    def test_create_session_rejects_malformed_model(self, client):
+        """Malformed model IDs fail before any session is created."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={
+                    "agent_profile": "developer",
+                    "model": "invalid;model",
+                },
+            )
+
+        assert response.status_code == 400
+        assert "model" in response.json()["detail"]
+        mock_svc.create_session.assert_not_called()
+
+    def test_create_session_rejects_empty_initial_message(self, client):
+        """An explicitly supplied but undeliverable empty task is not ignored."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={"agent_profile": "developer"},
+                json={"initial_message": ""},
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "initial_message must not be empty"
+        mock_svc.create_session.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("payload", "expected_detail"),
+        [
+            (
+                {"initial_message_orchestration_type": "send_message"},
+                "initial_message_orchestration_type requires initial_message",
+            ),
+            (
+                {
+                    "initial_message": "Review the current change",
+                    "initial_message_orchestration_type": "invalid",
+                },
+                "invalid initial_message_orchestration_type: 'invalid'",
+            ),
+        ],
+    )
+    def test_create_session_rejects_invalid_initial_message_orchestration(
+        self, client, payload, expected_detail
+    ):
+        """Invalid initial-message orchestration fails at the API boundary."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={"agent_profile": "developer"},
+                json=payload,
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == expected_detail
+        mock_svc.create_session.assert_not_called()
 
     def test_create_session_with_session_name(self, client):
         """POST /sessions with explicit session_name."""
@@ -599,6 +751,25 @@ class TestDeleteSession:
         assert response.status_code == 200
         service.delete_session.assert_called_once_with("test-session", registry=ANY, force=True)
 
+    def test_delete_session_deferred_cleanup_is_conflict(self, client):
+        """Deferred Grok cleanup must not look like a successful delete."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.delete_session.return_value = {
+                "deleted": [],
+                "errors": [
+                    {
+                        "terminal_id": "grok-terminal",
+                        "error": "cleanup deferred; retry delete_session",
+                    }
+                ],
+            }
+
+            response = client.delete("/sessions/test-session")
+
+        assert response.status_code == 409
+        assert "cleanup deferred" in response.json()["detail"]
+        assert "test-session" in response.json()["detail"]
+
     def test_delete_session_not_found(self, client):
         """DELETE /sessions/{name} returns 404 for nonexistent session."""
         with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
@@ -639,6 +810,7 @@ class TestCreateTerminalInSession:
             # The endpoint awaits terminal_service.create_terminal, so the
             # patched attribute must be an AsyncMock to return an awaitable.
             mock_svc.create_terminal = AsyncMock(return_value=mock_terminal)
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
 
             response = client.post(
                 "/sessions/test-session/terminals",
@@ -661,6 +833,7 @@ class TestCreateTerminalInSession:
     def test_create_terminal_session_not_found(self, client):
         """POST /sessions/{name}/terminals returns 404 for nonexistent session."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
             mock_svc.create_terminal.side_effect = ValueError("Session 'nonexistent' not found")
 
             response = client.post(
@@ -677,6 +850,7 @@ class TestCreateTerminalInSession:
     def test_create_terminal_server_error(self, client):
         """POST /sessions/{name}/terminals returns 500 on error."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
             mock_svc.create_terminal.side_effect = Exception("TMux error")
 
             response = client.post(
@@ -1026,6 +1200,26 @@ class TestGetTerminalOutput:
         assert response.status_code == 500
         assert "Failed to get output" in response.json()["detail"]
 
+    def test_get_output_last_mode_extraction_failure_is_500(self, client):
+        """A missing response marker is a 500, not a 404 (issue #570).
+
+        mode=last takes the pinned-depth retry path that re-raises as
+        OutputExtractionError; it subclasses ValueError, so without an arm
+        ordered before the ValueError catch below it collapsed back into this
+        route's 404. Same boundary mapping as POST /terminals/run-step.
+        """
+        from cli_agent_orchestrator.providers.base import OutputExtractionError
+
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_output.side_effect = OutputExtractionError(
+                "No completion marker found after last user message"
+            )
+
+            response = client.get("/terminals/abcd1234/output?mode=last")
+
+        assert response.status_code == 500
+        assert "No completion marker" in response.json()["detail"]
+
 
 class TestDeleteTerminal:
     """Tests for DELETE /terminals/{terminal_id} endpoint."""
@@ -1033,34 +1227,56 @@ class TestDeleteTerminal:
     def test_delete_terminal_success(self, client):
         """DELETE /terminals/{id} deletes terminal successfully."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.delete_terminal.return_value = True
+            mock_svc.delete_terminal.return_value = {
+                "reaped": [{"id": "abcd1234", "status": "reaped"}],
+                "skipped": [],
+                "uncertain": [],
+                "unattempted": [],
+            }
 
             response = client.delete("/terminals/abcd1234")
 
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
+        assert data["reaped"] == [{"id": "abcd1234", "status": "reaped"}]
         mock_svc.delete_terminal.assert_called_once_with("abcd1234", registry=ANY)
 
+    def test_delete_terminal_deferred_cleanup_is_conflict(self, client):
+        """HTTP 200 + success:false would hide a still-retryable Grok home."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.delete_terminal.return_value = False
+
+            response = client.delete("/terminals/abcd1234")
+
+        assert response.status_code == 409
+        assert "cleanup deferred" in response.json()["detail"]
+        assert "abcd1234" in response.json()["detail"]
+
     def test_delete_terminal_not_found(self, client):
-        """DELETE /terminals/{id} returns 404 for nonexistent terminal."""
+        """DELETE /terminals/{id} returns 200 with already_absent (D13)."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.delete_terminal.side_effect = ValueError("Terminal not found")
 
             response = client.delete("/terminals/deadbeef")
 
-        assert response.status_code == 404
-        assert "Terminal not found" in response.json()["detail"]
+        assert response.status_code == 200
+        body = response.json()
+        assert body["already_absent"] is True
+        assert body["success"] is True
 
     def test_delete_terminal_server_error(self, client):
-        """DELETE /terminals/{id} returns 500 on error."""
+        """DELETE /terminals/{id} returns 500 with typed detail (D12)."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.delete_terminal.side_effect = Exception("Cleanup failed")
 
             response = client.delete("/terminals/abcd1234")
 
         assert response.status_code == 500
-        assert "Failed to delete terminal" in response.json()["detail"]
+        # D12: detail is "{ClassName}: {message}", never empty
+        detail = response.json()["detail"]
+        assert "Exception" in detail
+        assert "Cleanup failed" in detail
 
 
 # ── flow_daemon ──────────────────────────────────────────────────────
@@ -1222,7 +1438,15 @@ class TestLifespan:
     """Tests for the lifespan() context manager."""
 
     @pytest.mark.asyncio
-    async def test_lifespan_startup_and_shutdown(self, caplog):
+    # NOTE: _seed_default_skills_at_startup is patched via decorator rather than
+    # added to the with-list below -- CPython caps statically nested blocks at 20
+    # and that parenthesized context-manager list is already at the limit.
+    @patch("cli_agent_orchestrator.api.main._seed_default_skills_at_startup")
+    @patch(
+        "cli_agent_orchestrator.api.main.terminal_service.rearm_fifo_readers_at_startup",
+        return_value={"rearmed": 0, "skipped_gone": 0, "skipped_existing": 0},
+    )
+    async def test_lifespan_startup_and_shutdown(self, mock_rearm, mock_seed, caplog):
         """lifespan starts the event-bus consumers on entry, cleans up on exit.
 
         The watchdog PollingObserver inbox watcher was replaced by event-bus
@@ -1255,6 +1479,7 @@ class TestLifespan:
         mock_load = AsyncMock(side_effect=record_registry_load)
         mock_teardown = AsyncMock()
         startup_order = []
+        mock_seed.side_effect = lambda: startup_order.append("skill_seed")
 
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
@@ -1318,11 +1543,16 @@ class TestLifespan:
                     mock_bus.set_loop.assert_called_once()
                     loop_arg = mock_bus.set_loop.call_args.args[0]
                     assert loop_arg is asyncio.get_running_loop()
+                    mock_seed.assert_called_once_with()
                     mock_purge.assert_called_once_with()
+                    mock_rearm.assert_called_once_with()
                     mock_recover.assert_called_once_with()
                     mock_orphan_reconcile.assert_called_once_with()
                     assert startup_order == [
                         "init_db",
+                        # Upstream skill seed must land AFTER the fail-stop
+                        # startup gates and before delivery recovery.
+                        "skill_seed",
                         "recover",
                         "orphan_reconcile",
                         "registry_load",
@@ -1375,6 +1605,10 @@ class TestLifespan:
             patch(
                 "cli_agent_orchestrator.api.main.terminal_service.purge_stale_terminal_records",
                 return_value=0,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.terminal_service.rearm_fifo_readers_at_startup",
+                return_value={"rearmed": 0, "skipped_gone": 0, "skipped_existing": 0},
             ),
             patch(
                 "cli_agent_orchestrator.services.memory_reconciliation.reconcile_memory_startup",

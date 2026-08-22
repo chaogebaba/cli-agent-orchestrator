@@ -25,8 +25,24 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 from urllib.parse import urlsplit
+
+FixtureVariant = Literal[
+    "healthy",
+    "empty-shell",
+    "post-send-death",
+    "process-less",
+    "procfs-unavailable",
+]
+FIXTURE_VARIANTS: tuple[str, ...] = (
+    "healthy",
+    "empty-shell",
+    "post-send-death",
+    "process-less",
+    "procfs-unavailable",
+    "spawn-then-fault",
+)
 
 MANIFEST_NAME = "instance-manifest.toml"
 OWNER_LOCK_NAME = "owner.lock"
@@ -81,6 +97,12 @@ SHARED_AUTH_PROVIDERS = {
         "credential_source": Path.home() / ".claude" / ".credentials.json",
         "credential_name": ".credentials.json",
         "home_env": "CLAUDE_CONFIG_DIR",
+    },
+    "grok_cli": {
+        "home_relative": "provider-homes/grok",
+        "credential_source": Path.home() / ".grok" / "auth.json",
+        "credential_name": "auth.json",
+        "home_env": "GROK_HOME",
     },
 }
 
@@ -212,6 +234,19 @@ def render_manifest(manifest: dict[str, Any]) -> str:
         row = manifest["providers"][provider]
         for key, value in row.items():
             lines.append(f"{key} = {_toml_string(str(value))}\n")
+    # F139: optional fixture_providers table (deterministic field order)
+    fixture_providers = manifest.get("fixture_providers")
+    if fixture_providers:
+        for fp_name, fp_row in fixture_providers.items():
+            lines.append(f"\n[fixture_providers.{fp_name}]\n")
+            for fp_key in (
+                "classification",
+                "binary_realpath",
+                "binary_sha256",
+                "variant",
+                "state_dir",
+            ):
+                lines.append(f"{fp_key} = {_toml_string(str(fp_row[fp_key]))}\n")
     return "".join(lines)
 
 
@@ -267,7 +302,7 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> dict[str
     missing = required - manifest.keys()
     if missing:
         raise SandboxError(f"manifest missing fields: {sorted(missing)}")
-    extra = manifest.keys() - required
+    extra = manifest.keys() - required - {"fixture_providers"}
     if extra:
         raise SandboxError(f"manifest has unknown fields: {sorted(extra)}")
     instance_id = manifest["instance_id"]
@@ -369,6 +404,45 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> dict[str
         _assert_clean_components(expected_credential)
         if not expected_home.is_relative_to(root):
             raise SandboxError(f"provider home is outside sandbox root: {provider}")
+    # F139: validate optional fixture_providers table
+    fixture_providers = manifest.get("fixture_providers")
+    if fixture_providers is not None:
+        if not isinstance(fixture_providers, dict):
+            raise SandboxError("fixture_providers must be a table")
+        if set(fixture_providers.keys()) != {"mock_cli"}:
+            raise SandboxError(
+                f"fixture_providers allows only 'mock_cli', got: {sorted(fixture_providers.keys())}"
+            )
+        fp_row = fixture_providers["mock_cli"]
+        if not isinstance(fp_row, dict):
+            raise SandboxError("fixture_providers.mock_cli must be a table")
+        fp_required = {"classification", "binary_realpath", "binary_sha256", "variant", "state_dir"}
+        if set(fp_row.keys()) != fp_required:
+            raise SandboxError(
+                f"fixture_providers.mock_cli has wrong fields: {sorted(fp_row.keys())}"
+            )
+        if fp_row["classification"] != "fixture-test":
+            raise SandboxError("fixture_providers.mock_cli classification must be 'fixture-test'")
+        if fp_row["variant"] not in FIXTURE_VARIANTS:
+            raise SandboxError(
+                f"fixture_providers.mock_cli variant is invalid: {fp_row['variant']}"
+            )
+        binary_path = Path(str(fp_row["binary_realpath"]))
+        _assert_clean_components(binary_path)
+        binary_path = _canonical(binary_path)
+        if not binary_path.is_file():
+            raise SandboxError("fixture binary is not a regular file")
+        if not os.access(binary_path, os.X_OK):
+            raise SandboxError("fixture binary is not executable")
+        if not binary_path.is_relative_to(fork_root):
+            raise SandboxError("fixture binary is outside the fork root")
+        actual_hash = hashlib.sha256(binary_path.read_bytes()).hexdigest()
+        if actual_hash != fp_row["binary_sha256"]:
+            raise SandboxError("fixture binary SHA-256 mismatch")
+        state_dir = _canonical(Path(str(fp_row["state_dir"])))
+        if not state_dir.is_relative_to(root):
+            raise SandboxError("fixture state_dir is outside sandbox root")
+        _assert_clean_components(Path(str(fp_row["state_dir"])))
     result = dict(manifest)
     result["root"] = str(root)
     result["endpoint"] = endpoint
@@ -377,7 +451,7 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> dict[str
 
 def _manifest_env(manifest: dict[str, Any], manifest_path: Path) -> dict[str, str]:
     result = {
-        "CAO_HOME": str(manifest["root"]),
+        "CAO_HOME_DIR": str(manifest["root"]),
         "CAO_ENDPOINT": str(manifest["endpoint"]),
         "CAO_INSTANCE_ID": str(manifest["instance_id"]),
         "CAO_TMUX_SOCKET": str(manifest["tmux_socket"]),
@@ -426,6 +500,40 @@ def _tmux_lifecycle(
         text=True,
         capture_output=True,
     )
+
+
+def _tmux_socket_path(socket_name: str) -> Path:
+    """Resolve where tmux places the ``-L <name>`` socket, the way tmux resolves it."""
+    return Path(os.environ.get("TMUX_TMPDIR") or "/tmp") / f"tmux-{os.getuid()}" / socket_name
+
+
+def _tmux_server_live(socket_name: str) -> bool:
+    return _tmux_lifecycle(socket_name, "list-sessions", check=False).returncode == 0
+
+
+def _unlink_dead_tmux_socket(socket_name: str, *, settle: float = 0.0) -> bool:
+    """F182: unlink the socket inode a dead tmux server leaves behind.
+
+    A live server keeps its socket: liveness is re-probed here, so no caller can
+    unlink a socket out from under a running sandbox.
+    """
+    deadline = time.monotonic() + settle
+    while _tmux_server_live(socket_name):
+        if time.monotonic() >= deadline:
+            raise SandboxError(f"refusing to unlink a live tmux socket: {socket_name}")
+        time.sleep(0.1)
+    path = _tmux_socket_path(socket_name)
+    try:
+        info = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    if not stat.S_ISSOCK(info.st_mode):
+        raise SandboxError(f"tmux socket path is not a socket: {path}")
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def _seed_sandbox_db(manifest: dict[str, Any]) -> None:
@@ -503,7 +611,9 @@ def _wait_ready(manifest: dict[str, Any], child: subprocess.Popen[bytes]) -> Non
     raise SandboxError("sandbox server readiness timed out")
 
 
-def _build_manifest(root: Path, port: int) -> dict[str, Any]:
+def _build_manifest(
+    root: Path, port: int, *, fixture_mock_cli_variant: FixtureVariant | None = None
+) -> dict[str, Any]:
     root = _canonical(root)
     if root.exists():
         raise SandboxError("sandbox root already exists")
@@ -555,6 +665,28 @@ def _build_manifest(root: Path, port: int) -> dict[str, Any]:
                 )
         for field, relative in MUTABLE_PATHS.items():
             manifest[field] = str(root / relative)
+        # F139: optional fixture provider manifest row
+        if fixture_mock_cli_variant is not None:
+            binary_path = fork_root / "test" / "providers" / "fixtures" / "bin" / "mock_cli"
+            binary_path = _canonical(binary_path)
+            if not binary_path.is_file():
+                raise SandboxError("fixture binary is not a regular file")
+            if not os.access(binary_path, os.X_OK):
+                raise SandboxError("fixture binary is not executable")
+            if not binary_path.is_relative_to(fork_root):
+                raise SandboxError("fixture binary is outside the fork root")
+            binary_hash = hashlib.sha256(binary_path.read_bytes()).hexdigest()
+            state_dir = root / "fixture-provider-state"
+            state_dir.mkdir(mode=0o700, exist_ok=False)
+            manifest["fixture_providers"] = {
+                "mock_cli": {
+                    "classification": "fixture-test",
+                    "binary_realpath": str(binary_path),
+                    "binary_sha256": binary_hash,
+                    "variant": fixture_mock_cli_variant,
+                    "state_dir": str(state_dir),
+                }
+            }
         return manifest
     except Exception:
         shutil.rmtree(root, ignore_errors=True)
@@ -574,14 +706,52 @@ def _initialize_claude_native_home(manifest: dict[str, Any]) -> Path:
 
 def command_up(args: argparse.Namespace) -> int:
     root = Path(args.root)
+    # F188: ensure root's parent exists (mkdir -p semantics) before disk-space check
+    try:
+        root.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SandboxError(f"cannot create sandbox root parent {root.parent}: {exc}") from exc
+    # F119: disk-space pre-flight guard
+    usage = shutil.disk_usage(str(root.parent if not root.exists() else root))
+    free_gb = usage.free / (1024**3)
+    if free_gb < 3.0:
+        print(
+            f"ERROR: disk_space_low: {free_gb:.1f}GB free on {root} "
+            f"(floor: 3.0GB). Refusing to start sandbox — free disk space first.",
+            file=sys.stderr,
+        )
+        return 1
     manifest: dict[str, Any] | None = None
     sentinel_created = False
     child: subprocess.Popen[bytes] | None = None
     try:
-        manifest = _build_manifest(root, args.port)
+        manifest = _build_manifest(
+            root,
+            args.port,
+            fixture_mock_cli_variant=getattr(args, "fixture_mock_cli_variant", None),
+        )
         manifest_path = Path(manifest["root"]) / MANIFEST_NAME
         validate_manifest(manifest, manifest_path)
-        _write_once(manifest_path, render_manifest(manifest), 0o400)
+        rendered = render_manifest(manifest)
+        _write_once(manifest_path, rendered, 0o400)
+        # F139 D3: immediate read-back round-trip equality check
+        readback = read_manifest(manifest_path)
+        validate_manifest(readback, manifest_path)
+        if manifest.get("fixture_providers"):
+            rb_fp = readback.get("fixture_providers", {}).get("mock_cli", {})
+            mem_fp = manifest["fixture_providers"]["mock_cli"]
+            for fp_key in (
+                "classification",
+                "binary_realpath",
+                "binary_sha256",
+                "variant",
+                "state_dir",
+            ):
+                if str(rb_fp.get(fp_key, "")) != str(mem_fp[fp_key]):
+                    raise SandboxError(
+                        f"fixture manifest round-trip mismatch on {fp_key}: "
+                        f"{rb_fp.get(fp_key)!r} != {mem_fp[fp_key]!r}"
+                    )
         _write_once(
             Path(manifest["root"]) / OWNER_LOCK_NAME,
             json.dumps(
@@ -607,15 +777,9 @@ def command_up(args: argparse.Namespace) -> int:
         _initialize_claude_native_home(manifest)
         _seed_sandbox_db(manifest)
         sentinel = f"cao-sbx-{manifest['instance_id']}-owner"
-        existing = _tmux_lifecycle(
-            str(manifest["tmux_socket"]),
-            "list-sessions",
-            "-F",
-            "#{session_name}",
-            check=False,
-        )
-        if existing.returncode == 0:
+        if _tmux_server_live(str(manifest["tmux_socket"])):
             raise SandboxError("sandbox tmux socket is already live")
+        _unlink_dead_tmux_socket(str(manifest["tmux_socket"]))
         _tmux_lifecycle(
             str(manifest["tmux_socket"]),
             "new-session",
@@ -681,12 +845,18 @@ def command_up(args: argparse.Namespace) -> int:
                 pass
         if manifest is not None and sentinel_created:
             _tmux_lifecycle(str(manifest["tmux_socket"]), "kill-server", check=False)
+            try:
+                _unlink_dead_tmux_socket(str(manifest["tmux_socket"]), settle=5.0)
+            except (SandboxError, OSError):
+                pass
         if manifest is not None:
             shutil.rmtree(manifest["root"], ignore_errors=True)
         raise
 
 
-def _load_owned(root: Path) -> tuple[dict[str, Any], Path, dict[str, Any]]:
+def _load_owned(
+    root: Path, *, allow_dead_pid: bool = False
+) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     _assert_clean_components(root)
     root = _canonical(root)
     manifest_path = root / MANIFEST_NAME
@@ -698,7 +868,14 @@ def _load_owned(root: Path) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     if pid_record.get("owner_nonce") != manifest["owner_nonce"]:
         raise SandboxError("sandbox pidfile owner mismatch")
     pid = int(pid_record.get("pid", 0))
-    if _process_start_time(pid) != int(pid_record.get("start_time", -1)):
+    try:
+        start_time = _process_start_time(pid)
+    except SandboxError:
+        if allow_dead_pid:
+            pid_record["_dead"] = True
+            return manifest, manifest_path, pid_record
+        raise
+    if start_time != int(pid_record.get("start_time", -1)):
         raise SandboxError("sandbox pid identity mismatch")
     return manifest, manifest_path, pid_record
 
@@ -740,21 +917,23 @@ def _sentinel_owned(manifest: dict[str, Any]) -> bool:
 
 
 def command_down(args: argparse.Namespace) -> int:
-    manifest, _, pid_record = _load_owned(Path(args.root))
+    manifest, _, pid_record = _load_owned(Path(args.root), allow_dead_pid=args.purge)
     if not _sentinel_owned(manifest):
         raise SandboxError("tmux ownership sentinel missing")
     pid = int(pid_record["pid"])
-    os.killpg(pid, signal.SIGTERM)
-    deadline = time.monotonic() + 15.0
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.1)
-    else:
-        os.killpg(pid, signal.SIGKILL)
-    _tmux_lifecycle(str(manifest["tmux_socket"]), "kill-server")
+    if not pid_record.get("_dead"):
+        os.killpg(pid, signal.SIGTERM)
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.killpg(pid, signal.SIGKILL)
+    _tmux_lifecycle(str(manifest["tmux_socket"]), "kill-server", check=False)
+    _unlink_dead_tmux_socket(str(manifest["tmux_socket"]), settle=5.0)
     Path(manifest["pidfile"]).unlink(missing_ok=True)
     if args.purge:
         current = validate_manifest(
@@ -799,6 +978,13 @@ def build_parser() -> argparse.ArgumentParser:
     up = commands.add_parser("up")
     up.add_argument("--root", required=True)
     up.add_argument("--port", required=True, type=int)
+    up.add_argument(
+        "--fixture-mock-cli-variant",
+        choices=FIXTURE_VARIANTS,
+        default=None,
+        dest="fixture_mock_cli_variant",
+        help="F139: pin one fixture provider behavior for this sandbox instance",
+    )
     up.set_defaults(handler=command_up)
     status_parser = commands.add_parser("status")
     status_parser.add_argument("--root", required=True)

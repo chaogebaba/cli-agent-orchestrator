@@ -1,0 +1,53 @@
+    2641 -            "\n"
+    2642 -            "Press enter to continue\n"
+    2643 -        )
+    2644 -        # Frame 2: trust dismissed, welcome banner visible but NO idle prompt yet
+    2645 -        # (transitional state before update dialog renders)
+    2646 -        frame_transitional = "OpenAI Codex (v0.142.5)\n"
+    2647 -        # Frame 3: update dialog renders
+    2648 -        frame_update = (
+    2649 -            "OpenAI Codex (v0.142.5)\n"
+    2650 -            "✨ Update available! 0.142.5 -> 0.144.5\n"
+    2651 -            "1. Update now (runs npm install -g @openai/codex)\n"
+    2652 -            "2. Skip\n"
+    2653 -            "3. Skip until next version\n"
+    2654 -            "Press enter to continue\n"
+    2655 -        )
+    2656 -        # Frame 4: update dismissed, idle prompt visible
+    2657 -        frame_idle = "OpenAI Codex (v0.142.5)\n› "
+    2658 -
+    2659 -        mock_tmux.return_value.get_history.side_effect = [
+    2660 -            frame_trust,
+    2661 -            frame_transitional,
+    2662 -            frame_update,
+    2663 -            frame_idle,
+    2664 -        ]
+    2665 -
+    2666 -        provider = CodexProvider("test1234", "test-session", "window-0")
+    2667 -        await provider._handle_trust_prompt(timeout=10.0)
+    2668 -
+    2669 -        # Trust was dismissed with Enter
+    2670 -        mock_tmux.return_value.send_special_key.assert_any_call("test-session", "window-0", "Enter")
+    2671 -        # Update dialog was dismissed with '3' then Enter
+    2672 -        mock_tmux.return_value.send_keys.assert_any_call(
+    2673 -            "test-session", "window-0", "3", enter_count=0
+    2674 -        )
+    2601
+
+• Explored
+  └ Search ^(<<<<<<<|=======|>>>>>>>) in main.py
+    Search features.multi_agent=false|check_for_update_on_startup=false in codex.py
+
+• Ran git diff --check
+  └ (no output)
+
+• Ran git add src/cli_agent_orchestrator/providers/codex.py test/providers/test_codex_provider_unit.py src/cli_agent_orchestrator/api/
+  │ main.py test/conftest.py
+  └ (no output)
+
+• Working (4m 15s • esc to interrupt)
+
+
+› Run /review on my current changes
+
+  ~/VScode_projects/cli-subagents · master · gpt-5.6-sol high · Context 62% left

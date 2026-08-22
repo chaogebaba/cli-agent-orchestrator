@@ -164,9 +164,8 @@ async def test_run_codex_review_job_creates_findings_path_and_pushes_completion(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
     monkeypatch.setattr(
-        svc,
-        "create_inbox_message",
-        lambda sender, receiver, message: created_messages.append((sender, receiver, message)),
+        "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
+        lambda sender, receiver, message, **kw: created_messages.append((sender, receiver, message)),
     )
     monkeypatch.setattr(
         svc.inbox_service,
@@ -188,7 +187,7 @@ async def test_run_codex_review_job_creates_findings_path_and_pushes_completion(
             ),
         )
     ]
-    assert delivered == [("deadbeef", None)]
+    # Delivery is implicit via create_routed_inbox_message (F136)
 
 
 @pytest.mark.asyncio
@@ -216,9 +215,8 @@ async def test_run_codex_review_job_pushes_stderr_tail_on_nonzero(tmp_path, monk
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
     monkeypatch.setattr(
-        svc,
-        "create_inbox_message",
-        lambda sender, receiver, message: created_messages.append((sender, receiver, message)),
+        "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
+        lambda sender, receiver, message, **kw: created_messages.append((sender, receiver, message)),
     )
     monkeypatch.setattr(svc.inbox_service, "deliver_pending", lambda receiver, registry=None: None)
 
@@ -251,9 +249,8 @@ async def test_run_codex_review_job_pushes_failure_for_bad_cwd(tmp_path, monkeyp
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_if_called)
     monkeypatch.setattr(
-        svc,
-        "create_inbox_message",
-        lambda sender, receiver, message: created_messages.append((sender, receiver, message)),
+        "cli_agent_orchestrator.services.mailbox_service.create_routed_inbox_message",
+        lambda sender, receiver, message, **kw: created_messages.append((sender, receiver, message)),
     )
     monkeypatch.setattr(svc.inbox_service, "deliver_pending", lambda receiver, registry=None: None)
 

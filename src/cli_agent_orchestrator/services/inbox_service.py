@@ -8,15 +8,19 @@ import copy
 import hashlib
 import json
 import logging
+import math
+import os
 import secrets
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from itertools import groupby
+from pathlib import Path
 from typing import Any, Callable, Literal, Sequence
 
 from sqlalchemy.exc import OperationalError
+from tzlocal import get_localzone
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
@@ -24,6 +28,7 @@ from cli_agent_orchestrator.clients.database import (
     AttemptOpenResult,
     NoticeInsertOutcome,
     OrphanReconcileResult,
+    _utcnow,
     advance_wpm2_continuity_cursor,
     attempt_proven_pre_paste,
     begin_delivery_attempt,
@@ -34,11 +39,12 @@ from cli_agent_orchestrator.clients.database import (
     find_inferred_delivery_evidence,
     get_attempt_mailbox_authority,
     get_current_mailbox_terminal,
+    get_latest_compact_transcript_binding,
     get_message_trace,
     get_owned_legacy_parked_messages,
+    get_park_warm_for_message_ids,
     get_pending_messages,
     get_pending_messages_by_ids,
-    get_park_warm_for_message_ids,
     get_terminal_metadata,
     insert_identity_authority_notice,
     list_attempt_member_ids,
@@ -55,6 +61,7 @@ from cli_agent_orchestrator.clients.database import (
     record_wpm1_stalled_notice,
     recover_transcript_binding_if_current,
     recover_wpm2_stale_attempt,
+    settle_attempt_inferred_delivered_batch,
     settle_delivery_attempt,
     settle_delivery_attempt_proof_safe,
     settle_open_attempt_inferred_delivered,
@@ -76,10 +83,11 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
-from cli_agent_orchestrator.services import receiver_state_view, terminal_service
+from cli_agent_orchestrator.services import receiver_state_view, settings_service, terminal_service
 from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.message_trace_service import (
+    binding_presumed_stale,
     clear_binding_staleness_state,
     confirm_delivery,
     continuity_aware_lookup,
@@ -105,9 +113,23 @@ from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
 
+# F162 D10: rate-limited gate5 WARN state — {terminal_id: last_warn_time}
+_fx158_gate5_last_warn: dict[str, float] = {}
+_FX158_GATE5_WARN_INTERVAL_S: float = 60.0
+
 IDLE_STALL_AGE = 30 * 60
 ABS_STALLED_NOTICE_AGE = 4 * 60 * 60
 WPM2_STALE_OPEN_AGE_SECONDS = 60
+# After this many presumed-stale suppress cycles, stop blocking delivery and
+# allow the normal confirm path (often send_returned_unverified). Matches the
+# binding-authority notice threshold so the operator is told at the same time
+# the deadlock is broken.
+BINDING_SUPPRESS_MAX_CYCLES = 3
+
+# F339: Maximum consecutive terminal-not-found (404) responses before an episode
+# is permanently abandoned. Prevents unbounded CPU/request storms when terminal
+# rows are wiped but in-memory delivery episodes persist.
+_F339_TERMINAL_NOT_FOUND_MAX = 5
 
 
 @dataclass(frozen=True)
@@ -258,16 +280,35 @@ def _wire_with_attempt_challenge(
     message_id: int,
 ) -> tuple[str, str | None]:
     """Splice a wire-only singleton challenge into the last authentic wrapper suffix."""
-    prefix = f"[Message from terminal {sender_id}. "
-    suffix = prefix + (
+    # F172: the MCP injection now uses "[Message from <display_name> (<id>). ..."
+    # but legacy messages use "[Message from terminal <id>. ...". Match both.
+    from cli_agent_orchestrator.utils.terminal import display_name as _dn
+
+    sender_dn = _dn(sender_id)
+    # New form: [Message from <display_name> (<id>). ...]
+    new_prefix = f"[Message from {sender_dn} ({sender_id}). "
+    new_suffix = new_prefix + (
         "Use the cao-mcp-server send_message MCP tool for any follow-up work — "
         "never a built-in collaboration.send_message.]"
     )
-    if not wire.endswith(suffix):
+    # Legacy form: [Message from terminal <id>. ...]
+    legacy_prefix = f"[Message from terminal {sender_id}. "
+    legacy_suffix = legacy_prefix + (
+        "Use the cao-mcp-server send_message MCP tool for any follow-up work — "
+        "never a built-in collaboration.send_message.]"
+    )
+
+    if wire.endswith(new_suffix):
+        prefix = new_prefix
+        suffix = new_suffix
+    elif wire.endswith(legacy_suffix):
+        prefix = legacy_prefix
+        suffix = legacy_suffix
+    else:
         return wire, None
     index = len(wire) - len(suffix)
     raw_challenge = secrets.token_hex(16)
-    replacement = f"[Message from terminal {sender_id} | mid {message_id}:{raw_challenge}. "
+    replacement = f"{prefix[:-2]} | mid {message_id}:{raw_challenge}. "
     challenged = wire[:index] + replacement + suffix[len(prefix) :]
     return challenged, hashlib.sha256(raw_challenge.encode()).hexdigest()
 
@@ -294,10 +335,224 @@ def classify_permanently_d2_only(attempt: dict, current_observation_epoch: str |
     return "epoch_mismatch" if epoch != current_observation_epoch else "normal"
 
 
+# WP-F44 required `receiver_status_at_settle == "processing"`. That came from
+# the fixture the WP was built on -- a BUSY grok_tester, still mid-turn at settle
+# -- and encodes the fixture's shape rather than a safety requirement.
+#
+# Measured 2026-07-27: of five ambiguous attempts in 24h, THREE had a stable
+# inode and real transcript growth (+813, +1058, +8969 bytes) and were refused
+# on status alone, because the receiver had reached COMPLETED. One of them also
+# carried queue corroboration. They were redelivered; the worker saw each brief
+# twice.
+#
+# `COMPLETED` means the receiver FINISHED a turn. For "did the payload land",
+# a turn that started and finished while the transcript grew is not weaker
+# evidence than one still running -- the growth is the same evidence, observed
+# slightly later. The original gate excluded its own best case.
+#
+# What is deliberately NOT admitted: IDLE and UNKNOWN. Growth on an idle
+# receiver is not attributable to this payload, and UNKNOWN is the sampler's
+# own failure -- WP-F44's ruling that "unknown -> False" stands, and is the
+# reason this is a closed set rather than a `!= IDLE` negation.
+_EXECUTING_AT_SETTLE = frozenset({TerminalStatus.PROCESSING.value, TerminalStatus.COMPLETED.value})
+
+
+def is_probable_delivered(evidence: dict) -> bool:
+    """Classify execution evidence without filesystem or service dependencies."""
+    if not isinstance(evidence, dict):
+        return False
+    if evidence.get("receiver_status_at_settle") not in _EXECUTING_AT_SETTLE:
+        return False
+    growth = evidence.get("transcript_growth")
+    if not isinstance(growth, dict) or growth.get("inode_stable") is not True:
+        return False
+    size_at_open = growth.get("size_at_open")
+    size_at_settle = growth.get("size_at_settle")
+    if type(size_at_open) is not int or type(size_at_settle) is not int:
+        return False
+    if size_at_settle <= size_at_open:
+        return False
+    if "busy_initial_submit" not in evidence:
+        return True
+    busy = evidence.get("busy_initial_submit")
+    return (
+        isinstance(busy, dict) and busy.get("status_at_submit") == TerminalStatus.PROCESSING.value
+    )
+
+
+def _opener_transcript_ref(evidence: dict[str, Any]) -> dict[str, Any] | None:
+    reference = _lookup_ref(evidence)
+    if reference is None:
+        return None
+    path, inode, size = reference
+    return {"path": path, "inode": inode, "size": size}
+
+
+def _classify_probable_delivery(
+    evidence: dict[str, Any],
+    terminal_id: str,
+    opener_ref: dict[str, Any] | None,
+) -> dict[str, Any]:
+    classified = dict(evidence) if isinstance(evidence, dict) else {}
+    try:
+        receiver_status = status_monitor.get_status(terminal_id)
+    except Exception:
+        receiver_status = None
+    classified["receiver_status_at_settle"] = (
+        receiver_status.value if isinstance(receiver_status, TerminalStatus) else "unknown"
+    )
+    growth = None
+    if opener_ref is not None:
+        path = opener_ref.get("path")
+        inode = opener_ref.get("inode")
+        size = opener_ref.get("size")
+        if isinstance(path, str) and path and type(size) is int:
+            try:
+                settled = Path(path).stat()
+            except (OSError, ValueError):
+                pass
+            else:
+                growth = {
+                    "size_at_open": size,
+                    "size_at_settle": settled.st_size,
+                    "inode_stable": type(inode) is int and settled.st_ino == inode,
+                }
+    classified["transcript_growth"] = growth
+    return classified
+
+
+def _confirmation_timeout_seconds() -> float:
+    defaults = settings_service.get_provider_defaults("inbox")
+    if "confirmation_timeout_seconds" not in defaults:
+        return 10.0
+    raw = defaults["confirmation_timeout_seconds"]
+    try:
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ValueError
+        timeout = float(raw)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError
+    except (OverflowError, TypeError, ValueError):
+        logger.warning(
+            "Invalid [inbox] confirmation_timeout_seconds=%r; using default 10.0",
+            raw,
+        )
+        return 10.0
+    return timeout
+
+
 _delivery_locks: dict[str, threading.Lock] = {}
 _delivery_locks_guard = threading.Lock()
 _delivery_wake_seq: dict[str, int] = {}
 _delivery_seq_guard = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# F136-D15: O(1) wake-admission state machine
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _WakeState:
+    """Per-terminal wake admission state (D15)."""
+
+    dirty_epoch: int = 0
+    immediate_admitted: bool = False
+    holder_epoch: int = 0
+    delayed_token: int = 0
+    delayed_handle: Any = None  # asyncio.TimerHandle | None
+
+
+_wake_states: dict[str, _WakeState] = {}
+
+
+# Failure backoff state (D16)
+_failure_streaks: dict[str, int] = {}
+_BACKOFF_SCHEDULE = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
+
+
+@dataclass
+class CallbackRunOutcome:
+    """D18: Structured outcome of one callback delivery run."""
+
+    selected: int = 0
+    processed: int = 0
+    cursor_before: int | None = None
+    cursor_after: int | None = None
+    replay_selected: int = 0
+    replay_drained: int = 0
+    written: int = 0
+    already_present: int = 0
+    retryable_failure_count: int = 0
+    identity_conflict_count: int = 0
+    bootstrap_mode: str | None = None
+    needs_immediate_wake: bool = False
+    retry_delay_s: float | None = None
+    reason: str = ""
+    max_written_row_id: int = 0  # F168 D4: highest row id written this run
+    # fx168 FIX-2: stale path heal data (mailbox_id, terminal_id, generation, new_path)
+    _fx168_stale_heal: tuple[str, str, int, str] | None = None
+
+
+def _get_backoff_delay(terminal_id: str) -> float:
+    """D16: Compute backoff delay and increment failure streak."""
+    streak = _failure_streaks.get(terminal_id, 0)
+    _failure_streaks[terminal_id] = streak + 1
+    idx = min(streak, len(_BACKOFF_SCHEDULE) - 1)
+    return _BACKOFF_SCHEDULE[idx]
+
+
+def request_delivery(terminal_id: str) -> None:
+    """D7/D15: Signal that deliverable work exists for a terminal.
+
+    O(1) admission: increments dirty_epoch, invalidates delayed token,
+    and admits at most one immediate callback. Never calls deliver_pending
+    inline and never writes the native inbox.
+    """
+    service = globals().get("inbox_service")
+    if not isinstance(service, InboxService):
+        return
+
+    # F339: suppress delivery for terminals already abandoned as ghosts.
+    if service._f339_is_abandoned(terminal_id):
+        return
+
+    old_handle: Any = None
+    post_immediate = False
+
+    with _delivery_seq_guard:
+        loop = service._delivery_loop
+        if loop is None or loop.is_closed():
+            return
+
+        state = _wake_states.get(terminal_id)
+        if state is None:
+            state = _WakeState()
+            _wake_states[terminal_id] = state
+
+        state.dirty_epoch += 1
+        # Invalidate delayed token
+        state.delayed_token += 1
+        old_handle = state.delayed_handle
+        state.delayed_handle = None
+
+        # Admit one immediate if none running/posted
+        if not state.immediate_admitted:
+            state.immediate_admitted = True
+            post_immediate = True
+
+    # Cancel old timer and post immediate outside guard
+    if old_handle is not None:
+        old_handle.cancel()
+
+    if post_immediate:
+        try:
+            loop.call_soon_threadsafe(service._f136_start_delivery_wake, terminal_id)
+        except RuntimeError:
+            with _delivery_seq_guard:
+                st = _wake_states.get(terminal_id)
+                if st:
+                    st.immediate_admitted = False
 
 
 @dataclass
@@ -327,8 +582,13 @@ def clear_terminal_delivery_state(terminal_id: str) -> None:
     if isinstance(service, InboxService):
         service._clear_identity_authority(terminal_id)
         service.reset_binding_episodes(terminal_id)
+        with service._binding_lock:
+            service._binding_suppress_counts.pop(terminal_id, None)
         with service._gone_lock:
             service._gone_streaks.pop(terminal_id, None)
+        # F339: clear ghost-terminal streak on explicit state reset.
+        with service._tnf_lock:
+            service._terminal_not_found_streaks.pop(terminal_id, None)
     clear_binding_staleness_state(terminal_id)
 
 
@@ -345,6 +605,26 @@ def _defer_messages(terminal_id: str, messages) -> None:
 class InboxService:
     """Delivers one pending message per terminal per IDLE cycle."""
 
+    # --- F74: message-state authority helper ---
+    @staticmethod
+    def _message_statuses(message_ids: list[int]) -> dict[int, str]:
+        """Read current MESSAGE-level statuses for a batch of IDs.
+
+        Single query, no lock — advisory pre-check before recovery actions.
+        The CAS in recover_wpm2_stale_attempt remains the last-line invariant.
+        """
+        if not message_ids:
+            return {}
+        from cli_agent_orchestrator.clients.database import InboxModel, SessionLocal
+
+        with SessionLocal() as db:
+            rows = (
+                db.query(InboxModel.id, InboxModel.status)
+                .filter(InboxModel.id.in_(message_ids))
+                .all()
+            )
+        return {int(row_id): status for row_id, status in rows}
+
     def __init__(self) -> None:
         self._defer_attempts: dict[int, int] = {}
         self._defer_notified: set[int] = set()
@@ -352,9 +632,14 @@ class InboxService:
         self._identity_authority: dict[tuple[str, str], _IdentityAuthorityEpisode] = {}
         self._identity_lock = threading.Lock()
         self._binding_authority: dict[tuple[str, str], _IdentityAuthorityEpisode] = {}
+        # Monotonic per-terminal suppress count for B3 escape (not reset on rebind).
+        self._binding_suppress_counts: dict[str, int] = {}
         self._binding_lock = threading.Lock()
         self._gone_streaks: dict[str, int] = {}
         self._gone_lock = threading.Lock()
+        # F339: consecutive terminal-not-found streaks for ghost-terminal detection.
+        self._terminal_not_found_streaks: dict[str, int] = {}
+        self._tnf_lock = threading.Lock()
         self._delivery_loop: asyncio.AbstractEventLoop | None = None
         self._delivery_registry: PluginRegistry | None = None
         self._posted_delivery_wakes: set[tuple[str, int]] = set()
@@ -470,6 +755,503 @@ class InboxService:
 
         task.add_done_callback(completed)
 
+    # -------------------------------------------------------------------
+    # F136-D13/D15: Callback delivery runner and wake lifecycle
+    # -------------------------------------------------------------------
+
+    def _f136_start_delivery_wake(self, terminal_id: str) -> None:
+        """D15: Start one delivery run for a terminal on the event loop."""
+
+        async def run_delivery() -> None:
+            outcome = await asyncio.to_thread(self._f136_run_callback_delivery, terminal_id)
+            self._f136_post_delivery(terminal_id, outcome)
+
+        task = asyncio.create_task(run_delivery())
+        self._delivery_tasks.add(task)
+
+        def done(t: asyncio.Task[None]) -> None:
+            self._delivery_tasks.discard(t)
+            try:
+                t.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("f136_delivery_wake_failed terminal=%s", terminal_id)
+
+        task.add_done_callback(done)
+
+    def _f136_run_callback_delivery(self, terminal_id: str) -> "CallbackRunOutcome":
+        """D13/D14: Bounded replay-first, cursor-second write protocol."""
+        # F339: if already abandoned, exit immediately without DB queries.
+        if self._f339_is_abandoned(terminal_id):
+            return CallbackRunOutcome(reason="abandoned_no_terminal")
+
+        from cli_agent_orchestrator.clients.database import (
+            CallbackBatchResult,
+            commit_supervisor_callback_progress,
+            get_supervisor_callback_batch,
+        )
+        from cli_agent_orchestrator.services.mailbox_service import (
+            get_mailbox_authority_lock,
+            is_supervisor_mailbox_pull_terminal,
+        )
+        from cli_agent_orchestrator.services.teammate_push_service import (
+            NativeInboxWriteResult,
+            write_supervisor_callback_notification,
+        )
+
+        MAX_ROWS_PER_RUN = 50
+        MAX_SECONDS_PER_RUN = 0.200
+
+        # Resolve mailbox for this terminal
+        from cli_agent_orchestrator.clients.database import (
+            MailboxIncarnationModel,
+            MailboxModel,
+            SessionLocal,
+        )
+
+        with SessionLocal() as db:
+            inc = db.query(MailboxIncarnationModel).filter_by(terminal_id=terminal_id).one_or_none()
+            if inc is None:
+                return self._f339_record_not_found(terminal_id, "no_incarnation")
+            mailbox = db.query(MailboxModel).filter_by(id=inc.mailbox_id).one_or_none()
+            if mailbox is None:
+                return self._f339_record_not_found(terminal_id, "no_mailbox")
+            mailbox_id = str(mailbox.id)
+            generation = int(mailbox.generation)
+            session_name = str(mailbox.session_name)
+            role = str(mailbox.role)
+
+        # F339: incarnation + mailbox found — reset ghost-terminal streak.
+        self._f339_reset_not_found(terminal_id)
+
+        # D10: acquire delivery_lock then authority lock
+        delivery_lock = get_delivery_lock(terminal_id)
+        if not delivery_lock.acquire(timeout=0.5):
+            return CallbackRunOutcome(reason="delivery_lock_contention")
+
+        authority_lock = get_mailbox_authority_lock(session_name, role)
+        if not authority_lock.acquire(timeout=0.5):
+            delivery_lock.release()
+            return CallbackRunOutcome(reason="authority_lock_contention")
+
+        try:
+            deadline_mono = time.monotonic() + MAX_SECONDS_PER_RUN
+
+            # D9: Get batch
+            batch = get_supervisor_callback_batch(
+                mailbox_id=mailbox_id,
+                terminal_id=terminal_id,
+                generation=generation,
+                limit=MAX_ROWS_PER_RUN,
+            )
+
+            if batch.kind == "stale_authority":
+                return CallbackRunOutcome(reason=f"stale: {batch.reason}")
+            if batch.kind == "retryable_failure":
+                return CallbackRunOutcome(
+                    retryable_failure_count=1,
+                    reason=batch.reason,
+                    retry_delay_s=_get_backoff_delay(terminal_id),
+                )
+            if batch.kind == "no_path":
+                # F150: Self-heal — attempt to re-discover inbox path from
+                # terminal metadata before giving up.
+                healed = self._f150_self_heal_inbox_path(
+                    mailbox_id=mailbox_id,
+                    terminal_id=terminal_id,
+                    generation=generation,
+                )
+                if healed:
+                    # Re-fetch batch now that path is populated
+                    batch = get_supervisor_callback_batch(
+                        mailbox_id=mailbox_id,
+                        terminal_id=terminal_id,
+                        generation=generation,
+                        limit=MAX_ROWS_PER_RUN,
+                    )
+                    if batch.kind == "no_path":
+                        # Self-heal wrote a path but it didn't stick — give up
+                        return CallbackRunOutcome(
+                            cursor_before=batch.cursor,
+                            reason="no_path",
+                            retry_delay_s=_get_backoff_delay(terminal_id),
+                            retryable_failure_count=1,
+                        )
+                else:
+                    return CallbackRunOutcome(
+                        cursor_before=batch.cursor,
+                        reason="no_path",
+                        retry_delay_s=_get_backoff_delay(terminal_id),
+                        retryable_failure_count=1,
+                    )
+            if not batch.rows:
+                # Empty scan: reset failure streak
+                _failure_streaks.pop(terminal_id, None)
+                return CallbackRunOutcome(
+                    cursor_before=batch.cursor,
+                    cursor_after=batch.cursor,
+                    bootstrap_mode=batch.bootstrap_mode,
+                    reason="empty",
+                )
+
+            # fx168 FIX-2: Staleness-aware self-heal — if the batch's canonical
+            # inbox_path differs from the CURRENT terminal metadata cc_team_inbox_path,
+            # exit the lock scope and reconcile via set_supervisor_callback_inbox_path
+            # (which acquires its own locks, bumps version, re-kicks request_delivery).
+            # One attempt per run; the re-wake handles the actual write.
+            _fx168_stale_heal_needed: tuple[str, str] | None = None
+            if batch.inbox_path:
+                try:
+                    from cli_agent_orchestrator.clients.database import (
+                        get_terminal_metadata as _get_meta,
+                    )
+
+                    _meta = _get_meta(terminal_id)
+                    _current_path = (
+                        (_meta.get("metadata") or {}).get("cc_team_inbox_path") if _meta else None
+                    )
+                    if _current_path and _current_path != batch.inbox_path:
+                        _fx168_stale_heal_needed = (batch.inbox_path, _current_path)
+                except Exception as _heal_exc:
+                    logger.debug(
+                        "fx168_stale_path_check_failed terminal=%s: %s", terminal_id, _heal_exc
+                    )
+
+            if _fx168_stale_heal_needed is not None:
+                # Cannot reconcile while holding locks (set_supervisor_callback_inbox_path
+                # acquires the same locks). Signal stale_path_detected; the reconcile
+                # happens in _f136_post_delivery after lock release.
+                _old_path, _new_path = _fx168_stale_heal_needed
+                return CallbackRunOutcome(
+                    cursor_before=batch.cursor,
+                    needs_immediate_wake=True,
+                    reason="stale_path_detected",
+                    _fx168_stale_heal=(mailbox_id, terminal_id, generation, _new_path),
+                )
+
+            inbox_path = Path(os.path.expanduser(batch.inbox_path))
+            cursor_before = batch.cursor
+            new_cursor = batch.cursor or 0
+            successful_replay_ids: list[int] = []
+            written = 0
+            already_present = 0
+            retryable_failures = 0
+            identity_conflicts = 0
+            processed = 0
+            _max_written_row_id = 0  # F168 D4: track highest row id written
+
+            # D13: Process replay rows first, then forward rows
+            for row in batch.rows:
+                if time.monotonic() >= deadline_mono:
+                    break
+
+                msg = InboxMessage(
+                    id=row.inbox_row_id,
+                    sender_id=row.sender_id,
+                    receiver_id=terminal_id,
+                    message=row.message,
+                    orchestration_type=OrchestrationType.SEND_MESSAGE,
+                    status=MessageStatus.PENDING,
+                    created_at=row.created_at,
+                )
+                result = write_supervisor_callback_notification(
+                    inbox_path=inbox_path,
+                    mailbox_id=mailbox_id,
+                    message=msg,
+                    deadline_mono=deadline_mono,
+                )
+                processed += 1
+
+                if result.kind == "written":
+                    written += 1
+                    if row.inbox_row_id > _max_written_row_id:
+                        _max_written_row_id = row.inbox_row_id
+                elif result.kind == "already_present":
+                    already_present += 1
+                elif result.kind == "retryable_failure":
+                    retryable_failures += 1
+                    break  # Stop at first failure
+                elif result.kind == "identity_conflict":
+                    identity_conflicts += 1
+                    logger.error(
+                        "f136_identity_conflict mailbox=%s row=%s reason=%s",
+                        mailbox_id,
+                        row.inbox_row_id,
+                        result.reason,
+                    )
+                    break  # Stop at conflict
+
+                # Track progress
+                if result.kind in ("written", "already_present"):
+                    if row.tag == "replay":
+                        successful_replay_ids.append(row.inbox_row_id)
+                    elif row.tag == "forward":
+                        # Forward rows are batch-ordered ascending; all are eligible.
+                        # Advance cursor through every successfully written row.
+                        new_cursor = row.inbox_row_id
+
+            # D13 step 5: commit progress once
+            if successful_replay_ids or new_cursor > (cursor_before or 0):
+                progress = commit_supervisor_callback_progress(
+                    mailbox_id=mailbox_id,
+                    terminal_id=terminal_id,
+                    generation=generation,
+                    expected_cursor=cursor_before or 0,
+                    new_cursor=new_cursor,
+                    expected_path_version=batch.path_version,
+                    replay_row_ids=tuple(successful_replay_ids),
+                )
+                if progress.kind == "advanced":
+                    _failure_streaks.pop(terminal_id, None)
+                elif progress.kind == "path_changed":
+                    return CallbackRunOutcome(
+                        selected=len(batch.rows),
+                        processed=processed,
+                        cursor_before=cursor_before,
+                        cursor_after=cursor_before,
+                        written=written,
+                        already_present=already_present,
+                        reason="path_changed_during_run",
+                        needs_immediate_wake=True,
+                    )
+                else:
+                    retryable_failures += 1
+            else:
+                _failure_streaks.pop(terminal_id, None)
+
+            replay_selected = sum(1 for r in batch.rows if r.tag == "replay")
+            needs_wake = batch.has_more or (retryable_failures == 0 and processed < len(batch.rows))
+
+            return CallbackRunOutcome(
+                selected=len(batch.rows),
+                processed=processed,
+                cursor_before=cursor_before,
+                cursor_after=new_cursor if new_cursor > (cursor_before or 0) else cursor_before,
+                replay_selected=replay_selected,
+                replay_drained=len(successful_replay_ids),
+                written=written,
+                already_present=already_present,
+                retryable_failure_count=retryable_failures,
+                identity_conflict_count=identity_conflicts,
+                bootstrap_mode=batch.bootstrap_mode,
+                needs_immediate_wake=needs_wake,
+                retry_delay_s=_get_backoff_delay(terminal_id) if retryable_failures else None,
+                reason="ok",
+                max_written_row_id=_max_written_row_id,
+            )
+        except Exception as exc:
+            logger.exception("f136_delivery_run_error terminal=%s", terminal_id)
+            return CallbackRunOutcome(
+                retryable_failure_count=1,
+                reason=f"exception: {exc}",
+                retry_delay_s=_get_backoff_delay(terminal_id),
+            )
+        finally:
+            authority_lock.release()
+            delivery_lock.release()
+
+    def _f150_self_heal_inbox_path(
+        self, *, mailbox_id: str, terminal_id: str, generation: int
+    ) -> bool:
+        """F150: Attempt to re-discover and populate cc_inbox_path from terminal metadata.
+
+        Returns True if a path was found and set, False otherwise.
+        """
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+        from cli_agent_orchestrator.services.mailbox_service import (
+            set_supervisor_callback_inbox_path,
+        )
+
+        try:
+            meta_record = get_terminal_metadata(terminal_id)
+            if not meta_record:
+                # F339: terminal metadata absent — record streak toward ghost detection.
+                # Note: we don't abandon here (the caller handles retries), but we
+                # increment so repeated failures across delivery attempts accumulate.
+                self._f339_record_not_found(terminal_id, "no_terminal_metadata_f150")
+                return False
+            # F339: terminal metadata found — reset ghost-terminal streak.
+            self._f339_reset_not_found(terminal_id)
+            md = meta_record.get("metadata") or {}
+            candidate_path = md.get("cc_team_inbox_path")
+            if not candidate_path:
+                return False
+            result = set_supervisor_callback_inbox_path(
+                mailbox_id=mailbox_id,
+                terminal_id=terminal_id,
+                generation=generation,
+                path=candidate_path,
+            )
+            return result.kind in ("updated", "unchanged")
+        except Exception as exc:
+            logger.debug("F150 self-heal inbox path failed: %s", exc)
+            return False
+
+    # ------------------------------------------------------------------
+    # F339: Ghost-terminal detection — stop polling after N consecutive 404s
+    # ------------------------------------------------------------------
+
+    def _f339_record_not_found(self, terminal_id: str, reason: str) -> "CallbackRunOutcome":
+        """Increment ghost-terminal streak; abandon episode at threshold."""
+        with self._tnf_lock:
+            streak = self._terminal_not_found_streaks.get(terminal_id, 0) + 1
+            self._terminal_not_found_streaks[terminal_id] = streak
+
+        if streak >= _F339_TERMINAL_NOT_FOUND_MAX:
+            logger.warning(
+                "f339_abandoned_no_terminal terminal=%s reason=%s streak=%d"
+                " — delivery permanently stopped for this episode",
+                terminal_id,
+                reason,
+                streak,
+            )
+            # Clear wake state so no further retries are scheduled
+            with _delivery_seq_guard:
+                _wake_states.pop(terminal_id, None)
+            return CallbackRunOutcome(reason="abandoned_no_terminal")
+        return CallbackRunOutcome(reason=reason)
+
+    def _f339_reset_not_found(self, terminal_id: str) -> None:
+        """Reset ghost-terminal streak on successful terminal lookup."""
+        with self._tnf_lock:
+            self._terminal_not_found_streaks.pop(terminal_id, None)
+
+    def _f339_is_abandoned(self, terminal_id: str) -> bool:
+        """Check if a terminal has been marked as abandoned (ghost)."""
+        with self._tnf_lock:
+            return (
+                self._terminal_not_found_streaks.get(terminal_id, 0) >= _F339_TERMINAL_NOT_FOUND_MAX
+            )
+
+    def _f136_post_delivery(self, terminal_id: str, outcome: "CallbackRunOutcome") -> None:
+        """D15: After delivery, decide: immediate rerun, delayed retry, or idle."""
+        # F339: If the episode was abandoned (ghost terminal), suppress all retries.
+        if outcome.reason == "abandoned_no_terminal":
+            return
+
+        # fx168 FIX-2: Perform stale-path reconcile outside the runner's lock scope.
+        # set_supervisor_callback_inbox_path acquires its own locks and signals
+        # request_delivery internally; the needs_immediate_wake flag re-arms the runner.
+        if outcome._fx168_stale_heal is not None:
+            try:
+                _mb_id, _term_id, _gen, _new_path = outcome._fx168_stale_heal
+                from cli_agent_orchestrator.services.mailbox_service import (
+                    set_supervisor_callback_inbox_path,
+                )
+
+                _heal_result = set_supervisor_callback_inbox_path(
+                    mailbox_id=_mb_id,
+                    terminal_id=_term_id,
+                    generation=_gen,
+                    path=_new_path,
+                )
+                if _heal_result.kind in ("updated", "unchanged"):
+                    logger.info(
+                        "fx168_stale_path_healed mailbox=%s terminal=%s new_path=%s",
+                        _mb_id,
+                        _term_id,
+                        _new_path,
+                    )
+            except Exception as _heal_exc:
+                logger.debug(
+                    "fx168_stale_path_heal_post_delivery_failed terminal=%s: %s",
+                    terminal_id,
+                    _heal_exc,
+                )
+
+        # F168 D2: ring the doorbell before entering _delivery_seq_guard.
+        # D3: best-effort, isolated — exceptions never propagate.
+        if outcome.written > 0 and outcome.max_written_row_id > 0:
+            try:
+                from cli_agent_orchestrator.services.doorbell_service import (
+                    ring_supervisor_doorbell,
+                )
+
+                ring_supervisor_doorbell(
+                    terminal_id,
+                    outcome.max_written_row_id,
+                    written_count=outcome.written,
+                )
+            except Exception as _bell_exc:
+                logger.debug(
+                    "f168_doorbell_post_delivery_error terminal=%s: %s", terminal_id, _bell_exc
+                )
+
+        post_immediate = False
+        arm_delayed: float | None = None
+
+        with _delivery_seq_guard:
+            state = _wake_states.get(terminal_id)
+            if state is None:
+                return
+
+            if outcome.needs_immediate_wake:
+                # More work available — rerun immediately
+                state.holder_epoch = state.dirty_epoch
+                post_immediate = True
+            elif outcome.retry_delay_s is not None:
+                # Failure — arm delayed retry
+                state.immediate_admitted = False
+                if state.dirty_epoch > state.holder_epoch:
+                    # New work arrived during run — immediate instead
+                    state.immediate_admitted = True
+                    post_immediate = True
+                else:
+                    arm_delayed = outcome.retry_delay_s
+            elif state.dirty_epoch > state.holder_epoch:
+                # New work arrived during our run — one more immediate
+                state.holder_epoch = state.dirty_epoch
+                post_immediate = True
+            else:
+                # Idle
+                state.immediate_admitted = False
+
+        loop = self._delivery_loop
+        if loop is None or loop.is_closed():
+            return
+
+        if post_immediate:
+            try:
+                loop.call_soon_threadsafe(self._f136_start_delivery_wake, terminal_id)
+            except RuntimeError:
+                with _delivery_seq_guard:
+                    st = _wake_states.get(terminal_id)
+                    if st:
+                        st.immediate_admitted = False
+        elif arm_delayed is not None:
+            try:
+                loop.call_soon_threadsafe(self._f136_arm_delayed, terminal_id, arm_delayed)
+            except RuntimeError:
+                pass
+
+    def _f136_arm_delayed(self, terminal_id: str, delay: float) -> None:
+        """Arm a delayed delivery wake on the event loop."""
+        with _delivery_seq_guard:
+            state = _wake_states.get(terminal_id)
+            if state is None:
+                return
+            token = state.delayed_token
+            state.delayed_handle = asyncio.get_event_loop().call_later(
+                delay, self._f136_delayed_fire, terminal_id, token
+            )
+
+    def _f136_delayed_fire(self, terminal_id: str, token: int) -> None:
+        """Fire a delayed wake if the token is still valid."""
+        with _delivery_seq_guard:
+            state = _wake_states.get(terminal_id)
+            if state is None:
+                return
+            if state.delayed_token != token:
+                return  # Superseded
+            state.delayed_handle = None
+            if not state.immediate_admitted:
+                state.immediate_admitted = True
+            else:
+                return  # Already running
+
+        self._f136_start_delivery_wake(terminal_id)
+
     def _clear_identity_authority(self, terminal_id: str) -> None:
         with self._identity_lock:
             for key in [key for key in self._identity_authority if key[0] == terminal_id]:
@@ -496,6 +1278,15 @@ class InboxService:
         return str(generation)
 
     @staticmethod
+    def _evidence_for_confirmed_attempt(
+        terminal_id: str, evidence: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Tag confirmed-settlement evidence when the binding is presumed_stale."""
+        if binding_presumed_stale(terminal_id):
+            return {**evidence, "kind": "binding_presumed_stale"}
+        return dict(evidence)
+
+    @staticmethod
     def _identity_notice_receiver(terminal_id: str, metadata: dict[str, Any]) -> str | None:
         caller_id = metadata.get("caller_id")
         if isinstance(caller_id, str) and get_terminal_metadata(caller_id) is not None:
@@ -504,18 +1295,57 @@ class InboxService:
         if not isinstance(session_name, str):
             return None
         from cli_agent_orchestrator.clients.database import list_terminals_by_session
+        from cli_agent_orchestrator.services.fleet_service import build_fleet
         from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
+        try:
+            fleet = build_fleet(session_name)
+        except ValueError:
+            return None
+        fleet_terminals = list(fleet.get("terminals", []))
+        live_ids = {
+            str(item["id"])
+            for item in fleet_terminals
+            if item.get("status") != TerminalStatus.ERROR.value and not item.get("orphan")
+        }
+        candidates: list[dict[str, Any]] = []
         for row in list_terminals_by_session(session_name):
-            if row.get("id") == terminal_id:
+            row_id = row.get("id")
+            if row_id == terminal_id or row_id not in live_ids:
                 continue
             try:
                 profile = load_agent_profile(row.get("agent_profile") or "")
             except (FileNotFoundError, ValueError):
                 continue
             if getattr(profile, "role", None) == "supervisor":
-                return str(row["id"])
-        return None
+                candidates.append(row)
+        if not candidates:
+            return None
+
+        # Parent → most-recent-live → critical. Prefer the subject's own live
+        # supervisor (metadata caller_id / fleet parent_id) before last_active.
+        parent_id = metadata.get("caller_id")
+        if not isinstance(parent_id, str):
+            subject = next(
+                (item for item in fleet_terminals if str(item.get("id")) == terminal_id),
+                None,
+            )
+            parent_id = subject.get("parent_id") if subject is not None else None
+        if isinstance(parent_id, str) and parent_id in live_ids:
+            for candidate in candidates:
+                if str(candidate.get("id")) == parent_id:
+                    return parent_id
+
+        def _last_active_key(row: dict[str, Any]) -> datetime:
+            value = row.get("last_active")
+            if not isinstance(value, datetime):
+                return datetime.min.replace(tzinfo=timezone.utc)
+            if value.tzinfo is None:
+                return value.replace(tzinfo=get_localzone(), fold=0).astimezone(timezone.utc)
+            return value.astimezone(timezone.utc)
+
+        candidates.sort(key=_last_active_key, reverse=True)
+        return str(candidates[0]["id"])
 
     def _record_identity_authority_failure(
         self,
@@ -619,12 +1449,40 @@ class InboxService:
         metadata: dict[str, Any],
         prior_lookups: Sequence[tuple[dict[str, Any], str, dict[str, Any]]],
     ) -> tuple[str, dict[str, Any] | None, dict[str, Any], str | None] | None:
-        """Resolve one presumed-stale binding before any new attempt can open."""
+        """Resolve one presumed-stale binding before any new attempt can open.
+
+        Compact/clear rotations are first-class: when a compact binding points at
+        a different transcript path, rebind and stop suppressing. Suppression is
+        bounded by BINDING_SUPPRESS_MAX_CYCLES — after that, return None so
+        delivery may open without transcript confirmation (unverified path).
+        """
         if not any(result == "absent" for _, result, _ in prior_lookups):
             return None
         stale = observe_binding_absence(metadata)
         if stale is None or not stale.presumed_stale:
             return None
+
+        compact = get_latest_compact_transcript_binding(terminal_id)
+        if compact is not None:
+            compact_path = Path(str(compact.get("transcript_path") or "")).resolve(strict=False)
+            if compact_path != stale.path and str(compact_path):
+                recovery = recover_transcript_binding_if_current(
+                    terminal_id, stale.binding_id, str(compact_path)
+                )
+                if recovery in {"inserted", "authority_changed"}:
+                    clear_binding_staleness_state(terminal_id)
+                    for prior, _, prior_evidence in prior_lookups:
+                        refreshed, refreshed_evidence = _wpm2_lookup(
+                            metadata,
+                            prior["payload_hash"],
+                            prior.get("started_at"),
+                            prior_evidence,
+                        )
+                        if refreshed == "hit":
+                            return "hit", prior, refreshed_evidence, str(compact_path)
+                    # Rotation followed; allow a fresh delivery attempt to open.
+                    return None
+
         for prior, _, prior_evidence in prior_lookups:
             candidate_result, candidate_evidence, candidate = scan_binding_candidates(
                 stale,
@@ -647,8 +1505,29 @@ class InboxService:
                 if refreshed == "hit":
                     return "hit", prior, refreshed_evidence, None
                 return "authority_changed", None, {}, None
-            return "hit", prior, candidate_evidence, str(candidate)
+            return (
+                "hit",
+                prior,
+                {**candidate_evidence, "kind": "binding_presumed_stale"},
+                str(candidate),
+            )
         self._record_binding_authority_failure(terminal_id, stale.binding_id, metadata)
+        # Escape counter is per-terminal (not per binding_id): rebind/POST must not
+        # restart the N-cycle climb and starve the deadlock break (S3).
+        with self._binding_lock:
+            count = self._binding_suppress_counts.get(terminal_id, 0) + 1
+            self._binding_suppress_counts[terminal_id] = count
+        if count >= BINDING_SUPPRESS_MAX_CYCLES:
+            logger.error(
+                "binding_authority_suppress_exhausted terminal=%s binding=%s count=%s "
+                "allowing_unverified_delivery",
+                terminal_id,
+                stale.binding_id,
+                count,
+            )
+            # Do NOT clear _declared_presumed_stale: escaped delivery must still
+            # tag kind=binding_presumed_stale so mailbox reports confirmed_unverified (S1).
+            return None
         return "suppressed", None, {}, None
 
     def _evict_defer_state(self, messages) -> None:
@@ -749,17 +1628,69 @@ class InboxService:
         if sender_id.startswith("watchdog:"):
             return
         stalled_callback_watchdog.record_callback_if_to_caller(sender_id, terminal_id)
-        if metadata.get("caller_id") and not park_warm and (
-            orchestration_type == OrchestrationType.ASSIGN
-            or (
-                orchestration_type == OrchestrationType.SEND_MESSAGE
-                and sender_id == metadata["caller_id"]
-                and stalled_callback_watchdog.has_episode(terminal_id)
+        if (
+            metadata.get("caller_id")
+            and not park_warm
+            and (
+                orchestration_type == OrchestrationType.ASSIGN
+                or (
+                    orchestration_type == OrchestrationType.SEND_MESSAGE
+                    and sender_id == metadata["caller_id"]
+                    and stalled_callback_watchdog.has_episode(terminal_id)
+                )
             )
         ):
             stalled_callback_watchdog.record_inbound_task(
                 terminal_id, metadata["caller_id"], metadata.get("agent_profile") or ""
             )
+
+    def _settle_probable_delivered(
+        self,
+        attempt_uuid: str,
+        message_ids: list[int],
+        batch: Sequence[InboxMessage],
+        evidence: dict[str, Any],
+        opener_ref: dict[str, Any] | None,
+        terminal_id: str,
+        sender_id: str,
+        orchestration_type: OrchestrationType,
+        metadata: dict[str, Any],
+        park_warm: bool,
+    ) -> tuple[bool, dict[str, Any]]:
+        classified = _classify_probable_delivery(evidence, terminal_id, opener_ref)
+        if not is_probable_delivered(classified):
+            return False, classified
+        settlement_evidence = self._evidence_for_confirmed_attempt(
+            terminal_id, {**classified, "kind": "execution_evidence"}
+        )
+        ordered_ids = sorted(message_ids)
+        won = _confirmed_settlement(
+            lambda: settle_attempt_inferred_delivered_batch(
+                attempt_uuid,
+                ordered_ids,
+                settlement_evidence,
+                on_confirmed=lambda: self._commit_watchdog_ops(
+                    terminal_id,
+                    sender_id,
+                    orchestration_type,
+                    metadata,
+                    park_warm,
+                ),
+            )
+        )
+        if not won:
+            return False, classified
+        growth = settlement_evidence["transcript_growth"]
+        assert isinstance(growth, dict)
+        growth_bytes = growth["size_at_settle"] - growth["size_at_open"]
+        logger.info(
+            "probable_delivered mids=%s receiver=%s growth=%s",
+            ordered_ids,
+            terminal_id,
+            growth_bytes,
+        )
+        self._evict_defer_state(batch)
+        return True, settlement_evidence
 
     @staticmethod
     def _exact_batch_attempts(message_ids: list[int]) -> list[dict]:
@@ -826,7 +1757,7 @@ class InboxService:
             return "normal", resolution
 
         newest = ambiguous[-1]
-        now = datetime.now(timezone.utc)
+        now = _utcnow()
         now_z = now.isoformat().replace("+00:00", "Z")
 
         lookup_result = "unresolved"
@@ -1149,10 +2080,14 @@ class InboxService:
     def deliver_pending(
         self,
         terminal_id: str,
-        num_messages: int = 1,
+        num_messages: int = 0,
         registry: PluginRegistry | None = None,
     ) -> None:
         """Deliver pending message(s) to a ready terminal. Use num_messages=0 for all.
+
+        F136/WPDT W6: Default changed from 1 to 0 (drain all eligible rows per
+        wake, bounded batch). This eliminates single-message starvation where
+        N>1 pending rows required N separate wakes to drain.
 
         Status comes from the StatusMonitor (the event-driven source of truth).
         Delivery normally happens on IDLE/COMPLETED; providers that accept input
@@ -1162,6 +2097,10 @@ class InboxService:
         ``send_message`` orchestration type are threaded to ``terminal_service``
         so ``PostSendMessageEvent`` hooks fire with correct attribution.
         """
+        # F339: skip delivery for terminals already abandoned as ghosts.
+        if self._f339_is_abandoned(terminal_id):
+            return
+
         with _delivery_seq_guard:
             captured_wake = _delivery_wake_seq.get(terminal_id, 0)
         delivery_lock = get_delivery_lock(terminal_id)
@@ -1173,8 +2112,16 @@ class InboxService:
             return
         try:
             metadata = get_terminal_metadata(terminal_id) or {}
+            if not metadata:
+                # F339: terminal row absent — record streak and bail if abandoned.
+                outcome = self._f339_record_not_found(terminal_id, "no_terminal_metadata")
+                if outcome.reason == "abandoned_no_terminal":
+                    return
+                return
             if metadata.get("recovery_state") not in (None, "rebound"):
                 return
+            # F339: terminal found — reset ghost-terminal streak.
+            self._f339_reset_not_found(terminal_id)
             legacy_test_seam = begin_delivery_attempt is not _PRODUCTION_BEGIN_DELIVERY_ATTEMPT
             routed_generation: int | None = None
             provider = None
@@ -1326,6 +2273,34 @@ class InboxService:
             if not messages:
                 return
 
+            # --- WP-MAILBOX-CHANNEL: pull-mode gate (D6) ---
+            # If the supervisor.mailbox_pull flag is on AND this terminal is the
+            # current supervisor mailbox incarnation, skip the push entirely.
+            # Rows stay PENDING; the supervisor drains them via list_messages/ack.
+            from cli_agent_orchestrator.services.mailbox_service import (
+                is_supervisor_mailbox_pull_terminal,
+            )
+
+            if is_supervisor_mailbox_pull_terminal(terminal_id):
+                # WP-W2M-PUSH-BRIDGE: attempt teammate-push notification (best-effort).
+                from cli_agent_orchestrator.services.teammate_push_service import (
+                    _should_teammate_push,
+                    attempt_teammate_push,
+                )
+
+                if _should_teammate_push(terminal_id):
+                    try:
+                        attempt_teammate_push(terminal_id, messages)
+                        # fx168 FIX-4: Removed dead D9 doorbell call. deliver_pending
+                        # holds delivery_lock here; ring_supervisor_doorbell's G1 gate
+                        # tries the same non-reentrant lock → always "skipped_gate".
+                        # The F136 runner's doorbell in _f136_post_delivery (armed by
+                        # FIX-1's request_delivery signal) is the correct path.
+                    except Exception as _push_exc:
+                        logger.debug(f"teammate_push side-effect failed: {_push_exc}")
+                return
+            # --- end WP-MAILBOX-CHANNEL gate ---
+
             # Deliver in contiguous runs of the same sender and orchestration mode.
             # With the default num_messages=1 this is a single run; when draining
             # all pending messages (num_messages=0) a batch can span multiple groups,
@@ -1386,9 +2361,18 @@ class InboxService:
                                 )
                             except Exception:
                                 return
-                        if not isinstance(
-                            getattr(admission_snapshot, "status", None), TerminalStatus
-                        ):
+                        if isinstance(getattr(admission_snapshot, "status", None), TerminalStatus):
+                            status = receiver_state_view.view_from_legacy(
+                                "delivery.admission_status",
+                                terminal_id,
+                                admission_snapshot.status,
+                                max_age_s=5.0,
+                                none_behavior="none",
+                                monitor=status_monitor,
+                            )
+                            if status is None:
+                                return
+                        else:
                             admission_snapshot = None
                             status = receiver_state_view.snapshot_view(
                                 "delivery.admission_status",
@@ -1404,8 +2388,6 @@ class InboxService:
                                 TerminalStatus.COMPLETED,
                             }:
                                 return
-                        else:
-                            status = admission_snapshot.status
                         if metadata.get("provider") == "claude_code" and status not in {
                             TerminalStatus.IDLE,
                             TerminalStatus.COMPLETED,
@@ -1455,6 +2437,7 @@ class InboxService:
                         if gate_state == "inject" and isinstance(gate_evidence, dict)
                         else transcript_ref(resolution)
                     )
+                    opener_ref = _opener_transcript_ref(persisted_evidence)
                     successor_plans: list[SuccessorLookupPlan] = []
                     carried_plans = persisted_evidence.pop("_successor_lookup_plans", ())
                     if isinstance(carried_plans, tuple) and all(
@@ -1897,6 +2880,23 @@ class InboxService:
                         return
                     attempt_uuid = opened.attempt_uuid
                     assert attempt_uuid is not None
+
+                    def settle_probable_delivery(
+                        candidate_evidence: dict[str, Any],
+                    ) -> tuple[bool, dict[str, Any]]:
+                        return self._settle_probable_delivered(
+                            attempt_uuid,
+                            message_ids,
+                            batch,
+                            candidate_evidence,
+                            opener_ref,
+                            terminal_id,
+                            sender_id,
+                            orchestration_type,
+                            metadata,
+                            park_warm,
+                        )
+
                     authority_lock = None
                     candidate_logical_id = getattr(batch[0], "logical_receiver_id", None)
                     logical_receiver_id = (
@@ -1997,9 +2997,14 @@ class InboxService:
                         if submit_observation is None:
                             raise
                         self._reset_identity_authority(terminal_id)
+                        probable, classified_evidence = settle_probable_delivery(
+                            submit_evidence or {}
+                        )
+                        if probable:
+                            return
                         settle_delivery_attempt_proof_safe(
                             attempt_uuid,
-                            submit_evidence or {},
+                            classified_evidence,
                             status_monitor.get_status_gen(terminal_id),
                         )
                         return
@@ -2028,9 +3033,14 @@ class InboxService:
                         if submit_observation is None and legacy_test_seam:
                             raise
                         self._reset_identity_authority(terminal_id)
+                        probable, classified_evidence = settle_probable_delivery(
+                            submit_evidence or dict(persisted_evidence)
+                        )
+                        if probable:
+                            return
                         settle_delivery_attempt_proof_safe(
                             attempt_uuid,
-                            submit_evidence or dict(persisted_evidence),
+                            classified_evidence,
                             status_monitor.get_status_gen(terminal_id),
                         )
                         return
@@ -2043,6 +3053,7 @@ class InboxService:
                         digest,
                         current_attempt["started_at"],
                         current_attempt.get("evidence"),
+                        timeout=_confirmation_timeout_seconds(),
                     )
                     if successor_source is not None:
                         evidence = {**current_attempt.get("evidence", {}), **evidence}
@@ -2054,6 +3065,7 @@ class InboxService:
                         else None
                     )
                     if inferred is not None:
+                        inferred = self._evidence_for_confirmed_attempt(terminal_id, inferred)
                         won = _confirmed_settlement(
                             lambda: settle_open_attempt_inferred_delivered(
                                 attempt_uuid,
@@ -2076,6 +3088,8 @@ class InboxService:
                             self._evict_defer_state(batch)
                             return
                     if outcome in {"hit", "unverified"}:
+                        if outcome == "hit":
+                            evidence = self._evidence_for_confirmed_attempt(terminal_id, evidence)
                         _confirmed_settlement(
                             lambda: settle_delivery_attempt(
                                 attempt_uuid,
@@ -2093,15 +3107,9 @@ class InboxService:
                             ),
                         )
                     else:
-                        try:
-                            receiver_status = status_monitor.get_status(terminal_id)
-                        except Exception:
-                            receiver_status = None
-                        evidence["receiver_status_at_settle"] = (
-                            receiver_status.value
-                            if isinstance(receiver_status, TerminalStatus)
-                            else "unknown"
-                        )
+                        probable, evidence = settle_probable_delivery(evidence)
+                        if probable:
+                            return
                         settle_delivery_attempt(
                             attempt_uuid,
                             MessageStatus.PENDING,
@@ -2122,9 +3130,14 @@ class InboxService:
                     if attempt_uuid:
                         self._reset_identity_authority(terminal_id)
                         if submit_evidence is not None:
+                            probable, classified_evidence = settle_probable_delivery(
+                                submit_evidence
+                            )
+                            if probable:
+                                return
                             settle_delivery_attempt_proof_safe(
                                 attempt_uuid,
-                                submit_evidence,
+                                classified_evidence,
                                 status_monitor.get_status_gen(terminal_id),
                             )
                             return
@@ -2144,9 +3157,14 @@ class InboxService:
                     if attempt_uuid:
                         self._reset_identity_authority(terminal_id)
                         if submit_evidence is not None:
+                            probable, classified_evidence = settle_probable_delivery(
+                                submit_evidence
+                            )
+                            if probable:
+                                return
                             settle_delivery_attempt_proof_safe(
                                 attempt_uuid,
-                                submit_evidence,
+                                classified_evidence,
                                 status_monitor.get_status_gen(terminal_id),
                             )
                             return
@@ -2170,9 +3188,14 @@ class InboxService:
                     # optimistically set to DELIVERED above. (#271 semantic.)
                     if attempt_uuid:
                         if submit_evidence is not None:
+                            probable, classified_evidence = settle_probable_delivery(
+                                submit_evidence
+                            )
+                            if probable:
+                                return
                             settle_delivery_attempt_proof_safe(
                                 attempt_uuid,
-                                submit_evidence,
+                                classified_evidence,
                                 status_monitor.get_status_gen(terminal_id),
                             )
                             return
@@ -2201,9 +3224,14 @@ class InboxService:
                                 attempt_uuid, MessageStatus.FAILED, "failed", error=str(e)
                             )
                         else:
+                            probable, classified_evidence = settle_probable_delivery(
+                                submit_evidence or {}
+                            )
+                            if probable:
+                                return
                             result = settle_delivery_attempt_proof_safe(
                                 attempt_uuid,
-                                submit_evidence or {},
+                                classified_evidence,
                                 status_monitor.get_status_gen(terminal_id),
                             )
                             return
@@ -2253,6 +3281,261 @@ class InboxService:
             except Exception as e:
                 logger.debug(f"Inbox reconciliation failed for {terminal_id}: {e}")
         self.recover_stale_deliveries(recurring=True)
+        # fx158 D1/D2: pull-mode pending-push reconciler (bypasses deliver_pending).
+        self.reconcile_pull_mode_notifications()
+        # WP-MAILBOX-CHANNEL: quarantine malformed mailbox rows on daemon heartbeat.
+        from cli_agent_orchestrator.services.config_service import ConfigService
+        from cli_agent_orchestrator.services.mailbox_service import (
+            quarantine_malformed_mailbox_rows,
+        )
+
+        if ConfigService.get("supervisor.mailbox_pull"):
+            from cli_agent_orchestrator.clients.database import MailboxModel as _MBModel
+            from cli_agent_orchestrator.clients.database import SessionLocal as _SL
+
+            with _SL() as _db:
+                supervisor_mailboxes = _db.query(_MBModel).filter_by(role="supervisor").all()
+                for mb in supervisor_mailboxes:
+                    try:
+                        quarantine_malformed_mailbox_rows(mb.id)
+                    except Exception as e:
+                        logger.debug(f"Mailbox quarantine sweep failed for {mb.id}: {e}")
+
+    def reconcile_pull_mode_notifications(self) -> None:
+        """fx158 D1: Push notifications for pull-mode supervisor mailboxes.
+
+        Bypasses deliver_pending entirely — routes directly to the push path.
+        D3 selection: mailbox-driven, cursor-aware, grace-windowed.
+        D9: per-mailbox failure isolation.
+        """
+        import hashlib
+
+        from cli_agent_orchestrator.clients.database import InboxModel as _InboxModel
+        from cli_agent_orchestrator.clients.database import MailboxModel as _MBModel
+        from cli_agent_orchestrator.clients.database import SessionLocal as _SL
+        from cli_agent_orchestrator.clients.database import TerminalModel as _TModel
+        from cli_agent_orchestrator.clients.database import (
+            begin_delivery_attempt,
+            settle_delivery_attempt,
+        )
+        from cli_agent_orchestrator.services.config_service import ConfigService
+        from cli_agent_orchestrator.services.mailbox_service import (
+            is_supervisor_mailbox_pull_terminal,
+        )
+        from cli_agent_orchestrator.services.teammate_push_service import (
+            PushOutcome,
+            _should_teammate_push,
+            attempt_teammate_push_reported,
+        )
+
+        # D3 condition 1: flag must be on
+        if not ConfigService.get("supervisor.mailbox_pull"):
+            return
+
+        cutoff = _utcnow() - timedelta(seconds=INBOX_RECONCILE_GRACE_SECONDS)
+
+        with _SL() as db:
+            supervisor_mailboxes = db.query(_MBModel).filter_by(role="supervisor").all()
+
+        for mb in supervisor_mailboxes:
+            try:
+                # D3 condition 2: current_terminal_id non-empty and pull-mode
+                if not mb.current_terminal_id:
+                    continue
+                if not is_supervisor_mailbox_pull_terminal(mb.current_terminal_id):
+                    continue
+
+                # D3 condition 3: live terminals row exists
+                with _SL() as db:
+                    terminal_row = (
+                        db.query(_TModel).filter_by(id=mb.current_terminal_id).one_or_none()
+                    )
+                if terminal_row is None:
+                    continue
+
+                # D3 condition 5: teammate_push flag gate
+                if not _should_teammate_push(mb.current_terminal_id):
+                    # F162 D10: rate-limited WARN when unregistered
+                    tid = mb.current_terminal_id
+                    now_ts = time.monotonic()
+                    last = _fx158_gate5_last_warn.get(tid)
+                    if last is None or (now_ts - last) >= _FX158_GATE5_WARN_INTERVAL_S:
+                        with _SL() as db:
+                            pending_count = (
+                                db.query(_InboxModel)
+                                .filter(
+                                    _InboxModel.logical_receiver_id == mb.id,
+                                    _InboxModel.status == MessageStatus.PENDING.value,
+                                    _InboxModel.id > mb.consumed_through_id,
+                                )
+                                .count()
+                            )
+                        if pending_count > 0:
+                            logger.warning(
+                                "fx158_gate5_unregistered terminal=%s pending=%d",
+                                tid,
+                                pending_count,
+                            )
+                            _fx158_gate5_last_warn[tid] = now_ts
+                    continue
+
+                # D3 condition 4: pending rows older than grace, above consumed_through_id
+                # F165-a: copy all needed scalars INSIDE the session to avoid
+                # DetachedInstanceError on deferred columns (logical_receiver_id).
+                with _SL() as db:
+                    pending_rows = (
+                        db.query(_InboxModel)
+                        .filter(
+                            _InboxModel.logical_receiver_id == mb.id,
+                            _InboxModel.status == MessageStatus.PENDING.value,
+                            _InboxModel.id > mb.consumed_through_id,
+                            _InboxModel.created_at < cutoff,
+                        )
+                        .order_by(_InboxModel.id)
+                        .limit(100)
+                        .all()
+                    )
+                    # Materialise scalars while session is open (deferred cols
+                    # like logical_receiver_id trigger DetachedInstanceError
+                    # after session close).
+                    pending_scalars = [
+                        {
+                            "id": row.id,
+                            "sender_id": row.sender_id,
+                            "receiver_id": row.receiver_id,
+                            "message": row.message,
+                            "orchestration_type": row.orchestration_type,
+                            "status": row.status,
+                            "created_at": row.created_at,
+                            "logical_receiver_id": getattr(row, "logical_receiver_id", None),
+                        }
+                        for row in pending_rows
+                    ]
+
+                if not pending_scalars:
+                    continue
+
+                # Convert to InboxMessage for the push function
+                messages = [
+                    InboxMessage(
+                        id=s["id"],
+                        sender_id=s["sender_id"],
+                        receiver_id=s["receiver_id"],
+                        message=s["message"],
+                        orchestration_type=OrchestrationType(s["orchestration_type"]),
+                        status=MessageStatus(s["status"]),
+                        created_at=s["created_at"],
+                        logical_receiver_id=s["logical_receiver_id"],
+                    )
+                    for s in pending_scalars
+                ]
+
+                # D4: call the reported form directly
+                outcome: PushOutcome = attempt_teammate_push_reported(
+                    mb.current_terminal_id, messages
+                )
+
+                # F168 D9: ring doorbell after reconciler push write.
+                # F186: pass caller_holds_no_delivery_lock=True — the reconciler
+                # does NOT hold delivery_lock, so G1 must be skipped to avoid the
+                # systematic contention that fx168 FIX-4 identified at the primary site.
+                if outcome.pushed and outcome.message_ids:
+                    try:
+                        from cli_agent_orchestrator.services.doorbell_service import (
+                            ring_supervisor_doorbell,
+                        )
+
+                        max_id = max(outcome.message_ids)
+                        ring_supervisor_doorbell(
+                            mb.current_terminal_id,
+                            max_id,
+                            written_count=1,
+                            caller_holds_no_delivery_lock=True,
+                        )
+                    except Exception:
+                        pass
+
+                # D5: instrumentation — record attempt row
+                if outcome.reason == "pushed":
+                    db_outcome = "push_written"
+                elif outcome.reason in ("no_inbox_path", "write_failed"):
+                    db_outcome = "push_failed"
+                else:
+                    db_outcome = "push_suppressed"
+
+                # S2: deterministic payload hash from sorted message ids
+                payload_hash = hashlib.sha256(
+                    json.dumps(sorted(m.id for m in messages)).encode()
+                ).hexdigest()
+
+                try:
+                    attempt_uuid = begin_delivery_attempt(
+                        messages,
+                        mb.current_terminal_id,
+                        provider="reconciler",
+                        payload_hash=payload_hash,
+                        payload_length=len(messages),
+                    )
+                    settle_delivery_attempt(
+                        attempt_uuid,
+                        MessageStatus.PENDING,  # rows stay PENDING (pull-mode)
+                        outcome=db_outcome,
+                        reason=outcome.reason,
+                    )
+                except Exception as e:
+                    logger.debug(f"fx158 instrumentation write failed for {mb.id}: {e}")
+
+            except Exception as e:
+                # D9: per-mailbox failure isolation.
+                # F165-F1: distinguish transient errors (network/DB) from
+                # programming errors (ORM detachment, type errors) that indicate
+                # broken code and would silently kill every tick forever.
+                from sqlalchemy.exc import InterfaceError as _SAInterfaceError
+
+                _D9_TRANSIENT_TYPES = (OSError, OperationalError, TimeoutError, _SAInterfaceError)
+                if isinstance(e, _D9_TRANSIENT_TYPES):
+                    logger.warning(
+                        "fx158_reconciler_transient mailbox=%s: %s",
+                        mb.id,
+                        e,
+                    )
+                else:
+                    # Programming error — surface loudly so it is not invisible.
+                    logger.error(
+                        "fx158_reconciler_programming_error mailbox=%s: %s",
+                        mb.id,
+                        e,
+                        exc_info=True,
+                    )
+                    # Record a durable marker so the failure is observable in
+                    # delivery_attempts even if logs rotate.
+                    try:
+                        import uuid as _uuid
+
+                        from cli_agent_orchestrator.clients.database import (
+                            InboxDeliveryAttemptModel as _AttemptModel,
+                        )
+                        from cli_agent_orchestrator.clients.database import SessionLocal as _ErrSL
+
+                        _now = _utcnow()
+                        _err_row = _AttemptModel(
+                            attempt_uuid=str(_uuid.uuid4()),
+                            receiver_terminal_id=mb.current_terminal_id or "unknown",
+                            provider="reconciler",
+                            started_at=_now,
+                            settled_at=_now,
+                            outcome="programming_error",
+                            reason=f"{type(e).__name__}: {e}"[:200],
+                            payload_hash="error",
+                            payload_length=0,
+                            sender_id="system",
+                            orchestration_type="reconciler_error",
+                            evidence="{}",
+                        )
+                        with _ErrSL.begin() as _err_db:
+                            _err_db.add(_err_row)
+                    except Exception:
+                        pass  # best-effort instrumentation
 
     def reconcile_pending_orphans(self) -> OrphanReconcileResult:
         """Settle one bounded batch of PENDING rows with absent receivers."""
@@ -2340,9 +3623,19 @@ class InboxService:
         try:
             metadata = get_terminal_metadata(terminal_id)
             if not metadata:
+                # F74: don't mark already-terminal messages as DELIVERY_FAILED
+                statuses = self._message_statuses(message_ids)
+                terminal_states = {
+                    MessageStatus.DELIVERED.value,
+                    MessageStatus.DELIVERY_FAILED.value,
+                    MessageStatus.DIGESTED.value,
+                }
+                eligible = [mid for mid in message_ids if statuses.get(mid) not in terminal_states]
+                if not eligible:
+                    return
                 recover_wpm2_stale_attempt(
                     attempt_uuid,
-                    message_ids,
+                    eligible,
                     MessageStatus.DELIVERY_FAILED,
                     "failed",
                     "receiver_gone",
@@ -2380,7 +3673,7 @@ class InboxService:
                         get_park_warm_for_message_ids(message_ids),
                     )
                 return
-            recovered_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            recovered_at = _utcnow().isoformat().replace("+00:00", "Z")
             recovery_evidence = {
                 **lookup_evidence,
                 "crash_recovery": {
@@ -2389,6 +3682,52 @@ class InboxService:
                     "lookup_kind": lookup_evidence.get("kind", "transcript_unresolved"),
                 },
             }
+            # F74: before resurrecting to PENDING, verify messages are still
+            # eligible (DELIVERING).  A message already at a terminal state
+            # (DELIVERED, DELIVERY_FAILED, DIGESTED) must not be re-driven.
+            statuses = self._message_statuses(message_ids)
+            terminal_states = {
+                MessageStatus.DELIVERED.value,
+                MessageStatus.DELIVERY_FAILED.value,
+                MessageStatus.DIGESTED.value,
+            }
+            if any(statuses.get(mid) in terminal_states for mid in message_ids):
+                logger.info(
+                    "F74: skipping resurrection to PENDING — messages %s already terminal",
+                    [mid for mid in message_ids if statuses.get(mid) in terminal_states],
+                )
+                return
+            # F44-T6: before resurrecting to PENDING, classify the persisted opener
+            # evidence. If it proves the payload was executed, settle inferred-delivered
+            # instead of re-driving the message. Falls through to resurrection when the
+            # predicate is False or the inferred-delivered settle loses its CAS.
+            opener_ref = _opener_transcript_ref(evidence)
+            classified = _classify_probable_delivery(evidence, terminal_id, opener_ref)
+            if is_probable_delivered(classified):
+                settlement_evidence = self._evidence_for_confirmed_attempt(
+                    terminal_id, {**classified, "kind": "execution_evidence"}
+                )
+                won = _confirmed_settlement(
+                    lambda: settle_attempt_inferred_delivered_batch(
+                        attempt_uuid,
+                        sorted(message_ids),
+                        settlement_evidence,
+                        on_confirmed=lambda: self._commit_watchdog_ops(
+                            terminal_id,
+                            attempt["sender_id"],
+                            OrchestrationType(attempt["orchestration_type"]),
+                            metadata,
+                            get_park_warm_for_message_ids(message_ids),
+                        ),
+                    )
+                )
+                if won:
+                    logger.info(
+                        "T6 recovery inferred_delivered %s receiver=%s",
+                        sorted(message_ids),
+                        terminal_id,
+                    )
+                    return
             recover_wpm2_stale_attempt(
                 attempt_uuid,
                 message_ids,

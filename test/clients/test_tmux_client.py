@@ -530,6 +530,40 @@ class TestGetSessionWindows:
         assert result == []
 
 
+class TestSetWindowParent:
+    def test_parent_indent_is_window_local_and_survives_external_rename(self, tmux):
+        options = {}
+        child = MagicMock()
+        child.name = "child"
+        child.set_option.side_effect = lambda name, value: options.__setitem__(name, value)
+        session = MagicMock()
+        session.active_window = MagicMock(name="different-current-window")
+        session.windows.get.return_value = child
+        tmux.server.sessions.get.return_value = session
+
+        tmux.set_window_parent("ses", "child", "parent123")
+        child.name = "renamed-externally"
+
+        assert options["@cao_parent"] == "parent123"
+        assert options["window-status-format"] == (
+            "#{?#{!=:#{@cao_parent},},  └─ ,}#I:#W#{?window_flags,#{window_flags},}"
+        )
+        assert session.active_window is not child
+
+    def test_unset_parent_cache_is_empty(self, tmux):
+        options = {}
+        child = MagicMock()
+        child.set_option.side_effect = lambda name, value: options.__setitem__(name, value)
+        session = MagicMock()
+        session.windows.get.return_value = child
+        tmux.server.sessions.get.return_value = session
+
+        tmux.set_window_parent("ses", "child", None)
+
+        assert options["@cao_parent"] == ""
+        assert "#{@cao_parent}" in options["window-status-format"]
+
+
 # ── kill_session ─────────────────────────────────────────────────────
 
 
@@ -780,3 +814,23 @@ class TestGetPaneSize:
             "#{pane_width} #{pane_height}",
         )
         active_pane.cmd.assert_not_called()
+
+
+class TestPaneIsBracketedPasteIncompatible:
+    @pytest.mark.parametrize(
+        "shell", ["sh", "dash", "bash", "zsh", "ksh", "mksh", "csh", "tcsh", "fish", "ash"]
+    )
+    def test_every_known_shell_is_incompatible(self, tmux, shell):
+        with patch.object(tmux, "get_pane_current_command", return_value=shell):
+            assert tmux._pane_is_bracketed_paste_incompatible("ses", "win") is True
+
+    @pytest.mark.parametrize("program", ["node", "claude", "kiro-cli", "python3", "codex"])
+    def test_known_tui_programs_are_compatible(self, tmux, program):
+        with patch.object(tmux, "get_pane_current_command", return_value=program):
+            assert tmux._pane_is_bracketed_paste_incompatible("ses", "win") is False
+
+    def test_lookup_failure_is_treated_as_compatible(self, tmux):
+        """Fails closed to the existing (pre-fix) behavior on an
+        unresolvable pane command -- see send_keys' own docstring."""
+        with patch.object(tmux, "get_pane_current_command", return_value=None):
+            assert tmux._pane_is_bracketed_paste_incompatible("ses", "win") is False

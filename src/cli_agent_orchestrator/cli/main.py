@@ -4,10 +4,13 @@ from importlib.metadata import PackageNotFoundError, version
 
 import click
 
+from cli_agent_orchestrator.cli.commands.agents import agents
 from cli_agent_orchestrator.cli.commands.barrier import barrier
 from cli_agent_orchestrator.cli.commands.base import base
 from cli_agent_orchestrator.cli.commands.config import config
+from cli_agent_orchestrator.cli.commands.doctor import doctor
 from cli_agent_orchestrator.cli.commands.env import env
+from cli_agent_orchestrator.cli.commands.fold import fold
 from cli_agent_orchestrator.cli.commands.info import info
 from cli_agent_orchestrator.cli.commands.init import init
 from cli_agent_orchestrator.cli.commands.install import install
@@ -21,11 +24,13 @@ from cli_agent_orchestrator.cli.commands.profile import profile
 from cli_agent_orchestrator.cli.commands.redeploy import redeploy
 from cli_agent_orchestrator.cli.commands.sandbox import sandbox
 from cli_agent_orchestrator.cli.commands.schedule import flow, schedule
+from cli_agent_orchestrator.cli.commands.seam import seam
 from cli_agent_orchestrator.cli.commands.session import session
 from cli_agent_orchestrator.cli.commands.shutdown import shutdown
 from cli_agent_orchestrator.cli.commands.skills import skills
 from cli_agent_orchestrator.cli.commands.suite import suite
 from cli_agent_orchestrator.cli.commands.terminal import terminal
+from cli_agent_orchestrator.cli.commands.tui import tui
 from cli_agent_orchestrator.cli.commands.update import update
 from cli_agent_orchestrator.cli.commands.verify import verify
 from cli_agent_orchestrator.cli.commands.workflow import workflow
@@ -44,8 +49,10 @@ def cli():
 
 # Register commands
 cli.add_command(profile)
+cli.add_command(agents)
 cli.add_command(base)
 cli.add_command(barrier)
+cli.add_command(doctor)
 cli.add_command(launch)
 cli.add_command(config)
 cli.add_command(init)
@@ -54,6 +61,7 @@ cli.add_command(redeploy)
 cli.add_command(sandbox)
 cli.add_command(shutdown)
 cli.add_command(schedule)
+cli.add_command(seam)
 cli.add_command(flow)  # deprecated alias for 'schedule' (issue #378)
 cli.add_command(env)
 cli.add_command(mcp_server)
@@ -65,10 +73,12 @@ cli.add_command(terminal)
 cli.add_command(workflow)
 cli.add_command(messages)
 cli.add_command(mailbox)
+cli.add_command(fold)
 cli.add_command(suite)
 cli.add_command(verify)
 cli.add_command(ledger)
 cli.add_command(update)
+cli.add_command(tui)  # bundled Rust terminal UI (issue #321)
 
 
 if __name__ == "__main__":

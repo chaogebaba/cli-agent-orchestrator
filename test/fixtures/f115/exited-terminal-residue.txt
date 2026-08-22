@@ -1,0 +1,6 @@
+| R2 worktree | lifecycle + use_worktree/group/metadata, default false; teardown not nested under persona | complete |
+| R3 discovery | init_* + group/metadata migrations; no profile discovery grants | complete |
+Suite 1 failed (known only), 9100 passed, 32 skipped (~603s)
+No push / no redeploy. Worked for 38m38s
+minimal · /help  ❯ /exit
+↑/↓ navigate · Enter:submit

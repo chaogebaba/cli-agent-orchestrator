@@ -24,11 +24,14 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
+from cli_agent_orchestrator.backends.base import TerminalBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
 from cli_agent_orchestrator.constants import SESSION_PREFIX
+from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.plugins import (
     PluginRegistry,
@@ -63,7 +66,12 @@ def canonical_session_env(
             )
         artifact_root = Path(override).resolve()
     else:
-        artifact_root = Path(working_directory or os.getcwd()).resolve() / "tmp" / "orch"
+        base = Path(working_directory or os.getcwd()).resolve()
+        orch_sub = base / "orchestrator"
+        if orch_sub.is_dir():
+            artifact_root = orch_sub / "tmp" / "orch"
+        else:
+            artifact_root = base / "tmp" / "orch"
     result[ARTIFACTS_DIR_ENV] = str(artifact_root)
     return result
 
@@ -91,6 +99,37 @@ def finalize_session(
     )
 
 
+async def _reconcile_inbox_path_on_publish(
+    *, terminal_id: str, mailbox_id: str, generation: int
+) -> None:
+    """F136-D5: Wire set_supervisor_callback_inbox_path at publication lifecycle.
+
+    Reads cc_team_inbox_path from terminal metadata and reconciles it as the
+    canonical callback inbox path for the mailbox. Idempotent no-op when the
+    path is unchanged or absent.
+    """
+    from cli_agent_orchestrator.clients.database import get_terminal_metadata
+    from cli_agent_orchestrator.services.mailbox_service import set_supervisor_callback_inbox_path
+
+    try:
+        meta_record = get_terminal_metadata(terminal_id)
+        if not meta_record:
+            return
+        md = meta_record.get("metadata") or {}
+        candidate_path = md.get("cc_team_inbox_path")
+        if not candidate_path:
+            return
+        await asyncio.to_thread(
+            set_supervisor_callback_inbox_path,
+            mailbox_id=mailbox_id,
+            terminal_id=terminal_id,
+            generation=generation,
+            path=candidate_path,
+        )
+    except Exception as exc:
+        logger.debug("inbox path reconciliation skipped: %s", exc)
+
+
 async def create_session(
     provider: str | None,
     agent_profile: str,
@@ -100,13 +139,37 @@ async def create_session(
     registry: PluginRegistry | None = None,
     env_vars: dict[str, str] | None = None,
     allow_incomplete_brief: bool = False,
+    engine: KiroEngine | str | None = None,
+    initial_message: str | None = None,
+    initial_message_orchestration_type: OrchestrationType | None = None,
+    model: str | None = None,
+    lifecycle: str | None = None,
+    group: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
     ``env_vars`` are operator-forwarded env vars from ``cao launch --env``.
     They are persisted on the session record so every worker spawned later
     in the same session inherits them. See issue #248.
+
+    When ``initial_message`` is provided, the initial terminal uses the
+    existing deferred-init path so provider initialization and delivery can
+    continue after the session response. Omitting it preserves the synchronous
+    initialization behavior used by existing callers.
+    On the deferred path, the ``post_create_session`` plugin event is dispatched
+    before provider initialization and message delivery finish.
+
+    ``group``/``metadata`` are the #432 discovery fields, set on the initial
+    terminal at creation time (``group`` is also updatable later via
+    ``PATCH /terminals/{id}/group``, ``metadata`` via the ``update_metadata``
+    MCP tool).
     """
+    if initial_message == "":
+        raise ValueError("initial_message must not be empty")
+    if initial_message is None and initial_message_orchestration_type is not None:
+        raise ValueError("initial_message_orchestration_type requires initial_message")
+
     if provider is None:
         resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
     else:
@@ -132,7 +195,7 @@ async def create_session(
 
     from cli_agent_orchestrator.services.terminal_service import seed_resume_bootstrap
 
-    fork_context = seed_resume_bootstrap(
+    fork_context = await seed_resume_bootstrap(
         agent_profile, resolved_provider, working_directory or os.getcwd()
     )
     terminal = await create_terminal(
@@ -146,6 +209,14 @@ async def create_session(
         env_vars=session_env,
         allow_incomplete_brief=allow_incomplete_brief,
         fork_context=fork_context,
+        engine=engine,
+        defer_init=initial_message is not None,
+        initial_message=initial_message,
+        initial_message_orchestration_type=initial_message_orchestration_type,
+        model=model,
+        lifecycle=lifecycle,
+        group=group,
+        metadata=metadata,
     )
     if mailbox_claim is not None:
         from cli_agent_orchestrator.clients.database import get_terminal_metadata
@@ -160,11 +231,10 @@ async def create_session(
             )
         except Exception as cause:
             try:
+                from cli_agent_orchestrator.services.terminal_service import delete_terminal
+
                 deleted = await asyncio.to_thread(
-                    __import__(
-                        "cli_agent_orchestrator.services.terminal_service",
-                        fromlist=["delete_terminal"],
-                    ).delete_terminal,
+                    delete_terminal,
                     terminal.id,
                     registry,
                 )
@@ -184,6 +254,12 @@ async def create_session(
             "published supervisor mailbox %s generation %s",
             publication["mailbox_id"],
             publication["generation"],
+        )
+        # F136-D5: reconcile inbox path from terminal metadata at publication
+        await _reconcile_inbox_path_on_publish(
+            terminal_id=terminal.id,
+            mailbox_id=publication["mailbox_id"],
+            generation=publication["generation"],
         )
     dispatch_plugin_event(
         registry,
@@ -228,11 +304,70 @@ async def start_session(**kwargs) -> dict:
     }
 
 
+def _enrich_session_ownership(
+    backend: TerminalBackend, session_data: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Add best-effort ownership metadata from the session's first known terminal."""
+    enriched = dict(session_data)
+    enriched.setdefault("working_directory", None)
+    enriched.setdefault("agent_profile", None)
+
+    # `... or ""` (not `.get("id", "")`): an explicit id=None must collapse to
+    # "" too, matching the sibling guard in list_sessions. `.get("id", "")`
+    # would yield the truthy string "None" and try to enrich a bogus session.
+    session_name = enriched.get("id") or ""
+    if not session_name:
+        return enriched
+
+    try:
+        terminals = list_terminals_by_session(session_name)
+    except Exception as e:
+        logger.warning(f"Failed to load terminal metadata for {session_name}: {e}")
+        terminals = []
+
+    ownership_terminal: Dict[str, Any] = {}
+    for terminal in terminals:
+        if terminal.get("agent_profile") or terminal.get("working_directory"):
+            ownership_terminal = terminal
+            break
+
+    if not ownership_terminal:
+        for terminal in terminals:
+            if terminal.get("tmux_window"):
+                ownership_terminal = terminal
+                break
+
+    if ownership_terminal:
+        enriched["agent_profile"] = ownership_terminal.get("agent_profile")
+        persisted_working_directory = ownership_terminal.get("working_directory")
+        if persisted_working_directory:
+            enriched["working_directory"] = persisted_working_directory
+        elif ownership_terminal.get("tmux_window"):
+            try:
+                enriched["working_directory"] = backend.get_pane_working_directory(
+                    session_name, ownership_terminal["tmux_window"]
+                )
+            except Exception as e:
+                logger.warning(f"Failed to resolve working directory for {session_name}: {e}")
+
+    return enriched
+
+
 def list_sessions() -> List[Dict]:
     """List all sessions from tmux."""
     try:
-        tmux_sessions = get_backend().list_sessions()
-        return [s for s in tmux_sessions if s["id"].startswith(SESSION_PREFIX)]
+        backend = get_backend()
+        tmux_sessions = backend.list_sessions()
+        return [
+            _enrich_session_ownership(backend, s)
+            for s in tmux_sessions
+            # Use .get() rather than s["id"]: a backend that returns a session
+            # dict without an "id" key must not blank the entire list (KeyError
+            # in this comprehension is swallowed by the outer except and returns
+            # []). Shipped backends always populate "id"; this hardens against a
+            # future backend that does not.
+            if (s.get("id") or "").startswith(SESSION_PREFIX)
+        ]
     except Exception as e:
         logger.error(f"Failed to list sessions: {e}")
         return []
@@ -318,15 +453,30 @@ def delete_session(
         tokens = {token.terminal_id: token for token in leases}
         for terminal in terminals:
             try:
-                terminal_service._delete_terminal_under_lease(
+                result_or_false = terminal_service._delete_terminal_under_lease(
                     terminal["id"], tokens[terminal["id"]], registry=registry
                 )
+                # Deferred cleanup: provider returned False, row retained
+                if result_or_false is False or (
+                    isinstance(result_or_false, dict) and not result_or_false.get("terminal_deleted", True)
+                ):
+                    result["errors"].append({
+                        "terminal_id": terminal["id"],
+                        "error": "cleanup deferred; retry delete_session",
+                    })
             except Exception as e:
                 if str(e) == "resume_in_progress":
                     raise
                 logger.warning(f"Failed to cleanup terminal {terminal['id']}: {e}")
 
-        finalize_session(session_name, registry)
+        if not result["errors"]:
+            finalize_session(session_name, registry)
+        else:
+            # Kill the tmux session even if cleanup is deferred — this stops
+            # the processes so a subsequent retry can complete the cleanup.
+            backend = get_backend()
+            if backend.session_exists(session_name):
+                backend.kill_session(session_name)
 
         for token in reversed(leases):
             release_rebind_lease(token)
@@ -339,8 +489,11 @@ def delete_session(
         release_session_lifecycle_lease(lifecycle_lease)
         lifecycle_lease = None
 
-        result["deleted"].append(session_name)
-        logger.info(f"Deleted session: {session_name}")
+        if not result["errors"]:
+            result["deleted"].append(session_name)
+            logger.info(f"Deleted session: {session_name}")
+        else:
+            logger.warning(f"Session {session_name} has deferred cleanups; not fully deleted")
         return result
 
     except Exception as e:

@@ -1,0 +1,13 @@
+diff --git a/src/cli_agent_orchestrator/api/main.py b/src/cli_agent_orchestrator/api/main.py
+index 7971ef5b..28cc8de2 100644
+--- a/src/cli_agent_orchestrator/api/main.py
++++ b/src/cli_agent_orchestrator/api/main.py
+@@ -6666,7 +6666,7 @@ async def create_inbox_message_endpoint(
+                 raise HTTPException(
+                     status_code=status.HTTP_403_FORBIDDEN,
+                     detail={
+-                        "code": error_code,
++                        "code": "FORBIDDEN",  # M14: no specific code
+                         "message": remedy,
+                     },
+                 )

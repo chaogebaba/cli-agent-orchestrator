@@ -304,3 +304,79 @@ class TestTmuxClientWorkingDirectory:
         result = client.get_pane_working_directory("test-session", "test-window")
 
         assert result is None
+
+    # ---------- F26: cwd-deleted guard (source detection at the tmux seam) ----------
+
+    def _pane_with_cwd(self, raw_cwd):
+        """Build a mocked pane whose display-message returns ``raw_cwd``."""
+        mock_session = Mock()
+        mock_window = Mock()
+        mock_pane = Mock()
+        self.mock_server.sessions.get.return_value = mock_session
+        mock_session.windows.get.return_value = mock_window
+        type(mock_window).active_pane = PropertyMock(return_value=mock_pane)
+        mock_result = Mock()
+        mock_result.stdout = [raw_cwd]
+        mock_pane.cmd.return_value = mock_result
+        return mock_pane
+
+    def test_f26_ac1_genuine_delete_returns_none_and_logs_cwd_deleted(self, caplog):
+        """AC1: a pane whose cwd was deleted returns None and logs cwd_deleted."""
+        import logging
+
+        raw = "/tmp/gone (deleted)"
+        self._pane_with_cwd(raw)
+        with patch("cli_agent_orchestrator.clients.tmux.os.path.exists", return_value=False):
+            with caplog.at_level(
+                logging.WARNING, logger="cli_agent_orchestrator.clients.tmux"
+            ):
+                result = TmuxClient().get_pane_working_directory("s", "w")
+        assert result is None
+        assert any("cwd_deleted" in rec.message for rec in caplog.records)
+
+    def test_f26_ac2_deleted_then_recreated_returns_none_and_logs_cwd_deleted_recreated(
+        self, caplog
+    ):
+        """AC2: deleted-then-recreated returns None, never the stripped live path."""
+        import logging
+
+        raw = "/tmp/gone (deleted)"
+        self._pane_with_cwd(raw)
+        # full (with suffix) gone; stripped (live) exists
+        def fake_exists(path):
+            return path == "/tmp/gone"
+
+        with patch("cli_agent_orchestrator.clients.tmux.os.path.exists", side_effect=fake_exists):
+            with caplog.at_level(
+                logging.WARNING, logger="cli_agent_orchestrator.clients.tmux"
+            ):
+                result = TmuxClient().get_pane_working_directory("s", "w")
+        assert result is None
+        assert any("cwd_deleted_recreated" in rec.message for rec in caplog.records)
+
+    def test_f26_ac3_legal_dir_literally_named_deleted_is_returned_unchanged(self):
+        """AC3: a real dir legally named '... (deleted)' is returned unchanged."""
+        raw = "/tmp/foo (deleted)"
+        self._pane_with_cwd(raw)
+        # full literal exists -> legal dir, never stripped
+        with patch("cli_agent_orchestrator.clients.tmux.os.path.exists", return_value=True):
+            result = TmuxClient().get_pane_working_directory("s", "w")
+        assert result == "/tmp/foo (deleted)"
+
+    def test_f26_ac4_fast_path_never_invokes_os_path_exists(self):
+        """AC4: when raw cwd does not end with ' (deleted)', exists() is never called."""
+        raw = "/home/user/project"
+        pane = self._pane_with_cwd(raw)
+        with patch(
+            "cli_agent_orchestrator.clients.tmux.os.path.exists",
+            side_effect=AssertionError("os.path.exists must not be called on fast path"),
+        ):
+            result = TmuxClient().get_pane_working_directory("s", "w")
+        assert result == "/home/user/project"
+        pane.cmd.assert_called_once_with("display-message", "-p", "#{pane_current_path}")
+
+    def test_f26_ac8_contract_stability_absent_session_still_returns_none(self):
+        """AC8: contract stability — an absent session/window still returns None."""
+        self.mock_server.sessions.get.return_value = None
+        result = TmuxClient().get_pane_working_directory("nonexistent", "w")
+        assert result is None

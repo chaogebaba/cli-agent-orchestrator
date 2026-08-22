@@ -310,6 +310,7 @@ def test_concurrent_updates_serialize_without_duplicate_versions(pin_db, tmp_pat
     assert versions == [1, 2, 3]
 
 
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_busy_lock_returns_db_busy(pin_db, tmp_path):
     authority = tmp_path / "authority.md"
     authority.write_text("v1")
@@ -326,3 +327,276 @@ def test_busy_lock_returns_db_busy(pin_db, tmp_path):
     finally:
         lock.rollback()
         lock.close()
+
+
+
+# ─── F129: Frozen pin tests ─────────────────────────────────────────────────
+
+
+class TestRegisterFrozenPins:
+    """Tests for register_frozen_pins (atomic frozen pin registration)."""
+
+    def test_registers_version1_frozen_true(self, pin_db, tmp_path):
+        """Frozen pins have frozen=True, version=1."""
+        authority = tmp_path / "blueprint.md"
+        authority.write_text("content")
+        sha = _sha(authority)
+
+        from cli_agent_orchestrator.services.authority_pin_service import register_frozen_pins
+
+        with pin_db.begin() as db:
+            results = register_frozen_pins(
+                db,
+                task_key="bbbbbbbb",
+                authority_files=[{"file_path": str(authority), "sha256": sha}],
+                registered_by="aaaaaaaa",
+            )
+            assert len(results) == 1
+            assert results[0]["version"] == 1
+            assert results[0]["sha256"] == sha
+
+        with pin_db() as db:
+            row = (
+                db.query(dbmod.AuthorityPinModel)
+                .filter_by(task_key="bbbbbbbb", file_path=str(authority))
+                .first()
+            )
+            assert row is not None
+            assert row.frozen is True
+            assert row.version == 1
+
+    def test_hash_mismatch_raises_authority_hash_mismatch(self, pin_db, tmp_path):
+        """Caller sha256 != server-computed -> AuthorityPinError."""
+        authority = tmp_path / "blueprint.md"
+        authority.write_text("real content")
+        wrong_sha = hashlib.sha256(b"wrong").hexdigest()
+
+        from cli_agent_orchestrator.services.authority_pin_service import register_frozen_pins
+
+        with pin_db() as db:
+            with pytest.raises(service.AuthorityPinError, match="authority_hash_mismatch"):
+                register_frozen_pins(
+                    db,
+                    task_key="bbbbbbbb",
+                    authority_files=[{"file_path": str(authority), "sha256": wrong_sha}],
+                    registered_by="aaaaaaaa",
+                )
+
+    def test_path_not_absolute_rejected(self, pin_db, tmp_path):
+        """Relative path -> AuthorityPinError('path_not_absolute')."""
+        from cli_agent_orchestrator.services.authority_pin_service import register_frozen_pins
+
+        with pin_db() as db:
+            with pytest.raises(service.AuthorityPinError, match="path_not_absolute"):
+                register_frozen_pins(
+                    db,
+                    task_key="bbbbbbbb",
+                    authority_files=[{"file_path": "relative.md", "sha256": "a" * 64}],
+                    registered_by="aaaaaaaa",
+                )
+
+    def test_empty_list_rejected(self, pin_db, tmp_path):
+        """Empty authority_files -> AuthorityPinError('empty_pin_list')."""
+        from cli_agent_orchestrator.services.authority_pin_service import register_frozen_pins
+
+        with pin_db() as db:
+            with pytest.raises(service.AuthorityPinError, match="empty_pin_list"):
+                register_frozen_pins(
+                    db,
+                    task_key="bbbbbbbb",
+                    authority_files=[],
+                    registered_by="aaaaaaaa",
+                )
+
+    def test_duplicate_paths_rejected(self, pin_db, tmp_path):
+        """Duplicate file_path in list -> AuthorityPinError('duplicate_path')."""
+        authority = tmp_path / "blueprint.md"
+        authority.write_text("content")
+        sha = _sha(authority)
+
+        from cli_agent_orchestrator.services.authority_pin_service import register_frozen_pins
+
+        with pin_db() as db:
+            with pytest.raises(service.AuthorityPinError, match="duplicate_path"):
+                register_frozen_pins(
+                    db,
+                    task_key="bbbbbbbb",
+                    authority_files=[
+                        {"file_path": str(authority), "sha256": sha},
+                        {"file_path": str(authority), "sha256": sha},
+                    ],
+                    registered_by="aaaaaaaa",
+                )
+
+    def test_transaction_atomicity_with_terminal_row(self, pin_db, tmp_path):
+        """Pin rows and terminal row committed in ONE transaction."""
+        authority = tmp_path / "blueprint.md"
+        authority.write_text("content")
+        sha = _sha(authority)
+
+        from cli_agent_orchestrator.services.authority_pin_service import register_frozen_pins
+
+        # Simulate atomic: create terminal + pins in one begin block
+        with pin_db.begin() as db:
+            db.add(TerminalModel(
+                id="dddddddd",
+                tmux_session="cao-test",
+                tmux_window="new-worker",
+                provider="codex",
+                agent_profile="developer",
+                caller_id="aaaaaaaa",
+                lifecycle_generation=1,
+            ))
+            register_frozen_pins(
+                db,
+                task_key="dddddddd",
+                authority_files=[{"file_path": str(authority), "sha256": sha}],
+                registered_by="aaaaaaaa",
+            )
+
+        # Both committed
+        with pin_db() as db:
+            assert db.query(TerminalModel).filter_by(id="dddddddd").first() is not None
+            pins = db.query(dbmod.AuthorityPinModel).filter_by(task_key="dddddddd").all()
+            assert len(pins) == 1
+
+
+class TestValidateFrozenPins:
+    """Tests for validate_frozen_pins."""
+
+    def test_no_frozen_pins_returns_no_frozen_pins(self, pin_db, tmp_path):
+        """Worker with no frozen rows -> outcome='no_frozen_pins'."""
+        from cli_agent_orchestrator.services.authority_pin_service import validate_frozen_pins
+
+        with pin_db() as db:
+            result = validate_frozen_pins(db, "cccccccc")
+            assert result.outcome == "no_frozen_pins"
+
+    def test_all_valid_returns_valid(self, pin_db, tmp_path):
+        """All hashes match -> outcome='valid'."""
+        authority = tmp_path / "blueprint.md"
+        authority.write_text("stable content")
+        sha = _sha(authority)
+
+        with pin_db.begin() as db:
+            db.add(dbmod.AuthorityPinModel(
+                task_key="bbbbbbbb",
+                file_path=str(authority),
+                sha256=sha,
+                version=1,
+                registered_by="aaaaaaaa",
+                frozen=True,
+            ))
+
+        from cli_agent_orchestrator.services.authority_pin_service import validate_frozen_pins
+
+        with pin_db() as db:
+            result = validate_frozen_pins(db, "bbbbbbbb")
+            assert result.outcome == "valid"
+            assert len(result.all_results) == 1
+            assert result.all_results[0].verdict == "VALID"
+
+    def test_one_drift_returns_drift(self, pin_db, tmp_path):
+        """One file modified -> outcome='drift'."""
+        authority = tmp_path / "blueprint.md"
+        authority.write_text("original")
+        sha = _sha(authority)
+
+        with pin_db.begin() as db:
+            db.add(dbmod.AuthorityPinModel(
+                task_key="bbbbbbbb",
+                file_path=str(authority),
+                sha256=sha,
+                version=1,
+                registered_by="aaaaaaaa",
+                frozen=True,
+            ))
+
+        authority.write_text("modified")
+
+        from cli_agent_orchestrator.services.authority_pin_service import validate_frozen_pins
+
+        with pin_db() as db:
+            result = validate_frozen_pins(db, "bbbbbbbb")
+            assert result.outcome == "drift"
+            assert len(result.drifted) == 1
+            assert result.drifted[0].reason == "content"
+
+    def test_missing_file_returns_drift_reason_missing(self, pin_db, tmp_path):
+        """File deleted -> DRIFT with reason='missing'."""
+        fake_path = str(tmp_path / "nonexistent.md")
+
+        with pin_db.begin() as db:
+            db.add(dbmod.AuthorityPinModel(
+                task_key="bbbbbbbb",
+                file_path=fake_path,
+                sha256="a" * 64,
+                version=1,
+                registered_by="aaaaaaaa",
+                frozen=True,
+            ))
+
+        from cli_agent_orchestrator.services.authority_pin_service import validate_frozen_pins
+
+        with pin_db() as db:
+            result = validate_frozen_pins(db, "bbbbbbbb")
+            assert result.outcome == "drift"
+            assert result.drifted[0].reason == "missing"
+
+    def test_ignores_mutable_pins(self, pin_db, tmp_path):
+        """Only frozen=True rows are validated; frozen=False skipped."""
+        authority = tmp_path / "mutable.md"
+        authority.write_text("content")
+        sha = _sha(authority)
+
+        with pin_db.begin() as db:
+            db.add(dbmod.AuthorityPinModel(
+                task_key="bbbbbbbb",
+                file_path=str(authority),
+                sha256=sha,
+                version=1,
+                registered_by="aaaaaaaa",
+                frozen=False,  # mutable
+            ))
+
+        from cli_agent_orchestrator.services.authority_pin_service import validate_frozen_pins
+
+        with pin_db() as db:
+            result = validate_frozen_pins(db, "bbbbbbbb")
+            assert result.outcome == "no_frozen_pins"
+
+
+class TestUpdatePinFrozenGuard:
+    """Tests for frozen pin immutability guard on update_pin."""
+
+    def test_update_pin_on_frozen_raises(self, pin_db, tmp_path):
+        """update_pin on a frozen pin -> AuthorityPinError('frozen_pin_immutable')."""
+        authority = tmp_path / "frozen.md"
+        authority.write_text("frozen content")
+        sha = _sha(authority)
+
+        with pin_db.begin() as db:
+            db.add(dbmod.AuthorityPinModel(
+                task_key="bbbbbbbb",
+                file_path=str(authority),
+                sha256=sha,
+                version=1,
+                registered_by="aaaaaaaa",
+                frozen=True,
+            ))
+
+        new_sha = hashlib.sha256(b"new").hexdigest()
+        with pytest.raises(service.AuthorityPinError, match="frozen_pin_immutable"):
+            service.update_pin("bbbbbbbb", str(authority), new_sha)
+
+    def test_update_pin_on_mutable_succeeds(self, pin_db, tmp_path):
+        """update_pin on a mutable pin -> works as before."""
+        authority = tmp_path / "mutable.md"
+        authority.write_text("mutable content")
+        sha = _sha(authority)
+
+        service.pin_authority("bbbbbbbb", [{"file_path": str(authority), "sha256": sha}])
+
+        new_sha = hashlib.sha256(b"v2").hexdigest()
+        result = service.update_pin("bbbbbbbb", str(authority), new_sha)
+        assert result["current_version"] == 2

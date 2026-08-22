@@ -1,8 +1,8 @@
 import asyncio
-import json
-import os
 import fcntl
 import io
+import json
+import os
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -14,8 +14,8 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.backends.base import PaneIdentityReadResult
+from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.clients.database import (
     Base,
     InboxDeliveryAttemptModel,
@@ -37,6 +37,12 @@ from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
 from cli_agent_orchestrator.providers.screen_classification import ScreenSignal
+from cli_agent_orchestrator.services import mailbox_service
+from cli_agent_orchestrator.services.inbox_service import (
+    InboxService,
+    clear_terminal_delivery_state,
+)
+from cli_agent_orchestrator.services.inbox_service import inbox_service as global_inbox_service
 from cli_agent_orchestrator.services.message_trace_service import (
     BindingStalenessObservation,
     _binding_staleness,
@@ -44,11 +50,6 @@ from cli_agent_orchestrator.services.message_trace_service import (
     observe_binding_absence,
     scan_binding_candidates,
     wire_hash,
-)
-from cli_agent_orchestrator.services.inbox_service import (
-    InboxService,
-    clear_terminal_delivery_state,
-    inbox_service as global_inbox_service,
 )
 from cli_agent_orchestrator.services.status_monitor import (
     BoundaryObservation,
@@ -70,9 +71,13 @@ def wpq2_db(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def isolate_wpq2_process_state():
+    from cli_agent_orchestrator.services.message_trace_service import _declared_presumed_stale
+
     _binding_staleness.clear()
+    _declared_presumed_stale.clear()
     yield
     _binding_staleness.clear()
+    _declared_presumed_stale.clear()
 
 
 def _provider(kind: str):
@@ -130,9 +135,7 @@ def test_temporal_corroboration_static_demotes_and_animated_stays_busy(
         ):
             return monitor.probe_screen_status("receiver"), backend
 
-    static_result, static_backend = run(
-        [[progress], [progress], [progress], [progress, *ready]]
-    )
+    static_result, static_backend = run([[progress], [progress], [progress], [progress, *ready]])
     static_status, static_meta = static_result.status, static_result.meta
     assert static_status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
     assert static_meta["temporal_demotion"]["frames"] == 2
@@ -548,9 +551,7 @@ def test_grok_static_spinner_demotes_then_delivers_through_real_inbox_seam(wpq2_
     assert probe["frame_rows_hash"] == _frame_rows_hash(final_rows)
     assert probe["frame_source"] == "fresh_capture"
     sent.assert_called_once_with("receiver", "deliver after demotion")
-    assert backend.read_pane_identity.call_args_list == [
-        (("session", "receiver"), {})
-    ] * 4
+    assert backend.read_pane_identity.call_args_list == [(("session", "receiver"), {})] * 4
 
 
 def test_corroborable_signal_requires_row_bytes():
@@ -1510,3 +1511,554 @@ def test_terminal_teardown_evicts_both_authority_stores():
     assert not any(
         key[0] == "teardown" for key in global_inbox_service._binding_authority  # noqa: SLF001
     )
+
+
+def test_b1_identity_notice_receiver_prefers_live_supervisor(wpq2_db):
+    """Session-scan fallback must skip dead supervisors and pick the live one."""
+    from datetime import datetime, timedelta, timezone
+
+    database.create_terminal(
+        "dead_sup",
+        "sess-b1",
+        "dead_sup",
+        "claude_code",
+        agent_profile="code_supervisor",
+    )
+    database.create_terminal(
+        "live_sup",
+        "sess-b1",
+        "live_sup",
+        "claude_code",
+        agent_profile="code_supervisor",
+    )
+    database.create_terminal(
+        "subject",
+        "sess-b1",
+        "subject",
+        "claude_code",
+        agent_profile="developer",
+    )
+    # Make dead_sup appear first by id order but older last_active; live is newer.
+    with database.SessionLocal.begin() as db:
+        dead = db.get(TerminalModel, "dead_sup")
+        live = db.get(TerminalModel, "live_sup")
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        dead.last_active = now - timedelta(days=8)
+        live.last_active = now
+
+    fleet = {
+        "session_name": "sess-b1",
+        "terminals": [
+            {"id": "dead_sup", "status": "error", "orphan": False},
+            {"id": "live_sup", "status": "idle", "orphan": False},
+            {"id": "subject", "status": "processing", "orphan": False},
+        ],
+    }
+    # No caller_id → force session-scan fallback (caller_id fast path is out of scope).
+    metadata = {"tmux_session": "sess-b1"}
+    with patch(
+        "cli_agent_orchestrator.services.fleet_service.build_fleet",
+        return_value=fleet,
+    ):
+        receiver = InboxService._identity_notice_receiver("subject", metadata)
+    assert receiver == "live_sup"
+
+
+def test_b1_identity_notice_receiver_no_live_supervisor_returns_none(wpq2_db):
+    database.create_terminal(
+        "dead_sup",
+        "sess-b1b",
+        "dead_sup",
+        "claude_code",
+        agent_profile="code_supervisor",
+    )
+    database.create_terminal(
+        "subject",
+        "sess-b1b",
+        "subject",
+        "claude_code",
+        agent_profile="developer",
+    )
+    fleet = {
+        "session_name": "sess-b1b",
+        "terminals": [
+            {"id": "dead_sup", "status": "error", "orphan": False},
+            {"id": "subject", "status": "idle", "orphan": False},
+        ],
+    }
+    with patch(
+        "cli_agent_orchestrator.services.fleet_service.build_fleet",
+        return_value=fleet,
+    ):
+        receiver = InboxService._identity_notice_receiver("subject", {"tmux_session": "sess-b1b"})
+    assert receiver is None
+
+
+def test_b2_confirmed_under_binding_presumed_stale_reports_unverified(wpq2_db, monkeypatch):
+    """Confirmed attempt with binding_presumed_stale evidence is not confirmed_hit."""
+    monkeypatch.setattr(mailbox_service, "SessionLocal", database.SessionLocal)
+    database.create_terminal("receiver", "session", "receiver", "claude_code")
+    message = database.create_inbox_message(
+        "sender", "receiver", "callback body", OrchestrationType.SEND_MESSAGE
+    )
+    attempt = begin_delivery_attempt([message], "receiver", "claude_code", "payload-hash", 12)
+    evidence = json.dumps({"path": "/tmp/transcript.jsonl", "kind": "binding_presumed_stale"})
+    assert settle_delivery_attempt(
+        attempt,
+        MessageStatus.DELIVERED,
+        "confirmed",
+        evidence=evidence,
+    )
+    listed = mailbox_service.list_messages("receiver")
+    assert listed["items"][0]["last_attempt_outcome"] == "confirmed_unverified"
+
+
+def test_b2_confirmed_hit_without_stale_kind_unchanged(wpq2_db, monkeypatch):
+    monkeypatch.setattr(mailbox_service, "SessionLocal", database.SessionLocal)
+    database.create_terminal("receiver", "session", "receiver", "claude_code")
+    message = database.create_inbox_message(
+        "sender", "receiver", "ok body", OrchestrationType.SEND_MESSAGE
+    )
+    attempt = begin_delivery_attempt([message], "receiver", "claude_code", "payload-hash", 7)
+    assert settle_delivery_attempt(
+        attempt,
+        MessageStatus.DELIVERED,
+        "confirmed",
+        evidence=json.dumps({"path": "/tmp/transcript.jsonl"}),
+    )
+    listed = mailbox_service.list_messages("receiver")
+    assert listed["items"][0]["last_attempt_outcome"] == "confirmed_hit"
+
+
+def test_b2_inferred_confirmed_under_stale_tags_via_production_path(wpq2_db, monkeypatch):
+    """Inferred-delivered confirm under presumed_stale must report confirmed_unverified.
+
+    Exercises production InboxService._evidence_for_confirmed_attempt (shared by
+    hit + inferred + probable confirmed paths) and settle_open_attempt_inferred_delivered
+    (the confirmed path that previously bypassed tagging and did not persist
+    evidence on the attempt row → confirmed_hit).
+    """
+    from cli_agent_orchestrator.clients.database import settle_open_attempt_inferred_delivered
+    from cli_agent_orchestrator.services.message_trace_service import (
+        _declared_presumed_stale,
+        binding_presumed_stale,
+    )
+
+    monkeypatch.setattr(mailbox_service, "SessionLocal", database.SessionLocal)
+    database.create_terminal("receiver", "session", "receiver", "claude_code")
+    message = database.create_inbox_message(
+        "sender", "receiver", "stale window body", OrchestrationType.SEND_MESSAGE
+    )
+    attempt = begin_delivery_attempt([message], "receiver", "claude_code", "payload-hash", 11)
+    _declared_presumed_stale.add("receiver")
+    assert binding_presumed_stale("receiver") is True
+
+    raw_evidence = {"proof": "challenge_reply", "path": "/tmp/t.jsonl"}
+    # Production tag site — not a local reimplementation of the predicate.
+    tagged = InboxService._evidence_for_confirmed_attempt("receiver", raw_evidence)
+    assert tagged["kind"] == "binding_presumed_stale"
+    assert "proof" in tagged
+    assert settle_open_attempt_inferred_delivered(attempt, tagged)
+
+    listed = mailbox_service.list_messages("receiver")
+    assert listed["items"][0]["status"] == MessageStatus.DELIVERED.value
+    assert listed["items"][0]["last_attempt_outcome"] == "confirmed_unverified"
+    trace = get_message_trace(message.id)
+    attempt_row = trace["attempts"][-1]
+    assert attempt_row["outcome"] == "confirmed"
+    assert attempt_row["reason"] == "inferred_by_reply"
+    evidence = attempt_row["evidence"]
+    if isinstance(evidence, str):
+        evidence = json.loads(evidence)
+    assert evidence.get("kind") == "binding_presumed_stale"
+
+
+def test_b2_inferred_without_tag_still_reports_hit_showing_bypass(wpq2_db, monkeypatch):
+    """Control: inferred settle without production tagging still yields confirmed_hit."""
+    from cli_agent_orchestrator.clients.database import settle_open_attempt_inferred_delivered
+    from cli_agent_orchestrator.services.message_trace_service import _declared_presumed_stale
+
+    monkeypatch.setattr(mailbox_service, "SessionLocal", database.SessionLocal)
+    database.create_terminal("receiver", "session", "receiver", "claude_code")
+    message = database.create_inbox_message(
+        "sender", "receiver", "control body", OrchestrationType.SEND_MESSAGE
+    )
+    attempt = begin_delivery_attempt([message], "receiver", "claude_code", "payload-hash", 9)
+    _declared_presumed_stale.add("receiver")
+    # Deliberately skip production tagging — documents the bypass the helper closes.
+    assert settle_open_attempt_inferred_delivered(
+        attempt, {"proof": "reply", "path": "/tmp/t.jsonl"}
+    )
+    listed = mailbox_service.list_messages("receiver")
+    assert listed["items"][0]["last_attempt_outcome"] == "confirmed_hit"
+
+
+def test_b1_identity_notice_receiver_prefers_live_parent_over_newer_peer(wpq2_db):
+    """Live parent supervisor wins over a more-recently-active non-parent supervisor."""
+    from datetime import datetime, timedelta, timezone
+
+    database.create_terminal(
+        "parent_sup",
+        "sess-b1p",
+        "parent_sup",
+        "claude_code",
+        agent_profile="code_supervisor",
+    )
+    database.create_terminal(
+        "peer_sup",
+        "sess-b1p",
+        "peer_sup",
+        "claude_code",
+        agent_profile="code_supervisor",
+    )
+    database.create_terminal(
+        "subject",
+        "sess-b1p",
+        "subject",
+        "claude_code",
+        agent_profile="developer",
+        caller_id="parent_sup",
+    )
+    with database.SessionLocal.begin() as db:
+        parent = db.get(TerminalModel, "parent_sup")
+        peer = db.get(TerminalModel, "peer_sup")
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        parent.last_active = now - timedelta(hours=1)
+        peer.last_active = now  # newer, but not the parent
+
+    fleet = {
+        "session_name": "sess-b1p",
+        "terminals": [
+            {"id": "parent_sup", "status": "idle", "orphan": False, "parent_id": None},
+            {"id": "peer_sup", "status": "idle", "orphan": False, "parent_id": None},
+            {
+                "id": "subject",
+                "status": "processing",
+                "orphan": False,
+                "parent_id": "parent_sup",
+            },
+        ],
+    }
+    # No caller_id on metadata → session-scan; parent must still win via fleet parent_id.
+    metadata = {"tmux_session": "sess-b1p"}
+    with patch(
+        "cli_agent_orchestrator.services.fleet_service.build_fleet",
+        return_value=fleet,
+    ):
+        receiver = InboxService._identity_notice_receiver("subject", metadata)
+    assert receiver == "parent_sup"
+
+
+def test_b3_compact_rotation_followed_for_confirm_binding(wpq2_db, tmp_path):
+    """Valid compact rotation must be the confirm binding, not the frozen pre-compact file."""
+    from cli_agent_orchestrator.services.message_trace_service import (
+        binding_for_transcript_confirm,
+        resolve_session_transcript,
+    )
+
+    old = tmp_path / "pre-compact.jsonl"
+    new = tmp_path / "post-compact.jsonl"
+    old.write_text(
+        json.dumps({"sessionId": "sess-old", "type": "user", "message": "old"}) + "\n",
+        encoding="utf-8",
+    )
+    new.write_text(
+        json.dumps({"sessionId": "sess-new", "type": "user", "message": "rotated"}) + "\n",
+        encoding="utf-8",
+    )
+    database.create_terminal("recv-b3", "sess", "recv-b3", "claude_code")
+    create_transcript_binding("recv-b3", "sess-old", str(old), old.stat().st_ino, "startup")
+    compact = create_transcript_binding(
+        "recv-b3", "sess-new", str(new), new.stat().st_ino, "compact"
+    )
+    chosen = binding_for_transcript_confirm("recv-b3")
+    assert chosen is not None
+    assert chosen["id"] == compact["id"]
+    assert Path(chosen["transcript_path"]).resolve() == new.resolve()
+    resolution = resolve_session_transcript(
+        {
+            "id": "recv-b3",
+            "provider": "claude_code",
+            "provider_session_id": "sess-new",
+            "working_directory": str(tmp_path),
+        }
+    )
+    assert resolution is not None
+    assert resolution.path.resolve() == new.resolve()
+    assert resolution.resolution_kind == "binding"
+
+
+def test_b3_compact_rotation_does_not_presumed_stale_on_old_file(wpq2_db, tmp_path):
+    """When compact binding exists, observe must not freeze on the pre-compact path."""
+    old = tmp_path / "bound-old.jsonl"
+    new = tmp_path / "bound-new.jsonl"
+    sibling = tmp_path / "sibling.jsonl"
+    old.write_text(
+        json.dumps({"sessionId": "old", "type": "user", "message": "frozen"}) + "\n",
+        encoding="utf-8",
+    )
+    new.write_text(
+        json.dumps({"sessionId": "new", "type": "user", "message": "live"}) + "\n",
+        encoding="utf-8",
+    )
+    sibling.write_text(
+        json.dumps({"sessionId": "sib", "type": "user", "message": "other"}) + "\n",
+        encoding="utf-8",
+    )
+    database.create_terminal("recv-b3o", "sess", "recv-b3o", "claude_code")
+    create_transcript_binding("recv-b3o", "old", str(old), old.stat().st_ino, "startup")
+    create_transcript_binding("recv-b3o", "new", str(new), new.stat().st_ino, "compact")
+    clear_binding_staleness_state("recv-b3o")
+    first = observe_binding_absence({"id": "recv-b3o"})
+    second = observe_binding_absence({"id": "recv-b3o"})
+    # Observing the live compact file (unchanged) twice can still go presumed_stale,
+    # but candidates must be relative to the compact path — never stuck on old alone.
+    assert first is not None
+    assert first.path.resolve() == new.resolve()
+    assert second is not None
+    assert second.path.resolve() == new.resolve()
+    clear_binding_staleness_state("recv-b3o")
+
+
+def test_b3_suppress_exhaustion_allows_delivery_not_deadlock(wpq2_db, tmp_path):
+    """After N suppressed cycles with no recovery, must not suppress forever (B3 deadlock)."""
+    from cli_agent_orchestrator.services.inbox_service import (
+        BINDING_SUPPRESS_MAX_CYCLES,
+        InboxService,
+    )
+    from cli_agent_orchestrator.services.message_trace_service import binding_presumed_stale
+
+    bound = tmp_path / "frozen.jsonl"
+    bound.write_text(
+        json.dumps({"sessionId": "sess", "type": "user", "message": "only-old"}) + "\n",
+        encoding="utf-8",
+    )
+    database.create_terminal("recv-b3d", "sess", "recv-b3d", "claude_code")
+    create_transcript_binding("recv-b3d", "sess", str(bound), bound.stat().st_ino, "startup")
+    clear_binding_staleness_state("recv-b3d")
+    meta = {"id": "recv-b3d"}
+    assert observe_binding_absence(meta) is not None
+    stale = observe_binding_absence(meta)
+    assert stale is not None and stale.presumed_stale is True
+
+    prior = {
+        "attempt_uuid": "attempt-prior",
+        "payload_hash": wire_hash("worker-callback-body"),
+        "started_at": None,
+    }
+    prior_lookups = [(prior, "absent", {})]
+    service = InboxService()
+    outcomes = []
+    for _ in range(BINDING_SUPPRESS_MAX_CYCLES + 1):
+        # Keep presumed_stale declared across cycles (escape must NOT clear it — S1).
+        if not binding_presumed_stale("recv-b3d"):
+            observe_binding_absence(meta)
+            observe_binding_absence(meta)
+        result = service._resolve_stale_binding_prior_hits(  # noqa: SLF001
+            "recv-b3d", meta, prior_lookups
+        )
+        outcomes.append(result[0] if result is not None else None)
+
+    assert outcomes[: BINDING_SUPPRESS_MAX_CYCLES - 1] == ["suppressed"] * (
+        BINDING_SUPPRESS_MAX_CYCLES - 1
+    )
+    assert outcomes[BINDING_SUPPRESS_MAX_CYCLES - 1] is None
+    # Terminal-keyed escape counter (S3), not per-binding_id.
+    assert (
+        service._binding_suppress_counts["recv-b3d"] >= BINDING_SUPPRESS_MAX_CYCLES  # noqa: SLF001
+    )
+    # Escaped cycle still leaves terminal declared stale so confirm tags unverified (S1).
+    assert binding_presumed_stale("recv-b3d") is True
+
+
+def test_b3_suppress_counter_survives_binding_rebind(wpq2_db, tmp_path):
+    """Escape counter is per-terminal: reset_binding_episodes must not zero it (S3)."""
+    from cli_agent_orchestrator.services.inbox_service import (
+        BINDING_SUPPRESS_MAX_CYCLES,
+        InboxService,
+    )
+
+    bound = tmp_path / "frozen.jsonl"
+    bound.write_text(
+        json.dumps({"sessionId": "sess", "type": "user", "message": "only-old"}) + "\n",
+        encoding="utf-8",
+    )
+    database.create_terminal("recv-b3s", "sess", "recv-b3s", "claude_code")
+    create_transcript_binding("recv-b3s", "sess", str(bound), bound.stat().st_ino, "startup")
+    clear_binding_staleness_state("recv-b3s")
+    meta = {"id": "recv-b3s"}
+    observe_binding_absence(meta)
+    observe_binding_absence(meta)
+    prior_lookups = [
+        (
+            {
+                "attempt_uuid": "a",
+                "payload_hash": wire_hash("x"),
+                "started_at": None,
+            },
+            "absent",
+            {},
+        )
+    ]
+    service = InboxService()
+    for _ in range(2):
+        service._resolve_stale_binding_prior_hits("recv-b3s", meta, prior_lookups)  # noqa: SLF001
+    assert service._binding_suppress_counts["recv-b3s"] == 2  # noqa: SLF001
+    service.reset_binding_episodes("recv-b3s")
+    assert service._binding_suppress_counts["recv-b3s"] == 2  # noqa: SLF001
+    service._resolve_stale_binding_prior_hits("recv-b3s", meta, prior_lookups)  # noqa: SLF001
+    assert service._binding_suppress_counts["recv-b3s"] == 3  # noqa: SLF001
+    assert BINDING_SUPPRESS_MAX_CYCLES == 3
+
+
+def test_b3_hook_compact_outranks_newer_server_recovery(wpq2_db, tmp_path):
+    """Selector must prefer provider-attested compact over later server_recovery (NIT/B1).
+
+    Distinguishes binding_for_transcript_confirm from plain get_current_transcript_binding:
+    compact is NOT last — a newer server_recovery points at a different existing path.
+    """
+    from cli_agent_orchestrator.clients.database import get_current_transcript_binding
+    from cli_agent_orchestrator.services.message_trace_service import (
+        binding_for_transcript_confirm,
+    )
+
+    main = tmp_path / "post-compact.jsonl"
+    sibling = tmp_path / "sibling-recovery.jsonl"
+    main.write_text(
+        json.dumps({"sessionId": "main", "type": "user", "message": "rotated"}) + "\n",
+        encoding="utf-8",
+    )
+    sibling.write_text(
+        json.dumps({"sessionId": "sib", "type": "user", "message": "sidechain"}) + "\n",
+        encoding="utf-8",
+    )
+    database.create_terminal("recv-b3n", "sess", "recv-b3n", "claude_code")
+    compact = create_transcript_binding(
+        "recv-b3n", "main", str(main), main.stat().st_ino, "compact"
+    )
+    recovery = create_transcript_binding(
+        "recv-b3n", "sib", str(sibling), sibling.stat().st_ino, "server_recovery"
+    )
+    # get_current is the newer recovery; selector must still pick compact.
+    current = get_current_transcript_binding("recv-b3n")
+    assert current is not None and current["id"] == recovery["id"]
+    chosen = binding_for_transcript_confirm("recv-b3n")
+    assert chosen is not None
+    assert chosen["id"] == compact["id"]
+    assert Path(chosen["transcript_path"]).resolve() == main.resolve()
+
+
+def test_b3_s6_newest_hook_beats_older_compact_over_recovery(wpq2_db, tmp_path):
+    """S6 falsifier: compact→resume→server_recovery must select the resume path, not compact."""
+    from cli_agent_orchestrator.clients.database import get_current_transcript_binding
+    from cli_agent_orchestrator.services.message_trace_service import (
+        binding_for_transcript_confirm,
+    )
+
+    p_a = tmp_path / "compact-old.jsonl"
+    p_b = tmp_path / "resume-live.jsonl"
+    p_c = tmp_path / "recovery-sib.jsonl"
+    for path, sid, msg in (
+        (p_a, "a", "compact-era"),
+        (p_b, "b", "resume-era"),
+        (p_c, "c", "recovery-era"),
+    ):
+        path.write_text(
+            json.dumps({"sessionId": sid, "type": "user", "message": msg}) + "\n",
+            encoding="utf-8",
+        )
+    database.create_terminal("recv-b3s6", "sess", "recv-b3s6", "claude_code")
+    compact = create_transcript_binding("recv-b3s6", "a", str(p_a), p_a.stat().st_ino, "compact")
+    resume = create_transcript_binding("recv-b3s6", "b", str(p_b), p_b.stat().st_ino, "resume")
+    recovery = create_transcript_binding(
+        "recv-b3s6", "c", str(p_c), p_c.stat().st_ino, "server_recovery"
+    )
+    current = get_current_transcript_binding("recv-b3s6")
+    assert current is not None and current["id"] == recovery["id"]
+    chosen = binding_for_transcript_confirm("recv-b3s6")
+    assert chosen is not None
+    # Must be newest HOOK (resume), not oldest compact and not recovery.
+    assert chosen["id"] == resume["id"], (
+        f"S6 live if compact wins: got id={chosen['id']} source={chosen.get('source')} "
+        f"path={chosen.get('transcript_path')}"
+    )
+    assert Path(chosen["transcript_path"]).resolve() == p_b.resolve()
+    assert chosen["id"] != compact["id"]
+
+
+def test_b3_n3_missing_hook_path_does_not_outrank_live_current(wpq2_db, tmp_path):
+    """N3: deleted hook transcript must not beat a live server_recovery path."""
+    from cli_agent_orchestrator.services.message_trace_service import (
+        binding_for_transcript_confirm,
+    )
+
+    hook_path = tmp_path / "gone-compact.jsonl"
+    live = tmp_path / "live-recovery.jsonl"
+    hook_path.write_text(
+        json.dumps({"sessionId": "h", "type": "user", "message": "hook"}) + "\n",
+        encoding="utf-8",
+    )
+    live.write_text(
+        json.dumps({"sessionId": "r", "type": "user", "message": "live"}) + "\n",
+        encoding="utf-8",
+    )
+    database.create_terminal("recv-b3n3", "sess", "recv-b3n3", "claude_code")
+    create_transcript_binding("recv-b3n3", "h", str(hook_path), hook_path.stat().st_ino, "compact")
+    recovery = create_transcript_binding(
+        "recv-b3n3", "r", str(live), live.stat().st_ino, "server_recovery"
+    )
+    hook_path.unlink()
+    chosen = binding_for_transcript_confirm("recv-b3n3")
+    assert chosen is not None
+    assert chosen["id"] == recovery["id"]
+    assert Path(chosen["transcript_path"]).resolve() == live.resolve()
+
+
+def test_b3_compact_rebind_skips_suppress_without_waiting_for_n(wpq2_db, tmp_path):
+    """Compact rotation mid-stale must rebind and allow delivery on the first resolve."""
+    from cli_agent_orchestrator.services.inbox_service import InboxService
+    from cli_agent_orchestrator.services.message_trace_service import BindingStalenessObservation
+
+    old = tmp_path / "old.jsonl"
+    new = tmp_path / "new.jsonl"
+    old.write_text(
+        json.dumps({"sessionId": "old-sess", "type": "user", "message": "prior"}) + "\n",
+        encoding="utf-8",
+    )
+    new.write_text(
+        json.dumps({"sessionId": "new-sess", "type": "user", "message": "summary"}) + "\n",
+        encoding="utf-8",
+    )
+    database.create_terminal("recv-b3r", "sess", "recv-b3r", "claude_code")
+    old_binding = create_transcript_binding(
+        "recv-b3r", "old-sess", str(old), old.stat().st_ino, "startup"
+    )
+    compact_row = create_transcript_binding(
+        "recv-b3r", "new-sess", str(new), new.stat().st_ino, "compact"
+    )
+    prior = {
+        "attempt_uuid": "a1",
+        "payload_hash": wire_hash("missing-in-compact"),
+        "started_at": None,
+    }
+    # Simulate in-memory presumed_stale still on the pre-compact path while a
+    # compact epoch already exists (the live gap before confirm follows compact).
+    stale_obs = BindingStalenessObservation(int(old_binding["id"]), old.resolve(), True, ())
+    service = InboxService()
+    with (
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.observe_binding_absence",
+            return_value=stale_obs,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.get_latest_compact_transcript_binding",
+            return_value=compact_row,
+        ),
+    ):
+        result = service._resolve_stale_binding_prior_hits(  # noqa: SLF001
+            "recv-b3r",
+            {"id": "recv-b3r"},
+            [(prior, "absent", {})],
+        )
+    # Rotation follow must not leave cycle-1 in suppressed.
+    assert result is None or (result is not None and result[0] in {"hit", "authority_changed"})

@@ -5,8 +5,8 @@ already rejects bad entries up front; this layer is the safety net for
 callers that bypass the CLI (cao-mcp-server, direct HTTP).
 """
 
-from cli_agent_orchestrator.clients.tmux import TmuxClient
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+from cli_agent_orchestrator.clients.tmux import TmuxClient
 
 
 def test_merge_with_none_is_noop():
@@ -78,6 +78,12 @@ def test_artifacts_dir_filter_parity_tmux_and_herdr():
     TmuxClient._merge_extra_env(tmux_env, extra)
 
     assert tmux_env == {"CAO_ARTIFACTS_DIR": "/repo/tmp/orch"}
-    assert HerdrBackend._build_extra_env_exports(extra) == [
-        "export CAO_ARTIFACTS_DIR=/repo/tmp/orch"
+    backend = object.__new__(HerdrBackend)
+    assert backend._build_env_args("deadbeef", "cao-test", extra) == [
+        "--env",
+        "CAO_ARTIFACTS_DIR=/repo/tmp/orch",
+        "--env",
+        "CAO_TERMINAL_ID=deadbeef",
+        "--env",
+        "CAO_SESSION_NAME=cao-test",
     ]

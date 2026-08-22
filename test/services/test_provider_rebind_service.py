@@ -221,12 +221,17 @@ async def test_wpd1_fleet_forwards_content_options_without_changing_legacy_calls
         content_options={"show": True, "force": False},
     )
     assert result["reason"] == "content-flag"
-    assert calls == [("worker", {
-        "interrupt": False,
-        "acknowledge_ownership": False,
-        "reason": "content-flag",
-        "content_options": {"show": True, "force": False},
-    })]
+    assert calls == [
+        (
+            "worker",
+            {
+                "interrupt": False,
+                "acknowledge_ownership": False,
+                "reason": "content-flag",
+                "content_options": {"show": True, "force": False},
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -465,6 +470,13 @@ def test_real_monitor_projected_error_diverges_from_candidate_raw(monkeypatch):
 @pytest.mark.asyncio
 async def test_transaction_p12_uses_real_raw_monitor_under_error_overlay(monkeypatch):
     old, candidate, _states = _install_transaction_harness(monkeypatch)
+    from cli_agent_orchestrator.utils.persona_context import PersonaPlan
+
+    candidate._persona_plan = object.__new__(PersonaPlan)
+    reap = MagicMock()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.utils.persona_context.reap_persona_generations", reap
+    )
     monitor = StatusMonitor()
     state = {"value": None}
     backend = MagicMock()
@@ -508,6 +520,7 @@ async def test_transaction_p12_uses_real_raw_monitor_under_error_overlay(monkeyp
     result = await service.rebind_terminal("txn")
     assert result["status"] == "rebound", result
     assert state["value"] == "rebound"
+    reap.assert_called_once_with("txn")
 
 
 @pytest.mark.asyncio
@@ -633,8 +646,12 @@ async def test_wpd1_scrub_runs_after_proven_death_and_before_candidate_initializ
         "prepare_content_recovery",
         lambda **kwargs: events.append(("scrub", kwargs)) or prepared,
     )
-    candidate.initialize = AsyncMock(side_effect=lambda **_kwargs: events.append(("initialize", {})))
-    monkeypatch.setattr(wpd1_decontam, "mark_recovery_complete", lambda _p: events.append(("complete", {})))
+    candidate.initialize = AsyncMock(
+        side_effect=lambda **_kwargs: events.append(("initialize", {}))
+    )
+    monkeypatch.setattr(
+        wpd1_decontam, "mark_recovery_complete", lambda _p: events.append(("complete", {}))
+    )
     monkeypatch.setattr(wpd1_decontam, "release_prepared_recovery", lambda _p: None)
     monkeypatch.setattr(
         wpd1_decontam,
@@ -663,10 +680,17 @@ async def test_wpd1_resume_failure_disables_unsanitized_fallback(monkeypatch):
     from cli_agent_orchestrator.services import wpd1_decontam
 
     metadata = {
-        "id": "txn", "recovery_state": None, "shell_command": "bash",
-        "provider_session_id": "uuid", "provider": "codex", "tmux_session": "cao-test",
-        "tmux_window": "worker", "agent_profile": "dev", "allowed_tools": None,
-        "lifecycle_generation": 4, "caller_mailbox_id": None,
+        "id": "txn",
+        "recovery_state": None,
+        "shell_command": "bash",
+        "provider_session_id": "uuid",
+        "provider": "codex",
+        "tmux_session": "cao-test",
+        "tmux_window": "worker",
+        "agent_profile": "dev",
+        "allowed_tools": None,
+        "lifecycle_generation": 4,
+        "caller_mailbox_id": None,
     }
     monkeypatch.setattr(service, "get_terminal_metadata", lambda _tid: metadata.copy())
     prepared = SimpleNamespace()
@@ -674,7 +698,8 @@ async def test_wpd1_resume_failure_disables_unsanitized_fallback(monkeypatch):
     monkeypatch.setattr(wpd1_decontam, "release_prepared_recovery", lambda _p: None)
     monkeypatch.setattr(wpd1_decontam, "post_initialize_failure", lambda *_a: True)
     monkeypatch.setattr(
-        wpd1_decontam, "public_scrub_summary",
+        wpd1_decontam,
+        "public_scrub_summary",
         lambda _p, show: {"incident_path": "/tmp/incident"},
     )
     candidate.initialize.side_effect = RuntimeError("candidate failed")
@@ -696,10 +721,17 @@ async def test_wpd1_watchdog_resume_failure_runs_post_append_authority_law(monke
     from cli_agent_orchestrator.services import wpd1_decontam
 
     metadata = {
-        "id": "txn", "recovery_state": None, "shell_command": "bash",
-        "provider_session_id": "uuid", "provider": "codex", "tmux_session": "cao-test",
-        "tmux_window": "worker", "agent_profile": "dev", "allowed_tools": None,
-        "lifecycle_generation": 4, "caller_mailbox_id": None,
+        "id": "txn",
+        "recovery_state": None,
+        "shell_command": "bash",
+        "provider_session_id": "uuid",
+        "provider": "codex",
+        "tmux_session": "cao-test",
+        "tmux_window": "worker",
+        "agent_profile": "dev",
+        "allowed_tools": None,
+        "lifecycle_generation": 4,
+        "caller_mailbox_id": None,
     }
     monkeypatch.setattr(service, "get_terminal_metadata", lambda _tid: metadata.copy())
     prepared = SimpleNamespace()
@@ -709,7 +741,8 @@ async def test_wpd1_watchdog_resume_failure_runs_post_append_authority_law(monke
     monkeypatch.setattr(wpd1_decontam, "post_initialize_failure", post)
     monkeypatch.setattr(wpd1_decontam, "mark_recovery_failure", MagicMock())
     monkeypatch.setattr(
-        wpd1_decontam, "public_scrub_summary",
+        wpd1_decontam,
+        "public_scrub_summary",
         lambda _p, show: {"incident_path": "/tmp/incident"},
     )
 
@@ -726,10 +759,17 @@ async def test_wpd1_guard_release_error_still_closes_incident_complete(monkeypat
     from cli_agent_orchestrator.services import wpd1_decontam
 
     metadata = {
-        "id": "txn", "recovery_state": None, "shell_command": "bash",
-        "provider_session_id": "uuid", "provider": "codex", "tmux_session": "cao-test",
-        "tmux_window": "worker", "agent_profile": "dev", "allowed_tools": None,
-        "lifecycle_generation": 4, "caller_mailbox_id": None,
+        "id": "txn",
+        "recovery_state": None,
+        "shell_command": "bash",
+        "provider_session_id": "uuid",
+        "provider": "codex",
+        "tmux_session": "cao-test",
+        "tmux_window": "worker",
+        "agent_profile": "dev",
+        "allowed_tools": None,
+        "lifecycle_generation": 4,
+        "caller_mailbox_id": None,
     }
     monkeypatch.setattr(service, "get_terminal_metadata", lambda _tid: metadata.copy())
     prepared = SimpleNamespace()
@@ -738,7 +778,8 @@ async def test_wpd1_guard_release_error_still_closes_incident_complete(monkeypat
     complete = MagicMock()
     monkeypatch.setattr(wpd1_decontam, "mark_recovery_complete", complete)
     monkeypatch.setattr(
-        wpd1_decontam, "public_scrub_summary",
+        wpd1_decontam,
+        "public_scrub_summary",
         lambda _p, show: {"incident_path": "/tmp/incident"},
     )
     monkeypatch.setattr(
@@ -1329,12 +1370,24 @@ def test_eager_identity_helper_orders_capture_validate_then_atomic_persist(monke
 
 def test_public_delete_passes_current_lease_token_to_single_teardown_body(monkeypatch):
     seen = []
+    metadata = {
+        "id": "delete-a",
+        "tmux_session": "cao-delete",
+        "tmux_window": "worker",
+        "caller_id": None,
+    }
+    monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda _tid: metadata)
+    monkeypatch.setattr(terminal_service, "list_terminals_by_session", lambda _session: [metadata])
+    monkeypatch.setattr(terminal_service, "quiesce_deferred_session_sync", lambda _session: None)
     monkeypatch.setattr(
         terminal_service,
         "_delete_terminal_under_lease",
-        lambda terminal_id, token, registry=None: seen.append((terminal_id, token)) or True,
+        lambda terminal_id, token, **_kwargs: (
+            seen.append((terminal_id, token)) or {"terminal_deleted": True}
+        ),
     )
-    assert terminal_service.delete_terminal("delete-a") is True
+    result = terminal_service.delete_terminal("delete-a")
+    assert result["reaped"] == [{"id": "delete-a", "status": "reaped"}]
     assert seen[0][0] == "delete-a"
     assert seen[0][1] is not None
     assert seen[0][1].terminal_id == "delete-a"
@@ -1366,11 +1419,20 @@ def test_many_terminal_delivery_defers_without_blocking_rebind_work(monkeypatch)
 async def test_delete_is_busy_with_zero_teardown_at_commit_boundaries(monkeypatch, boundary):
     _old, candidate, _states = _install_transaction_harness(monkeypatch)
     teardown = MagicMock()
+    metadata = {
+        "id": "txn",
+        "tmux_session": "cao-test",
+        "tmux_window": "worker",
+        "caller_id": None,
+    }
+    monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda _tid: metadata)
+    monkeypatch.setattr(terminal_service, "list_terminals_by_session", lambda _session: [metadata])
+    monkeypatch.setattr(terminal_service, "quiesce_deferred_session_sync", lambda _session: None)
     monkeypatch.setattr(terminal_service, "_delete_terminal_under_lease", teardown)
     observed = []
 
     def assert_delete_blocked(label):
-        with pytest.raises(RuntimeError, match="rebind_in_progress"):
+        with pytest.raises(RuntimeError, match="resume_in_progress"):
             terminal_service.delete_terminal("txn")
         observed.append(label)
         teardown.assert_not_called()
@@ -1408,3 +1470,48 @@ async def test_delete_is_busy_with_zero_teardown_at_commit_boundaries(monkeypatc
     assert result["status"] == "rebound"
     assert observed == (["p12", "p13"] if boundary == "p12_p13" else [boundary])
     teardown.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_f26_ac9_rebind_none_cwd_marks_unresumable_not_typeerror(monkeypatch):
+    """AC9: a rebind resume attempt whose pane cwd is None is marked
+    unresumable with a directed reason (cwd_unavailable), never a TypeError
+    from quote(None) and never a wrong-cwd fallback."""
+    _old, _candidate, _states = _install_transaction_harness(monkeypatch)
+    backend = MagicMock()
+    backend.get_pane_working_directory.return_value = None
+    monkeypatch.setattr(service, "get_backend", lambda: backend)
+    result = await service.rebind_terminal("txn")
+    assert result["status"] == "unresumable"
+    assert result["error_code"] == "cwd_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_f26_ac11_rebind_create_path_none_cwd_fails_directed_not_getcwd(monkeypatch):
+    """AC11: rebind create_terminal path with a None cwd fails directed
+    (unresumable) and NEVER falls back to os.getcwd()."""
+    from cli_agent_orchestrator.services import provider_rebind_service as svc
+
+    metadata = {
+        "id": "txn",
+        "tmux_session": "cao-test",
+        "tmux_window": "worker",
+        "provider_session_id": "uuid",
+        "provider": "codex",
+        "agent_profile": "dev",
+        "allowed_tools": None,
+        "shell_command": "bash",
+    }
+    backend = MagicMock()
+    backend.get_pane_working_directory.return_value = None
+    monkeypatch.setattr(svc, "get_backend", lambda: backend)
+    monkeypatch.setattr(svc, "set_terminal_recovery_state", lambda *a, **k: True)
+    monkeypatch.setattr(svc, "get_terminal_metadata", lambda _tid: metadata)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.create_terminal",
+        AsyncMock(side_effect=AssertionError("create_terminal must not be called")),
+    )
+    result = await svc._fallback(metadata, "uuid", None, None)
+    assert result["status"] == "unresumable"
+    assert result["error_code"] == "cwd_unavailable"
+    assert result["new_terminal_id"] is None

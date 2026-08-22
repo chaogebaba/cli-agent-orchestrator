@@ -20,14 +20,28 @@ The provider detects the following terminal states:
 import logging
 import re
 import shlex
+import time
+from pathlib import Path
 from typing import Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.constants import BLOCKED_WAIT_CAP_S, KIRO_AGENTS_DIR
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
-from cli_agent_orchestrator.services.settings_service import get_server_settings
+from cli_agent_orchestrator.providers.kiro_capabilities import build_kiro_command
+from cli_agent_orchestrator.services.settings_service import (
+    get_provider_defaults,
+    get_provider_profile_defaults,
+    get_server_settings,
+    resolve_provider_string_option,
+)
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.terminal import (
+    BlockedWaitPolicy,
+    wait_for_shell,
+    wait_until_status,
+)
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
@@ -130,6 +144,17 @@ TUI_PERMISSION_PATTERN = (
 # Must be anchored to bottom screen region (see get_status WAITING check) to avoid stale matches.
 TUI_TRUST_ALL_TOOLS_FOOTER = r"esc to cancel · ↑↓ to navigate · ↵ to select"
 
+# Distinctive consent-dialog body text. TUI_TRUST_ALL_TOOLS_FOOTER above is
+# kiro's GENERIC list-selector chrome — an update/login/onboarding selector
+# renders it identically — so before answering we require this trust-specific
+# line, and require the ❯ cursor to sit on "No, exit" so Down lands on
+# "Yes, I accept" (not "Yes, and don't ask again"). Anything else fails closed.
+TUI_TRUST_ALL_TOOLS_BODY = r"Kiro is running in trust all tools mode"
+TUI_TRUST_ALL_TOOLS_CURSOR = r"❯\s*No, exit"
+
+# Bottom pane lines scanned for the consent dialog (mirrors codex's window).
+STARTUP_PROMPT_BOTTOM_LINES = 15
+
 # =============================================================================
 # Error Detection
 # =============================================================================
@@ -139,6 +164,7 @@ ERROR_INDICATORS = ["Kiro is having trouble responding right now"]
 
 
 class KiroCliProvider(BaseProvider):
+    supports_screen_detection = True  # F110: auto-responder opt-in (G7 R2 root cause)
     """Provider for Kiro CLI tool integration.
 
     This provider manages the lifecycle of a Kiro CLI chat session within a tmux window,
@@ -160,6 +186,8 @@ class KiroCliProvider(BaseProvider):
         window_name: str,
         agent_profile: str,
         allowed_tools: Optional[list] = None,
+        engine: Optional[KiroEngine] = None,
+        model: Optional[str] = None,
     ):
         """Initialize Kiro CLI provider with terminal context.
 
@@ -169,11 +197,17 @@ class KiroCliProvider(BaseProvider):
             window_name: Name of the tmux window
             agent_profile: Name of the Kiro agent profile to use (e.g., "developer")
             allowed_tools: Optional list of CAO tool names the agent is allowed to use
+            engine: Resolved Kiro engine. Terminal creation probes it before this provider exists.
+            model: Explicit per-call override for profile.model (see
+                _get_profile_model), e.g. a handoff/assign caller pinning a
+                specific model for one worker without a dedicated profile.
         """
         super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
         self._input_received = False
         self._agent_profile = agent_profile
+        self._engine = resolve_kiro_engine(persisted=engine)
+        self._model = model
 
         # Build dynamic prompt pattern based on agent profile
         # This pattern matches various Kiro prompt formats after ANSI stripping:
@@ -189,6 +223,11 @@ class KiroCliProvider(BaseProvider):
 
         # New TUI header pattern: "agent_name · model · ◔ N%"
         self._new_tui_header_pattern = rf"{re.escape(self._agent_profile)}\s+·\s+.*·\s+◔\s*\d+%"
+
+    @property
+    def resolved_model(self) -> Optional[str]:
+        """Return the effective model resolved by the service layer."""
+        return getattr(self, '_model', None)
 
     @property
     def paste_enter_count(self) -> int:
@@ -223,22 +262,101 @@ class KiroCliProvider(BaseProvider):
         return 2000
 
     def _get_profile_model(self) -> Optional[str]:
-        """Return profile.model if the agent profile can be loaded, else None.
+        """Resolve model: spawn override > providers.toml > profile field.
+
+        F107 B2: kiro joins codex/grok/claude on resolve_provider_string_option
+        so ``[kiro_cli] model = "auto"`` in providers.toml is honored.
 
         Best-effort: historically the Kiro CLI provider has not required the
         CAO agent profile to be loadable at runtime (kiro-cli has its own
-        agent store). A missing or unparseable profile must not block launch.
+        agent store). A missing or unparseable profile must not block launch;
+        toml defaults still apply when the profile is absent.
         """
+        if self._model:
+            return self._model
+        profile = None
         try:
             profile = load_agent_profile(self._agent_profile)
         except (FileNotFoundError, RuntimeError) as exc:
             logger.debug(
-                "Profile '%s' not loadable by CAO; skipping --model resolution: %s",
+                "Profile '%s' not loadable by CAO; falling back to providers.toml: %s",
                 self._agent_profile,
                 exc,
             )
-            return None
-        return profile.model or None
+        provider_defaults = get_provider_defaults("kiro_cli")
+        profile_name = getattr(profile, "name", None) or self._agent_profile
+        profile_defaults = get_provider_profile_defaults(provider_defaults, profile_name)
+        return resolve_provider_string_option(
+            profile_defaults,
+            provider_defaults,
+            profile,
+            "model",
+            "model",
+        )
+
+    def _assert_kiro_identity_guard(self) -> None:
+        """F118 §7 loud identity guard — runs at the top of initialize().
+
+        Raises on:
+        (a) Profile declares a provider != kiro_cli (misroute from explicit param).
+        (b) Base agent JSON missing (profile never installed for kiro → kiro_default).
+        """
+        # (a) Provider-routing mismatch: profile says it belongs to another provider.
+        try:
+            profile = load_agent_profile(self._agent_profile)
+            if profile.provider and profile.provider != "kiro_cli":
+                raise RuntimeError(
+                    f"Provider routing mismatch: profile '{self._agent_profile}' declares "
+                    f"provider='{profile.provider}' but was routed to kiro_cli. Refusing to "
+                    f"launch — fix the routing or the profile's provider field."
+                )
+        except (FileNotFoundError, RuntimeError) as exc:
+            # If we can't load the profile at all, that's fine for the mismatch
+            # check — the base-exists check below is what matters.
+            if "routing mismatch" in str(exc):
+                raise
+            logger.debug(
+                "Profile '%s' not loadable for mismatch check: %s",
+                self._agent_profile,
+                exc,
+            )
+
+        # (b) Base agent JSON must exist (installed by `cao install`).
+        base = KIRO_AGENTS_DIR / f"{self._agent_profile.replace('/', '__')}.json"
+        if not base.exists():
+            raise RuntimeError(
+                f"kiro base agent JSON missing: {base} (profile '{self._agent_profile}' has no "
+                f"installed kiro agent; re-run `cao install` for a kiro variant, or fix the "
+                f"provider routing). Refusing to launch unprofiled kiro_default."
+            )
+
+    def _assert_postlaunch_identity(self) -> None:
+        """F118 §7.2 post-launch assertion — verify status bar shows expected agent.
+
+        Polls the pane buffer for the kiro not-found banner or kiro_default status.
+        Raises on mismatch so the launch fails loudly instead of running unprofiled.
+        """
+        pane_content = get_backend().capture_viewport(self.session_name, self.window_name)
+        if not pane_content:
+            return  # No content yet — skip (timeout will catch real failures)
+
+        # Check for the "agent not found" banner
+        not_found_pattern = r'agent ".*?" not found, using "kiro_default"'
+        if re.search(not_found_pattern, pane_content):
+            raise RuntimeError(
+                f"kiro-cli launched with kiro_default (agent '{self._agent_profile}' not found "
+                f"in kiro registry). The base agent JSON may be corrupt or the name field "
+                f"doesn't match. Re-run `cao install`."
+            )
+
+        # Check the TUI header for agent name — if it shows a different agent, fail.
+        # Only assert if we can positively see the header (absence is not a failure).
+        if re.search(r"kiro_default\s+·", pane_content):
+            raise RuntimeError(
+                f"kiro-cli status bar shows 'kiro_default' instead of "
+                f"'{self._agent_profile}'. The agent JSON name field may not match "
+                f"the profile name. Re-run `cao install`."
+            )
 
     async def initialize(self) -> bool:
         """Initialize Kiro CLI provider by starting kiro-cli chat command.
@@ -255,6 +373,9 @@ class KiroCliProvider(BaseProvider):
             TimeoutError: If shell or Kiro CLI initialization times out
         """
         from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        # F118 §7: Loud identity guard — fail fast on misroute or missing base JSON.
+        self._assert_kiro_identity_guard()
 
         # Step 1: Wait for shell prompt to appear in the tmux window
         # This ensures the terminal is ready before we send commands
@@ -298,12 +419,22 @@ class KiroCliProvider(BaseProvider):
                 "kiro_cli yolo mode: forcing --legacy-ui (kiro-cli 2.0.1 TUI "
                 "shows a non-bypassable trust-all-tools consent dialog)"
             )
-            base_args = ["kiro-cli", "chat", "--legacy-ui", "--trust-all-tools"]
+            base_args = build_kiro_command(
+                self._engine,
+                self._agent_profile,
+                model=model,
+                yolo=True,
+                legacy_ui=True,
+            )
         else:
-            base_args = ["kiro-cli", "chat", "--trust-all-tools"]
-        if model:
-            base_args.extend(["--model", model])
-        base_args.extend(["--agent", self._agent_profile])
+            # Current CAO policy always bypasses Kiro's interactive approval
+            # prompt; CAO still enforces the profile/MCP allowlist itself.
+            base_args = build_kiro_command(
+                self._engine,
+                self._agent_profile,
+                model=model,
+                yolo=True,
+            )
         command = shlex.join(base_args)
         # Arm the StatusMonitor stickiness gate before launching the CLI so
         # the IDLE → PROCESSING → IDLE/COMPLETED transition is honored.
@@ -313,41 +444,78 @@ class KiroCliProvider(BaseProvider):
         # Step 3: Wait for Kiro CLI to fully initialize and show the agent prompt.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
-        if not await wait_until_status(
-            self.terminal_id,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=float(get_server_settings()["provider_init_timeout"]),
-        ):
+        #
+        # F109: Build a BlockedWaitPolicy (mirrors codex.py) so that named
+        # auto-responder wait rules pause the init deadline instead of burning it.
+        from cli_agent_orchestrator.services.auto_responder import auto_responder
+
+        async def notify_blocked(rule_name: str) -> None:
+            if self.blocked_wait_notifier is not None:
+                await self.blocked_wait_notifier(rule_name)
+
+        def probe_blocked() -> tuple[str, str] | None:
+            gate = auto_responder.waiting_gate(self.terminal_id)
+            return gate if isinstance(gate, tuple) else None
+
+        blocked_policy = BlockedWaitPolicy(
+            probe=probe_blocked,
+            blocked_cap_s=BLOCKED_WAIT_CAP_S,
+            on_first_blocked=notify_blocked,
+        )
+
+        # _wait_ready_accepting_trust_dialog also auto-answers the
+        # --trust-all-tools startup consent dialog (see its docstring), which
+        # kiro-cli >= 2.1 shows in the default TUI *and* under --legacy-ui.
+        if not await self._wait_ready_accepting_trust_dialog(blocked_policy=blocked_policy):
             if yolo:
                 # Yolo already launched with --legacy-ui; no further fallback.
-                raise TimeoutError("Kiro CLI initialization timed out with --legacy-ui (yolo mode)")
+                suffix = (
+                    f" after blocked wait rule '{blocked_policy.last_blocked_rule}'"
+                    if blocked_policy.last_blocked_rule
+                    else ""
+                )
+                raise TimeoutError(
+                    f"Kiro CLI initialization timed out with --legacy-ui (yolo mode){suffix}"
+                )
             # Non-yolo TUI mode failed — fall back to --legacy-ui
             logger.warning("Kiro CLI TUI initialization timed out, retrying with --legacy-ui")
             # Exit the current session and start fresh with --legacy-ui
             status_monitor.notify_input_sent(self.terminal_id)
             get_backend().send_keys(self.session_name, self.window_name, "/exit")
-            init_timeout = get_server_settings()["provider_init_timeout"]
-            if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
+            init_timeout_shell = get_server_settings()["provider_init_timeout"]
+            if not await wait_for_shell(self.terminal_id, timeout=init_timeout_shell):
                 raise TimeoutError(
-                    f"Shell recovery timed out after {init_timeout}s (--legacy-ui fallback)"
+                    f"Shell recovery timed out after {init_timeout_shell}s (--legacy-ui fallback)"
                 )
             # Clear the StatusMonitor buffer so the --legacy-ui attempt is detected
             # against a clean buffer, not one still full of stale TUI marker bytes
             # from the failed first attempt (which would otherwise time out too).
             status_monitor.reset_buffer(self.terminal_id)
-            legacy_args = ["kiro-cli", "chat", "--legacy-ui", "--trust-all-tools"]
-            if model:
-                legacy_args.extend(["--model", model])
-            legacy_args.extend(["--agent", self._agent_profile])
+            legacy_args = build_kiro_command(
+                self._engine,
+                self._agent_profile,
+                model=model,
+                yolo=True,
+                legacy_ui=True,
+            )
             legacy_command = shlex.join(legacy_args)
             status_monitor.notify_input_sent(self.terminal_id)
             get_backend().send_keys(self.session_name, self.window_name, legacy_command)
-            if not await wait_until_status(
-                self.terminal_id,
-                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-                timeout=float(get_server_settings()["provider_init_timeout"]),
-            ):
-                raise TimeoutError("Kiro CLI initialization timed out with TUI and `--legacy-ui`")
+            # Reset last_blocked_rule so a rule from the first wait doesn't
+            # falsely label a second-wait timeout that never parked (fold r1/D1).
+            blocked_policy.last_blocked_rule = None
+            if not await self._wait_ready_accepting_trust_dialog(blocked_policy=blocked_policy):
+                suffix = (
+                    f" after blocked wait rule '{blocked_policy.last_blocked_rule}'"
+                    if blocked_policy.last_blocked_rule
+                    else ""
+                )
+                raise TimeoutError(
+                    f"Kiro CLI initialization timed out with TUI and `--legacy-ui`{suffix}"
+                )
+
+        # F118 §7.2: Post-launch identity assertion — catch kiro_default fallback.
+        self._assert_postlaunch_identity()
 
         self._initialized = True
         return True
@@ -357,6 +525,106 @@ class KiroCliProvider(BaseProvider):
             "interactive_dialog"
             if self.get_status_from_screen(rows) == TerminalStatus.WAITING_USER_ANSWER
             else None
+        )
+
+    async def _wait_ready_accepting_trust_dialog(
+        self, *, blocked_policy: "BlockedWaitPolicy | None" = None
+    ) -> bool:
+        """Wait for the agent prompt, auto-answering the trust-all-tools dialog.
+
+        CAO always launches kiro-cli with ``--trust-all-tools`` (there is no
+        human at the terminal to answer per-tool permission prompts in headless
+        orchestration; CAO enforces tool scoping at its own profile/MCP layers).
+        Since kiro-cli 2.1, ``--trust-all-tools`` opens a one-time startup
+        consent dialog *before* the chat prompt is interactive:
+
+            ❯ No, exit
+              Yes, I accept
+              Yes, and don't ask again
+
+        The default TUI shows this dialog on kiro-cli 2.16.1 (verified), so the
+        earlier "force --legacy-ui to skip it" workaround no longer helps and
+        init just times out on the dialog. This helper is applied to the
+        ``--legacy-ui`` fallback path too, so if a kiro build shows the dialog
+        there as well it is handled without a version check. get_status()
+        classifies the dialog as WAITING_USER_ANSWER off generic selector
+        chrome, so before answering we VERIFY the dialog body and the ❯ cursor
+        line (fail closed on anything else), then select **"Yes, I accept"**
+        (Down, Enter) — the one-line-down option. We deliberately do NOT pick
+        "Yes, and don't ask again", which would persist a trust-all-tools
+        bypass into the user's kiro config; CAO's acceptance is scoped to this
+        ephemeral session only.
+
+        Returns:
+            True if the terminal reached IDLE or COMPLETED (dialog answered if
+            it was verified and shown), False if it timed out or a
+            WAITING_USER_ANSWER could not be verified as the consent dialog.
+        """
+        init_timeout = float(get_server_settings()["provider_init_timeout"])
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        start = time.monotonic()
+        ready = await wait_until_status(
+            self.terminal_id,
+            {
+                TerminalStatus.IDLE,
+                TerminalStatus.COMPLETED,
+                TerminalStatus.WAITING_USER_ANSWER,
+            },
+            timeout=init_timeout,
+            blocked_policy=blocked_policy,
+        )
+        if not ready:
+            return False
+        # Ready-flap window: wait_until_status returned on WAITING_USER_ANSWER,
+        # but get_status is re-read here rather than trusted from the wait. If it
+        # has since flapped to IDLE/COMPLETED, treat the terminal as ready and do
+        # NOT send dialog keys (a blind Down+Enter into a live prompt would be a
+        # stray message). Low probability given the sticky latch, but explicit.
+        if status_monitor.get_status(self.terminal_id) != TerminalStatus.WAITING_USER_ANSWER:
+            return True
+
+        # WAITING_USER_ANSWER is classified from TUI_TRUST_ALL_TOOLS_FOOTER,
+        # which is kiro's GENERIC list-selector chrome. Verify the dialog BODY
+        # and the ❯ cursor position before answering — a blind Down+Enter on
+        # some other startup selector would pick an arbitrary option. Same
+        # fail-closed shape as codex's directory-trust check. On any mismatch,
+        # fall through to the normal timeout/fallback path.
+        backend = get_backend()
+        pane = strip_terminal_escapes(
+            re.sub(ANSI_CODE_PATTERN, "", backend.get_history(self.session_name, self.window_name))
+        )
+        bottom = "\n".join(pane.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+        if not (
+            re.search(TUI_TRUST_ALL_TOOLS_BODY, bottom)
+            and re.search(TUI_TRUST_ALL_TOOLS_CURSOR, bottom)
+        ):
+            logger.warning(
+                "kiro_cli: WAITING_USER_ANSWER but the trust-all-tools consent "
+                "dialog (body + '❯ No, exit') was not verified; not answering"
+            )
+            return False
+
+        # Verified consent dialog: cursor on "No, exit", so Down lands on
+        # "Yes, I accept" (session-scoped — NOT "Yes, and don't ask again").
+        logger.info(
+            "kiro_cli: answering --trust-all-tools startup consent dialog "
+            "with 'Yes, I accept' (session-scoped)"
+        )
+        # Arm the PROCESSING latch before the keystrokes, like every other
+        # send_special_key path, so answering the dialog isn't blocked by the
+        # WAITING_USER_ANSWER we just observed.
+        status_monitor.notify_input_sent(self.terminal_id)
+        backend.send_special_key(self.session_name, self.window_name, "Down")
+        backend.send_special_key(self.session_name, self.window_name, "Enter")
+        # Bound the post-accept wait by the time already spent, so total startup
+        # stays within provider_init_timeout rather than up to 2x it.
+        remaining = max(0.0, init_timeout - (time.monotonic() - start))
+        return await wait_until_status(
+            self.terminal_id,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=remaining,
+            blocked_policy=blocked_policy,
         )
 
     def get_status(self, output: str) -> TerminalStatus:
@@ -376,6 +644,10 @@ class KiroCliProvider(BaseProvider):
         which is why kiro never reached IDLE and init timed out. The shared
         BaseProvider helper consults the backend and disambiguates herdr's
         ambiguous "idle" via _task_dispatched (set by mark_input_received).
+
+        F107 B3: engine-branched. v2 path is unchanged; KAS uses a dedicated
+        seat with best-effort v3 guesses until G7 live sampling (E1) pins
+        the final chrome strings.
         """
         native = self._resolve_native_status(output)
         if native is not None:
@@ -387,6 +659,41 @@ class KiroCliProvider(BaseProvider):
         if not output:
             return TerminalStatus.UNKNOWN
 
+        if self._engine == KiroEngine.KAS:
+            return self._get_status_kas(output)
+        return self._get_status_v2(output)
+
+    def _get_status_kas(self, output: str) -> TerminalStatus:
+        """F107 B3 KAS (--v3) classifier seat.
+
+        Best-effort provisional chrome until G7 live sampling (E1) pins the
+        final strings. Known/guessed KAS markers are checked first; anything
+        unmatched falls through to the v2 classifier as a provisional baseline
+        (v3 agent configs are backward-compatible; chrome may still diverge).
+        """
+        # Best-effort v3 guesses (provisional — G7 E1 replaces/extends these):
+        # - "Thinking..." already covered by TUI_PROCESSING_PATTERN in the v2 body
+        # - possible alternate working chrome observed on early KAS builds
+        clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+        kas_working = re.search(
+            r"Working on (?:your |the )?request|Agent is thinking|Generating response",
+            clean_output,
+            re.IGNORECASE,
+        )
+        if kas_working:
+            # Only park as PROCESSING when no idle chrome follows the marker
+            # (same ghost-text discipline as the v2 working check).
+            after = clean_output[kas_working.end() :]
+            if not (
+                re.search(self._idle_prompt_pattern, after)
+                or re.search(NEW_TUI_IDLE_PATTERN, after)
+            ):
+                return TerminalStatus.PROCESSING
+        # Provisional baseline: reuse v2 classification for shared chrome.
+        return self._get_status_v2(output)
+
+    def _get_status_v2(self, output: str) -> TerminalStatus:
+        """v2 / legacy-UI status classifier (byte-identical pre-F107 behavior)."""
         # Strip ONLY SGR colour codes for pattern matching. Carriage returns and
         # cursor-movement sequences are intentionally preserved: the permission
         # check below counts idle prompts per "\n"-delimited line and relies on
@@ -831,6 +1138,8 @@ class KiroCliProvider(BaseProvider):
         Returns a pattern that matches either the legacy UI format
         or the new TUI format.
         """
+        from cli_agent_orchestrator.utils.tombstones import tombstone
+        tombstone("TS-0002b")
         return rf"(?:{IDLE_PROMPT_PATTERN_LOG}|{NEW_TUI_IDLE_PATTERN_LOG})"
 
     def exit_cli(self) -> str:

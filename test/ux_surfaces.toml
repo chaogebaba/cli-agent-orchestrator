@@ -1,0 +1,89 @@
+# F254 D3 — UX Surface Roster (frozen at 12 surfaces)
+#
+# Each row carries its invariant list and obligation string (E/C/S/L).
+# test/ux/test_coverage_matrix.py enforces that every obligation cell is filled.
+# Adding an @mcp.tool() without a roster row fails the matrix test (D6.3).
+
+[[surface]]
+id = "S01"
+name = "assign"
+mcp_tools = ["assign"]
+invariants = ["UX-1", "UX-6"]
+obligation = "ECS"
+
+[[surface]]
+id = "S02"
+name = "handoff"
+mcp_tools = ["handoff"]
+invariants = ["UX-1", "UX-4"]
+obligation = "ECS"
+
+[[surface]]
+id = "S03"
+name = "send_message"
+mcp_tools = ["send_message"]
+invariants = ["UX-2", "UX-3", "UX-5"]
+obligation = "ECS"
+
+[[surface]]
+id = "S04"
+name = "list_messages / ack_messages"
+mcp_tools = ["list_messages", "ack_messages"]
+invariants = ["UX-2"]
+obligation = "ECS"
+
+[[surface]]
+id = "S05"
+name = "inbox delivery"
+mcp_tools = []
+invariants = ["UX-2", "UX-3"]
+obligation = "S"
+
+[[surface]]
+id = "S06"
+name = "authority pins"
+mcp_tools = ["pin_authority", "update_pin", "verify_pin"]
+invariants = ["UX-5"]
+obligation = "ECS"
+
+[[surface]]
+id = "S07"
+name = "callback barrier"
+mcp_tools = ["barrier_status", "cancel_barrier"]
+invariants = ["UX-4"]
+obligation = "ECS"
+
+[[surface]]
+id = "S08"
+name = "workflow_* / workflow_return"
+mcp_tools = ["workflow_run", "workflow_start", "workflow_status", "workflow_wait", "workflow_result", "workflow_events", "workflow_cancel", "workflow_return", "workflow_resume", "workflow_list"]
+invariants = ["UX-4"]
+obligation = "ECS"
+
+[[surface]]
+id = "S09"
+name = "auto-responder + answer_user_prompt"
+mcp_tools = ["answer_user_prompt"]
+invariants = ["UX-3"]
+obligation = "S"
+
+[[surface]]
+id = "S10"
+name = "session_manifest / fleet"
+mcp_tools = ["session_manifest", "fleet"]
+invariants = ["UX-6"]
+obligation = "ECS"
+
+[[surface]]
+id = "S11"
+name = "list_siblings / peek_terminal / update_metadata / delete_terminal / interrupt_terminal"
+mcp_tools = ["list_siblings", "peek_terminal", "update_metadata", "delete_terminal", "interrupt_terminal"]
+invariants = ["UX-6"]
+obligation = "ECS"
+
+[[surface]]
+id = "S12"
+name = "find_profiles / mark_base_ready / list_base_sessions / unregister_base"
+mcp_tools = ["find_profiles", "mark_base_ready", "list_base_sessions", "unregister_base"]
+invariants = ["UX-6"]
+obligation = "EC"

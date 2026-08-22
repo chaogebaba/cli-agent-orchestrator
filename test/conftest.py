@@ -15,14 +15,12 @@ that need to exercise the Auth0 paths.
 
 import os
 import pathlib
-import time
-from typing import Any, Dict
-from unittest.mock import patch
-
-import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
+from typing import Any, Dict
+from unittest.mock import patch
 
 import pytest
 
@@ -30,7 +28,54 @@ import pytest
 # test module can import the global database engine. This prevents tests from
 # depending on (or migrating) the installed production database.
 _TEST_CAO_HOME = Path(tempfile.mkdtemp(prefix="cao-pytest-"))
-os.environ["CAO_HOME"] = str(_TEST_CAO_HOME)
+
+
+# ---------------------------------------------------------------------------
+# F113: Worktree-safe root-repo derivation
+# ---------------------------------------------------------------------------
+# In a normal checkout, the subrepo lives at <root-repo>/cli-agent-orchestrator/
+# and tests can reach the root repo via parents[N]. In a git worktree (e.g.
+# /tmp/<name>/), parent indices shift, breaking any hard-coded depth. This
+# helper walks up first (covers normal checkouts), then falls back to
+# git-common-dir (covers worktrees) to reliably locate the root repo.
+
+def _derive_root_repo() -> "Path | None":
+    """Find the root repository that contains the cli-agent-orchestrator subrepo.
+
+    Returns None if the root repo cannot be located (e.g. running from an
+    extracted tarball with no .git context).
+    """
+    import subprocess as _sp
+
+    subrepo = Path(__file__).resolve().parent.parent  # test/ -> subrepo root
+
+    # Strategy 1: walk up from subrepo looking for root-repo markers
+    # (providers.toml.default or install.sh — both are root-repo-only files)
+    for parent in subrepo.parents:
+        if (parent / "providers.toml.default").exists() or (parent / "install.sh").exists():
+            return parent
+
+    # Strategy 2: git-common-dir fallback (worktree → main checkout's .git)
+    try:
+        common = Path(_sp.check_output(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=subrepo, text=True, stderr=_sp.DEVNULL,
+        ).strip())
+        # common = <root-repo>/cli-agent-orchestrator/.git → root repo = common.parents[1]
+        candidate = common.parents[1]
+        if candidate.exists() and (
+            (candidate / "providers.toml.default").exists()
+            or (candidate / "install.sh").exists()
+        ):
+            return candidate
+    except Exception:
+        pass
+
+    return None
+
+
+ROOT_REPO: "Path | None" = _derive_root_repo()
+os.environ["CAO_HOME_DIR"] = str(_TEST_CAO_HOME)
 
 from cli_agent_orchestrator.clients.database import engine, init_db  # noqa: E402
 
@@ -41,6 +86,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """Release the isolated suite database and remove its namespace."""
     engine.dispose()
     shutil.rmtree(_TEST_CAO_HOME, ignore_errors=True)
+
+
 # Make the `mock_cli` test-fixture binary discoverable for the pytest
 # session so MockCliProvider can `shlex.join(["mock_cli", ...])` without
 # an absolute path. Not on PATH outside the test session — production
@@ -58,6 +105,20 @@ pytest_plugins = (
     "test.fixtures.jwt_factory",
     "test.fixtures.jwks_server",
     "test.fixtures.terminal_factory",
+    "test.plugins.rss_guard",
+    "test.plugins.local_fixture_guard",
+    "test.plugins.smoke_tags",
+    "test.plugins.suite_slot",
+    "test.plugins.tier_marks",
+    "test.plugins.tier_budget",
+    "test.plugins.quarantine",
+    "test.plugins.quarantine_expiry",
+    "test.plugins.env_capabilities",
+    "test.plugins.resource_census",
+    "test.plugins.basetemp_offload",
+    "test.plugins.tmux_finalizer",
+    "test.plugins.worktree_pruner",
+    "test.plugins.xdist_remove_node_fix",
 )
 
 
@@ -65,14 +126,13 @@ _AUTH_TEST_DOMAIN = "test.local"
 _AUTH_TEST_AUDIENCE = "cao://test"
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def rsa_keys():
-    """Generate a fresh RSA-2048 keypair for the test.
+    """Generate a session-scoped RSA-2048 keypair for tests.
 
-    Same shape as the local fixture in ``test/security/test_auth.py``
-    (which still wins locally — pytest fixture resolution prefers the
-    closest definition). Lifted here so sibling test modules can mint
-    their own tokens without duplicating the RSA boilerplate.
+    F254 D25: promoted from function to session scope — the value is immutable
+    and regenerating RSA-2048 per test is pure waste (0.17 s setup cluster).
+    Local overrides in test/security/test_auth.py win by proximity (D11).
     """
     from authlib.jose import JsonWebKey
     from cryptography.hazmat.primitives import serialization
@@ -159,6 +219,125 @@ def _no_llm_compile_in_tests(monkeypatch):
     var themselves or stub the ``wiki_compiler`` seams.
     """
     monkeypatch.setenv("CAO_MEMORY_COMPILE_MODE", "append")
+
+
+@pytest.fixture(autouse=True)
+def _reset_backend_registry():
+    """Prevent leaked backend singletons from crossing test boundaries (fixes #522)."""
+    from cli_agent_orchestrator.backends import registry
+
+    original = registry._backend
+    registry._backend = None
+    yield
+    registry._backend = original
+
+
+@pytest.fixture(autouse=True)
+def _sim_leak_guard():
+    """F254 D14: suite-wide guard — no sim clock/RNG/backend leaks across tests.
+
+    Promoted from test/simulation/conftest.py to suite-wide scope. Extended
+    to also assert backends.registry._backend is None on entry (D14 amendment).
+    """
+    from cli_agent_orchestrator.sim.clock import active as clock_active
+    from cli_agent_orchestrator.sim.rng import active as rng_active
+    from cli_agent_orchestrator.backends import registry
+
+    # Pre-check: should not be installed
+    leaked_clock_pre = clock_active()
+    leaked_rng_pre = rng_active()
+    if leaked_clock_pre is not None or leaked_rng_pre is not None:
+        # Force cleanup from a previous leak
+        import cli_agent_orchestrator.sim.clock as _clk
+        import cli_agent_orchestrator.sim.rng as _rng
+        _clk._active_clock = None
+        _rng._active_rng = None
+
+    yield
+
+    # Post-check: must be clean after test
+    leaked_clock = clock_active()
+    leaked_rng = rng_active()
+    if leaked_clock is not None or leaked_rng is not None:
+        import cli_agent_orchestrator.sim.clock as _clk
+        import cli_agent_orchestrator.sim.rng as _rng
+        _clk._active_clock = None
+        _rng._active_rng = None
+        parts = []
+        if leaked_clock is not None:
+            parts.append("SimClock")
+        if leaked_rng is not None:
+            parts.append("SimRNG")
+        pytest.fail(
+            f"Sim binding leak detected: {', '.join(parts)} still installed after test. "
+            "Wrap sim usage in a context manager or call world.uninstall() (D14)."
+        )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_seam_parity_and_incarnations():
+    """F254 D24: unified teardown for seam-parity and process-incarnation tables.
+
+    Replaces three separate autouse fixtures (two _clean_f138_incarnations +
+    one _isolate_seam_parity_state) with a single DB session, reducing per-test
+    overhead from 3 sessions to 1 (and 4→1 under test/services/).
+    """
+    yield
+
+    from sqlalchemy.exc import SQLAlchemyError
+
+    try:
+        from cli_agent_orchestrator.clients.database import (
+            SeamParityMismatchModel,
+            SeamParityModel,
+            SessionLocal,
+        )
+        from sqlalchemy import inspect, text
+
+        with SessionLocal() as db:
+            # Seam-parity cleanup (was _isolate_seam_parity_state)
+            try:
+                tables = set(inspect(db.get_bind()).get_table_names())
+                for model in (SeamParityMismatchModel, SeamParityModel):
+                    if model.__tablename__ in tables:
+                        db.query(model).delete()
+            except (AttributeError, SQLAlchemyError):
+                # Migration and fault-injection tests intentionally replace
+                # SessionLocal with incomplete schemas.
+                pass
+
+            # F138 incarnation cleanup (was _clean_f138_incarnations)
+            try:
+                db.execute(text("DELETE FROM process_incarnations"))
+                db.execute(text("DELETE FROM orphan_reconcile_jobs"))
+            except Exception:
+                pass
+
+            db.commit()
+    except Exception:
+        # If SessionLocal itself is broken (e.g. no DB file), skip silently.
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_cao_env(monkeypatch):
+    """Strip CAO runtime env vars that leak when the suite runs inside a CAO terminal.
+
+    Without this, tests that assert default values (e.g. sender_id=="supervisor")
+    fail because the real terminal's CAO_TERMINAL_ID overrides the default.
+    monkeypatch.delenv runs BEFORE the test body, so tests that explicitly
+    monkeypatch.setenv one of these after fixture setup still work correctly.
+    """
+    # server.py defaults sender_id to "supervisor" when unset
+    monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
+    # server.py reads these for workflow_return context detection
+    monkeypatch.delenv("CAO_WORKFLOW_RUN_ID", raising=False)
+    monkeypatch.delenv("CAO_WORKFLOW_STEP_ID", raising=False)
+    # cli/commands/info.py uses this for session detection
+    monkeypatch.delenv("CAO_SESSION_NAME", raising=False)
+    # HTTP clients must not inherit the enclosing CAO sandbox binding.
+    monkeypatch.delenv("CAO_ENDPOINT", raising=False)
+    monkeypatch.delenv("CAO_INSTANCE_ID", raising=False)
 
 
 @pytest.fixture

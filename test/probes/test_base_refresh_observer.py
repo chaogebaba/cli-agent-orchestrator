@@ -8,15 +8,15 @@ from pathlib import Path
 import pytest
 
 
-def _find_observer_script() -> Path:
-    for root in Path(__file__).resolve().parents:
-        script = root / "probes" / "base-refresh-observer.py"
-        if script.is_file():
-            return script
-    raise RuntimeError("base-refresh-observer.py not found in repository ancestors")
+from test.conftest import ROOT_REPO
 
+if ROOT_REPO is None:
+    pytest.skip("root repo not found (worktree without .git context)", allow_module_level=True)
 
-SCRIPT = _find_observer_script()
+SCRIPT = ROOT_REPO / "probes" / "base-refresh-observer.py"
+if not SCRIPT.is_file():
+    pytest.skip("base-refresh-observer.py not found in root repo", allow_module_level=True)
+
 TOKEN = "V2-ANSWER-TOKEN"
 
 

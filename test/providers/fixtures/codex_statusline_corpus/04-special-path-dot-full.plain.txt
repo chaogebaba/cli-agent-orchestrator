@@ -1,0 +1,40 @@
+╭────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.145.0)                     │
+│                                                │
+│ model:     gpt-5.6-sol high   /model to change │
+│ directory: /tmp/fx a·b                         │
+╰────────────────────────────────────────────────╯
+
+  Tip: Join the OpenAI community Discord: http://discord.gg/openai
+
+
+› Improve documentation in @filename
+
+  /tmp/fx a·b · gpt-5.6-sol high · Context 100% left
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

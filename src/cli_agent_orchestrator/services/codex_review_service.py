@@ -200,9 +200,11 @@ def _push_completion(
     registry: PluginRegistry | None = None,
 ) -> None:
     """Queue a server-generated completion message to the requester."""
+    from cli_agent_orchestrator.services.mailbox_service import create_routed_inbox_message
+
     message = _completion_message(job, exit_code, stderr)
-    create_inbox_message(f"codex_review:{job.review_id}", job.requester_id, message)
-    inbox_service.deliver_pending(job.requester_id, registry=registry)
+    # F136-D6/D17: routed completion push (supervisor -> logical)
+    create_routed_inbox_message(f"codex_review:{job.review_id}", job.requester_id, message)
 
 
 async def run_codex_review_job(

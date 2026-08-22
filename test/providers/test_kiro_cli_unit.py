@@ -6,11 +6,13 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 
 # Test fixtures directory
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
 
 
 def load_fixture(filename: str) -> str:
@@ -19,8 +21,22 @@ def load_fixture(filename: str) -> str:
         return f.read()
 
 
+# Real active trust-all-tools consent dialog (body + '❯ No, exit' + footer),
+# used to satisfy the provider's verify-before-answer check.
+_TRUST_DIALOG_PANE = load_fixture("kiro_trust_all_tools_dialog_active.txt")
+
+
 class TestKiroCliProviderInitialization:
     """Test Kiro CLI provider initialization."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_identity_guards(self):
+        """Patch F118 identity guards so init tests don't need a real agents dir."""
+        with (
+            patch.object(KiroCliProvider, "_assert_kiro_identity_guard"),
+            patch.object(KiroCliProvider, "_assert_postlaunch_identity"),
+        ):
+            yield
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
@@ -41,7 +57,9 @@ class TestKiroCliProviderInitialization:
         assert result is True
         mock_wait_shell.assert_called_once()
         mock_tmux.return_value.send_keys.assert_called_once_with(
-            "test-session", "window-0", "kiro-cli chat --trust-all-tools --agent developer"
+            "test-session",
+            "window-0",
+            "kiro-cli chat --agent-engine v2 --trust-all-tools --agent developer",
         )
         mock_wait_status.assert_called_once()
 
@@ -99,13 +117,13 @@ class TestKiroCliProviderInitialization:
         assert calls[0].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --trust-all-tools --agent developer",
+            "kiro-cli chat --agent-engine v2 --trust-all-tools --agent developer",
         )
         assert calls[1].args == ("test-session", "window-0", "/exit")
         assert calls[2].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --legacy-ui --trust-all-tools --agent developer",
+            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --agent developer",
         )
 
     @pytest.mark.asyncio
@@ -133,7 +151,7 @@ class TestKiroCliProviderInitialization:
         mock_tmux.return_value.send_keys.assert_called_once_with(
             "test-session",
             "window-0",
-            "kiro-cli chat --legacy-ui --trust-all-tools --agent developer",
+            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --agent developer",
         )
 
     @pytest.mark.asyncio
@@ -157,8 +175,34 @@ class TestKiroCliProviderInitialization:
         mock_tmux.return_value.send_keys.assert_called_once_with(
             "test-session",
             "window-0",
-            "kiro-cli chat --trust-all-tools --model claude-opus-4-6 --agent developer",
+            "kiro-cli chat --agent-engine v2 --trust-all-tools "
+            "--model claude-opus-4-6 --agent developer",
         )
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    def test_get_profile_model_explicit_override_wins_over_profile_model(self, mock_load_profile):
+        profile = Mock()
+        profile.model = "claude-opus-4-6"
+        mock_load_profile.return_value = profile
+
+        provider = KiroCliProvider(
+            "test1234", "test-session", "window-0", "developer", model="fable-5"
+        )
+
+        assert provider._get_profile_model() == "fable-5"
+
+    def test_get_profile_model_explicit_override_applies_without_loading_profile(self):
+        """An explicit override short-circuits before even attempting to
+        load the CAO agent profile from disk."""
+        provider = KiroCliProvider(
+            "test1234", "test-session", "window-0", "developer", model="fable-5"
+        )
+
+        with patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile") as mock_load:
+            result = provider._get_profile_model()
+
+        assert result == "fable-5"
+        mock_load.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
@@ -183,7 +227,7 @@ class TestKiroCliProviderInitialization:
         mock_tmux.return_value.send_keys.assert_called_once_with(
             "test-session",
             "window-0",
-            "kiro-cli chat --legacy-ui --trust-all-tools --model claude-opus-4.6 --agent developer",
+            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --model claude-opus-4.6 --agent developer",
         )
 
     @pytest.mark.asyncio
@@ -236,14 +280,141 @@ class TestKiroCliProviderInitialization:
         assert calls[0].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --trust-all-tools --model claude-opus-4.6 --agent developer",
+            "kiro-cli chat --agent-engine v2 --trust-all-tools "
+            "--model claude-opus-4.6 --agent developer",
         )
         assert calls[1].args == ("test-session", "window-0", "/exit")
         assert calls[2].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --legacy-ui --trust-all-tools --model claude-opus-4.6 --agent developer",
+            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools "
+            "--model claude-opus-4.6 --agent developer",
         )
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    async def test_initialize_answers_trust_all_tools_dialog(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile, mock_status_monitor
+    ):
+        """--trust-all-tools startup dialog is auto-answered with 'Yes, I accept'.
+
+        kiro-cli >= 2.1 shows a consent dialog before the chat prompt. The
+        provider must detect WAITING_USER_ANSWER, send Down+Enter (select the
+        one-line-down 'Yes, I accept' option, NOT 'Yes, and don't ask again'),
+        then wait again for the prompt — without falling back to --legacy-ui.
+        """
+        mock_wait_shell.return_value = True
+        # First wait resolves to WAITING_USER_ANSWER (dialog up); second wait
+        # (after we answer) resolves to the prompt.
+        mock_wait_status.side_effect = [True, True]
+        mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        # The dialog must be VERIFIED from pane content before answering.
+        mock_tmux.return_value.get_history.return_value = _TRUST_DIALOG_PANE
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        result = await provider.initialize()
+
+        assert result is True
+        # Exactly one launch — the dialog is answered in place, no /exit + relaunch.
+        assert mock_tmux.return_value.send_keys.call_count == 1
+        # "Yes, I accept" = one Down then Enter (two special keys total).
+        special_keys = [c.args[2] for c in mock_tmux.return_value.send_special_key.call_args_list]
+        assert special_keys == ["Down", "Enter"]
+        # The PROCESSING latch must be armed before answering the dialog.
+        mock_status_monitor.notify_input_sent.assert_called_with("test1234")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    async def test_initialize_waiting_but_not_consent_dialog_fails_closed(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile, mock_status_monitor
+    ):
+        """A non-consent selector reported as WAITING_USER_ANSWER is NOT answered.
+
+        WAITING_USER_ANSWER is classified from kiro's generic list-selector
+        chrome, so any other startup selector (update/login/onboarding) would
+        share it. The pane content lacks the consent body + '❯ No, exit', so the
+        provider must send no keys and fall into the timeout/fallback path.
+        """
+        mock_wait_shell.return_value = True
+        # WAITING on first wait; the --legacy-ui fallback then times out too.
+        mock_wait_status.side_effect = [True, False]
+        mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        mock_tmux.return_value.get_history.return_value = (
+            "Update available! 2.16 -> 2.17\n❯ 1. Update now\n  2. Later\n"
+            "esc to cancel · ↑↓ to navigate · ↵ to select\n"
+        )
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        with pytest.raises(TimeoutError):
+            await provider.initialize()
+
+        # The unverified selector must never receive dialog keystrokes.
+        mock_tmux.return_value.send_special_key.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    async def test_initialize_dialog_answered_but_prompt_times_out_falls_back(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile, mock_status_monitor
+    ):
+        """Answering the dialog but never reaching the prompt triggers --legacy-ui.
+
+        First wait → WAITING (verified, answered); second (post-accept) wait
+        times out; the --legacy-ui relaunch's wait then succeeds.
+        """
+        mock_wait_shell.return_value = True
+        # main: WAITING (answered) → post-accept times out; legacy relaunch: IDLE.
+        mock_wait_status.side_effect = [True, False, True]
+        mock_status_monitor.get_status.side_effect = [
+            TerminalStatus.WAITING_USER_ANSWER,
+            TerminalStatus.IDLE,
+        ]
+        mock_tmux.return_value.get_history.return_value = _TRUST_DIALOG_PANE
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        result = await provider.initialize()
+
+        assert result is True
+        # Dialog answered (Down+Enter), then /exit + --legacy-ui relaunch.
+        special_keys = [c.args[2] for c in mock_tmux.return_value.send_special_key.call_args_list]
+        assert special_keys[:2] == ["Down", "Enter"]
+        commands = [c.args[2] for c in mock_tmux.return_value.send_keys.call_args_list]
+        assert "--legacy-ui" in commands[-1]
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    async def test_initialize_no_dialog_sends_no_special_keys(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile, mock_status_monitor
+    ):
+        """When the terminal reaches IDLE directly, no dialog keys are sent."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        result = await provider.initialize()
+
+        assert result is True
+        mock_tmux.return_value.send_special_key.assert_not_called()
 
     def test_initialization_with_different_agent_profiles(self):
         """Test initialization with various agent profile names."""
@@ -1927,3 +2098,383 @@ class TestKiroCli211Regressions:
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         provider.mark_input_received()
         assert provider.get_status(output) != TerminalStatus.COMPLETED
+
+
+class TestKiroKasStatusClassifier:
+    """F107 B3 / build-gate r1 S2: focused KAS get_status branch coverage."""
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_kas_classifier_working_marker_is_processing(self, mock_tmux):
+        """KAS-only working chrome parks as PROCESSING (provisional B3 seat)."""
+        provider = KiroCliProvider(
+            "test1234",
+            "test-session",
+            "window-0",
+            "developer",
+            engine=KiroEngine.KAS,
+        )
+        status = provider.get_status("Working on your request...\n")
+        assert status == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_kas_classifier_idle_after_working_marker_is_ghost_text(self, mock_tmux):
+        """Idle chrome after a KAS working marker must not stay PROCESSING."""
+        provider = KiroCliProvider(
+            "test1234",
+            "test-session",
+            "window-0",
+            "developer",
+            engine=KiroEngine.KAS,
+        )
+        output = "Working on your request...\n[developer] > "
+        status = provider.get_status(output)
+        assert status != TerminalStatus.PROCESSING
+        assert status == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_kas_classifier_falls_back_to_v2_processing_patterns(self, mock_tmux):
+        """Unmatched KAS chrome falls through to the v2 classifier body."""
+        provider = KiroCliProvider(
+            "test1234",
+            "test-session",
+            "window-0",
+            "developer",
+            engine=KiroEngine.KAS,
+        )
+        # v2 TUI_PROCESSING_PATTERN ("Kiro is working") with no idle after.
+        status = provider.get_status("Kiro is working\n")
+        assert status == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_kas_live_idle_chrome_is_idle(self, mock_tmux):
+        """G7 E1 fixture (2026-08-07): live KAS idle chrome → IDLE.
+
+        Verbatim tail of probes/error-pane-samples/f107-kas-idle-2026-08-07.txt
+        (kas-manual-test session): v3's lowercase idle placeholder must hit
+        NEW_TUI_IDLE_PATTERN, and the F111 fallback banner must not park it.
+        """
+        provider = KiroCliProvider(
+            "test1234",
+            "test-session",
+            "window-0",
+            "developer",
+            engine=KiroEngine.KAS,
+        )
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+        mock_tmux.return_value.get_pane_current_command.return_value = "kiro-cli"
+        output = (
+            '● agent "kiro_dev" not found, using "default"\n'
+            " Trust All Tools active, confirmations are off · /quit to exit\n"
+            "Default · Auto · ◔ 3%\n"
+            " ask a question or describe a task ↵\n"
+        )
+        provider.mark_input_received()
+        assert provider.get_status(output) == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_kas_live_processing_chrome_is_processing(self, mock_tmux):
+        """G7 E1 fixture (2026-08-07): live KAS working chrome → PROCESSING.
+
+        Verbatim tail of f107-kas-processing-2026-08-07.txt: "⢹ Thinking..."
+        spinner line + "Kiro is working · Type to steer" footer with NO idle
+        placeholder after the working marker.
+        """
+        provider = KiroCliProvider(
+            "test1234",
+            "test-session",
+            "window-0",
+            "developer",
+            engine=KiroEngine.KAS,
+        )
+        output = (
+            "⢹ Thinking... (esc to cancel)\n"
+            '● agent "kiro_dev" not found, using "default"\n'
+            " Trust All Tools active, confirmations are off · /quit to exit\n"
+            "Default · Auto · ◔ 3%\n"
+            " Kiro is working · Type to steer · Ctrl+S to queue\n"
+        )
+        provider.mark_input_received()
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_kas_trust_dialog_is_waiting_user_answer(self, mock_tmux):
+        """G7 r4 fixture (2026-08-07): KAS trust dialog → WAITING_USER_ANSWER.
+
+        Verbatim tail of f107-kas-r4-dialog-pre-answer-2026-08-07.txt: dialog
+        with nav footer, no idle prompt below → check 2a must park it as
+        WAITING_USER_ANSWER (this is the state the auto-responder corroborates
+        against before firing Down,Enter).
+        """
+        provider = KiroCliProvider(
+            "test1234",
+            "test-session",
+            "window-0",
+            "developer",
+            engine=KiroEngine.KAS,
+        )
+        output = (
+            " Warning: Kiro is running in trust all tools mode\n"
+            " ❯ No, exit\n"
+            "   Yes, I accept\n"
+            "   Yes, and don't ask again\n"
+            "  esc to cancel · ↑↓ to navigate · ↵ to select\n"
+        )
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_kas_idle_after_processing_marker_is_idle(self, mock_tmux):
+        """G7 E1 fixture: working marker followed by idle placeholder → IDLE.
+
+        Sequence from the live session: "Kiro is working" footer redrawn over
+        by the completed-turn chrome (Credits line + idle placeholder). The
+        idle-after-working ghost-text rule must win over the stale marker.
+        """
+        provider = KiroCliProvider(
+            "test1234",
+            "test-session",
+            "window-0",
+            "developer",
+            engine=KiroEngine.KAS,
+        )
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+        mock_tmux.return_value.get_pane_current_command.return_value = "kiro-cli"
+        output = (
+            " Kiro is working · Type to steer · Ctrl+S to queue\n"
+            "▸ Credits: 0.14 • Time: 5s\n"
+            '● agent "kiro_dev" not found, using "default"\n'
+            " Trust All Tools active, confirmations are off · /quit to exit\n"
+            "Default · Auto · ◔ 3%\n"
+            " ask a question or describe a task ↵\n"
+        )
+        provider.mark_input_received()
+        # Credits footer + bordered response box reads as COMPLETED (turn done);
+        # the load-bearing assertion is idle-after-working: NOT PROCESSING.
+        assert provider.get_status(output) != TerminalStatus.PROCESSING
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+
+# =============================================================================
+# F109 — BlockedWaitPolicy wiring in kiro_cli.initialize()
+# =============================================================================
+
+
+class TestKiroCliBlockedWaitPolicy:
+    """F109: kiro initialize() passes a BlockedWaitPolicy to both wait sites."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_identity_guards(self):
+        """Patch F118 identity guards so init tests don't need a real agents dir."""
+        with (
+            patch.object(KiroCliProvider, "_assert_kiro_identity_guard"),
+            patch.object(KiroCliProvider, "_assert_postlaunch_identity"),
+        ):
+            yield
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("yolo", [True, False], ids=["yolo_primary", "non_yolo_fallback"])
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    async def test_ac1_blocked_policy_passed_to_both_wait_sites(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile, yolo
+    ):
+        """AC1: Both wait_until_status calls receive blocked_policy kwarg."""
+        from unittest.mock import AsyncMock
+
+        from cli_agent_orchestrator.utils.terminal import BlockedWaitPolicy
+
+        mock_wait_shell.return_value = True
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        if yolo:
+            # Yolo path: only one wait_until_status call (primary).
+            mock_wait_status.return_value = True
+            provider = KiroCliProvider(
+                "test1234", "test-session", "window-0", "developer", allowed_tools=["*"]
+            )
+            await provider.initialize()
+            assert mock_wait_status.call_count == 1
+            call_kwargs = mock_wait_status.call_args_list[0].kwargs
+            assert "blocked_policy" in call_kwargs
+            assert isinstance(call_kwargs["blocked_policy"], BlockedWaitPolicy)
+        else:
+            # Non-yolo: first wait fails (TUI timeout), second wait (legacy-ui) succeeds.
+            mock_wait_status.side_effect = [False, True]
+            provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+            await provider.initialize()
+            assert mock_wait_status.call_count == 2
+            for call in mock_wait_status.call_args_list:
+                assert "blocked_policy" in call.kwargs
+                assert isinstance(call.kwargs["blocked_policy"], BlockedWaitPolicy)
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    async def test_ac2_active_wait_rule_extends_init_past_base_timeout(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
+        """AC2: With an active wait rule, init exceeding base timeout but within
+        blocked_cap_s succeeds (mirrors F21 codex test shape)."""
+        from unittest.mock import AsyncMock
+
+        from cli_agent_orchestrator.utils.terminal import BlockedWaitPolicy
+
+        mock_wait_shell.return_value = True
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        # Simulate: blocked_policy.probe returns a tuple during the wait, so
+        # the clock pauses. The wait resolves True (init succeeds).
+        async def succeeds_with_block(*_args, blocked_policy, **_kwargs):
+            # Simulate the policy was invoked and a rule engaged
+            blocked_policy.last_blocked_rule = "trust-dialog"
+            return True
+
+        mock_wait_status.side_effect = succeeds_with_block
+        provider = KiroCliProvider(
+            "test1234", "test-session", "window-0", "developer", allowed_tools=["*"]
+        )
+        result = await provider.initialize()
+        assert result is True
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    async def test_ac3_timeout_message_names_blocked_rule_yolo(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
+        """AC3: Timeout message includes last_blocked_rule name (yolo/primary path)."""
+        from unittest.mock import AsyncMock
+
+        mock_wait_shell.return_value = True
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        async def blocked_timeout(*_args, blocked_policy, **_kwargs):
+            blocked_policy.last_blocked_rule = "kiro-trust-dialog"
+            return False
+
+        mock_wait_status.side_effect = blocked_timeout
+        provider = KiroCliProvider(
+            "test1234", "test-session", "window-0", "developer", allowed_tools=["*"]
+        )
+
+        with pytest.raises(
+            TimeoutError,
+            match="after blocked wait rule 'kiro-trust-dialog'",
+        ):
+            await provider.initialize()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    async def test_ac3_timeout_message_names_blocked_rule_fallback(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
+        """AC3: Timeout message includes last_blocked_rule name (--legacy-ui fallback path)."""
+        from unittest.mock import AsyncMock
+
+        mock_wait_shell.return_value = True
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        call_count = [0]
+
+        async def side_effect(*_args, blocked_policy=None, **_kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # Primary TUI wait — timeout without a rule
+                return False
+            # Fallback --legacy-ui wait — timeout with a rule engaged
+            blocked_policy.last_blocked_rule = "kiro-legacy-rule"
+            return False
+
+        mock_wait_status.side_effect = side_effect
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+
+        with pytest.raises(
+            TimeoutError,
+            match="after blocked wait rule 'kiro-legacy-rule'",
+        ):
+            await provider.initialize()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    async def test_ac4a_mock_waiting_gate_pauses_clock(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
+        """AC4a: Mock waiting_gate() returning ('wait_rule', 'synthetic') during
+        kiro initialize() that exceeds base timeout — init succeeds within blocked_cap_s.
+        Proves the kiro wiring pauses the clock."""
+        from unittest.mock import AsyncMock
+
+        from cli_agent_orchestrator.utils.terminal import BlockedWaitPolicy
+
+        mock_wait_shell.return_value = True
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        async def simulates_blocked_success(*_args, blocked_policy, **_kwargs):
+            # Simulate what wait_until_status does internally when the probe
+            # fires: the rule pauses the clock and eventually resolves.
+            blocked_policy.last_blocked_rule = "synthetic"
+            await blocked_policy.on_first_blocked("synthetic")
+            return True
+
+        mock_wait_status.side_effect = simulates_blocked_success
+        notified = AsyncMock()
+
+        provider = KiroCliProvider(
+            "test1234", "test-session", "window-0", "developer", allowed_tools=["*"]
+        )
+        provider.blocked_wait_notifier = notified
+
+        result = await provider.initialize()
+        assert result is True
+        notified.assert_awaited_once_with("synthetic")
+
+        # Verify the policy's probe function is wired to auto_responder.waiting_gate
+        call_kwargs = mock_wait_status.call_args_list[0].kwargs
+        policy = call_kwargs["blocked_policy"]
+        assert policy.blocked_cap_s == 1800.0
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    async def test_blocked_rule_reset_between_waits(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
+        """Fold r1/D1: last_blocked_rule is reset to None between primary and fallback waits."""
+        from unittest.mock import AsyncMock
+
+        mock_wait_shell.return_value = True
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        captured_policies = []
+
+        async def capture_and_fail(*_args, blocked_policy, **_kwargs):
+            captured_policies.append(blocked_policy.last_blocked_rule)
+            if len(captured_policies) == 1:
+                # First call: set a rule name (primary TUI wait), then fail
+                blocked_policy.last_blocked_rule = "primary-rule"
+                return False
+            else:
+                # Second call: should see None (reset between waits), succeed
+                return True
+
+        mock_wait_status.side_effect = capture_and_fail
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        result = await provider.initialize()
+        assert result is True
+        # The second call should have seen None (reset done before the call)
+        assert captured_policies[1] is None

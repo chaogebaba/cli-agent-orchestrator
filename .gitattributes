@@ -1,0 +1,2 @@
+test/providers/fixtures/codex_statusline_corpus/** -whitespace
+test/providers/fixtures/live-statusline-enabled-*.txt -whitespace

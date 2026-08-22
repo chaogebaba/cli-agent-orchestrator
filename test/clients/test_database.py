@@ -1,7 +1,7 @@
 """Tests for the database client."""
 
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -25,9 +25,9 @@ from cli_agent_orchestrator.clients.database import (
     cancel_pending_watchdog_message,
     confirm_batch_from_prior_attempt,
     count_ambiguous_attempts,
+    create_digest_pending_notice,
     create_flow,
     create_inbox_message,
-    create_digest_pending_notice,
     create_terminal,
     create_transcript_binding,
     delete_flow,
@@ -38,12 +38,14 @@ from cli_agent_orchestrator.clients.database import (
     get_inbox_messages,
     get_message_trace,
     get_pending_messages,
+    get_terminal_group,
     get_terminal_metadata,
     init_db,
     list_flows,
     list_pending_receiver_ids,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
+    list_siblings_by_group_prefix,
     list_terminals_by_session,
     settle_delivery_attempt,
     settle_terminal_fallback,
@@ -53,7 +55,10 @@ from cli_agent_orchestrator.clients.database import (
     update_last_active,
     update_message_status,
     update_terminal_provider_session_id_if_null,
+    update_terminal_group,
+    update_terminal_metadata,
     update_terminal_shell_command,
+    update_terminal_tmux_window,
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 
@@ -108,7 +113,9 @@ class TestTerminalOperations:
             assert row.message.startswith("[CAO DIGEST-PENDING] base=base key=k1\n")
 
     def test_digest_pending_notice_deduplicates_across_mailbox_rollover(
-        self, test_db, monkeypatch,
+        self,
+        test_db,
+        monkeypatch,
     ):
         monkeypatch.setattr("cli_agent_orchestrator.clients.database.SessionLocal", test_db)
         create_terminal("old", "cao-session", "window-old", "codex")
@@ -116,13 +123,19 @@ class TestTerminalOperations:
         with test_db.begin() as db:
             db.add(
                 MailboxModel(
-                    id="mb_digest", session_name="cao-session", role="supervisor",
-                    current_terminal_id="old", generation=1, consumed_through_id=0,
+                    id="mb_digest",
+                    session_name="cao-session",
+                    role="supervisor",
+                    current_terminal_id="old",
+                    generation=1,
+                    consumed_through_id=0,
                 )
             )
             db.add(
                 MailboxIncarnationModel(
-                    mailbox_id="mb_digest", generation=1, terminal_id="old",
+                    mailbox_id="mb_digest",
+                    generation=1,
+                    terminal_id="old",
                 )
             )
 
@@ -133,7 +146,9 @@ class TestTerminalOperations:
             mailbox.generation = 2
             db.add(
                 MailboxIncarnationModel(
-                    mailbox_id="mb_digest", generation=2, terminal_id="new",
+                    mailbox_id="mb_digest",
+                    generation=2,
+                    terminal_id="new",
                 )
             )
         second = create_digest_pending_notice("mb_digest", "base", "k1", "body")
@@ -502,7 +517,10 @@ class TestMessageTraceTransactions:
         mock_terminal.tmux_window = "window-0"
         mock_terminal.provider = "kiro_cli"
         mock_terminal.agent_profile = "developer"
+        mock_terminal.working_directory = "/workspace/project"
         mock_terminal.allowed_tools = None
+        mock_terminal.group = None
+        mock_terminal.metadata_json = None
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()
@@ -514,6 +532,9 @@ class TestMessageTraceTransactions:
 
         assert result is not None
         assert result["id"] == "test123"
+        assert result["group"] is None
+        assert result["metadata"] is None
+        assert result["working_directory"] == "/workspace/project"
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_get_terminal_metadata_not_found(self, mock_session_class):
@@ -583,6 +604,27 @@ class TestMessageTraceTransactions:
 
         assert result is False
 
+    def test_update_terminal_tmux_window(self, test_db, monkeypatch):
+        monkeypatch.setattr(database_client, "SessionLocal", test_db)
+        create_terminal("terminal-a", "cao-session", "old-name", "codex")
+
+        assert update_terminal_tmux_window("terminal-a", "new-name") is True
+        assert get_terminal_metadata("terminal-a")["tmux_window"] == "new-name"
+
+    def test_update_terminal_tmux_window_not_found(self, test_db, monkeypatch):
+        monkeypatch.setattr(database_client, "SessionLocal", test_db)
+
+        assert update_terminal_tmux_window("missing", "new-name") is False
+
+    def test_update_terminal_tmux_window_refuses_same_session_conflict(self, test_db, monkeypatch):
+        monkeypatch.setattr(database_client, "SessionLocal", test_db)
+        create_terminal("terminal-a", "cao-session", "old-name", "codex")
+        create_terminal("terminal-b", "cao-session", "claimed-name", "codex")
+
+        assert update_terminal_tmux_window("terminal-a", "claimed-name") is False
+        assert get_terminal_metadata("terminal-a")["tmux_window"] == "old-name"
+        assert get_terminal_metadata("terminal-b")["tmux_window"] == "claimed-name"
+
     @patch(
         "cli_agent_orchestrator.clients.database.delete_terminal_and_warm_intent",
         return_value={"terminal_deleted": True, "intent_deleted": True},
@@ -618,6 +660,25 @@ class TestMessageTraceTransactions:
         mock_terminal.tmux_window = "window-0"
         mock_terminal.provider = "kiro_cli"
         mock_terminal.agent_profile = "developer"
+        mock_terminal.working_directory = "/workspace/project"
+        mock_terminal.allowed_tools = None
+        mock_terminal.shell_command = None
+        mock_terminal.caller_id = None
+        mock_terminal.caller_mailbox_id = None
+        mock_terminal.lifecycle = "ephemeral"
+        mock_terminal.reparented_from = None
+        mock_terminal.provider_session_id = None
+        mock_terminal.recovery_state = None
+        mock_terminal.recovery_error = None
+        mock_terminal.recovery_updated_at = None
+        mock_terminal.fallback_terminal_id = None
+        mock_terminal.init_state = None
+        mock_terminal.init_started_at = None
+        mock_terminal.init_owner_epoch = None
+        mock_terminal.init_failure_token = None
+        mock_terminal.init_deadline_s = None
+        mock_terminal.engine = None
+        mock_terminal.metadata_json = None
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()
@@ -629,6 +690,7 @@ class TestMessageTraceTransactions:
 
         assert len(result) == 1
         assert result[0]["id"] == "test123"
+        assert result[0]["working_directory"] == "/workspace/project"
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_list_pending_receiver_ids_by_provider(self, mock_session_class):
@@ -656,8 +718,8 @@ class TestMessageTraceTransactions:
         Uses the real in-memory DB (not a mocked session) so the age cutoff,
         status filter, and terminal join are actually exercised.
         """
-        old = datetime.now() - timedelta(seconds=120)
-        fresh = datetime.now()
+        old = datetime.now(timezone.utc) - timedelta(seconds=120)
+        fresh = datetime.now(timezone.utc)
 
         with test_db() as seed:
             seed.add_all(
@@ -740,6 +802,721 @@ class TestMessageTraceTransactions:
         )
 
 
+class TestGroupAndMetadata:
+    """Tests for the #432 group/metadata columns and their CRUD helpers."""
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_create_terminal_persists_group_and_metadata(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_session_class.return_value = mock_session
+
+        result = create_terminal(
+            "test123",
+            "cao-session",
+            "window-0",
+            "kiro_cli",
+            "developer",
+            group=["tenant_1", "project_5"],
+            metadata={"task": "reviewing PR"},
+        )
+
+        assert result["group"] == ["tenant_1", "project_5"]
+        assert result["metadata"] == {"task": "reviewing PR"}
+        added_terminal = mock_session.add.call_args[0][0]
+        assert added_terminal.group == '["tenant_1", "project_5"]'
+        assert added_terminal.metadata_json == '{"task": "reviewing PR"}'
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_create_terminal_no_group_or_metadata_stores_null(self, mock_session_class):
+        """Omitting group/metadata must not write the literal string 'null'."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_session_class.return_value = mock_session
+
+        result = create_terminal("test123", "cao-session", "window-0", "kiro_cli", "developer")
+
+        assert result["group"] is None
+        assert result["metadata"] is None
+        added_terminal = mock_session.add.call_args[0][0]
+        assert added_terminal.group is None
+        assert added_terminal.metadata_json is None
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_create_terminal_explicit_empty_group_and_metadata_normalized_to_none(
+        self, mock_session_class
+    ):
+        """Self-ROAST finding: an explicit empty container (group=[], metadata={},
+        as opposed to omitted/None) is stored as NULL -- the return dict must echo
+        that same normalized None, not the raw [] / {} the caller passed in, or a
+        create_terminal() response would disagree with an immediately-following
+        get_terminal_metadata()/GET /terminals/{id} on the same row."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_session_class.return_value = mock_session
+
+        result = create_terminal(
+            "test123", "cao-session", "window-0", "kiro_cli", "developer", group=[], metadata={}
+        )
+
+        assert result["group"] is None
+        assert result["metadata"] is None
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_get_terminal_metadata_decodes_group_and_metadata(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_terminal.id = "test123"
+        mock_terminal.tmux_session = "cao-session"
+        mock_terminal.tmux_window = "window-0"
+        mock_terminal.provider = "kiro_cli"
+        mock_terminal.agent_profile = "developer"
+        mock_terminal.allowed_tools = None
+        mock_terminal.group = '["tenant_1", "project_5"]'
+        mock_terminal.metadata_json = '{"task": "reviewing PR"}'
+        mock_terminal.last_active = datetime.now()
+
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = get_terminal_metadata("test123")
+
+        assert result["group"] == ["tenant_1", "project_5"]
+        assert result["metadata"] == {"task": "reviewing PR"}
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_group(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = update_terminal_group("test123", ["tenant_1", "project_9"])
+
+        assert result is True
+        assert mock_terminal.group == '["tenant_1", "project_9"]'
+        mock_session.commit.assert_called_once()
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_group_empty_list_clears(self, mock_session_class):
+        """An empty list clears the group column (opts back out of discovery)."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_terminal.group = '["stale"]'
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = update_terminal_group("test123", [])
+
+        assert result is True
+        assert mock_terminal.group is None
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_group_not_found(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = None
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = update_terminal_group("nonexistent", ["a"])
+
+        assert result is False
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_metadata(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = update_terminal_metadata("test123", {"task": "writing tests"})
+
+        assert result is True
+        assert mock_terminal.metadata_json == '{"task": "writing tests"}'
+        mock_session.commit.assert_called_once()
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_metadata_not_found(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = None
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = update_terminal_metadata("nonexistent", {"task": "x"})
+
+        assert result is False
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_get_terminal_group_returns_decoded_list(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_terminal.group = '["tenant_1", "project_5"]'
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        assert get_terminal_group("test123") == ["tenant_1", "project_5"]
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_get_terminal_group_none_when_unset(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_terminal.group = None
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        assert get_terminal_group("test123") is None
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_get_terminal_group_none_when_terminal_missing(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = None
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        assert get_terminal_group("nonexistent") is None
+
+
+class TestListSiblingsByGroupPrefix:
+    """Real-DB regression tests for the #432 sibling-discovery prefix match.
+
+    Uses the in-memory-sqlite ``test_db`` fixture (not a mocked session) so
+    the actual JSON decode + prefix comparison across multiple rows is
+    exercised, not just the query-building calls.
+    """
+
+    def _seed(self, test_db, terminals):
+        with test_db() as seed:
+            seed.add_all(terminals)
+            seed.commit()
+
+    def test_matching_siblings_returned_with_group_and_metadata(self, test_db):
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="sib-1",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5", "folder_1"]',
+                    metadata_json='{"task": "reviewing"}',
+                ),
+                TerminalModel(
+                    id="sib-2",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5", "folder_2"]',
+                ),
+                TerminalModel(
+                    id="other-tenant",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_2", "project_5", "folder_1"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        ids = {r["id"] for r in result}
+        assert ids == {"sib-1", "sib-2"}
+        by_id = {r["id"]: r for r in result}
+        assert by_id["sib-1"]["group"] == ["tenant_1", "project_5", "folder_1"]
+        assert by_id["sib-1"]["metadata"] == {"task": "reviewing"}
+        assert by_id["sib-2"]["metadata"] is None
+
+    def test_caller_excluded_from_its_own_results(self, test_db):
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="caller-1",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5"]',
+                ),
+                TerminalModel(
+                    id="sib-1",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        assert {r["id"] for r in result} == {"sib-1"}
+
+    def test_shorter_sibling_group_excluded_not_partially_matched(self, test_db):
+        """A sibling whose group is shorter than the requested depth is
+        excluded rather than compared partially or raising an IndexError
+        (#432's own documented edge case)."""
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="shallow",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        assert result == []
+
+    def test_longer_sibling_group_matches_on_shared_prefix(self, test_db):
+        """A sibling with a LONGER group than the requested depth still
+        matches as long as its leading elements agree."""
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="deep",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5", "folder_9", "subtask_2"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        assert [r["id"] for r in result] == ["deep"]
+
+    def test_no_group_terminal_excluded_from_being_found(self, test_db):
+        """A terminal with no group set is never returned as a sibling to
+        anyone, regardless of what prefix is requested."""
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="no-group",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group=None,
+                ),
+                TerminalModel(
+                    id="has-group",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix("caller-1", ["tenant_1"])
+
+        assert [r["id"] for r in result] == ["has-group"]
+
+    def test_no_matching_prefix_returns_empty(self, test_db):
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="unrelated",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_9", "project_1"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        assert result == []
+
+    def test_sql_prefilter_narrows_rows_before_python_decode(self, test_db):
+        """Copilot review, PR #433: prove the SQL query itself narrows the
+        candidate set, not just that the final (correct) results happen to
+        match -- i.e. this is no longer a full-table scan + Python filter.
+
+        ``json.loads`` is only ever called (inside the function) on
+        ``row.group`` for rows the DB query actually returned, so its call
+        count is a direct proxy for how many rows were pulled into Python
+        for decoding. 5 non-matching siblings (different top-level tenant)
+        plus 1 matching one are seeded -- a full scan would decode all 6; a
+        working SQL prefilter decodes only the 1 that can possibly match.
+        """
+        import json as real_json
+
+        non_matching = [
+            TerminalModel(
+                id=f"other-tenant-{i}",
+                tmux_session="s",
+                tmux_window="w",
+                provider="kiro_cli",
+                group=f'["tenant_{i}", "project_5"]',
+            )
+            for i in range(2, 7)
+        ]
+        self._seed(
+            test_db,
+            non_matching
+            + [
+                TerminalModel(
+                    id="sib-1",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5", "folder_1"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            with patch("json.loads", wraps=real_json.loads) as mock_loads:
+                result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        assert [r["id"] for r in result] == ["sib-1"]
+        # Only the 1 matching row should ever reach json.loads -- proof the
+        # other 5 were excluded at the SQL level, never loaded for decoding.
+        assert mock_loads.call_count == 1
+
+    def test_element_text_prefix_does_not_false_positive_match(self, test_db):
+        """A sibling group element that merely shares a *text* prefix with a
+        requested prefix element (e.g. "project_50" vs. requested
+        "project_5") must not match -- the SQL LIKE prefilter operates on
+        the JSON encoding, where each string element is quote-delimited, so
+        this can't false-positive."""
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="near-miss",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_50"]',
+                ),
+                TerminalModel(
+                    id="exact",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5", "folder_1"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        assert [r["id"] for r in result] == ["exact"]
+
+    def test_corrupt_group_json_skipped_not_fatal_to_whole_query(self, test_db, caplog):
+        """tedswinyar, PR #433 review: a row with corrupt JSON in its group
+        column must be logged and skipped, not raise and fail discovery for
+        every OTHER terminal sharing the same prefix."""
+        import logging
+
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="corrupt",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    # Malformed JSON (unterminated array) but still matches the
+                    # SQL LIKE prefilter, so it reaches the Python decode step.
+                    group='["tenant_1", "project_5"',
+                ),
+                TerminalModel(
+                    id="good-1",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5", "folder_1"]',
+                ),
+                TerminalModel(
+                    id="good-2",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5", "folder_2"]',
+                ),
+            ],
+        )
+
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.clients.database"):
+            with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+                result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        assert {r["id"] for r in result} == {"good-1", "good-2"}
+        assert any("corrupt" in record.getMessage() for record in caplog.records)
+
+    def test_corrupt_group_json_decoding_to_non_list_is_also_skipped(self, test_db, caplog):
+        """Well-formed JSON that decodes to something other than a list (e.g.
+        a stray object) is exactly as unusable for prefix matching as a
+        JSONDecodeError, so it must be treated the same way -- logged and
+        skipped, not crash on the ``sibling_group[:depth]`` slice below.
+
+        This can't happen through the real write path today (both writers
+        always encode a list), so it's reached here by making the decode
+        itself return a dict for the corrupted row -- the same defense
+        that would trigger against a hand-edited DB row.
+        """
+        import json as real_json
+        import logging
+
+        corrupted_group_text = '["tenant_1", "project_5", "onlyme"]'
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="not-a-list",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group=corrupted_group_text,
+                ),
+                TerminalModel(
+                    id="good-1",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5"]',
+                ),
+            ],
+        )
+
+        _orig_loads = real_json.loads
+
+        def fake_loads(text):
+            if text == corrupted_group_text:
+                return {"tenant_1": "project_5"}  # decodes fine, but not a list
+            return _orig_loads(text)
+
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.clients.database"):
+            with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+                with patch("json.loads", side_effect=fake_loads):
+                    result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        assert [r["id"] for r in result] == ["good-1"]
+        assert any("corrupt" in record.getMessage() for record in caplog.records)
+
+    def test_corrupt_metadata_json_reports_sibling_with_metadata_none(self, test_db, caplog):
+        """A matching sibling with corrupt metadata JSON is still a REAL,
+        discoverable sibling -- only its metadata is unreadable, logged and
+        reported as None rather than dropping the whole sibling."""
+        import logging
+
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="corrupt-metadata",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5"]',
+                    metadata_json="{not valid json",
+                ),
+            ],
+        )
+
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.clients.database"):
+            with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+                result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        assert len(result) == 1
+        assert result[0]["id"] == "corrupt-metadata"
+        assert result[0]["metadata"] is None
+        assert any("corrupt" in record.getMessage() for record in caplog.records)
+
+    def test_group_element_with_like_special_characters_matches_literally(self, test_db):
+        """Group elements containing SQL LIKE wildcards (``%``, ``_``) must
+        be matched as literal text, not interpreted as wildcards, in the SQL
+        prefilter (autoescape)."""
+        import json as real_json
+
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="literal-match",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group=real_json.dumps(["50%_off", "folder_1"]),
+                ),
+                TerminalModel(
+                    id="unrelated",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group=real_json.dumps(["completely_different", "folder_1"]),
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix("caller-1", ["50%_off"])
+
+        assert [r["id"] for r in result] == ["literal-match"]
+
+    def test_session_scoped_by_default_excludes_other_sessions(self, test_db):
+        """Issue #432 design discussion (tedswinyar + klabulan, 2026-07-17/18):
+        sibling discovery is session-scoped by default -- two terminals in
+        DIFFERENT tmux sessions that happen to share a group prefix (a
+        naming collision, a copy-pasted template, two features reusing the
+        same tenant/project id) must NOT discover each other unless
+        cross_session=True is explicitly passed."""
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="same-session-sibling",
+                    tmux_session="cao-session-a",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5"]',
+                ),
+                TerminalModel(
+                    id="other-session-sibling",
+                    tmux_session="cao-session-b",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix(
+                "caller-1", ["tenant_1", "project_5"], caller_session="cao-session-a"
+            )
+
+        assert [r["id"] for r in result] == ["same-session-sibling"]
+
+    def test_cross_session_true_includes_other_sessions(self, test_db):
+        """cross_session=True is the explicit opt-in that restores the
+        previous (pre-#432-discussion) server-wide behavior."""
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="same-session-sibling",
+                    tmux_session="cao-session-a",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5"]',
+                ),
+                TerminalModel(
+                    id="other-session-sibling",
+                    tmux_session="cao-session-b",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix(
+                "caller-1",
+                ["tenant_1", "project_5"],
+                caller_session="cao-session-a",
+                cross_session=True,
+            )
+
+        assert {r["id"] for r in result} == {"same-session-sibling", "other-session-sibling"}
+
+    def test_no_caller_session_provided_does_not_filter_by_session(self, test_db):
+        """Backward-compatible default: omitting caller_session entirely
+        (the pre-existing call shape every other test in this class uses)
+        applies no session filter at all, rather than matching only
+        terminals with a null/empty session."""
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="session-a-sibling",
+                    tmux_session="cao-session-a",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1"]',
+                ),
+                TerminalModel(
+                    id="session-b-sibling",
+                    tmux_session="cao-session-b",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix("caller-1", ["tenant_1"])
+
+        assert {r["id"] for r in result} == {"session-a-sibling", "session-b-sibling"}
+
+
 class TestInboxOperations:
     """Tests for inbox database operations."""
 
@@ -772,10 +1549,13 @@ class TestInboxOperations:
             "id",
             "message_id",
             "kind",
+            "phase",
+            "decision",
+            "reason",
             "payload",
             "created_at",
         }
-        assert {index["name"] for index in inspector.get_indexes("inbox_message_trace_event")} == {
+        assert {index["name"] for index in inspector.get_indexes("inbox_message_trace_event")} >= {
             "ix_inbox_message_trace_event_message_id",
             "ix_inbox_message_trace_event_kind_created_message",
         }
@@ -1232,10 +2012,10 @@ class TestInitDb:
 
 
 class TestTerminalsSchemaMigration:
-    """Tests for the terminals-table column-add migration (caller_id, issue #284)."""
+    """Tests for terminals-table additive column migrations."""
 
-    def test_caller_id_column_added_to_legacy_table(self, tmp_path, monkeypatch):
-        """A pre-#284 terminals table gains the caller_id column."""
+    def test_missing_terminal_columns_added_to_legacy_table(self, tmp_path, monkeypatch):
+        """A legacy terminals table gains nullable metadata columns."""
         import sqlite3
 
         from cli_agent_orchestrator.clients import database as db_mod
@@ -1264,9 +2044,10 @@ class TestTerminalsSchemaMigration:
 
         with sqlite3.connect(str(db_file)) as conn:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(terminals)")}
-            rows = conn.execute("SELECT id, caller_id FROM terminals").fetchall()
+            rows = conn.execute("SELECT id, caller_id, working_directory FROM terminals").fetchall()
         assert "caller_id" in columns
-        assert rows == [("abc12345", None)], "existing rows must get NULL caller_id"
+        assert "working_directory" in columns
+        assert rows == [("abc12345", None, None)], "existing rows must get NULL metadata values"
 
     def test_migration_is_idempotent(self, tmp_path, monkeypatch):
         """Running the migration twice must not fail or duplicate columns."""
@@ -1294,16 +2075,187 @@ class TestTerminalsSchemaMigration:
         with sqlite3.connect(str(db_file)) as conn:
             columns = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
         assert columns.count("caller_id") == 1
+        assert columns.count("working_directory") == 1
         assert columns.count("allowed_tools") == 1
 
+    def test_group_and_metadata_columns_added_to_legacy_table(self, tmp_path, monkeypatch):
+        """#432: a pre-existing terminals table (predating group/metadata) gains both
+        columns, and existing rows get NULL rather than erroring."""
+        import sqlite3
 
-class TestCallerIdRoundTrip:
-    """caller_id must round-trip create→read (issue #284): a write path that
-    persists it and a read path that drops it would silently break callback
-    routing for every worker."""
+        from cli_agent_orchestrator.clients import database as db_mod
 
-    def test_caller_id_round_trips_through_real_db(self, tmp_path, monkeypatch):
-        """create_terminal persists caller_id; get_terminal_metadata returns it."""
+        db_file = tmp_path / "pre432.db"
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "CREATE TABLE terminals ("
+                "id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL, "
+                "tmux_window TEXT NOT NULL, provider TEXT NOT NULL, "
+                "agent_profile TEXT, allowed_tools TEXT, shell_command TEXT, "
+                "caller_id TEXT, last_active TIMESTAMP)"
+            )
+            conn.execute(
+                "INSERT INTO terminals (id, tmux_session, tmux_window, provider) "
+                "VALUES ('abc12345', 'cao-s', 'w-0', 'kiro_cli')"
+            )
+            conn.commit()
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+
+        db_mod._migrate_terminals_schema()
+
+        with sqlite3.connect(str(db_file)) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(terminals)")}
+            rows = conn.execute('SELECT id, "group", "metadata" FROM terminals').fetchall()
+        assert {"group", "metadata"} <= columns
+        assert rows == [("abc12345", None, None)]
+
+    def test_group_and_metadata_migration_is_idempotent(self, tmp_path, monkeypatch):
+        """Running the migration twice must not fail or duplicate the new columns."""
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = tmp_path / "pre432_twice.db"
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "CREATE TABLE terminals ("
+                "id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL, "
+                "tmux_window TEXT NOT NULL, provider TEXT NOT NULL)"
+            )
+            conn.commit()
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+
+        db_mod._migrate_terminals_schema()
+        db_mod._migrate_terminals_schema()
+
+        with sqlite3.connect(str(db_file)) as conn:
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
+        assert columns.count("group") == 1
+        assert columns.count("metadata") == 1
+
+    def test_real_production_upgrade_seeded_rows_survive_init_db(self, tmp_path, monkeypatch):
+        """tedswinyar, PR #433 review: every other migration test here starts
+        from an empty database and only checks the resulting schema. This is
+        the actual production-upgrade case -- a DB with SEVERAL pre-#432
+        terminal rows already in it (the shape right after #284's caller_id
+        migration, no group/metadata columns yet) -- exercised through the
+        real ``init_db()`` entry point (not the internal migration helper
+        directly) and read back through the real application read path
+        (``get_terminal_metadata``, not raw SQL), so this proves the whole
+        upgrade a running server actually performs, twice for idempotency.
+        """
+        import sqlite3
+
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = tmp_path / "prod_upgrade.db"
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "CREATE TABLE terminals ("
+                "id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL, "
+                "tmux_window TEXT NOT NULL, provider TEXT NOT NULL, "
+                "agent_profile TEXT, allowed_tools TEXT, shell_command TEXT, "
+                "caller_id TEXT, last_active TIMESTAMP)"
+            )
+            conn.executemany(
+                "INSERT INTO terminals "
+                "(id, tmux_session, tmux_window, provider, agent_profile, "
+                "allowed_tools, shell_command, caller_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        "aaaa1111",
+                        "cao-sess-1",
+                        "developer-0",
+                        "kiro_cli",
+                        "developer",
+                        '["send_message", "handoff"]',
+                        "bash",
+                        None,
+                    ),
+                    (
+                        "bbbb2222",
+                        "cao-sess-1",
+                        "reviewer-0",
+                        "claude_code",
+                        "reviewer",
+                        None,
+                        None,
+                        "aaaa1111",
+                    ),
+                    (
+                        "cccc3333",
+                        "cao-sess-2",
+                        "developer-1",
+                        "codex",
+                        None,
+                        None,
+                        None,
+                        None,
+                    ),
+                ],
+            )
+            conn.commit()
+
+        # A real server binds `engine`/`SessionLocal` to DATABASE_FILE once at
+        # import time -- point BOTH at the seeded legacy file so init_db()'s
+        # create_all/migrations and the subsequent application-level reads
+        # all operate on the same DB (not the process's real one).
+        new_engine = create_engine(
+            f"sqlite:///{db_file}", connect_args={"check_same_thread": False}
+        )
+        monkeypatch.setattr(db_mod, "engine", new_engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=new_engine))
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+
+        def assert_seeded_rows_intact():
+            aaaa = db_mod.get_terminal_metadata("aaaa1111")
+            bbbb = db_mod.get_terminal_metadata("bbbb2222")
+            cccc = db_mod.get_terminal_metadata("cccc3333")
+
+            for row in (aaaa, bbbb, cccc):
+                assert row is not None
+                assert row["group"] is None, "pre-migration rows must read group as NULL"
+                assert row["metadata"] is None, "pre-migration rows must read metadata as NULL"
+
+            # Original pre-migration data must survive untouched.
+            assert aaaa["tmux_session"] == "cao-sess-1"
+            assert aaaa["agent_profile"] == "developer"
+            assert aaaa["allowed_tools"] == ["send_message", "handoff"]
+            assert bbbb["caller_id"] == "aaaa1111"
+            assert cccc["provider"] == "codex"
+
+        db_mod.init_db()
+        assert_seeded_rows_intact()
+
+        # Idempotency: a second real init_db() call (e.g. server restart)
+        # must not fail or corrupt the already-migrated rows.
+        db_mod.init_db()
+        assert_seeded_rows_intact()
+
+        with sqlite3.connect(str(db_file)) as conn:
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
+        assert columns.count("group") == 1
+        assert columns.count("metadata") == 1
+
+
+class TestTerminalMetadataRoundTrip:
+    """Terminal metadata used by orchestration surfaces must round-trip."""
+
+    def test_caller_id_and_working_directory_round_trip_through_real_db(
+        self, tmp_path, monkeypatch
+    ):
+        """create_terminal persists ownership metadata; reads return it."""
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
 
@@ -1314,16 +2266,24 @@ class TestCallerIdRoundTrip:
         monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
 
         created = create_terminal(
-            "abc12345", "cao-s", "w-0", "kiro_cli", "developer", caller_id="def67890"
+            "abc12345",
+            "cao-s",
+            "w-0",
+            "kiro_cli",
+            "developer",
+            caller_id="def67890",
+            working_directory="/workspace/project",
         )
         assert created["caller_id"] == "def67890"
+        assert created["working_directory"] == "/workspace/project"
 
         fetched = get_terminal_metadata("abc12345")
         assert fetched is not None
         assert fetched["caller_id"] == "def67890"
+        assert fetched["working_directory"] == "/workspace/project"
 
-    def test_caller_id_defaults_to_none(self, tmp_path, monkeypatch):
-        """Operator-launched terminals (no caller) round-trip NULL."""
+    def test_nullable_metadata_defaults_to_none(self, tmp_path, monkeypatch):
+        """Operator-launched terminals without optional metadata round-trip NULL."""
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
 
@@ -1335,10 +2295,12 @@ class TestCallerIdRoundTrip:
 
         created = create_terminal("abc12345", "cao-s", "w-0", "kiro_cli")
         assert created["caller_id"] is None
+        assert created["working_directory"] is None
 
         fetched = get_terminal_metadata("abc12345")
         assert fetched is not None
         assert fetched["caller_id"] is None
+        assert fetched["working_directory"] is None
 
 
 class TestProjectAliasMigration:

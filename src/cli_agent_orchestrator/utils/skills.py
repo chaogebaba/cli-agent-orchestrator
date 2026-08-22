@@ -9,6 +9,7 @@ import frontmatter
 from pydantic import ValidationError
 
 from cli_agent_orchestrator.constants import SKILLS_DIR
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.skill import SkillMetadata
 
 logger = logging.getLogger(__name__)
@@ -18,6 +19,25 @@ SKILL_CATALOG_INSTRUCTION = (
     "To load a skill's full content, use the `mcp__cao-mcp-server__load_skill` tool (NOT the Skill command). "
     "These skills are not accessible through provider-native skill commands or directories."
 )
+
+# Provider-specific skill-load instructions. Keyed by ProviderType value.
+# The `mcp__<server>__<tool>` form in the default is Claude Code's naming
+# convention, shared by Codex (verified: Codex emits standard MCP identifiers
+# unless the opt-in `non_prefixed_mcp_tool_names` flag is set). Grok CLI uses
+# `<server>__<tool>` with NO `mcp__` prefix and requires `search_tool`
+# discovery before `use_tool` dispatch, so it needs its own text — not just a
+# renamed tool. Providers absent from this mapping get the default.
+SKILL_CATALOG_INSTRUCTIONS: Dict[str, str] = {
+    ProviderType.GROK_CLI.value: (
+        "The following skills are available exclusively in this CAO orchestration context. "
+        "To load a skill's full content, first discover it with `search_tool` "
+        "(keywords: `cao-mcp-server load skill`), then call `use_tool` with the qualified "
+        "tool name `cao-mcp-server__load_skill` and `tool_input` `{\"name\": \"<skill-name>\"}`. "
+        "Do NOT prefix the tool name with `mcp__`, and do NOT use a provider-native skill "
+        "command or read the skill file directly from disk. "
+        "These skills are not accessible through provider-native skill commands or directories."
+    ),
+}
 
 
 class SkillNameError(ValueError):
@@ -162,7 +182,11 @@ def list_skills() -> List[SkillMetadata]:
     return sorted(skills_by_name.values(), key=lambda skill: skill.name)
 
 
-def build_skill_catalog(skill_filter: Optional[List[str]] = None) -> str:
+def build_skill_catalog(
+    skill_filter: Optional[List[str]] = None,
+    *,
+    provider: Optional[str] = None,
+) -> str:
     """Build the injected skill catalog block.
 
     Args:
@@ -173,6 +197,10 @@ def build_skill_catalog(skill_filter: Optional[List[str]] = None) -> str:
             least one pattern are listed; an empty list advertises no skills at
             all. Patterns that match no installed skill are logged (usually a
             typo or a stale skill name).
+        provider: Optional provider type value string. Selects the provider-
+            specific skill-load instruction from ``SKILL_CATALOG_INSTRUCTIONS``.
+            Falls back to the default ``SKILL_CATALOG_INSTRUCTION`` when the
+            provider is ``None`` or absent from the mapping.
     """
     skills = list_skills()
     if skill_filter is not None:
@@ -196,13 +224,14 @@ def build_skill_catalog(skill_filter: Optional[List[str]] = None) -> str:
     if not skills:
         return ""
 
+    instruction = SKILL_CATALOG_INSTRUCTIONS.get(provider, SKILL_CATALOG_INSTRUCTION)
     skill_lines = [f"- **{skill.name}**: {skill.description}" for skill in skills]
 
     return "\n".join(
         [
             "## Available Skills",
             "",
-            SKILL_CATALOG_INSTRUCTION,
+            instruction,
             "",
             *skill_lines,
         ]

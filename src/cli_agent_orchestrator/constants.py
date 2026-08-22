@@ -50,8 +50,10 @@ def _env_positive_float(name: str, default: float) -> float:
 # =============================================================================
 # Session Configuration
 # =============================================================================
-# All CAO-managed tmux sessions are prefixed to distinguish them from user sessions
-SESSION_PREFIX = "cao-"
+# All CAO-managed tmux sessions are prefixed to distinguish them from user sessions.
+# In test environments (CaoServer fixture), CAO_SESSION_PREFIX overrides the
+# default so test-spawned sessions are identifiable during incident triage (#190).
+SESSION_PREFIX = os.environ.get("CAO_SESSION_PREFIX", "cao-")
 
 # =============================================================================
 # Provider Configuration
@@ -70,14 +72,71 @@ DEFAULT_PROVIDER = ProviderType.KIRO_CLI.value
 # Higher values provide more context but increase memory usage
 TMUX_HISTORY_LINES = 200
 
+# Foreground commands to treat as bracketed-paste INCOMPATIBLE.
+# (\x1b[200~...\x1b[201~). send_keys(force_bracketed_paste=True) checks the
+# pane's live #{pane_current_command} against this set before wrapping, so a
+# terminal whose provider process has already exited back to a bare shell
+# (e.g. after a TUI's own `/exit`) doesn't get the escape bytes glued onto
+# the first token of the next command. Bash is included deliberately even
+# though it CAN understand bracketed paste: readline's support is
+# version/config-dependent (default-off before readline 8.1/bash 5.1,
+# default-on after, and always overridable via `set enable-bracketed-paste`
+# in .inputrc) and there's no reliable way to detect from here whether it's
+# active in a given pane -- so the safe default is to skip wrapping rather
+# than risk the pasted markers leaking into the command on a
+# bracketed-paste-off bash.
+BRACKETED_PASTE_INCOMPATIBLE_SHELLS = frozenset(
+    {"sh", "dash", "bash", "zsh", "ksh", "mksh", "csh", "tcsh", "fish", "ash"}
+)
+
 # =============================================================================
 # Application Directory Structure
 # =============================================================================
-# Base directory for all CAO data (~/.aws/cli-agent-orchestrator)
-CAO_HOME_DIR = Path(
-    os.environ.get("CAO_HOME", str(Path.home() / ".aws" / "cli-agent-orchestrator"))
+# Base directory for all CAO data. Defaults to ``~/.aws/cli-agent-orchestrator``,
+# overridable via the ``CAO_HOME_DIR`` env var (read at import, mirroring the
+# ``CAO_AGENTS_DIR`` / ``CAO_GRAPH_EXPORT_ROOT`` convention). Every path below
+# derives from it, so one override relocates the whole tree. Motivating case:
+# environments that restrict reads under ``~/.aws`` at the OS level (e.g.
+# AppArmor, mount namespaces, or similar path-based sandboxing) to protect
+# credentials; pointing this outside ``~/.aws`` keeps the sandbox enabled.
+# Must be set before this module is first imported. Empty or whitespace-only
+# values are treated as unset; tilde is expanded and the result is resolved to
+# an absolute path.
+_cao_home_raw = os.environ.get("CAO_HOME_DIR", "").strip()
+CAO_HOME_DIR = (
+    Path(_cao_home_raw).expanduser().resolve()
+    if _cao_home_raw
+    else Path.home() / ".aws" / "cli-agent-orchestrator"
 )
+
+# WPU1 (upstream absorb 2026-07-27): upstream renamed this override from our
+# ``CAO_HOME`` to ``CAO_HOME_DIR`` and we adopted their name (user ruling) so
+# the constants block stops re-conflicting. The rename is a SILENT failure if
+# any exporter is missed: ``test/conftest.py`` sets the override before
+# importing the database engine, and ``sandbox_bootstrap.py`` exports it into
+# the G7 manifest -- a stale ``CAO_HOME`` would not error, it would quietly
+# resolve to the PRODUCTION tree and let a suite run migrate the real DB.
+# Fail loudly instead: the old name set without the new one is always a
+# missed rename, never a legitimate configuration.
+if os.environ.get("CAO_HOME", "").strip() and not _cao_home_raw:
+    raise RuntimeError(
+        "CAO_HOME is set but CAO_HOME_DIR is not. CAO_HOME was renamed to "
+        "CAO_HOME_DIR when upstream's override landed; a stale CAO_HOME would "
+        "silently resolve to the production tree instead of your override. "
+        "Rename the variable at the site that exported it."
+    )
+
+# Ensure the base directory exists with owner-only permissions. When relocated
+# outside ~/.aws there is no parent permission umbrella protecting the DB,
+# memory, agent-store, and terminal logs from other local users.
+CAO_HOME_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+try:
+    os.chmod(CAO_HOME_DIR, 0o700)
+except OSError:
+    pass  # best-effort: may fail on read-only mounts or non-owned dirs
+
 DEFERRED_DEADLETTER_DIR = CAO_HOME_DIR / "deadletters"
+SEAM_PARITY_POISON_DIR = CAO_HOME_DIR / "seam_parity_poison"
 BLOCKED_WAIT_CAP_S = 1800.0
 
 # Managed environment variable file
@@ -89,20 +148,31 @@ DB_DIR = CAO_HOME_DIR / "db"
 # Log file directory structure
 LOG_DIR = CAO_HOME_DIR / "logs"
 TERMINAL_LOG_DIR = LOG_DIR / "terminal"  # Per-terminal log files for pipe-pane output
-TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 DRAFT_LOG_DIR = LOG_DIR / "drafts"  # Stashed human composer drafts before CAO injection
-DRAFT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+DRAFT_LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 # FIFO directory for event-driven terminal output streaming
 FIFO_DIR = CAO_HOME_DIR / "fifos"  # Named pipes for tmux pipe-pane streaming
-FIFO_DIR.mkdir(parents=True, exist_ok=True)
+FIFO_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+# Sidecar lock directory for utils/atomic_file.locked_atomic_rewrite. The
+# targets it serializes (AGENTS.md / .claude/CLAUDE.md / dev.agent.md) live in
+# the USER's working tree, so a lock file placed beside each target would leave
+# permanent untracked ``*.lock`` files polluting the user's repo. Keeping the
+# lock files here — under CAO's own home dir, keyed by a hash of the target's
+# resolved absolute path — means every process (CLI and cao-server) that locks
+# the same target agrees on the same lock file while the user's tree gains ZERO
+# new files. Created lazily (0o700) on first use by the lock helper.
+LOCK_DIR = CAO_HOME_DIR / "locks"
 
 # =============================================================================
 # Event-Driven State Detection Configuration
 # =============================================================================
-# Rolling buffer size for state detection (8KB)
-# Keeps trailing 8KB of terminal output for pattern matching
-STATE_BUFFER_MAX = 8192
+# The rolling per-terminal raw-output buffer StatusMonitor keeps for raw-path
+# status detection and GET /terminals/{id}/output (mode=full) is a server
+# tuning value, not a fixed constant -- see settings_service.py's
+# ``_SERVER_DEFAULTS["state_buffer_max"]`` / ``get_server_settings()``.
 
 # Max events buffered per subscriber queue before dropping. Claude's TUI startup
 # can emit thousands of small chunks in a short burst, so keep this comfortably
@@ -422,6 +492,138 @@ WS_ALLOWED_CLIENTS = [
     "localhost",
 ] + _split_env_list("CAO_WS_ALLOWED_CLIENTS")
 
+# Extra Origin values accepted on the WebSocket PTY attach handshake, on top of
+# the same-origin match and the ``CORS_ORIGINS`` list the HTTP surface already
+# trusts. The browser sends ``Origin`` on every cross-site WebSocket handshake,
+# but — unlike ``fetch`` — the Same-Origin Policy does NOT block the connection
+# and Starlette's ``CORSMiddleware`` never runs for the WebSocket ASGI scope,
+# so the handler must validate ``Origin`` itself or any web page the victim
+# visits can drive the local PTY (CWE-1385, cross-site WebSocket hijacking).
+# Operators serving the terminal viewer from a genuinely cross-origin page can
+# allow it here; a literal ``*`` disables the Origin check entirely, mirroring
+# ``CAO_WS_ALLOWED_CLIENTS="*"`` for trusted setups.
+WS_ALLOWED_ORIGINS = _split_env_list("CAO_WS_ALLOWED_ORIGINS")
+
+
+def _origin_authority(origin: str) -> "str | None":
+    """Return the ``host[:port]`` authority of an http/https ``Origin``.
+
+    ``None`` for anything that is not a plain http/https origin — an opaque
+    ``"null"`` origin, a ``file://``/``data:`` scheme, or a malformed value —
+    so those never satisfy the same-origin match below.
+    """
+    parts = urlsplit(origin)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return None
+    # ``netloc`` may carry userinfo (user:pass@host); the authority a browser
+    # actually reports in ``Origin`` never does, but strip it defensively so a
+    # crafted value can't smuggle the trusted host into the userinfo segment.
+    return parts.netloc.rsplit("@", 1)[-1]
+
+
+def is_ws_origin_allowed(origin: "str | None", host: "str | None" = None) -> bool:
+    """Whether a WebSocket handshake ``Origin`` header may open a PTY socket.
+
+    Rules, tightest-safe first:
+
+    * A missing / empty ``Origin`` is allowed. Browsers *always* send it on a
+      cross-site WebSocket handshake, so its absence means the caller is a
+      non-browser client (native ``websockets`` lib, CLI, tests). Those are
+      still gated by the loopback IP allowlist (``WS_ALLOWED_CLIENTS``); the
+      cross-site-request-forgery threat this guards against is browser-only.
+    * A literal ``*`` in ``WS_ALLOWED_ORIGINS`` disables the check (opt-in
+      escape hatch for trusted tunnels, matching ``WS_ALLOWED_CLIENTS``).
+    * **Same-origin**: the ``Origin`` authority equals the request ``Host``.
+      This is the request the browser makes when the viewer is served by
+      cao-server itself, and it is exactly what a cross-site attacker CANNOT
+      forge — script-set ``Host`` is forbidden and the real ``Host`` is the
+      CAO server the socket is opened to, not the attacker's page. Matching on
+      the live ``Host`` is what lets the imported-app deployment
+      (``uvicorn ...:app``, which never runs ``add_local_cors_origins``) and
+      dynamic reverse-proxy / Codespaces hostnames work without pre-registering
+      every origin.
+
+      This branch trusts ``Host`` and so is only as safe as ``Host`` itself:
+      ``TrustedHostMiddleware`` validates ``Host`` against ``ALLOWED_HOSTS`` on
+      the same WebSocket scope BEFORE this handler runs, which is what makes
+      the match DNS-rebinding-safe in the default (loopback) config. Setting
+      ``CAO_ALLOWED_HOSTS="*"`` turns that validation off (``allow_any``), so an
+      operator who does that has opted out of the DNS-rebinding protection for
+      this branch too — the same explicit-opt-out tradeoff as
+      ``CAO_WS_ALLOWED_CLIENTS="*"``. Keep ``ALLOWED_HOSTS`` scoped to the real
+      serving hostname(s) rather than ``*`` whenever possible.
+    * Otherwise the ``Origin`` must appear in the explicit allowlists: the same
+      ``CORS_ORIGINS`` list the HTTP API enforces plus any
+      ``CAO_WS_ALLOWED_ORIGINS`` entries. Exact-string match mirrors how the
+      browser reports ``Origin`` and how ``CORSMiddleware`` compares it.
+
+    A ``*`` entry in ``CORS_ORIGINS`` (i.e. ``CAO_CORS_ORIGINS="*"``) is
+    **deliberately NOT** treated as a wildcard here: it would open unauthenticated
+    PTY access — keystroke injection is RCE — to every website the victim
+    visits, a far higher blast radius than the read-oriented HTTP surface
+    ``CORSMiddleware`` guards. Disabling this check therefore requires the
+    dedicated, more conspicuous ``CAO_WS_ALLOWED_ORIGINS="*"`` opt-in, matching
+    the ``CAO_WS_ALLOWED_CLIENTS="*"`` escape hatch for the IP check. This
+    divergence from ``CORSMiddleware`` is intentional.
+    """
+    if not origin:
+        return True
+    if "*" in WS_ALLOWED_ORIGINS:
+        return True
+    if host:
+        authority = _origin_authority(origin)
+        if authority is not None and authority == host:
+            return True
+    # Membership only — an operator's ``CAO_CORS_ORIGINS="*"`` lands as the
+    # literal string "*" in this list and matches ONLY a literal "*" Origin
+    # (which no browser sends), so it never widens PTY trust. See docstring.
+    return origin in CORS_ORIGINS or origin in WS_ALLOWED_ORIGINS
+
+
+def is_http_origin_allowed(origin: "str | None", host: "str | None" = None) -> bool:
+    """Whether a state-changing HTTP request ``Origin`` header is trusted.
+
+    CSRF / CWE-352 guard for the default-unauthenticated HTTP surface, mirroring
+    ``is_ws_origin_allowed`` on the read/mutation HTTP split:
+
+    * A missing / empty ``Origin`` is allowed. Browsers always attach one on a
+      cross-site state-changing request (``fetch``, XHR, and form posts alike),
+      so its absence means a non-browser client (curl, ``requests``, MCP, the
+      ``cao`` CLI) — one with no ambient credentials a foreign page could use.
+    * A literal ``*`` in ``CORS_ORIGINS`` (i.e. ``CAO_CORS_ORIGINS="*"``) allows
+      every origin — the operator-visible wildcard that ``CORSMiddleware``
+      already honors for the read surface, so a ``"*"``-configured deployment
+      behaves consistently for writes too.
+    * **Same-origin**: the ``Origin`` authority equals the request ``Host``.
+      This is the request the bundled Web UI makes when served by cao-server
+      itself, and it is exactly what a cross-site attacker CANNOT forge —
+      script-set ``Host`` is forbidden and the real ``Host`` is the CAO server
+      the request was made to, not the attacker's page. Matching on the live
+      ``Host`` lets the imported-app deployment and dynamic reverse-proxy /
+      Codespaces hostnames work without pre-registering every origin.
+
+      Like the WebSocket branch, this trusts ``Host`` and is only as safe as
+      ``Host`` itself: ``TrustedHostMiddleware`` validates ``Host`` against
+      ``ALLOWED_HOSTS`` on the same scope BEFORE the HTTP origin check runs,
+      which keeps the match DNS-rebinding-safe in the default loopback config.
+      ``CAO_ALLOWED_HOSTS="*"`` opts out of that protection, matching the WS
+      guard's documented tradeoff.
+    * Otherwise the ``Origin`` must be in ``CORS_ORIGINS``. Exact-string match
+      mirrors how the browser serializes ``Origin`` and how ``CORSMiddleware``
+      compares it, so anything the CORS layer already trusts for reads is
+      trusted for writes too.
+    """
+    if not origin:
+        return True
+    if "*" in CORS_ORIGINS:
+        return True
+    if host:
+        authority = _origin_authority(origin)
+        if authority is not None and authority == host:
+            return True
+    return origin in CORS_ORIGINS
+
+
 # Trusted upstream IP allowlist for uvicorn's ``proxy_headers`` and
 # ``forwarded_allow_ips`` settings. When cao-server is bound to a
 # non-loopback address (Codespaces, devcontainer, reverse proxy), uvicorn
@@ -482,7 +684,7 @@ MEMORY_ARCHIVE_MAX_GZIP_RATIO = 100  # reject > 100x expansion
 # Built-in role defaults. A role is a named bundle of allowedTools.
 # Users can define custom roles in settings.json under "roles".
 # CAO vocabulary: execute_bash, fs_read, fs_write, fs_list, fs_*, web_fetch,
-# @builtin, @cao-mcp-server.
+# @builtin, @cao-mcp-server, discovery.
 # web_fetch is granted only to developer: supervisor/reviewer are intentionally
 # kept off the network (no WebFetch/WebSearch), shrinking their exfiltration surface.
 ROLE_TOOL_DEFAULTS = {
@@ -494,6 +696,18 @@ ROLE_TOOL_DEFAULTS = {
     "reviewer": ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"],
     "developer": ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"],
 }
+
+# Issue #432 design discussion (tedswinyar + klabulan, 2026-07-17/18): sibling
+# discovery (list_siblings/update_metadata) is a distinct capability from the
+# existing handoff/assign/send_message orchestration trio, and must be an
+# explicit, separate opt-in rather than bundled into @cao-mcp-server's
+# all-or-nothing MCP-server-level grant -- a profile should be able to keep
+# orchestration tools while declining peer-to-peer discovery. Deliberately
+# NOT in any built-in role's defaults above; a profile author adds it
+# explicitly (see docs/tool-restrictions.md and
+# docs/discovery-tool-coexistence.md for the full rationale and enforcement
+# mechanism).
+DISCOVERY_TOOL_MARKER = "discovery"
 
 # Security constraints prepended to system prompts for providers without
 # native tool restriction mechanisms (kimi_cli, codex).
@@ -518,11 +732,28 @@ WORKFLOW_MAX_SPEC_BYTES = 256 * 1024
 WORKFLOW_OUTPUT_SCHEMA_MAX_DEPTH = 8
 WORKFLOW_MAX_INPUTS = 64
 
+# SQLite busy-timeout for journal connections, in milliseconds (issue #583, NFR-4).
+# Journal writes are single-row upserts in one short transaction, so the realistic
+# contention window is milliseconds; 5000 gives ~3 orders of magnitude of headroom, which
+# makes "database is locked" mean a genuinely stuck writer rather than ordinary collision.
+# Per-connection (unlike WAL, which is per-database and deliberately out of scope,
+# ADR-583-10).
+WORKFLOW_JOURNAL_BUSY_TIMEOUT_MS = 5000
+
 # Max size (bytes) of the compact-JSON resolved inputs map delivered to a script
 # run via the CAO_WORKFLOW_INPUTS spawn-env key. Enforced at the run route, on
 # the RESOLVED map, BEFORE any journal write or registry registration (ADR-5) —
 # never inside _build_env. An oversized payload is rejected as ValueError -> 400.
 WORKFLOW_INPUTS_MAX_BYTES = 32768
+
+# Byte bound on the persisted step result text (issue #583, NFR-1 / TD-2). Applied to
+# ``last_message`` AFTER redaction (never before — SR-1), on the UTF-8 encoding rather
+# than the character count, because the bound is a storage limit. Matches
+# WORKFLOW_INPUTS_MAX_BYTES rather than inventing a fourth magnitude: being slightly
+# tight is VISIBLE (``truncated=True`` on the envelope) and cheap to revise from a named
+# constant, while being loose accumulates SILENTLY in a shared database that has no
+# eviction for this column.
+WORKFLOW_JOURNAL_RESULT_MAX_BYTES = 32768
 
 # Units (from units-generation) whose constructs are EXECUTABLE in the current
 # Bolt. Empty in Bolt 1: the run engine (N5) is not shipped, so every
@@ -586,6 +817,31 @@ WORKFLOW_STEP_TIMEOUT = 600.0
 # running near the 100-step ceiling can raise it via the env override if needed.
 WORKFLOW_RUN_REQUEST_TIMEOUT = (WORKFLOW_STEP_TIMEOUT + 120.0) * 12 + 180.0  # = 8820.0s (~2.45h)
 
+# Poll interval (seconds) for the async-run FOLLOWERS: ``cao workflow run`` (bare
+# follow-to-terminal + ``wait``) and the ``workflow_wait`` MCP tool (issue #505,
+# U5/U6). ADR-4 chose a poll loop over the snapshot route (Option A) rather than
+# consuming the events stream (that live follower is U10); the value itself was
+# delegated to functional design and pinned here (U5-FP-5). Named — not a magic
+# literal — so both the CLI follower and the MCP poll tool reference one constant.
+# Each poll's HTTP call uses the normal per-call timeout (MCP_REQUEST_TIMEOUT /
+# ``_mcp_timeout()``), NOT the long blocking WORKFLOW_RUN_REQUEST_TIMEOUT — the
+# long ceiling bounds only the OVERALL wait, never a single snapshot read.
+WORKFLOW_POLL_INTERVAL_SECONDS = 1.0
+
+# Admission ceiling on CONCURRENT background drives started by the async submit
+# route ``POST /workflows/runs:submit`` (issue #505 review, AB-1). The blocking
+# twin ``POST /workflows/runs`` is self-throttling — the caller holds the socket
+# for the whole run, so an overloaded server backs pressure up into its clients.
+# The async route deliberately REMOVES that property (that is the point of a 202),
+# so N submits would otherwise mean N concurrent drives, each spawning terminals.
+# The bound is applied INSIDE the background task (never at the handler), so a
+# submit over the ceiling still gets its durable row and its 202 and simply QUEUES
+# — admission stays decoupled from execution, and INV-1
+# (run-id-allocated-before-ack) is untouched. Sized to match the 12-step blocking
+# ceiling reasoning above rather than CPU count: each drive is dominated by
+# subprocess/agent wait, not local compute.
+WORKFLOW_MAX_CONCURRENT_BACKGROUND_DRIVES = 12
+
 # Script-linter rule inputs (Bolt 2, U1/C2, FR-1.3 / U1-BR-8). Import prefixes
 # whose first dotted segment marks a CAO-internal import — scripts reach CAO
 # over HTTP only (C-1). The ``cao_workflow`` shim (U6, ADR-6) is the sanctioned
@@ -615,6 +871,53 @@ WORKFLOW_ENV_ALLOWLIST = frozenset(
 # accepted length is 64 via WORKFLOW_NAME_RE; this cap is the outer fence).
 WORKFLOW_ENV_VALUE_MAX_LEN = 256
 
+# Model-ID validation for the explicit per-call ``model`` override on
+# handoff/assign (issue reported via PR #501 review). The override reaches a
+# provider's own launch-command builder (e.g. Codex/Kimi's ``--model
+# <value>``) which is shlex-quoted before delivery, so classic word-splitting
+# injection is not reachable -- but a control character or newline surviving
+# quoting into the command string is still a delivery hazard (this codebase
+# already treats that class of input as one: claude_code.py escapes newlines
+# in system_prompt to prevent tmux paste-buffer chunking, and bash's own
+# bracketed-paste-safety is called out in tmux.py). No allowlist is needed
+# (unlike WORKFLOW_ENV_ALLOWLIST's fixed key set) since a model id is
+# free-form per-provider, but a conservative charset covers every real model
+# id across all nine providers, including OpenCode's "vendor/model" form.
+MODEL_ID_RE = r"^[A-Za-z0-9._:/-]+$"
+MODEL_ID_MAX_LEN = 128
+
+# Live-event follower (issue #505, U10). The CLI ``cao workflow events --follow``
+# and the MCP ``workflow_events`` open #504's events-follow SSE route
+# (``GET /workflows/runs/{id}/events`` with ``Accept: text/event-stream``) as thin
+# HTTP clients. A ``(connect, read)`` timeout tuple bounds the streamed GET — the
+# read leg must comfortably exceed #504's SSE heartbeat/poll cadence (250ms tail),
+# mirroring the AG-UI stream reader's 10s/60s split so a quiet run does not trip a
+# spurious read timeout between frames. The reconnect budget bounds how many times
+# a dropped connection is re-opened (resuming exactly via ``?after_seq=<last_seq>``,
+# RS-1/RS-3) before the follower gives up and does a final terminal status check —
+# so a flapping stream can never spin forever.
+WORKFLOW_EVENTS_CONNECT_TIMEOUT = 10.0
+WORKFLOW_EVENTS_READ_TIMEOUT = 60.0
+WORKFLOW_EVENTS_MAX_RECONNECTS = 5
+
+# Bound on frames the bounded MCP ``workflow_events`` follower drains before it
+# returns (an MCP tool call cannot stream indefinitely). The follower stops at a
+# terminal state OR this many events, whichever comes first (U10 MCP bound).
+WORKFLOW_EVENTS_MCP_MAX_EVENTS = 500
+
+# WALL-CLOCK bound (seconds) on the same bounded MCP ``workflow_events`` follower
+# (issue #505 review, TB-1). WORKFLOW_EVENTS_MCP_MAX_EVENTS above bounds the call in
+# EVENTS, which is not a bound at all for a stream that delivers no events: SSE
+# ``:keep-alive`` comment lines are skipped by ``parse_sse_frames`` (they yield no
+# frame, so they never count toward the event ceiling and never carry a terminal
+# event type) while still being traffic that resets the socket read timeout. So a
+# heartbeat-only stream satisfies neither existing bound and the tool would block
+# indefinitely. This is the independent time bound that makes "BOUNDED" true on
+# every stream shape. Set below the 60s read timeout so the deadline — not a socket
+# error — is what ends a quiet stream, giving the caller a clean partial result plus
+# ``timed_out: true`` to resume from.
+WORKFLOW_EVENTS_MCP_MAX_SECONDS = 45.0
+
 # Script-runner subprocess lifecycle (Bolt 3, U4/C1). Wall-clock bound + grace,
 # output ring-buffer cap, engine-owned scratch root for resume materialization.
 WORKFLOW_SCRIPT_TERM_GRACE = 5.0  # SIGTERM->SIGKILL grace (BR-10/11, NFR-REL-1)
@@ -624,3 +927,17 @@ WORKFLOW_SCRIPT_TERM_GRACE = 5.0  # SIGTERM->SIGKILL grace (BR-10/11, NFR-REL-1)
 WORKFLOW_SCRIPT_TIMEOUT = 8700.0
 WORKFLOW_SCRIPT_LOG_CAP = 256 * 1024  # per-stream tail cap, bytes (BR-24/25, Q7=A)
 WORKFLOW_SCRIPT_SCRATCH_DIR = CAO_HOME_DIR / "workflow-script-scratch"  # 0o700 (BR-30)
+
+# =============================================================================
+# Terminal group/metadata caps (#432 follow-up review, PR #433)
+# =============================================================================
+# ``group`` and (especially) ``metadata`` are written by the terminal's own
+# running agent via the ``update_metadata``/``update_group`` MCP tools, with
+# no operator review in the loop. Left unbounded, a worker could grow the
+# terminals.metadata/group TEXT columns arbitrarily, and that growth is
+# amplified into every sibling's ``list_siblings`` response (call-me-ram, PR
+# #433 review). Same shape as ``WORKFLOW_MAX_SPEC_BYTES``: a structural cap
+# enforced at the request boundary, fail-closed with 422.
+TERMINAL_METADATA_MAX_BYTES = 16 * 1024  # encoded (json.dumps) size cap
+TERMINAL_GROUP_MAX_ELEMENTS = 16
+TERMINAL_GROUP_ELEMENT_MAX_LEN = 128

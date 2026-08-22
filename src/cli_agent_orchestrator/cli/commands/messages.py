@@ -95,6 +95,7 @@ def _resolve_me(value: str) -> str:
 @click.option("--generation")
 @click.option("--original-receiver-id")
 @click.option("--audit-browse", is_flag=True)
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable compact JSON output.")
 def list_cmd(
     receiver: str,
     since: str | None,
@@ -104,6 +105,7 @@ def list_cmd(
     generation: str | None,
     original_receiver_id: str | None,
     audit_browse: bool,
+    as_json: bool,
 ) -> None:
     """List durable inbox messages in ascending id order."""
     params: dict[str, object] = {"to": _resolve_me(receiver), "limit": limit}
@@ -133,7 +135,11 @@ def list_cmd(
         raise click.ClickException(
             format_domain_detail(detail) if detail else f"list request failed: {response.text}"
         )
-    click.echo(json.dumps(response.json(), indent=2))
+    body = response.json()
+    if as_json:
+        click.echo(json.dumps(body))
+    else:
+        click.echo(json.dumps(body, indent=2))
 
 
 @messages.command("ack")

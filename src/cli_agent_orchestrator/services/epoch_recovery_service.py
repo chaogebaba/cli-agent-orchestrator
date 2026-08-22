@@ -16,23 +16,39 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.models.terminal import ForkContext
 from cli_agent_orchestrator.providers.manager import get_provider_class
-from cli_agent_orchestrator.services.fork_context_service import mark_ready, staleness
 from cli_agent_orchestrator.services.epoch_recovery_lease import (
-    acquire_epoch_recovery_lease, release_epoch_recovery_lease,
+    acquire_epoch_recovery_lease,
+    release_epoch_recovery_lease,
 )
+from cli_agent_orchestrator.services.fork_context_service import mark_ready, staleness
 from cli_agent_orchestrator.services.rebind_lease import acquire_rebind_lease, release_rebind_lease
 from cli_agent_orchestrator.services.terminal_service import create_terminal, provider_session_owner
+from cli_agent_orchestrator.utils import provider_plane
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.persona_context import resolve_codex_home
 from cli_agent_orchestrator.utils.provider_plane import provider_home
 from cli_agent_orchestrator.utils.terminal import generate_terminal_id
 
 
+def _resolved_codex_home(terminal_id: str | None) -> Path:
+    resolved = resolve_codex_home(terminal_id)
+    if resolved == provider_plane.provider_home("codex").home:
+        return provider_home("codex").home
+    return resolved
+
+
 def _result(base, status, terminal_id=None, error_code=None, unscoped=False):
     retryable = status in {"resume_failed", "skipped_busy"} and error_code not in {
-        "rollback_kill_uncertain", "quarantine_persist_failed",
+        "rollback_kill_uncertain",
+        "quarantine_persist_failed",
     }
-    row = {"base": base, "status": status, "terminal_id": terminal_id,
-           "error_code": error_code, "retryable": retryable}
+    row = {
+        "base": base,
+        "status": status,
+        "terminal_id": terminal_id,
+        "error_code": error_code,
+        "retryable": retryable,
+    }
     if unscoped:
         row["unscoped_registration"] = True
     return row
@@ -40,11 +56,16 @@ def _result(base, status, terminal_id=None, error_code=None, unscoped=False):
 
 def _artifact_exists(row) -> bool:
     if row["provider"] == "codex":
-        return any(row["session_uuid"] in path.name for path in
-                   provider_home("codex").sessions.glob("**/rollout-*.jsonl"))
+        return any(
+            row["session_uuid"] in path.name
+            for path in (_resolved_codex_home(row.get("source_terminal_id")) / "sessions").glob(
+                "**/rollout-*.jsonl"
+            )
+        )
     if row["provider"] == "grok_cli":
-        return (Path.home() / ".grok" / "sessions" / quote(row["cwd"], safe="") /
-                row["session_uuid"]).exists()
+        return (
+            provider_home("grok_cli").home / "sessions" / quote(row["cwd"], safe="") / row["session_uuid"]
+        ).exists()
     return False
 
 
@@ -53,13 +74,21 @@ def _normalize_creation_error(exc: Exception) -> str:
     if isinstance(exc, TimeoutError):
         return "initialize_timeout"
     for code in (
-        "window_create_failed", "fifo_create_failed", "db_publish_failed",
-        "context_build_failed", "provider_construct_failed", "initialize_failed",
-        "session_capture_ambiguous", "session_capture_mismatch", "artifact_invalid",
-        "identity_persist_failed", "herdr_register_failed",
+        "window_create_failed",
+        "fifo_create_failed",
+        "db_publish_failed",
+        "context_build_failed",
+        "provider_construct_failed",
+        "initialize_failed",
+        "session_capture_ambiguous",
+        "session_capture_mismatch",
+        "artifact_invalid",
+        "identity_persist_failed",
+        "herdr_register_failed",
         "rollback_kill_uncertain",
         "quarantine_persist_failed",
-        "resume_in_progress", "owner_conflict",
+        "resume_in_progress",
+        "owner_conflict",
     ):
         if code in message:
             return code
@@ -67,8 +96,11 @@ def _normalize_creation_error(exc: Exception) -> str:
         return "session_capture_ambiguous"
     if "session_capture_mismatch" in message:
         return "session_capture_mismatch"
-    if message in {"terminal_metadata_missing", "shell_baseline_unavailable",
-                   "terminal_identity_persist_failed"}:
+    if message in {
+        "terminal_metadata_missing",
+        "shell_baseline_unavailable",
+        "terminal_identity_persist_failed",
+    }:
         return "identity_persist_failed"
     if message.startswith("session_artifact_"):
         return "artifact_invalid"
@@ -79,30 +111,37 @@ def _preflight(row, session_name):
     if row.get("session_name") is not None and row["session_name"] != session_name:
         return _result(row["name"], "wrong_session")
     if not _artifact_exists(row):
-        return _result(row["name"], "artifact_missing",
-                       unscoped=row.get("session_name") is None)
+        return _result(row["name"], "artifact_missing", unscoped=row.get("session_name") is None)
     if provider_session_owner(row["session_uuid"])["state"] != "gone":
-        return _result(row["name"], "skipped_live_owner",
-                       unscoped=row.get("session_name") is None)
+        return _result(row["name"], "skipped_live_owner", unscoped=row.get("session_name") is None)
     try:
         load_agent_profile(row["agent_profile"])
     except Exception:
-        return _result(row["name"], "profile_unresolvable",
-                       error_code="profile_load_failed",
-                       unscoped=row.get("session_name") is None)
+        return _result(
+            row["name"],
+            "profile_unresolvable",
+            error_code="profile_load_failed",
+            unscoped=row.get("session_name") is None,
+        )
     provider = resolve_provider(row["agent_profile"], row["provider"])
     if provider != row["provider"]:
-        return _result(row["name"], "profile_unresolvable",
-                       error_code="provider_mismatch",
-                       unscoped=row.get("session_name") is None)
+        return _result(
+            row["name"],
+            "profile_unresolvable",
+            error_code="provider_mismatch",
+            unscoped=row.get("session_name") is None,
+        )
     try:
         supports = get_provider_class(provider).supports_fork_context
     except ValueError:
         supports = False
     if not supports:
-        return _result(row["name"], "profile_unresolvable",
-                       error_code="provider_lacks_fork_capability",
-                       unscoped=row.get("session_name") is None)
+        return _result(
+            row["name"],
+            "profile_unresolvable",
+            error_code="provider_lacks_fork_capability",
+            unscoped=row.get("session_name") is None,
+        )
     return None
 
 
@@ -111,51 +150,105 @@ async def _recover_row(row, session_name):
     if failed:
         return failed, None
     from cli_agent_orchestrator.services.session_lifecycle_lease import (
-        acquire_session_lifecycle_shared, release_session_lifecycle_lease,
+        acquire_session_lifecycle_shared,
+        release_session_lifecycle_lease,
     )
+
     lifecycle_lease = acquire_session_lifecycle_shared(session_name)
     if lifecycle_lease is None:
-        return _result(row["name"], "skipped_busy", error_code="rebind_in_progress",
-                       unscoped=row.get("session_name") is None), None
+        return (
+            _result(
+                row["name"],
+                "skipped_busy",
+                error_code="rebind_in_progress",
+                unscoped=row.get("session_name") is None,
+            ),
+            None,
+        )
     from cli_agent_orchestrator.services.provider_session_lease import (
-        acquire_provider_session_lease, release_provider_session_lease,
+        acquire_provider_session_lease,
+        release_provider_session_lease,
     )
+
     uuid_lease = acquire_provider_session_lease(row["session_uuid"])
     if uuid_lease is None:
         release_session_lifecycle_lease(lifecycle_lease)
-        return _result(row["name"], "skipped_busy", error_code="rebind_in_progress",
-                       unscoped=row.get("session_name") is None), None
+        return (
+            _result(
+                row["name"],
+                "skipped_busy",
+                error_code="rebind_in_progress",
+                unscoped=row.get("session_name") is None,
+            ),
+            None,
+        )
     terminal_id = generate_terminal_id()
     lease = acquire_rebind_lease(terminal_id)
     if lease is None:
         release_provider_session_lease(uuid_lease)
         release_session_lifecycle_lease(lifecycle_lease)
-        return _result(row["name"], "skipped_busy", error_code="rebind_in_progress",
-                       unscoped=row.get("session_name") is None), None
+        return (
+            _result(
+                row["name"],
+                "skipped_busy",
+                error_code="rebind_in_progress",
+                unscoped=row.get("session_name") is None,
+            ),
+            None,
+        )
     try:
-        context = ForkContext(mode="resume", session_uuid=row["session_uuid"],
-                              base_name=row["name"], provider=row["provider"],
-                              initial_preamble="")
+        context = ForkContext(
+            mode="resume",
+            session_uuid=row["session_uuid"],
+            base_name=row["name"],
+            provider=row["provider"],
+            initial_preamble="",
+        )
         try:
             terminal = await create_terminal(
-                provider=row["provider"], agent_profile=row["agent_profile"],
-                session_name=session_name, new_session=False, working_directory=row["cwd"],
-                defer_init=False, fork_context=context, terminal_id=terminal_id,
-                lease_token=lease, strict_backend_registration=True,
+                provider=row["provider"],
+                agent_profile=row["agent_profile"],
+                session_name=session_name,
+                new_session=False,
+                working_directory=row["cwd"],
+                defer_init=False,
+                fork_context=context,
+                terminal_id=terminal_id,
+                lease_token=lease,
+                strict_backend_registration=True,
                 uuid_lease_token=uuid_lease,
                 session_lifecycle_lease_token=lifecycle_lease,
             )
         except Exception as exc:
             code = _normalize_creation_error(exc)
             if code == "resume_in_progress":
-                return _result(row["name"], "skipped_busy", terminal_id,
-                               "rebind_in_progress", row.get("session_name") is None), None
+                return (
+                    _result(
+                        row["name"],
+                        "skipped_busy",
+                        terminal_id,
+                        "rebind_in_progress",
+                        row.get("session_name") is None,
+                    ),
+                    None,
+                )
             if code == "owner_conflict":
-                return _result(row["name"], "skipped_live_owner", terminal_id,
-                               None, row.get("session_name") is None), None
-            return _result(row["name"], "resume_failed", terminal_id,
-                           code,
-                           row.get("session_name") is None), None
+                return (
+                    _result(
+                        row["name"],
+                        "skipped_live_owner",
+                        terminal_id,
+                        None,
+                        row.get("session_name") is None,
+                    ),
+                    None,
+                )
+            return (
+                _result(
+                    row["name"], "resume_failed", terminal_id, code, row.get("session_name") is None
+                ),
+                None,
+            )
         remark_error = None
         try:
             mark_ready(
@@ -167,12 +260,20 @@ async def _recover_row(row, session_name):
         except Exception:
             remark_error = "remark_failed"
         stale = staleness(row)
-        source = {"base": row["name"], "terminal_id": terminal.id,
-                  "status": "resumed", "error_code": remark_error,
-                  "staleness": stale.changed_count,
-                  "stale_registration": remark_error == "remark_failed"}
-        return _result(row["name"], "resumed", terminal.id, remark_error,
-                       row.get("session_name") is None), source
+        source = {
+            "base": row["name"],
+            "terminal_id": terminal.id,
+            "status": "resumed",
+            "error_code": remark_error,
+            "staleness": stale.changed_count,
+            "stale_registration": remark_error == "remark_failed",
+        }
+        return (
+            _result(
+                row["name"], "resumed", terminal.id, remark_error, row.get("session_name") is None
+            ),
+            source,
+        )
     finally:
         release_rebind_lease(lease)
         release_provider_session_lease(uuid_lease)
@@ -205,8 +306,14 @@ async def recover_epoch(session_name: str, base_names: list[str] | None = None) 
     for row in sorted(selected, key=lambda item: item["name"]):
         recovery_lease = acquire_epoch_recovery_lease(session_name, row["name"])
         if recovery_lease is None:
-            results.append(_result(row["name"], "skipped_busy", error_code="rebind_in_progress",
-                                   unscoped=row.get("session_name") is None))
+            results.append(
+                _result(
+                    row["name"],
+                    "skipped_busy",
+                    error_code="rebind_in_progress",
+                    unscoped=row.get("session_name") is None,
+                )
+            )
             continue
         try:
             result, source = await _recover_row(row, session_name)
@@ -223,32 +330,52 @@ async def recover_epoch(session_name: str, base_names: list[str] | None = None) 
     candidates = []
     for intent in list_warm_intents(session_name):
         parent = result_by_name.get(intent["parent_base_name"])
-        state = "not_selected" if parent is None else (
-            "resumed" if parent["status"] == "resumed" else
-            parent["status"] if parent["status"] in {"not_found", "not_ready"} else "failed")
+        state = (
+            "not_selected"
+            if parent is None
+            else (
+                "resumed"
+                if parent["status"] == "resumed"
+                else (
+                    parent["status"] if parent["status"] in {"not_found", "not_ready"} else "failed"
+                )
+            )
+        )
         base = get_ready_provider_session(intent["parent_base_name"])
         stale = None
         if base:
             stale = staleness(base).changed_count
-        candidates.append({
-            "intent_id": intent["intent_id"],
-            "worker_terminal_id": intent["worker_terminal_id"],
-            "replaces_worker_terminal_id": intent["replaces_worker_terminal_id"],
-            "profile": intent["worker_profile"], "base": intent["parent_base_name"],
-            "provider": intent["provider"], "base_state": state,
-            "base_resumed": state == "resumed", "base_staleness": stale,
-        })
+        candidates.append(
+            {
+                "intent_id": intent["intent_id"],
+                "worker_terminal_id": intent["worker_terminal_id"],
+                "replaces_worker_terminal_id": intent["replaces_worker_terminal_id"],
+                "profile": intent["worker_profile"],
+                "base": intent["parent_base_name"],
+                "provider": intent["provider"],
+                "base_state": state,
+                "base_resumed": state == "resumed",
+                "base_staleness": stale,
+            }
+        )
     manifest = None
     manifest_error = None
     try:
         from cli_agent_orchestrator.services.session_manifest_service import build_session_manifest
+
         manifest = build_session_manifest(session_name)
     except Exception as exc:
         manifest_error = str(exc)
     return {
-        "schema_version": "cao.session-recover/v1", "session": session_name,
-        "reason": "epoch", "started_at": started,
-        "finished_at": datetime.now(timezone.utc).isoformat(), "results": results,
-        "manifest": manifest, "manifest_error": manifest_error,
-        "fork_sources": sources, "respawn_candidates": candidates, "epoch": epoch,
+        "schema_version": "cao.session-recover/v1",
+        "session": session_name,
+        "reason": "epoch",
+        "started_at": started,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "results": results,
+        "manifest": manifest,
+        "manifest_error": manifest_error,
+        "fork_sources": sources,
+        "respawn_candidates": candidates,
+        "epoch": epoch,
     }

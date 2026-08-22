@@ -18,11 +18,12 @@ rather than crashing ``cao-server``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
-from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.plugins import PostCreateTerminalEvent, hook
 from cli_agent_orchestrator.plugins.base import CaoPlugin
 from cli_agent_orchestrator.plugins.builtin.memory_file import (
@@ -33,6 +34,7 @@ from cli_agent_orchestrator.plugins.builtin.memory_file import (
     write_marker_block,
 )
 from cli_agent_orchestrator.services.memory_service import MemoryService
+from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +61,15 @@ class CodexMemoryPlugin(CaoPlugin):
 
         if event.provider != "codex":
             return
-        inject_memory_file(
+        from cli_agent_orchestrator.utils.persona_context import has_persona_plan
+
+        if has_persona_plan(event.terminal_id):
+            return
+        # locked_atomic_rewrite polls with time.sleep up to the lock
+        # timeout; run the pipeline off the event loop so a contended lock
+        # cannot stall cao-server for other terminals.
+        await asyncio.to_thread(
+            inject_memory_file,
             event,
             "codex_memory",
             lambda: self._resolve_working_directory(event),
@@ -73,10 +83,10 @@ class CodexMemoryPlugin(CaoPlugin):
     # helpers
 
     def _resolve_working_directory(self, event: PostCreateTerminalEvent) -> str | None:
-        """Look up the tmux pane's working directory for the terminal."""
+        """Look up the pane's working directory for the terminal via backend."""
 
         return resolve_working_directory(
-            event, get_terminal_metadata, tmux_client.get_pane_working_directory
+            event, get_terminal_metadata, get_backend().get_pane_working_directory
         )
 
     def _validated_target_path(self, working_directory: str) -> Path:
@@ -90,9 +100,22 @@ class CodexMemoryPlugin(CaoPlugin):
         return validated_target_path(working_directory, AGENTS_FILENAME)
 
     def _write_block(self, target: Path, context_block: str) -> None:
-        """Write or replace the delimited memory section in AGENTS.md."""
+        """Write or replace the delimited memory section in AGENTS.md.
 
-        write_marker_block(target, context_block, BEGIN_MARKER, END_MARKER)
+        AGENTS.md is user-authored, so an interrupted write must never
+        truncate it, and concurrent writers (multiple terminals, or the CLI
+        and cao-server touching the same working directory) must never lose
+        each other's memory block. ``locked_atomic_rewrite`` holds an
+        inter-process lock for the whole read-strip-append-replace cycle so
+        ``compute_new_content`` always sees the latest published content.
+        """
+
+        def compute_new_content(existing: str) -> str:
+            stripped = self._strip_existing_block(existing)
+            separator = "" if not stripped or stripped.endswith("\n") else "\n"
+            return f"{stripped}{separator}{BEGIN_MARKER}\n{context_block}\n{END_MARKER}\n"
+
+        locked_atomic_rewrite(target, compute_new_content)
 
     @staticmethod
     def _strip_existing_block(content: str) -> str:

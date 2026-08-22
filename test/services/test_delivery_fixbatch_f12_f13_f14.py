@@ -100,7 +100,7 @@ def _terminal_send(
     monkeypatch.setattr(draft_guard.status_monitor, "get_rendered_screen", lambda _tid: None)
     monkeypatch.setattr(terminal_service.status_monitor, "notify_input_sent", lambda _tid: None)
     monkeypatch.setattr(
-        terminal_service.status_monitor, "clear_rolling_buffer", lambda _tid: None
+        terminal_service.status_monitor, "clear_rolling_buffer", lambda _tid, _p=None: None
     )
     monkeypatch.setattr(
         terminal_service.status_monitor,
@@ -487,11 +487,11 @@ def test_f13_ready_backlog_alert_once_and_never_retries_receiver():
             10,
         ),
         patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "create_inbox_message"
+            "cli_agent_orchestrator.services.mailbox_service."
+            "create_routed_inbox_message"
         ) as create,
         patch(
-            "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending"
+            "cli_agent_orchestrator.services.inbox_service.request_delivery"
         ) as deliver,
     ):
         service.tick_ready_backlog(now=100.0)
@@ -504,7 +504,7 @@ def test_f13_ready_backlog_alert_once_and_never_retries_receiver():
     assert (sender, receiver) == ("watchdog:receiver", "caller")
     assert "message 17 aged 100s" in message
     assert "cao messages trace 17" in message
-    deliver.assert_called_once_with("caller", registry=None)
+    # Delivery is implicit via create_routed_inbox_message (F136-D17)
     assert not any(call.args and call.args[0] == "receiver" for call in deliver.call_args_list)
 
 
@@ -541,11 +541,11 @@ def test_f13_ready_backlog_suppressed_while_open_and_progress_resets_clock():
             10,
         ),
         patch(
-            "cli_agent_orchestrator.services.stalled_callback_watchdog."
-            "create_inbox_message"
+            "cli_agent_orchestrator.services.mailbox_service."
+            "create_routed_inbox_message"
         ) as create,
         patch(
-            "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending"
+            "cli_agent_orchestrator.services.inbox_service.request_delivery"
         ),
     ):
         service.tick_ready_backlog(now=90.0)

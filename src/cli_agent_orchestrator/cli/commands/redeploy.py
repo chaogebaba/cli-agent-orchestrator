@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import time
+import tomllib
 from pathlib import Path
 from urllib.parse import quote
 
 import click
 import requests
 
-from cli_agent_orchestrator.constants import CAO_HOME_DIR, MCP_REQUEST_TIMEOUT
+from cli_agent_orchestrator.constants import MCP_REQUEST_TIMEOUT
 from cli_agent_orchestrator.services.verification_service import (
     DeploymentStatus,
     cli_deploy_root,
@@ -47,17 +49,47 @@ def _installable_profiles(workspace_root: Path) -> list[Path]:
     ]
 
 
-def _install_redeploy(source_root: Path) -> None:
+def _install_python_version(source_root: Path) -> str:
+    """Derive the interpreter to install under from the package's own floor.
+
+    This used to be the literal "3.13" while `install.sh` said 3.14, so raising
+    the floor to >=3.14 made `cao redeploy` resolve an interpreter its own
+    package rejects:
+
+        Because the current Python version (3.13.14) does not satisfy
+        Python>=3.14 ... your requirements are unsatisfiable
+
+    A hardcoded version in the installer is a SECOND copy of the floor that
+    nothing keeps in step with the first. Reading `requires-python` means the
+    two cannot disagree: there is only one floor now, and this asks it.
+    """
+    pyproject = (source_root / "pyproject.toml").read_text(encoding="utf-8")
+    requires = tomllib.loads(pyproject)["project"]["requires-python"]
+    match = re.search(r"(\d+)\.(\d+)", requires)
+    if match is None:
+        raise ValueError(f"cannot derive an interpreter from requires-python = {requires!r}")
+    return f"{match.group(1)}.{match.group(2)}"
+
+
+def _install_redeploy(source_root: Path, *, force_providers: bool = False) -> None:
     workspace_root = source_root.parent
     subprocess.run(
-        ["uv", "tool", "install", "--force", "--python", "3.13", str(source_root)],
+        [
+            "uv",
+            "tool",
+            "install",
+            "--force",
+            "--python",
+            _install_python_version(source_root),
+            str(source_root),
+        ],
         check=True,
     )
-    providers_target = CAO_HOME_DIR / "providers.toml"
-    providers_target.parent.mkdir(parents=True, exist_ok=True)
-    if not providers_target.exists():
-        shutil.copyfile(workspace_root / "providers.toml.default", providers_target)
     cao = shutil.which("cao") or "cao"
+    reconcile_command = [cao, "config", "reconcile"]
+    if force_providers:
+        reconcile_command.append("--force-providers")
+    subprocess.run(reconcile_command, check=True)
     for profile in _installable_profiles(workspace_root):
         # cao install derives the provider from the profile's own frontmatter.
         subprocess.run([cao, "install", str(profile)], check=True)
@@ -139,12 +171,17 @@ def _print_deployment(
 
 @click.command()
 @click.option("--yes", is_flag=True, help="Restart without an interactive confirmation.")
-def redeploy(yes: bool) -> None:
+@click.option(
+    "--force-providers",
+    is_flag=True,
+    help="Back up and reset providers.toml from the workspace template.",
+)
+def redeploy(yes: bool, force_providers: bool) -> None:
     """Reinstall CAO, optionally restart its server, then verify deployment."""
     require_not_sandbox_mutation("redeploy")
     source_root = _redeploy_source_root()
     try:
-        _install_redeploy(source_root)
+        _install_redeploy(source_root, force_providers=force_providers)
     except (OSError, subprocess.CalledProcessError) as exc:
         raise click.ClickException(f"install failed: {exc}") from exc
 

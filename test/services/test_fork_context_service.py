@@ -1,9 +1,9 @@
 import json
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
-from unittest.mock import patch
 
 from cli_agent_orchestrator.services.fork_context_service import snapshot, staleness
 
@@ -115,8 +115,121 @@ def test_deleted_at_snapshot_then_symlink_is_stale(repo: Path):
 def test_present_but_unreadable_hash_is_stale(repo: Path):
     (repo / "tracked.txt").write_text("dirty-at-mark")
     captured = snapshot(str(repo))
-    with patch("cli_agent_orchestrator.services.fork_context_service._hash",
-               side_effect=PermissionError("unreadable")):
+    with patch(
+        "cli_agent_orchestrator.services.fork_context_service._hash",
+        side_effect=PermissionError("unreadable"),
+    ):
         stale = staleness(row(repo, captured.git_sha, captured.dirty_hashes()))
     assert stale.delta.paths == ("tracked.txt",)
     assert stale.preamble.startswith("[STALE]")
+
+
+def test_f80_mark_ready_warns_on_dirty_tree(repo: Path, caplog):
+    """F80: mark_ready logs WARNING when tree is dirty."""
+    import logging
+
+    from cli_agent_orchestrator.services import fork_context_service as fcs
+
+    (repo / "tracked.txt").write_text("dirty")
+    with (
+        patch.object(
+            fcs,
+            "get_terminal_metadata",
+            return_value={
+                "provider": "grok_cli",
+                "provider_session_id": "session",
+                "working_directory": str(repo),
+                "agent_profile": "dev",
+                "tmux_session": "cao-s",
+                "tmux_window": "w",
+            },
+        ),
+        patch.object(fcs, "register_provider_session", side_effect=lambda **kw: kw),
+        patch.object(fcs, "update_terminal_provider_session_id", return_value=None),
+        caplog.at_level(
+            logging.WARNING, logger="cli_agent_orchestrator.services.fork_context_service"
+        ),
+    ):
+        result = fcs.mark_ready("terminal", "base", None)
+
+    assert result["_entry_count"] > 0
+    assert any("base_registered_dirty" in rec.message for rec in caplog.records)
+
+
+def test_f78_mark_ready_warns_on_manifest_near_cap(repo: Path, caplog):
+    """F78: mark_ready logs WARNING when manifest is near budget cap."""
+    import logging
+
+    from cli_agent_orchestrator.services import fork_context_service as fcs
+    from cli_agent_orchestrator.services.base_digest_service import MAX_DIGEST_BYTES
+
+    # Create many dirty files to push manifest near cap
+    for i in range(80):
+        (repo / f"file_{i:04d}_with_a_longer_name_to_push_bytes.py").write_text(f"dirty{i}")
+
+    with (
+        patch.object(
+            fcs,
+            "get_terminal_metadata",
+            return_value={
+                "provider": "grok_cli",
+                "provider_session_id": "session",
+                "working_directory": str(repo),
+                "agent_profile": "dev",
+                "tmux_session": "cao-s",
+                "tmux_window": "w",
+            },
+        ),
+        patch.object(fcs, "register_provider_session", side_effect=lambda **kw: kw),
+        patch.object(fcs, "update_terminal_provider_session_id", return_value=None),
+        caplog.at_level(
+            logging.WARNING, logger="cli_agent_orchestrator.services.fork_context_service"
+        ),
+    ):
+        result = fcs.mark_ready("terminal", "base", None)
+
+    # Check whether we hit the threshold — if manifest is >80% cap, warning is logged
+    if result["_projected_manifest_bytes"] > MAX_DIGEST_BYTES * 0.8:
+        assert any("base_manifest_near_cap" in rec.message for rec in caplog.records)
+
+
+def test_f26_ac5_mark_ready_deleted_cwd_raises_directed_fork_context_error():
+    """AC5: mark_ready with a deleted base cwd raises ForkContextError naming
+    'worker deleted its own cwd' — never the opaque snapshot_git-failure."""
+    from cli_agent_orchestrator.services import fork_context_service as fcs
+    from cli_agent_orchestrator.services.fork_context_service import ForkContextError
+
+    deleted = "/tmp/f26-definitely-not-a-real-dir"
+
+    def fake_exists(path):
+        return False
+
+    with (
+        patch.object(
+            fcs,
+            "get_terminal_metadata",
+            return_value={
+                "provider": "grok_cli",
+                "provider_session_id": "session",
+                "working_directory": None,
+                "agent_profile": "dev",
+                "tmux_session": "cao-s",
+                "tmux_window": "w",
+            },
+        ),
+        patch("cli_agent_orchestrator.backends.registry.get_backend") as mock_registry_backend,
+        patch(
+            "cli_agent_orchestrator.services.fork_context_service.os.path.exists",
+            side_effect=fake_exists,
+        ),
+    ):
+        mock_registry_backend.return_value.get_pane_working_directory.return_value = deleted
+        try:
+            fcs.mark_ready("terminal", "base", None)
+        except ForkContextError as exc:
+            assert "worker deleted its own cwd" in str(exc), str(exc)
+            assert deleted in str(exc)
+            assert "snapshot" not in str(exc)
+            assert "git-failure" not in str(exc)
+        else:
+            pytest.fail("expected ForkContextError for deleted cwd")

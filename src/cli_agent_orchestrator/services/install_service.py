@@ -4,7 +4,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlparse
 
 import frontmatter
@@ -16,15 +16,16 @@ from cli_agent_orchestrator.constants import (
     COPILOT_AGENTS_DIR,
     DEFAULT_PROVIDER,
     KIRO_AGENTS_DIR,
-    LOCAL_AGENT_STORE_DIR,
     OPENCODE_AGENTS_DIR,
     PROVIDERS,
     SKILLS_DIR,
 )
 from cli_agent_orchestrator.models.copilot_agent import CopilotAgentConfig
 from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.opencode_agent import OpenCodeAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.services.profile_store import write_profile
 from cli_agent_orchestrator.utils.agent_profiles import (
     _read_agent_profile_source,
     parse_agent_profile_text,
@@ -75,6 +76,41 @@ _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # worker. 1_200_000 ms (20 min) matches CAO's default handoff/run-step budget.
 # This mirrors the kimi_cli provider's tool_call_timeout_ms override.
 _KIRO_MCP_TOOL_TIMEOUT_MS = 1_200_000
+
+
+def _inject_kiro_identity_env(
+    mcp_servers: Optional[Dict[str, object]],
+) -> Optional[Dict[str, object]]:
+    """Inject ``${VAR}`` identity env vars into EVERY mcpServers entry.
+
+    kiro-cli expands ``${VAR}`` syntax from its own process environment at MCP
+    spawn time.  The pane env carries CAO_TERMINAL_ID (set by tmux_client at
+    launch), so a single statically-installed base JSON serves every terminal
+    without per-terminal file copies.
+
+    Per F118 gate-fold D3: inject into ALL entries (not just cao-mcp-server)
+    because extra env vars are harmless to non-CAO servers and this removes any
+    matching-decision from the install path.
+    """
+    if not mcp_servers:
+        return mcp_servers
+
+    _IDENTITY_VARS = {
+        "CAO_TERMINAL_ID": "${CAO_TERMINAL_ID}",
+        "CAO_INSTANCE_ID": "${CAO_INSTANCE_ID}",
+        "CAO_ENDPOINT": "${CAO_ENDPOINT}",
+    }
+
+    result: Dict[str, object] = {}
+    for name, cfg in mcp_servers.items():
+        if not isinstance(cfg, dict):
+            result[name] = cfg
+            continue
+        env = dict(cfg.get("env") or {})
+        for key, val in _IDENTITY_VARS.items():
+            env.setdefault(key, val)
+        result[name] = {**cfg, "env": env}
+    return result
 
 
 def _inject_kiro_mcp_timeout(
@@ -154,11 +190,11 @@ def _download_agent(source: str) -> str:
     has legitimate filesystem trust, and keeping Path(user_input) out of the
     HTTP-reachable layer closes an entire class of py/path-injection alerts
     (CodeQL #49/#61 kept reopening while this lived here). The CLI entry point
-    copies local files into LOCAL_AGENT_STORE_DIR itself and then calls
+    resolves the local file itself and stores it via profile_store, then calls
     install_agent() with the bare stem, which flows through the "name" branch.
+    This function only ever hands profile_store a stem it has already validated,
+    never a caller-supplied path.
     """
-    LOCAL_AGENT_STORE_DIR.mkdir(parents=True, exist_ok=True)
-
     # SSRF hardening: narrow what a caller-provided URL can reach before any
     # network I/O happens. https-only rules out http://169.254.169.254/...;
     # the host allowlist rules out arbitrary internal services; the path
@@ -199,9 +235,12 @@ def _download_agent(source: str) -> str:
         raise ValueError("Redirects are not allowed for profile downloads.")
     response.raise_for_status()
 
-    dest_file = LOCAL_AGENT_STORE_DIR / filename
-    dest_file.write_text(response.text, encoding="utf-8")
-    return dest_file.stem
+    # The stem was validated against _PROFILE_NAME_RE above; profile_store owns
+    # the store join and the atomic write. overwrite=True preserves the
+    # pre-existing re-download behaviour of replacing the stored copy.
+    stem = filename[: -len(".md")]
+    write_profile(stem, response.text, overwrite=True)
+    return stem
 
 
 def parse_env_assignment(env_assignment: str) -> Tuple[str, str]:
@@ -341,6 +380,45 @@ def install_agent(
         safe_filename = profile.name.replace("/", "__")
 
         if provider == ProviderType.KIRO_CLI.value:
+            # F107 A8: v3 honors v2 JSON agent configs by backward compat.
+            # Reject only v2-ONLY fields on KAS profiles (toolsSettings, hooks),
+            # not the engine itself.
+            if profile.engine == KiroEngine.KAS and (
+                profile.toolsSettings is not None or profile.hooks is not None
+            ):
+                raise ValueError(
+                    "Kiro KAS profiles cannot set toolsSettings or hooks "
+                    "(v2-only fields; v3 uses permissions). Remove those fields "
+                    "or set engine: v2."
+                )
+
+            # F113 D2 tripwire: v2 tolerance of an extra permissions key is
+            # unverified — warn when a non-KAS profile declares one.
+            if profile.engine != KiroEngine.KAS and profile.permissions is not None:
+                logger.warning(
+                    "Profile '%s' declares permissions but engine is %s "
+                    "(v2 tolerance of this key is unverified).",
+                    profile.name,
+                    profile.engine,
+                )
+
+            # F113: KAS profiles require a permissions block for registry load.
+            # Default to the standard autonomous-worker rules when not declared;
+            # explicit permissions (including {}) pass through verbatim.
+            kiro_permissions: Optional[Dict[str, Any]] = profile.permissions
+            if profile.engine == KiroEngine.KAS and kiro_permissions is None:
+                kiro_permissions = {
+                    "rules": [
+                        {"capability": "shell", "effect": "allow"},
+                        {"capability": "web_fetch", "effect": "allow"},
+                        {
+                            "capability": "mcp",
+                            "match": ["builtin/*", "cao-mcp-server/*"],
+                            "effect": "allow",
+                        },
+                    ]
+                }
+
             KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
             # Kiro natively supports skill:// resources with progressive loading
             # (metadata at startup, full content on demand).
@@ -360,11 +438,16 @@ def install_agent(
                 prompt=raw_prompt,
                 # Raise the cao-mcp-server tool-call timeout so kiro doesn't
                 # cancel long handoff RPCs client-side (see helper docstring).
-                mcpServers=_inject_kiro_mcp_timeout(profile.mcpServers),
+                # F118: inject ${VAR} identity env into every MCP entry so
+                # kiro-cli expands CAO_TERMINAL_ID et al from its pane env.
+                mcpServers=_inject_kiro_identity_env(
+                    _inject_kiro_mcp_timeout(profile.mcpServers)
+                ),
                 toolAliases=profile.toolAliases,
                 toolsSettings=profile.toolsSettings,
                 hooks=profile.hooks,
                 model=profile.model,
+                permissions=kiro_permissions,
             )
             agent_file = KIRO_AGENTS_DIR / f"{safe_filename}.json"
             agent_file.write_text(

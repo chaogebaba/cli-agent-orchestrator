@@ -7,10 +7,11 @@ no alternative is configured.
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 from cli_agent_orchestrator.backends.base import (
     PaneIdentityReadResult,
+    ScopeProbe,
     TerminalBackend,
     TerminalBackendError,
 )
@@ -42,10 +43,11 @@ class TmuxBackend(TerminalBackend):
         terminal_id: str,
         working_directory: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        terminal_token: Optional[str] = None,
     ) -> str:
         try:
             return self._client.create_session(
-                session_name, window_name, terminal_id, working_directory, extra_env=extra_env
+                session_name, window_name, terminal_id, working_directory, extra_env=extra_env, terminal_token=terminal_token
             )
         except Exception as e:
             raise TerminalBackendError(f"Failed to create session '{session_name}': {e}") from e
@@ -69,6 +71,7 @@ class TmuxBackend(TerminalBackend):
         working_directory: Optional[str] = None,
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        terminal_token: Optional[str] = None,
     ) -> str:
         try:
             return self._client.create_window(
@@ -78,6 +81,7 @@ class TmuxBackend(TerminalBackend):
                 working_directory,
                 window_shell,
                 extra_env=extra_env,
+                terminal_token=terminal_token,
             )
         except Exception as e:
             raise TerminalBackendError(
@@ -101,6 +105,126 @@ class TmuxBackend(TerminalBackend):
         if "can't find session" in stderr or "no server running" in stderr:
             return "gone"
         return "error"
+
+    def enumerate_windows(
+        self, session_name: str
+    ) -> tuple[Literal["ok", "error"], List[Dict[str, object]] | None]:
+        """Enumerate windows via subprocess. Classifies its own failure."""
+        import subprocess
+
+        try:
+            proc = subprocess.run(
+                tmux_argv("list-windows", "-t", session_name, "-F", "#{window_name}"),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if proc.returncode == 0:
+                windows: List[Dict[str, object]] = [
+                    {"name": name} for name in proc.stdout.splitlines() if name
+                ]
+                return ("ok", windows)
+            stderr = proc.stderr.lower()
+            if "can't find session" in stderr or "no server running" in stderr:
+                return ("ok", [])  # genuinely absent — not a failure
+            return ("error", None)  # unclassifiable
+        except subprocess.TimeoutExpired:
+            return ("error", None)
+        except Exception:
+            return ("error", None)
+
+    def session_scope_probe(
+        self,
+        session_name: str,
+        *,
+        window_name: str,
+        samples: int = 2,
+        timeout_s: float = 5.0,
+    ) -> ScopeProbe:
+        """F218-a D2: Classify scope via parse-free _has_session_via_cli + enumerate_windows.
+
+        Verdict table:
+        - session present AND enumeration ok → window_gone (with sibling list)
+        - has_session is False on ``samples`` consecutive probes → session_gone
+        - has_session is None, enumeration ("error", None), or disagreement → unknown
+        """
+        import time
+
+        evidence_lines: list[str] = []
+        false_count = 0
+
+        for i in range(samples):
+            if i > 0:
+                time.sleep(min(timeout_s / samples, 1.0))
+
+            has = self._client._has_session_via_cli(session_name)
+            evidence_lines.append(f"has_session[{i}]={has}")
+
+            if has is True:
+                # Session present — classify as window_gone via enumeration
+                status, windows = self.enumerate_windows(session_name)
+                if status == "ok":
+                    sibling_names = tuple(
+                        w.get("name", "") for w in (windows or [])
+                        if w.get("name") != window_name
+                    )
+                    evidence_lines.append(
+                        f"enumerate[{i}]=ok siblings={len(sibling_names)}"
+                    )
+                    return ScopeProbe(
+                        scope="window_gone",
+                        session_present=True,
+                        sibling_windows=sibling_names,
+                        samples=i + 1,
+                        evidence=tuple(evidence_lines),
+                    )
+                else:
+                    evidence_lines.append(f"enumerate[{i}]=error")
+                    # Disagreement: has_session=True but can't enumerate — unknown
+                    return ScopeProbe(
+                        scope="unknown",
+                        session_present=True,
+                        sibling_windows=None,
+                        samples=i + 1,
+                        evidence=tuple(evidence_lines),
+                    )
+            elif has is False:
+                false_count += 1
+            else:
+                # None = could not ask — unknown
+                evidence_lines.append(f"probe_unavailable[{i}]")
+                return ScopeProbe(
+                    scope="unknown",
+                    session_present=None,
+                    sibling_windows=None,
+                    samples=i + 1,
+                    evidence=tuple(evidence_lines),
+                )
+
+        # All samples returned False — session genuinely gone
+        if false_count >= samples:
+            return ScopeProbe(
+                scope="session_gone",
+                session_present=False,
+                sibling_windows=(),
+                samples=samples,
+                evidence=tuple(evidence_lines),
+            )
+
+        # Should not reach here, but safety fallback
+        return ScopeProbe(
+            scope="unknown",
+            session_present=None,
+            sibling_windows=None,
+            samples=samples,
+            evidence=tuple(evidence_lines),
+        )
+
+    def get_session_windows(self, session_name: str) -> List[Dict[str, object]]:
+        return self._client.get_session_windows(session_name)
+
+    def set_window_parent(self, session_name: str, window_name: str, parent_id: str | None) -> None:
+        self._client.set_window_parent(session_name, window_name, parent_id)
 
     # --- Input ---
 

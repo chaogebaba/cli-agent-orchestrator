@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shlex
 import shutil
@@ -39,7 +40,9 @@ SOURCE = REPO / "src" / "cli_agent_orchestrator"
 def _plane(tmp_path: Path, provider: str = "codex") -> ProviderHome:
     native = tmp_path / "native"
     native.mkdir(parents=True)
-    credential_name = "auth.json" if provider == "codex" else ".credentials.json"
+    _cred_names = {"codex": "auth.json", "claude_code": ".credentials.json", "grok_cli": "auth.json"}
+    _home_envs = {"codex": "CODEX_HOME", "claude_code": "CLAUDE_CONFIG_DIR", "grok_cli": "GROK_HOME"}
+    credential_name = _cred_names[provider]
     source = native / credential_name
     source.write_text('{"token":"seed"}', encoding="utf-8")
     source.chmod(0o600)
@@ -50,7 +53,7 @@ def _plane(tmp_path: Path, provider: str = "codex") -> ProviderHome:
         home,
         source,
         home / credential_name,
-        "CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR",
+        _home_envs[provider],
         home / "native-home" if provider == "claude_code" else None,
     )
 
@@ -77,7 +80,7 @@ def _activate_plane(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, provider: s
     return plane
 
 
-@pytest.mark.parametrize("provider", ["codex", "claude_code"])
+@pytest.mark.parametrize("provider", ["codex", "claude_code", "grok_cli"])
 @pytest.mark.asyncio
 async def test_supported_planes_admit_through_real_public_entry_points(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
@@ -184,12 +187,26 @@ def test_dead_initializer_partial_is_removed_and_reseeded(
 
 def test_native_home_guard_and_every_roster_consumer_is_injected() -> None:
     allowed = {"sandbox_bootstrap.py", "utils/provider_plane.py"}
+    # Files that reference provider-home paths for binary/config lookups (not session data)
+    # are permitted — they access read-only production paths even in sandbox.
+    grok_binary_config_allowed = {
+        "providers/grok_cli.py",
+        "utils/grok_config.py",
+        "cli/commands/doctor.py",
+    }
     for path in SOURCE.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
         assert '"/.codex/sessions/"' not in text
-        if 'Path.home() / ".codex"' not in text and 'Path.home() / ".claude"' not in text:
+        if (
+            'Path.home() / ".codex"' not in text
+            and 'Path.home() / ".claude"' not in text
+            and 'Path.home() / ".grok"' not in text
+        ):
             continue
-        assert path.relative_to(SOURCE).as_posix() in allowed
+        relative = path.relative_to(SOURCE).as_posix()
+        assert relative in allowed | grok_binary_config_allowed, (
+            f"{relative} has a native-home literal but is not in the allowed set"
+        )
 
     roster = {
         "providers/codex.py",
@@ -197,10 +214,82 @@ def test_native_home_guard_and_every_roster_consumer_is_injected() -> None:
         "services/fork_context_service.py",
         "services/epoch_recovery_service.py",
         "services/message_trace_service.py",
+        "services/cc_session_registry.py",
         "api/main.py",
     }
     for relative in roster:
         assert "provider_home(" in (SOURCE / relative).read_text(encoding="utf-8")
+
+
+def test_cc_session_registry_reads_the_injected_plane_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """F184: the registry must resolve its base per call from the injected plane.
+
+    A literal Path.home()/".claude"/"sessions" would read the operator's live records
+    from cao-server (which runs outside the worker's bwrap), so the read must follow
+    the plane, and must fail closed — not fall back to the native home — when the
+    plane is unsafe.
+    """
+    from cli_agent_orchestrator.services import cc_session_registry
+
+    plane = _plane(tmp_path, "claude_code")
+    plane.sessions.mkdir(parents=True)
+    (plane.sessions / "4242.json").write_text(
+        json.dumps(
+            {
+                "sessionId": "s-1",
+                "messagingSocketPath": "/tmp/sock",
+                "procStart": 7,
+                "statusUpdatedAt": "2026-08-13T12:00:01+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    requested: list[str] = []
+
+    def injected(provider: str) -> ProviderHome:
+        requested.append(provider)
+        return plane
+
+    monkeypatch.setattr(cc_session_registry, "provider_home", injected)
+    records = cc_session_registry.read_registry()
+    assert [record.pid for record in records] == [4242]
+    assert cc_session_registry.verify_wake(records[0], "2026-08-13T12:00:00+00:00", timeout_s=1)
+    assert set(requested) == {"claude_code"}
+
+    # A native home holding a record that WOULD verify: any fallback read returns True,
+    # so False below can only mean the native home was never consulted.
+    native_sessions = tmp_path / "native-home" / ".claude" / "sessions"
+    native_sessions.mkdir(parents=True)
+    (native_sessions / "4242.json").write_text(
+        json.dumps(
+            {
+                "sessionId": "s-1",
+                "messagingSocketPath": "/tmp/sock",
+                "procStart": 7,
+                "statusUpdatedAt": "2026-08-13T12:00:09+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(native_sessions.parents[1]))
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: native_sessions.parents[1]))
+    assert cc_session_registry.verify_wake(
+        records[0], "2026-08-13T12:00:00+00:00", sessions_dir=native_sessions, timeout_s=1
+    )
+
+    def unsafe(_provider: str) -> ProviderHome:
+        raise SandboxProviderUnsafe("sandbox_provider_unsafe:claude_code")
+
+    monkeypatch.setattr(cc_session_registry, "provider_home", unsafe)
+    with caplog.at_level(logging.WARNING, logger=cc_session_registry.__name__):
+        assert cc_session_registry.read_registry() == []
+        assert (
+            cc_session_registry.verify_wake(records[0], "2026-08-13T12:00:00+00:00", timeout_s=1)
+            is False
+        )
+    assert "registry_plane_unusable" in caplog.text
 
 
 def test_every_native_home_consumer_reads_the_injected_plane(
@@ -484,6 +573,7 @@ def test_outer_parent_death_tears_down_full_bwrap_descendant_closure(tmp_path: P
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bwrap unavailable")
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_outer_parent_death_probe_kills_die_with_parent_removal_mutant(tmp_path: Path) -> None:
     plane = _plane(tmp_path, "claude_code")
     assert plane.native_home is not None
@@ -626,13 +716,13 @@ def _configure_failing_sync_create(
     monkeypatch.setattr(terminal_service, "get_backend", lambda: backend)
     monkeypatch.setattr(terminal_service, "load_agent_profile", lambda _profile: None)
     monkeypatch.setattr(terminal_service, "generate_terminal_id", lambda: "worker99")
-    monkeypatch.setattr(terminal_service, "generate_window_name", lambda _profile: "worker")
+    monkeypatch.setattr(terminal_service, "generate_window_name", lambda *_a: "worker")
     monkeypatch.setattr(terminal_service, "clear_session_env", lambda _session: None)
     monkeypatch.setattr(terminal_service, "set_session_env", lambda *_args: None)
     monkeypatch.setattr(
         terminal_service.fifo_manager,
         "create_reader",
-        lambda _terminal: events.append("fifo-create"),
+        lambda *_args, **_kwargs: events.append("fifo-create"),
     )
     monkeypatch.setattr(
         terminal_service.fifo_manager,
@@ -659,6 +749,10 @@ def _configure_failing_sync_create(
         terminal_service.provider_manager, "cleanup_provider", lambda _terminal: None
     )
     monkeypatch.setattr(terminal_service.status_monitor, "clear_terminal", lambda _terminal: None)
+    # F138: bypass process-liveness check in unit tests
+    monkeypatch.setattr(
+        terminal_service, "_confirm_launch_health", AsyncMock()
+    )
     return events
 
 

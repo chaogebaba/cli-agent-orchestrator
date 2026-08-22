@@ -10,7 +10,7 @@ def test_send_message_threads_park_warm_to_inbox_producer():
     from cli_agent_orchestrator.mcp_server.server import _send_message_impl
 
     with (
-        patch.dict(os.environ, {"CAO_TERMINAL_ID": "sender"}),
+        patch.dict(os.environ, {"CAO_TERMINAL_ID": "deadbeef"}),
         patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox") as send,
     ):
         send.return_value = {"success": True}
@@ -69,11 +69,11 @@ class TestSendMessageSelfSendGuard:
         """Sending to the caller's own CAO_TERMINAL_ID should be rejected."""
         from cli_agent_orchestrator.mcp_server.server import _send_message_impl
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "worker-abc"}):
-            result = _send_message_impl("worker-abc", "Done!")
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "badc0de1"}):
+            result = _send_message_impl("badc0de1", "Done!")
 
         assert result["success"] is False
-        assert "worker-abc" in result["error"]
+        assert "badc0de1" in result["error"]
         assert "own CAO_TERMINAL_ID" in result["error"]
         mock_inbox.assert_not_called()
 
@@ -84,11 +84,11 @@ class TestSendMessageSelfSendGuard:
 
         mock_inbox.return_value = {"success": True}
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "worker-abc"}):
-            _send_message_impl("supervisor-xyz", "Done!")
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "badc0de1"}):
+            _send_message_impl("c0ffee01", "Done!")
 
         mock_inbox.assert_called_once()
-        assert mock_inbox.call_args[0][0] == "supervisor-xyz"
+        assert mock_inbox.call_args[0][0] == "c0ffee01"
 
     @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
     def test_send_message_no_guard_when_cao_terminal_id_unset(self, mock_inbox):
@@ -115,16 +115,16 @@ class TestSendMessageSenderIdInjection:
 
         mock_inbox.return_value = {"success": True}
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "sender-xyz"}):
-            result = _send_message_impl("receiver-123", "Here are the results")
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "deadbeef"}):
+            _send_message_impl("receiver-123", "Here are the results")
 
         sent_message = mock_inbox.call_args[0][1]
         assert sent_message.startswith("Here are the results")
-        assert "[Message from terminal sender-xyz" in sent_message
+        assert "[Message from" in sent_message
+        assert "deadbeef" in sent_message
         assert (
             "Use the cao-mcp-server send_message MCP tool for any follow-up work — "
-            "never a built-in collaboration.send_message.]"
-            in sent_message
+            "never a built-in collaboration.send_message.]" in sent_message
         )
         assert "collaboration.send_message" in sent_message
 
@@ -136,8 +136,8 @@ class TestSendMessageSenderIdInjection:
 
         mock_inbox.return_value = {"success": True}
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "sender-xyz"}):
-            result = _send_message_impl("receiver-123", "Here are the results")
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "deadbeef"}):
+            _send_message_impl("receiver-123", "Here are the results")
 
         sent_message = mock_inbox.call_args[0][1]
         assert sent_message == "Here are the results"
@@ -152,7 +152,7 @@ class TestSendMessageSenderIdInjection:
         mock_inbox.return_value = {"success": True}
 
         with patch.dict(os.environ, {}, clear=True):
-            result = _send_message_impl("receiver-123", "Status update")
+            _send_message_impl("receiver-123", "Status update")
 
         sent_message = mock_inbox.call_args[0][1]
         assert sent_message == "Status update"
@@ -167,12 +167,12 @@ class TestSendMessageSenderIdInjection:
         mock_inbox.return_value = {"success": True}
         original = "Task complete. Here are the deliverables."
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "sender-999"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "deadbeef"}):
             _send_message_impl("receiver-123", original)
 
         sent_message = mock_inbox.call_args[0][1]
         assert sent_message.startswith(original)
-        assert sent_message.index("[Message from terminal") > len(original)
+        assert sent_message.index("[Message from") > len(original)
 
 
 class TestSendMessageCallerDefault:
@@ -192,16 +192,16 @@ class TestSendMessageCallerDefault:
         from cli_agent_orchestrator.mcp_server.server import _send_message_impl
 
         mock_response = MagicMock()
-        mock_response.json.return_value = {"id": "worker-abc", "caller_id": "supervisor-xyz"}
+        mock_response.json.return_value = {"id": "badc0de1", "caller_id": "c0ffee01"}
         mock_response.raise_for_status.return_value = None
         mock_requests.get.return_value = mock_response
         mock_inbox.return_value = {"success": True}
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "worker-abc"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "badc0de1"}):
             result = _send_message_impl(None, "Results ready")
 
         mock_inbox.assert_called_once()
-        assert mock_inbox.call_args[0][0] == "supervisor-xyz"
+        assert mock_inbox.call_args[0][0] == "c0ffee01"
         assert result == {"success": True}
 
     @patch("cli_agent_orchestrator.mcp_server.server.requests")
@@ -211,11 +211,11 @@ class TestSendMessageCallerDefault:
         from cli_agent_orchestrator.mcp_server.server import _send_message_impl
 
         mock_response = MagicMock()
-        mock_response.json.return_value = {"id": "worker-abc", "caller_id": None}
+        mock_response.json.return_value = {"id": "badc0de1", "caller_id": None}
         mock_response.raise_for_status.return_value = None
         mock_requests.get.return_value = mock_response
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "worker-abc"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "badc0de1"}):
             result = _send_message_impl(None, "Results ready")
 
         assert result["success"] is False
@@ -244,7 +244,7 @@ class TestSendMessageCallerDefault:
 
         mock_inbox.return_value = {"success": True}
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "worker-abc"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "badc0de1"}):
             _send_message_impl("explicit-recv", "Results")
 
         mock_requests.get.assert_not_called()
@@ -261,18 +261,18 @@ class TestSendMessageCallerDefault:
 
         mock_requests.HTTPError = requests.HTTPError
         mock_response = MagicMock()
-        mock_response.json.return_value = {"detail": "Terminal 'worker-abc' not found"}
+        mock_response.json.return_value = {"detail": "Terminal 'badc0de1' not found"}
         http_error = requests.HTTPError("404 Client Error")
         http_error.response = mock_response
         mock_response.raise_for_status.side_effect = http_error
         mock_requests.get.return_value = mock_response
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "worker-abc"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "badc0de1"}):
             result = _send_message_impl(None, "Results ready")
 
         assert result["success"] is False
         assert "caller lookup" in result["error"]
-        assert "Terminal 'worker-abc' not found" in result["error"]
+        assert "Terminal 'badc0de1' not found" in result["error"]
         assert "receiver_id" in result["error"]
         mock_inbox.assert_not_called()
 
@@ -284,17 +284,17 @@ class TestSendMessageCallerDefault:
         from cli_agent_orchestrator.mcp_server.server import _send_message_impl
 
         mock_response = MagicMock()
-        mock_response.json.return_value = {"detail": "Terminal 'supervisor-xyz' not found"}
+        mock_response.json.return_value = {"detail": "Terminal 'c0ffee01' not found"}
         http_error = requests.HTTPError("404 Client Error")
         http_error.response = mock_response
         mock_inbox.side_effect = http_error
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "worker-abc"}):
-            result = _send_message_impl("supervisor-xyz", "Results ready")
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "badc0de1"}):
+            result = _send_message_impl("c0ffee01", "Results ready")
 
         assert result["success"] is False
-        assert "supervisor-xyz" in result["error"]
-        assert "Terminal 'supervisor-xyz' not found" in result["error"]
+        assert "c0ffee01" in result["error"]
+        assert "Terminal 'c0ffee01' not found" in result["error"]
 
     @patch("cli_agent_orchestrator.mcp_server.server.requests")
     @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
@@ -306,11 +306,11 @@ class TestSendMessageCallerDefault:
         from cli_agent_orchestrator.mcp_server.server import _send_message_impl
 
         mock_response = MagicMock()
-        mock_response.json.return_value = {"id": "worker-abc", "caller_id": "worker-abc"}
+        mock_response.json.return_value = {"id": "badc0de1", "caller_id": "badc0de1"}
         mock_response.raise_for_status.return_value = None
         mock_requests.get.return_value = mock_response
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "worker-abc"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "badc0de1"}):
             result = _send_message_impl(None, "Results")
 
         assert result["success"] is False

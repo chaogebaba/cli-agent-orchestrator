@@ -27,8 +27,8 @@ from cli_agent_orchestrator.services.rebind_lease import (
     rebind_lease_held,
     release_rebind_lease,
 )
-from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.stalled_callback_watchdog import stalled_callback_watchdog
+from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 
@@ -196,10 +196,11 @@ async def _wait_for_backend_proof(
 
 def _launch_context(metadata: dict) -> str | None:
     profile = load_agent_profile(metadata["agent_profile"])
-    prompt = build_skill_catalog(profile.skills)
+    prompt = build_skill_catalog(profile.skills, provider=metadata["provider"])
     if profile.sessionBrief:
         from cli_agent_orchestrator.services.session_manifest_service import (
-            build_session_manifest, render_session_brief,
+            build_session_manifest,
+            render_session_brief,
         )
         brief = render_session_brief(build_session_manifest(metadata["tmux_session"], metadata["id"]))
         prompt = f"{prompt}\n\n{brief}" if prompt else brief
@@ -214,11 +215,20 @@ async def _fallback(metadata: dict, session_uuid: str, source_lease, lifecycle_l
         mode="resume", session_uuid=session_uuid, base_name="reauth-fallback",
         provider=metadata["provider"], initial_preamble="",
     )
+    cwd = get_backend().get_pane_working_directory(
+        metadata["tmux_session"], metadata["tmux_window"])
+    if cwd is None:
+        # F26 AC11: never fall back to os.getcwd() for a deleted/unavailable
+        # pane cwd — recreating the terminal in the wrong directory is the
+        # silent wrong-repo incident class D3 rejects. Fail directed.
+        return {
+            "status": "unresumable", "new_terminal_id": None,
+            "error_code": "cwd_unavailable",
+        }
     replacement = await create_terminal(
         provider=metadata["provider"], agent_profile=metadata["agent_profile"],
         session_name=metadata["tmux_session"], new_session=False,
-        working_directory=get_backend().get_pane_working_directory(
-            metadata["tmux_session"], metadata["tmux_window"]),
+        working_directory=cwd,
         allowed_tools=metadata.get("allowed_tools"), caller_id=metadata.get("caller_id"),
         fork_context=context,
         fallback_source_terminal_id=metadata["id"],
@@ -242,7 +252,8 @@ async def rebind_terminal(
     if not initial_metadata:
         return _result(terminal_id, "unresumable", error_code="terminal_missing", interrupt=interrupt)
     from cli_agent_orchestrator.services.session_lifecycle_lease import (
-        acquire_session_lifecycle_shared, release_session_lifecycle_lease,
+        acquire_session_lifecycle_shared,
+        release_session_lifecycle_lease,
     )
     lifecycle_lease = acquire_session_lifecycle_shared(initial_metadata["tmux_session"])
     if lifecycle_lease is None:
@@ -304,6 +315,12 @@ async def rebind_terminal(
             return _result(terminal_id, "unresumable", error_code="shell_baseline_missing", interrupt=interrupt)
         pid = pane_pid(metadata["tmux_session"], metadata["tmux_window"])
         cwd = get_backend().get_pane_working_directory(metadata["tmux_session"], metadata["tmux_window"])
+        if cwd is None:
+            # F26 D5: a deleted/unavailable pane cwd must mark the rebind
+            # unresumable with a directed reason, never escape as a TypeError
+            # from quote(None) inside capture_session_uuid /
+            # validate_session_artifact.
+            return _result(terminal_id, "unresumable", error_code="cwd_unavailable", interrupt=interrupt)
         session_uuid = metadata.get("provider_session_id")
         phase = "p4"
         if not session_uuid:
@@ -493,6 +510,13 @@ async def rebind_terminal(
                 return result
         if old_provider is not candidate:
             old_provider.cleanup()
+            from cli_agent_orchestrator.utils.persona_context import (
+                PersonaPlan,
+                reap_persona_generations,
+            )
+
+            if isinstance(getattr(candidate, "_persona_plan", None), PersonaPlan):
+                reap_persona_generations(terminal_id)
         result = _result(terminal_id, "rebound", interrupt=interrupt)
         if prepared_recovery is not None:
             from cli_agent_orchestrator.services.wpd1_decontam import public_scrub_summary

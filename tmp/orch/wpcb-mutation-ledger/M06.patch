@@ -1,0 +1,13 @@
+diff --git a/src/cli_agent_orchestrator/providers/cline_cli.py b/src/cli_agent_orchestrator/providers/cline_cli.py
+index 532726bc..92b8602c 100644
+--- a/src/cli_agent_orchestrator/providers/cline_cli.py
++++ b/src/cli_agent_orchestrator/providers/cline_cli.py
+@@ -341,7 +341,7 @@ class ClineCliProvider(BaseProvider):
+         cao_entry = mcp_servers.get("cao-mcp-server", {})
+         raw_command = cao_entry.get("command", "cao-mcp-server")
+         raw_args = cao_entry.get("args", []) or []
+-        command, args = resolve_cao_mcp_command(raw_command, raw_args, persisted=True)
++        command, args = "/home/chao/.local/bin/cao-mcp-server", []  # M6: hardcoded
+ 
+         # Build the MCP settings with per-worker identity
+         env_block: dict[str, str] = {

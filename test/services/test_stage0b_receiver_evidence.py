@@ -212,7 +212,11 @@ class _Emitter:
         signal_kinds=frozenset({"progress", "chrome"}),
     )
 
+    def __init__(self) -> None:
+        self.emitter_calls = 0
+
     def emit_screen_signals(self, rows):
+        self.emitter_calls += 1
         row = rows[0]
         if row.startswith("spin"):
             return (ScreenSignal("progress", "spin", 0, row, "corroborable"),)
@@ -266,11 +270,7 @@ class _CorroboratingRunningEmitter:
 
     def emit_screen_signals(self, rows):
         self.emitter_calls += 1
-        return (
-            ScreenSignal(
-                "progress", "RUNNING_PATTERN", 0, rows[0], "corroborable"
-            ),
-        )
+        return (ScreenSignal("progress", "RUNNING_PATTERN", 0, rows[0], "corroborable"),)
 
     def get_status_from_screen(self, _rows):
         return TerminalStatus.PROCESSING
@@ -446,9 +446,7 @@ def test_d6_status_only_processing_watchdog_never_suppresses(monkeypatch) -> Non
         "prove_terminal_identity",
         lambda terminal_id: IdentityProof(terminal_id, "pane_readback", 10.0, None),
     )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor", monitor
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.services.status_monitor.status_monitor", monitor)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
         lambda _id: metadata,
@@ -461,9 +459,7 @@ def test_d6_status_only_processing_watchdog_never_suppresses(monkeypatch) -> Non
         "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
         lambda _id: provider,
     )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.backends.registry.get_backend", lambda: backend
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.seam_activation.receiver_state_active",
         lambda op: op == "watchdog.pane_classify",
@@ -480,13 +476,18 @@ def test_d6_status_only_processing_watchdog_never_suppresses(monkeypatch) -> Non
     assert view is None
 
 
-def test_d6_status_only_auto_responder_uses_latched_status_before_enter(
-    monkeypatch,
+@pytest.mark.parametrize("signal_emitting", [False, True])
+def test_d6_auto_responder_publishes_full_frame_then_reclassifies_region(
+    monkeypatch, signal_emitting
 ) -> None:
     monitor = StatusMonitor()
-    provider = _StatusOnlyProvider(TerminalStatus.WAITING_USER_ANSWER)
+    provider = (
+        _Emitter() if signal_emitting else _StatusOnlyProvider(TerminalStatus.WAITING_USER_ANSWER)
+    )
+    if not signal_emitting:
+        provider.get_status_from_screen = MagicMock(wraps=provider.get_status_from_screen)
     engine = ar.AutoResponder()
-    rule = ar.Rule("status-only", True, "contains", "Proceed?", [], ["Enter"])
+    rule = ar.Rule("status-only", True, "contains", "Proceed", [], ["Enter"])
     metadata = {
         "id": "terminal",
         "provider": "status-only",
@@ -498,7 +499,9 @@ def test_d6_status_only_auto_responder_uses_latched_status_before_enter(
     published: dict[str, object] = {}
     backend = MagicMock()
     backend.supports_event_inbox.return_value = False
-    backend.capture_viewport.side_effect = lambda *_args: order.append("capture") or "Proceed?"
+    backend.capture_viewport.side_effect = (
+        lambda *_args: order.append("capture") or "1. Proceed\nPress enter"
+    )
     backend.send_special_key.side_effect = lambda *_args: order.append("effect")
     real_publish = monitor.publish_fresh_observation
     real_snapshot = monitor.receiver_state_store.snapshot_view
@@ -521,9 +524,7 @@ def test_d6_status_only_auto_responder_uses_latched_status_before_enter(
     monkeypatch.setattr(monitor, "prove_terminal_identity", prove)
     monkeypatch.setattr(monitor, "publish_fresh_observation", publish)
     monkeypatch.setattr(monitor.receiver_state_store, "snapshot_view", snapshot)
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor", monitor
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.services.status_monitor.status_monitor", monitor)
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.get_terminal_metadata",
         lambda _id: metadata,
@@ -532,9 +533,7 @@ def test_d6_status_only_auto_responder_uses_latched_status_before_enter(
         "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
         lambda _id: provider,
     )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.backends.registry.get_backend", lambda: backend
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.seam_activation.receiver_state_active",
         lambda op: op == "auto_responder.frame_classify",
@@ -548,12 +547,17 @@ def test_d6_status_only_auto_responder_uses_latched_status_before_enter(
         metadata,
         provider,
         rule,
-        "Proceed?",
+        "1. Proceed Press enter",
         engine._state_for("terminal", rule.name),
+        engine._snapshot_incarnation("terminal", metadata),
     )
 
     assert fired
     backend.send_special_key.assert_called_once_with("session", "window", "Enter")
+    if signal_emitting:
+        assert provider.emitter_calls == 2
+    else:
+        assert provider.get_status_from_screen.call_count == 2
     assert order == ["prove", "capture", "publish", "read", "effect"]
 
 
@@ -576,9 +580,7 @@ def test_d6_signal_emitting_watchdog_plumbs_priors_into_running_decision(
         "prove_terminal_identity",
         lambda terminal_id: IdentityProof(terminal_id, "pane_readback", 10.0, None),
     )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.status_monitor.status_monitor", monitor
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.services.status_monitor.status_monitor", monitor)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
         lambda _id: metadata,
@@ -591,9 +593,7 @@ def test_d6_signal_emitting_watchdog_plumbs_priors_into_running_decision(
         "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
         lambda _id: provider,
     )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.backends.registry.get_backend", lambda: backend
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.seam_activation.receiver_state_active",
         lambda op: op == "watchdog.pane_classify",

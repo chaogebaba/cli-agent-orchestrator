@@ -15,7 +15,7 @@ import tarfile
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 import requests as http_requests
@@ -299,7 +299,10 @@ def test_probe_01_delayed_relaunch_digests_old_generation_without_replay(
     with scratch_db() as db:
         assert db.get(InboxModel, second.id).status == "pending"
     stale_backend = MagicMock()
-    stale_backend.get_history.side_effect = RuntimeError("missing window")
+    stale_backend.supports_identity_readback = True
+    stale_backend.window_liveness.return_value = "gone"
+    stale_backend.enumerate_windows.return_value = ("ok", [])
+    stale_backend.get_session_windows.return_value = []
     with patch.object(terminal_service_module, "get_backend", return_value=stale_backend):
         assert terminal_service_module.purge_stale_terminal_records() == 1
     assert adopt_mailbox_rows_at_startup() == 2
@@ -359,7 +362,7 @@ def test_probe_02_real_publication_races_have_one_winner_and_teardown_loser(
     monkeypatch.setattr(session_service, "create_terminal", create_terminal_side_effect)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.seed_resume_bootstrap",
-        lambda *_args, **_kwargs: None,
+        AsyncMock(return_value=None),
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.delete_terminal",
@@ -589,7 +592,7 @@ def test_probe_04_two_generation_replay_me_and_digest_crash_retry_exclusion(
     with scratch_db.begin() as db:
         delivered_two = inbox(db, "22222222", "delivered", logical="mb_aaaaaaaa")
     second = publish_supervisor_incarnation(claim_mailbox("cao-wave3b"), "33333333")
-    page = list_messages("mb_aaaaaaaa")
+    page = list_messages("mb_aaaaaaaa", audit_browse=True)
     ids = {item["id"] for item in page["items"]}
     assert {delivered_one.id, delivered_two.id}.issubset(ids)
     assert second["digest_message_id"] is None
@@ -952,6 +955,8 @@ def test_probe_08_each_direct_writer_resolves_dead_incarnation_to_mailbox(scratc
         assert direct.enqueue_generation == logical.enqueue_generation == 2
 
 
+@pytest.mark.requires_git_object("33aad1c")
+@pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_probe_09_raw_addressed_output_bytes_match_parent_33aad1c(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     parent = tmp_path / "parent"
@@ -1192,7 +1197,7 @@ def test_probe_12_publication_cleanup_failure_keeps_typed_original_cause(
     monkeypatch.setattr(session_service, "create_terminal", create_terminal_side_effect)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.seed_resume_bootstrap",
-        lambda *_args, **_kwargs: None,
+        AsyncMock(return_value=None),
     )
     cause = MailboxDomainError("mailbox_conflict", "original conflict")
     monkeypatch.setattr(
@@ -1790,9 +1795,12 @@ def test_wpq1_purge_uses_shared_p5_transaction_and_notice(scratch_db):
         terminal(db, "stale")
         row = inbox(db, "stale", sender="sender")
     backend = MagicMock()
-    backend.get_history.side_effect = lambda _session, window, **_kwargs: (
-        "alive" if window == "sender" else (_ for _ in ()).throw(RuntimeError("gone"))
+    backend.supports_identity_readback = True
+    backend.window_liveness.side_effect = lambda _session, window: (
+        "live" if window == "sender" else "gone"
     )
+    backend.enumerate_windows.return_value = ("ok", [])
+    backend.get_session_windows.return_value = []
 
     with patch.object(terminal_service_module, "get_backend", return_value=backend):
         assert terminal_service_module.purge_stale_terminal_records() == 1

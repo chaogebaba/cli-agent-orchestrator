@@ -3,6 +3,11 @@ from pathlib import Path
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.main import cli
+from cli_agent_orchestrator.kernel.receiver_state.trace_manifest import (
+    CONSUMER_MODULES,
+    TRACE_MANIFEST_PATH,
+    generate_manifest,
+)
 from cli_agent_orchestrator.services import verification_service as svc
 
 
@@ -389,6 +394,80 @@ def test_verify_scope_happy_and_failure(tmp_path, monkeypatch):
     assert "missing expected: b.py" in result.output
 
 
+def _trace_manifest_tree(tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path / "repo"
+    source_root = Path(__file__).parents[3]
+    for relative_path in CONSUMER_MODULES:
+        source_path = source_root / relative_path
+        destination = root / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source_path.read_bytes())
+    manifest_path = root / TRACE_MANIFEST_PATH
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(generate_manifest(root), encoding="utf-8")
+    return root, manifest_path
+
+
+def _trace_identity(row: str) -> tuple[str, str]:
+    path, _, symbol = row.rsplit(":", 2)
+    return path, symbol
+
+
+def test_verify_manifest_regen_preserves_identities_across_line_shift(
+    tmp_path, monkeypatch
+):
+    import cli_agent_orchestrator.cli.commands.verify as command
+
+    root, manifest_path = _trace_manifest_tree(tmp_path)
+    committed = manifest_path.read_text(encoding="utf-8")
+    shifted_path = root / "src/cli_agent_orchestrator/services/inbox_service.py"
+    shifted_path.write_text(
+        "\n" + shifted_path.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    monkeypatch.setattr(command, "git_root", lambda: root)
+
+    result = CliRunner().invoke(cli, ["verify", "manifest", "--regen"])
+
+    assert result.exit_code == 0
+    assert result.output == "Trace manifest: hits=38 files_touched=1 changed=yes\n"
+    regenerated = manifest_path.read_text(encoding="utf-8")
+    committed_rows = committed.splitlines()
+    regenerated_rows = regenerated.splitlines()
+    assert len(committed_rows) == len(regenerated_rows) == 38
+    assert [_trace_identity(row) for row in committed_rows] == [
+        _trace_identity(row) for row in regenerated_rows
+    ]
+    changed_paths = {
+        before.rsplit(":", 2)[0]
+        for before, after in zip(committed_rows, regenerated_rows, strict=True)
+        if before != after
+    }
+    assert changed_paths == {"src/cli_agent_orchestrator/services/inbox_service.py"}
+
+
+def test_verify_manifest_regen_unchanged_tree_does_not_write(tmp_path, monkeypatch):
+    import cli_agent_orchestrator.cli.commands.verify as command
+
+    root, manifest_path = _trace_manifest_tree(tmp_path)
+    committed = manifest_path.read_bytes()
+    writes: list[Path] = []
+    original_write_text = Path.write_text
+
+    def record_write(path: Path, *args, **kwargs):
+        writes.append(path)
+        return original_write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(command, "git_root", lambda: root)
+    monkeypatch.setattr(Path, "write_text", record_write)
+
+    result = CliRunner().invoke(cli, ["verify", "manifest", "--regen"])
+
+    assert result.exit_code == 0
+    assert result.output == "Trace manifest: hits=38 files_touched=0 changed=no\n"
+    assert writes == []
+    assert manifest_path.read_bytes() == committed
+
+
 def test_ledger_check_warns_for_drained_header_and_counts_pending(tmp_path, monkeypatch):
     handoff = tmp_path / "HANDOFF.md"
     handoff.write_text(
@@ -411,3 +490,51 @@ def test_ledger_check_missing_file(tmp_path, monkeypatch):
     result = CliRunner().invoke(cli, ["ledger", "check"])
     assert result.exit_code != 0
     assert "HANDOFF.md not found" in result.output
+    assert "orchestrator/HANDOFF.md" in result.output
+
+
+
+def test_ledger_check_finds_orchestrator_layout(tmp_path, monkeypatch):
+    """New layout: orchestrator/HANDOFF.md is preferred over root HANDOFF.md."""
+    orch = tmp_path / "orchestrator"
+    orch.mkdir()
+    handoff = orch / "HANDOFF.md"
+    handoff.write_text(
+        "## POST-RESTART RE-ENTRY\nFeature Gamma needs work\n\n"
+        "## Live ledger\n"
+        "| feature | assertion | commit | probe | status | notes |\n"
+        "|---|---|---|---|---|---|\n"
+        "| Feature Gamma | x | c | p | pending | n |\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(cli, ["ledger", "check"])
+    assert result.exit_code == 0
+    assert "pending-row count: 1" in result.output
+
+
+def test_ledger_check_prefers_orchestrator_over_legacy(tmp_path, monkeypatch):
+    """When both exist, orchestrator/HANDOFF.md wins."""
+    # Legacy at root
+    (tmp_path / "HANDOFF.md").write_text(
+        "## POST-RESTART RE-ENTRY\n\n"
+        "## Live ledger\n"
+        "| feature | assertion | commit | probe | status | notes |\n"
+        "|---|---|---|---|---|---|\n"
+        "| Legacy | x | c | p | pending | n |\n"
+        "| Legacy2 | x | c | p | pending | n |\n"
+    )
+    # New layout
+    orch = tmp_path / "orchestrator"
+    orch.mkdir()
+    (orch / "HANDOFF.md").write_text(
+        "## POST-RESTART RE-ENTRY\n\n"
+        "## Live ledger\n"
+        "| feature | assertion | commit | probe | status | notes |\n"
+        "|---|---|---|---|---|---|\n"
+        "| NewLayout | x | c | p | pending | n |\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(cli, ["ledger", "check"])
+    assert result.exit_code == 0
+    # Should read from orchestrator/ (1 pending), not legacy (2 pending)
+    assert "pending-row count: 1" in result.output

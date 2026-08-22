@@ -120,14 +120,14 @@ async def test_required_brief_is_built_after_db_and_fifo_and_before_provider(mon
     provider.initialize.side_effect = lambda: order.append("provider")
 
     monkeypatch.setattr(svc, "load_agent_profile", lambda _name: profile)
-    monkeypatch.setattr(svc, "build_skill_catalog", lambda _filter: "SKILLS")
+    monkeypatch.setattr(svc, "build_skill_catalog", lambda _filter, **_kw: "SKILLS")
     monkeypatch.setattr(svc, "generate_terminal_id", lambda: "term0001")
     monkeypatch.setattr(svc, "generate_session_name", lambda: "cao-test")
-    monkeypatch.setattr(svc, "generate_window_name", lambda _name: "supervisor-1")
+    monkeypatch.setattr(svc, "generate_window_name", lambda *_a: "supervisor-1")
     monkeypatch.setattr(svc, "get_backend", lambda: backend)
     monkeypatch.setattr(svc, "clear_session_env", lambda *_: None)
     monkeypatch.setattr(svc, "db_create_terminal", lambda *_args, **_kwargs: order.append("db"))
-    monkeypatch.setattr(svc.fifo_manager, "create_reader", lambda *_: None)
+    monkeypatch.setattr(svc.fifo_manager, "create_reader", lambda *_, **__: None)
     monkeypatch.setattr(svc, "FIFO_DIR", tmp_path)
     def create_provider(*_args, **kwargs):
         provider_kwargs.update(kwargs)
@@ -184,10 +184,10 @@ def _install_failure_harness(monkeypatch, tmp_path, *, build_effect):
     create_provider = Mock(return_value=provider)
 
     monkeypatch.setattr(svc, "load_agent_profile", lambda _name: profile)
-    monkeypatch.setattr(svc, "build_skill_catalog", lambda _filter: "SKILLS")
+    monkeypatch.setattr(svc, "build_skill_catalog", lambda _filter, **_kw: "SKILLS")
     monkeypatch.setattr(svc, "generate_terminal_id", lambda: "term0001")
     monkeypatch.setattr(svc, "generate_session_name", lambda: "cao-test")
-    monkeypatch.setattr(svc, "generate_window_name", lambda _name: "supervisor-1")
+    monkeypatch.setattr(svc, "generate_window_name", lambda *_a: "supervisor-1")
     monkeypatch.setattr(svc, "get_backend", lambda: backend)
     monkeypatch.setattr(svc, "clear_session_env", lambda *_: None)
     monkeypatch.setattr(svc, "db_create_terminal", lambda *_args, **_kwargs: calls.append("db"))
@@ -196,7 +196,7 @@ def _install_failure_harness(monkeypatch, tmp_path, *, build_effect):
         lambda *_args, **_kwargs: calls.append("delete-db") or
         {"terminal_deleted": True, "intent_deleted": False},
     )
-    monkeypatch.setattr(svc.fifo_manager, "create_reader", lambda *_: None)
+    monkeypatch.setattr(svc.fifo_manager, "create_reader", lambda *_, **__: None)
     monkeypatch.setattr(svc.fifo_manager, "stop_reader", lambda *_: calls.append("stop-fifo"))
     monkeypatch.setattr(svc, "FIFO_DIR", tmp_path)
     monkeypatch.setattr(svc.provider_manager, "create_provider", create_provider)

@@ -22,27 +22,31 @@ _TABLE_RE = re.compile(r"^\s*\[([^\]]+)\]\s*(?:#.*)?$")
 
 
 def ensure_grok_mcp_servers(
-    mcp_servers: Dict[str, Any] | None, *, terminal_id: str | None = None
+    mcp_servers: Dict[str, Any] | None,
+    *,
+    terminal_id: str | None = None,
+    config_path: "Path | None" = None,
 ) -> None:
-    """Ensure profile MCP servers exist in ``~/.grok/config.toml``.
+    """Ensure profile MCP servers exist in Grok config.
 
-    The write is intentionally narrow: only ``[mcp_servers.<name>]`` and its
-    nested tables for names present in *mcp_servers* are replaced. Unrelated
-    user config and unrelated MCP servers are left intact.
+    When *config_path* is provided, reads/writes that explicit path instead of
+    the global ``~/.grok/config.toml``. A terminal-specific invocation never
+    mutates the global config. Atomic write targets the specified path.
     """
     if not mcp_servers:
         return
 
-    content = GROK_CONFIG_FILE.read_text(encoding="utf-8") if GROK_CONFIG_FILE.exists() else ""
+    target = config_path or GROK_CONFIG_FILE
+    content = target.read_text(encoding="utf-8") if target.exists() else ""
     for name, raw_config in mcp_servers.items():
         config = dict(raw_config)
         if terminal_id is not None:
             config = bind_mcp_server_identity(config, terminal_id)
         content = _upsert_mcp_server_section(content, name, config)
 
-    GROK_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(GROK_CONFIG_FILE, content)
-    logger.info("Ensured %d Grok MCP server(s) in %s", len(mcp_servers), GROK_CONFIG_FILE)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(target, content)
+    logger.info("Ensured %d Grok MCP server(s) in %s", len(mcp_servers), target)
 
 
 def _upsert_mcp_server_section(content: str, name: str, config: Dict[str, Any]) -> str:

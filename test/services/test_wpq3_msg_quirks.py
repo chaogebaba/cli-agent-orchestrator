@@ -412,7 +412,7 @@ def _patch_successful_auto_resume(monkeypatch, service, metadata, deliver):
         lambda *_args: WatchdogInsertResult("inserted", 46),
     )
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending", deliver
+        "cli_agent_orchestrator.services.inbox_service.request_delivery", deliver
     )
     return delivery_lock
 
@@ -454,7 +454,7 @@ def test_d5_kill_switch_preserves_ordinary_push(monkeypatch, disabled):
     )
     due = service.collect_due_notifications(now=13.0)
     assert due == [
-        _watchdog_notice("[watchdog] worker worker (developer) idle 3s without callback")
+        _watchdog_notice("[watchdog] worker developer-worker idle 3s without callback")
     ]
 
 
@@ -502,7 +502,7 @@ def test_d5_full_fire_inserts_exact_body_then_delivers(monkeypatch):
         insert,
     )
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending", deliver
+        "cli_agent_orchestrator.services.inbox_service.request_delivery", deliver
     )
     assert service.collect_due_notifications(now=13.0) == []
     insert.assert_called_once_with("worker", AUTO_RESUME_BODY)
@@ -582,7 +582,7 @@ def test_d5_auto_resume_is_one_shot_and_suffix_preserves_mark(monkeypatch):
         insert,
     )
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending", deliver
+        "cli_agent_orchestrator.services.inbox_service.request_delivery", deliver
     )
 
     assert service.collect_due_notifications(now=13.0) == []
@@ -596,7 +596,8 @@ def test_d5_auto_resume_is_one_shot_and_suffix_preserves_mark(monkeypatch):
     deliver.assert_called_once_with("worker")
 
 
-def test_d5_second_callback_read_cancels_pending_resume(monkeypatch):
+@pytest.mark.parametrize("status", [MessageStatus.PENDING, MessageStatus.DIGESTED])
+def test_d5_second_callback_read_cancels_pending_resume(monkeypatch, status):
     service, metadata = _armed()
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
@@ -604,7 +605,7 @@ def test_d5_second_callback_read_cancels_pending_resume(monkeypatch):
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.stalled_callback_watchdog.get_callback_status_since",
-        MagicMock(side_effect=[None, MessageStatus.PENDING]),
+        MagicMock(side_effect=[None, status]),
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status",
@@ -630,6 +631,7 @@ def test_d5_second_callback_read_cancels_pending_resume(monkeypatch):
     assert service.collect_due_notifications(now=13.0) == []
     cancel.assert_called_once_with(42, "worker")
     assert not service._episodes["worker"].auto_resumed
+    assert service._episodes["worker"].callback_seen is (status == MessageStatus.DIGESTED)
 
 
 def test_d5_failed_before_commit_pushes_without_marking_auto_resumed(monkeypatch):
@@ -666,12 +668,12 @@ def test_d5_failed_before_commit_pushes_without_marking_auto_resumed(monkeypatch
         lambda *_args: WatchdogInsertResult("failed_before_commit"),
     )
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending", deliver
+        "cli_agent_orchestrator.services.inbox_service.request_delivery", deliver
     )
 
     assert service.collect_due_notifications(now=13.0) == [
         _watchdog_notice(
-            "[watchdog] worker worker (developer) idle 3s without callback "
+            "[watchdog] worker developer-worker idle 3s without callback "
             "[reason: transient_api_error]",
             "transient_api_error",
         )
@@ -724,7 +726,7 @@ def test_wpq6_a_g_capacity_auto_resumes_then_pushes_composed_reason(monkeypatch)
         insert,
     )
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending", deliver
+        "cli_agent_orchestrator.services.inbox_service.request_delivery", deliver
     )
     monkeypatch.setattr("cli_agent_orchestrator.backends.registry.get_backend", lambda: backend)
     monkeypatch.setattr(
@@ -736,7 +738,7 @@ def test_wpq6_a_g_capacity_auto_resumes_then_pushes_composed_reason(monkeypatch)
     attempted_at = service._episodes["worker"].auto_resume_attempted_at
     assert service.collect_due_notifications(now=16.0) == [
         _watchdog_notice(
-            "[watchdog] worker worker (developer) idle 3s without callback "
+            "[watchdog] worker developer-worker idle 3s without callback "
             f"[reason: transient_api_error] (auto-resume attempted at {attempted_at})",
             "transient_api_error",
         )
@@ -783,7 +785,7 @@ def test_wpq6_c_excluded_collision_pushes_reason_without_auto_resume(monkeypatch
 
     assert service.collect_due_notifications(now=13.0) == [
         _watchdog_notice(
-            "[watchdog] worker worker (developer) idle 3s without callback "
+            "[watchdog] worker developer-worker idle 3s without callback "
             "[reason: quota_or_auth]",
             "quota_or_auth",
         )
@@ -948,7 +950,7 @@ def test_wpq6_w_cropped_indented_capacity_never_auto_resumes(monkeypatch):
     )
 
     assert service.collect_due_notifications(now=13.0)[0].message == (
-        "[watchdog] worker worker (developer) idle 3s without callback"
+        "[watchdog] worker developer-worker idle 3s without callback"
     )
     insert.assert_not_called()
 
@@ -1127,7 +1129,7 @@ def test_d5_finalize_exits_while_delivery_lock_held(monkeypatch):
         lambda *_args: WatchdogInsertResult("inserted", 47),
     )
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",
+        "cli_agent_orchestrator.services.inbox_service.request_delivery",
         lambda _terminal: None,
     )
 
@@ -1240,7 +1242,7 @@ def test_d5_invalid_finalize_cancellation_exits_while_delivery_lock_held(monkeyp
         cancel_pending,
     )
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",
+        "cli_agent_orchestrator.services.inbox_service.request_delivery",
         deliver,
     )
 
@@ -1341,7 +1343,7 @@ def test_d5_auto_resume_order_is_insert_finalize_then_deliver(monkeypatch):
         insert,
     )
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending", deliver
+        "cli_agent_orchestrator.services.inbox_service.request_delivery", deliver
     )
 
     assert service.collect_due_notifications(now=13.0) == []
