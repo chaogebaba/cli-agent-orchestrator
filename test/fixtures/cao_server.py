@@ -411,6 +411,74 @@ def _seed_omp_e2e_state(home_dir: Path) -> None:
             shutil.copy2(examples_dir / f"{name}.md", target)
 
 
+# ---------------------------------------------------------------------------
+# Provider HOME prerequisites seeding (F347 #202)
+# ---------------------------------------------------------------------------
+
+# Provider classes resolve binaries and config from Path.home() — which returns
+# the redirected HOME in e2e. This registry maps each dot-directory under the
+# real HOME to its purpose. A symlink is created from <redirected-HOME>/<rel>
+# to <real-HOME>/<rel> for each entry whose source exists.
+#
+# Only directories/files needed at PROVIDER BOOT time belong here (binaries,
+# agent JSON, auth). Per-session sandbox state must NOT be shared.
+
+_PROVIDER_HOME_SYMLINKS: tuple[str, ...] = (
+    # cline_cli: CLINE_BINARY = Path.home() / ".bun" / "bin" / "cline"
+    # Also needed by codex, claude, gemini, firecrawl binaries installed via bun.
+    ".bun",
+    # kiro_cli: KIRO_AGENTS_DIR = Path.home() / ".kiro" / "agents"
+    ".kiro",
+    # cline_cli: _CLINE_USER_DATA = Path.home() / ".cline" / "data"
+    ".cline",
+    # grok_cli: GROK_BINARY = Path.home() / ".grok" / "bin" / "grok"
+    # Also grok auth.json (already seeded by require_grok fixture, but the
+    # symlink here is idempotent and makes grok work without the fixture too).
+    ".grok",
+    # copilot_cli: config_dir = Path.home() / ".copilot"
+    ".copilot",
+    # kimi_cli: Path.home() / ".kimi"
+    ".kimi",
+    # minimax_code: Path.home() / ".minimax"
+    ".minimax",
+    # antigravity_cli (gemini): Path.home() / ".gemini"
+    ".gemini",
+)
+
+
+def _seed_provider_home_prerequisites(home_dir: Path) -> None:
+    """Symlink provider-required dot-directories from real HOME into the redirected HOME.
+
+    Provider modules resolve binaries and config via ``Path.home()`` at module
+    scope or during ``initialize()``. When the e2e fixture redirects HOME, those
+    paths resolve against the empty scratch dir — causing FileNotFoundError at
+    runtime.
+
+    This function creates symlinks from ``<home_dir>/<dotdir>`` →
+    ``<real_home>/<dotdir>`` for every provider prerequisite that exists on the
+    host. Symlinks are preferred over copies: they stay current if the developer
+    updates a binary/config between test runs, and they don't duplicate large
+    node_modules trees.
+
+    Only dot-directories needed at provider boot are linked. Per-session mutable
+    state (sandbox dirs, session DBs) is intentionally NOT shared.
+    """
+    # Resolve the REAL home — not the redirected one. The subprocess hasn't
+    # started yet, and this code runs in the pytest process whose HOME is still
+    # the developer's real home. But in case HOME was already overridden in the
+    # pytest env (e.g. by an outer fixture), fall back to /etc/passwd.
+    _env_home = os.environ.get("_CAO_REAL_HOME", "").strip()
+    real_home = Path(_env_home) if _env_home else Path.home()
+    if not real_home.is_dir():
+        return
+
+    for dotdir in _PROVIDER_HOME_SYMLINKS:
+        source = real_home / dotdir
+        target = home_dir / dotdir
+        if source.exists() and not target.exists():
+            target.symlink_to(source)
+
+
 def _start_cao_server(
     home_dir: Path,
     port: int,
@@ -425,6 +493,7 @@ def _start_cao_server(
     ``stop`` callable.
     """
     home_dir.mkdir(parents=True, exist_ok=True)
+    _seed_provider_home_prerequisites(home_dir)
     _seed_packaged_skills(home_dir)
     _seed_omp_e2e_state(home_dir)
     log_path = home_dir / "server.log"
