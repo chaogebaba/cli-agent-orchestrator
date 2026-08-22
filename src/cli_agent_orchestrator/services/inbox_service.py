@@ -28,6 +28,7 @@ from cli_agent_orchestrator.clients.database import (
     AttemptOpenResult,
     NoticeInsertOutcome,
     OrphanReconcileResult,
+    _utcnow,
     advance_wpm2_continuity_cursor,
     attempt_proven_pre_paste,
     begin_delivery_attempt,
@@ -70,7 +71,6 @@ from cli_agent_orchestrator.clients.database import (
     transition_pending_to_delivery_failed,
     transition_pending_to_inferred_delivered,
     update_message_status,
-    _utcnow,
 )
 
 _PRODUCTION_BEGIN_DELIVERY_ATTEMPT = begin_delivery_attempt
@@ -125,6 +125,11 @@ WPM2_STALE_OPEN_AGE_SECONDS = 60
 # binding-authority notice threshold so the operator is told at the same time
 # the deadlock is broken.
 BINDING_SUPPRESS_MAX_CYCLES = 3
+
+# F339: Maximum consecutive terminal-not-found (404) responses before an episode
+# is permanently abandoned. Prevents unbounded CPU/request storms when terminal
+# rows are wiped but in-memory delivery episodes persist.
+_F339_TERMINAL_NOT_FOUND_MAX = 5
 
 
 @dataclass(frozen=True)
@@ -304,7 +309,7 @@ def _wire_with_attempt_challenge(
     index = len(wire) - len(suffix)
     raw_challenge = secrets.token_hex(16)
     replacement = f"{prefix[:-2]} | mid {message_id}:{raw_challenge}. "
-    challenged = wire[:index] + replacement + suffix[len(prefix):]
+    challenged = wire[:index] + replacement + suffix[len(prefix) :]
     return challenged, hashlib.sha256(raw_challenge.encode()).hexdigest()
 
 
@@ -508,6 +513,10 @@ def request_delivery(terminal_id: str) -> None:
     if not isinstance(service, InboxService):
         return
 
+    # F339: suppress delivery for terminals already abandoned as ghosts.
+    if service._f339_is_abandoned(terminal_id):
+        return
+
     old_handle: Any = None
     post_immediate = False
 
@@ -577,6 +586,9 @@ def clear_terminal_delivery_state(terminal_id: str) -> None:
             service._binding_suppress_counts.pop(terminal_id, None)
         with service._gone_lock:
             service._gone_streaks.pop(terminal_id, None)
+        # F339: clear ghost-terminal streak on explicit state reset.
+        with service._tnf_lock:
+            service._terminal_not_found_streaks.pop(terminal_id, None)
     clear_binding_staleness_state(terminal_id)
 
 
@@ -625,6 +637,9 @@ class InboxService:
         self._binding_lock = threading.Lock()
         self._gone_streaks: dict[str, int] = {}
         self._gone_lock = threading.Lock()
+        # F339: consecutive terminal-not-found streaks for ghost-terminal detection.
+        self._terminal_not_found_streaks: dict[str, int] = {}
+        self._tnf_lock = threading.Lock()
         self._delivery_loop: asyncio.AbstractEventLoop | None = None
         self._delivery_registry: PluginRegistry | None = None
         self._posted_delivery_wakes: set[tuple[str, int]] = set()
@@ -767,6 +782,10 @@ class InboxService:
 
     def _f136_run_callback_delivery(self, terminal_id: str) -> "CallbackRunOutcome":
         """D13/D14: Bounded replay-first, cursor-second write protocol."""
+        # F339: if already abandoned, exit immediately without DB queries.
+        if self._f339_is_abandoned(terminal_id):
+            return CallbackRunOutcome(reason="abandoned_no_terminal")
+
         from cli_agent_orchestrator.clients.database import (
             CallbackBatchResult,
             commit_supervisor_callback_progress,
@@ -794,14 +813,17 @@ class InboxService:
         with SessionLocal() as db:
             inc = db.query(MailboxIncarnationModel).filter_by(terminal_id=terminal_id).one_or_none()
             if inc is None:
-                return CallbackRunOutcome(reason="no_incarnation")
+                return self._f339_record_not_found(terminal_id, "no_incarnation")
             mailbox = db.query(MailboxModel).filter_by(id=inc.mailbox_id).one_or_none()
             if mailbox is None:
-                return CallbackRunOutcome(reason="no_mailbox")
+                return self._f339_record_not_found(terminal_id, "no_mailbox")
             mailbox_id = str(mailbox.id)
             generation = int(mailbox.generation)
             session_name = str(mailbox.session_name)
             role = str(mailbox.role)
+
+        # F339: incarnation + mailbox found — reset ghost-terminal streak.
+        self._f339_reset_not_found(terminal_id)
 
         # D10: acquire delivery_lock then authority lock
         delivery_lock = get_delivery_lock(terminal_id)
@@ -881,13 +903,20 @@ class InboxService:
             _fx168_stale_heal_needed: tuple[str, str] | None = None
             if batch.inbox_path:
                 try:
-                    from cli_agent_orchestrator.clients.database import get_terminal_metadata as _get_meta
+                    from cli_agent_orchestrator.clients.database import (
+                        get_terminal_metadata as _get_meta,
+                    )
+
                     _meta = _get_meta(terminal_id)
-                    _current_path = ((_meta.get("metadata") or {}).get("cc_team_inbox_path") if _meta else None)
+                    _current_path = (
+                        (_meta.get("metadata") or {}).get("cc_team_inbox_path") if _meta else None
+                    )
                     if _current_path and _current_path != batch.inbox_path:
                         _fx168_stale_heal_needed = (batch.inbox_path, _current_path)
                 except Exception as _heal_exc:
-                    logger.debug("fx168_stale_path_check_failed terminal=%s: %s", terminal_id, _heal_exc)
+                    logger.debug(
+                        "fx168_stale_path_check_failed terminal=%s: %s", terminal_id, _heal_exc
+                    )
 
             if _fx168_stale_heal_needed is not None:
                 # Cannot reconcile while holding locks (set_supervisor_callback_inbox_path
@@ -947,7 +976,9 @@ class InboxService:
                     identity_conflicts += 1
                     logger.error(
                         "f136_identity_conflict mailbox=%s row=%s reason=%s",
-                        mailbox_id, row.inbox_row_id, result.reason,
+                        mailbox_id,
+                        row.inbox_row_id,
+                        result.reason,
                     )
                     break  # Stop at conflict
 
@@ -975,9 +1006,12 @@ class InboxService:
                     _failure_streaks.pop(terminal_id, None)
                 elif progress.kind == "path_changed":
                     return CallbackRunOutcome(
-                        selected=len(batch.rows), processed=processed,
-                        cursor_before=cursor_before, cursor_after=cursor_before,
-                        written=written, already_present=already_present,
+                        selected=len(batch.rows),
+                        processed=processed,
+                        cursor_before=cursor_before,
+                        cursor_after=cursor_before,
+                        written=written,
+                        already_present=already_present,
                         reason="path_changed_during_run",
                         needs_immediate_wake=True,
                     )
@@ -1032,7 +1066,13 @@ class InboxService:
         try:
             meta_record = get_terminal_metadata(terminal_id)
             if not meta_record:
+                # F339: terminal metadata absent — record streak toward ghost detection.
+                # Note: we don't abandon here (the caller handles retries), but we
+                # increment so repeated failures across delivery attempts accumulate.
+                self._f339_record_not_found(terminal_id, "no_terminal_metadata_f150")
                 return False
+            # F339: terminal metadata found — reset ghost-terminal streak.
+            self._f339_reset_not_found(terminal_id)
             md = meta_record.get("metadata") or {}
             candidate_path = md.get("cc_team_inbox_path")
             if not candidate_path:
@@ -1048,8 +1088,48 @@ class InboxService:
             logger.debug("F150 self-heal inbox path failed: %s", exc)
             return False
 
+    # ------------------------------------------------------------------
+    # F339: Ghost-terminal detection — stop polling after N consecutive 404s
+    # ------------------------------------------------------------------
+
+    def _f339_record_not_found(self, terminal_id: str, reason: str) -> "CallbackRunOutcome":
+        """Increment ghost-terminal streak; abandon episode at threshold."""
+        with self._tnf_lock:
+            streak = self._terminal_not_found_streaks.get(terminal_id, 0) + 1
+            self._terminal_not_found_streaks[terminal_id] = streak
+
+        if streak >= _F339_TERMINAL_NOT_FOUND_MAX:
+            logger.warning(
+                "f339_abandoned_no_terminal terminal=%s reason=%s streak=%d"
+                " — delivery permanently stopped for this episode",
+                terminal_id,
+                reason,
+                streak,
+            )
+            # Clear wake state so no further retries are scheduled
+            with _delivery_seq_guard:
+                _wake_states.pop(terminal_id, None)
+            return CallbackRunOutcome(reason="abandoned_no_terminal")
+        return CallbackRunOutcome(reason=reason)
+
+    def _f339_reset_not_found(self, terminal_id: str) -> None:
+        """Reset ghost-terminal streak on successful terminal lookup."""
+        with self._tnf_lock:
+            self._terminal_not_found_streaks.pop(terminal_id, None)
+
+    def _f339_is_abandoned(self, terminal_id: str) -> bool:
+        """Check if a terminal has been marked as abandoned (ghost)."""
+        with self._tnf_lock:
+            return (
+                self._terminal_not_found_streaks.get(terminal_id, 0) >= _F339_TERMINAL_NOT_FOUND_MAX
+            )
+
     def _f136_post_delivery(self, terminal_id: str, outcome: "CallbackRunOutcome") -> None:
         """D15: After delivery, decide: immediate rerun, delayed retry, or idle."""
+        # F339: If the episode was abandoned (ghost terminal), suppress all retries.
+        if outcome.reason == "abandoned_no_terminal":
+            return
+
         # fx168 FIX-2: Perform stale-path reconcile outside the runner's lock scope.
         # set_supervisor_callback_inbox_path acquires its own locks and signals
         # request_delivery internally; the needs_immediate_wake flag re-arms the runner.
@@ -1059,6 +1139,7 @@ class InboxService:
                 from cli_agent_orchestrator.services.mailbox_service import (
                     set_supervisor_callback_inbox_path,
                 )
+
                 _heal_result = set_supervisor_callback_inbox_path(
                     mailbox_id=_mb_id,
                     terminal_id=_term_id,
@@ -1068,23 +1149,34 @@ class InboxService:
                 if _heal_result.kind in ("updated", "unchanged"):
                     logger.info(
                         "fx168_stale_path_healed mailbox=%s terminal=%s new_path=%s",
-                        _mb_id, _term_id, _new_path,
+                        _mb_id,
+                        _term_id,
+                        _new_path,
                     )
             except Exception as _heal_exc:
-                logger.debug("fx168_stale_path_heal_post_delivery_failed terminal=%s: %s", terminal_id, _heal_exc)
+                logger.debug(
+                    "fx168_stale_path_heal_post_delivery_failed terminal=%s: %s",
+                    terminal_id,
+                    _heal_exc,
+                )
 
         # F168 D2: ring the doorbell before entering _delivery_seq_guard.
         # D3: best-effort, isolated — exceptions never propagate.
         if outcome.written > 0 and outcome.max_written_row_id > 0:
             try:
-                from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+                from cli_agent_orchestrator.services.doorbell_service import (
+                    ring_supervisor_doorbell,
+                )
+
                 ring_supervisor_doorbell(
                     terminal_id,
                     outcome.max_written_row_id,
                     written_count=outcome.written,
                 )
             except Exception as _bell_exc:
-                logger.debug("f168_doorbell_post_delivery_error terminal=%s: %s", terminal_id, _bell_exc)
+                logger.debug(
+                    "f168_doorbell_post_delivery_error terminal=%s: %s", terminal_id, _bell_exc
+                )
 
         post_immediate = False
         arm_delayed: float | None = None
@@ -1129,9 +1221,7 @@ class InboxService:
                         st.immediate_admitted = False
         elif arm_delayed is not None:
             try:
-                loop.call_soon_threadsafe(
-                    self._f136_arm_delayed, terminal_id, arm_delayed
-                )
+                loop.call_soon_threadsafe(self._f136_arm_delayed, terminal_id, arm_delayed)
             except RuntimeError:
                 pass
 
@@ -2003,6 +2093,10 @@ class InboxService:
         ``send_message`` orchestration type are threaded to ``terminal_service``
         so ``PostSendMessageEvent`` hooks fire with correct attribution.
         """
+        # F339: skip delivery for terminals already abandoned as ghosts.
+        if self._f339_is_abandoned(terminal_id):
+            return
+
         with _delivery_seq_guard:
             captured_wake = _delivery_wake_seq.get(terminal_id, 0)
         delivery_lock = get_delivery_lock(terminal_id)
@@ -2014,8 +2108,16 @@ class InboxService:
             return
         try:
             metadata = get_terminal_metadata(terminal_id) or {}
+            if not metadata:
+                # F339: terminal row absent — record streak and bail if abandoned.
+                outcome = self._f339_record_not_found(terminal_id, "no_terminal_metadata")
+                if outcome.reason == "abandoned_no_terminal":
+                    return
+                return
             if metadata.get("recovery_state") not in (None, "rebound"):
                 return
+            # F339: terminal found — reset ghost-terminal streak.
+            self._f339_reset_not_found(terminal_id)
             legacy_test_seam = begin_delivery_attempt is not _PRODUCTION_BEGIN_DELIVERY_ATTEMPT
             routed_generation: int | None = None
             provider = None
@@ -3204,18 +3306,10 @@ class InboxService:
         """
         import hashlib
 
-        from cli_agent_orchestrator.clients.database import (
-            InboxModel as _InboxModel,
-        )
-        from cli_agent_orchestrator.clients.database import (
-            MailboxModel as _MBModel,
-        )
-        from cli_agent_orchestrator.clients.database import (
-            SessionLocal as _SL,
-        )
-        from cli_agent_orchestrator.clients.database import (
-            TerminalModel as _TModel,
-        )
+        from cli_agent_orchestrator.clients.database import InboxModel as _InboxModel
+        from cli_agent_orchestrator.clients.database import MailboxModel as _MBModel
+        from cli_agent_orchestrator.clients.database import SessionLocal as _SL
+        from cli_agent_orchestrator.clients.database import TerminalModel as _TModel
         from cli_agent_orchestrator.clients.database import (
             begin_delivery_attempt,
             settle_delivery_attempt,
@@ -3249,7 +3343,9 @@ class InboxService:
 
                 # D3 condition 3: live terminals row exists
                 with _SL() as db:
-                    terminal_row = db.query(_TModel).filter_by(id=mb.current_terminal_id).one_or_none()
+                    terminal_row = (
+                        db.query(_TModel).filter_by(id=mb.current_terminal_id).one_or_none()
+                    )
                 if terminal_row is None:
                     continue
 
@@ -3273,7 +3369,8 @@ class InboxService:
                         if pending_count > 0:
                             logger.warning(
                                 "fx158_gate5_unregistered terminal=%s pending=%d",
-                                tid, pending_count,
+                                tid,
+                                pending_count,
                             )
                             _fx158_gate5_last_warn[tid] = now_ts
                     continue
@@ -3340,10 +3437,15 @@ class InboxService:
                 # systematic contention that fx168 FIX-4 identified at the primary site.
                 if outcome.pushed and outcome.message_ids:
                     try:
-                        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+                        from cli_agent_orchestrator.services.doorbell_service import (
+                            ring_supervisor_doorbell,
+                        )
+
                         max_id = max(outcome.message_ids)
                         ring_supervisor_doorbell(
-                            mb.current_terminal_id, max_id, written_count=1,
+                            mb.current_terminal_id,
+                            max_id,
+                            written_count=1,
                             caller_holds_no_delivery_lock=True,
                         )
                     except Exception:
@@ -3385,16 +3487,21 @@ class InboxService:
                 # programming errors (ORM detachment, type errors) that indicate
                 # broken code and would silently kill every tick forever.
                 from sqlalchemy.exc import InterfaceError as _SAInterfaceError
+
                 _D9_TRANSIENT_TYPES = (OSError, OperationalError, TimeoutError, _SAInterfaceError)
                 if isinstance(e, _D9_TRANSIENT_TYPES):
                     logger.warning(
-                        "fx158_reconciler_transient mailbox=%s: %s", mb.id, e,
+                        "fx158_reconciler_transient mailbox=%s: %s",
+                        mb.id,
+                        e,
                     )
                 else:
                     # Programming error — surface loudly so it is not invisible.
                     logger.error(
                         "fx158_reconciler_programming_error mailbox=%s: %s",
-                        mb.id, e, exc_info=True,
+                        mb.id,
+                        e,
+                        exc_info=True,
                     )
                     # Record a durable marker so the failure is observable in
                     # delivery_attempts even if logs rotate.
@@ -3404,9 +3511,7 @@ class InboxService:
                         from cli_agent_orchestrator.clients.database import (
                             InboxDeliveryAttemptModel as _AttemptModel,
                         )
-                        from cli_agent_orchestrator.clients.database import (
-                            SessionLocal as _ErrSL,
-                        )
+                        from cli_agent_orchestrator.clients.database import SessionLocal as _ErrSL
 
                         _now = _utcnow()
                         _err_row = _AttemptModel(
