@@ -822,6 +822,9 @@ class InboxService:
             session_name = str(mailbox.session_name)
             role = str(mailbox.role)
 
+        # F339: incarnation + mailbox found — reset ghost-terminal streak.
+        self._f339_reset_not_found(terminal_id)
+
         # D10: acquire delivery_lock then authority lock
         delivery_lock = get_delivery_lock(terminal_id)
         if not delivery_lock.acquire(timeout=0.5):
