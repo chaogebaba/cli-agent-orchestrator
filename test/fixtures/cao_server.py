@@ -434,6 +434,11 @@ _PROVIDER_HOME_SYMLINKS: tuple[str, ...] = (
     # runtime via HOME/.local/, so the entire .local tree must be reachable —
     # symlinking only .local/share/kiro-cli is insufficient (blank pane).
     ".local",
+    # Shell profile: tmux starts a login shell that sources $HOME/.profile
+    # (which sources .bashrc). Without these, PATH in the tmux pane has no
+    # user customizations and provider binaries in ~/.local/bin are not found.
+    ".profile",
+    ".bashrc",
     # cline_cli: _CLINE_USER_DATA = Path.home() / ".cline" / "data"
     ".cline",
     # grok_cli: GROK_BINARY = Path.home() / ".grok" / "bin" / "grok"
