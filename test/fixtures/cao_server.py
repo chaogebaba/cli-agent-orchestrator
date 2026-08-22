@@ -429,6 +429,16 @@ _PROVIDER_HOME_SYMLINKS: tuple[str, ...] = (
     ".bun",
     # kiro_cli: KIRO_AGENTS_DIR = Path.home() / ".kiro" / "agents"
     ".kiro",
+    # kiro_cli: KAS runtime, node/bun binaries, and kiro-cli-chat binary all
+    # live under ~/.local/. kiro-cli-chat resolves sibling binaries and the KAS
+    # runtime via HOME/.local/, so the entire .local tree must be reachable —
+    # symlinking only .local/share/kiro-cli is insufficient (blank pane).
+    ".local",
+    # Shell profile: tmux starts a login shell that sources $HOME/.profile
+    # (which sources .bashrc). Without these, PATH in the tmux pane has no
+    # user customizations and provider binaries in ~/.local/bin are not found.
+    ".profile",
+    ".bashrc",
     # cline_cli: _CLINE_USER_DATA = Path.home() / ".cline" / "data"
     ".cline",
     # grok_cli: GROK_BINARY = Path.home() / ".grok" / "bin" / "grok"
@@ -476,6 +486,7 @@ def _seed_provider_home_prerequisites(home_dir: Path) -> None:
         source = real_home / dotdir
         target = home_dir / dotdir
         if source.exists() and not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
             target.symlink_to(source)
 
 
