@@ -170,7 +170,12 @@ def emit_trace_or_collapse(
     reason: str | None,
     db: Session,
 ) -> None:
-    """D15: Repeated identical defers collapse onto existing row via counter."""
+    """D15: Repeated identical traces collapse onto existing row via counter.
+
+    F351: Extended to collapse ANY repeated identical (phase, decision, reason)
+    combination, not just "defer". The resolve+proceed trace was writing a new
+    row every 5s for every OPEN obligation — hundreds of garbage rows per hour.
+    """
     existing = (
         db.query(InboxMessageTraceEventModel)
         .filter(
@@ -181,7 +186,7 @@ def emit_trace_or_collapse(
         )
         .first()
     )
-    if existing is not None and decision == "defer":
+    if existing is not None:
         # Collapse: bump counter in payload
         p = existing.payload if isinstance(existing.payload, dict) else {}
         p["count"] = p.get("count", 1) + 1
@@ -929,6 +934,19 @@ def _drive_one_obligation(
         obl.terminal_at = now
         obl.terminal_reason = "consumed"
         emit_trace_or_collapse(obl.inbox_row_id, "ack", "settle", "consumed", db)
+        return
+
+    # F351: If the inbox message is already delivered, the obligation just waits
+    # for the consumption ack — no need to resolve target or attempt transport.
+    # Reschedule at a longer interval to avoid spinning every tick_s.
+    inbox_row = db.query(InboxModel.status).filter_by(id=obl.inbox_row_id).one_or_none()
+    if inbox_row is not None and inbox_row.status == "delivered":
+        from datetime import timedelta
+        # Back off: delivered messages just need the ack cursor to advance.
+        # Check every 30s instead of every 5s — the ack_messages call will
+        # settle it much sooner via the normal path.
+        obl.next_attempt_at = now + timedelta(seconds=max(tick_s * 6, 30.0))
+        obl.attempts += 1
         return
 
     # Check escalation threshold (D6)
