@@ -417,15 +417,27 @@ def write_to_socket(
     payload_line: str,
     *,
     connect_timeout_s: float = 5.0,
+    auth_token: Optional[str] = None,
 ) -> Optional[str]:
     """Write one JSON line to the CC session socket and half-close. No read.
 
+    F337: When auth_token is provided, sends it as the first line before the
+    payload (correct on the day the UDS gate flips; harmless now while gate is off).
+
     Returns None on success, or an error reason string on failure.
     """
+    # F216: EINVAL short-circuit — refuse empty/null socket path before connect
+    if not socket_path:
+        return "socket_path_empty"
+
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(connect_timeout_s)
     try:
         sock.connect(socket_path)
+        # F337: Optional auth first-line
+        if auth_token:
+            auth_data = (auth_token + "\n").encode("utf-8")
+            sock.sendall(auth_data)
         # Write the line + newline, then half-close (D5: no response read)
         data = (payload_line + "\n").encode("utf-8")
         sock.sendall(data)
@@ -440,6 +452,8 @@ def write_to_socket(
     except socket.timeout:
         return "socket_timeout"
     except OSError as e:
+        if e.errno == 22:  # EINVAL
+            return "socket_einval"
         return f"socket_error:{e.errno}"
     finally:
         sock.close()
