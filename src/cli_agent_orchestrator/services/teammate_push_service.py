@@ -337,15 +337,60 @@ def _should_teammate_push(terminal_id: str) -> bool:
 
 
 def _resolve_inbox_path(terminal_id: str) -> Optional[Path]:
-    """Resolve and expand the CC inbox path from terminal metadata."""
+    """Resolve and expand the CC inbox path from terminal metadata.
+
+    WPDT W3 (F152): Includes lazy-derive self-heal — if cc_team_inbox_path is
+    absent but the terminal has a working_directory and is a claude_code provider,
+    derive the path and persist it to metadata for future calls.
+    """
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:
         return None
     md = metadata.get("metadata") or {}
     raw = md.get("cc_team_inbox_path")
-    if not raw:
+    if raw:
+        return Path(os.path.expanduser(raw))
+
+    # F152 self-heal: derive path from working_directory + provider
+    provider = metadata.get("provider")
+    working_dir = metadata.get("working_directory")
+    if not working_dir or provider != "claude_code":
         return None
-    return Path(os.path.expanduser(raw))
+
+    derived = _derive_cc_team_inbox_path(working_dir)
+    if derived is None:
+        return None
+
+    # Persist to metadata for future calls
+    try:
+        from cli_agent_orchestrator.clients.database import update_terminal_metadata
+
+        new_md = dict(md)
+        new_md["cc_team_inbox_path"] = str(derived)
+        update_terminal_metadata(terminal_id, new_md)
+        logger.info("f152_self_heal terminal=%s path=%s", terminal_id, derived)
+    except Exception as e:
+        logger.debug("f152_self_heal persist failed: %s", e)
+
+    return derived
+
+
+def _derive_cc_team_inbox_path(working_directory: str) -> Optional[Path]:
+    """F152: Derive the CC team inbox path from working directory.
+
+    Uses the Claude provider's project directory encoding to build the path.
+    Returns ~/.claude/projects/{cwd_key}/team-lead.json.
+    """
+    import re
+
+    try:
+        cwd_key = re.sub(r"[^A-Za-z0-9]", "-", working_directory)
+        inbox_path = Path.home() / ".claude" / "projects" / cwd_key / "team-lead.json"
+        # Ensure parent directory exists (W3: "mkdir included")
+        inbox_path.parent.mkdir(parents=True, exist_ok=True)
+        return inbox_path
+    except Exception:
+        return None
 
 
 def _get_last_notified_id(terminal_id: str) -> int:

@@ -1298,6 +1298,44 @@ async def create_terminal(
             env_vars, terminal_id, plan=persona_plan, incarnation_token=_f138_token
         )
 
+        # WPDT W3 (F152): Derive and set cc_team_inbox_path at pane creation
+        # for claude_code supervisor terminals with teammate_push enabled.
+        from cli_agent_orchestrator.services.config_service import ConfigService as _CS
+
+        if (
+            provider == "claude_code"
+            and _CS.get("supervisor.teammate_push", default=False)
+            and not metadata
+        ):
+            _wd = working_directory or os.getcwd()
+            try:
+                from cli_agent_orchestrator.services.teammate_push_service import (
+                    _derive_cc_team_inbox_path,
+                )
+
+                _inbox_path = _derive_cc_team_inbox_path(_wd)
+                if _inbox_path is not None:
+                    metadata = {"cc_team_inbox_path": str(_inbox_path)}
+            except Exception:
+                pass
+        elif (
+            provider == "claude_code"
+            and _CS.get("supervisor.teammate_push", default=False)
+            and metadata is not None
+            and "cc_team_inbox_path" not in metadata
+        ):
+            _wd = working_directory or os.getcwd()
+            try:
+                from cli_agent_orchestrator.services.teammate_push_service import (
+                    _derive_cc_team_inbox_path,
+                )
+
+                _inbox_path = _derive_cc_team_inbox_path(_wd)
+                if _inbox_path is not None:
+                    metadata["cc_team_inbox_path"] = str(_inbox_path)
+            except Exception:
+                pass
+
         window_name = generate_window_name(agent_profile, terminal_id)
 
         # Step 1b: Provision an isolated git worktree (issue #100, Phase 1) before
