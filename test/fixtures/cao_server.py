@@ -429,10 +429,11 @@ _PROVIDER_HOME_SYMLINKS: tuple[str, ...] = (
     ".bun",
     # kiro_cli: KIRO_AGENTS_DIR = Path.home() / ".kiro" / "agents"
     ".kiro",
-    # kiro_cli: KAS runtime + node/bun binaries for `kiro-cli chat` subprocess.
-    # Without this, `kiro-cli chat --help` fails with "No such file or directory"
-    # because the chat subcommand is backed by a JS runtime in this directory.
-    ".local/share/kiro-cli",
+    # kiro_cli: KAS runtime, node/bun binaries, and kiro-cli-chat binary all
+    # live under ~/.local/. kiro-cli-chat resolves sibling binaries and the KAS
+    # runtime via HOME/.local/, so the entire .local tree must be reachable —
+    # symlinking only .local/share/kiro-cli is insufficient (blank pane).
+    ".local",
     # cline_cli: _CLINE_USER_DATA = Path.home() / ".cline" / "data"
     ".cline",
     # grok_cli: GROK_BINARY = Path.home() / ".grok" / "bin" / "grok"
