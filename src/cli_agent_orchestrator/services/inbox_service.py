@@ -2080,10 +2080,14 @@ class InboxService:
     def deliver_pending(
         self,
         terminal_id: str,
-        num_messages: int = 1,
+        num_messages: int = 0,
         registry: PluginRegistry | None = None,
     ) -> None:
         """Deliver pending message(s) to a ready terminal. Use num_messages=0 for all.
+
+        F136/WPDT W6: Default changed from 1 to 0 (drain all eligible rows per
+        wake, bounded batch). This eliminates single-message starvation where
+        N>1 pending rows required N separate wakes to drain.
 
         Status comes from the StatusMonitor (the event-driven source of truth).
         Delivery normally happens on IDLE/COMPLETED; providers that accept input

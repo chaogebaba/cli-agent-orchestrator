@@ -6493,10 +6493,15 @@ def _pending_receiver_predicate(receiver_id: str, mailbox_schema: bool):
 
 def get_pending_messages(
     receiver_id: str,
-    limit: int = 1,
+    limit: int = 100,
     excluded_message_ids: set[int] | None = None,
 ) -> List[InboxMessage]:
-    """Get pending messages ordered by created_at ASC (oldest first)."""
+    """Get pending messages ordered by id ASC (F276: strict FIFO by creation id).
+
+    WPDT W6 (F276): Changed primary sort from created_at to id. This ensures
+    assign-brief messages (created atomically with the terminal) are always
+    delivered before later send_message calls, even when timestamps collide.
+    """
     excluded = set(excluded_message_ids or ())
     with SessionLocal() as db:
         mailbox_schema = _mailbox_schema_available(db)
@@ -6506,7 +6511,8 @@ def get_pending_messages(
         )
         if excluded:
             query = query.filter(~InboxModel.id.in_(excluded))
-        rows = query.order_by(InboxModel.created_at.asc(), InboxModel.id.asc()).limit(limit).all()
+        # F276: enforce per-terminal FIFO by creation id at delivery time
+        rows = query.order_by(InboxModel.id.asc()).limit(limit).all()
         return [
             InboxMessage(
                 id=row.id,
