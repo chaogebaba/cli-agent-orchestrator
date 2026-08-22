@@ -172,6 +172,10 @@ class TestValidateFrontmatter:
         messages = _validate_frontmatter({"name": "x", key: value})
         assert any("[error]" in message and key in message for message in messages)
 
+    def test_claude_config_accepted(self):
+        meta = {"name": "x", "claudeConfig": {"effort": "high"}}
+        assert _validate_frontmatter(meta) == []
+
 
 class TestAgentsListCommand:
     """Tests for cao agents list."""

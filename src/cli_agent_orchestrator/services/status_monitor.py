@@ -1529,7 +1529,7 @@ class StatusMonitor:
             except RuntimeError:
                 pass  # loop already closed during shutdown — the timer is moot
 
-    def notify_input_sent(self, terminal_id: str) -> None:
+    def notify_input_sent(self, terminal_id: str, *, assume_processing: bool = False) -> None:
         """Arm the next PROCESSING transition.
 
         Call before any send_keys / paste that initiates a new processing
@@ -1549,6 +1549,8 @@ class StatusMonitor:
                 self._processing_gen.get(terminal_id, 0),
                 self._status_gen.get(terminal_id, 0),
             )
+            if assume_processing:
+                self._apply_detection(terminal_id, TerminalStatus.PROCESSING)
 
     def get_input_gen(self, terminal_id: str) -> int:
         """Return the current input-event generation for a terminal."""

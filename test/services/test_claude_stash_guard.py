@@ -17,6 +17,7 @@ class StashProvider:
     blocks_orchestrated_input_while_waiting_user_answer = True
     paste_enter_count = 1
     paste_submit_delay = 0.3
+    assume_processing_on_dispatch = False
 
     def read_composer_draft(self, lines):
         for index, line in enumerate(lines):

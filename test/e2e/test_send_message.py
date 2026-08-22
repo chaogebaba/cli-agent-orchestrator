@@ -505,3 +505,11 @@ class TestClineCliSendMessage:
     def test_send_message_to_inbox(self, require_cline):
         """Standard inbox delivery test for cline_cli provider."""
         _run_send_message_test(provider="cline_cli", agent_profile="cline_dev")
+
+
+@pytest.mark.e2e
+class TestMiniMaxCodeSendMessage:
+    """E2E inbox delivery test for MiniMax Code."""
+
+    def test_send_message_to_inbox(self, require_minimax_code):
+        _run_send_message_test(provider="mcode", agent_profile="developer")

@@ -156,6 +156,7 @@ class _Provider:
         self.composer_stash_keys = None
         self.paste_enter_count = 1
         self.paste_submit_delay = 0.0
+        self.assume_processing_on_dispatch = False
 
     def resolve_native_status(self, native):
         return NativeResolution(native, None, None)

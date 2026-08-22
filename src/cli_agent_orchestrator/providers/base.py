@@ -81,6 +81,20 @@ class TerminalArtifactValidation(ArtifactValidationError):
     """The observed artifact is terminally invalid for this init attempt."""
 
 
+class OutputExtractionError(ValueError):
+    """A provider ran but no usable message could be extracted from its output.
+
+    Distinct from the ``ValueError``s that name a bad terminal or provider
+    reference, which are genuine lookup failures. This one means the terminal
+    exists and the step ran; only the response marker was missing from the
+    scrollback.
+
+    Subclasses ``ValueError`` so existing ``except ValueError`` callers keep
+    working; the API boundary catches this narrower type first so an extraction
+    failure is not reported as 404 Not Found (issue #570).
+    """
+
+
 class BaseProvider(ABC):
     supports_fork_context: bool = False
     supports_reauth_rebind: bool = False
@@ -430,6 +444,17 @@ class BaseProvider(ABC):
         task text would be interpreted as the answer to that prompt. Providers
         with those surfaces can opt in so CAO blocks orchestrated task delivery
         while still allowing explicit user-prompt answers.
+        """
+        return False
+
+    @property
+    def assume_processing_on_dispatch(self) -> bool:
+        """Publish PROCESSING immediately when a task is dispatched.
+
+        Most CLIs repaint quickly enough for their first activity frame to
+        drive the transition. Full-screen TUIs that can remain visually
+        unchanged just after submission opt in so callers cannot observe the
+        previous turn's cached COMPLETED state as the new turn's result.
         """
         return False
 
