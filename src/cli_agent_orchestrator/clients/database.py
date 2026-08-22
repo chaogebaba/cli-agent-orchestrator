@@ -3066,14 +3066,40 @@ def create_terminal_with_warm_intent(
         return {"id": terminal_id, "tmux_session": tmux_session, "tmux_window": tmux_window}
 
 
+# ---------------------------------------------------------------------------
+# F351: TTL cache for get_terminal_metadata — eliminates repeated identical DB
+# queries within the same tick cycle (watchdog, status_monitor, delivery all
+# call this for the same terminal_id within milliseconds of each other).
+# ---------------------------------------------------------------------------
+import threading as _threading_cache
+
+_terminal_metadata_cache: Dict[str, tuple[float, Any]] = {}
+_terminal_metadata_cache_lock = _threading_cache.Lock()
+_TERMINAL_METADATA_TTL_S = 2.0
+
+
+def invalidate_terminal_metadata_cache(terminal_id: str) -> None:
+    """Evict a terminal's cached metadata after a mutation."""
+    with _terminal_metadata_cache_lock:
+        _terminal_metadata_cache.pop(terminal_id, None)
+
+
 def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
-    """Get terminal metadata by ID."""
+    """Get terminal metadata by ID (F351: TTL-cached to eliminate N+1 per tick)."""
     import json as _json
+
+    now = time.monotonic()
+    with _terminal_metadata_cache_lock:
+        entry = _terminal_metadata_cache.get(terminal_id)
+        if entry is not None and (now - entry[0]) < _TERMINAL_METADATA_TTL_S:
+            return entry[1]
 
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if not terminal:
             logger.warning(f"Terminal metadata not found for terminal_id: {terminal_id}")
+            with _terminal_metadata_cache_lock:
+                _terminal_metadata_cache[terminal_id] = (now, None)
             return None
         logger.debug(
             f"Retrieved terminal metadata for {terminal_id}: provider={terminal.provider}, session={terminal.tmux_session}"
@@ -3086,7 +3112,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             if isinstance(terminal.worktree_info, str)
             else None
         )
-        return {
+        result: Dict[str, Any] = {
             "id": terminal.id,
             "tmux_session": terminal.tmux_session,
             "tmux_window": terminal.tmux_window,
@@ -3116,6 +3142,9 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "worktree_info": worktree_info_raw,
             "last_active": terminal.last_active,
         }
+        with _terminal_metadata_cache_lock:
+            _terminal_metadata_cache[terminal_id] = (now, result)
+        return result
 
 
 def terminal_exists(terminal_id: str) -> bool:
@@ -3136,7 +3165,8 @@ def update_terminal_group(terminal_id: str, group: Optional[List[str]]) -> bool:
             return False
         terminal.group = _json.dumps(group) if group else None
         db.commit()
-        return True
+    invalidate_terminal_metadata_cache(terminal_id)
+    return True
 
 
 def update_terminal_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]]) -> bool:
@@ -3171,7 +3201,8 @@ def update_terminal_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]
             new_meta = {"cao": existing_cao} if existing_cao else None
         terminal.metadata_json = _json.dumps(new_meta) if new_meta else None
         db.commit()
-        return True
+    invalidate_terminal_metadata_cache(terminal_id)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -3437,7 +3468,14 @@ def list_siblings_by_group_prefix(
 
 
 def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
-    """List all terminals in a tmux session."""
+    """List all terminals in a tmux session (F351: TTL-cached)."""
+    now = time.monotonic()
+    cache_key = f"__session__{tmux_session}"
+    with _terminal_metadata_cache_lock:
+        entry = _terminal_metadata_cache.get(cache_key)
+        if entry is not None and (now - entry[0]) < _TERMINAL_METADATA_TTL_S:
+            return entry[1]
+
     with SessionLocal() as db:
         terminals = db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).all()
         results = []
@@ -3483,7 +3521,9 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 # ObjectDeletedError (or similar) instead of crashing the pass
                 logger.debug("list_terminals_by_session: skipping stale row: %s", exc)
                 continue
-        return results
+    with _terminal_metadata_cache_lock:
+        _terminal_metadata_cache[cache_key] = (now, results)
+    return results
 
 
 def update_last_active(terminal_id: str) -> bool:
@@ -4262,10 +4302,12 @@ def delete_terminal_and_warm_intent(
                 db.query(WarmIntentModel).filter_by(worker_terminal_id=terminal_id).delete() > 0
             )
         terminal_deleted = db.query(TerminalModel).filter_by(id=terminal_id).delete() > 0
-        return {
-            "terminal_deleted": terminal_deleted,
-            "intent_deleted": intent_deleted,
-        }
+    # F351: evict from metadata cache after deletion
+    invalidate_terminal_metadata_cache(terminal_id)
+    return {
+        "terminal_deleted": terminal_deleted,
+        "intent_deleted": intent_deleted,
+    }
 
 
 def list_warm_intents(session_name: str) -> List[Dict[str, Any]]:
@@ -8886,8 +8928,64 @@ def get_supervisor_callback_batch(
     """D9: Get a batch of rows needing callback notification.
 
     Handles bootstrap, legacy adoption, replay cleaning, and combined selection.
+
+    F351: Cheap-emptiness fast-path — when the cursor is set and no deliverable
+    rows exist beyond it, skip the expensive BEGIN IMMEDIATE transaction.
     """
     try:
+        # F351: lightweight pre-check (read-only, no exclusive lock)
+        with SessionLocal() as db:
+            _pre = (
+                db.query(
+                    MailboxModel.callback_notified_through_id,
+                    MailboxModel.current_terminal_id,
+                    MailboxModel.generation,
+                    MailboxModel.cc_inbox_path,
+                )
+                .filter_by(id=mailbox_id)
+                .one_or_none()
+            )
+            if _pre is not None and _pre.cc_inbox_path and _pre.callback_notified_through_id is not None:
+                if _pre.current_terminal_id == terminal_id and int(_pre.generation) == generation:
+                    _cursor_val = int(_pre.callback_notified_through_id)
+                    _has_work = db.query(
+                        db.query(InboxModel.id)
+                        .filter(
+                            InboxModel.logical_receiver_id == mailbox_id,
+                            InboxModel.enqueue_generation == generation,
+                            InboxModel.id > _cursor_val,
+                            InboxModel.status == MessageStatus.PENDING.value,
+                        )
+                        .exists()
+                    ).scalar()
+                    if not _has_work:
+                        _has_replay = db.query(
+                            db.query(CallbackReplayQueueModel.id)
+                            .filter(CallbackReplayQueueModel.mailbox_id == mailbox_id)
+                            .exists()
+                        ).scalar()
+                        if not _has_replay:
+                            _has_legacy = db.query(
+                                db.query(InboxModel.id)
+                                .filter(
+                                    InboxModel.receiver_id == terminal_id,
+                                    InboxModel.logical_receiver_id.is_(None),
+                                    InboxModel.status == MessageStatus.PENDING.value,
+                                )
+                                .exists()
+                            ).scalar()
+                            if not _has_legacy:
+                                return CallbackBatchResult(
+                                    kind="ok",
+                                    rows=(),
+                                    has_more=False,
+                                    cursor=_cursor_val,
+                                    inbox_path=str(_pre.cc_inbox_path),
+                                    path_version=0,
+                                    bootstrap_mode=None,
+                                    reason=None,
+                                )
+
         with SessionLocal() as db:
             db.execute(text("BEGIN IMMEDIATE"))
 
