@@ -72,9 +72,10 @@ WAITING_USER_ANSWER_PATTERN = (
     # F264: first-run trust-directory dialog footer (bottom row)
     r"|Enter or y to trust\b"
 )
-# Real grok dialogs render in the bottom rows (question + options + footer = 5 rows max).
-# Waiting signals from higher scrollback rows are stale quoted prose, not real dialogs.
-WAITING_VIEWPORT_ROWS = 5
+# F354: geometry-derived — grok trust dialog footer renders at row 41 in a 49-row
+# pane (8 rows from bottom); must reach it (≥8) while excluding F264's quoted-footer
+# text at row 1 in a 21-row negative (safe up to 19).  10 gives comfortable margin.
+WAITING_VIEWPORT_ROWS = 10
 ERROR_PATTERN = (
     r"^\s*(?:"
     r"Error:\s+.+"

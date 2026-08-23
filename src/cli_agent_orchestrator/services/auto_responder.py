@@ -57,7 +57,10 @@ KEY_DELAY_S = 0.1
 UNKNOWN_DIALOG_PUSH_FLOOR_S = 300.0
 UNKNOWN_DIALOG_PAYLOAD_CHARS = 600
 DIALOG_PROXIMITY_CHARS = 200
-DIALOG_REGION_LINES = 15
+# F354: geometry-derived — grok trust dialog question renders 16–17 rows above
+# pane bottom (above ASCII banner); must reach it (≥17) while staying below the
+# M2/F55 quoted-prose suppression boundary (≤23).
+DIALOG_REGION_LINES = 20
 
 # F86: Known permission/AskUserQuestion patterns — these are interactive prompts
 # from the host CLI (claude_code, kiro) that should NOT trigger unknown-dialog
