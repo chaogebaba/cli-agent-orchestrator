@@ -462,6 +462,19 @@ def _backlog_observation(
     )
 
 
+def _boundary_observation(status):
+    """F353: stub matching what the delivery busy-gate reads in inbox_service."""
+    return BoundaryObservation(
+        observation_epoch="epoch",
+        status=status,
+        status_gen=0,
+        input_gen=0,
+        seq=0,
+        last_non_ready_seq=None,
+        last_ready_seq=None,
+    )
+
+
 def test_f13_ready_backlog_alert_once_and_never_retries_receiver():
     service = StalledCallbackWatchdog()
     observation = _backlog_observation()
@@ -480,6 +493,11 @@ def test_f13_ready_backlog_alert_once_and_never_retries_receiver():
         patch(
             "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
             return_value=TerminalStatus.IDLE,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor."
+            "get_boundary_observation",
+            return_value=_boundary_observation(TerminalStatus.IDLE),
         ),
         patch(
             "cli_agent_orchestrator.services.stalled_callback_watchdog."
@@ -536,6 +554,11 @@ def test_f13_ready_backlog_suppressed_while_open_and_progress_resets_clock():
             return_value=TerminalStatus.COMPLETED,
         ),
         patch(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor."
+            "get_boundary_observation",
+            return_value=_boundary_observation(TerminalStatus.COMPLETED),
+        ),
+        patch(
             "cli_agent_orchestrator.services.stalled_callback_watchdog."
             "CAO_WAITING_INBOX_GRACE_SECONDS",
             10,
@@ -557,6 +580,105 @@ def test_f13_ready_backlog_suppressed_while_open_and_progress_resets_clock():
 
     create.assert_called_once()
     assert service._ready_backlog_episodes == {}
+
+
+def test_f353_ready_backlog_no_alert_when_delivery_busy_gate_says_busy():
+    """F353 #208: busy terminal + aged pending message -> no alert.
+
+    The watchdog's status view can lag at IDLE while the provider pane runs a
+    long shell command; the delivery busy-gate (boundary observation) correctly
+    reports PROCESSING and holds delivery. An aged message with no attempt is
+    then normal queueing, not an incident.
+    """
+    service = StalledCallbackWatchdog()
+    observation = _backlog_observation()
+    metadata = {"caller_id": "caller", "agent_profile": "kiro"}
+    with (
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "list_ready_backlog_observations",
+            return_value=[observation],
+        ),
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "get_terminal_metadata",
+            return_value=metadata,
+        ),
+        # Watchdog's own (stale/lagging) status source says idle...
+        patch(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
+            return_value=TerminalStatus.IDLE,
+        ),
+        # ...but the delivery busy-gate's source says the pane is busy.
+        patch(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor."
+            "get_boundary_observation",
+            return_value=_boundary_observation(TerminalStatus.PROCESSING),
+        ),
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "CAO_WAITING_INBOX_GRACE_SECONDS",
+            10,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.mailbox_service."
+            "create_routed_inbox_message"
+        ) as create,
+    ):
+        # Well past the grace window — the alert would have fired pre-fix.
+        service.tick_ready_backlog(now=100.0)
+        service.tick_ready_backlog(now=200.0)
+        service.tick_ready_backlog(now=400.0)
+
+    create.assert_not_called()
+    # Episode stays retired while the terminal is busy; the clock restarts
+    # only once the terminal is actually deliverable again.
+    assert service._ready_backlog_episodes == {}
+
+
+def test_f353_ready_backlog_alert_fires_when_deliverable_and_unattempted():
+    """F353 #208: deliverable terminal + aged message + no attempt -> alert."""
+    service = StalledCallbackWatchdog()
+    observation = _backlog_observation()
+    metadata = {"caller_id": "caller", "agent_profile": "kiro"}
+    with (
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "list_ready_backlog_observations",
+            return_value=[observation],
+        ),
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "get_terminal_metadata",
+            return_value=metadata,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor.get_status",
+            return_value=TerminalStatus.IDLE,
+        ),
+        # Busy-gate agrees the terminal is genuinely deliverable.
+        patch(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor."
+            "get_boundary_observation",
+            return_value=_boundary_observation(TerminalStatus.IDLE),
+        ),
+        patch(
+            "cli_agent_orchestrator.services.stalled_callback_watchdog."
+            "CAO_WAITING_INBOX_GRACE_SECONDS",
+            10,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.mailbox_service."
+            "create_routed_inbox_message"
+        ) as create,
+    ):
+        service.tick_ready_backlog(now=100.0)
+        service.tick_ready_backlog(now=111.0)
+
+    create.assert_called_once()
+    sender, receiver, message = create.call_args.args
+    assert (sender, receiver) == ("watchdog:receiver", "caller")
+    assert "message 17 aged 100s" in message
 
 
 def test_f13_backlog_fingerprint_observes_coalesced_deferred_last_at(delivery_db):

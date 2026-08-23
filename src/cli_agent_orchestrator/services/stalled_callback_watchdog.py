@@ -1465,8 +1465,27 @@ class StalledCallbackWatchdog:
                 none_behavior="watchdog",
                 monitor=status_monitor,
             )
+            # F353 #208: an aged pending message on a terminal the delivery
+            # busy-gate considers busy is normal queueing, not a stuck
+            # backlog. The delivery admission gate (inbox_service) reads
+            # status_monitor's boundary observation, which correctly stays
+            # non-ready while the provider pane runs a long command even when
+            # this tick's status view lags at IDLE. Defer to that source:
+            # suppress the alert whenever the busy-gate would hold delivery.
+            try:
+                delivery_gate_status = status_monitor.get_boundary_observation(
+                    terminal_id
+                ).status
+            except Exception:
+                delivery_gate_status = None
+            busy_per_delivery_gate = (
+                delivery_gate_status is not None
+                and delivery_gate_status
+                not in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
+            )
             if (
                 status not in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
+                or busy_per_delivery_gate
                 or observation.oldest_pending_age_seconds <= CAO_WAITING_INBOX_GRACE_SECONDS
                 or observation.has_open_delivering_attempt
             ):
