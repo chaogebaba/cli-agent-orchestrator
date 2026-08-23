@@ -265,6 +265,14 @@ class StatusMonitor:
         # --- unregister / quarantine state (B5, f100) ---
         self._consecutive_errors: Dict[str, int] = {}
         self._quarantined: set[str] = set()
+        # --- ghost-terminal tolerance (F360, issue #215) ---
+        # Consecutive "Terminal ... not found in database" misses per terminal
+        # id from provider_manager.get_provider(). One miss is tolerated (the
+        # row may not be committed yet during creation); after a second
+        # consecutive miss the ghost id is dropped from the watch state with a
+        # single warning instead of raising on every output chunk forever.
+        self._provider_not_found_count: Dict[str, int] = {}
+        self._dropped_not_found: set[str] = set()
 
     @property
     def receiver_state_store(self) -> ReceiverStateStore:
@@ -933,7 +941,39 @@ class StatusMonitor:
           resumed) and at quiescence (output stopped) — see
           _schedule_screen_detection.
         """
-        provider = provider_manager.get_provider(terminal_id)
+        # F360 (#215): a ghost terminal id (DB row deleted, e.g. by a failed
+        # create that unwound its registration, while buffered output events
+        # still arrive) makes get_provider raise ValueError on every chunk.
+        # Tolerate one miss (creation window), then drop the ghost from the
+        # watch state with one warning instead of erroring forever.
+        if terminal_id in self._dropped_not_found:
+            return
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except ValueError as exc:
+            if "not found in database" not in str(exc):
+                raise
+            misses = self._provider_not_found_count.get(terminal_id, 0) + 1
+            self._provider_not_found_count[terminal_id] = misses
+            if misses > 1:
+                self._dropped_not_found.add(terminal_id)
+                logger.warning(
+                    "StatusMonitor: terminal %s not found in database %d times; "
+                    "dropping ghost terminal from watch state (issue #215)",
+                    terminal_id,
+                    misses,
+                )
+                self.clear_terminal(terminal_id)
+            else:
+                logger.debug(
+                    "StatusMonitor: terminal %s not found in database yet "
+                    "(miss %d); tolerating",
+                    terminal_id,
+                    misses,
+                )
+            return
+        if terminal_id in self._provider_not_found_count:
+            self._provider_not_found_count.pop(terminal_id, None)
         use_screen = (
             CAO_PYTE_STATUS
             and provider is not None
@@ -1665,6 +1705,9 @@ class StatusMonitor:
         with self._lock:
             self._consecutive_errors.pop(terminal_id, None)
             self._quarantined.discard(terminal_id)
+            # F360 (#215): ghost-id tracking goes with the rest of the state.
+            self._provider_not_found_count.pop(terminal_id, None)
+            self._dropped_not_found.discard(terminal_id)
         self.clear_terminal(terminal_id)
 
     def record_probe_error(self, terminal_id: str) -> bool:
