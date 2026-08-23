@@ -2122,11 +2122,19 @@ class StalledCallbackWatchdog:
         queue = bus.subscribe("terminal.*.status")
         logger.info("StalledCallbackWatchdog started")
         interval = max(1.0, min(5.0, float(self.grace_seconds)))
+        # F351: self-tuning idle backoff — stretch the tick interval when no
+        # episodes are active, reset on any status event.
+        _idle_consecutive = 0
+        _IDLE_BACKOFF_MAX_S = 5.0  # Cap: never exceed the normal tick cadence
         next_parity_sweep = self._parity_clock() + 60.0
         while True:
             try:
+                # F351: use stretched interval when idle
+                effective_interval = min(
+                    interval + (_idle_consecutive * 0.5), _IDLE_BACKOFF_MAX_S
+                ) if _idle_consecutive > 0 else interval
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=interval)
+                    event = await asyncio.wait_for(queue.get(), timeout=effective_interval)
                 except asyncio.TimeoutError:
                     event = None
                 if event is not None:
@@ -2135,6 +2143,22 @@ class StalledCallbackWatchdog:
                         terminal_id,
                         TerminalStatus(event["data"]["status"]),
                     )
+                    _idle_consecutive = 0  # F351: reset backoff on event
+                else:
+                    # F351: no event — check if episodes exist before running ticks
+                    with self._lock:
+                        _has_episodes = bool(self._episodes)
+                    if not _has_episodes:
+                        _idle_consecutive = min(_idle_consecutive + 1, 10)
+                        # Skip heavy tick functions when completely idle
+                        parity_now = self._parity_clock()
+                        if parity_now >= next_parity_sweep:
+                            next_parity_sweep = parity_now + 60.0
+                            await asyncio.to_thread(seam_parity.sweep)
+                        continue
+                    else:
+                        _idle_consecutive = 0
+
                 await asyncio.to_thread(self._fx191_convergence_tick)
                 await asyncio.to_thread(self.poll_unarmed_statuses)
                 await asyncio.to_thread(self.refresh_screen_fingerprints)

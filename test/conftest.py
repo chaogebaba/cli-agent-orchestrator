@@ -340,6 +340,21 @@ def _hermetic_cao_env(monkeypatch):
     monkeypatch.delenv("CAO_INSTANCE_ID", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _clear_terminal_metadata_cache():
+    """F351/B2: Clear the metadata TTL cache before and after each test.
+
+    The module-level cache in database.py persists across tests within the same
+    xdist worker. Tests that swap SessionLocal to an isolated DB would otherwise
+    get stale metadata from a prior test's database.
+    """
+    from cli_agent_orchestrator.clients.database import clear_terminal_metadata_cache
+
+    clear_terminal_metadata_cache()
+    yield
+    clear_terminal_metadata_cache()
+
+
 @pytest.fixture
 def isolated_memory_db(tmp_path, monkeypatch):
     """Route default memory sessions to an initialized per-test SQLite database."""
