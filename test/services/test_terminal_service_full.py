@@ -66,6 +66,10 @@ async def test_blocked_deferred_assign_queues_verbatim_once_and_notifies_once():
         patch(
             "cli_agent_orchestrator.services.terminal_service.create_inbox_message"
         ) as create_message,
+        patch(
+            "cli_agent_orchestrator.services.auto_responder.AutoResponder.waiting_gate",
+            return_value="unknown_dialog",
+        ),
     ):
         _schedule_deferred_init(
             provider, "worker99", shaped, OrchestrationType.ASSIGN, registry=None
@@ -78,6 +82,48 @@ async def test_blocked_deferred_assign_queues_verbatim_once_and_notifies_once():
     assert notice_call.args[:2] == ("worker99", "caller01")
     assert "queued" in notice_call.args[2]
     assert "will deliver when the dialog clears" in notice_call.args[2]
+
+
+@pytest.mark.asyncio
+async def test_blocked_deferred_assign_suppresses_notice_when_gate_cleared():
+    """F365 #220: When the auto-responder clears the dialog before the notice
+    is sent, the supervisor push is suppressed (no stale noise)."""
+    provider = MagicMock()
+    provider.initialize = AsyncMock(return_value=True)
+    provider.shell_baseline = None
+    shaped = "MCP-shaped bytes\n[Assigned by terminal caller01]"
+
+    with (
+        patch(
+            "cli_agent_orchestrator.services.terminal_service._confirm_launch_health",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+            return_value={"caller_id": "caller01"},
+        ),
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.send_input",
+            side_effect=TerminalInputBlockedError("dialog"),
+        ),
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.create_inbox_message"
+        ) as create_message,
+        patch(
+            "cli_agent_orchestrator.services.auto_responder.AutoResponder.waiting_gate",
+            return_value=None,  # gate already cleared — responder handled it
+        ),
+    ):
+        _schedule_deferred_init(
+            provider, "worker99", shaped, OrchestrationType.ASSIGN, registry=None
+        )
+        await asyncio.gather(*list(_deferred_init_tasks))
+
+    # Only the blocked_queue enqueue should happen; no notice to supervisor
+    assert create_message.call_count == 1
+    create_message.assert_called_once_with(
+        "caller01", "worker99", shaped, OrchestrationType.ASSIGN
+    )
 
 
 @pytest.mark.asyncio
