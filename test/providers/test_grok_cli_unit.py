@@ -889,3 +889,113 @@ def test_ac9_all_grok_profiles_register_cao_mcp_server() -> None:
             f"{profile_name} does not register 'cao-mcp-server' — found keys: "
             f"{list(frontmatter_data['mcpServers'].keys())}"
         )
+
+
+
+# --- F361 (#216): Collapsed tool-result expander classification ---
+
+
+def test_grok_read_composer_draft_with_collapsed_expander_above_prompt() -> None:
+    """F361: collapsed expander above the prompt + visible footer → empty draft."""
+    provider = _provider()
+    fixture = Path(__file__).parents[1] / "fixtures" / "fx6" / "fx6-grok-collapsed-expander.txt"
+    screen = [
+        line
+        for line in fixture.read_text(encoding="utf-8").splitlines()
+        if not line.startswith("#")
+    ]
+
+    assert provider.read_composer_draft(screen) == ""
+
+
+def test_grok_read_composer_draft_collapsed_expander_no_footer() -> None:
+    """F361: collapsed expander replaces footer in viewport → still classifies empty."""
+    provider = _provider()
+    fixture = (
+        Path(__file__).parents[1]
+        / "fixtures"
+        / "fx6"
+        / "fx6-grok-collapsed-expander-no-footer.txt"
+    )
+    screen = [
+        line
+        for line in fixture.read_text(encoding="utf-8").splitlines()
+        if not line.startswith("#")
+    ]
+
+    assert provider.read_composer_draft(screen) == ""
+
+
+def test_grok_read_composer_draft_collapsed_expander_inline() -> None:
+    """F361: screen with both expander and normal footer classifies via footer."""
+    provider = _provider()
+    screen = [
+        "◆ Run send_message(...)",
+        "    result line 1",
+        "    ... (4 more lines, press Enter to view)",
+        "❯",
+        "Grok 4.5 (high) · always-approve · ctrl+o transcript",
+    ]
+
+    assert provider.read_composer_draft(screen) == ""
+
+
+def test_grok_read_composer_draft_collapsed_expander_with_human_draft() -> None:
+    """F361: expander present + non-empty draft text → draft returned."""
+    provider = _provider()
+    screen = [
+        "    ... (7 more lines, press Enter to view)",
+        "❯ HUMAN_DRAFT_TEXT",
+        "Grok 4.5 · always-approve · ctrl+o transcript",
+    ]
+
+    assert provider.read_composer_draft(screen) == "HUMAN_DRAFT_TEXT"
+
+
+def test_grok_read_composer_draft_expander_as_only_anchor() -> None:
+    """F361: viewport has only expander (no footer) + prompt → empty draft."""
+    provider = _provider()
+    screen = [
+        "Some tool output",
+        "More output here",
+        "❯",
+        "... (12 more lines, press Enter to view)",
+    ]
+
+    assert provider.read_composer_draft(screen) == ""
+
+
+def test_grok_screen_status_idle_with_collapsed_expander() -> None:
+    """F361: status detection remains IDLE with collapsed expander visible."""
+    provider = _provider()
+    screen = [
+        "◆ Run send_message(...)",
+        "    ... (4 more lines, press Enter to view)",
+        "❯",
+        "Grok 4.5 (high) · always-approve · ctrl+o transcript",
+    ]
+
+    assert provider.get_status_from_screen(screen) == TerminalStatus.IDLE
+
+
+def test_grok_collapsed_expander_does_not_match_other_text() -> None:
+    """F361: pattern-scoped — unrelated ellipsis text doesn't trigger fallback."""
+    provider = _provider()
+    # No footer, no expander — should return None
+    screen = [
+        "... some other text",
+        "❯",
+    ]
+
+    assert provider.read_composer_draft(screen) is None
+
+
+def test_grok_collapsed_expander_singular_line() -> None:
+    """F361: expander with '1 more line' (singular) also matches."""
+    provider = _provider()
+    screen = [
+        "❯",
+        "... (1 more line, press Enter to view)",
+    ]
+
+    assert provider.read_composer_draft(screen) == ""

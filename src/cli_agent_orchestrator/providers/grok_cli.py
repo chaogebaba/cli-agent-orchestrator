@@ -89,6 +89,9 @@ ERROR_PATTERN = (
 FOOTER_HINT_PATTERN = r"(?:\balways-approve\b|ctrl\+o transcript|Shift\+Tab:mode|Ctrl\+x:shortcuts)"
 IDLE_FOOTER_PATTERN = FOOTER_HINT_PATTERN
 COMPOSER_PROMPT_PATTERN = r"^\s*(?:│\s*)?❯(?:\s|$)"
+# Grok's collapsed tool-result expander: "... (N more lines, press Enter to view)"
+# rendered above the idle prompt after tool invocations.
+GROK_COLLAPSED_EXPANDER_PATTERN = r"\.\.\.\s*\(\d+ more lines?,\s*press Enter to view\)"
 EMPTY_DRAFT_PLACEHOLDERS = {
     "",
 }
@@ -512,6 +515,16 @@ class GrokCliProvider(BaseProvider):
             if re.search(FOOTER_HINT_PATTERN, visible[idx]):
                 footer_idx = idx
                 break
+
+        # F361: grok's collapsed tool-result expander ("... (N more lines,
+        # press Enter to view)") can obscure the footer in the rendered
+        # viewport.  Treat it as an equivalent bottom anchor so the composer
+        # classifier doesn't return None and trigger repeated deferrals.
+        if footer_idx == len(visible):
+            for idx in range(len(visible) - 1, -1, -1):
+                if re.search(GROK_COLLAPSED_EXPANDER_PATTERN, visible[idx]):
+                    footer_idx = idx
+                    break
         if footer_idx == len(visible):
             return None
 
