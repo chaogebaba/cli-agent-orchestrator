@@ -134,7 +134,9 @@ def _refresh_terminal_token_from_pane() -> Optional[str]:
         # S1 identity cross-check: only adopt the token when the parent env
         # belongs to THIS terminal. Otherwise the token could leak across
         # terminal boundaries (e.g. a reparented/shared parent process).
-        if ppid_terminal_id != os.environ.get("CAO_TERMINAL_ID"):
+        # Both sides must have a terminal ID and they must match.
+        own_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+        if not own_terminal_id or ppid_terminal_id != own_terminal_id:
             return None
         return token
     except (OSError, PermissionError, UnicodeDecodeError):

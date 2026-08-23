@@ -237,14 +237,43 @@ class TestRefreshTerminalTokenFromPane:
 
         assert result == "secret123"
 
-    def test_returns_none_when_no_terminal_id(self):
+    def test_returns_none_when_own_terminal_id_unset(self):
+        """S1: own CAO_TERMINAL_ID unset → reject even if ppid also unset."""
         from cli_agent_orchestrator.mcp_server.server import _refresh_terminal_token_from_pane
 
-        with patch.dict(os.environ, {}, clear=True):
-            # CAO_TERMINAL_ID not set
+        # Parent has a token but no CAO_TERMINAL_ID — both sides None would
+        # match via == but we reject because own_terminal_id is falsy.
+        fake_environ = b"CAO_TERMINAL_TOKEN=secret123\x00"
+
+        with patch("os.getppid", return_value=12345), \
+             patch("os.path.exists", return_value=True), \
+             patch.dict(os.environ, {}, clear=True), \
+             patch("builtins.open", create=True) as mock_open:
+            mock_open.return_value.__enter__ = lambda s: s
+            mock_open.return_value.__exit__ = MagicMock(return_value=False)
+            mock_open.return_value.read = lambda: fake_environ
             result = _refresh_terminal_token_from_pane()
-        # Should not crash, returns None
-        # (actually the function doesn't check terminal_id anymore - it uses ppid)
+
+        # Both terminal IDs are None but we reject — can't verify identity
+        assert result is None
+
+    def test_returns_none_when_ppid_terminal_id_absent(self):
+        """S1: ppid has token but no CAO_TERMINAL_ID → reject."""
+        from cli_agent_orchestrator.mcp_server.server import _refresh_terminal_token_from_pane
+
+        fake_environ = b"CAO_TERMINAL_TOKEN=secret123\x00"
+
+        with patch("os.getppid", return_value=12345), \
+             patch("os.path.exists", return_value=True), \
+             patch.dict(os.environ, {"CAO_TERMINAL_ID": "abcd1234"}, clear=False), \
+             patch("builtins.open", create=True) as mock_open:
+            mock_open.return_value.__enter__ = lambda s: s
+            mock_open.return_value.__exit__ = MagicMock(return_value=False)
+            mock_open.return_value.read = lambda: fake_environ
+            result = _refresh_terminal_token_from_pane()
+
+        # ppid_terminal_id is None, doesn't match ours → reject
+        assert result is None
 
     def test_returns_none_on_permission_error(self):
         from cli_agent_orchestrator.mcp_server.server import _refresh_terminal_token_from_pane
