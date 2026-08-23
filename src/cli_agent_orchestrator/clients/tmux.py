@@ -413,6 +413,14 @@ class TmuxClient:
             environment["CAO_TERMINAL_ID"] = terminal_id
             if terminal_token:
                 environment["CAO_TERMINAL_TOKEN"] = terminal_token
+            # Issue #206: kiro-cli's zsh hook exec-wraps interactive pane
+            # shells as "zsh (kiro-cli-term)" unless PROCESS_LAUNCHED_BY_Q is
+            # non-empty, which masks tmux pane_current_command and breaks
+            # worker status detection. Baked in AFTER _merge_extra_env (like
+            # CAO_TERMINAL_ID) so it cannot be dropped or unset, and injected
+            # at every spawn so it survives tmux/server restarts instead of
+            # depending on the volatile `tmux set-environment -g` value.
+            environment["PROCESS_LAUNCHED_BY_Q"] = "1"
 
             # Explicit 220x50 pane size avoids the default 80x24 that tmux
             # assigns to detached sessions. kiro-cli 2.1.x's TUI v2 fails to
@@ -510,6 +518,10 @@ class TmuxClient:
             window_env["CAO_TERMINAL_ID"] = terminal_id
             if terminal_token:
                 window_env["CAO_TERMINAL_TOKEN"] = terminal_token
+            # Issue #206: same permanent export as create_session — windows
+            # added to an existing session don't inherit the session's -e env,
+            # so the kiro-cli zsh-hook guard must be injected here too.
+            window_env["PROCESS_LAUNCHED_BY_Q"] = "1"
 
             kwargs: dict = {
                 "window_name": window_name,
