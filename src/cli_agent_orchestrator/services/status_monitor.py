@@ -44,6 +44,13 @@ from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
 
+# F360 (#215, diff gate SHOULD): consecutive "Terminal ... not found in
+# database" misses from provider_manager.get_provider() tolerated before a
+# ghost terminal id is dropped from the watch state. 3 (not 2) so a live
+# terminal whose creation commit is delayed by lock contention — while
+# buffered output events still arrive — is not dropped mid-creation.
+GHOST_DROP_MISSES = 3
+
 
 class PaneIdentityProofFailure(RuntimeError):
     """Internal control flow for a fail-closed admission identity proof."""
@@ -265,6 +272,15 @@ class StatusMonitor:
         # --- unregister / quarantine state (B5, f100) ---
         self._consecutive_errors: Dict[str, int] = {}
         self._quarantined: set[str] = set()
+        # --- ghost-terminal tolerance (F360, issue #215) ---
+        # Consecutive "Terminal ... not found in database" misses per terminal
+        # id from provider_manager.get_provider(). The first misses are
+        # tolerated (the row may not be committed yet during creation, even
+        # under lock contention); after GHOST_DROP_MISSES consecutive misses
+        # the ghost id is dropped from the watch state with a single warning
+        # instead of raising on every output chunk forever.
+        self._provider_not_found_count: Dict[str, int] = {}
+        self._dropped_not_found: set[str] = set()
 
     @property
     def receiver_state_store(self) -> ReceiverStateStore:
@@ -933,7 +949,40 @@ class StatusMonitor:
           resumed) and at quiescence (output stopped) — see
           _schedule_screen_detection.
         """
-        provider = provider_manager.get_provider(terminal_id)
+        # F360 (#215): a ghost terminal id (DB row deleted, e.g. by a failed
+        # create that unwound its registration, while buffered output events
+        # still arrive) makes get_provider raise ValueError on every chunk.
+        # Tolerate the first misses (creation window, incl. lock-contention
+        # commit delay), then drop the ghost from the watch state with one
+        # warning instead of erroring forever.
+        if terminal_id in self._dropped_not_found:
+            return
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except ValueError as exc:
+            if "not found in database" not in str(exc):
+                raise
+            misses = self._provider_not_found_count.get(terminal_id, 0) + 1
+            self._provider_not_found_count[terminal_id] = misses
+            if misses >= GHOST_DROP_MISSES:
+                self._dropped_not_found.add(terminal_id)
+                logger.warning(
+                    "StatusMonitor: terminal %s not found in database %d times; "
+                    "dropping ghost terminal from watch state (issue #215)",
+                    terminal_id,
+                    misses,
+                )
+                self.clear_terminal(terminal_id)
+            else:
+                logger.debug(
+                    "StatusMonitor: terminal %s not found in database yet "
+                    "(miss %d); tolerating",
+                    terminal_id,
+                    misses,
+                )
+            return
+        if terminal_id in self._provider_not_found_count:
+            self._provider_not_found_count.pop(terminal_id, None)
         use_screen = (
             CAO_PYTE_STATUS
             and provider is not None
@@ -1665,6 +1714,9 @@ class StatusMonitor:
         with self._lock:
             self._consecutive_errors.pop(terminal_id, None)
             self._quarantined.discard(terminal_id)
+            # F360 (#215): ghost-id tracking goes with the rest of the state.
+            self._provider_not_found_count.pop(terminal_id, None)
+            self._dropped_not_found.discard(terminal_id)
         self.clear_terminal(terminal_id)
 
     def record_probe_error(self, terminal_id: str) -> bool:

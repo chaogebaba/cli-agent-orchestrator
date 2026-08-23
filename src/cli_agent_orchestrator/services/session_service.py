@@ -130,6 +130,39 @@ async def _reconcile_inbox_path_on_publish(
         logger.debug("inbox path reconciliation skipped: %s", exc)
 
 
+async def _unwind_registered_terminal(
+    terminal_id: str,
+    registry: PluginRegistry | None,
+) -> None:
+    """F360 (#215): best-effort unwind of a terminal registered mid-create.
+
+    ``create_session`` allocates and fully registers the terminal id (DB row,
+    FIFO reader, StatusMonitor state, tmux window/session) inside
+    ``create_terminal``. Any failure AFTER that point must deregister it before
+    the error propagates, or the API caller sees a 500 while StatusMonitor
+    keeps chasing a ghost id whose DB row no longer resolves.
+    """
+    from cli_agent_orchestrator.services.status_monitor import status_monitor
+    from cli_agent_orchestrator.services.terminal_service import delete_terminal
+
+    try:
+        await asyncio.to_thread(delete_terminal, terminal_id, registry)
+    except Exception as exc:
+        # ValueError("Terminal ... not found") means an earlier cleanup
+        # (e.g. the publication-failure path) already unwound the row — that
+        # is success, not a leak. Anything else is logged and survived; the
+        # StatusMonitor ghost-id drop (F360) is the backstop.
+        logger.warning(
+            "session_create_unwind_delete_failed terminal=%s: %s", terminal_id, exc
+        )
+    try:
+        status_monitor.unregister(terminal_id)
+    except Exception as exc:
+        logger.warning(
+            "session_create_unwind_monitor_failed terminal=%s: %s", terminal_id, exc
+        )
+
+
 async def create_session(
     provider: str | None,
     agent_profile: str,
@@ -218,57 +251,65 @@ async def create_session(
         group=group,
         metadata=metadata,
     )
-    if mailbox_claim is not None:
-        from cli_agent_orchestrator.clients.database import get_terminal_metadata
-        from cli_agent_orchestrator.services.mailbox_service import (
-            PublicationCleanupFailed,
-            publish_supervisor_incarnation,
-        )
-
-        try:
-            publication = await asyncio.to_thread(
-                publish_supervisor_incarnation, mailbox_claim, terminal.id
+    # F360 (#215): the terminal id is now allocated and fully registered. Any
+    # exception from here on unwinds that registration (deregister + monitor
+    # removal) before propagating, so a failed create leaves no terminal row
+    # or StatusMonitor entry behind.
+    try:
+        if mailbox_claim is not None:
+            from cli_agent_orchestrator.clients.database import get_terminal_metadata
+            from cli_agent_orchestrator.services.mailbox_service import (
+                PublicationCleanupFailed,
+                publish_supervisor_incarnation,
             )
-        except Exception as cause:
+
             try:
-                from cli_agent_orchestrator.services.terminal_service import delete_terminal
-
-                deleted = await asyncio.to_thread(
-                    delete_terminal,
-                    terminal.id,
-                    registry,
+                publication = await asyncio.to_thread(
+                    publish_supervisor_incarnation, mailbox_claim, terminal.id
                 )
-                if not deleted and get_terminal_metadata(terminal.id) is not None:
-                    raise RuntimeError("terminal retained")
-            except Exception as cleanup_error:
-                raise PublicationCleanupFailed(cause) from cleanup_error
-            raise
-        from cli_agent_orchestrator.services.inbox_service import inbox_service
+            except Exception as cause:
+                try:
+                    from cli_agent_orchestrator.services.terminal_service import delete_terminal
 
-        await asyncio.to_thread(
-            inbox_service.deliver_pending,
-            terminal.id,
-            registry=registry,
+                    deleted = await asyncio.to_thread(
+                        delete_terminal,
+                        terminal.id,
+                        registry,
+                    )
+                    if not deleted and get_terminal_metadata(terminal.id) is not None:
+                        raise RuntimeError("terminal retained")
+                except Exception as cleanup_error:
+                    raise PublicationCleanupFailed(cause) from cleanup_error
+                raise
+            from cli_agent_orchestrator.services.inbox_service import inbox_service
+
+            await asyncio.to_thread(
+                inbox_service.deliver_pending,
+                terminal.id,
+                registry=registry,
+            )
+            logger.info(
+                "published supervisor mailbox %s generation %s",
+                publication["mailbox_id"],
+                publication["generation"],
+            )
+            # F136-D5: reconcile inbox path from terminal metadata at publication
+            await _reconcile_inbox_path_on_publish(
+                terminal_id=terminal.id,
+                mailbox_id=publication["mailbox_id"],
+                generation=publication["generation"],
+            )
+        dispatch_plugin_event(
+            registry,
+            "post_create_session",
+            PostCreateSessionEvent(
+                session_id=terminal.session_name,
+                session_name=terminal.session_name,
+            ),
         )
-        logger.info(
-            "published supervisor mailbox %s generation %s",
-            publication["mailbox_id"],
-            publication["generation"],
-        )
-        # F136-D5: reconcile inbox path from terminal metadata at publication
-        await _reconcile_inbox_path_on_publish(
-            terminal_id=terminal.id,
-            mailbox_id=publication["mailbox_id"],
-            generation=publication["generation"],
-        )
-    dispatch_plugin_event(
-        registry,
-        "post_create_session",
-        PostCreateSessionEvent(
-            session_id=terminal.session_name,
-            session_name=terminal.session_name,
-        ),
-    )
+    except Exception:
+        await _unwind_registered_terminal(terminal.id, registry)
+        raise
     return terminal
 
 
