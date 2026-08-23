@@ -1,0 +1,16 @@
+# F361 (#216): grok CLI collapsed tool-result expander — footer obscured.
+# Pyte viewport capture where the grok TUI's collapsed expander rendering
+# has pushed the footer off-screen (or the cursor-positioned expander
+# overwrites the footer row). Only the prompt and expander are visible.
+◆ Run send_message(receiver_id=10cdda20, message=FX6 test result)
+    ───
+    pre_tool_use
+      ✓ global/settings:pre_tool_use[0].hooks[0] (14ms)
+    Message sent successfully to terminal 10cdda20
+    id: 229
+    status: pending
+    delivered_at: 2026-08-23T09:58:12Z
+    receiver_status: IDLE
+    ... (4 more lines, press Enter to view)
+❯
+... (4 more lines, press Enter to view)

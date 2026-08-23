@@ -1,0 +1,14 @@
+# F361 (#216): grok CLI collapsed tool-result expander pane capture.
+# Captured 2026-08-23 from grok_tester-1d8d3f3c while IDLE at ❯ prompt.
+# The collapsed expander "... (4 more lines, press Enter to view)" sits
+# above the idle prompt; draft-guard could not classify this and deferred.
+◆ Run send_message(receiver_id=10cdda20, message=FX6 test result)
+    ───
+    pre_tool_use
+      ✓ global/settings:pre_tool_use[0].hooks[0] (14ms)
+    Message sent successfully to terminal 10cdda20
+    id: 229
+    status: pending
+    ... (4 more lines, press Enter to view)
+❯
+Grok 4.5 (high) · always-approve · 74K / 500K (15%) · ctrl+o transcript
