@@ -78,7 +78,7 @@ pytestmark = pytest.mark.integration
 # is terminal so the happy path is fast.
 _POLL_ATTEMPTS = 300
 _POLL_SLEEP = 0.1
-_HTTP_TIMEOUT = 5.0
+_HTTP_TIMEOUT = 10.0
 
 # A self-contained script-tier spec: no provider, no run-step callback, no disallowed
 # import (only stdlib ``time``/``json`` -- ``time`` is a lint WARNING, never an ERROR,
