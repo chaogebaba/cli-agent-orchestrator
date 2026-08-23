@@ -33,6 +33,31 @@ from cli_agent_orchestrator.constants import API_BASE_URL
 # double-mark items.
 
 
+# ---------------------------------------------------------------------------
+# F362 #217: Per-test timeout override for live e2e tests.
+#
+# The global pyproject.toml timeout=30 is sized for non-live unit/contract
+# tests. Live tests MUST exceed 30s because _create_terminal_with_tools uses
+# retry_delay=30s + _wait_for_ready timeout=90s + COMPLETION_TIMEOUT=180s.
+# Rather than raise the global (which would hide slow unit tests), we override
+# per-test for live items only.
+# ---------------------------------------------------------------------------
+_LIVE_TEST_TIMEOUT = 300  # retry(30) + ready(90) + completion(180) margin
+
+
+def pytest_collection_modifyitems(config, items: list):
+    """Apply per-test timeout override to live e2e tests (F362 #217).
+
+    This runs AFTER tier_marks.py has derived the ``live`` mark for all
+    /test/e2e/ items. The pytest-timeout plugin respects the closest
+    ``timeout`` marker, so this class-level override takes precedence over
+    the ini-file ``timeout=30``.
+    """
+    for item in items:
+        if "/test/e2e/" in str(item.path) and "/test/e2e/script_runner/" not in str(item.path):
+            item.add_marker(pytest.mark.timeout(_LIVE_TEST_TIMEOUT))
+
+
 @pytest.fixture(scope="session", autouse=True)
 def require_live_provider_opt_in(request):
     """Refuse to boot real provider CLIs unless --run-live was passed.
@@ -100,10 +125,50 @@ def require_claude():
 
 
 @pytest.fixture()
-def require_kiro():
-    """Skip test if kiro-cli is not available."""
+def require_kiro(require_cao_server: CaoServer):
+    """Skip test if kiro-cli is not available; provision kiro agent profiles.
+
+    The kiro_cli provider requires a base agent JSON at
+    ``~/.kiro/agents/{profile}.json`` — created by ``cao install``. The
+    managed e2e server uses a redirected HOME so the real user store is
+    invisible. Seed minimal agent JSONs so e2e tests that use the generic
+    ``developer``, ``code_supervisor``, ``data_analyst``, and
+    ``report_generator`` profiles succeed without a prior ``cao install`` on
+    the box.
+    """
     if not _cli_available("kiro-cli"):
         pytest.skip("kiro-cli CLI not installed")
+
+    import json as _json
+
+    agents_dir = require_cao_server.home_dir / ".kiro" / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+
+    # Map profile name → (allowedTools, tools) for the minimal JSON.
+    # code_supervisor must restrict tools to match its allowedTools constraint
+    # (kiro enforces tool restrictions via the agent JSON's allowedTools field).
+    _profiles: dict[str, tuple[list[str], list[str]]] = {
+        "developer": (["*"], ["*"]),
+        "code_supervisor": (["@cao-mcp-server"], ["@cao-mcp-server"]),
+        "data_analyst": (["*"], ["*"]),
+        "report_generator": (["*"], ["*"]),
+    }
+    for profile_name, (allowed, tools) in _profiles.items():
+        agent_file = agents_dir / f"{profile_name}.json"
+        if not agent_file.exists():
+            agent_file.write_text(
+                _json.dumps(
+                    {
+                        "name": profile_name,
+                        "description": f"{profile_name} agent for e2e testing",
+                        "tools": tools,
+                        "allowedTools": allowed,
+                        "resources": [],
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
 
 
 @pytest.fixture()
