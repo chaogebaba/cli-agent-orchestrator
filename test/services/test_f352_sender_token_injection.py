@@ -175,13 +175,60 @@ class TestRefreshTerminalTokenFromPane:
     def test_reads_from_proc_ppid_environ(self, tmp_path):
         from cli_agent_orchestrator.mcp_server.server import _refresh_terminal_token_from_pane
 
-        # Mock /proc/<ppid>/environ with a known token
-        fake_environ = b"HOME=/home/test\x00CAO_TERMINAL_TOKEN=secret123\x00PATH=/usr/bin\x00"
+        # Mock /proc/<ppid>/environ with a known token + matching terminal ID
+        fake_environ = (
+            b"HOME=/home/test\x00CAO_TERMINAL_ID=abcd1234\x00"
+            b"CAO_TERMINAL_TOKEN=secret123\x00PATH=/usr/bin\x00"
+        )
         environ_file = tmp_path / "environ"
         environ_file.write_bytes(fake_environ)
 
         with patch("os.getppid", return_value=12345), \
              patch("os.path.exists", return_value=True), \
+             patch.dict(os.environ, {"CAO_TERMINAL_ID": "abcd1234"}, clear=False), \
+             patch("builtins.open", create=True) as mock_open:
+            mock_open.return_value.__enter__ = lambda s: s
+            mock_open.return_value.__exit__ = MagicMock(return_value=False)
+            mock_open.return_value.read = lambda: fake_environ
+            result = _refresh_terminal_token_from_pane()
+
+        assert result == "secret123"
+
+    def test_mismatched_ppid_terminal_id_returns_none(self, tmp_path):
+        """S1: ppid CAO_TERMINAL_ID differs from ours → no token adopted."""
+        from cli_agent_orchestrator.mcp_server.server import _refresh_terminal_token_from_pane
+
+        fake_environ = (
+            b"CAO_TERMINAL_ID=deadbeef\x00CAO_TERMINAL_TOKEN=secret123\x00"
+        )
+        environ_file = tmp_path / "environ"
+        environ_file.write_bytes(fake_environ)
+
+        with patch("os.getppid", return_value=12345), \
+             patch("os.path.exists", return_value=True), \
+             patch.dict(os.environ, {"CAO_TERMINAL_ID": "abcd1234"}, clear=False), \
+             patch("builtins.open", create=True) as mock_open:
+            mock_open.return_value.__enter__ = lambda s: s
+            mock_open.return_value.__exit__ = MagicMock(return_value=False)
+            mock_open.return_value.read = lambda: fake_environ
+            result = _refresh_terminal_token_from_pane()
+
+        assert result is None
+
+    def test_matching_ppid_terminal_id_adopts_token(self, tmp_path):
+        """S1: ppid CAO_TERMINAL_ID matches ours → token adopted (app_tools.py
+        refresh path shares this same function via import)."""
+        from cli_agent_orchestrator.mcp_server.server import _refresh_terminal_token_from_pane
+
+        fake_environ = (
+            b"CAO_TERMINAL_ID=abcd1234\x00CAO_TERMINAL_TOKEN=secret123\x00"
+        )
+        environ_file = tmp_path / "environ"
+        environ_file.write_bytes(fake_environ)
+
+        with patch("os.getppid", return_value=12345), \
+             patch("os.path.exists", return_value=True), \
+             patch.dict(os.environ, {"CAO_TERMINAL_ID": "abcd1234"}, clear=False), \
              patch("builtins.open", create=True) as mock_open:
             mock_open.return_value.__enter__ = lambda s: s
             mock_open.return_value.__exit__ = MagicMock(return_value=False)

@@ -122,9 +122,21 @@ def _refresh_terminal_token_from_pane() -> Optional[str]:
             return None
         with open(environ_path, "rb") as f:
             data = f.read()
+        ppid_terminal_id = None
+        token = None
         for entry in data.split(b"\x00"):
             if entry.startswith(b"CAO_TERMINAL_TOKEN="):
-                return entry.split(b"=", 1)[1].decode("utf-8")
+                token = entry.split(b"=", 1)[1].decode("utf-8")
+            elif entry.startswith(b"CAO_TERMINAL_ID="):
+                ppid_terminal_id = entry.split(b"=", 1)[1].decode("utf-8")
+        if token is None:
+            return None
+        # S1 identity cross-check: only adopt the token when the parent env
+        # belongs to THIS terminal. Otherwise the token could leak across
+        # terminal boundaries (e.g. a reparented/shared parent process).
+        if ppid_terminal_id != os.environ.get("CAO_TERMINAL_ID"):
+            return None
+        return token
     except (OSError, PermissionError, UnicodeDecodeError):
         pass
     return None
