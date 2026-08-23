@@ -708,6 +708,25 @@ class InboxService:
             return InjectSafetyResult("veto", "safety_unverified")
         return InjectSafetyResult("safe")
 
+    @staticmethod
+    def _dialog_gate_active(terminal_id: str) -> bool:
+        """F354: True while the auto-responder reports a blocking dialog.
+
+        Wraps ``auto_responder.waiting_gate`` (unknown-dialog episode, wait
+        rule, or retry-exhausted). A probe failure is treated as "gate active"
+        so a broken responder fails closed: delivery holds rather than pasting
+        into a possibly dialog-blocked TUI.
+        """
+        try:
+            from cli_agent_orchestrator.services.auto_responder import auto_responder
+
+            return auto_responder.waiting_gate(terminal_id) is not None
+        except Exception:
+            logger.warning(
+                "delivery_dialog_gate_probe_failed terminal=%s", terminal_id, exc_info=True
+            )
+            return True
+
     def schedule_delivery_wake(self, terminal_id: str) -> bool:
         """Post one coalesced, non-blocking retry onto the owning API loop."""
         with _delivery_seq_guard:
@@ -2092,7 +2111,9 @@ class InboxService:
         Status comes from the StatusMonitor (the event-driven source of truth).
         Delivery normally happens on IDLE/COMPLETED; providers that accept input
         mid-turn (``accepts_input_while_processing``) also receive messages while
-        PROCESSING/WAITING_USER_ANSWER when ``EAGER_INBOX_DELIVERY`` is on (#251).
+        PROCESSING when ``EAGER_INBOX_DELIVERY`` is on (#251). WAITING_USER_ANSWER
+        never admits delivery (F354): a blocking dialog holds the message PENDING
+        until it clears.
         When a plugin registry is supplied, the originating sender and a
         ``send_message`` orchestration type are threaded to ``terminal_service``
         so ``PostSendMessageEvent`` hooks fire with correct attribution.
@@ -2409,10 +2430,15 @@ class InboxService:
                                 if provider is None:
                                     provider = provider_manager.get_provider(terminal_id)
                                 eager_eligible = admission_kind == "s4_initial"
-                            elif EAGER_INBOX_DELIVERY and status in (
-                                TerminalStatus.PROCESSING,
-                                TerminalStatus.WAITING_USER_ANSWER,
-                            ):
+                            elif EAGER_INBOX_DELIVERY and status == TerminalStatus.PROCESSING:
+                                # F354: WAITING_USER_ANSWER is deliberately NOT
+                                # eager-admissible. A blocking dialog means the
+                                # paste would stack duplicate payloads into a
+                                # stalled TUI and burn ambiguous attempts; the
+                                # message must stay cleanly PENDING until the
+                                # dialog clears (the auto-responder's gate
+                                # transition or the next ready status re-wakes
+                                # delivery).
                                 if provider is None:
                                     provider = provider_manager.get_provider(terminal_id)
                                 capabilities = (
@@ -2422,6 +2448,14 @@ class InboxService:
                                     capabilities is not None
                                     and capabilities.accepts_input_while_processing
                                 )
+                                # F354: the auto-responder's blocking-dialog gate
+                                # holds delivery even when the admission status
+                                # flapped away from WAITING_USER_ANSWER mid-dialog.
+                                if eager_eligible and self._dialog_gate_active(terminal_id):
+                                    logger.info(
+                                        "delivery_held_dialog_gate terminal=%s", terminal_id
+                                    )
+                                    return
                             if not eager_eligible:
                                 return
                     ambiguous_count = count_ambiguous_attempts(message_ids)
