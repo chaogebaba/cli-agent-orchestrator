@@ -3979,6 +3979,11 @@ def settle_terminal_fallback(old_terminal_id: str, new_terminal_id: str) -> int:
                     below = [rid for rid in reactivated_ids if rid <= cursor_val]
                     if below:
                         enqueue_callback_replay(db, mailbox_id=str(inc.mailbox_id), inbox_row_ids=below)
+        # S4: query child IDs before bulk update so we can invalidate their caches
+        child_ids = [
+            row.id
+            for row in db.query(TerminalModel.id).filter(TerminalModel.caller_id == old_terminal_id).all()
+        ]
         changed += (
             db.query(TerminalModel)
             .filter(TerminalModel.caller_id == old_terminal_id)
@@ -4001,6 +4006,9 @@ def settle_terminal_fallback(old_terminal_id: str, new_terminal_id: str) -> int:
         ).update({"provider_session_id": None}, synchronize_session=False)
     invalidate_terminal_metadata_cache(old_terminal_id)
     invalidate_terminal_metadata_cache(new_terminal_id)
+    # S4: invalidate reparented children so their cached caller_id is refreshed
+    for child_id in child_ids:
+        invalidate_terminal_metadata_cache(child_id)
     return changed
 
 
