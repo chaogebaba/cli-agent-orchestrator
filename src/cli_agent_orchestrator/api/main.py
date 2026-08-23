@@ -7152,18 +7152,29 @@ async def create_inbox_message_endpoint(
                     receiver_id,
                     "absent" if not presented_token else "mismatch",
                 )
-                remedy = (
-                    "Callers must present X-CAO-Terminal-Token matching sender_id. "
-                    "Inside a CAO terminal this is $CAO_TERMINAL_TOKEN. "
-                    "Do not hand-write inbox POSTs — call the send_message MCP tool."
-                    if error_code == "E-SENDER-TOKEN"
-                    else "sender_id is not a live terminal issued by this server."
-                )
+                if error_code == "E-SENDER-TOKEN":
+                    if not presented_token:
+                        remedy = (
+                            "X-CAO-Terminal-Token header is missing. "
+                            "$CAO_TERMINAL_TOKEN is not set in the MCP server process "
+                            "environment. Re-run `cao install <profile>` to regenerate "
+                            "the agent config with the token variable, then retry."
+                        )
+                    else:
+                        remedy = (
+                            "X-CAO-Terminal-Token does not match the stored token for "
+                            "this sender. Inside a CAO terminal the correct value is "
+                            "$CAO_TERMINAL_TOKEN. "
+                            "Do not hand-write inbox POSTs — call the send_message MCP tool."
+                        )
+                else:
+                    remedy = "sender_id is not a live terminal issued by this server."
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail={
                         "code": error_code,
                         "message": remedy,
+                        "retryable": not presented_token,
                     },
                 )
 
