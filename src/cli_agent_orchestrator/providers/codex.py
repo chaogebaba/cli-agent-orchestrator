@@ -60,7 +60,7 @@ def _resolved_codex_home(terminal_id: str | None) -> Path:
 
 # Regex patterns for Codex output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
-IDLE_PROMPT_PATTERN = r"(?:❯|›|codex>)"
+IDLE_PROMPT_PATTERN = r"(?:❯|›|»|codex>)"
 # Number of lines from the bottom of capture to check for the idle prompt.
 # With --no-alt-screen, codex output is inline (scrollback contains history),
 # so we can't anchor to \Z. Instead, check the last few lines where the prompt
@@ -92,15 +92,16 @@ MCP_TOOL_CALL_PATTERN = r"^[^\S\n]*•\s+Called\s+[\w-]+\.[\w-]+\("
 # filter a fresh terminal showing only the banner is classified COMPLETED and
 # the banner text gets extracted as the model's reply (false handoff success).
 SYSTEM_NOTICE_PATTERN = r"^[^\S\n]*•\s+You have \d+ usage limit reset"
-# Match user input: "You ..." (label style) or "› text" (Codex interactive prompt).
-# The "›[^\S\n]*\S" alternative requires a non-whitespace character on the same line
-# to distinguish user input ("› what is your role?") from the empty idle prompt ("› ").
+# Match user input: "You ..." (label style), "› text" (older Codex interactive
+# prompt), or "» text" (Codex 0.149+ interactive prompt). The prompt alternative
+# requires a non-whitespace character on the same line to distinguish user input
+# from an empty idle prompt.
 # [^\S\n] matches horizontal whitespace only (spaces/tabs), preventing the pattern
 # from crossing newline boundaries into subsequent lines.
-USER_PREFIX_PATTERN = r"^(?:You\b|›[^\S\n]*\S)"
+USER_PREFIX_PATTERN = r"^(?:You\b|[›»][^\S\n]*\S)"
 # Strict idle prompt pattern for extraction: matches empty prompt lines only.
 # Distinguishes "› " (idle) from "› user message" (user input with text).
-IDLE_PROMPT_STRICT_PATTERN = r"^\s*(?:❯|›|codex>)\s*$"
+IDLE_PROMPT_STRICT_PATTERN = r"^\s*(?:❯|›|»|codex>)\s*$"
 IDLE_PROMPT_SCREEN_PATTERN = rf"^\s*{IDLE_PROMPT_PATTERN}"
 
 PROCESSING_PATTERN = r"\b(thinking|working|running|executing|processing|analyzing)\b"
@@ -381,7 +382,8 @@ STARTUP_IDLE_PLACEHOLDER_PATTERN = (
     r"Write tests for @filename|"
     r"Improve documentation in @filename|"
     r"Run /review on my current changes|"
-    r"Use /skills to list available skills"
+    r"Use /skills to list available skills|"
+    r"Ask Codex to do anything"
     r")\s*$"
 )
 
