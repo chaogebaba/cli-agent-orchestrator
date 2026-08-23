@@ -231,6 +231,57 @@ class TestTerminalOperations:
             assert old.recovery_state == "fallback_ready"
             assert rows == {"p": "new", "d": "old", "f": "old"}
 
+    def test_settle_fallback_invalidates_reparented_children_cache(self, test_db, monkeypatch):
+        """S4: children reparented by settle_terminal_fallback have their cache invalidated."""
+        monkeypatch.setattr("cli_agent_orchestrator.clients.database.SessionLocal", test_db)
+        from cli_agent_orchestrator.clients.database import (
+            _terminal_metadata_cache,
+            get_terminal_metadata,
+        )
+
+        _terminal_metadata_cache.clear()
+        with test_db.begin() as db:
+            db.add_all(
+                [
+                    TerminalModel(
+                        id="old",
+                        tmux_session="s",
+                        tmux_window="w1",
+                        provider="codex",
+                        recovery_state="fallback_starting",
+                        provider_session_id="uuid-old",
+                    ),
+                    TerminalModel(
+                        id="new",
+                        tmux_session="s",
+                        tmux_window="w2",
+                        provider="codex",
+                        provider_session_id="uuid-new",
+                    ),
+                    TerminalModel(
+                        id="child1",
+                        tmux_session="s",
+                        tmux_window="w3",
+                        provider="codex",
+                        caller_id="old",
+                    ),
+                ]
+            )
+        # Prime the cache for the child — should reflect caller_id="old"
+        meta = get_terminal_metadata("child1")
+        assert meta is not None
+        assert meta["caller_id"] == "old"
+        assert "child1" in _terminal_metadata_cache
+
+        settle_terminal_fallback("old", "new")
+
+        # Child's cache entry must have been evicted
+        assert "child1" not in _terminal_metadata_cache
+        # A fresh read reflects the reparented caller_id
+        refreshed = get_terminal_metadata("child1")
+        assert refreshed is not None
+        assert refreshed["caller_id"] == "new"
+
 
 class TestMessageTraceTransactions:
     def test_transcript_binding_nullable_inode_migration_is_idempotent(self, tmp_path, monkeypatch):
