@@ -3942,11 +3942,22 @@ def _schedule_deferred_init(
                 )
                 return
             await _mark_ready_if_generation_current(terminal_id, generation)
-            notice = (
-                f"Worker {terminal_id} is waiting on a dialog; the assigned task is "
-                f"queued and will deliver when the dialog clears."
-            )
-            if snapshot.get("caller_id"):
+            # F365: Re-check the dialog gate before notifying the supervisor.
+            # The auto-responder may have already cleared the dialog by the time
+            # we reach this point — sending the notice would be stale noise.
+            from cli_agent_orchestrator.services.auto_responder import auto_responder as _ar
+
+            if _ar.waiting_gate(terminal_id) is None:
+                logger.info(
+                    "Deferred init for %s: dialog gate already cleared "
+                    "(auto-responder handled it); suppressing supervisor notice.",
+                    terminal_id,
+                )
+            elif snapshot.get("caller_id"):
+                notice = (
+                    f"Worker {terminal_id} is waiting on a dialog; the assigned task is "
+                    f"queued and will deliver when the dialog clears."
+                )
                 try:
                     await _tracked_blocking(
                         terminal_id,
