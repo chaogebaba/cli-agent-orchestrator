@@ -67,6 +67,7 @@ If the task asks you to create files, write them before reporting completion. Wh
 
 - Never `cd` into a directory you may later delete; run cleanup from outside the disposable directory.
 - If every command fails with `getcwd`/`ENOENT`, stop issuing commands and report the cwd brick to your supervisor via `send_message` immediately; do not retry.
+- Any tmux window or pane you create for scratch/debug work MUST be created detached (`tmux new-window -d` / `split-window -d`) — a bare `new-window` steals the attached operator's focus mid-keystroke (F356 #211). Kill your scratch windows when done.
 
 ### Fixture law for builders (3 consecutive diff-gate SHIP-NOs: 0b, 0b.1, WPWD — 2026-07-20/21)
 
