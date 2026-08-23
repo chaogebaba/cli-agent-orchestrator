@@ -158,6 +158,9 @@ class _Provider:
         self.paste_submit_delay = 0.0
         self.assume_processing_on_dispatch = False
 
+    def pre_paste_gate(self):
+        pass
+
     def resolve_native_status(self, native):
         return NativeResolution(native, None, None)
 

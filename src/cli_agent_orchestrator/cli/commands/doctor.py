@@ -18,7 +18,7 @@ class _DoctorGroup(click.Group):
     """Group that invokes the check subcommand when called without a subcommand."""
 
     def invoke(self, ctx: click.Context) -> None:
-        if not ctx.protected_args and not ctx.invoked_subcommand:
+        if not ctx.args and not ctx.invoked_subcommand:
             # No subcommand given — run the default "check" behaviour
             ctx.invoke(check)
             return

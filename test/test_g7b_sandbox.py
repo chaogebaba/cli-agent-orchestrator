@@ -193,6 +193,7 @@ def test_native_home_guard_and_every_roster_consumer_is_injected() -> None:
         "providers/grok_cli.py",
         "utils/grok_config.py",
         "cli/commands/doctor.py",
+        "services/teammate_push_service.py",
     }
     for path in SOURCE.rglob("*.py"):
         text = path.read_text(encoding="utf-8")

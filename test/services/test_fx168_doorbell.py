@@ -532,11 +532,19 @@ class TestAC15CallSiteInventory:
         made it structurally dead). Remaining sites: _f136_post_delivery and the
         fx158 pull-mode reconciler.
         """
-        import inspect
+        import ast as _ast
         import cli_agent_orchestrator.services.inbox_service as mod
+        import inspect
         source = inspect.getsource(mod)
-        # Count the number of 'ring_supervisor_doorbell' calls (not imports)
-        import_count = source.count("from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell")
+        # Count import sites by looking for the identifier in ImportFrom nodes
+        tree = _ast.parse(source)
+        import_count = sum(
+            1
+            for node in _ast.walk(tree)
+            if isinstance(node, _ast.ImportFrom)
+            and node.module == "cli_agent_orchestrator.services.doorbell_service"
+            and any(alias.name == "ring_supervisor_doorbell" for alias in node.names)
+        )
         call_count = source.count("ring_supervisor_doorbell(")
         # 2 import sites (fx168 FIX-4: removed the dead D9 site in deliver_pending)
         assert import_count == 2, f"Expected 2 import sites, got {import_count}"

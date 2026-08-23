@@ -3,7 +3,7 @@
 import asyncio
 import os
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -295,6 +295,7 @@ class TestCreateTerminal:
             "kiro_cli",
             "developer",
             ["fs_read"],
+            auth_token=ANY,
             caller_id=None,
             engine="v2",
             group=None,

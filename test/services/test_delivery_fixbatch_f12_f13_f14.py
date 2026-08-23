@@ -35,6 +35,7 @@ from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
 from cli_agent_orchestrator.services import draft_guard, terminal_service
 from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 from cli_agent_orchestrator.services.inbox_service import InboxService
+from cli_agent_orchestrator.services.inbox_service import begin_delivery_attempt
 from cli_agent_orchestrator.services.message_trace_service import (
     TranscriptLiveReference,
     TranscriptResolution,
@@ -247,6 +248,14 @@ def _deliver_with_fakes(
         patch(
             "cli_agent_orchestrator.services.inbox_service.confirm_delivery",
             return_value=confirm_result,
+        )
+    )
+    # Trigger the legacy_test_seam path (patching begin_delivery_attempt makes
+    # `begin_delivery_attempt is not _PRODUCTION_BEGIN_DELIVERY_ATTEMPT` True)
+    stack.enter_context(
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt",
+            side_effect=begin_delivery_attempt,
         )
     )
     return stack, lookup, paste, wires

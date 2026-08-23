@@ -100,6 +100,8 @@ class TestFix2StalePathSelfHeal:
         from cli_agent_orchestrator.services.inbox_service import InboxService
 
         service = InboxService.__new__(InboxService)
+        service._tnf_lock = threading.Lock()
+        service._terminal_not_found_streaks = {}
 
         @dataclass
         class FakeBatchRow:
@@ -181,6 +183,8 @@ class TestFix2StalePathSelfHeal:
         service = InboxService.__new__(InboxService)
         service._delivery_loop = None
         service._delivery_tasks = set()
+        service._tnf_lock = threading.Lock()
+        service._terminal_not_found_streaks = {}
 
         outcome = CallbackRunOutcome(
             needs_immediate_wake=True,
@@ -209,6 +213,8 @@ class TestFix2StalePathSelfHeal:
         from cli_agent_orchestrator.services.inbox_service import InboxService
 
         service = InboxService.__new__(InboxService)
+        service._tnf_lock = threading.Lock()
+        service._terminal_not_found_streaks = {}
 
         @dataclass
         class FakeBatchRow:
@@ -420,6 +426,8 @@ class TestFix4DeadD9Removed:
         service = InboxService.__new__(InboxService)
         service._delivery_loop = MagicMock()
         service._delivery_tasks = set()
+        service._tnf_lock = threading.Lock()
+        service._terminal_not_found_streaks = {}
 
         with (
             patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_dl,

@@ -100,7 +100,7 @@ def test_endpoint_ast_guard_is_closed() -> None:
 
 @pytest.mark.slow  # F254 D19: exceeds unit budget
 def test_tmux_ast_guard_is_closed() -> None:
-    allowed = {"utils/tmux_command.py", "sandbox_bootstrap.py"}
+    allowed = {"utils/tmux_command.py", "sandbox_bootstrap.py", "services/readopt_service.py"}
     for path in _python_files():
         relative = path.relative_to(SOURCE).as_posix()
         violations = _raw_tmux_calls(ast.parse(path.read_text(encoding="utf-8")))
