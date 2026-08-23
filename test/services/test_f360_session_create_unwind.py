@@ -5,8 +5,9 @@ Two layers:
    via ``delete_terminal`` + StatusMonitor state via ``unregister``) on ANY
    exception raised after ``create_terminal`` allocated and registered the id.
 2. ``StatusMonitor._process_chunk`` drops a terminal id from its watch state
-   with one warning after the second consecutive "not found in database" miss
-   from ``provider_manager.get_provider`` instead of erroring forever.
+   with one warning after the third consecutive "not found in database" miss
+   (``GHOST_DROP_MISSES``) from ``provider_manager.get_provider`` instead of
+   erroring forever.
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -15,7 +16,7 @@ import pytest
 
 from cli_agent_orchestrator.services import session_service
 from cli_agent_orchestrator.services.session_service import create_session
-from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+from cli_agent_orchestrator.services.status_monitor import GHOST_DROP_MISSES, StatusMonitor
 
 
 def _terminal_double():
@@ -136,20 +137,22 @@ def _not_found(terminal_id):
 
 
 class TestStatusMonitorGhostDrop:
-    """Monitor drops a ghost id after the first not-found miss (issue #215)."""
+    """Monitor drops a ghost id after GHOST_DROP_MISSES misses (issue #215)."""
 
+    @pytest.mark.parametrize("misses", [1, GHOST_DROP_MISSES - 1])
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
-    def test_first_not_found_tolerated_not_dropped(self, mock_pm):
+    def test_first_misses_tolerated_not_dropped(self, mock_pm, misses):
         sm = StatusMonitor()
         mock_pm.get_provider.side_effect = _not_found("ghost0001")
 
-        sm._process_chunk("ghost0001", "chunk")
+        for i in range(misses):
+            sm._process_chunk("ghost0001", f"chunk{i}")
 
         assert "ghost0001" not in sm._dropped_not_found
-        assert sm._provider_not_found_count["ghost0001"] == 1
+        assert sm._provider_not_found_count["ghost0001"] == misses
 
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
-    def test_second_not_found_drops_ghost_with_one_warning(self, mock_pm, caplog):
+    def test_third_not_found_drops_ghost_with_one_warning(self, mock_pm, caplog):
         sm = StatusMonitor()
         tid = "ghost0002"
         mock_pm.get_provider.side_effect = _not_found(tid)
@@ -158,10 +161,13 @@ class TestStatusMonitorGhostDrop:
         sm._process_chunk(tid, "chunk1")
         with sm._lock:
             sm._buffers[tid] = "stale ghost buffer"
-        sm._process_chunk(tid, "chunk2")
+        sm._process_chunk(tid, "chunk2")  # 2 misses: still watching (commit
+        # window under lock contention — F360 diff gate SHOULD finding).
+        assert tid not in sm._dropped_not_found
+        sm._process_chunk(tid, "chunk3")  # 3rd miss: drop.
         # Further chunks are ignored silently — no more errors, no more warnings.
-        sm._process_chunk(tid, "chunk3")
         sm._process_chunk(tid, "chunk4")
+        sm._process_chunk(tid, "chunk5")
 
         assert tid in sm._dropped_not_found
         with sm._lock:
