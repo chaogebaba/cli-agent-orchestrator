@@ -34,6 +34,7 @@ FixtureVariant = Literal[
     "post-send-death",
     "process-less",
     "procfs-unavailable",
+    "spawn-then-fault",
 ]
 FIXTURE_VARIANTS: tuple[str, ...] = (
     "healthy",
