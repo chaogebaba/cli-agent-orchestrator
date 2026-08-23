@@ -107,6 +107,43 @@ def _current_terminal_id() -> Optional[str]:
     return terminal_id
 
 
+def _refresh_terminal_token_from_pane() -> Optional[str]:
+    """F352: Attempt to read CAO_TERMINAL_TOKEN from the parent process env.
+
+    When the MCP server was spawned without the token in its env (e.g. kiro
+    agent config missing the ${CAO_TERMINAL_TOKEN} expansion), the token may
+    still be available in the parent process (kiro-cli) which inherited it
+    from the tmux pane. We read it from /proc/<ppid>/environ on Linux.
+    """
+    try:
+        ppid = os.getppid()
+        environ_path = f"/proc/{ppid}/environ"
+        if not os.path.exists(environ_path):
+            return None
+        with open(environ_path, "rb") as f:
+            data = f.read()
+        ppid_terminal_id = None
+        token = None
+        for entry in data.split(b"\x00"):
+            if entry.startswith(b"CAO_TERMINAL_TOKEN="):
+                token = entry.split(b"=", 1)[1].decode("utf-8")
+            elif entry.startswith(b"CAO_TERMINAL_ID="):
+                ppid_terminal_id = entry.split(b"=", 1)[1].decode("utf-8")
+        if token is None:
+            return None
+        # S1 identity cross-check: only adopt the token when the parent env
+        # belongs to THIS terminal. Otherwise the token could leak across
+        # terminal boundaries (e.g. a reparented/shared parent process).
+        # Both sides must have a terminal ID and they must match.
+        own_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+        if not own_terminal_id or ppid_terminal_id != own_terminal_id:
+            return None
+        return token
+    except (OSError, PermissionError, UnicodeDecodeError):
+        pass
+    return None
+
+
 def _resolve_input_terminal_id(value: str) -> str:
     """Resolve a user-supplied terminal identifier (F172 input leniency).
 
@@ -895,6 +932,28 @@ def _send_to_inbox(
         headers=headers or None,
         timeout=_mcp_timeout(),
     )
+
+    # F352: On 403 E-SENDER-TOKEN with absent token, attempt one retry after
+    # re-reading CAO_TERMINAL_TOKEN from the pane env (it may have been set
+    # after this MCP server process launched, e.g. due to a missing env var in
+    # the kiro agent config that was since fixed by `cao install`).
+    if response.status_code == 403 and not terminal_token:
+        try:
+            detail = response.json().get("detail", {})
+            if isinstance(detail, dict) and detail.get("code") == "E-SENDER-TOKEN":
+                refreshed_token = _refresh_terminal_token_from_pane()
+                if refreshed_token:
+                    os.environ["CAO_TERMINAL_TOKEN"] = refreshed_token
+                    headers["X-CAO-Terminal-Token"] = refreshed_token
+                    response = cao_http.post(
+                        f"/terminals/{receiver_id}/inbox/messages",
+                        params=params,
+                        headers=headers,
+                        timeout=_mcp_timeout(),
+                    )
+        except Exception:
+            pass  # Fall through to original response handling
+
     response.raise_for_status()
     return response.json()
 

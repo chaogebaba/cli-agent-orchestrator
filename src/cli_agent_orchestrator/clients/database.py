@@ -2945,9 +2945,11 @@ def create_terminal_with_warm_intent(
     engine: Optional[str] = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    working_directory: Optional[str] = None,
     worktree_info: Optional[Dict[str, str]] = None,
     authority_files: Optional[List[Dict[str, str]]] = None,
     resolved_model: Optional[str] = None,
+    auth_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Publish terminal metadata and a fork-only warm intent together."""
     import json as _json
@@ -2973,8 +2975,10 @@ def create_terminal_with_warm_intent(
             engine=engine,
             group=_json.dumps(group) if group else None,
             metadata_json=_json.dumps(metadata) if metadata else None,
+            working_directory=working_directory,
             worktree_info=_json.dumps(worktree_info) if worktree_info else None,
             resolved_model=resolved_model,
+            auth_token=auth_token,
         )
         db.add(terminal)
         db.flush()

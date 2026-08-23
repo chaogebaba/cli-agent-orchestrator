@@ -97,6 +97,7 @@ def _inject_kiro_identity_env(
 
     _IDENTITY_VARS = {
         "CAO_TERMINAL_ID": "${CAO_TERMINAL_ID}",
+        "CAO_TERMINAL_TOKEN": "${CAO_TERMINAL_TOKEN}",
         "CAO_INSTANCE_ID": "${CAO_INSTANCE_ID}",
         "CAO_ENDPOINT": "${CAO_ENDPOINT}",
     }

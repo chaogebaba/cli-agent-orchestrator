@@ -164,6 +164,29 @@ def _post_json(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         headers=headers or None,
         timeout=MCP_REQUEST_TIMEOUT,
     )
+
+    # F352: On 403 E-SENDER-TOKEN with absent token, attempt refresh from parent env
+    if response.status_code == 403 and not terminal_token:
+        try:
+            detail = response.json().get("detail", {})
+            if isinstance(detail, dict) and detail.get("code") == "E-SENDER-TOKEN":
+                from cli_agent_orchestrator.mcp_server.server import (
+                    _refresh_terminal_token_from_pane,
+                )
+
+                refreshed = _refresh_terminal_token_from_pane()
+                if refreshed:
+                    os.environ["CAO_TERMINAL_TOKEN"] = refreshed
+                    headers["X-CAO-Terminal-Token"] = refreshed
+                    response = cao_http.post(
+                        f"{path}",
+                        params={k: v for k, v in (params or {}).items() if v is not None} or None,
+                        headers=headers,
+                        timeout=MCP_REQUEST_TIMEOUT,
+                    )
+        except Exception:
+            pass
+
     response.raise_for_status()
     try:
         return response.json()
