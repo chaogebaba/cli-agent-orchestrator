@@ -1,9 +1,15 @@
-"""F295 AC4: Background watcher for canonical grok config changes.
+"""F295 AC4 / F358: Background watcher for canonical grok config changes.
 
 Polls the canonical ``~/.grok/config.toml`` mtime periodically. On change,
-recomputes the canonical hash and pushes ONE supervisor inbox notice per
-change event. Debounced: one notice per mtime change, not per poll cycle.
+extracts ONLY the routing-relevant keys (F358) and pushes ONE supervisor
+inbox notice per actual routing change. The grok CLI itself rewrites
+config.toml during normal sessions (marketplace/ui/skills churn), so the
+raw sha256 is no longer the change detector — the key comparison is.
+Debounced: one notice per change event, not per poll cycle.
 NO auto-respawn — flag + notify only.
+
+Fail-open (F358): if the TOML fails to parse, notify ONCE (the previous
+good state is unknown), then stay quiet until a valid parse resumes.
 """
 
 from __future__ import annotations
@@ -12,6 +18,7 @@ import asyncio
 import hashlib
 import json as _json
 import logging
+import tomllib
 from pathlib import Path
 
 from cli_agent_orchestrator.utils.provider_plane import provider_home
@@ -20,6 +27,38 @@ logger = logging.getLogger(__name__)
 
 # Poll interval for mtime checks (seconds).  Cheap stat() call.
 GROK_CONFIG_POLL_INTERVAL_S = 10.0
+
+# F358: routing-relevant keys inside the top-level [models] section.
+ROUTING_MODELS_KEYS = ("default", "default_reasoning_effort")
+
+# F358: top-level sections that carry endpoint/api routing wholesale.
+# [model.<name>] tables hold base_url / api_key / api_backend (see
+# grok_preflight._read_model_table); [api] is included when present.
+ROUTING_SECTIONS = ("model", "api")
+
+
+def _routing_fingerprint(text: str) -> dict | None:
+    """F358: extract routing-relevant keys from config TOML text.
+
+    Returns a comparable dict of routing keys, or None when the TOML is
+    malformed (caller fails open).
+    """
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return None
+    fp: dict = {}
+    models = data.get("models")
+    if isinstance(models, dict):
+        picked = {k: models[k] for k in ROUTING_MODELS_KEYS if k in models}
+        if picked:
+            fp["models"] = picked
+    for section in ROUTING_SECTIONS:
+        val = data.get(section)
+        if isinstance(val, dict) and val:
+            fp[section] = val
+    return fp
+
 
 
 def _canonical_config_path() -> Path:
@@ -93,6 +132,10 @@ class GrokConfigWatcher:
     def __init__(self) -> None:
         self._last_mtime: float | None = None
         self._last_hash: str | None = None
+        # F358: routing-key fingerprint is the change detector; hash stays
+        # in the notice text and stale-count comparison only.
+        self._last_fingerprint: dict | None = None
+        self._parse_fail_notified: bool = False
 
     async def run(self) -> None:
         """Main loop — call as an asyncio task from lifespan."""
@@ -117,12 +160,22 @@ class GrokConfigWatcher:
                 self._last_mtime = path.stat().st_mtime
                 text = path.read_text(encoding="utf-8")
                 self._last_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                # F358: baseline the routing fingerprint; a malformed
+                # baseline suppresses the fail-open notice (nothing to
+                # compare against — no change event has occurred).
+                fingerprint = _routing_fingerprint(text)
+                self._last_fingerprint = fingerprint
+                self._parse_fail_notified = fingerprint is None
             else:
                 self._last_mtime = None
                 self._last_hash = None
+                self._last_fingerprint = None
+                self._parse_fail_notified = False
         except OSError:
             self._last_mtime = None
             self._last_hash = None
+            self._last_fingerprint = None
+            self._parse_fail_notified = False
 
     def _check_and_notify(self) -> None:
         """Single poll iteration: check mtime, notify if changed."""
@@ -133,6 +186,9 @@ class GrokConfigWatcher:
                 # (missing canonical is a warning, not a config change event)
                 self._last_mtime = None
                 self._last_hash = None
+                # Keep _last_fingerprint so a resurrected config is compared
+                # against the pre-deletion routing state; re-arm fail-open.
+                self._parse_fail_notified = False
                 logger.warning("F295 AC4: canonical config deleted")
             return
 
@@ -154,13 +210,33 @@ class GrokConfigWatcher:
         current_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
 
         # Update tracked state
-        old_mtime = self._last_mtime
         self._last_mtime = current_mtime
 
         # If hash unchanged (e.g. touch without edit), skip notification
         if current_hash == self._last_hash:
             return
+
+        # F358 fail-open: malformed TOML — notify once, then stay quiet
+        # until a valid parse resumes.
+        fingerprint = _routing_fingerprint(text)
+        if fingerprint is None:
+            if not self._parse_fail_notified:
+                self._parse_fail_notified = True
+                self._last_hash = current_hash
+                logger.warning("F358: grok config TOML parse failed; failing open (one notice)")
+                stale_count = _count_stale_grok_terminals(current_hash)
+                _push_supervisor_notice(current_hash, stale_count)
+            return
+        self._parse_fail_notified = False
+
         self._last_hash = current_hash
+
+        # F358: the change detector is the routing-key comparison, NOT the
+        # sha256 — the grok CLI rewrites non-routing sections during normal
+        # sessions and those churns must not fire "respawn" notices.
+        if fingerprint == self._last_fingerprint:
+            return
+        self._last_fingerprint = fingerprint
 
         # Push one notice
         stale_count = _count_stale_grok_terminals(current_hash)
