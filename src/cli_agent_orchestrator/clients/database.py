@@ -3250,6 +3250,8 @@ def merge_terminal_system_metadata(terminal_id: str, patch: Dict[str, Any]) -> b
         existing[_SYSTEM_KEY] = cao_ns
         terminal.metadata_json = _json.dumps(existing)
         db.commit()
+        # S3: evict from metadata cache after system metadata write
+        invalidate_terminal_metadata_cache(terminal_id)
         return True
 
 
@@ -3791,6 +3793,8 @@ def settle_terminal_rebound(
                 terminal_id,
                 _f138_old_inc_id,
             )
+    # S3: evict from metadata cache after rebound settle
+    invalidate_terminal_metadata_cache(terminal_id)
     return _result_generation
 
 
@@ -3856,7 +3860,10 @@ def fail_terminal_rebound(
                         synchronize_session=False,
                     )
                 )
-        return int(changed)
+        _changed = int(changed)
+    # S3: evict from metadata cache after rebound failure
+    invalidate_terminal_metadata_cache(terminal_id)
+    return _changed
 
 
 def set_terminal_recovery_state(
@@ -3874,12 +3881,15 @@ def set_terminal_recovery_state(
         }
         if fallback_terminal_id is not None:
             values["fallback_terminal_id"] = fallback_terminal_id
-        return (
+        updated = (
             db.query(TerminalModel)
             .filter_by(id=terminal_id)
             .update(values, synchronize_session=False)
             > 0
         )
+    # S3: evict from metadata cache after recovery state write
+    invalidate_terminal_metadata_cache(terminal_id)
+    return updated
 
 
 def quarantine_terminal_owner(
@@ -3912,7 +3922,10 @@ def quarantine_terminal_owner(
         row.recovery_state = "rebind_failed"
         row.recovery_error = error[:2048]
         row.recovery_updated_at = _utcnow()
-        return association
+        _association = association
+    # S3: evict from metadata cache after quarantine write
+    invalidate_terminal_metadata_cache(terminal_id)
+    return _association
 
 
 def settle_terminal_fallback(old_terminal_id: str, new_terminal_id: str) -> int:
@@ -4307,6 +4320,11 @@ def delete_terminal_and_warm_intent(
         )
 
         _mark_barrier_member_gone_in_db(db, terminal_id)
+        # B3: query child IDs before bulk update so we can invalidate their caches
+        child_ids = [
+            row.id
+            for row in db.query(TerminalModel.id).filter(TerminalModel.caller_id == terminal_id).all()
+        ]
         child_values = {
             TerminalModel.caller_id: target.id if target is not None else None,
             TerminalModel.caller_mailbox_id: (
@@ -4326,6 +4344,9 @@ def delete_terminal_and_warm_intent(
         terminal_deleted = db.query(TerminalModel).filter_by(id=terminal_id).delete() > 0
     # F351: evict from metadata cache after deletion
     invalidate_terminal_metadata_cache(terminal_id)
+    # B3: invalidate reparented children so their cached caller_id is refreshed
+    for child_id in child_ids:
+        invalidate_terminal_metadata_cache(child_id)
     return {
         "terminal_deleted": terminal_deleted,
         "intent_deleted": intent_deleted,
