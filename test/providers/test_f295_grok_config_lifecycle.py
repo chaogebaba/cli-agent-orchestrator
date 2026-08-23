@@ -445,3 +445,227 @@ class TestAC4ChangeNotice:
 
             watcher._check_and_notify()
             mock_push.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# F358: routing-key change detection (no false pushes on non-routing churn)
+# ---------------------------------------------------------------------------
+
+
+class TestF358RoutingKeyDetection:
+    """Watcher notifies only when routing-relevant keys actually change."""
+
+    def test_no_notice_on_non_routing_churn(self, tmp_path):
+        """grok CLI rewrites ui/skills/marketplace sections — no notice (F358)."""
+        from cli_agent_orchestrator.services.grok_config_watcher import GrokConfigWatcher
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            '[models]\ndefault = "grok-4.6"\ndefault_reasoning_effort = "high"\n\n[ui]\nyolo = true\n'
+        )
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.grok_config_watcher._canonical_config_path",
+                return_value=config,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.grok_config_watcher._push_supervisor_notice"
+            ) as mock_push,
+        ):
+            watcher = GrokConfigWatcher()
+            watcher._snapshot_baseline()
+
+            # grok CLI churn: ui/skills rewritten, routing untouched
+            config.write_text(
+                '[models]\ndefault = "grok-4.6"\ndefault_reasoning_effort = "high"\n\n'
+                '[ui]\nyolo = false\n\n[skills]\ndisabled = ["tmux"]\n'
+            )
+
+            watcher._check_and_notify()
+            mock_push.assert_not_called()
+
+    def test_notice_on_default_model_change(self, tmp_path):
+        """Changing [models].default fires exactly one notice."""
+        from cli_agent_orchestrator.services.grok_config_watcher import GrokConfigWatcher
+
+        config = tmp_path / "config.toml"
+        config.write_text('[models]\ndefault = "grok-4.6"\n')
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.grok_config_watcher._canonical_config_path",
+                return_value=config,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.grok_config_watcher._push_supervisor_notice"
+            ) as mock_push,
+            patch(
+                "cli_agent_orchestrator.services.grok_config_watcher._count_stale_grok_terminals",
+                return_value=0,
+            ),
+        ):
+            watcher = GrokConfigWatcher()
+            watcher._snapshot_baseline()
+
+            config.write_text('[models]\ndefault = "grok-4.7"\n')
+
+            watcher._check_and_notify()
+            mock_push.assert_called_once()
+
+    def test_notice_on_reasoning_effort_change(self, tmp_path):
+        """Changing [models].default_reasoning_effort fires a notice."""
+        from cli_agent_orchestrator.services.grok_config_watcher import GrokConfigWatcher
+
+        config = tmp_path / "config.toml"
+        config.write_text('[models]\ndefault = "grok-4.6"\ndefault_reasoning_effort = "high"\n')
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.grok_config_watcher._canonical_config_path",
+                return_value=config,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.grok_config_watcher._push_supervisor_notice"
+            ) as mock_push,
+        ):
+            watcher = GrokConfigWatcher()
+            watcher._snapshot_baseline()
+
+            config.write_text('[models]\ndefault = "grok-4.6"\ndefault_reasoning_effort = "low"\n')
+
+            watcher._check_and_notify()
+            mock_push.assert_called_once()
+
+    def test_notice_on_model_table_endpoint_change(self, tmp_path):
+        """Changing a [model.<name>] endpoint table (base_url) fires a notice."""
+        from cli_agent_orchestrator.services.grok_config_watcher import GrokConfigWatcher
+
+        config = tmp_path / "config.toml"
+        config.write_text(
+            '[models]\ndefault = "relay"\n\n[model.relay]\nbase_url = "http://a"\napi_backend = "chat"\n'
+        )
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.grok_config_watcher._canonical_config_path",
+                return_value=config,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.grok_config_watcher._push_supervisor_notice"
+            ) as mock_push,
+        ):
+            watcher = GrokConfigWatcher()
+            watcher._snapshot_baseline()
+
+            config.write_text(
+                '[models]\ndefault = "relay"\n\n[model.relay]\nbase_url = "http://b"\napi_backend = "chat"\n'
+            )
+
+            watcher._check_and_notify()
+            mock_push.assert_called_once()
+
+    def test_notice_keeps_sha_in_args(self, tmp_path):
+        """The notice still carries the new content sha (kept for text/stale logic)."""
+        import hashlib as _hashlib
+
+        from cli_agent_orchestrator.services.grok_config_watcher import GrokConfigWatcher
+
+        config = tmp_path / "config.toml"
+        config.write_text('[models]\ndefault = "grok-4.6"\n')
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.grok_config_watcher._canonical_config_path",
+                return_value=config,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.grok_config_watcher._push_supervisor_notice"
+            ) as mock_push,
+            patch(
+                "cli_agent_orchestrator.services.grok_config_watcher._count_stale_grok_terminals",
+                return_value=3,
+            ),
+        ):
+            watcher = GrokConfigWatcher()
+            watcher._snapshot_baseline()
+
+            new_text = '[models]\ndefault = "grok-4.7"\n'
+            config.write_text(new_text)
+
+            watcher._check_and_notify()
+            args = mock_push.call_args[0]
+            assert args[0] == _hashlib.sha256(new_text.encode()).hexdigest()
+            assert args[1] == 3
+
+    def test_malformed_toml_fails_open_once(self, tmp_path):
+        """Parse failure notifies once (fail-open), not on every poll."""
+        import os
+        import time
+
+        from cli_agent_orchestrator.services.grok_config_watcher import GrokConfigWatcher
+
+        config = tmp_path / "config.toml"
+        config.write_text('[models]\ndefault = "grok-4.6"\n')
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.grok_config_watcher._canonical_config_path",
+                return_value=config,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.grok_config_watcher._push_supervisor_notice"
+            ) as mock_push,
+            patch(
+                "cli_agent_orchestrator.services.grok_config_watcher._count_stale_grok_terminals",
+                return_value=0,
+            ),
+        ):
+            watcher = GrokConfigWatcher()
+            watcher._snapshot_baseline()
+
+            # Corrupt the file — fail open with ONE notice
+            config.write_text('[models]\ndefault = "unterminated\n')
+            watcher._check_and_notify()
+            assert mock_push.call_count == 1
+
+            # Still corrupt, mtime bumped again — no second notice
+            time.sleep(0.01)
+            os.utime(config, (time.time() + 2, time.time() + 2))
+            watcher._check_and_notify()
+            assert mock_push.call_count == 1
+
+    def test_recovery_from_malformed_detects_routing_change(self, tmp_path):
+        """After a parse failure, valid TOML resumes detection against the
+        last good routing fingerprint (no notice if routing unchanged)."""
+        from cli_agent_orchestrator.services.grok_config_watcher import GrokConfigWatcher
+
+        config = tmp_path / "config.toml"
+        config.write_text('[models]\ndefault = "grok-4.6"\n')
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.grok_config_watcher._canonical_config_path",
+                return_value=config,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.grok_config_watcher._push_supervisor_notice"
+            ) as mock_push,
+        ):
+            watcher = GrokConfigWatcher()
+            watcher._snapshot_baseline()
+
+            # Corrupt → one fail-open notice
+            config.write_text("not [valid toml ===\n")
+            watcher._check_and_notify()
+            assert mock_push.call_count == 1
+
+            # Recover with SAME routing keys — no additional notice
+            config.write_text('[models]\ndefault = "grok-4.6"\n[ui]\nyolo = true\n')
+            watcher._check_and_notify()
+            assert mock_push.call_count == 1
+
+            # Recovered state then changes a routing key — notice fires
+            config.write_text('[models]\ndefault = "grok-4.7"\n[ui]\nyolo = true\n')
+            watcher._check_and_notify()
+            assert mock_push.call_count == 2
