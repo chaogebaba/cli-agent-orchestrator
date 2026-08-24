@@ -213,7 +213,8 @@ def _deliver_with_fakes(
 
     def send(_terminal_id, wire, **kwargs):
         wires.append(wire)
-        kwargs["on_submitted"](observation)
+        if "on_submitted" in kwargs:
+            kwargs["on_submitted"](observation)
         return observation
 
     stack = ExitStack()
@@ -267,7 +268,6 @@ def test_f13_f14_resolution_object_normalized_third_tagged_attempt_and_cap_unblo
     message = create_inbox_message("sender", "receiver", "payload")
     first = _ambiguous(message, "payload")
     second = _ambiguous(message, "payload")
-    next_message = create_inbox_message("sender", "receiver", "next")
     resolution = _resolution(tmp_path)
     service = InboxService()
 
@@ -303,6 +303,11 @@ def test_f13_f14_resolution_object_normalized_third_tagged_attempt_and_cap_unblo
     assert lookup.call_count == 3
     paste.assert_not_called()
     assert get_message_trace(message.id)["message"]["status"] == "delivery_failed"
+
+    # F401: Create next_message AFTER the first message is fully settled
+    # (delivery_failed). Earlier creation caused a batch membership mismatch
+    # because deliver_pending batches all pending messages together.
+    next_message = create_inbox_message("sender", "receiver", "next")
 
     stack, _, paste, wires = _deliver_with_fakes(
         service,

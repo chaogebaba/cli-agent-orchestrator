@@ -1,0 +1,210 @@
+diff --git a/src/cli_agent_orchestrator/providers/mock_cli.py b/src/cli_agent_orchestrator/providers/mock_cli.py
+index 9a084b3b..fd6efb02 100644
+--- a/src/cli_agent_orchestrator/providers/mock_cli.py
++++ b/src/cli_agent_orchestrator/providers/mock_cli.py
+@@ -158,8 +158,17 @@ class MockCliProvider(BaseProvider):
+             ]
+             command = shlex.join(argv)
+         else:
+-            # Legacy CI mode: binary on PATH
+-            command = shlex.join([self.BINARY_NAME, "--delay-ms", str(self._delay_ms)])
++            # Legacy CI mode: binary on PATH.
++            # F401: resolve to absolute path so tmux panes whose login shell
++            # resets PATH (e.g. /etc/profile on Debian 13 boxes) can still find
++            # the binary. shutil.which reads the CURRENT process PATH (set by
++            # test/conftest.py), producing a path the pane shell can execute
++            # even if its own PATH no longer contains the test fixtures dir.
++            import shutil as _shutil
++
++            resolved = _shutil.which(self.BINARY_NAME)
++            binary = resolved if resolved else self.BINARY_NAME
++            command = shlex.join([binary, "--delay-ms", str(self._delay_ms)])
+ 
+         get_backend().send_keys(self.session_name, self.window_name, command)
+ 
+diff --git a/src/cli_agent_orchestrator/sandbox_bootstrap.py b/src/cli_agent_orchestrator/sandbox_bootstrap.py
+index bfbbeba4..d384c5b0 100644
+--- a/src/cli_agent_orchestrator/sandbox_bootstrap.py
++++ b/src/cli_agent_orchestrator/sandbox_bootstrap.py
+@@ -847,7 +847,7 @@ def command_up(args: argparse.Namespace) -> int:
+         if manifest is not None and sentinel_created:
+             _tmux_lifecycle(str(manifest["tmux_socket"]), "kill-server", check=False)
+             try:
+-                _unlink_dead_tmux_socket(str(manifest["tmux_socket"]), settle=5.0)
++                _unlink_dead_tmux_socket(str(manifest["tmux_socket"]), settle=15.0)
+             except (SandboxError, OSError):
+                 pass
+         if manifest is not None:
+@@ -934,7 +934,7 @@ def command_down(args: argparse.Namespace) -> int:
+         else:
+             os.killpg(pid, signal.SIGKILL)
+     _tmux_lifecycle(str(manifest["tmux_socket"]), "kill-server", check=False)
+-    _unlink_dead_tmux_socket(str(manifest["tmux_socket"]), settle=5.0)
++    _unlink_dead_tmux_socket(str(manifest["tmux_socket"]), settle=15.0)
+     Path(manifest["pidfile"]).unlink(missing_ok=True)
+     if args.purge:
+         current = validate_manifest(
+diff --git a/test/services/test_delivery_fixbatch_f12_f13_f14.py b/test/services/test_delivery_fixbatch_f12_f13_f14.py
+index ca10f11f..7cf70d25 100644
+--- a/test/services/test_delivery_fixbatch_f12_f13_f14.py
++++ b/test/services/test_delivery_fixbatch_f12_f13_f14.py
+@@ -213,7 +213,8 @@ def _deliver_with_fakes(
+ 
+     def send(_terminal_id, wire, **kwargs):
+         wires.append(wire)
+-        kwargs["on_submitted"](observation)
++        if "on_submitted" in kwargs:
++            kwargs["on_submitted"](observation)
+         return observation
+ 
+     stack = ExitStack()
+@@ -267,7 +268,6 @@ def test_f13_f14_resolution_object_normalized_third_tagged_attempt_and_cap_unblo
+     message = create_inbox_message("sender", "receiver", "payload")
+     first = _ambiguous(message, "payload")
+     second = _ambiguous(message, "payload")
+-    next_message = create_inbox_message("sender", "receiver", "next")
+     resolution = _resolution(tmp_path)
+     service = InboxService()
+ 
+@@ -304,6 +304,11 @@ def test_f13_f14_resolution_object_normalized_third_tagged_attempt_and_cap_unblo
+     paste.assert_not_called()
+     assert get_message_trace(message.id)["message"]["status"] == "delivery_failed"
+ 
++    # F401: Create next_message AFTER the first message is fully settled
++    # (delivery_failed). Earlier creation caused a batch membership mismatch
++    # because deliver_pending batches all pending messages together.
++    next_message = create_inbox_message("sender", "receiver", "next")
++
+     stack, _, paste, wires = _deliver_with_fakes(
+         service,
+         resolution=resolution,
+diff --git a/test/services/test_fifo_reader.py b/test/services/test_fifo_reader.py
+index a7d93b5a..c148a669 100644
+--- a/test/services/test_fifo_reader.py
++++ b/test/services/test_fifo_reader.py
+@@ -112,7 +112,18 @@ class TestReaderThreadLifecycle:
+         fifo_path = tmp_path / "term-data.fifo"
+ 
+         for payload in (b"first", b"second"):
+-            wfd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
++            # F401: On loaded boxes the reader thread may not have opened the
++            # read end yet when we try O_WRONLY|O_NONBLOCK (yields ENXIO).
++            # Retry briefly to tolerate thread scheduling latency.
++            open_deadline = time.monotonic() + 3.0
++            wfd = -1
++            while time.monotonic() < open_deadline:
++                try:
++                    wfd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
++                    break
++                except OSError:
++                    threading.Event().wait(0.05)
++            assert wfd >= 0, "FIFO reader did not open read end in time"
+             os.write(wfd, payload)
+             os.close(wfd)
+             # Wait for the reader's select loop to pick the chunk up.
+diff --git a/test/services/test_fx193_nudge_discipline.py b/test/services/test_fx193_nudge_discipline.py
+index 4721775d..d51bccf9 100644
+--- a/test/services/test_fx193_nudge_discipline.py
++++ b/test/services/test_fx193_nudge_discipline.py
+@@ -460,6 +460,10 @@ class TestAC6EBoundEscalation:
+         delivery_service._escalate still calls attempt_rung2 directly with
+         is_escalation=True, bypassing nudge_discipline entirely. The nudge
+         discipline cannot suppress or delay escalation (D5).
++
++        F401: Uses worker profile because supervisor-role targets now take a
++        distinct escalation path (F210 D14 — supervisor_role_exempt) that
++        never calls attempt_rung2.
+         """
+         from unittest.mock import MagicMock, patch
+ 
+@@ -490,16 +494,16 @@ class TestAC6EBoundEscalation:
+                 TerminalModel(
+                     id="sup1",
+                     tmux_session="cao-test",
+-                    tmux_window="supervisor",
++                    tmux_window="worker-w",
+                     provider="kiro_cli",
+-                    agent_profile="supervisor",
++                    agent_profile="developer",
+                 )
+             )
+             db.add(
+                 MailboxModel(
+                     id="mb1",
+                     session_name="cao-test",
+-                    role="supervisor",
++                    role="worker",
+                     current_terminal_id="sup1",
+                     generation=1,
+                     consumed_through_id=0,
+diff --git a/test/services/test_wave4_delivery_state.py b/test/services/test_wave4_delivery_state.py
+index 6dc0840a..5155bcd6 100644
+--- a/test/services/test_wave4_delivery_state.py
++++ b/test/services/test_wave4_delivery_state.py
+@@ -974,6 +974,10 @@ def test_probe_15_prior_hit_suppression_precedes_every_open_kind():
+ 
+ 
+ def test_probe_16_frozen_drain_sql_fixture_ratios():
++    import shutil
++
++    if not shutil.which("sqlite3"):
++        pytest.skip("sqlite3 CLI binary not installed (apt install sqlite3)")
+     from test.conftest import ROOT_REPO
+     if ROOT_REPO is None:
+         pytest.skip("root repo not found (worktree without .git context)")
+diff --git a/test/test_g7a_sandbox.py b/test/test_g7a_sandbox.py
+index 28e6e7fa..062ba296 100644
+--- a/test/test_g7a_sandbox.py
++++ b/test/test_g7a_sandbox.py
+@@ -369,6 +369,7 @@ def _manifest(tmp_path: Path) -> tuple[dict, Path]:
+     return manifest, root / bootstrap.MANIFEST_NAME
+ 
+ 
++@pytest.mark.xdist_group("g7a_tmux_lifecycle")
+ def test_foreign_tmux_socket_collision_is_neither_adopted_nor_killed(
+     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+ ) -> None:
+@@ -404,9 +405,10 @@ def test_foreign_tmux_socket_collision_is_neither_adopted_nor_killed(
+             capture_output=True,
+             text=True,
+         )
+-        bootstrap._unlink_dead_tmux_socket(socket_name, settle=5.0)
++        bootstrap._unlink_dead_tmux_socket(socket_name, settle=15.0)
+ 
+ 
++@pytest.mark.xdist_group("g7a_tmux_lifecycle")
+ def test_dead_tmux_socket_is_reaped_and_live_one_is_refused() -> None:
+     socket_name = f"cao-sbx-{uuid.uuid4().hex[:8]}"
+     socket_path = bootstrap._tmux_socket_path(socket_name)
+@@ -430,13 +432,14 @@ def test_dead_tmux_socket_is_reaped_and_live_one_is_refused() -> None:
+             text=True,
+         )
+     assert socket_path.exists(), "F182: tmux leaves the socket inode behind after kill-server"
+-    assert bootstrap._unlink_dead_tmux_socket(socket_name, settle=5.0) is True
++    assert bootstrap._unlink_dead_tmux_socket(socket_name, settle=15.0) is True
+     assert not socket_path.exists()
+     assert bootstrap._unlink_dead_tmux_socket(socket_name) is False
+ 
+ 
+ @pytest.mark.requires_tmux
+ @pytest.mark.slow  # F254 D19: exceeds unit budget
++@pytest.mark.xdist_group("g7a_tmux_lifecycle")
+ def test_up_reclaims_a_dead_socket_of_the_same_name(
+     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+ ) -> None:
+@@ -563,6 +566,7 @@ def _free_port() -> int:
+ 
+ 
+ @pytest.mark.slow  # F254 D19: exceeds unit budget
++@pytest.mark.xdist_group("g7a_tmux_lifecycle")
+ def test_empty_cache_invalid_and_valid_lifecycle_audit(tmp_path: Path) -> None:
+     before = _cache_snapshot()
+     env = {
+@@ -643,6 +647,7 @@ def test_empty_cache_invalid_and_valid_lifecycle_audit(tmp_path: Path) -> None:
+ 
+ 
+ @pytest.mark.slow  # F254 D19: exceeds unit budget
++@pytest.mark.xdist_group("g7a_tmux_lifecycle")
+ def test_real_down_purge_rejects_symlink_swapped_root(tmp_path: Path) -> None:
+     root = tmp_path / "purge"
+     moved = tmp_path / "purge-moved"

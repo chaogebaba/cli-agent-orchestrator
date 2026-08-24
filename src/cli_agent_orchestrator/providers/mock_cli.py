@@ -158,8 +158,17 @@ class MockCliProvider(BaseProvider):
             ]
             command = shlex.join(argv)
         else:
-            # Legacy CI mode: binary on PATH
-            command = shlex.join([self.BINARY_NAME, "--delay-ms", str(self._delay_ms)])
+            # Legacy CI mode: binary on PATH.
+            # F401: resolve to absolute path so tmux panes whose login shell
+            # resets PATH (e.g. /etc/profile on Debian 13 boxes) can still find
+            # the binary. shutil.which reads the CURRENT process PATH (set by
+            # test/conftest.py), producing a path the pane shell can execute
+            # even if its own PATH no longer contains the test fixtures dir.
+            import shutil as _shutil
+
+            resolved = _shutil.which(self.BINARY_NAME)
+            binary = resolved if resolved else self.BINARY_NAME
+            command = shlex.join([binary, "--delay-ms", str(self._delay_ms)])
 
         get_backend().send_keys(self.session_name, self.window_name, command)
 

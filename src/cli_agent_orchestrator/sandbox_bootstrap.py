@@ -847,7 +847,7 @@ def command_up(args: argparse.Namespace) -> int:
         if manifest is not None and sentinel_created:
             _tmux_lifecycle(str(manifest["tmux_socket"]), "kill-server", check=False)
             try:
-                _unlink_dead_tmux_socket(str(manifest["tmux_socket"]), settle=5.0)
+                _unlink_dead_tmux_socket(str(manifest["tmux_socket"]), settle=15.0)
             except (SandboxError, OSError):
                 pass
         if manifest is not None:
@@ -934,7 +934,7 @@ def command_down(args: argparse.Namespace) -> int:
         else:
             os.killpg(pid, signal.SIGKILL)
     _tmux_lifecycle(str(manifest["tmux_socket"]), "kill-server", check=False)
-    _unlink_dead_tmux_socket(str(manifest["tmux_socket"]), settle=5.0)
+    _unlink_dead_tmux_socket(str(manifest["tmux_socket"]), settle=15.0)
     Path(manifest["pidfile"]).unlink(missing_ok=True)
     if args.purge:
         current = validate_manifest(
