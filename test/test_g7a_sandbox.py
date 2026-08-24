@@ -369,6 +369,7 @@ def _manifest(tmp_path: Path) -> tuple[dict, Path]:
     return manifest, root / bootstrap.MANIFEST_NAME
 
 
+@pytest.mark.xdist_group("g7a_tmux_lifecycle")
 def test_foreign_tmux_socket_collision_is_neither_adopted_nor_killed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -407,6 +408,7 @@ def test_foreign_tmux_socket_collision_is_neither_adopted_nor_killed(
         bootstrap._unlink_dead_tmux_socket(socket_name, settle=15.0)
 
 
+@pytest.mark.xdist_group("g7a_tmux_lifecycle")
 def test_dead_tmux_socket_is_reaped_and_live_one_is_refused() -> None:
     socket_name = f"cao-sbx-{uuid.uuid4().hex[:8]}"
     socket_path = bootstrap._tmux_socket_path(socket_name)
@@ -437,6 +439,7 @@ def test_dead_tmux_socket_is_reaped_and_live_one_is_refused() -> None:
 
 @pytest.mark.requires_tmux
 @pytest.mark.slow  # F254 D19: exceeds unit budget
+@pytest.mark.xdist_group("g7a_tmux_lifecycle")
 def test_up_reclaims_a_dead_socket_of_the_same_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -563,6 +566,7 @@ def _free_port() -> int:
 
 
 @pytest.mark.slow  # F254 D19: exceeds unit budget
+@pytest.mark.xdist_group("g7a_tmux_lifecycle")
 def test_empty_cache_invalid_and_valid_lifecycle_audit(tmp_path: Path) -> None:
     before = _cache_snapshot()
     env = {
@@ -643,6 +647,7 @@ def test_empty_cache_invalid_and_valid_lifecycle_audit(tmp_path: Path) -> None:
 
 
 @pytest.mark.slow  # F254 D19: exceeds unit budget
+@pytest.mark.xdist_group("g7a_tmux_lifecycle")
 def test_real_down_purge_rejects_symlink_swapped_root(tmp_path: Path) -> None:
     root = tmp_path / "purge"
     moved = tmp_path / "purge-moved"
