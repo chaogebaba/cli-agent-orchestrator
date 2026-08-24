@@ -1,0 +1,512 @@
+diff --git a/src/cli_agent_orchestrator/clients/tmux.py b/src/cli_agent_orchestrator/clients/tmux.py
+index e17cc51b..e662baf8 100644
+--- a/src/cli_agent_orchestrator/clients/tmux.py
++++ b/src/cli_agent_orchestrator/clients/tmux.py
+@@ -315,6 +315,11 @@ class TmuxClient:
+             "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+             "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+             "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
++            # CODEX_HOME is the config/session directory — not a nesting vector.
++            # Persona isolation injects it via sandbox_guard; dropping it breaks
++            # the session-artifact validator (it resolves persona codex_home while
++            # the codex binary falls back to ~/.codex).
++            "CODEX_HOME",
+         }
+     )
+     # Per-var value cap (PR #246) — keeps the full tmux ``new-session -e`` /
+diff --git a/src/cli_agent_orchestrator/utils/persona_context.py b/src/cli_agent_orchestrator/utils/persona_context.py
+index fde974ba..a8844b60 100644
+--- a/src/cli_agent_orchestrator/utils/persona_context.py
++++ b/src/cli_agent_orchestrator/utils/persona_context.py
+@@ -500,6 +500,12 @@ def compose_persona_plan(
+             if auth.is_symlink() or not auth.is_file():
+                 raise PersonaContextError("persona_codex_auth_invalid")
+             os.symlink(str(auth.resolve()), staging / "codex-home/auth.json")
++            # Symlink sessions/ so `codex resume` (with CODEX_HOME pointing here)
++            # can find rollouts created by seed_resume_identity (which runs
++            # without persona env and writes to the production home's sessions/).
++            real_sessions = real_codex_home / "sessions"
++            if real_sessions.is_dir():
++                os.symlink(str(real_sessions), staging / "codex-home/sessions")
+             for leaf, source in leaf_sources:
+                 shutil.copyfile(source, staging / "codex-home" / leaf)
+                 (staging / "codex-home" / leaf).chmod(0o600)
+diff --git a/test/clients/test_codex_init_persona_home.py b/test/clients/test_codex_init_persona_home.py
+new file mode 100644
+index 00000000..5c446ac6
+--- /dev/null
++++ b/test/clients/test_codex_init_persona_home.py
+@@ -0,0 +1,150 @@
++"""Regression tests for codex init pipeline persona-home mismatch.
++
++Root cause (2026-08-24): The persona context composes a CODEX_HOME env var
++pointing to an isolated codex-home directory, but tmux.py's blocked-prefix
++filter dropped CODEX_HOME in production mode.  This caused:
++  1. codex binary in the pane used ~/.codex (no CODEX_HOME set)
++  2. validate_session_artifact resolved persona codex_home (no sessions/ dir)
++  3. session_artifact_missing → deferred_init_watchdog fires → worker unwound
++
++Fix: CODEX_HOME added to _BLOCKED_PREFIX_ALLOWLIST in tmux.py, and a sessions
++symlink is created in the persona codex-home during compose.
++"""
++
++import json
++import os
++from pathlib import Path
++
++import pytest
++
++from cli_agent_orchestrator.clients.tmux import TmuxClient
++
++
++class TestCodexHomeAllowlist:
++    """CODEX_HOME must pass through the blocked-prefix filter."""
++
++    def test_codex_home_not_blocked(self):
++        assert TmuxClient._is_blocked_env_key("CODEX_HOME") is False
++
++    def test_codex_home_passes_merge_extra_env(self):
++        env: dict[str, str] = {}
++        TmuxClient._merge_extra_env(
++            env, {"CODEX_HOME": "/run/user/1000/cao-personas/abc/current/gen-1/codex-home"}
++        )
++        assert env["CODEX_HOME"] == "/run/user/1000/cao-personas/abc/current/gen-1/codex-home"
++
++    def test_other_codex_prefixed_vars_still_blocked(self):
++        """CODEX_TOKEN and similar must still be blocked."""
++        assert TmuxClient._is_blocked_env_key("CODEX_TOKEN") is True
++        assert TmuxClient._is_blocked_env_key("CODEX_SESSION_ID") is True
++
++
++class TestPersonaCodexHomeSessionsSymlink:
++    """The persona codex-home must include a sessions symlink to production home."""
++
++    def test_sessions_symlink_created_during_compose(self, tmp_path, monkeypatch):
++        """compose_persona_plan creates sessions symlink in codex-home."""
++        # Set up fake production codex home with sessions dir
++        fake_codex_home = tmp_path / "codex-home-prod"
++        fake_codex_home.mkdir()
++        (fake_codex_home / "config.toml").write_text('model = "gpt-4"\n')
++        (fake_codex_home / "auth.json").write_text('{"token": "x"}')
++        sessions_dir = fake_codex_home / "sessions"
++        sessions_dir.mkdir()
++        # Put a fake rollout in sessions
++        rollout = sessions_dir / "2026" / "08" / "24"
++        rollout.mkdir(parents=True)
++        rollout_file = (
++            rollout / "rollout-2026-08-24T05-43-21-01a03327-3263-76d3-80df-532ba0fd16dd.jsonl"
++        )
++        rollout_file.write_text(
++            json.dumps(
++                {
++                    "type": "session_meta",
++                    "payload": {"id": "01a03327-3263-76d3-80df-532ba0fd16dd", "cwd": "/work"},
++                }
++            )
++            + "\n"
++        )
++
++        # Replicate the compose_persona_plan codex-home setup logic
++        codex_staging = tmp_path / "staging" / "codex-home"
++        codex_staging.mkdir(parents=True, mode=0o700)
++
++        real_codex_home = fake_codex_home.resolve()
++        # Auth symlink (existing logic)
++        auth = real_codex_home / "auth.json"
++        os.symlink(str(auth.resolve()), codex_staging / "auth.json")
++        # Sessions symlink (the fix)
++        real_sessions = real_codex_home / "sessions"
++        if real_sessions.is_dir():
++            os.symlink(str(real_sessions), codex_staging / "sessions")
++
++        # Verify symlink exists and points correctly
++        assert (codex_staging / "sessions").is_symlink()
++        assert (codex_staging / "sessions").resolve() == sessions_dir.resolve()
++        # The rollout is findable via the symlink
++        found = list(
++            (codex_staging / "sessions").glob(
++                "**/rollout-*01a03327-3263-76d3-80df-532ba0fd16dd*.jsonl"
++            )
++        )
++        assert len(found) == 1
++        assert found[0].name == rollout_file.name
++
++
++class TestValidateSessionArtifactWithPersonaHome:
++    """validate_session_artifact must find rollouts through persona home symlink."""
++
++    def test_finds_rollout_via_sessions_symlink(self, tmp_path, monkeypatch):
++        """When persona codex-home has sessions → production symlink, validation passes."""
++        from cli_agent_orchestrator.providers.codex import CodexProvider
++
++        # Real sessions dir with a rollout
++        sessions_dir = tmp_path / "real-codex" / "sessions" / "2026" / "08" / "24"
++        sessions_dir.mkdir(parents=True)
++        uuid = "01a03327-3263-76d3-80df-532ba0fd16dd"
++        rollout = sessions_dir / f"rollout-2026-08-24T05-43-21-{uuid}.jsonl"
++        rollout.write_text(
++            json.dumps(
++                {
++                    "type": "session_meta",
++                    "payload": {"id": uuid, "cwd": "/work"},
++                }
++            )
++            + "\n"
++        )
++
++        # Persona codex-home with sessions symlink
++        persona_home = tmp_path / "persona-codex-home"
++        persona_home.mkdir()
++        os.symlink(str(tmp_path / "real-codex" / "sessions"), persona_home / "sessions")
++
++        # Mock _resolved_codex_home to return persona home
++        monkeypatch.setattr(
++            "cli_agent_orchestrator.providers.codex._resolved_codex_home",
++            lambda tid: persona_home,
++        )
++
++        provider = CodexProvider("test1234", "sess", "win", "dev")
++        # Should NOT raise
++        provider.validate_session_artifact(uuid, "/work")
++
++    def test_fails_without_symlink(self, tmp_path, monkeypatch):
++        """Without sessions symlink, validation raises RetryableArtifactValidation."""
++        from cli_agent_orchestrator.providers.base import RetryableArtifactValidation
++        from cli_agent_orchestrator.providers.codex import CodexProvider
++
++        # Empty persona codex-home (no sessions dir at all)
++        persona_home = tmp_path / "persona-codex-home"
++        persona_home.mkdir()
++        (persona_home / "sessions").mkdir()  # empty sessions dir
++
++        monkeypatch.setattr(
++            "cli_agent_orchestrator.providers.codex._resolved_codex_home",
++            lambda tid: persona_home,
++        )
++
++        provider = CodexProvider("test1234", "sess", "win", "dev")
++        with pytest.raises(RetryableArtifactValidation):
++            provider.validate_session_artifact("01a03327-3263-76d3-80df-532ba0fd16dd", "/work")
+diff --git a/tmp/orch/codex-init-debug-report.md b/tmp/orch/codex-init-debug-report.md
+new file mode 100644
+index 00000000..5c6ccc4c
+--- /dev/null
++++ b/tmp/orch/codex-init-debug-report.md
+@@ -0,0 +1,135 @@
++# Codex Worker Init Pipeline — Debug Report
++
++**Date:** 2026-08-24  
++**Branch:** `cao/6e515e5c`  
++**Tip SHA:** `d5640c95`  
++**Status:** Fixed — OUR bug, not codex-version-behavior
++
++---
++
++## Root Cause
++
++**Persona CODEX_HOME dropped by tmux blocked-prefix filter.**
++
++The init pipeline breaks at the `validate_session_artifact` step because the validator and the codex binary disagree on where session files live:
++
++1. `compose_persona_plan` creates an isolated `codex-home/` dir for the worker (under `/run/user/1000/cao-personas/<terminal_id>/current/gen-1/codex-home/`)
++2. `sandbox_guard.py` correctly injects `CODEX_HOME=<persona codex-home>` into the pane environment
++3. **BUG:** `tmux.py:_BLOCKED_ENV_PREFIXES` includes `"CODEX_"` — and `_merge_extra_env` drops `CODEX_HOME` in production mode (non-sandbox), logging: `"Dropping forwarded env var with blocked prefix: CODEX_HOME"`
++4. Without `CODEX_HOME`, the codex binary defaults to `~/.codex` and writes sessions there
++5. `validate_session_artifact` calls `_resolved_codex_home(terminal_id)` → finds the persona plan → resolves to `<persona codex-home>` (which has NO `sessions/` directory)
++6. Glob finds zero matches → `RetryableArtifactValidation("session_artifact_missing")` → retries until deadline → watchdog fires → worker unwound
++
++**Confirmed in all 5 failing terminals:** Every spawn had the log line:
++```
++cli_agent_orchestrator.clients.tmux - WARNING - Dropping forwarded env var with blocked prefix: CODEX_HOME
++```
++
++**Secondary issue:** Even if CODEX_HOME passed through, `codex resume <uuid>` still wouldn't find the seed session because:
++- `seed_resume_identity` runs as a subprocess (no persona env) → rollout lands in `~/.codex/sessions/`
++- If the pane's codex gets `CODEX_HOME=<persona home>`, it looks in `<persona home>/sessions/` → not found
++
++---
++
++## Fix (2 changes)
++
++### 1. tmux.py — Allow CODEX_HOME through blocked-prefix filter
++
++Added `"CODEX_HOME"` to `_BLOCKED_PREFIX_ALLOWLIST`. Rationale: CODEX_HOME is a config/session directory path — it cannot cause "nested session" errors (the original reason for blocking `CODEX_*`). Other `CODEX_*` vars (CODEX_TOKEN, CODEX_SESSION_ID, etc.) remain blocked.
++
++### 2. persona_context.py — Symlink sessions/ into persona codex-home
++
++After creating the persona's `codex-home/` staging dir and symlinking `auth.json`, we now also symlink `sessions → <production home>/sessions`. This ensures:
++- `codex resume <uuid>` (running with CODEX_HOME pointing to persona home) can find the seed's rollout via the symlink
++- The validator's glob through persona home resolves to the same physical files
++
++---
++
++## Evidence
++
++### Log analysis (all 5 terminals: d85e84f0, 6364da8b, c404ed1e, 91a11c1b, 34990a75)
++
++| Terminal | CODEX_HOME dropped? | Result |
++|----------|---------------------|--------|
++| d85e84f0 | YES (05:34:25) | watchdog_deadline + session_artifact_missing |
++| 6364da8b | YES (05:38:23) | session_artifact_missing at task delivery |
++| c404ed1e | YES (05:40:17) | watchdog_deadline |
++| 91a11c1b | YES (05:43:26) | deferred_init cancelled + watchdog |
++| 34990a75 | YES (05:44:37) | startup prompt timeout + watchdog |
++
++### Test results
++
++```
++test/clients/test_codex_init_persona_home.py — 6 passed
++test/clients/test_tmux_merge_extra_env.py    — 9 passed (existing tests unaffected)
++test/utils/test_persona_context.py           — 27 passed
++test/clients/test_persona_retention.py       — 12 passed
++test/services/test_f110_deferred_init_watchdog.py — 7 passed
++```
++
++---
++
++## Confounders (not the root cause)
++
++- **codex v0.149.1 resume-cwd dialog:** Appeared on early spawns (d85e84f0, 6364da8b) before `resume_cwd="current"` was persisted at 05:43. This added latency but is NOT the root cause — the dialog is handled by `_handle_trust_prompt`, and even after the dialog was eliminated (91a11c1b, 34990a75), the session_artifact_missing still blocked delivery.
++
++- **cc-switch at 05:43:** Rewrote `~/.codex/config.toml` to add `resume_cwd = "current"`. This fixed the dialog but didn't affect the persona home mismatch.
++
++---
++
++## Files Changed
++
++- `src/cli_agent_orchestrator/clients/tmux.py` — CODEX_HOME added to allowlist
++- `src/cli_agent_orchestrator/utils/persona_context.py` — sessions symlink in compose
++- `test/clients/test_codex_init_persona_home.py` — regression test (6 cases)
++
++---
++
++## Upstream Behavior Hardening (codex 0.142.5+ / 0.148+)
++
++### a) Lazy rollout creation (openai/codex#31158, since 0.142.5)
++
++Rollout files are created at FIRST TURN, not thread start. The fix's sessions
++symlink does NOT mask this into a hard failure:
++- Empty glob through symlink → `RetryableArtifactValidation("session_artifact_missing")` — same retryable error as without symlink
++- Retry window: 60s (`artifact_validate_deadline_s`), poll_interval=0.4s default
++  (deferred path overrides to POLL_INTERVAL=2.0s) → 30–150 retries depending on path
++- The symlink is to a directory (not a file); it doesn't change the glob's semantics for absent files
++
++No adjustment needed — existing retry window tolerates first-turn latency.
++
++### b) PTY input discarded during TUI startup (openai/codex#38641, since 0.148)
++
++Our spawn path is safe: the task message is delivered ONLY after
++`provider_instance.initialize()` returns (which waits for the idle composer
++prompt via `_handle_trust_prompt`). The send_input call is sequenced AFTER:
++  1. `initialize()` (idle prompt visible)
++  2. `_confirm_launch_health()` (process alive)
++  3. `_validate_deferred_artifact()` (rollout exists)
++
++The shell command that launches codex (`codex resume <uuid>`) is consumed by
++the shell, not the codex TUI, so it's unaffected by codex's input buffering.
++
++**Residual risk (separate issue, out of scope):** If `_handle_trust_prompt`
++times out (the 20s startup_prompt_handler_timeout fires), the code logs an
++error and proceeds — in theory this could deliver a message before the TUI is
++fully ready. However, this is a pre-existing behavior unrelated to this fix
++and already handled by `_confirm_worker_started_or_resubmit`.
++
++### c) Cross-persona session symlink — collision risk analysis
++
++All persona codex-homes symlink sessions/ to the same `~/.codex/sessions/`.
++This is acceptable:
++
++1. **UUID uniqueness:** Each seed creates a fresh UUID via `codex exec`; the
++   fork_context binds that UUID exclusively to one worker
++2. **Glob specificity:** `validate_session_artifact` globs `*{session_uuid}*`
++   — UUID substring collision probability is negligible (36-char hex)
++3. **Resume isolation:** `codex resume <uuid>` is session-locked; it cannot
++   interfere with another session's files
++4. **Pre-existing sharing:** All processes on this machine already share
++   `~/.codex/sessions/` at the OS level. Persona isolation targets config and
++   auth (preventing credential leakage between profiles), not session-file
++   visibility. The shared sessions dir is the SAME isolation boundary as
++   before this fix — we just made the persona's codex binary aware of it
++
+diff --git a/tmp/orch/codexfix-diff-d5640c95.patch b/tmp/orch/codexfix-diff-d5640c95.patch
+new file mode 100644
+index 00000000..e9f8c803
+--- /dev/null
++++ b/tmp/orch/codexfix-diff-d5640c95.patch
+@@ -0,0 +1,176 @@
++diff --git a/src/cli_agent_orchestrator/clients/tmux.py b/src/cli_agent_orchestrator/clients/tmux.py
++index e17cc51b..e662baf8 100644
++--- a/src/cli_agent_orchestrator/clients/tmux.py
+++++ b/src/cli_agent_orchestrator/clients/tmux.py
++@@ -315,6 +315,11 @@ class TmuxClient:
++             "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
++             "CLAUDE_CODE_SKIP_VERTEX_AUTH",
++             "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+++            # CODEX_HOME is the config/session directory — not a nesting vector.
+++            # Persona isolation injects it via sandbox_guard; dropping it breaks
+++            # the session-artifact validator (it resolves persona codex_home while
+++            # the codex binary falls back to ~/.codex).
+++            "CODEX_HOME",
++         }
++     )
++     # Per-var value cap (PR #246) — keeps the full tmux ``new-session -e`` /
++diff --git a/src/cli_agent_orchestrator/utils/persona_context.py b/src/cli_agent_orchestrator/utils/persona_context.py
++index fde974ba..a8844b60 100644
++--- a/src/cli_agent_orchestrator/utils/persona_context.py
+++++ b/src/cli_agent_orchestrator/utils/persona_context.py
++@@ -500,6 +500,12 @@ def compose_persona_plan(
++             if auth.is_symlink() or not auth.is_file():
++                 raise PersonaContextError("persona_codex_auth_invalid")
++             os.symlink(str(auth.resolve()), staging / "codex-home/auth.json")
+++            # Symlink sessions/ so `codex resume` (with CODEX_HOME pointing here)
+++            # can find rollouts created by seed_resume_identity (which runs
+++            # without persona env and writes to the production home's sessions/).
+++            real_sessions = real_codex_home / "sessions"
+++            if real_sessions.is_dir():
+++                os.symlink(str(real_sessions), staging / "codex-home/sessions")
++             for leaf, source in leaf_sources:
++                 shutil.copyfile(source, staging / "codex-home" / leaf)
++                 (staging / "codex-home" / leaf).chmod(0o600)
++diff --git a/test/clients/test_codex_init_persona_home.py b/test/clients/test_codex_init_persona_home.py
++new file mode 100644
++index 00000000..a2eb4c56
++--- /dev/null
+++++ b/test/clients/test_codex_init_persona_home.py
++@@ -0,0 +1,137 @@
+++"""Regression tests for codex init pipeline persona-home mismatch.
+++
+++Root cause (2026-08-24): The persona context composes a CODEX_HOME env var
+++pointing to an isolated codex-home directory, but tmux.py's blocked-prefix
+++filter dropped CODEX_HOME in production mode.  This caused:
+++  1. codex binary in the pane used ~/.codex (no CODEX_HOME set)
+++  2. validate_session_artifact resolved persona codex_home (no sessions/ dir)
+++  3. session_artifact_missing → deferred_init_watchdog fires → worker unwound
+++
+++Fix: CODEX_HOME added to _BLOCKED_PREFIX_ALLOWLIST in tmux.py, and a sessions
+++symlink is created in the persona codex-home during compose.
+++"""
+++
+++import os
+++import json
+++import tempfile
+++from pathlib import Path
+++from types import SimpleNamespace
+++from unittest.mock import patch
+++
+++import pytest
+++
+++from cli_agent_orchestrator.clients.tmux import TmuxClient
+++
+++
+++class TestCodexHomeAllowlist:
+++    """CODEX_HOME must pass through the blocked-prefix filter."""
+++
+++    def test_codex_home_not_blocked(self):
+++        assert TmuxClient._is_blocked_env_key("CODEX_HOME") is False
+++
+++    def test_codex_home_passes_merge_extra_env(self):
+++        env: dict[str, str] = {}
+++        TmuxClient._merge_extra_env(env, {"CODEX_HOME": "/run/user/1000/cao-personas/abc/current/gen-1/codex-home"})
+++        assert env["CODEX_HOME"] == "/run/user/1000/cao-personas/abc/current/gen-1/codex-home"
+++
+++    def test_other_codex_prefixed_vars_still_blocked(self):
+++        """CODEX_TOKEN and similar must still be blocked."""
+++        assert TmuxClient._is_blocked_env_key("CODEX_TOKEN") is True
+++        assert TmuxClient._is_blocked_env_key("CODEX_SESSION_ID") is True
+++
+++
+++class TestPersonaCodexHomeSessionsSymlink:
+++    """The persona codex-home must include a sessions symlink to production home."""
+++
+++    def test_sessions_symlink_created_during_compose(self, tmp_path, monkeypatch):
+++        """compose_persona_plan creates sessions symlink in codex-home."""
+++        # Set up fake production codex home with sessions dir
+++        fake_codex_home = tmp_path / "codex-home-prod"
+++        fake_codex_home.mkdir()
+++        (fake_codex_home / "config.toml").write_text('model = "gpt-4"\n')
+++        (fake_codex_home / "auth.json").write_text('{"token": "x"}')
+++        sessions_dir = fake_codex_home / "sessions"
+++        sessions_dir.mkdir()
+++        # Put a fake rollout in sessions
+++        rollout = sessions_dir / "2026" / "08" / "24"
+++        rollout.mkdir(parents=True)
+++        rollout_file = rollout / "rollout-2026-08-24T05-43-21-01a03327-3263-76d3-80df-532ba0fd16dd.jsonl"
+++        rollout_file.write_text(json.dumps({
+++            "type": "session_meta",
+++            "payload": {"id": "01a03327-3263-76d3-80df-532ba0fd16dd", "cwd": "/work"},
+++        }) + "\n")
+++
+++        # Replicate the compose_persona_plan codex-home setup logic
+++        codex_staging = tmp_path / "staging" / "codex-home"
+++        codex_staging.mkdir(parents=True, mode=0o700)
+++
+++        real_codex_home = fake_codex_home.resolve()
+++        # Auth symlink (existing logic)
+++        auth = real_codex_home / "auth.json"
+++        os.symlink(str(auth.resolve()), codex_staging / "auth.json")
+++        # Sessions symlink (the fix)
+++        real_sessions = real_codex_home / "sessions"
+++        if real_sessions.is_dir():
+++            os.symlink(str(real_sessions), codex_staging / "sessions")
+++
+++        # Verify symlink exists and points correctly
+++        assert (codex_staging / "sessions").is_symlink()
+++        assert (codex_staging / "sessions").resolve() == sessions_dir.resolve()
+++        # The rollout is findable via the symlink
+++        found = list((codex_staging / "sessions").glob(
+++            "**/rollout-*01a03327-3263-76d3-80df-532ba0fd16dd*.jsonl"
+++        ))
+++        assert len(found) == 1
+++        assert found[0].name == rollout_file.name
+++
+++
+++class TestValidateSessionArtifactWithPersonaHome:
+++    """validate_session_artifact must find rollouts through persona home symlink."""
+++
+++    def test_finds_rollout_via_sessions_symlink(self, tmp_path, monkeypatch):
+++        """When persona codex-home has sessions → production symlink, validation passes."""
+++        from cli_agent_orchestrator.providers.codex import CodexProvider
+++
+++        # Real sessions dir with a rollout
+++        sessions_dir = tmp_path / "real-codex" / "sessions" / "2026" / "08" / "24"
+++        sessions_dir.mkdir(parents=True)
+++        uuid = "01a03327-3263-76d3-80df-532ba0fd16dd"
+++        rollout = sessions_dir / f"rollout-2026-08-24T05-43-21-{uuid}.jsonl"
+++        rollout.write_text(json.dumps({
+++            "type": "session_meta",
+++            "payload": {"id": uuid, "cwd": "/work"},
+++        }) + "\n")
+++
+++        # Persona codex-home with sessions symlink
+++        persona_home = tmp_path / "persona-codex-home"
+++        persona_home.mkdir()
+++        os.symlink(str(tmp_path / "real-codex" / "sessions"), persona_home / "sessions")
+++
+++        # Mock _resolved_codex_home to return persona home
+++        monkeypatch.setattr(
+++            "cli_agent_orchestrator.providers.codex._resolved_codex_home",
+++            lambda tid: persona_home,
+++        )
+++
+++        provider = CodexProvider("test1234", "sess", "win", "dev")
+++        # Should NOT raise
+++        provider.validate_session_artifact(uuid, "/work")
+++
+++    def test_fails_without_symlink(self, tmp_path, monkeypatch):
+++        """Without sessions symlink, validation raises RetryableArtifactValidation."""
+++        from cli_agent_orchestrator.providers.codex import CodexProvider
+++        from cli_agent_orchestrator.providers.base import RetryableArtifactValidation
+++
+++        # Empty persona codex-home (no sessions dir at all)
+++        persona_home = tmp_path / "persona-codex-home"
+++        persona_home.mkdir()
+++        (persona_home / "sessions").mkdir()  # empty sessions dir
+++
+++        monkeypatch.setattr(
+++            "cli_agent_orchestrator.providers.codex._resolved_codex_home",
+++            lambda tid: persona_home,
+++        )
+++
+++        provider = CodexProvider("test1234", "sess", "win", "dev")
+++        with pytest.raises(RetryableArtifactValidation):
+++            provider.validate_session_artifact("01a03327-3263-76d3-80df-532ba0fd16dd", "/work")
