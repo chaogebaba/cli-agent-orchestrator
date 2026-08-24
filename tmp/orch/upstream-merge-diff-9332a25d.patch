@@ -1,0 +1,4444 @@
+diff --git a/docs/agent-profile.md b/docs/agent-profile.md
+index fe6bf2c2..7c2c97b1 100644
+--- a/docs/agent-profile.md
++++ b/docs/agent-profile.md
+@@ -54,7 +54,10 @@ portable and make profile listings useful.
+ 
+ ### Provider configuration
+ 
+-- `mcpServers` (object): MCP server definitions.
++- `mcpServers` (object): MCP server definitions. Each entry defines either
++  `command` (with optional `args`, `env`, `timeout`) for a server CAO launches,
++  or `url` for a remote one, with `type` naming its transport (for example
++  `http` or `sse`). An entry defining neither is invalid.
+ - `tools` (array), `toolAliases` (object), and `toolsSettings` (object):
+   provider tool configuration.
+ - `resources` (array), `hooks` (object), and `useLegacyMcpJson` (boolean):
+diff --git a/docs/api.md b/docs/api.md
+index f3482a8e..40ba699e 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -60,6 +60,76 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
+   client can render create and edit forms from the server's definition instead
+   of duplicating the field list.
+ - `POST /agents/profiles/install` installs a profile.
++- `POST /agents/profiles` creates a profile in the local store from a supplied
++  document. Named distinctly from `install`, which takes a bare profile name or
++  an https:// URL rather than the document itself. The request carries `name`
++  and `content`; the two identities of a profile, its storage key and its
++  frontmatter `name`, must agree, so a mismatch is a 400 rather than a silent
++  rename. A conflicting name returns 409. Requires `cao:write` or `cao:admin`.
++- `PUT /agents/profiles/{name}` replaces an existing local-store profile and
++  never creates one. A request naming a built-in or provider-managed profile
++  returns 404 rather than writing a local file that would shadow the original.
++  Requires `cao:write` or `cao:admin`.
++- `DELETE /agents/profiles/{name}` removes a profile from the local store.
++  Requires `cao:write` or `cao:admin`, the same guard as create and replace, so
++  one credential covers the whole create/edit/delete cycle. Scopes are a flat
++  set rather than a hierarchy, so requiring admin here would 403 a caller
++  holding exactly `cao:write`. Built-ins are not deletable, for the same reason
++  they are not replaceable.
++- Both write routes run the profile validator on the exact submitted document
++  before persisting anything, so an invalid profile never reaches disk. Errors
++  reject the request with 400 and the findings attached; warnings do not block
++  the write and are returned in the response so a client can surface them after
++  a successful save.
++- The validator rejects non-string mapping keys. A profile is written as YAML,
++  which allows any scalar as a key, but the format is described by JSON Schema,
++  where object keys are strings. Without this rule `mcpServers: {1: {...}}`
++  validates clean and persists, then fails to load, since the model requires
++  string keys. Note YAML also auto-types an unquoted date, so `2026-01-01:` is a
++  date key rather than a string; quote such keys.
++- A document is rejected up front if it cannot safely be handed to the steps that
++  follow, on any of three grounds: how large it renders, how deeply it nests, or
++  whether it contains a cycle. The reason is that YAML anchors decouple a
++  document's rendered size from its byte count, and the schema step interpolates a
++  rendering of an offending value into every error message it builds. Chained
++  anchors multiply structure, and aliasing one large scalar multiplies content, so
++  a request under the 256 KB `content` cap can render to gigabytes either way. The
++  ceilings are therefore in *rendered bytes*, the unit that cost is paid in: at
++  most 1 MB, about 3.8x the largest request that can arrive and ~2060x the largest
++  bundled profile's 485 bytes, and at most 64 levels of nesting (~21x). Exceeding
++  either is itself an error and nothing further runs, since the later steps are
++  what such a document is expensive in. A cycle is rejected rather than measured:
++  it has no finite rendering, and the providers that consume a profile cannot
++  serialize one, so accepting it would persist a document the runtime cannot
++  install. Individual schema findings are also length-capped before they reach a
++  response, which bounds the case where several fields each render a subtree.
++- Within those bounds, containers already visited are skipped, so each offending
++  mapping key is reported once, at the first path that reaches it. Note that
++  differs from the schema step, which does not memoize and so reports a shared
++  invalid value once per referencing path.
++- An `mcpServers` entry must define either `command`, for a server CAO launches,
++  or `url`, for a remote one whose `type` names its transport. The schema
++  previously required `command` unconditionally, which made the write routes
++  reject url-based servers that the runtime accepts and passes through to the
++  provider unchanged. An entry defining neither is still rejected. `url` is the
++  spelling `resolve_mcp_server_config` documents; an entry naming its endpoint
++  under any other key satisfies neither branch and is rejected.
++- Every 400 from the profile write and source routes uses one `detail` shape,
++  `{"message", "errors"}`, so a client never has to switch on the type of
++  `detail`. `errors` is empty for a failure that is not attributable to a field,
++  but the key is always present. This covers rejected names as well as schema
++  findings. 404 and 409 keep FastAPI's conventional bare-string `detail`, since
++  the status code already discriminates and there are no findings to attach.
++- `GET /agents/profiles/{name}/source` returns a profile's document exactly as
++  stored. Use this, not `GET /agents/profiles/{name}`, when the document is
++  going to be edited and written back: that route returns the *resolved*
++  profile, having applied `${VAR}` substitution from the managed environment
++  file to the raw text before parsing. Round-tripping a resolved document
++  through a write would persist substituted values into a plaintext profile.
++  Requires `cao:read`, `cao:write`, or `cao:admin`, the same guard the profile
++  reads beside it now carry. Gating matters at least as much here as on the parsed
++  route, because this one returns the stored bytes verbatim from every configured
++  store, including documents that fail to parse.
+ - Template validation and preview require the selected template to include a
+   `schema.json` file.
+ - `/agents/providers` reports provider availability.
+diff --git a/docs/control-planes.md b/docs/control-planes.md
+index d5f3d986..da93d2f2 100644
+--- a/docs/control-planes.md
++++ b/docs/control-planes.md
+@@ -91,6 +91,13 @@ MCP tool discovery is authoritative for clients. The declarations in
+ [`ops_mcp_server/server.py`](../src/cli_agent_orchestrator/ops_mcp_server/server.py)
+ are the source of truth when the server surface changes.
+ 
++For a runnable walkthrough of the full lifecycle — discover, launch, poll for
++readiness, follow up, read output, shut down — see
++[`examples/ops-mcp/`](../examples/ops-mcp/). It also documents the boundary
++between this external plane and in-session orchestration, and the readiness
++polling that `launch_session` requires because it returns before the provider is
++up.
++
+ Choose the surface by caller:
+ 
+ | Caller | Preferred surface |
+diff --git a/examples/ops-mcp/README.md b/examples/ops-mcp/README.md
+new file mode 100644
+index 00000000..3adc0372
+--- /dev/null
++++ b/examples/ops-mcp/README.md
+@@ -0,0 +1,149 @@
++# Ops MCP Example
++
++This example drives a complete CAO session lifecycle from a process that is
++**outside** CAO, using the typed tools of `cao-ops-mcp-server` over stdio MCP.
++It discovers profiles, launches a session, waits for it to be ready, sends a
++follow-up, reads the result, and shuts down — without building a single shell
++command and without ever becoming a CAO terminal.
++
++This is **not** an orchestration example. Nothing here uses `handoff`, `assign`,
++or `send_message`; those are in-session tools that require a terminal CAO
++already manages. For delegation between agents see [`../assign/`](../assign/)
++and [`../orchestration/`](../orchestration/). For choosing between control
++surfaces see [Control planes](../../docs/control-planes.md).
++
++## Naming note
++
++The bundled profile is prefixed `ops_mcp_` so `cao install` cannot overwrite a
++built-in profile such as `developer`.
++
++## Pattern Overview
++
++| Concern | External management (`cao-ops-mcp`) | In-session orchestration (`cao-mcp-server`) |
++|---|---|---|
++| Who calls it | Any MCP client outside CAO | An agent inside a CAO terminal |
++| Terminal context | None — never reads `CAO_TERMINAL_ID` | Requires it; each agent knows only its own |
++| Creates sessions | Yes, `launch_session` | No |
++| Talks to an agent | `send_session_message` by terminal id | `handoff` / `assign` / `send_message` |
++| Ends a session | Yes, `shutdown_session` | No |
++
++The two planes are complements, not alternatives: this example creates the
++session that in-session tools then work inside.
++
++## Setup
++
++```bash
++# 1. Start the CAO server (leave running in its own terminal)
++cao-server
++
++# 2. Install the example's worker profile
++cao install examples/ops-mcp/ops_mcp_worker.md
++```
++
++The example spawns `cao-ops-mcp-server` itself as a stdio subprocess, so it does
++not need to be started separately. It does need `cao-server` reachable at
++`http://127.0.0.1:9889` (override with `CAO_API_PORT`), because the ops server
++talks to CAO over that API.
++
++## Usage
++
++```bash
++# Minimal run
++python3 examples/ops-mcp/run.py --task "Reply with the word ready and stop."
++
++# Pin a provider and a working directory, and send a second message
++python3 examples/ops-mcp/run.py \
++  --profile ops_mcp_worker \
++  --provider claude_code \
++  --working-directory /tmp/ops-mcp-demo \
++  --task "Create hello.txt containing the word ready, then confirm." \
++  --follow-up "Now tell me the file size in bytes."
++```
++
++Exit codes: `0` the lifecycle completed, `1` a lifecycle step failed, `2` the
++server did not expose the expected tools.
++
++## What the run does
++
++```
++list_profiles          -> confirm the profile is installed before launching
++launch_session         -> create a named session, deliver the task on launch
++get_terminal_status    -> poll until THIS turn finishes (see below)
++read_session_output    -> record the turn boundary before a follow-up
++send_session_message   -> optional follow-up
++get_terminal_status    -> poll until the follow-up turn finishes
++read_session_output    -> read the agent's last response
++shutdown_session       -> always, including when a step above failed
++get_session_info       -> verify the session is actually gone
++```
++
++Three details are load-bearing rather than incidental.
++
++**`launch_session` returns immediately.** It hands back `session_name` and
++`terminal_id` while provider startup and message delivery continue in the
++background, so the caller must poll. `--timeout` bounds each turn.
++
++**A ready status is not proof your turn ran.** This is the subtle one. `idle` can
++precede delivery of a queued message, and `completed` can belong to the
++*previous* turn — the messaging tool only promises the message was queued, so a
++cached status may still hold its pre-dispatch value. Accepting the first ready
++enum therefore reads the wrong turn's output, and can shut the session down while
++the follow-up is still pending. So the example requires evidence that *this* turn
++ran: activity observed while waiting, output produced past a recorded baseline,
++or `completed` when the baseline was not already a ready state (reaching
++completed requires dispatched input, so it cannot predate the first turn).
++
++**Cleanup is verified, not assumed.** Shutdown runs in a `finally`, and the
++session is then confirmed absent with `get_session_info`. An unverified cleanup
++fails the run with exit 1, because reporting success while a session is still
++alive leaves behind exactly the orphan this example is meant to prevent. A
++session that is already gone counts as verified however it got there.
++
++## Reading status honestly
++
++A reported status is inferred from the rendered terminal screen, not from a
++structured protocol, so it can disagree with reality. This example polls status
++and then reads output, which is the minimum discipline; before reporting
++progress to a human, corroborate the two. See
++[`cao-session-liveness`](../../skills/cao-session-liveness/SKILL.md) for the
++dead-session signatures and the reason a completed `handoff` leaves no worker
++terminal behind.
++
++## Expected failures
++
++| Situation | What you get |
++|---|---|
++| `cao-server` not running | `launch failed: ... Connection refused` |
++| Profile not installed | `profile 'ops_mcp_worker' is not installed`, with the install command; nothing is launched |
++| Working directory does not exist | Launch succeeds, then the agent fails confusingly — pass an absolute path that exists |
++| Agent never produces evidence of the turn | `TimeoutError` naming the last status, then shutdown still runs |
++| Session still present after shutdown | `cleanup not verified`, exit 1 — deliberately a failure, not a warning |
++| Session already gone at cleanup | Counted as verified cleanup; the run reports its result normally |
++
++## Tests
++
++Protocol-level tests run in CI without provider credentials or a running
++server — `run_lifecycle` takes any object with `call_tool`, so a recording
++double stands in for a live MCP session:
++
++```bash
++uv run pytest test/examples/test_ops_mcp_example.py -v
++```
++
++They lock the tool ordering, the turn-evidence rules, the verified-cleanup
++guarantee, result parsing across `structuredContent` / JSON text / plain text /
++error results, and — by AST assertion — that the example never reads
++`CAO_TERMINAL_ID`.
++
++Two test classes exist specifically to keep earlier mistakes from returning:
++`TestTurnEvidence` proves a stale `idle` or a previous turn's `completed` does not
++end the wait, and `TestVerifiedCleanup` proves an unverified cleanup fails the run
++rather than reporting success.
++
++## See Also
++
++- [Control planes](../../docs/control-planes.md) — choosing between CLI, MCP, and Web UI
++- [HTTP API](../../docs/api.md) — the REST surface the ops server calls
++- [`cao-session-liveness`](../../skills/cao-session-liveness/SKILL.md) — verifying a session is alive
++- [`../assign/`](../assign/) and [`../orchestration/`](../orchestration/) — in-session delegation
++- [`../headless-ci/`](../headless-ci/) — the same lifecycle driven by shell instead of MCP
+diff --git a/examples/ops-mcp/ops_mcp_worker.md b/examples/ops-mcp/ops_mcp_worker.md
+new file mode 100644
+index 00000000..baddc962
+--- /dev/null
++++ b/examples/ops-mcp/ops_mcp_worker.md
+@@ -0,0 +1,54 @@
++---
++name: ops_mcp_worker
++description: Minimal single-agent worker launched by the ops-mcp example - answers the task it is given and stops, so the external control plane is what the example exercises
++role: developer  # @builtin, fs_*, execute_bash, web_fetch, @cao-mcp-server. For fine-grained control, see docs/tool-restrictions.md
++---
++
++# OPS-MCP WORKER AGENT
++
++## Role and Identity
++You are a single worker agent launched by an external process through CAO's
++operations MCP server. That process is not a CAO terminal — it manages you from
++outside the session using typed tools, not shell commands.
++
++Your job is deliberately small. The example exists to demonstrate the external
++control plane, so you should be predictable rather than ambitious.
++
++## Core Responsibilities
++- Do exactly the task you are given
++- Reply with the result and nothing else
++- Stop when the task is done, and wait for any follow-up
++
++## Critical Rules
++1. **Keep replies short.** The external caller reads your last response through
++   `read_session_output`. A long reply makes the example's output hard to read.
++2. **Do not delegate.** This example has one agent on purpose. Delegation is
++   covered by `examples/assign/` and `examples/orchestration/`.
++3. **Do not start background work.** The caller polls your terminal status and
++   shuts the session down once it has your answer; work you leave running is
++   killed mid-flight.
++4. **Stay inside the working directory** the caller supplied.
++
++## Example Task Handling
++
++**Received Message**
++```
++Create a file called hello.txt containing the word ready, then confirm.
++```
++
++**Your Actions**
++1. Write `hello.txt` in the working directory
++2. Reply with one line confirming what you wrote
++
++```
++Wrote hello.txt containing "ready".
++```
++
++## Why This Matters for External Management
++The caller never attaches to your terminal and never sets `CAO_TERMINAL_ID`. It
++knows only what the typed tools report: your status, and your last response. If
++you finish quietly without replying, an external operator has nothing to read —
++so always end with a result.
++
++See [Control planes](../../docs/control-planes.md) for how external management
++compares to in-session orchestration.
+diff --git a/examples/ops-mcp/run.py b/examples/ops-mcp/run.py
+new file mode 100644
+index 00000000..f73ddba5
+--- /dev/null
++++ b/examples/ops-mcp/run.py
+@@ -0,0 +1,416 @@
++#!/usr/bin/env python3
++"""Drive a CAO session from outside CAO, over MCP.
++
++Spawns `cao-ops-mcp-server` as a stdio MCP server and runs one full session
++lifecycle through its typed tools: discover profiles, launch a session, wait for
++the dispatched turn to finish, send a follow-up, read the output, and shut down.
++
++Nothing here builds a shell command, and nothing reads the CAO terminal-id
++environment variable -- this process is not a CAO terminal and never becomes one.
++
++Usage:
++    python3 examples/ops-mcp/run.py --task "Say hello and stop."
++    python3 examples/ops-mcp/run.py --profile ops_mcp_worker --provider claude_code \
++        --working-directory /tmp/ops-mcp-demo --task "List the files here."
++
++Requires `cao-server` running (default http://127.0.0.1:9889).
++"""
++
++from __future__ import annotations
++
++import argparse
++import asyncio
++import json
++import os
++import sys
++import time
++from typing import Any, Dict, Optional
++
++from mcp import ClientSession, StdioServerParameters, stdio_client
++from mcp.types import CallToolResult, Implementation, TextContent
++
++# The agent is between turns and can accept input.
++READY_STATUSES = frozenset({"idle", "completed"})
++# The agent is working, or blocked on a prompt. Either way a turn is in flight.
++ACTIVE_STATUSES = frozenset({"processing", "waiting_user_answer"})
++# The agent will not become ready on its own.
++DEAD_STATUSES = frozenset({"error"})
++
++LIFECYCLE_TOOLS = (
++    "list_profiles",
++    "launch_session",
++    "get_terminal_status",
++    "send_session_message",
++    "read_session_output",
++    "get_session_info",
++    "shutdown_session",
++)
++
++
++def parse_tool_result(result: CallToolResult) -> Any:
++    """Extract the payload from an MCP tool result.
++
++    Prefers ``structuredContent`` when the tool declares an output schema, and
++    otherwise falls back to concatenated text blocks, parsed as JSON when
++    possible. Errors are returned as a dict so callers handle one shape.
++    """
++    if result.structured_content is not None:
++        return result.structured_content
++
++    texts = [block.text for block in result.content if isinstance(block, TextContent)]
++    combined = "\n".join(texts)
++
++    if result.is_error:
++        return {"success": False, "message": combined or "tool reported an error"}
++
++    try:
++        return json.loads(combined)
++    except (json.JSONDecodeError, ValueError):
++        return combined
++
++
++async def call_tool(session: Any, name: str, **arguments: Any) -> Any:
++    """Call one typed tool and return its parsed payload."""
++    result = await session.call_tool(name=name, arguments=arguments)
++    return parse_tool_result(result)
++
++
++def _failed(payload: Any) -> bool:
++    """Whether a tool payload reports failure.
++
++    Tools that succeed either omit ``success`` or set it True, so only an
++    explicit False counts as a failure.
++    """
++    return isinstance(payload, dict) and payload.get("success") is False
++
++
++async def read_output(session: Any, terminal_id: str, *, mode: str = "full") -> str:
++    """Read a terminal's output, raising when the read itself failed."""
++    payload = await call_tool(session, "read_session_output", terminal_id=terminal_id, mode=mode)
++    if _failed(payload):
++        raise RuntimeError(f"read output failed: {payload.get('message')}")
++    if isinstance(payload, dict):
++        return str(payload.get("output", ""))
++    return str(payload)
++
++
++async def output_size(session: Any, terminal_id: str) -> int:
++    """Total characters the terminal has produced so far.
++
++    Used as a turn-boundary marker: growth past a recorded size is evidence that
++    the agent produced something after the message was dispatched.
++    """
++    payload = await call_tool(session, "read_session_output", terminal_id=terminal_id, mode="full")
++    if _failed(payload):
++        raise RuntimeError(f"read output failed: {payload.get('message')}")
++    if isinstance(payload, dict):
++        total = payload.get("total_chars")
++        if isinstance(total, int):
++            return total
++        return len(str(payload.get("output", "")))
++    return len(str(payload))
++
++
++async def wait_for_turn(
++    session: Any,
++    terminal_id: str,
++    *,
++    baseline_status: str,
++    baseline_output_size: Optional[int],
++    timeout: float = 120.0,
++    interval: float = 2.0,
++    sleep: Any = asyncio.sleep,
++    now: Any = time.monotonic,
++) -> str:
++    """Wait for the turn dispatched *after* the recorded baseline to finish.
++
++    A status enum alone cannot prove a turn ran. ``idle`` may predate delivery of
++    a queued message, and ``completed`` may belong to the *previous* turn -- the
++    messaging tool only promises the message was queued, so a cached status can
++    still hold its pre-dispatch value. Accepting the first ready enum therefore
++    reads the wrong turn's output.
++
++    So a ready status is accepted only alongside evidence that this turn ran:
++
++    * a status in ``ACTIVE_STATUSES`` observed while waiting, or
++    * output produced past ``baseline_output_size``, or
++    * ``completed`` when the baseline was not already a ready state -- reaching
++      completed requires dispatched input, so it cannot predate the first turn.
++
++    Returns the ready status. Raises RuntimeError on a dead status and
++    TimeoutError when no dispatched turn finishes in time.
++    """
++    deadline = now() + timeout
++    saw_activity = False
++    status = "unknown"
++    baseline_was_ready = baseline_status in READY_STATUSES
++
++    while now() < deadline:
++        payload = await call_tool(session, "get_terminal_status", terminal_id=terminal_id)
++        if _failed(payload):
++            raise RuntimeError(f"status check failed: {payload.get('message')}")
++
++        status = payload.get("status", "unknown") if isinstance(payload, dict) else "unknown"
++
++        if status in DEAD_STATUSES:
++            raise RuntimeError(f"terminal {terminal_id} reached status {status!r}")
++
++        if status in ACTIVE_STATUSES:
++            saw_activity = True
++        elif status in READY_STATUSES:
++            if saw_activity:
++                return status
++            if status == "completed" and not baseline_was_ready:
++                return status
++            if baseline_output_size is not None:
++                if await output_size(session, terminal_id) > baseline_output_size:
++                    return status
++
++        await sleep(interval)
++
++    raise TimeoutError(
++        f"terminal {terminal_id} was {status!r} after {timeout:.0f}s "
++        "with no evidence the dispatched turn ran"
++    )
++
++
++async def session_is_absent(session: Any, session_name: str) -> bool:
++    """Whether CAO no longer has this session.
++
++    An already-absent session counts as verified cleanup: the goal is that no
++    session is left running, not that this process performed the removal. The
++    ops-MCP server currently identifies this case with its canonical not-found
++    message; every other failed lookup leaves cleanup unverified.
++    """
++    payload = await call_tool(session, "get_session_info", session_name=session_name)
++    if _failed(payload):
++        expected = (
++            f"Get session info for '{session_name}' failed: Session '{session_name}' not found"
++        )
++        if payload.get("message") == expected:
++            return True
++        raise RuntimeError(f"cleanup verification lookup failed: {payload.get('message')}")
++    return not isinstance(payload, dict)
++
++
++async def run_lifecycle(
++    session: Any,
++    *,
++    profile: str,
++    task: str,
++    provider: Optional[str] = None,
++    session_name: Optional[str] = None,
++    working_directory: Optional[str] = None,
++    follow_up: Optional[str] = None,
++    timeout: float = 120.0,
++    sleep: Any = asyncio.sleep,
++    now: Any = time.monotonic,
++) -> Dict[str, Any]:
++    """Run one CAO session lifecycle over an initialized MCP session.
++
++    Transport-agnostic on purpose: ``session`` only needs ``call_tool``, so the
++    ordering, turn-evidence and cleanup guarantees below are testable without a
++    live server.
++
++    The launched session is always shut down, and cleanup is *verified* -- an
++    unverified cleanup fails the run rather than reporting success.
++    """
++    report: Dict[str, Any] = {"steps": [], "session_name": None, "terminal_id": None}
++
++    def record(step: str, detail: Any) -> None:
++        report["steps"].append({"step": step, "detail": detail})
++
++    profiles = await call_tool(session, "list_profiles")
++    if _failed(profiles):
++        raise RuntimeError(f"could not list profiles: {profiles.get('message')}")
++    names = (
++        [p.get("name") for p in profiles.get("profiles", [])] if isinstance(profiles, dict) else []
++    )
++    record("list_profiles", {"count": len(names)})
++    if profile not in names:
++        raise RuntimeError(
++            f"profile {profile!r} is not installed. Install it with: "
++            f"cao install examples/ops-mcp/{profile}.md"
++        )
++
++    launch = await call_tool(
++        session,
++        "launch_session",
++        agent_profile=profile,
++        provider=provider,
++        session_name=session_name,
++        working_directory=working_directory,
++        initial_message=task,
++    )
++    if _failed(launch):
++        raise RuntimeError(f"launch failed: {launch.get('message')}")
++
++    report["session_name"] = launch.get("session_name")
++    report["terminal_id"] = launch.get("terminal_id")
++    record(
++        "launch_session",
++        {"session_name": report["session_name"], "terminal_id": report["terminal_id"]},
++    )
++
++    if not report["session_name"] or not report["terminal_id"]:
++        raise RuntimeError(f"launch returned no session identity: {launch}")
++
++    terminal_id = report["terminal_id"]
++
++    try:
++        # No pre-dispatch baseline exists here: the task was delivered inside
++        # launch_session. Evidence must come from activity or a completed turn.
++        status = await wait_for_turn(
++            session,
++            terminal_id,
++            baseline_status="unknown",
++            baseline_output_size=None,
++            timeout=timeout,
++            sleep=sleep,
++            now=now,
++        )
++        record("wait_for_turn", {"status": status, "evidence": "launch turn"})
++
++        if follow_up:
++            # Retain the pre-dispatch size for reporting. Follow-up completion
++            # requires observed activity because rolling output can be reset.
++            previous_output_size = await output_size(session, terminal_id)
++
++            sent = await call_tool(
++                session,
++                "send_session_message",
++                terminal_id=terminal_id,
++                message=follow_up,
++            )
++            if _failed(sent):
++                raise RuntimeError(f"follow-up failed: {sent.get('message')}")
++            record(
++                "send_session_message",
++                {
++                    "queued": True,
++                    "previous_output_chars": previous_output_size,
++                    "baseline_chars": previous_output_size,
++                },
++            )
++
++            status = await wait_for_turn(
++                session,
++                terminal_id,
++                baseline_status=status,
++                baseline_output_size=None,
++                timeout=timeout,
++                interval=0.5,
++                sleep=sleep,
++                now=now,
++            )
++            record("wait_for_turn", {"status": status, "evidence": "follow-up turn"})
++
++        text = await read_output(session, terminal_id, mode="last")
++        report["output"] = text
++        record("read_session_output", {"chars": len(text)})
++    finally:
++        # Always clean up, even when a step above raised, and confirm the
++        # session is actually gone rather than trusting the return value.
++        shutdown = await call_tool(session, "shutdown_session", session_name=report["session_name"])
++        report["shutdown_reported"] = not _failed(shutdown)
++        report["cleanup_verified"] = await session_is_absent(session, report["session_name"])
++        record(
++            "shutdown_session",
++            {
++                "reported": report["shutdown_reported"],
++                "verified_gone": report["cleanup_verified"],
++            },
++        )
++        if not report["cleanup_verified"]:
++            print(
++                f"warning: session {report['session_name']} may still be running",
++                file=sys.stderr,
++            )
++
++    # Reached only when the body succeeded; an earlier exception propagates and
++    # is not masked by this check.
++    if not report["cleanup_verified"]:
++        raise RuntimeError(
++            f"cleanup not verified: session {report['session_name']} is still present"
++        )
++
++    return report
++
++
++def build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(description="Drive a CAO session over cao-ops-mcp.")
++    parser.add_argument(
++        "--profile", default="ops_mcp_worker", help="installed agent profile to launch"
++    )
++    parser.add_argument(
++        "--provider", default=None, help="provider override (default: profile or CAO default)"
++    )
++    parser.add_argument(
++        "--session-name", default=None, help="session name (default: CAO generates one)"
++    )
++    parser.add_argument(
++        "--working-directory", default=None, help="absolute working directory for the session"
++    )
++    parser.add_argument("--task", required=True, help="initial task delivered on launch")
++    parser.add_argument(
++        "--follow-up", default=None, help="optional second message sent after the first turn"
++    )
++    parser.add_argument(
++        "--timeout", type=float, default=120.0, help="seconds to wait for each turn"
++    )
++    parser.add_argument(
++        "--server-command", default="cao-ops-mcp-server", help="stdio MCP server to spawn"
++    )
++    return parser
++
++
++async def main(argv: Optional[list[str]] = None) -> int:
++    args = build_parser().parse_args(argv)
++
++    # This process is an external operator, not a CAO terminal. Saying so keeps
++    # an inherited value from making the example look like it needs one.
++    if "CAO_TERMINAL_ID" in os.environ:
++        print(
++            "note: CAO_TERMINAL_ID is set in this shell; this example ignores it", file=sys.stderr
++        )
++
++    params = StdioServerParameters(command=args.server_command, args=[])
++
++    async with stdio_client(params) as (read_stream, write_stream):
++        async with ClientSession(
++            read_stream,
++            write_stream,
++            client_info=Implementation(name="cao-ops-mcp-example", version="1.0.0"),
++        ) as session:
++            init = await session.initialize()
++            print(f"connected to {init.serverInfo.name} (protocol {init.protocolVersion})")
++
++            available = {tool.name for tool in (await session.list_tools()).tools}
++            missing = [name for name in LIFECYCLE_TOOLS if name not in available]
++            if missing:
++                print(f"server is missing expected tools: {', '.join(missing)}", file=sys.stderr)
++                return 2
++
++            try:
++                report = await run_lifecycle(
++                    session,
++                    profile=args.profile,
++                    provider=args.provider,
++                    session_name=args.session_name,
++                    working_directory=args.working_directory,
++                    task=args.task,
++                    follow_up=args.follow_up,
++                    timeout=args.timeout,
++                )
++            except (RuntimeError, TimeoutError) as exc:
++                print(f"lifecycle failed: {exc}", file=sys.stderr)
++                return 1
++
++    for entry in report["steps"]:
++        print(f"  {entry['step']}: {json.dumps(entry['detail'])}")
++    print(f"\nsession {report['session_name']} output:\n{report.get('output', '')}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(asyncio.run(main()))
+diff --git a/src/cli_agent_orchestrator/api/main.py b/src/cli_agent_orchestrator/api/main.py
+index 318a4191..86a5946e 100644
+--- a/src/cli_agent_orchestrator/api/main.py
++++ b/src/cli_agent_orchestrator/api/main.py
+@@ -16,7 +16,18 @@ from contextlib import asynccontextmanager
+ from dataclasses import asdict
+ from datetime import datetime, timezone
+ from pathlib import Path
+-from typing import Annotated, Any, AsyncIterator, Dict, List, Literal, Optional, Tuple, cast
++from typing import (
++    Annotated,
++    Any,
++    AsyncIterator,
++    Dict,
++    List,
++    Literal,
++    Optional,
++    Sequence,
++    Tuple,
++    cast,
++)
+ 
+ import yaml
+ from fastapi import (
+@@ -1168,6 +1179,61 @@ class ProfileValidationResponse(BaseModel):
+     messages: List[ProfileValidationMessage] = Field(default_factory=list)
+ 
+ 
++class ProfileCreateRequest(BaseModel):
++    """Request body for ``POST /agents/profiles``.
++
++    ``name`` is explicit rather than parsed out of ``content`` so the conflict
++    target is unambiguous even when the document is malformed. When the
++    frontmatter also declares a ``name`` the two must agree; see
++    ``_assert_frontmatter_name_matches``.
++    """
++
++    name: str = Field(description="Profile name, used as the local-store filename stem")
++    content: str = Field(
++        max_length=262_144,
++        description="Full profile markdown, including YAML frontmatter",
++    )
++
++
++class ProfileReplaceRequest(BaseModel):
++    """Request body for ``PUT /agents/profiles/{name}``.
++
++    No ``name`` field: the path parameter is authoritative. Frontmatter that
++    declares a different name is rejected rather than silently renaming.
++    """
++
++    content: str = Field(
++        max_length=262_144,
++        description="Full profile markdown, including YAML frontmatter",
++    )
++
++
++class ProfileWriteResponse(BaseModel):
++    """Outcome of a profile create or replace.
++
++    ``warnings`` carries advisory findings that did not block the write, so a
++    client can surface them after a successful save. Errors never reach here;
++    they reject the request with 400.
++    """
++
++    name: str
++    warnings: List[ProfileValidationMessage] = Field(default_factory=list)
++
++
++class ProfileSourceResponse(BaseModel):
++    """A profile's document exactly as stored, with placeholders intact.
++
++    Distinct from ``GET /agents/profiles/{name}``, which returns the *parsed and
++    resolved* profile. That response runs ``resolve_env_vars`` over the raw text
++    before parsing, so managed ``${VAR}`` placeholders come back as their
++    substituted values. Round-tripping that through a write would persist
++    resolved secrets into a plaintext profile, so an editor must read from here.
++    """
++
++    name: str
++    content: str
++
++
+ class MemorySummary(BaseModel):
+     """Memory list entry. Excludes file_path (absolute server filesystem path)."""
+ 
+@@ -1811,7 +1877,9 @@ class OriginCheckMiddleware:
+                 for name, value in scope.get("headers", [])
+             }
+             origin = headers.get("origin")
+-            if origin and not is_http_origin_allowed(origin, headers.get("host")):
++            if origin and not is_http_origin_allowed(
++                origin, headers.get("host"), scope.get("scheme")
++            ):
+                 logger.warning(
+                     "Rejected cross-origin %s request: disallowed Origin %r",
+                     scope["method"],
+@@ -2896,12 +2964,111 @@ async def get_agent_profile_schema_endpoint() -> Dict:
+     return load_profile_schema()
+ 
+ 
++def _profile_write_rejection(message: str, findings: Sequence[Any] = ()) -> HTTPException:
++    """Build the one 400 a profile write route may return.
++
++    Every 400 from the profile write and source routes carries this shape,
++    ``{"message", "errors"}``, so a client parses one thing rather than switching
++    on ``type(detail)``. ``errors`` is empty for a failure that is not
++    attributable to a field, but the key is always present so a caller can
++    iterate it unconditionally.
++
++    Deliberately covers the service-raised ``InvalidProfileNameError`` paths too,
++    not only schema findings. An unsafe name is a rejected input just like a
++    schema violation, and returning a bare string for one and a dict for the
++    other reintroduces exactly the type-switching this removes. The 404 and 409
++    mappings keep FastAPI's conventional bare-string ``detail``: the status code
++    already tells a client what happened and there are no findings to attach.
++    """
++    return HTTPException(
++        status_code=status.HTTP_400_BAD_REQUEST,
++        detail={
++            "message": message,
++            "errors": [
++                {"severity": f.severity, "message": f.message, "path": f.path} for f in findings
++            ],
++        },
++    )
++
++
++def _validate_profile_for_write(name: str, content: str) -> List[ProfileValidationMessage]:
++    """Validate a submitted profile document and enforce name identity.
++
++    Shared by ``POST /agents/profiles`` and ``PUT /agents/profiles/{name}`` so the
++    two cannot drift apart on either rule.
++
++    Runs the same validator the CLI and ``POST /agents/profiles/validate`` use, on
++    the exact document being persisted rather than on a client-side approximation
++    of it. Error-severity findings reject the write; warnings are returned so a
++    client can surface them after a successful save.
++
++    A profile has two identities: the storage key (its filename stem) and the
++    frontmatter ``name``. ``parse_agent_profile_text`` treats the stem only as a
++    fallback when frontmatter omits ``name``, so the two can diverge and nothing
++    reconciles them: ``name: foo`` in ``bar.md`` loads as ``foo`` while being
++    addressed as ``bar``. Requiring them to agree closes that without introducing
++    a rename operation, which has its own failure semantics.
++
++    Args:
++        name: The storage name, authoritative.
++        content: The full profile document.
++
++    Returns:
++        The warning-severity findings, if any.
++
++    Raises:
++        HTTPException: 400 if the document is unparseable, carries an
++            error-severity finding, or declares a conflicting ``name``. See
++            :func:`_profile_write_rejection` for the shared ``detail`` shape.
++    """
++    import frontmatter
++
++    from cli_agent_orchestrator.services.profile_validator import validate_frontmatter
++
++    def _reject(message: str, findings: Sequence[Any] = ()) -> None:
++        raise _profile_write_rejection(message, findings)
++
++    # Parsed once here, then handed to validate_frontmatter as metadata.
++    # validate_profile_text would parse it again: its docstring exists precisely
++    # to keep callers from duplicating the parse, and this function needs the
++    # metadata anyway for the name check below.
++    try:
++        parsed = frontmatter.loads(content)
++    except Exception as exc:
++        _reject(f"Profile could not be parsed and was not written: {exc}")
++
++    findings = validate_frontmatter(parsed.metadata)
++
++    errors = [f for f in findings if f.severity == "error"]
++    if errors:
++        _reject("Profile failed validation and was not written.", errors)
++
++    declared = parsed.metadata.get("name")
++    if isinstance(declared, str) and declared != name:
++        _reject(
++            f"Frontmatter name '{declared}' does not match the profile name "
++            f"'{name}'. They must agree; renaming a profile is not supported "
++            f"through this endpoint."
++        )
++
++    return [
++        ProfileValidationMessage(severity=f.severity, message=f.message, path=f.path)
++        for f in findings
++        if f.severity == "warning"
++    ]
++
++
+ @app.get("/agents/profiles/{name}")
+ async def get_agent_profile_endpoint(
+     name: str,
+     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+ ) -> Dict:
+-    """Return the full parsed content of a named agent profile."""
++    """Return the full parsed content of a named agent profile.
++
++    Note this response is *resolved*: ``load_agent_profile`` applies
++    ``resolve_env_vars`` before parsing. Use ``GET /agents/profiles/{name}/source``
++    when the document is going to be edited and written back.
++    """
+     try:
+         profile = load_agent_profile(name)
+         return profile.model_dump(exclude_none=True)
+@@ -2938,6 +3105,150 @@ async def install_agent_profile_endpoint(
+     return result
+ 
+ 
++@app.post("/agents/profiles", status_code=status.HTTP_201_CREATED)
++async def create_agent_profile_endpoint(
++    request: ProfileCreateRequest,
++    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
++) -> ProfileWriteResponse:
++    """Create a profile in the local store from a supplied document.
++
++    Named distinctly from ``POST /agents/profiles/install``, which installs from a
++    bare name or an https:// URL. This one takes the document itself in the body.
++
++    Validation runs on the exact submitted content before anything is persisted,
++    so an invalid profile never reaches disk. Conflict detection is delegated to
++    ``write_profile(overwrite=False)``, which checks for an existing file inside
++    the write lock; a pre-check here would sit outside that critical section and
++    let two concurrent creators both succeed.
++    """
++    from cli_agent_orchestrator.services.profile_store import (
++        InvalidProfileNameError,
++        ProfileExistsError,
++        write_profile,
++    )
++
++    warnings = _validate_profile_for_write(request.name, request.content)
++
++    try:
++        write_profile(request.name, request.content, overwrite=False)
++    except InvalidProfileNameError as exc:
++        raise _profile_write_rejection(str(exc))
++    except ProfileExistsError as exc:
++        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
++
++    return ProfileWriteResponse(name=request.name, warnings=warnings)
++
++
++@app.put("/agents/profiles/{name}")
++async def replace_agent_profile_endpoint(
++    name: str,
++    request: ProfileReplaceRequest,
++    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
++) -> ProfileWriteResponse:
++    """Replace an existing local-store profile. Never creates one.
++
++    Backed by ``replace_profile``, which requires the target to exist *inside* the
++    write lock. That is what makes a PUT naming a built-in or provider-managed
++    profile a 404 rather than a silent create: the local store is the only place
++    this resolves, so a built-in's name is simply not there. An upsert would
++    instead write a local file that shadows the built-in on load, manufacturing
++    exactly the condition ``duplicated_in`` exists to report.
++    """
++    from cli_agent_orchestrator.services.profile_store import (
++        InvalidProfileNameError,
++        ProfileNotFoundError,
++        replace_profile,
++    )
++
++    warnings = _validate_profile_for_write(name, request.content)
++
++    try:
++        replace_profile(name, request.content)
++    except InvalidProfileNameError as exc:
++        raise _profile_write_rejection(str(exc))
++    except ProfileNotFoundError as exc:
++        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
++
++    return ProfileWriteResponse(name=name, warnings=warnings)
++
++
++@app.delete("/agents/profiles/{name}", status_code=status.HTTP_204_NO_CONTENT)
++async def delete_agent_profile_endpoint(
++    name: str,
++    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
++) -> None:
++    """Delete a profile from the local store.
++
++    Write-or-admin, the same guard as POST and PUT, so one credential completes
++    the whole create/edit/delete cycle that issue #510 specifies. Scopes are a
++    flat set here, not a hierarchy: ``require_any_scope`` tests membership, so
++    admin-only would 403 a caller holding exactly ``cao:write`` and leave a
++    client that can create and edit a profile unable to remove it.
++
++    Most other ``DELETE`` routes on this service do require admin alone, but they
++    remove *running or generated* state: sessions, terminals, workflows, flows,
++    and bulk memory. A profile is an authored document, closer to
++    ``DELETE /memory/relationships/{id}``, which is also write-or-admin. Removing
++    one stops no in-flight work and destroys nothing that cannot be re-authored,
++    and the deletion is already gated behind a confirmation in the UI.
++
++    Built-in and provider-managed profiles are not deletable for the same reason
++    they are not replaceable: ``delete_profile`` resolves only inside the local
++    store, so their names raise ``ProfileNotFoundError``.
++    """
++    from cli_agent_orchestrator.services.profile_store import (
++        InvalidProfileNameError,
++        ProfileNotFoundError,
++        delete_profile,
++    )
++
++    try:
++        delete_profile(name)
++    except InvalidProfileNameError as exc:
++        raise _profile_write_rejection(str(exc))
++    except ProfileNotFoundError as exc:
++        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
++
++
++@app.get("/agents/profiles/{name}/source")
++async def get_agent_profile_source_endpoint(
++    name: str,
++    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
++) -> ProfileSourceResponse:
++    """Return a profile's document exactly as stored, unresolved.
++
++    The authoring counterpart to ``GET /agents/profiles/{name}``. That route calls
++    ``load_agent_profile``, which applies ``resolve_env_vars`` to the raw text
++    *before* parsing, so substitution reaches the Markdown body as well as the
++    frontmatter, and the substitution source is the managed CAO ``.env`` file.
++    Using that response to pre-fill an editor and then PUT it back would persist
++    resolved secret values into a plaintext profile. ``safe_substitute`` leaves
++    unset variables intact, which would make the damage selective and silent.
++
++    Reads across all configured stores, not only the local one, so a built-in can
++    be fetched as the starting point for a clone. Writing it back still requires
++    the local store, which is enforced by the write routes.
++
++    Scope-gated like the profile reads beside it. This route was gated on its own
++    when it was added here, on the #505 precedent that a *new* read route carries
++    the gate while already-shipped ungated siblings are left alone; #606 has since
++    gated those siblings too, so the asymmetry that reasoning managed no longer
++    exists. Gating matters at least as much here as on the parsed route because
++    this one returns the stored bytes verbatim from the local, provider, extra and
++    built-in stores, including documents that fail to parse, whereas the parsed
++    route can only return what the model accepts. Registered alongside them in
++    ``test/api/test_auth_read_gating.py::_GATED_ROUTES``.
++    """
++    from cli_agent_orchestrator.utils.agent_profiles import _read_agent_profile_source
++
++    try:
++        return ProfileSourceResponse(name=name, content=_read_agent_profile_source(name))
++    except FileNotFoundError as exc:
++        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
++    except ValueError as exc:
++        raise _profile_write_rejection(str(exc))
++
++
+ @app.get("/agents/providers")
+ async def list_providers_endpoint() -> List[Dict]:
+     """List available providers with installation status."""
+@@ -7797,7 +8108,9 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
+     # WebSocket scope first (CAO_ALLOWED_HOSTS="*" opts out of that; see
+     # is_ws_origin_allowed).
+     origin = websocket.headers.get("origin")
+-    if not is_ws_origin_allowed(origin, websocket.headers.get("host")):
++    if not is_ws_origin_allowed(
++        origin, websocket.headers.get("host"), websocket.scope.get("scheme")
++    ):
+         logger.warning(
+             "Rejected WebSocket attach for terminal %r: disallowed Origin %r",
+             terminal_id,
+diff --git a/src/cli_agent_orchestrator/constants.py b/src/cli_agent_orchestrator/constants.py
+index 20de05e7..859302a0 100644
+--- a/src/cli_agent_orchestrator/constants.py
++++ b/src/cli_agent_orchestrator/constants.py
+@@ -505,8 +505,19 @@ WS_ALLOWED_CLIENTS = [
+ WS_ALLOWED_ORIGINS = _split_env_list("CAO_WS_ALLOWED_ORIGINS")
+ 
+ 
+-def _origin_authority(origin: str) -> "str | None":
+-    """Return the ``host[:port]`` authority of an http/https ``Origin``.
++# ASGI reports ``ws``/``wss`` on a WebSocket scope, while a browser always
++# serializes the ``Origin`` header with the matching ``http``/``https`` scheme.
++# Fold the WebSocket forms onto the origin forms before comparing the two.
++_REQUEST_SCHEME_AS_ORIGIN_SCHEME = {
++    "http": "http",
++    "https": "https",
++    "ws": "http",
++    "wss": "https",
++}
++
++
++def _origin_scheme_and_authority(origin: str) -> "tuple[str, str] | None":
++    """Return ``(scheme, host[:port])`` for a plain http/https ``Origin``.
+ 
+     ``None`` for anything that is not a plain http/https origin — an opaque
+     ``"null"`` origin, a ``file://``/``data:`` scheme, or a malformed value —
+@@ -525,10 +536,50 @@ def _origin_authority(origin: str) -> "str | None":
+     # ``netloc`` may carry userinfo (user:pass@host); the authority a browser
+     # actually reports in ``Origin`` never does, but strip it defensively so a
+     # crafted value can't smuggle the trusted host into the userinfo segment.
+-    return parts.netloc.rsplit("@", 1)[-1]
++    return parts.scheme, parts.netloc.rsplit("@", 1)[-1]
+ 
+ 
+-def is_ws_origin_allowed(origin: "str | None", host: "str | None" = None) -> bool:
++def _origin_authority(origin: str) -> "str | None":
++    """Return the ``host[:port]`` authority of an http/https ``Origin``."""
++    parsed = _origin_scheme_and_authority(origin)
++    return None if parsed is None else parsed[1]
++
++
++def _is_same_origin(origin: str, host: str, scheme: "str | None") -> bool:
++    """Whether ``origin`` is same-origin with the request ``host``/``scheme``.
++
++    RFC 6454 defines an origin as the (scheme, host, port) triple, so the
++    authority match alone is not sufficient: ``http://h`` and ``https://h`` are
++    different origins.
++
++    The scheme comparison is deliberately one-directional. An ``http`` Origin on
++    an ``https`` request is rejected, which is unambiguous. An ``https`` Origin
++    on a request the server sees as plain ``http`` is still accepted, because
++    that is exactly the shape an HTTPS-terminating proxy produces when its
++    address is not in ``TRUSTED_FORWARDER_IPS``: uvicorn then ignores
++    ``X-Forwarded-Proto`` and reports ``scheme="http"`` for a request the browser
++    genuinely made over TLS. Rejecting that direction would break working
++    reverse-proxy and Codespaces deployments without closing a real hole, since
++    forging it means already controlling the victim's own origin over TLS.
++
++    ``scheme=None`` skips the comparison entirely, preserving the behaviour
++    callers had before the scheme was threaded through.
++    """
++    parsed = _origin_scheme_and_authority(origin)
++    if parsed is None:
++        return False
++    origin_scheme, authority = parsed
++    if authority != host:
++        return False
++    if scheme is None:
++        return True
++    request_scheme = _REQUEST_SCHEME_AS_ORIGIN_SCHEME.get(scheme.lower())
++    return not (request_scheme == "https" and origin_scheme == "http")
++
++
++def is_ws_origin_allowed(
++    origin: "str | None", host: "str | None" = None, scheme: "str | None" = None
++) -> bool:
+     """Whether a WebSocket handshake ``Origin`` header may open a PTY socket.
+ 
+     Rules, tightest-safe first:
+@@ -559,6 +610,10 @@ def is_ws_origin_allowed(origin: "str | None", host: "str | None" = None) -> boo
+       this branch too — the same explicit-opt-out tradeoff as
+       ``CAO_WS_ALLOWED_CLIENTS="*"``. Keep ``ALLOWED_HOSTS`` scoped to the real
+       serving hostname(s) rather than ``*`` whenever possible.
++
++      When ``scheme`` is supplied (the ASGI ``scope["scheme"]``, i.e. ``ws`` or
++      ``wss``), the match also requires the schemes to agree. See
++      ``_is_same_origin``.
+     * Otherwise the ``Origin`` must appear in the explicit allowlists: the same
+       ``CORS_ORIGINS`` list the HTTP API enforces plus any
+       ``CAO_WS_ALLOWED_ORIGINS`` entries. Exact-string match mirrors how the
+@@ -577,17 +632,17 @@ def is_ws_origin_allowed(origin: "str | None", host: "str | None" = None) -> boo
+         return True
+     if "*" in WS_ALLOWED_ORIGINS:
+         return True
+-    if host:
+-        authority = _origin_authority(origin)
+-        if authority is not None and authority == host:
+-            return True
++    if host and _is_same_origin(origin, host, scheme):
++        return True
+     # Membership only — an operator's ``CAO_CORS_ORIGINS="*"`` lands as the
+     # literal string "*" in this list and matches ONLY a literal "*" Origin
+     # (which no browser sends), so it never widens PTY trust. See docstring.
+     return origin in CORS_ORIGINS or origin in WS_ALLOWED_ORIGINS
+ 
+ 
+-def is_http_origin_allowed(origin: "str | None", host: "str | None" = None) -> bool:
++def is_http_origin_allowed(
++    origin: "str | None", host: "str | None" = None, scheme: "str | None" = None
++) -> bool:
+     """Whether a state-changing HTTP request ``Origin`` header is trusted.
+ 
+     CSRF / CWE-352 guard for the default-unauthenticated HTTP surface, mirroring
+@@ -615,6 +670,11 @@ def is_http_origin_allowed(origin: "str | None", host: "str | None" = None) -> b
+       which keeps the match DNS-rebinding-safe in the default loopback config.
+       ``CAO_ALLOWED_HOSTS="*"`` opts out of that protection, matching the WS
+       guard's documented tradeoff.
++
++      When ``scheme`` is supplied (the ASGI ``scope["scheme"]``), the match also
++      requires the schemes to agree, so an ``https`` request no longer accepts a
++      plain-``http`` Origin as same-origin. See ``_is_same_origin`` for why the
++      comparison is one-directional.
+     * Otherwise the ``Origin`` must be in ``CORS_ORIGINS``. Exact-string match
+       mirrors how the browser serializes ``Origin`` and how ``CORSMiddleware``
+       compares it, so anything the CORS layer already trusts for reads is
+@@ -624,10 +684,8 @@ def is_http_origin_allowed(origin: "str | None", host: "str | None" = None) -> b
+         return True
+     if "*" in CORS_ORIGINS:
+         return True
+-    if host:
+-        authority = _origin_authority(origin)
+-        if authority is not None and authority == host:
+-            return True
++    if host and _is_same_origin(origin, host, scheme):
++        return True
+     return origin in CORS_ORIGINS
+ 
+ 
+diff --git a/src/cli_agent_orchestrator/schemas/agent_profile.schema.json b/src/cli_agent_orchestrator/schemas/agent_profile.schema.json
+index 5d4bced9..11e3a979 100644
+--- a/src/cli_agent_orchestrator/schemas/agent_profile.schema.json
++++ b/src/cli_agent_orchestrator/schemas/agent_profile.schema.json
+@@ -110,14 +110,19 @@
+       "description": "MCP server configurations for additional tools.",
+       "additionalProperties": {
+         "type": "object",
++        "description": "One MCP server. A command-launched server sets 'command'; a remote server sets 'url', with 'type' naming its transport (for example 'http' or 'sse'). At least one of the two is required.",
+         "properties": {
+           "type": {"type": "string"},
+           "command": {"type": "string"},
+           "args": {"type": "array", "items": {"type": "string"}},
+           "env": {"type": "object", "additionalProperties": {"type": "string"}},
+-          "timeout": {"type": "integer"}
++          "timeout": {"type": "integer"},
++          "url": {"type": "string"}
+         },
+-        "required": ["command"]
++        "anyOf": [
++          {"required": ["command"]},
++          {"required": ["url"]}
++        ]
+       }
+     },
+     "tools": {
+diff --git a/src/cli_agent_orchestrator/services/profile_store.py b/src/cli_agent_orchestrator/services/profile_store.py
+index 87f5d570..115723a6 100644
+--- a/src/cli_agent_orchestrator/services/profile_store.py
++++ b/src/cli_agent_orchestrator/services/profile_store.py
+@@ -19,7 +19,7 @@ import re
+ from pathlib import Path
+ 
+ from cli_agent_orchestrator.constants import LOCAL_AGENT_STORE_DIR
+-from cli_agent_orchestrator.utils.atomic_file import locked_atomic_write
++from cli_agent_orchestrator.utils.atomic_file import locked_atomic_delete, locked_atomic_write
+ 
+ # A profile name becomes a single filesystem segment under
+ # LOCAL_AGENT_STORE_DIR. Restricting to [A-Za-z0-9_-] with a 64-char cap
+@@ -38,6 +38,7 @@ __all__ = [
+     "ProfileExistsError",
+     "ProfileNotFoundError",
+     "delete_profile",
++    "replace_profile",
+     "store_path",
+     "write_profile",
+ ]
+@@ -140,9 +141,66 @@ def write_profile(name: str, content: str, *, overwrite: bool = False) -> Path:
+     return target
+ 
+ 
++def replace_profile(name: str, content: str) -> Path:
++    """Replace an existing local-store profile. Never creates one.
++
++    The update-only counterpart to :func:`write_profile`. ``write_profile`` with
++    ``overwrite=True`` is an upsert, which is wrong for an HTTP ``PUT``: a request
++    naming a built-in or provider-managed profile would not fail, it would create a
++    *new* local file that shadows the original, silently changing which profile
++    wins on load. That is exactly the shadowing the ``duplicated_in`` field exists
++    to surface, so an upsert would manufacture the condition we warn about.
++
++    Because this module resolves only inside ``LOCAL_AGENT_STORE_DIR``, a built-in's
++    name is simply not present here, so requiring the target to exist rejects
++    writes against built-ins at the service boundary rather than by a check in the
++    caller.
++
++    The existence requirement is enforced *inside* the write lock. A caller testing
++    for the file first would leave a window where a concurrent delete turns the
++    intended update back into a create.
++
++    Args:
++        name: Profile name, used as the filename stem.
++        content: Full profile text (frontmatter + body).
++
++    Returns:
++        The path written.
++
++    Raises:
++        InvalidProfileNameError: If ``name`` is not a safe single segment.
++        ProfileNotFoundError: If the profile is not in the local store.
++    """
++    # Inline guard: see _PROFILE_NAME_RE.
++    if not _PROFILE_NAME_RE.fullmatch(name):
++        raise InvalidProfileNameError(f"Profile name '{name}' must match [A-Za-z0-9_-]{{1,64}}.")
++    root = LOCAL_AGENT_STORE_DIR.resolve()
++    target = (LOCAL_AGENT_STORE_DIR / f"{name}.md").resolve()
++    if not target.is_relative_to(root):
++        raise InvalidProfileNameError(f"Profile name '{name}' escapes the local store.")
++
++    try:
++        locked_atomic_write(target, content, overwrite=True, must_exist=True)
++    except FileNotFoundError as exc:
++        raise ProfileNotFoundError(
++            f"Profile '{name}' is not in the local store, so there is nothing to "
++            f"replace. Built-in and provider-managed profiles are not writable; "
++            f"copy one into the local store first."
++        ) from exc
++    return target
++
++
+ def delete_profile(name: str) -> None:
+     """Delete the profile ``name`` from the local store.
+ 
++    The existence check and the unlink both happen inside the target's write
++    lock, via :func:`locked_atomic_delete`. That lock is shared with
++    :func:`replace_profile`, and it has to be: an unlocked delete can slip
++    between an update's ``must_exist`` check and its publish, so the update
++    recreates the file and both operations report success. Deletion being the
++    unlocked side of that pair would silently void the update-only guarantee
++    ``replace_profile`` advertises.
++
+     Args:
+         name: Profile name, used as the filename stem.
+ 
+@@ -158,6 +216,7 @@ def delete_profile(name: str) -> None:
+     if not target.is_relative_to(root):
+         raise InvalidProfileNameError(f"Profile name '{name}' escapes the local store.")
+ 
+-    if not target.exists():
+-        raise ProfileNotFoundError(f"Profile '{name}' not found in the local store.")
+-    target.unlink()
++    try:
++        locked_atomic_delete(target)
++    except FileNotFoundError as exc:
++        raise ProfileNotFoundError(f"Profile '{name}' not found in the local store.") from exc
+diff --git a/src/cli_agent_orchestrator/services/profile_validator.py b/src/cli_agent_orchestrator/services/profile_validator.py
+index 2551e690..d277e954 100644
+--- a/src/cli_agent_orchestrator/services/profile_validator.py
++++ b/src/cli_agent_orchestrator/services/profile_validator.py
+@@ -18,18 +18,63 @@ Ref: https://github.com/awslabs/cli-agent-orchestrator/issues/510
+ """
+ 
+ import json
++import re
+ from dataclasses import dataclass
+ from functools import lru_cache
+ from importlib.resources import files as _pkg_files
+-from typing import Literal, Optional
++from itertools import islice
++from typing import Any, Iterator, Literal, Optional
+ 
+ import frontmatter
+-from jsonschema import Draft202012Validator
++from jsonschema import Draft202012Validator as _Draft202012Validator
++from jsonschema import ValidationError, validators
+ 
+ from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS
+ 
+ Severity = Literal["error", "warning"]
+ 
++
++_DEFAULT_ADDITIONAL_PROPERTIES = _Draft202012Validator.VALIDATORS["additionalProperties"]
++
++
++def _ordered_additional_properties(
++    validator: Any,
++    additional_properties: object,
++    instance: object,
++    schema: dict[str, Any],
++) -> Iterator[ValidationError]:
++    """Validate object-valued additional properties in document order.
++
++    jsonschema's default keyword implementation first converts matching property
++    names to a set. When the outer validator takes a bounded prefix, that makes
++    the selected findings depend on ``PYTHONHASHSEED``. Walking the already
++    ordered mapping directly keeps the prefix stable without materializing or
++    sorting the omitted tail.
++
++    Boolean-valued ``additionalProperties`` keeps the default implementation so
++    its single aggregate error and wording remain unchanged.
++    """
++    if isinstance(additional_properties, dict) and isinstance(instance, dict):
++        properties = schema.get("properties", {})
++        patterns = tuple(schema.get("patternProperties", {}))
++        for property_name, value in instance.items():
++            if property_name in properties:
++                continue
++            if isinstance(property_name, str) and any(
++                re.search(pattern, property_name) for pattern in patterns
++            ):
++                continue
++            yield from validator.descend(value, additional_properties, path=property_name)
++        return
++
++    yield from _DEFAULT_ADDITIONAL_PROPERTIES(validator, additional_properties, instance, schema)
++
++
++Draft202012Validator = validators.extend(
++    _Draft202012Validator,
++    {"additionalProperties": _ordered_additional_properties},
++)
++
+ # Known deprecated frontmatter fields that should trigger warnings.
+ _DEPRECATED_FIELDS = {"autoApproveTools"}
+ 
+@@ -71,50 +116,393 @@ def load_profile_schema() -> dict:
+     return json.loads(schema_path.read_text(encoding="utf-8"))
+ 
+ 
++# Structural ceilings, applied before anything else walks or validates a
++# document. The byte ceiling is in *rendered* bytes, the unit the step downstream
++# costs in, and is set against the 256 KB cap both write routes put on ``content``:
++# a document with no aliasing renders to roughly its own size, so 1 MB is ~3.8x
++# the largest request that can arrive. Measured against real input, the largest
++# bundled profile's frontmatter renders to 485 bytes and nests 3 deep, clearing
++# these by ~2060x and ~21x.
++_MAX_RENDERED_BYTES = 1_000_000
++_MAX_DEPTH = 64
++
++# Ceiling on a single finding's text. The collector applies it to every producer,
++# even though jsonschema is the one that can interpolate a large instance.
++_MAX_FINDING_CHARS = 2_000
++
++# Aggregate response ceilings. The finding count includes the omission marker,
++# and the text budget counts UTF-8 bytes from both messages and paths. The marker
++# is reserved up front so truncation can always be reported within both limits.
++_MAX_FINDINGS = 100
++_MAX_FINDING_TEXT_BYTES = 100_000
++_MAX_FINDING_PATH_BYTES = 2_000
++_OMISSION_MESSAGE = "Additional validation findings omitted."
++_PATH_TRUNCATION_SUFFIX = "... (path truncated)"
++
++
++def _capped(message: str) -> str:
++    """Bound one finding's text before it reaches a response body.
++
++    A backstop, not the fix. jsonschema interpolates the offending instance into
++    the message inside ``iter_errors``, so the allocation has already happened by
++    the time this sees the string; :func:`_structural_bound_finding` is what
++    prevents it. This bounds two things that guard does not. A document within the
++    rendering ceiling can still trip errors on several fields, each rendering its
++    own subtree, so the total response is a small multiple of the ceiling rather
++    than the ceiling. And it is a second line of defence on a function that has now
++    twice bounded the wrong dimension, first depth and then value occurrences.
++    """
++    if len(message) <= _MAX_FINDING_CHARS:
++        return message
++    suffix = f"... (message truncated, {len(message)} chars)"
++    return f"{message[: _MAX_FINDING_CHARS - len(suffix)]}{suffix}"
++
++
++def _capped_path(path: Optional[str]) -> Optional[str]:
++    """Bound one finding path in the byte unit used by response serialization."""
++    if path is None:
++        return None
++    encoded = path.encode("utf-8")
++    if len(encoded) <= _MAX_FINDING_PATH_BYTES:
++        return path
++
++    suffix_bytes = _PATH_TRUNCATION_SUFFIX.encode("utf-8")
++    prefix_budget = _MAX_FINDING_PATH_BYTES - len(suffix_bytes)
++    prefix = encoded[:prefix_budget].decode("utf-8", errors="ignore")
++    return f"{prefix}{_PATH_TRUNCATION_SUFFIX}"
++
++
++class _FindingCollector:
++    """Apply one count and aggregate-text budget across every finding producer."""
++
++    def __init__(self) -> None:
++        self._findings: list[ValidationMessage] = []
++        self._remaining_regular_slots = _MAX_FINDINGS - 1
++        self._remaining_text_bytes = _MAX_FINDING_TEXT_BYTES - len(
++            _OMISSION_MESSAGE.encode("utf-8")
++        )
++        self._omitted_severity: Optional[Severity] = None
++
++    @property
++    def remaining_regular_slots(self) -> int:
++        """Number of findings available before the reserved marker slot."""
++        return self._remaining_regular_slots
++
++    def add(self, finding: ValidationMessage) -> bool:
++        """Add one normalized finding, or mark it omitted and reject it."""
++        normalized = ValidationMessage(
++            finding.severity,
++            _capped(finding.message),
++            _capped_path(finding.path),
++        )
++        text_bytes = len(normalized.message.encode("utf-8"))
++        if normalized.path is not None:
++            text_bytes += len(normalized.path.encode("utf-8"))
++
++        if self._remaining_regular_slots == 0 or text_bytes > self._remaining_text_bytes:
++            self.mark_omitted(normalized.severity)
++            return False
++
++        self._findings.append(normalized)
++        self._remaining_regular_slots -= 1
++        self._remaining_text_bytes -= text_bytes
++        return True
++
++    def mark_omitted(self, severity: Severity) -> None:
++        """Record omission without counting or exhausting the producer."""
++        if self._omitted_severity is None or severity == "error":
++            self._omitted_severity = severity
++
++    def finalize(self) -> list[ValidationMessage]:
++        """Return findings with exactly one trailing marker when truncated."""
++        if self._omitted_severity is None:
++            return list(self._findings)
++        return [
++            *self._findings,
++            ValidationMessage(self._omitted_severity, _OMISSION_MESSAGE),
++        ]
++
++
++def _structural_bound_finding(metadata: object) -> Optional["ValidationMessage"]:
++    """Reject a document the rest of the validator cannot safely be handed.
++
++    Three ways a document fails here: it renders too large, it nests too deep, or
++    it contains a cycle.
++
++    **Why bytes.** The cost this guard exists to bound is ``repr(instance)``:
++    jsonschema builds every error message eagerly, interpolating a rendering of the
++    offending instance. ``yaml.safe_load`` resolves each alias to another reference
++    to the *same* object, so a document's rendered size is unbounded by its own
++    byte count in two separate ways. Chained anchors multiply *structure*: 20
++    levels that each reference the previous one twice took a 651-byte body to a
++    25 MB message. Aliasing one large scalar multiplies *content*: a 250,055-byte
++    body holding a 190,000-character scalar referenced 15,000 times renders to
++    2.85 GB. An earlier version of this function counted value *occurrences*, which
++    caught the first and missed the second, since every scalar counted as 1
++    regardless of length. Counting the bytes each occurrence renders covers both,
++    because it is the same unit the downstream step pays in.
++
++    Both land on ``POST /agents/profiles/validate`` in particular: it is
++    scope-exempt, so it answers without credentials even when OAuth is configured,
++    and it is declared ``async``, so work on its thread delays every other request
++    rather than only the caller's own.
++
++    **Why cycles are rejected rather than counted.** A cycle has no finite
++    rendering, so any finite number this function returned for one would be a
++    fiction. It is also unusable downstream: ``model_dump_json`` raises
++    ``PydanticSerializationError: Circular reference detected`` when the Kiro
++    materialization path writes the profile out, so accepting one persists a
++    document the runtime cannot use. In-progress identities are therefore tracked
++    separately from completed ones: revisiting a container that is still being
++    measured is a back-edge, while revisiting a finished one is ordinary sharing
++    and stays memoized.
++
++    **Why memoization is sound.** Identity is compared rather than value because
++    every object stays reachable from ``metadata`` for the duration, so nothing can
++    be collected and no id recycled midway. Scalars are memoized too, so a large
++    shared scalar is rendered once even when referenced thousands of times, which
++    keeps this function's own allocation bounded by the source document while still
++    charging its bytes at every reference.
++
++    Returns:
++        An error finding naming what was exceeded, or ``None`` when the document is
++        within all three bounds.
++    """
++    memo: dict[int, int] = {}
++    in_progress: set[int] = set()
++    ceiling = _MAX_RENDERED_BYTES + 1
++    exceeded: Optional[str] = None
++
++    def rendered(value: object, depth: int) -> int:
++        nonlocal exceeded
++        if exceeded is not None:
++            return 0
++
++        identity = id(value)
++
++        if not isinstance(value, (dict, list)):
++            cached = memo.get(identity)
++            if cached is None:
++                cached = len(repr(value))
++                memo[identity] = cached
++            return cached
++
++        if depth > _MAX_DEPTH:
++            exceeded = "depth"
++            return 0
++        if identity in in_progress:
++            exceeded = "cycle"
++            return 0
++        completed = memo.get(identity)
++        if completed is not None:
++            return completed
++
++        in_progress.add(identity)
++        total = 2  # The enclosing braces or brackets.
++        children = value.items() if isinstance(value, dict) else enumerate(value)
++        for key, child in children:
++            # ``'key': `` for a mapping, ``, `` between entries either way. The
++            # index of a sequence entry is not rendered, so it costs nothing.
++            total += (len(repr(key)) + 2) if isinstance(value, dict) else 0
++            total += 2 + rendered(child, depth + 1)
++            if exceeded is not None:
++                break
++            if total >= ceiling:
++                total = ceiling
++                break
++        in_progress.discard(identity)
++
++        memo[identity] = total
++        return total
++
++    size = rendered(metadata, 0)
++
++    if exceeded == "cycle":
++        return ValidationMessage(
++            "error",
++            "Frontmatter contains a circular YAML alias, so it has no finite "
++            "rendering and cannot be serialized by the providers that consume it. "
++            "Remove the self-reference.",
++        )
++    if exceeded == "depth":
++        return ValidationMessage(
++            "error",
++            f"Frontmatter nests more than {_MAX_DEPTH} levels deep, past what this "
++            f"validator will inspect. Flatten the document.",
++        )
++    if size >= ceiling:
++        return ValidationMessage(
++            "error",
++            f"Frontmatter renders to more than {_MAX_RENDERED_BYTES} bytes, past "
++            f"what this validator will inspect. If it uses YAML anchors, note that "
++            f"every alias renders its target again in full, so a small document can "
++            f"exceed this. Simplify the document.",
++        )
++    return None
++
++
++def _collect_non_string_key_findings(metadata: object, collector: _FindingCollector) -> bool:
++    """Add non-string mapping keys in document order until the budget fills.
++
++    Closes a gap between the two formats in play. A profile arrives as **YAML**,
++    which allows any scalar as a mapping key, but the format is described by
++    **JSON Schema**, where object keys are strings by definition. jsonschema
++    therefore does not flag ``mcpServers: {1: {command: echo}}`` at all, while
++    ``AgentProfile`` refuses to load it later because ``Dict[str, ...]`` rejects
++    the integer key.
++
++    Reported here rather than only on the HTTP write path so that every consumer
++    agrees. Otherwise ``cao profile validate`` and
++    ``POST /agents/profiles/validate`` would call such a document valid and the
++    write routes would then reject it, and a UI that validates before saving
++    would show a contradiction.
++
++    The same mismatch reaches further than integer keys: YAML also auto-types
++    unquoted dates, so ``2026-01-01:`` becomes a ``datetime.date`` key. Checking
++    the key type generally covers those without enumerating them.
++
++    ``seen`` skips any container already walked, keyed on ``id()``. That removes
++    alias amplification at its source and costs no coverage: a shared subtree
++    cannot hold different keys on a second visit. Comparing identity is sound
++    because every value stays reachable from ``metadata`` for the duration, so
++    nothing can be collected and no id recycled midway.
++
++    A shared value that is *schema*-invalid still yields one finding per
++    referencing path because jsonschema does not memoize, while a shared
++    *non-string key* yields exactly one at the first path reaching it. A client
++    highlighting findings against a document should not assume one convention.
++
++    The collector replaces the former accumulated list. No intermediate children
++    list is built, and a rejected candidate stops traversal immediately.
++
++    Returns:
++        ``True`` when the walk completed, or ``False`` when the collector rejected
++        a finding and traversal stopped immediately.
++    """
++    seen: set[int] = set()
++
++    def walk(value: object, path: str) -> bool:
++        if not isinstance(value, (dict, list)):
++            return True
++        if id(value) in seen:
++            return True
++        seen.add(id(value))
++
++        if isinstance(value, dict):
++            # Preserve the previous direct-keys-before-descendants ordering without
++            # materializing an unbounded intermediate children list.
++            for key in value:
++                child_path = f"{path}.{key}" if path else str(key)
++                if not isinstance(key, str):
++                    if not collector.add(
++                        ValidationMessage(
++                            "error",
++                            f"Mapping key {key!r} is a {type(key).__name__}, not a string. "
++                            f"Profile fields are string-keyed; quote it as '{key}'.",
++                            child_path,
++                        )
++                    ):
++                        return False
++            for key, child in value.items():
++                child_path = f"{path}.{key}" if path else str(key)
++                if not walk(child, child_path):
++                    return False
++        else:
++            for index, child in enumerate(value):
++                child_path = f"{path}.{index}" if path else str(index)
++                if not walk(child, child_path):
++                    return False
++
++        return True
++
++    return walk(metadata, "")
++
++
+ def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
+     """Validate a frontmatter dict against the schema and CAO conventions.
+ 
+-    Returns findings in a stable order: deprecated fields, then JSON-Schema
+-    errors sorted by path, then ``allowedTools`` vocabulary warnings, then the
+-    role check. An empty list means the profile is valid with no advisories.
++    Returns a bounded prefix in stable producer order: deprecated fields, then
++    non-string mapping keys, then a bounded JSON-Schema prefix sorted by path,
++    then ``allowedTools`` vocabulary warnings, then the role check. At most
++    ``_MAX_FINDINGS`` are returned, including one final omission marker when the
++    shared count or aggregate-text budget fills. An empty list means the profile
++    is valid with no advisories.
++
++    A document outside the structural ceilings is the one exception to that
++    order: it is reported and nothing further runs, because the later steps are
++    exactly what such a document is expensive in.
+     """
+-    messages: list[ValidationMessage] = []
++    collector = _FindingCollector()
+ 
+     # 1. Deprecated fields first, before ``additionalProperties: false``
+     #    rejects them with a less helpful message.
+     for field in sorted(_DEPRECATED_FIELDS):
+         if field in metadata:
+-            messages.append(
++            if not collector.add(
+                 ValidationMessage(
+                     "warning",
+                     f"'{field}' is deprecated and rejected by CAO 2.2+. "
+                     f"Use 'allowedTools' instead.",
+                 )
+-            )
++            ):
++                return collector.finalize()
++
++    # 2. Structural ceilings, before anything traverses or validates the
++    #    document: rendered size, nesting depth, and cycles.
++    structural = _structural_bound_finding(metadata)
++    if structural is not None:
++        collector.add(structural)
++        return collector.finalize()
+ 
+-    # 2. JSON-Schema structural validation.
++    # 3. Non-string mapping keys, which JSON Schema cannot see. Stream findings
++    #    into the shared collector and stop the walk as soon as its budget fills.
++    if not _collect_non_string_key_findings(metadata, collector):
++        return collector.finalize()
++
++    # 4. JSON-Schema structural validation. Consume only the remaining capacity
++    #    plus one lookahead before sorting, so the iterator and sort allocation
++    #    are bounded without exhausting the omitted tail merely to count it.
+     validator = Draft202012Validator(load_profile_schema())
+-    for error in sorted(validator.iter_errors(metadata), key=lambda e: list(e.path)):
++    remaining = collector.remaining_regular_slots
++    sampled_errors = list(islice(validator.iter_errors(metadata), remaining + 1))
++    omitted_schema_errors = len(sampled_errors) > remaining
++    for error in sorted(sampled_errors[:remaining], key=lambda e: [str(p) for p in e.path]):
+         path = ".".join(str(p) for p in error.absolute_path) or "(root)"
+-        messages.append(ValidationMessage("error", error.message, path))
++        if not collector.add(ValidationMessage("error", error.message, path)):
++            return collector.finalize()
++    if omitted_schema_errors:
++        collector.mark_omitted("error")
++        return collector.finalize()
+ 
+-    # 3. allowedTools vocabulary check (advisory, not blocking).
++    # 5. allowedTools vocabulary check (advisory, not blocking).
++    #
++    # Each entry is type-checked before the membership test. ``_VALID_TOOL_VOCAB``
++    # is a set, so ``tool not in`` hashes ``tool``, and an unhashable element
++    # (``allowedTools: [[Read]]``) would raise TypeError. The schema already
++    # rejects a non-string entry, so this check only has to avoid crashing on
++    # input the caller will be told about anyway.
+     allowed = metadata.get("allowedTools")
+     if allowed and isinstance(allowed, list):
+         for tool in allowed:
++            if not isinstance(tool, str):
++                continue
+             if tool not in _VALID_TOOL_VOCAB:
+-                messages.append(
++                if not collector.add(
+                     ValidationMessage(
+                         "warning",
+                         f"allowedTools entry '{tool}' is not in CAO's recognized "
+                         f"vocabulary. It may be silently ignored by some providers.",
+                     )
+-                )
++                ):
++                    return collector.finalize()
+ 
+-    # 4. Role check (advisory — custom roles are valid but worth flagging).
++    # 6. Role check (advisory — custom roles are valid but worth flagging).
++    #
++    # Same hashing hazard as above: ``role: [developer]`` is unhashable. The
++    # schema reports the type error, so this advisory check simply stands aside.
+     role = metadata.get("role")
+-    if role and role not in _BUILTIN_ROLES:
+-        messages.append(
++    if isinstance(role, str) and role and role not in _BUILTIN_ROLES:
++        collector.add(
+             ValidationMessage(
+                 "warning",
+                 f"role '{role}' is not a built-in CAO role "
+@@ -123,7 +511,7 @@ def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
+             )
+         )
+ 
+-    return messages
++    return collector.finalize()
+ 
+ 
+ def validate_profile_text(text: str) -> list[ValidationMessage]:
+diff --git a/src/cli_agent_orchestrator/utils/atomic_file.py b/src/cli_agent_orchestrator/utils/atomic_file.py
+index 2e03ed09..4bfa3c93 100644
+--- a/src/cli_agent_orchestrator/utils/atomic_file.py
++++ b/src/cli_agent_orchestrator/utils/atomic_file.py
+@@ -248,6 +248,7 @@ def locked_atomic_write(
+     encoding: str = "utf-8",
+     lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+     overwrite: bool = True,
++    must_exist: bool = False,
+ ) -> None:
+     """Replace ``target``'s entire contents atomically and safely across processes.
+ 
+@@ -274,25 +275,98 @@ def locked_atomic_write(
+             observe an absent file. Callers must not pre-check with
+             ``target.exists()`` themselves: that test would sit outside this
+             critical section and reintroduce the race.
++        must_exist: When True, refuse to create a missing target, so the write
++            is an update and never an insert. Checked inside the same lock and
++            for the same reason: a caller testing existence beforehand would let
++            a concurrent delete slip between the check and the write, turning an
++            intended update back into a create. ``overwrite=False`` with
++            ``must_exist=True`` is contradictory and raises ``ValueError``.
+ 
+     Raises:
+         FileExistsError: If ``target`` exists and ``overwrite`` is False.
++        FileNotFoundError: If ``target`` is absent and ``must_exist`` is True.
++        ValueError: If ``overwrite`` is False and ``must_exist`` is True.
+         LockTimeoutError: If the lock is not acquired within ``lock_timeout``
+             seconds.
+         OSError: Propagated from filesystem operations (write, fsync, replace).
+     """
++    if not overwrite and must_exist:
++        raise ValueError(
++            "overwrite=False with must_exist=True can never succeed: it demands a "
++            "target that exists and refuses to replace it."
++        )
++
+     target.parent.mkdir(parents=True, exist_ok=True)
+     lock_path = _lock_path_for(target)
+ 
+     with _file_lock(lock_path, lock_timeout):
+         # Checked HERE, not by the caller: an exists() test outside this
+         # critical section lets two concurrent creators both see "absent" and
+-        # both write, so the second silently clobbers the first.
++        # both write, so the second silently clobbers the first. The same
++        # applies in reverse to must_exist, where a concurrent delete between
++        # an external check and the write would turn an update into a create.
+         if not overwrite and target.exists():
+             raise FileExistsError(f"{target} already exists")
++        if must_exist and not target.exists():
++            raise FileNotFoundError(f"{target} does not exist")
+         _atomic_publish(target, content, encoding)
+ 
+ 
++def locked_atomic_delete(
++    target: Path,
++    *,
++    lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
++    must_exist: bool = True,
++) -> None:
++    """Remove ``target`` while holding the same lock the writers use.
++
++    The deleting sibling of :func:`locked_atomic_write`. It exists because
++    ``locked_atomic_write``'s ``must_exist`` guarantee is only real if deletion
++    participates in the same critical section. An unlocked
++    ``exists()``-then-``unlink()`` can land *between* an update's existence check
++    and its ``os.replace``: the delete succeeds, the update then republishes the
++    file, and both callers are told they succeeded while a supposedly-deleted
++    file is back on disk holding the new content. Serialising here makes one of
++    the two lose, which is the whole point of ``must_exist``.
++
++    Deletion needs no temp file or ``os.replace`` because ``unlink`` is already
++    atomic. The lock is what this adds, not atomicity.
++
++    Note:
++        Safe against the ``fcntl.flock``-is-per-inode hazard because the lock
++        file is not the target. ``_lock_path_for`` keys a file under
++        ``LOCK_DIR`` by a hash of the target's *resolved* path, and those lock
++        files are never unlinked, so removing the target leaves the lock inode
++        untouched and a concurrent writer keeps contending on the same one.
++
++    Args:
++        target: The file to remove.
++        lock_timeout: Seconds to wait for the lock before raising
++            ``LockTimeoutError``.
++        must_exist: When True (default), a missing target raises
++            ``FileNotFoundError``. The check runs inside the lock, so two
++            concurrent deleters cannot both observe the file as present.
++            Pass False to make removal idempotent.
++
++    Raises:
++        FileNotFoundError: If ``target`` is absent and ``must_exist`` is True.
++        LockTimeoutError: If the lock is not acquired within ``lock_timeout``
++            seconds.
++        OSError: Propagated from the unlink.
++    """
++    lock_path = _lock_path_for(target)
++
++    with _file_lock(lock_path, lock_timeout):
++        # Inside the lock for the same reason as locked_atomic_write's checks:
++        # a caller testing existence beforehand would race both a concurrent
++        # deleter (double unlink) and a concurrent update (resurrected file).
++        if not target.exists():
++            if must_exist:
++                raise FileNotFoundError(f"{target} does not exist")
++            return
++        target.unlink()
++
++
+ def _atomic_publish(target: Path, content: str, encoding: str) -> None:
+     """Write ``content`` to ``target`` via a unique temp file + ``os.replace``.
+ 
+diff --git a/test/api/test_api_profile_surface.py b/test/api/test_api_profile_surface.py
+index 753503d7..f958762c 100644
+--- a/test/api/test_api_profile_surface.py
++++ b/test/api/test_api_profile_surface.py
+@@ -11,6 +11,10 @@ from unittest.mock import patch
+ import pytest
+ 
+ from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT
++from cli_agent_orchestrator.services.profile_validator import (
++    _MAX_FINDINGS,
++    _OMISSION_MESSAGE,
++)
+ 
+ 
+ @pytest.fixture(autouse=True)
+@@ -497,3 +501,687 @@ class TestAgentProfileSchemaEndpoint:
+         assert response.status_code == 200
+         assert not mock_load.called
+         assert "properties" in response.json()
++
++
++class TestValidateEndpointOnMalformedInput:
++    """The endpoint must diagnose bad documents, not 500 on them.
++
++    Regression guard for the P3 finding on #575: these three shapes raised
++    ``TypeError`` inside the handler, which is not caught by its ``except
++    ValueError``, so the client received HTTP 500 instead of the findings it
++    asked for. Asserting the status explicitly is the point of these tests.
++    """
++
++    def test_unhashable_allowed_tools_entry_returns_findings(self, client) -> None:
++        content = "---\nname: x\nallowedTools:\n  - [Read]\n---\n\nBody.\n"
++
++        response = client.post("/agents/profiles/validate", json={"content": content})
++
++        assert response.status_code == 200
++        body = response.json()
++        assert body["valid"] is False
++        assert any(m["severity"] == "error" for m in body["messages"])
++
++    def test_unhashable_role_returns_findings(self, client) -> None:
++        content = "---\nname: x\nrole:\n  - developer\n---\n\nBody.\n"
++
++        response = client.post("/agents/profiles/validate", json={"content": content})
++
++        assert response.status_code == 200
++        assert response.json()["valid"] is False
++
++    def test_mixed_type_mapping_keys_return_findings(self, client) -> None:
++        content = "---\nname: x\nmcpServers:\n  1: {}\n  x: {}\n---\n\nBody.\n"
++
++        response = client.post("/agents/profiles/validate", json={"content": content})
++
++        assert response.status_code == 200
++        assert response.json()["valid"] is False
++
++
++# --------------------------------------------------------------------------
++# Write endpoints (POST / PUT / DELETE) and the authoring read
++# --------------------------------------------------------------------------
++
++VALID_PROFILE = "---\nname: {name}\ndescription: A test profile.\n---\n\nYou are a test agent.\n"
++
++
++@pytest.fixture()
++def write_store(tmp_path, monkeypatch):
++    """Point the local profile store at a tmp dir for the write routes.
++
++    Both module references must be patched. ``profile_store`` and
++    ``agent_profiles`` each import ``LOCAL_AGENT_STORE_DIR`` by value, so the
++    write routes read one copy and the source route reads the other. Patching
++    only ``profile_store`` leaves the source route resolving against the real
++    store on the developer's machine.
++    """
++    from cli_agent_orchestrator.services import profile_store
++    from cli_agent_orchestrator.utils import agent_profiles
++
++    target = tmp_path / "agent-store"
++    monkeypatch.setattr(profile_store, "LOCAL_AGENT_STORE_DIR", target)
++    monkeypatch.setattr(agent_profiles, "LOCAL_AGENT_STORE_DIR", target)
++    return target
++
++
++class TestCreateAgentProfileEndpoint:
++    """POST /agents/profiles -- create from a supplied document."""
++
++    def test_creates_a_profile_and_returns_201(self, client, write_store) -> None:
++        response = client.post(
++            "/agents/profiles",
++            json={"name": "fresh", "content": VALID_PROFILE.format(name="fresh")},
++        )
++
++        assert response.status_code == 201
++        assert response.json()["name"] == "fresh"
++        assert (write_store / "fresh.md").exists()
++
++    def test_conflicting_name_returns_409(self, client, write_store) -> None:
++        """Conflict is detected inside the write lock, not by a pre-check."""
++        body = {"name": "dupe", "content": VALID_PROFILE.format(name="dupe")}
++        assert client.post("/agents/profiles", json=body).status_code == 201
++
++        assert client.post("/agents/profiles", json=body).status_code == 409
++
++    def test_invalid_profile_is_rejected_and_not_written(self, client, write_store) -> None:
++        """Validation runs before persistence, so nothing reaches disk."""
++        content = "---\nname: bad\nengine: v3\n---\n\nBody.\n"
++
++        response = client.post("/agents/profiles", json={"name": "bad", "content": content})
++
++        assert response.status_code == 400
++        assert not (write_store / "bad.md").exists()
++        assert response.json()["detail"]["errors"]
++
++    def test_frontmatter_name_mismatch_is_rejected(self, client, write_store) -> None:
++        """The storage name and the frontmatter name must agree.
++
++        Without this the two silently diverge: the profile loads under its
++        frontmatter name while being addressed by its filename stem.
++        """
++        content = VALID_PROFILE.format(name="something-else")
++
++        response = client.post("/agents/profiles", json={"name": "declared", "content": content})
++
++        assert response.status_code == 400
++        assert "does not match" in response.json()["detail"]["message"]
++        assert not (write_store / "declared.md").exists()
++
++    def test_unsafe_name_is_rejected(self, client, write_store) -> None:
++        content = "---\nname: ok\n---\n\nBody.\n"
++
++        response = client.post("/agents/profiles", json={"name": "../escape", "content": content})
++
++        assert response.status_code == 400
++
++    def test_warnings_do_not_block_the_write(self, client, write_store) -> None:
++        """A warning-only profile is written, with the warnings returned.
++
++        This is the block/allow contract: only errors reject a save.
++        """
++        content = "---\nname: warned\nrole: archaeologist\n---\n\nBody.\n"
++
++        response = client.post("/agents/profiles", json={"name": "warned", "content": content})
++
++        assert response.status_code == 201
++        assert response.json()["warnings"]
++        assert (write_store / "warned.md").exists()
++
++    def test_oversized_content_is_rejected_by_the_model(self, client, write_store) -> None:
++        response = client.post("/agents/profiles", json={"name": "big", "content": "x" * 262_145})
++
++        assert response.status_code == 422
++
++
++class TestReplaceAgentProfileEndpoint:
++    """PUT /agents/profiles/{name} -- update only, never insert."""
++
++    def test_replaces_an_existing_profile(self, client, write_store) -> None:
++        client.post(
++            "/agents/profiles",
++            json={"name": "target", "content": VALID_PROFILE.format(name="target")},
++        )
++        updated = "---\nname: target\ndescription: Updated.\n---\n\nNew body.\n"
++
++        response = client.put("/agents/profiles/target", json={"content": updated})
++
++        assert response.status_code == 200
++        assert "New body." in (write_store / "target.md").read_text(encoding="utf-8")
++
++    def test_missing_profile_returns_404_and_creates_nothing(self, client, write_store) -> None:
++        content = VALID_PROFILE.format(name="ghost")
++
++        response = client.put("/agents/profiles/ghost", json={"content": content})
++
++        assert response.status_code == 404
++        assert not (write_store / "ghost.md").exists()
++
++    def test_built_in_profile_cannot_be_shadowed(self, client, write_store) -> None:
++        """A PUT naming a built-in must 404, not create a shadowing local file.
++
++        ``code_supervisor`` ships with the package. An upsert would write a local
++        file of the same name that wins on load, which is the condition
++        ``duplicated_in`` exists to report.
++        """
++        content = VALID_PROFILE.format(name="code_supervisor")
++
++        response = client.put("/agents/profiles/code_supervisor", json={"content": content})
++
++        assert response.status_code == 404
++        assert not (write_store / "code_supervisor.md").exists()
++
++    def test_frontmatter_name_mismatch_is_rejected(self, client, write_store) -> None:
++        client.post(
++            "/agents/profiles",
++            json={"name": "keeper", "content": VALID_PROFILE.format(name="keeper")},
++        )
++
++        response = client.put(
++            "/agents/profiles/keeper", json={"content": VALID_PROFILE.format(name="renamed")}
++        )
++
++        assert response.status_code == 400
++        assert "does not match" in response.json()["detail"]["message"]
++
++    def test_invalid_profile_does_not_overwrite(self, client, write_store) -> None:
++        client.post(
++            "/agents/profiles",
++            json={"name": "guarded", "content": VALID_PROFILE.format(name="guarded")},
++        )
++        original = (write_store / "guarded.md").read_text(encoding="utf-8")
++
++        response = client.put(
++            "/agents/profiles/guarded",
++            json={"content": "---\nname: guarded\nengine: v3\n---\n\nBody.\n"},
++        )
++
++        assert response.status_code == 400
++        assert (write_store / "guarded.md").read_text(encoding="utf-8") == original
++
++
++class TestDeleteAgentProfileEndpoint:
++    """DELETE /agents/profiles/{name} -- local store only."""
++
++    def test_deletes_an_existing_profile(self, client, write_store) -> None:
++        client.post(
++            "/agents/profiles",
++            json={"name": "doomed", "content": VALID_PROFILE.format(name="doomed")},
++        )
++
++        response = client.delete("/agents/profiles/doomed")
++
++        assert response.status_code == 204
++        assert not (write_store / "doomed.md").exists()
++
++    def test_missing_profile_returns_404(self, client, write_store) -> None:
++        assert client.delete("/agents/profiles/never-existed").status_code == 404
++
++    def test_built_in_profile_cannot_be_deleted(self, client, write_store) -> None:
++        """Built-ins are not in the local store, so they are not deletable."""
++        assert client.delete("/agents/profiles/code_supervisor").status_code == 404
++
++    def test_unsafe_name_is_rejected(self, client, write_store) -> None:
++        """A single-segment unsafe name reaches the handler and is rejected there.
++
++        An encoded traversal such as ``..%2Fescape`` never gets this far: the URL
++        normalises to a different path and routing answers 405, so it does not
++        exercise the name guard.
++        """
++        assert client.delete("/agents/profiles/bad@name").status_code == 400
++
++
++class TestAgentProfileSourceEndpoint:
++    """GET /agents/profiles/{name}/source -- unresolved authoring read."""
++
++    def test_returns_the_document_as_stored(self, client, write_store) -> None:
++        content = VALID_PROFILE.format(name="sourced")
++        client.post("/agents/profiles", json={"name": "sourced", "content": content})
++
++        response = client.get("/agents/profiles/sourced/source")
++
++        assert response.status_code == 200
++        assert response.json()["content"] == content
++
++    def test_placeholders_are_not_resolved(self, client, write_store) -> None:
++        """The whole point of this route.
++
++        ``GET /agents/profiles/{name}`` runs resolve_env_vars over the raw text
++        before parsing, so a managed variable would come back substituted and an
++        edit round-trip would persist the resolved value. Here the placeholder
++        must survive verbatim.
++        """
++        content = "---\nname: templated\ndescription: Uses a variable.\n---\n\nToken: ${MY_TOKEN}\n"
++        client.post("/agents/profiles", json={"name": "templated", "content": content})
++
++        response = client.get("/agents/profiles/templated/source")
++
++        assert "${MY_TOKEN}" in response.json()["content"]
++
++    def test_is_not_shadowed_by_the_name_route(self, client, write_store) -> None:
++        """Route-ordering guard.
++
++        ``GET /agents/profiles/{name}`` is declared first. It must not capture
++        ``foo/source`` as a profile named "foo/source", and this route must not be
++        served by the parsed-profile handler.
++        """
++        client.post(
++            "/agents/profiles",
++            json={"name": "distinct", "content": VALID_PROFILE.format(name="distinct")},
++        )
++
++        source = client.get("/agents/profiles/distinct/source").json()
++        parsed = client.get("/agents/profiles/distinct").json()
++
++        assert set(source) == {"name", "content"}
++        assert "system_prompt" in parsed
++
++    def test_missing_profile_returns_404(self, client, write_store) -> None:
++        assert client.get("/agents/profiles/absent/source").status_code == 404
++
++
++class TestNonStringMappingKeysAreRejected:
++    """A profile the runtime cannot load must not reach disk.
++
++    Reported as a P2 in round 1 of review on #585. The request body is YAML,
++    which allows any scalar as a mapping key, but the gate was JSON Schema, where
++    object keys are strings by definition. jsonschema saw nothing wrong with
++    ``mcpServers: {1: {command: echo}}``, so the write returned 201 and created
++    the file, and ``parse_agent_profile_text`` then refused to load it with a
++    Pydantic error at ``mcpServers.1.[key]``. The profile saved and could not be
++    read or launched, which contradicts the route's guarantee.
++
++    The check lives in the validator rather than only on this path, so
++    ``cao profile validate`` and ``POST /agents/profiles/validate`` agree with
++    the write routes. A UI that validates before saving would otherwise be told
++    the document is fine and then handed a 400.
++    """
++
++    CASES = {
++        "mcpServers integer key": "---\nname: probe\nmcpServers:\n  1:\n    command: echo\n---\n\nB.\n",
++        "toolAliases integer key": "---\nname: probe\ntoolAliases:\n  1: Read\n---\n\nB.\n",
++        # YAML auto-types an unquoted date, so this key is a datetime.date. The
++        # same mismatch, reached without anyone writing a number.
++        "unquoted date key": "---\nname: probe\ntoolAliases:\n  2026-01-01: Read\n---\n\nB.\n",
++    }
++
++    @pytest.mark.parametrize("label", list(CASES))
++    def test_create_rejects_and_writes_nothing(self, client, write_store, label) -> None:
++        response = client.post(
++            "/agents/profiles", json={"name": "probe", "content": self.CASES[label]}
++        )
++
++        assert response.status_code == 400, label
++        assert not (write_store / "probe.md").exists(), f"{label}: profile was persisted"
++
++    @pytest.mark.parametrize("label", list(CASES))
++    def test_replace_rejects_and_leaves_the_original(self, client, write_store, label) -> None:
++        """The existing document must survive a rejected update byte-for-byte."""
++        write_store.mkdir(parents=True, exist_ok=True)
++        original = VALID_PROFILE.format(name="probe")
++        (write_store / "probe.md").write_text(original, encoding="utf-8")
++
++        response = client.put("/agents/profiles/probe", json={"content": self.CASES[label]})
++
++        assert response.status_code == 400, label
++        assert (write_store / "probe.md").read_text(encoding="utf-8") == original, label
++
++    def test_the_rejected_document_is_indeed_unloadable(self, write_store) -> None:
++        """Anchors the reason for rejecting: the runtime cannot parse these.
++
++        Without this, the rule above reads as an arbitrary restriction. Asserting
++        the load failure keeps the justification in the suite rather than only in
++        a commit message.
++        """
++        import pytest as _pytest
++
++        from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
++
++        with _pytest.raises(Exception) as excinfo:
++            parse_agent_profile_text(self.CASES["mcpServers integer key"], "probe")
++
++        assert "mcpServers" in str(excinfo.value)
++
++
++class TestWriteRejectionShape:
++    """Every 400 from the profile write and source routes uses one ``detail`` shape.
++
++    A client should not have to switch on ``type(detail)``. Before this was
++    unified, a schema failure returned a dict while a name mismatch and a parse
++    failure returned bare strings, from the same endpoint.
++
++    Two kinds of 400 reach the client and both are covered below: validation
++    findings raised inside ``_validate_profile_for_write``, and the
++    service-raised ``InvalidProfileNameError``, which ``DELETE`` reaches because
++    it has no body to validate first. Round 1 of review on #585 caught that this
++    class asserted the suite-wide contract while exercising only ``POST``, and
++    that ``DELETE``'s name error was in fact still a bare string. The parameters
++    below exist so that gap fails a test rather than merely contradicting a
++    docstring.
++
++    404 and 409 deliberately keep FastAPI's conventional bare-string ``detail``
++    and are not covered here: the status code already discriminates and there are
++    no findings to attach.
++    """
++
++    # (label, client method, url, json body or None)
++    REJECTIONS = [
++        (
++            "post: schema error",
++            "post",
++            "/agents/profiles",
++            {"name": "x", "content": "---\nname: x\nengine: v3\n---\n\nB.\n"},
++        ),
++        (
++            "post: name mismatch",
++            "post",
++            "/agents/profiles",
++            {"name": "x", "content": "---\nname: other\n---\n\nB.\n"},
++        ),
++        (
++            "post: unparseable",
++            "post",
++            "/agents/profiles",
++            {"name": "x", "content": "---\nname: [unclosed\n  b: : y\n---\n\nB.\n"},
++        ),
++        (
++            "post: missing name",
++            "post",
++            "/agents/profiles",
++            {"name": "x", "content": "---\ndescription: none\n---\n\nB.\n"},
++        ),
++        (
++            "post: non-string mapping key",
++            "post",
++            "/agents/profiles",
++            {
++                "name": "x",
++                "content": "---\nname: x\nmcpServers:\n  1:\n    command: echo\n---\n\nB.\n",
++            },
++        ),
++        (
++            "put: name mismatch",
++            "put",
++            "/agents/profiles/x",
++            {"content": "---\nname: other\n---\n\nB.\n"},
++        ),
++        ("delete: unsafe name", "delete", "/agents/profiles/bad@name", None),
++    ]
++
++    @pytest.mark.parametrize("label,method,url,body", REJECTIONS, ids=[r[0] for r in REJECTIONS])
++    def test_every_rejection_has_the_same_detail_shape(
++        self, client, write_store, label, method, url, body
++    ) -> None:
++        call = getattr(client, method)
++        response = call(url) if body is None else call(url, json=body)
++
++        assert response.status_code == 400, label
++        detail = response.json()["detail"]
++        assert isinstance(detail, dict), f"{label}: detail was {type(detail).__name__}"
++        assert set(detail) == {"message", "errors"}, label
++        assert isinstance(detail["message"], str), label
++        assert isinstance(detail["errors"], list), label
++
++    def test_field_level_failures_carry_a_path(self, client, write_store) -> None:
++        """A schema failure must say which field, so a form can render it."""
++        response = client.post(
++            "/agents/profiles",
++            json={"name": "x", "content": "---\nname: x\nengine: v3\n---\n\nB.\n"},
++        )
++
++        errors = response.json()["detail"]["errors"]
++        assert errors
++        assert any(e["path"] == "engine" for e in errors)
++
++    def test_non_field_failures_carry_an_empty_error_list(self, client, write_store) -> None:
++        """A parse failure is not attributable to a field, so ``errors`` is empty.
++
++        The key is still present, so a client can iterate it unconditionally.
++        """
++        response = client.post(
++            "/agents/profiles",
++            json={"name": "x", "content": "---\nname: [unclosed\n  b: : y\n---\n\nB.\n"},
++        )
++
++        assert response.json()["detail"]["errors"] == []
++
++
++class TestValidateEndpointResistsAliasAmplification:
++    """The unauthenticated validate route must not be stallable or OOM'd by its body.
++
++    Two findings, both on this route. Round 2 of review on #585 added a
++    non-string mapping key check bounded only by a depth cap, so the walk
++    revisited alias-shared subtrees exponentially. Further testing then
++    found the larger half: jsonschema interpolates ``repr`` of an offending
++    instance into every error message it builds, so an amplified value that trips
++    one ``type`` error yielded a 25 MB message at 20 anchor levels and 101 MB at
++    22, which the route would then serialise into its response body.
++
++    This route is the exposed one: it is in the scope-exemption set, so it answers
++    without credentials even when OAuth is configured, and it is declared
++    ``async``, so work on its thread delays every other request rather than only
++    the caller's own. That exemption is pinned in
++    ``test/api/test_scope_coverage.py::_EXEMPT``, which is the one place it is
++    asserted; if it is ever removed, the reasoning here changes.
++
++    Both are closed by rejecting a document whose expansion exceeds a ceiling,
++    ahead of either step. The assertions are on status and response size rather
++    than elapsed time, so a regression fails rather than hanging to CI's timeout.
++    """
++
++    @staticmethod
++    def _bomb(levels: int, tail: str = "") -> str:
++        lines = [
++            "---",
++            "name: bomb",
++            "description: A profile.",
++            "hooks:",
++            "  a0: &a0 {k: v}",
++        ]
++        for level in range(1, levels + 1):
++            lines.append(f"  a{level}: &a{level} {{x: *a{level - 1}, y: *a{level - 1}}}")
++        if tail:
++            lines.append(tail)
++        return "\n".join(lines) + "\n---\n\nBody.\n"
++
++    def test_an_anchor_bomb_is_rejected_with_a_small_response(self, client) -> None:
++        content = self._bomb(40)
++        assert len(content) < 1500
++
++        response = client.post("/agents/profiles/validate", json={"content": content})
++
++        assert response.status_code == 200
++        body = response.json()
++        assert body["valid"] is False
++        assert any("renders to more than" in m["message"] for m in body["messages"])
++        assert (
++            len(response.content) < 2000
++        ), f"a {len(content)}-byte body produced a {len(response.content)}-byte response"
++
++    def test_a_bomb_that_trips_a_schema_error_does_not_render_itself(self, client) -> None:
++        """The response must not grow with the bomb.
++
++        Before the ceiling, the offending instance here was the amplified node, so
++        the schema error's message was its full expansion: 25 MB of JSON out of a
++        sub-kilobyte request.
++        """
++        for levels in (20, 22, 30):
++            content = self._bomb(levels, tail="toolsSettings: [*a%d]" % levels)
++
++            response = client.post("/agents/profiles/validate", json={"content": content})
++
++            assert response.status_code == 200, levels
++            assert response.json()["valid"] is False, levels
++            assert (
++                len(response.content) < 2000
++            ), f"{levels} levels produced a {len(response.content)}-byte response"
++
++    @pytest.mark.parametrize(
++        "scalar_length, alias_count",
++        [(2_048, 5_000), (190_000, 15_000)],
++        ids=["2KB scalar x5000", "190KB scalar x15000"],
++    )
++    def test_an_aliased_scalar_cannot_amplify_the_response(
++        self, client, scalar_length, alias_count
++    ) -> None:
++        """A big scalar referenced many times must not become a big response.
++
++        The round-4 ceiling counted value occurrences, so a scalar contributed 1
++        however long it was. @haofeif's two cases: the smaller returned a
++        10,260,109-byte response from a 22 KB request, and the larger sat under the
++        256 KB content cap while the one jsonschema instance rendering had a 2.85 GB
++        lower bound. The ceiling now counts rendered bytes, the unit that cost is
++        actually paid in.
++        """
++        scalar = "x" * scalar_length
++        aliases = ", ".join(["*s"] * alias_count)
++        content = (
++            f"---\nname: t\ndescription: d\nhooks:\n  s: &s {scalar}\n"
++            f"toolsSettings: [{aliases}]\n---\n\nB.\n"
++        )
++
++        response = client.post("/agents/profiles/validate", json={"content": content})
++
++        assert response.status_code == 200
++        assert response.json()["valid"] is False
++        assert len(response.content) < 2000, (
++            f"a {len(content)}-byte request produced a " f"{len(response.content)}-byte response"
++        )
++
++    def test_a_cyclic_profile_is_not_persisted(self, client, write_store) -> None:
++        """The write gate must not accept a profile the runtime cannot materialize.
++
++        Reported by @haofeif on the round-4 head, where this returned 201 and wrote
++        the file. Installing it then failed in the Kiro path, because
++        ``model_dump_json`` refuses a circular reference. Same failure mode as the
++        non-string key rule: valid enough to parse, unusable once written.
++        """
++        content = "---\nname: cyc\ndescription: cyclic\ntoolsSettings: &c {self: *c}\n---\n\nB.\n"
++
++        response = client.post("/agents/profiles", json={"name": "cyc", "content": content})
++
++        assert response.status_code == 400
++        assert not (write_store / "cyc.md").exists()
++        assert any("circular" in e["message"] for e in response.json()["detail"]["errors"])
++
++    def test_a_profile_using_anchors_normally_is_still_valid(self, client) -> None:
++        """The ceiling is on expansion, not on anchors."""
++        content = (
++            "---\nname: shared\ndescription: A profile.\ntoolsSettings:\n"
++            "  common: &common {timeout: 30}\n  fs: *common\n  web: *common\n---\n\nBody.\n"
++        )
++
++        response = client.post("/agents/profiles/validate", json={"content": content})
++
++        assert response.status_code == 200
++        assert response.json()["valid"] is True
++
++
++class TestValidateEndpointBoundsAggregateFindings:
++    """A compact permitted-size request cannot produce an unbounded response."""
++
++    @staticmethod
++    def _content(entry: str) -> str:
++        items = ",".join([entry] * 130_000)
++        return f"---\nname: t\ndescription: d\nallowedTools: [{items}]\n---\n\nB.\n"
++
++    @pytest.mark.parametrize(
++        "entry,expected_valid,marker_severity",
++        [("0", False, "error"), ("z", True, "warning")],
++        ids=["integer schema errors", "unknown string warnings"],
++    )
++    def test_130k_entries_return_one_bounded_result_set(
++        self, client, entry: str, expected_valid: bool, marker_severity: str
++    ) -> None:
++        content = self._content(entry)
++        assert len(content) < 262_144
++
++        response = client.post("/agents/profiles/validate", json={"content": content})
++
++        assert response.status_code == 200
++        body = response.json()
++        assert body["valid"] is expected_valid
++        assert len(body["messages"]) == _MAX_FINDINGS
++        assert sum(m["message"] == _OMISSION_MESSAGE for m in body["messages"]) == 1
++        assert body["messages"][-1] == {
++            "severity": marker_severity,
++            "message": _OMISSION_MESSAGE,
++            "path": None,
++        }
++        assert len(response.content) < 120_000
++
++
++class TestUrlBasedMcpServersAreWritable:
++    """A url-based MCP entry is a supported form and must survive the write gate.
++
++    Reported as a P2 in round 2 of review on #585. ``agent_profile.schema.json``
++    required ``command`` on every ``mcpServers`` entry, while
++    ``resolve_mcp_server_config`` documents command-less entries shaped
++    ``{"type": "http", "url": ...}`` as passing through untouched. Making that
++    schema the blocking gate in front of persistence turned an incomplete
++    description into a rejected save, the mirror image of the round-1 P2: that one
++    let unloadable profiles through, this one blocked loadable ones.
++    """
++
++    URL_PROFILE = (
++        "---\nname: {name}\ndescription: A test profile.\nmcpServers:\n"
++        "  docs:\n    type: http\n    url: https://example.test/mcp\n---\n\nYou are a test agent.\n"
++    )
++
++    def test_create_accepts_a_url_based_server(self, client, write_store) -> None:
++        response = client.post(
++            "/agents/profiles",
++            json={"name": "remote", "content": self.URL_PROFILE.format(name="remote")},
++        )
++
++        assert response.status_code == 201, response.json()
++        assert (write_store / "remote.md").exists()
++
++    def test_the_written_profile_loads_and_keeps_its_transport(self, client, write_store) -> None:
++        """Accepting it is only correct if the runtime can then use it.
++
++        Guards against fixing the gate by loosening it past what CAO supports:
++        the entry has to survive both the profile parse and MCP resolution with
++        its ``type``/``url`` intact.
++        """
++        from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
++        from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
++
++        client.post(
++            "/agents/profiles",
++            json={"name": "remote", "content": self.URL_PROFILE.format(name="remote")},
++        )
++        stored = (write_store / "remote.md").read_text(encoding="utf-8")
++
++        profile = parse_agent_profile_text(stored, "remote")
++        resolved = resolve_mcp_server_config(dict(profile.mcpServers["docs"]))
++
++        assert resolved == {"type": "http", "url": "https://example.test/mcp"}
++
++    def test_replace_accepts_a_url_based_server(self, client, write_store) -> None:
++        write_store.mkdir(parents=True, exist_ok=True)
++        (write_store / "remote.md").write_text(
++            VALID_PROFILE.format(name="remote"), encoding="utf-8"
++        )
++
++        response = client.put(
++            "/agents/profiles/remote",
++            json={"content": self.URL_PROFILE.format(name="remote")},
++        )
++
++        assert response.status_code == 200, response.json()
++        assert "url: https://example.test/mcp" in (write_store / "remote.md").read_text()
++
++    def test_an_entry_naming_no_transport_is_still_rejected(self, client, write_store) -> None:
++        """The rule gained a branch; it was not removed."""
++        content = (
++            "---\nname: broken\ndescription: A test profile.\nmcpServers:\n"
++            "  docs:\n    type: http\n---\n\nBody.\n"
++        )
++
++        response = client.post("/agents/profiles", json={"name": "broken", "content": content})
++
++        assert response.status_code == 400
++        assert not (write_store / "broken.md").exists()
++        assert response.json()["detail"]["errors"]
+diff --git a/test/api/test_auth_read_gating.py b/test/api/test_auth_read_gating.py
+index e7be8ebf..76e5e18a 100644
+--- a/test/api/test_auth_read_gating.py
++++ b/test/api/test_auth_read_gating.py
+@@ -40,6 +40,7 @@ TERMINAL_ID = "abcdef12"
+ _GATED_ROUTES = [
+     ("GET", "/agents/profiles"),
+     ("GET", "/agents/profiles/{name}"),
++    ("GET", "/agents/profiles/{name}/source"),
+     ("GET", "/sessions"),
+     ("GET", "/sessions/{session_name}"),
+     ("GET", "/terminals/{terminal_id}"),
+@@ -62,6 +63,7 @@ def _sample_requests():
+     return [
+         ("GET", "/agents/profiles", {}),
+         ("GET", "/agents/profiles/sample", {}),
++        ("GET", "/agents/profiles/sample/source", {}),
+         ("GET", "/sessions", {}),
+         ("GET", "/sessions/sample-session", {}),
+         ("GET", f"/terminals/{TERMINAL_ID}", {}),
+diff --git a/test/api/test_run_step_extraction_failure_status.py b/test/api/test_run_step_extraction_failure_status.py
+index c1a7e645..e3a29c9c 100644
+--- a/test/api/test_run_step_extraction_failure_status.py
++++ b/test/api/test_run_step_extraction_failure_status.py
+@@ -13,6 +13,7 @@ failure -> 500"), it is a 500.
+ """
+ 
+ from unittest.mock import AsyncMock, patch
++from uuid import uuid4
+ 
+ import pytest
+ 
+@@ -87,7 +88,7 @@ class TestExtractionFailureSettlement:
+         from cli_agent_orchestrator.services import workflow_journal, workflow_service
+         from cli_agent_orchestrator.services.script_runner import ScriptRunRecord
+ 
+-        run_id = "run-bookkeeping"
++        run_id = f"run-bookkeeping-{uuid4().hex}"
+         env_vars = {
+             "CAO_WORKFLOW_RUN_ID": run_id,
+             "CAO_WORKFLOW_GENERATION": "1",
+diff --git a/test/api/test_scope_coverage.py b/test/api/test_scope_coverage.py
+index 61c489d9..363a2e26 100644
+--- a/test/api/test_scope_coverage.py
++++ b/test/api/test_scope_coverage.py
+@@ -309,3 +309,122 @@ def test_write_token_still_admitted_on_run_list(client, auth_on):
+     app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_WRITE])
+     resp = client.get("/workflows/runs")
+     assert resp.status_code != 403
++
++
++# --------------------------------------------------------------------------
++# Profile write routes (#510 PR B)
++#
++# All three mutating routes accept cao:write or cao:admin, so a single credential
++# covers the create/edit/delete cycle #510 specifies. Scopes are a flat set, not
++# a hierarchy — ``require_any_scope`` tests membership — so gating DELETE on
++# admin alone would 403 a caller holding exactly cao:write and leave a client
++# able to create and edit a profile unable to remove it. Most other DELETE
++# routes here are admin-only, but they remove running or generated state
++# (sessions, terminals, workflows, flows, bulk memory); a profile is an authored
++# document, like DELETE /memory/relationships/{id}, which is also write-or-admin.
++# --------------------------------------------------------------------------
++
++
++def test_read_token_forbidden_on_profile_create(client, auth_on):
++    """A cao:read token cannot create a profile."""
++    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_READ])
++    resp = client.post("/agents/profiles", json={"name": "x", "content": "---\nname: x\n---\n"})
++    assert resp.status_code == 403
++
++
++def test_write_token_admitted_on_profile_create(client, auth_on):
++    """A cao:write token passes the create dependency."""
++    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_WRITE])
++    resp = client.post("/agents/profiles", json={"name": "x", "content": "---\nname: x\n---\n"})
++    assert resp.status_code != 403
++
++
++def test_write_token_admitted_on_profile_replace(client, auth_on):
++    """A cao:write token passes the replace dependency."""
++    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_WRITE])
++    resp = client.put("/agents/profiles/x", json={"content": "---\nname: x\n---\n"})
++    assert resp.status_code != 403
++
++
++def test_read_token_forbidden_on_profile_delete(client, auth_on):
++    """A cao:read token cannot delete a profile — deletion is still a mutation."""
++    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_READ])
++    resp = client.delete("/agents/profiles/x")
++    assert resp.status_code == 403
++
++
++def test_write_token_admitted_on_profile_delete(client, auth_on):
++    """A cao:write token passes the deletion dependency.
++
++    Changed during the PR #585 review. DELETE was briefly admin-only, which
++    contradicted the contract published in #510 and would have broken the
++    documented create/edit/delete workflow for a write-scoped client, since
++    holding cao:write grants no admin privilege under a flat scope set.
++    """
++    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_WRITE])
++    resp = client.delete("/agents/profiles/x")
++    assert resp.status_code != 403
++
++
++def test_admin_token_admitted_on_profile_delete(client, auth_on):
++    """A cao:admin token passes the deletion dependency."""
++    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_ADMIN])
++    resp = client.delete("/agents/profiles/x")
++    assert resp.status_code != 403
++
++
++# --------------------------------------------------------------------------
++# PR #585 review — the NEW #510 read route carries a read-scope gate.
++#
++# Scoped deliberately to the one route this PR ADDED, following the precedent
++# the #505 block above set. The pre-existing profile reads (``GET
++# /agents/profiles``, ``/search``, ``/templates``, ``/schema``, ``/{name}``) are
++# equally ungated and are left alone: tightening shipped routes could break an
++# existing unauthenticated reader.
++#
++# The gate matters more on this route than on those siblings because
++# ``_read_agent_profile_source`` returns the stored bytes verbatim, across the
++# local, provider, extra and built-in stores, including documents that fail to
++# parse. The parsed route can only return what the model accepts.
++# --------------------------------------------------------------------------
++_NEW_510_READ_ROUTES = [
++    ("GET", "/agents/profiles/{name}/source"),
++]
++
++
++@pytest.mark.parametrize("method,path", _NEW_510_READ_ROUTES)
++def test_new_510_read_routes_declare_a_scope_dependency(method, path):
++    """Structural guard: the dependency is present on the route object.
++
++    Asserting on the route table rather than on a status code, for the reason the
++    #505 version of this test spells out: ``is_auth_enabled()`` is default-off and
++    ``require_any_scope`` hands back the full scope set when auth is off, so a
++    "the route still returns 200" test passes whether or not the dependency
++    exists at all. That is exactly how this route shipped ungated.
++    """
++    matches = [
++        r
++        for r in app.routes
++        if getattr(r, "path", None) == path and method in (getattr(r, "methods", None) or set())
++    ]
++    assert matches, f"{method} {path} is not registered"
++    assert _has_scope_dependency(matches[0]), f"{method} {path} has no require_any_scope dependency"
++
++
++def test_scopeless_token_forbidden_on_profile_source(client, auth_on):
++    """Enforcement: a token holding none of read/write/admin is 403'd on the source read."""
++    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([])
++    resp = client.get("/agents/profiles/x/source")
++    assert resp.status_code == 403
++
++
++def test_read_token_admitted_on_profile_source(client, auth_on):
++    """A cao:read token PASSES the gate — this is an authoring read, not a mutation.
++
++    Guards the over-restriction failure mode: gating on write/admin only would
++    lock out a read-only client that legitimately needs the unresolved document,
++    which is the safe one to read since it never returns substituted secrets.
++    """
++    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_READ])
++    resp = client.get("/agents/profiles/x/source")
++    assert resp.status_code != 403
+diff --git a/test/examples/test_ops_mcp_example.py b/test/examples/test_ops_mcp_example.py
+new file mode 100644
+index 00000000..2ab11247
+--- /dev/null
++++ b/test/examples/test_ops_mcp_example.py
+@@ -0,0 +1,492 @@
++"""Protocol-level tests for the ops-mcp example.
++
++These run in CI without provider credentials and without a running cao-server:
++``run_lifecycle`` only needs an object with ``call_tool``, so a scriptable double
++stands in for a live MCP session. A live-provider run is gated separately.
++
++Two classes carry regressions for review findings on PR #647:
++``TestTurnEvidence`` (a ready status that predates the dispatched turn must not
++be accepted) and ``TestVerifiedCleanup`` (an unverified cleanup must fail).
++"""
++
++from __future__ import annotations
++
++import ast
++import importlib.util
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Sequence
++
++import pytest
++from mcp.types import CallToolResult, TextContent
++
++EXAMPLE_DIR = Path(__file__).resolve().parents[2] / "examples" / "ops-mcp"
++RUN_PY = EXAMPLE_DIR / "run.py"
++
++
++def _mentions_terminal_id(node: ast.AST) -> bool:
++    """Whether any literal inside this node is the CAO terminal-id name."""
++    return any(
++        isinstance(child, ast.Constant) and child.value == "CAO_TERMINAL_ID"
++        for child in ast.walk(node)
++    )
++
++
++def _load_run_module() -> Any:
++    """Import examples/ops-mcp/run.py by path (examples/ is not a package)."""
++    spec = importlib.util.spec_from_file_location("ops_mcp_example_run", RUN_PY)
++    assert spec and spec.loader
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++run = _load_run_module()
++
++
++def _text_result(text: str, *, is_error: bool = False) -> CallToolResult:
++    return CallToolResult(content=[TextContent(type="text", text=text)], isError=is_error)
++
++
++def _step(values: Sequence[Any], nth: int) -> Any:
++    """Value for the nth (1-based) call; the last value repeats forever."""
++    return values[min(nth, len(values)) - 1]
++
++
++class FakeOps:
++    """Scriptable stand-in for an initialized MCP ClientSession.
++
++    ``statuses`` and ``output_sizes`` are consumed one entry per matching call,
++    with the final entry repeating, which is what lets a test express "the
++    terminal reported the previous turn's state twice before this turn started".
++    """
++
++    def __init__(
++        self,
++        *,
++        profiles: Sequence[str] = ("ops_mcp_worker",),
++        statuses: Sequence[str] = ("processing", "completed"),
++        output_sizes: Sequence[int] = (0,),
++        last_output: str = "done",
++        launch_session_name: Optional[str] = "cao-demo",
++        launch_terminal_id: Optional[str] = "abc123",
++        send_succeeds: bool = True,
++        read_succeeds: bool = True,
++        shutdown_succeeds: bool = True,
++        session_absent: bool = True,
++        session_info_failure_message: Optional[str] = None,
++    ) -> None:
++        self._profiles = profiles
++        self._statuses = statuses
++        self._output_sizes = output_sizes
++        self._last_output = last_output
++        self._launch_session_name = launch_session_name
++        self._launch_terminal_id = launch_terminal_id
++        self._send_succeeds = send_succeeds
++        self._read_succeeds = read_succeeds
++        self._shutdown_succeeds = shutdown_succeeds
++        self._session_absent = session_absent
++        self._session_info_failure_message = session_info_failure_message
++        self.calls: List[Dict[str, Any]] = []
++
++    def _nth(self, name: str) -> int:
++        return len([c for c in self.calls if c["name"] == name])
++
++    async def call_tool(self, *, name: str, arguments: Dict[str, Any]) -> CallToolResult:
++        self.calls.append({"name": name, "arguments": arguments})
++
++        if name == "list_profiles":
++            entries = ", ".join('{"name": "%s"}' % p for p in self._profiles)
++            return _text_result('{"success": true, "profiles": [%s]}' % entries)
++
++        if name == "launch_session":
++            return _text_result(
++                '{"success": true, "session_name": %s, "terminal_id": %s}'
++                % (
++                    json_or_null(self._launch_session_name),
++                    json_or_null(self._launch_terminal_id),
++                )
++            )
++
++        if name == "get_terminal_status":
++            return _text_result('{"status": "%s"}' % _step(self._statuses, self._nth(name)))
++
++        if name == "read_session_output":
++            if not self._read_succeeds:
++                return _text_result('{"success": false, "message": "extraction failed"}')
++            if arguments.get("mode") == "last":
++                return _text_result(
++                    '{"success": true, "output": "%s", "truncated": false}' % self._last_output
++                )
++            size = _step(self._output_sizes, self._nth(name))
++            return _text_result('{"success": true, "output": "", "total_chars": %d}' % size)
++
++        if name == "send_session_message":
++            if not self._send_succeeds:
++                return _text_result('{"success": false, "message": "terminal is busy"}')
++            return _text_result('{"success": true, "terminal_id": "abc123"}')
++
++        if name == "shutdown_session":
++            if not self._shutdown_succeeds:
++                return _text_result('{"success": false, "message": "shutdown failed"}')
++            return _text_result('{"success": true}')
++
++        if name == "get_session_info":
++            if self._session_info_failure_message is not None:
++                return _text_result(
++                    '{"success": false, "message": %s}'
++                    % json_or_null(self._session_info_failure_message)
++                )
++            if self._session_absent:
++                return _text_result(
++                    '{"success": false, "message": '
++                    "\"Get session info for 'cao-demo' failed: Session 'cao-demo' not found\"}"
++                )
++            return _text_result('{"name": "cao-demo", "terminals": [{"id": "abc123"}]}')
++
++        raise AssertionError(f"unexpected tool call: {name}")
++
++    @property
++    def call_names(self) -> List[str]:
++        return [call["name"] for call in self.calls]
++
++    def count(self, name: str) -> int:
++        return self._nth(name)
++
++
++def json_or_null(value: Optional[str]) -> str:
++    return "null" if value is None else '"%s"' % value
++
++
++async def _no_sleep(_seconds: float) -> None:
++    return None
++
++
++class TestParseToolResult:
++    def test_structured_content_wins_when_present(self) -> None:
++        result = CallToolResult(
++            content=[TextContent(type="text", text='{"ignored": true}')],
++            structuredContent={"chosen": True},
++        )
++        assert run.parse_tool_result(result) == {"chosen": True}
++
++    def test_json_text_is_decoded(self) -> None:
++        assert run.parse_tool_result(_text_result('{"a": 1}')) == {"a": 1}
++
++    def test_non_json_text_is_returned_verbatim(self) -> None:
++        assert run.parse_tool_result(_text_result("not json")) == "not json"
++
++    def test_error_result_becomes_a_failure_dict(self) -> None:
++        assert run.parse_tool_result(_text_result("boom", is_error=True)) == {
++            "success": False,
++            "message": "boom",
++        }
++
++    def test_error_result_with_no_text_still_reports_failure(self) -> None:
++        payload = run.parse_tool_result(CallToolResult(content=[], isError=True))
++        assert payload["success"] is False
++        assert payload["message"]
++
++
++class TestTurnEvidence:
++    """Regression: a ready status that predates the dispatched turn is not the turn.
++
++    Review finding on PR #647 -- ``idle`` can precede deferred delivery, and
++    ``completed`` can belong to the previous turn, so the first ready enum
++    observed is not proof that the dispatched message was handled.
++    """
++
++    @pytest.mark.asyncio
++    async def test_idle_before_delivery_is_not_accepted_at_launch(self) -> None:
++        ops = FakeOps(statuses=("idle", "idle", "processing", "idle"))
++        status = await run.wait_for_turn(
++            ops,
++            "abc123",
++            baseline_status="unknown",
++            baseline_output_size=None,
++            sleep=_no_sleep,
++        )
++        assert status == "idle"
++        # It must have kept polling past the two pre-delivery idles.
++        assert ops.count("get_terminal_status") == 4
++
++    @pytest.mark.asyncio
++    async def test_completed_at_launch_is_accepted_without_activity(self) -> None:
++        """Reaching completed requires dispatched input, so it cannot predate turn one."""
++        ops = FakeOps(statuses=("completed",))
++        status = await run.wait_for_turn(
++            ops,
++            "abc123",
++            baseline_status="unknown",
++            baseline_output_size=None,
++            sleep=_no_sleep,
++        )
++        assert status == "completed"
++        assert ops.count("get_terminal_status") == 1
++
++    @pytest.mark.asyncio
++    async def test_previous_turns_completed_is_rejected_on_a_follow_up(self) -> None:
++        """The reported reproduction: a stale completed must not end the wait."""
++        ops = FakeOps(
++            statuses=("completed", "completed", "processing", "completed"),
++            output_sizes=(100,),  # no growth: the agent produced nothing new yet
++        )
++        status = await run.wait_for_turn(
++            ops,
++            "abc123",
++            baseline_status="completed",
++            baseline_output_size=100,
++            sleep=_no_sleep,
++        )
++        assert status == "completed"
++        assert ops.count("get_terminal_status") == 4
++
++    @pytest.mark.asyncio
++    async def test_output_growth_is_accepted_as_turn_evidence(self) -> None:
++        ops = FakeOps(statuses=("completed",), output_sizes=(150,))
++        status = await run.wait_for_turn(
++            ops,
++            "abc123",
++            baseline_status="completed",
++            baseline_output_size=100,
++            sleep=_no_sleep,
++        )
++        assert status == "completed"
++        assert ops.count("get_terminal_status") == 1
++
++    @pytest.mark.asyncio
++    async def test_no_evidence_ever_arrives_raises_timeout(self) -> None:
++        ops = FakeOps(statuses=("completed",), output_sizes=(100,))
++        clock = iter([0.0, 1.0, 2.0, 99.0])
++        with pytest.raises(TimeoutError, match="no evidence the dispatched turn ran"):
++            await run.wait_for_turn(
++                ops,
++                "abc123",
++                baseline_status="completed",
++                baseline_output_size=100,
++                timeout=10.0,
++                sleep=_no_sleep,
++                now=lambda: next(clock),
++            )
++
++    @pytest.mark.asyncio
++    async def test_error_status_raises_instead_of_waiting_out_the_timeout(self) -> None:
++        ops = FakeOps(statuses=("error",))
++        with pytest.raises(RuntimeError, match="reached status 'error'"):
++            await run.wait_for_turn(
++                ops,
++                "abc123",
++                baseline_status="unknown",
++                baseline_output_size=None,
++                sleep=_no_sleep,
++            )
++
++    @pytest.mark.asyncio
++    async def test_waiting_user_answer_counts_as_activity(self) -> None:
++        ops = FakeOps(statuses=("waiting_user_answer", "idle"))
++        status = await run.wait_for_turn(
++            ops,
++            "abc123",
++            baseline_status="unknown",
++            baseline_output_size=None,
++            sleep=_no_sleep,
++        )
++        assert status == "idle"
++
++    @pytest.mark.asyncio
++    async def test_failed_status_call_raises(self) -> None:
++        class Broken(FakeOps):
++            async def call_tool(self, *, name: str, arguments: Dict[str, Any]) -> CallToolResult:
++                self.calls.append({"name": name, "arguments": arguments})
++                return _text_result('{"success": false, "message": "no such terminal"}')
++
++        with pytest.raises(RuntimeError, match="no such terminal"):
++            await run.wait_for_turn(
++                Broken(),
++                "abc123",
++                baseline_status="unknown",
++                baseline_output_size=None,
++                sleep=_no_sleep,
++            )
++
++
++class TestVerifiedCleanup:
++    """Regression: cleanup must be verified, not assumed.
++
++    Review finding on PR #647 -- recording ``shutdown_ok = false`` and returning
++    normally let automation see success while a session stayed alive.
++    """
++
++    @pytest.mark.asyncio
++    async def test_unverified_cleanup_fails_the_run(self) -> None:
++        ops = FakeOps(shutdown_succeeds=True, session_absent=False)
++        with pytest.raises(RuntimeError, match="cleanup not verified"):
++            await run.run_lifecycle(ops, profile="ops_mcp_worker", task="x", sleep=_no_sleep)
++
++    @pytest.mark.asyncio
++    async def test_failed_shutdown_with_absent_session_counts_as_verified(self) -> None:
++        """An already-absent session is the goal state, however it got there."""
++        ops = FakeOps(shutdown_succeeds=False, session_absent=True)
++        report = await run.run_lifecycle(ops, profile="ops_mcp_worker", task="x", sleep=_no_sleep)
++        assert report["shutdown_reported"] is False
++        assert report["cleanup_verified"] is True
++
++    @pytest.mark.asyncio
++    async def test_cleanup_check_does_not_mask_the_original_failure(self) -> None:
++        ops = FakeOps(read_succeeds=False, session_absent=False)
++        with pytest.raises(RuntimeError, match="read output failed"):
++            await run.run_lifecycle(ops, profile="ops_mcp_worker", task="x", sleep=_no_sleep)
++        assert ops.count("shutdown_session") == 1
++
++    @pytest.mark.asyncio
++    async def test_cleanup_is_verified_after_a_successful_run(self) -> None:
++        ops = FakeOps()
++        report = await run.run_lifecycle(ops, profile="ops_mcp_worker", task="x", sleep=_no_sleep)
++        assert report["cleanup_verified"] is True
++        assert ops.call_names[-1] == "get_session_info"
++
++    @pytest.mark.asyncio
++    async def test_failed_cleanup_lookup_is_not_accepted_as_absence(self) -> None:
++        ops = FakeOps(
++            session_info_failure_message="Get session info for 'cao-demo' failed: HTTP 503"
++        )
++        with pytest.raises(RuntimeError, match="cleanup verification lookup failed: .*HTTP 503"):
++            await run.run_lifecycle(ops, profile="ops_mcp_worker", task="x", sleep=_no_sleep)
++
++
++class TestRunLifecycle:
++    @pytest.mark.asyncio
++    async def test_full_lifecycle_calls_tools_in_order(self) -> None:
++        ops = FakeOps()
++        report = await run.run_lifecycle(
++            ops, profile="ops_mcp_worker", task="do the thing", sleep=_no_sleep
++        )
++        assert ops.call_names == [
++            "list_profiles",
++            "launch_session",
++            "get_terminal_status",
++            "get_terminal_status",
++            "read_session_output",
++            "shutdown_session",
++            "get_session_info",
++        ]
++        assert report["session_name"] == "cao-demo"
++        assert report["terminal_id"] == "abc123"
++        assert report["output"] == "done"
++
++    @pytest.mark.asyncio
++    async def test_launch_passes_task_and_working_directory(self) -> None:
++        ops = FakeOps()
++        await run.run_lifecycle(
++            ops,
++            profile="ops_mcp_worker",
++            task="do the thing",
++            working_directory="/tmp/demo",
++            provider="mock_cli",
++            sleep=_no_sleep,
++        )
++        launch = next(c for c in ops.calls if c["name"] == "launch_session")
++        assert launch["arguments"]["initial_message"] == "do the thing"
++        assert launch["arguments"]["working_directory"] == "/tmp/demo"
++        assert launch["arguments"]["provider"] == "mock_cli"
++        assert launch["arguments"]["agent_profile"] == "ops_mcp_worker"
++
++    @pytest.mark.asyncio
++    async def test_follow_up_captures_current_output_before_sending(self) -> None:
++        ops = FakeOps(statuses=("processing", "completed", "processing", "completed"))
++        await run.run_lifecycle(
++            ops,
++            profile="ops_mcp_worker",
++            task="first",
++            follow_up="second",
++            sleep=_no_sleep,
++        )
++        names = ops.call_names
++        # The pre-dispatch output snapshot is recorded before delivery.
++        snapshot_read = names.index("read_session_output")
++        assert snapshot_read < names.index("send_session_message")
++
++    @pytest.mark.asyncio
++    async def test_follow_up_waits_past_stale_completed_status(self) -> None:
++        ops = FakeOps(
++            statuses=("completed", "completed", "processing", "completed"),
++            output_sizes=(200,),
++        )
++        report = await run.run_lifecycle(
++            ops,
++            profile="ops_mcp_worker",
++            task="first",
++            follow_up="second",
++            sleep=_no_sleep,
++        )
++        send_step = next(step for step in report["steps"] if step["step"] == "send_session_message")
++        assert ops.count("get_terminal_status") == 4
++        assert send_step["detail"]["baseline_chars"] == 200
++
++    @pytest.mark.asyncio
++    async def test_failed_follow_up_send_is_reported(self) -> None:
++        ops = FakeOps(send_succeeds=False)
++        with pytest.raises(RuntimeError, match="terminal is busy"):
++            await run.run_lifecycle(
++                ops,
++                profile="ops_mcp_worker",
++                task="first",
++                follow_up="second",
++                sleep=_no_sleep,
++            )
++        assert ops.count("shutdown_session") == 1
++
++    @pytest.mark.asyncio
++    async def test_uninstalled_profile_fails_before_launching_anything(self) -> None:
++        ops = FakeOps(profiles=("something_else",))
++        with pytest.raises(RuntimeError, match="cao install examples/ops-mcp"):
++            await run.run_lifecycle(ops, profile="ops_mcp_worker", task="x", sleep=_no_sleep)
++        assert ops.call_names == ["list_profiles"]
++
++    @pytest.mark.asyncio
++    async def test_launch_without_identity_is_reported_and_nothing_is_shut_down(self) -> None:
++        ops = FakeOps(launch_session_name=None, launch_terminal_id=None)
++        with pytest.raises(RuntimeError, match="no session identity"):
++            await run.run_lifecycle(ops, profile="ops_mcp_worker", task="x", sleep=_no_sleep)
++        assert "shutdown_session" not in ops.call_names
++
++
++class TestExternalOperatorContract:
++    def test_example_never_reads_cao_terminal_id(self) -> None:
++        """#592: the caller must not depend on CAO terminal context.
++
++        Asserted against the AST rather than the text, so prose mentioning the
++        variable cannot fail the test and a real read cannot hide in a comment.
++        """
++        tree = ast.parse(RUN_PY.read_text(encoding="utf-8"))
++        literals = [
++            node
++            for node in ast.walk(tree)
++            if isinstance(node, ast.Constant) and node.value == "CAO_TERMINAL_ID"
++        ]
++        assert len(literals) == 1, "expected exactly one mention, in the advisory check"
++
++        # A membership test is fine; fetching the value is not.
++        for node in ast.walk(tree):
++            if isinstance(node, ast.Subscript):
++                assert not _mentions_terminal_id(node), "must not index os.environ for it"
++            if isinstance(node, ast.Call):
++                func = node.func
++                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
++                if name in {"getenv", "get"}:
++                    assert not _mentions_terminal_id(node), "must not fetch it from the environment"
++
++    def test_example_declares_the_tools_it_depends_on(self) -> None:
++        assert set(run.LIFECYCLE_TOOLS) == {
++            "list_profiles",
++            "launch_session",
++            "get_terminal_status",
++            "send_session_message",
++            "read_session_output",
++            "get_session_info",
++            "shutdown_session",
++        }
++
++    def test_fixture_profile_name_is_prefixed_to_avoid_collisions(self) -> None:
++        profile = EXAMPLE_DIR / "ops_mcp_worker.md"
++        assert profile.is_file()
++        assert "name: ops_mcp_worker" in profile.read_text(encoding="utf-8")
+diff --git a/test/services/test_profile_store.py b/test/services/test_profile_store.py
+index a613b505..b7005e9f 100644
+--- a/test/services/test_profile_store.py
++++ b/test/services/test_profile_store.py
+@@ -244,3 +244,173 @@ def test_delete_profile_does_not_follow_a_name_out_of_the_store(
+     with pytest.raises((InvalidProfileNameError, ProfileNotFoundError)):
+         delete_profile("../outsider")
+     assert outsider.exists()
++
++
++# --------------------------------------------------------------------------
++# replace_profile
++# --------------------------------------------------------------------------
++
++
++def test_replace_profile_updates_an_existing_profile(store: Path) -> None:
++    profile_store.write_profile("agent", "original\n")
++
++    written = profile_store.replace_profile("agent", "updated\n")
++
++    assert written.read_text(encoding="utf-8") == "updated\n"
++
++
++def test_replace_profile_refuses_to_create_a_missing_profile(store: Path) -> None:
++    """The whole point of the function: update-only, never insert.
++
++    ``write_profile(..., overwrite=True)`` is an upsert, which is wrong for an
++    HTTP PUT. Requiring the target to exist is what stops a PUT from creating a
++    file at all.
++    """
++    with pytest.raises(profile_store.ProfileNotFoundError):
++        profile_store.replace_profile("never-installed", "content\n")
++
++    assert not (store / "never-installed.md").exists()
++
++
++def test_replace_profile_will_not_shadow_a_built_in(store: Path) -> None:
++    """A built-in's name is not in the local store, so PUT must reject it.
++
++    ``code_supervisor`` ships in ``cli_agent_orchestrator/agent_store``. An upsert
++    would create a *local* file of the same name that wins on load, silently
++    shadowing the built-in. That is precisely the condition ``duplicated_in``
++    exists to report, so it must not be manufacturable through the write path.
++    """
++    with pytest.raises(profile_store.ProfileNotFoundError):
++        profile_store.replace_profile("code_supervisor", "hijacked\n")
++
++    assert not (store / "code_supervisor.md").exists()
++
++
++def test_replace_profile_rejects_an_unsafe_name_before_touching_disk(store: Path) -> None:
++    with pytest.raises(profile_store.InvalidProfileNameError):
++        profile_store.replace_profile("../escape", "content\n")
++
++    assert not store.exists()
++
++
++def test_replace_profile_can_replace_a_corrupt_store_file(store: Path) -> None:
++    """Undecodable bytes must not make an existing profile unrepairable.
++
++    Same property ``write_profile`` has, for the same reason: the write path must
++    not read the old content first.
++    """
++    store.mkdir(parents=True, exist_ok=True)
++    target = store / "agent.md"
++    target.write_bytes(b"\xff\xfe not utf-8 at all")
++
++    profile_store.replace_profile("agent", "clean\n")
++
++    assert target.read_text(encoding="utf-8") == "clean\n"
++
++
++def test_replace_profile_refuses_every_concurrent_writer_when_the_target_is_absent(
++    store: Path,
++) -> None:
++    """The existence requirement holds under contention, not just serially.
++
++    Two threads race to replace the same profile after it is deleted. Neither may
++    succeed by creating the file, because the check lives inside the lock.
++
++    Note what this does NOT cover: the file is removed *before* the barrier, so
++    both racers are writers and no delete overlaps a write. The interleaving that
++    actually threatened the update-only guarantee is covered by
++    ``test_delete_profile_cannot_unlink_while_a_replace_holds_the_lock`` below.
++    """
++    import threading
++
++    profile_store.write_profile("agent", "original\n")
++    profile_store.delete_profile("agent")
++
++    barrier = threading.Barrier(2)
++    outcomes: list[str] = []
++    lock = threading.Lock()
++
++    def attempt(label: str) -> None:
++        barrier.wait()
++        try:
++            profile_store.replace_profile("agent", f"{label}\n")
++            with lock:
++                outcomes.append(f"created:{label}")
++        except profile_store.ProfileNotFoundError:
++            with lock:
++                outcomes.append(f"rejected:{label}")
++
++    threads = [threading.Thread(target=attempt, args=(name,)) for name in ("FIRST", "SECOND")]
++    for thread in threads:
++        thread.start()
++    for thread in threads:
++        thread.join()
++
++    assert sorted(outcomes) == ["rejected:FIRST", "rejected:SECOND"]
++    assert not (store / "agent.md").exists()
++
++
++def test_delete_profile_cannot_unlink_while_a_replace_holds_the_lock(
++    store: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A concurrent delete cannot resurrect a profile through an in-flight update.
++
++    Reported on PR #585. ``delete_profile`` used to do an unlocked ``exists()``
++    then ``unlink()``, so this interleaving was reachable:
++
++      1. ``replace_profile`` takes the lock and passes its ``must_exist`` check
++      2. ``delete_profile`` unlinks the file and reports success
++      3. ``replace_profile`` publishes, recreating what was just deleted
++
++    Both callers were told they succeeded and the "deleted" profile was back on
++    disk holding the replacement text. Pausing inside the publish makes the
++    window deterministic rather than hoping the scheduler lands in it: the
++    deleter must still be blocked on the lock while the replace holds it.
++    """
++    from cli_agent_orchestrator.utils import atomic_file
++
++    profile_store.write_profile("agent", "original\n")
++    target = store / "agent.md"
++
++    publish_entered = threading.Event()
++    release = threading.Event()
++    real_publish = atomic_file._atomic_publish
++
++    def paused_publish(t: Path, content: str, encoding: str) -> None:
++        publish_entered.set()
++        release.wait(timeout=10)
++        return real_publish(t, content, encoding)
++
++    monkeypatch.setattr(atomic_file, "_atomic_publish", paused_publish)
++
++    delete_outcome: list[str] = []
++
++    def deleter() -> None:
++        try:
++            profile_store.delete_profile("agent")
++            delete_outcome.append("deleted")
++        except Exception as exc:  # noqa: BLE001 - recording the class is the point
++            delete_outcome.append(type(exc).__name__)
++
++    replacer = threading.Thread(target=lambda: profile_store.replace_profile("agent", "REPLACED\n"))
++    replacer.start()
++    assert publish_entered.wait(timeout=10), "replace never reached the publish step"
++
++    deleter_thread = threading.Thread(target=deleter)
++    deleter_thread.start()
++    deleter_thread.join(timeout=0.5)
++
++    # The assertion that fails on the unlocked implementation: the delete would
++    # have completed here, having unlinked a file the replace is about to
++    # republish.
++    assert deleter_thread.is_alive(), "delete_profile did not wait for the write lock"
++    assert target.exists()
++
++    release.set()
++    replacer.join(timeout=10)
++    deleter_thread.join(timeout=15)
++
++    # Serialised, so the delete lands after the update rather than inside it and
++    # the file is genuinely gone.
++    assert delete_outcome == ["deleted"]
++    assert not target.exists()
+diff --git a/test/services/test_profile_validator.py b/test/services/test_profile_validator.py
+index 0f76921c..83ebc918 100644
+--- a/test/services/test_profile_validator.py
++++ b/test/services/test_profile_validator.py
+@@ -11,15 +11,36 @@ Ref: https://github.com/awslabs/cli-agent-orchestrator/issues/510
+ 
+ import pytest
+ 
++import cli_agent_orchestrator.services.profile_validator as profile_validator
+ from cli_agent_orchestrator.models.agent_profile import AgentProfile
+ from cli_agent_orchestrator.services.profile_validator import (
++    _MAX_FINDING_CHARS,
++    _MAX_FINDING_PATH_BYTES,
++    _MAX_FINDING_TEXT_BYTES,
++    _MAX_FINDINGS,
++    _MAX_RENDERED_BYTES,
++    _OMISSION_MESSAGE,
+     ValidationMessage,
++    _capped,
++    _FindingCollector,
+     load_profile_schema,
+     validate_frontmatter,
+     validate_profile_text,
+ )
+ 
+ 
++class TestFindingMessageCap:
++    """Schema finding text, including its marker, must fit the declared cap."""
++
++    def test_truncation_suffix_counts_toward_the_cap(self) -> None:
++        message = "x" * (_MAX_FINDING_CHARS + 1)
++
++        capped = _capped(message)
++
++        assert len(capped) == _MAX_FINDING_CHARS
++        assert capped.endswith(f"... (message truncated, {len(message)} chars)")
++
++
+ class TestLoadProfileSchema:
+     """Tests for load_profile_schema."""
+ 
+@@ -278,3 +299,497 @@ class TestSchemaModelParity:
+             f"The schema declares {sorted(extra)} but AgentProfile has no such "
+             "field, so a client filling them in would have them silently dropped."
+         )
++
++
++class TestMalformedButParseableInput:
++    """Schema-invalid values must be *reported*, never raise.
++
++    Regression guard for the P3 finding on #575. The advisory checks test set
++    membership, which hashes the value, so an unhashable one (a list) raised
++    ``TypeError``; and the schema-error sort key used raw path components, so
++    mixed-type mapping keys could not be ordered. Both escaped the endpoint's
++    ``except ValueError`` and surfaced as HTTP 500 from a route whose entire
++    purpose is reporting what is wrong with a document.
++
++    Every case below is syntactically valid YAML that the schema already rejects,
++    so the correct outcome is an error finding rather than an exception.
++    """
++
++    def test_unhashable_allowed_tools_entry_is_reported(self) -> None:
++        findings = validate_frontmatter({"name": "x", "allowedTools": [["Read"]]})
++
++        assert any(f.severity == "error" for f in findings)
++
++    def test_unhashable_role_is_reported(self) -> None:
++        findings = validate_frontmatter({"name": "x", "role": ["developer"]})
++
++        assert any(f.severity == "error" for f in findings)
++
++    def test_mixed_type_mapping_keys_are_reported(self) -> None:
++        """Path components of different types must not break the error sort."""
++        findings = validate_frontmatter({"name": "x", "mcpServers": {1: {}, "x": {}}})
++
++        assert any(f.severity == "error" for f in findings)
++
++    def test_non_string_role_does_not_produce_a_spurious_warning(self) -> None:
++        """The advisory role check stands aside; the schema owns the type error."""
++        findings = validate_frontmatter({"name": "x", "role": 7})
++
++        assert any(f.severity == "error" for f in findings)
++        assert not any(f.severity == "warning" for f in findings)
++
++    def test_non_string_allowed_tool_does_not_produce_a_spurious_warning(self) -> None:
++        findings = validate_frontmatter({"name": "x", "allowedTools": [{"a": 1}]})
++
++        assert any(f.severity == "error" for f in findings)
++        assert not any(f.severity == "warning" for f in findings)
++
++    def test_well_formed_values_still_warn(self) -> None:
++        """The type guards must not silence the checks they protect."""
++        tool_findings = validate_frontmatter({"name": "x", "allowedTools": ["not_a_real_tool"]})
++        role_findings = validate_frontmatter({"name": "x", "role": "archaeologist"})
++
++        assert any(f.severity == "warning" for f in tool_findings)
++        assert any(f.severity == "warning" for f in role_findings)
++
++
++def _alias_amplified_yaml(levels: int, leaf: str = "{k: v}", tail: str = "") -> str:
++    """A profile whose *expanded* value count is exponential in ``levels``.
++
++    Each anchor references the previous one twice, so ``yaml.safe_load`` returns
++    ``levels + 1`` dicts while a full expansion of them contains ~2**levels
++    values. Nested under ``toolsSettings``/``hooks`` because those fields are
++    free-form objects, which keeps the document otherwise *valid*: a document
++    rejected on its own merits would never reach the expensive steps anyway.
++
++    ``tail`` appends a final line, used to plant a schema error whose offending
++    instance is the amplified node.
++    """
++    lines = ["---", "name: bomb", "description: A profile.", "hooks:", f"  a0: &a0 {leaf}"]
++    for level in range(1, levels + 1):
++        lines.append(f"  a{level}: &a{level} {{x: *a{level - 1}, y: *a{level - 1}}}")
++    if tail:
++        lines.append(tail)
++    return "\n".join(lines) + "\n---\n\nBody.\n"
++
++
++class TestAliasAmplificationIsBounded:
++    """A YAML-anchor bomb must not reach anything that pays for its expansion.
++
++    Two rounds of review on #585 landed here. Round 2 added a non-string mapping
++    key check whose only bound was a recursion depth cap, which bounded the wrong
++    dimension: aliases resolve to repeated references to the *same* object, so the
++    walk revisited shared subtrees exponentially while the document stayed tiny. A
++    640-byte body took ~1s, doubling per anchor level. Reported by @haofeif.
++
++    Further testing found the larger half. jsonschema builds each error
++    message eagerly, interpolating ``repr`` of the offending instance, so an
++    amplified value that trips one ``type`` error produced a 25 MB message at 20
++    levels and 101 MB at 22, which is an allocation ceiling rather than a stall and
++    was reachable on merged ``main`` independently of this PR.
++
++    Both are now closed ahead of either step, by rejecting a document whose
++    expansion exceeds a ceiling. Every assertion below is deterministic: a
++    regression fails on a count or a length rather than hanging until CI's job
++    timeout, which is what the earlier timing-only assertions would have done.
++    """
++
++    def test_an_anchor_bomb_is_rejected_rather_than_traversed(self) -> None:
++        document = _alias_amplified_yaml(40)
++        assert len(document) < 1500  # the whole point: tiny input, huge expansion
++
++        findings = validate_profile_text(document)
++        errors = [f for f in findings if f.severity == "error"]
++
++        assert len(errors) == 1
++        assert "renders to more than" in errors[0].message
++
++    def test_the_rejection_does_not_grow_with_the_bomb(self) -> None:
++        """Rejecting must not itself render the document.
++
++        This is the regression guard for the jsonschema message vector: the
++        offending instance below is the amplified node, so before the ceiling
++        existed the returned message *was* its full ``repr``. Asserting a bound on
++        the response size catches that without measuring time.
++        """
++        for levels in (20, 22, 30):
++            document = _alias_amplified_yaml(levels, tail="toolsSettings: [*a%d]" % levels)
++
++            findings = validate_profile_text(document)
++
++            assert len(findings) == 1, levels
++            assert len(findings[0].message) < 1000, (
++                f"{levels} levels produced a {len(findings[0].message)}-char message; "
++                f"the offending instance is being rendered"
++            )
++
++    CYCLIC = "---\nname: cyc\ndescription: cyclic\ntoolsSettings: &c {self: *c}\n---\n\nB.\n"
++
++    def test_a_cyclic_document_is_rejected(self) -> None:
++        """A cycle is not merely small, it is unrenderable.
++
++        The first version of this guard gave a back-edge a provisional size of 1,
++        which made a cycle look finite, and an earlier revision of this test
++        asserted the resulting document was *valid*. Reported by @haofeif.
++        """
++        findings = validate_profile_text(self.CYCLIC)
++        errors = [f for f in findings if f.severity == "error"]
++
++        assert len(errors) == 1
++        assert "circular" in errors[0].message
++
++    @pytest.mark.parametrize(
++        "frontmatter",
++        [
++            "hooks:\n  a: &a {b: {c: {d: *a}}}",
++            "hooks: &a [*a]",
++            "hooks: &a [{inner: *a}]",
++        ],
++        ids=["indirect through mappings", "sequence self-reference", "sequence to mapping"],
++    )
++    def test_a_cycle_is_rejected_whatever_shape_it_takes(self, frontmatter: str) -> None:
++        """The back-edge need not be a top-level self-reference in a mapping.
++
++        Only the mapping form was reported. Tracking in-progress identities catches
++        any of these, and pinning the shapes keeps a later refactor from narrowing
++        the check to the one case that was raised.
++        """
++        document = f"---\nname: c\ndescription: d\n{frontmatter}\n---\n\nB.\n"
++
++        errors = [f for f in validate_profile_text(document) if f.severity == "error"]
++
++        assert len(errors) == 1
++        assert "circular" in errors[0].message
++
++    def test_merge_keys_cannot_amplify_either(self) -> None:
++        """``<<`` is a second alias mechanism, and renders its target in each copy.
++
++        Not reported, found while probing the fix. A merge key copies the target's
++        entries into the merging mapping, so the values are shared but rendered
++        again per copy, which is the same content multiplication as an aliased
++        scalar reached by a different route.
++        """
++        blob = "y" * 60_000
++        copies = "\n".join(f"  d{index}: {{<<: *s}}" for index in range(3_000))
++        document = (
++            f"---\nname: t\ndescription: d\nhooks:\n  s: &s {{k: {blob}}}\n"
++            f"{copies}\n---\n\nB.\n"
++        )
++
++        errors = [f for f in validate_profile_text(document) if f.severity == "error"]
++
++        assert len(errors) == 1
++        assert "renders to more than" in errors[0].message
++
++    def test_ordinary_merge_keys_still_pass(self) -> None:
++        """``<<`` is also a normal YAML convenience and must not be rejected."""
++        document = (
++            "---\nname: t\ndescription: d\nhooks:\n  base: &b {timeout: 30}\n"
++            "  a: {<<: *b}\n  b: {<<: *b}\n---\n\nB.\n"
++        )
++
++        assert [f for f in validate_profile_text(document) if f.severity == "error"] == []
++
++    def test_the_rejected_cycle_is_indeed_unusable(self) -> None:
++        """Anchors the reason for rejecting, so the rule is not arbitrary.
++
++        A cyclic profile parses, so nothing before this guard objects, but the Kiro
++        materialization path serializes ``toolsSettings`` and Pydantic refuses. The
++        write gate accepting it would persist a profile the runtime cannot install,
++        which is the same failure mode the non-string key rule exists for.
++        """
++        import pytest as _pytest
++
++        from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
++        from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
++
++        profile = parse_agent_profile_text(self.CYCLIC, "cyc")
++        config = KiroAgentConfig(
++            name="cyc", description="cyclic", toolsSettings=profile.toolsSettings
++        )
++
++        with _pytest.raises(Exception) as excinfo:
++            config.model_dump_json(indent=2, exclude_none=True)
++
++        assert "Circular reference" in str(excinfo.value)
++
++    @pytest.mark.parametrize(
++        "scalar_length, alias_count",
++        [(2_048, 5_000), (190_000, 15_000)],
++        ids=["2KB scalar x5000", "190KB scalar x15000"],
++    )
++    def test_an_aliased_scalar_cannot_amplify_the_response(
++        self, scalar_length: int, alias_count: int
++    ) -> None:
++        """Counting occurrences missed this; counting rendered bytes catches it.
++
++        Every scalar used to contribute 1 regardless of length, so a single large
++        scalar referenced thousands of times passed the ceiling while the one
++        jsonschema instance rendering ran to megabytes, and at the larger size to a
++        2.85 GB lower bound from a request under the 256 KB cap. Both cases here are
++        @haofeif's, and the assertion is on the response size rather than a clock.
++        """
++        scalar = "x" * scalar_length
++        aliases = ", ".join(["*s"] * alias_count)
++        document = (
++            f"---\nname: t\ndescription: d\nhooks:\n  s: &s {scalar}\n"
++            f"toolsSettings: [{aliases}]\n---\n\nB.\n"
++        )
++
++        findings = validate_profile_text(document)
++
++        assert len(findings) == 1
++        assert "renders to more than" in findings[0].message
++        assert len(findings[0].message) < 1000, (
++            f"a {len(document)}-byte request produced a " f"{len(findings[0].message)}-char message"
++        )
++
++    def test_a_bad_key_in_a_shared_subtree_is_reported_exactly_once(self) -> None:
++        """Deterministic proof of the memoization, with no reliance on a clock.
++
++        Ten levels is 1024 paths to the single node every alias resolves to, and
++        expands to well under the ceiling so the walk still runs. One finding
++        confirms shared nodes are visited once; the unmemoized walk emitted 1024
++        copies of it.
++        """
++        document = _alias_amplified_yaml(10, leaf="{1: one}")
++
++        findings = validate_profile_text(document)
++        key_errors = [f for f in findings if "not a string" in f.message]
++
++        assert len(key_errors) == 1
++        assert key_errors[0].severity == "error"
++        assert key_errors[0].path == "hooks.a0.1"
++
++    def test_legitimate_anchor_reuse_still_validates_clean(self) -> None:
++        """Anchors are a normal YAML convenience, not inherently suspect.
++
++        The ceiling is on expansion, not on aliasing, so ordinary reuse has to
++        pass. Without this, satisfying the bound by rejecting anchors outright
++        would look like a fix.
++        """
++        document = (
++            "---\nname: shared\ndescription: A profile.\ntoolsSettings:\n"
++            "  common: &common {timeout: 30}\n  fs: *common\n  web: *common\n---\n\nBody.\n"
++        )
++
++        assert validate_profile_text(document) == []
++
++    def test_exceeding_a_ceiling_is_an_error_not_silence(self) -> None:
++        """A document past a ceiling is rejected, not called valid.
++
++        Reporting nothing would present an uninspected document as clean, which is
++        the failure mode of the depth cap this replaced: it returned an empty list.
++
++        The oversized case is a document that is simply large rather than aliased,
++        which is why it has to exceed a megabyte to trip the ceiling. Over HTTP the
++        256 KB cap on ``content`` gets there first, so the reachable caller for this
++        branch is ``cao profile validate`` on a local file, which has no such cap.
++        """
++        deep: dict = {"name": "deep", "description": "A profile."}
++        node = deep
++        for _ in range(70):
++            node["toolsSettings"] = {}
++            node = node["toolsSettings"]
++        oversized = {
++            "name": "big",
++            "description": "A profile.",
++            "toolsSettings": {"blob": "x" * (_MAX_RENDERED_BYTES + 1)},
++        }
++
++        for metadata, expected in ((deep, "nests more than"), (oversized, "renders to more")):
++            errors = [f for f in validate_frontmatter(metadata) if f.severity == "error"]
++            assert len(errors) == 1
++            assert expected in errors[0].message
++
++    def test_a_large_but_unaliased_document_still_passes(self) -> None:
++        """The ceiling is on rendering, so size alone below it must not reject.
++
++        Guards against tightening the bound into something that rejects ordinary
++        large profiles, which is the opposite failure from the one above.
++        """
++        metadata = {
++            "name": "big",
++            "description": "A profile.",
++            "toolsSettings": {f"k{index}": "v" * 20 for index in range(2_000)},
++        }
++        assert len(repr(metadata)) > 50_000  # genuinely large, still under the ceiling
++
++        assert [f for f in validate_frontmatter(metadata) if f.severity == "error"] == []
++
++
++class TestMcpServerTransports:
++    """``mcpServers`` entries may be command-launched *or* url-based.
++
++    The schema required ``command`` unconditionally, which made the write routes
++    reject a form CAO supports: ``resolve_mcp_server_config`` documents entries
++    without a ``command`` (``{"type": "http", "url": ...}``) as passing through
++    untouched, and providers forward them to their own MCP config. Because
++    #585 made this schema the blocking gate in front of persistence, a latent
++    description gap became a broken save path. Reported by @haofeif.
++    """
++
++    ACCEPTED = {
++        "http url": {"docs": {"type": "http", "url": "https://example.test/mcp"}},
++        "sse url": {"docs": {"type": "sse", "url": "https://example.test/sse"}},
++        "url with headers": {
++            "docs": {"type": "http", "url": "https://example.test/mcp", "headers": {"A": "b"}}
++        },
++        "command": {"fs": {"command": "npx", "args": ["-y", "server"]}},
++        "bundled cao server": {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}},
++        "command and url together": {"z": {"command": "npx", "url": "https://example.test/mcp"}},
++    }
++
++    @pytest.mark.parametrize("label", sorted(ACCEPTED))
++    def test_supported_forms_validate(self, label: str) -> None:
++        findings = validate_frontmatter(
++            {"name": "x", "description": "d", "mcpServers": self.ACCEPTED[label]}
++        )
++
++        assert [f for f in findings if f.severity == "error"] == []
++
++    @pytest.mark.parametrize(
++        "entry", [{"type": "http"}, {}, {"args": ["-y"]}], ids=["type only", "empty", "args only"]
++    )
++    def test_an_entry_with_neither_command_nor_url_is_rejected(self, entry: dict) -> None:
++        """Widening the rule must not widen it into accepting anything.
++
++        An entry naming no transport cannot be launched or reached, so the gate
++        still has to catch it -- the fix is a second permitted shape, not the
++        removal of the requirement.
++        """
++        findings = validate_frontmatter(
++            {"name": "x", "description": "d", "mcpServers": {"broken": entry}}
++        )
++        errors = [f for f in findings if f.severity == "error"]
++
++        assert len(errors) == 1
++        assert errors[0].path == "mcpServers.broken"
++
++    def test_url_is_described_rather_than_merely_tolerated(self) -> None:
++        """The field is typed, so a form generator can render it and catch a typo.
++
++        The inner object does not set ``additionalProperties: false``, so a url
++        entry would pass even with no ``url`` property declared. Declaring it is
++        what makes ``GET /agents/profiles/schema`` describe the shape, and what
++        makes a wrong type a finding.
++        """
++        inner = load_profile_schema()["properties"]["mcpServers"]["additionalProperties"]
++        assert inner["properties"]["url"] == {"type": "string"}
++        assert inner["anyOf"] == [{"required": ["command"]}, {"required": ["url"]}]
++
++        findings = validate_frontmatter(
++            {"name": "x", "description": "d", "mcpServers": {"docs": {"url": 7}}}
++        )
++
++        assert any(f.severity == "error" and f.path == "mcpServers.docs.url" for f in findings)
++
++
++class TestAggregateFindingBudget:
++    """Every producer shares one bounded response budget."""
++
++    @staticmethod
++    def _text_bytes(findings: list[ValidationMessage]) -> int:
++        return sum(
++            len(finding.message.encode("utf-8"))
++            + len(finding.path.encode("utf-8") if finding.path else b"")
++            for finding in findings
++        )
++
++    def test_non_string_keys_stop_at_one_error_marker(self) -> None:
++        metadata = {"name": "agent", **{index: "value" for index in range(200)}}
++
++        findings = validate_frontmatter(metadata)
++
++        assert len(findings) == _MAX_FINDINGS
++        assert sum(f.message == _OMISSION_MESSAGE for f in findings) == 1
++        assert findings[-1] == ValidationMessage("error", _OMISSION_MESSAGE)
++
++    def test_unknown_tools_keep_warning_only_result_advisory(self) -> None:
++        findings = validate_frontmatter(
++            {"name": "agent", "allowedTools": [f"unknown-{index}" for index in range(200)]}
++        )
++
++        assert len(findings) == _MAX_FINDINGS
++        assert sum(f.message == _OMISSION_MESSAGE for f in findings) == 1
++        assert findings[-1] == ValidationMessage("warning", _OMISSION_MESSAGE)
++        assert not any(f.severity == "error" for f in findings)
++
++    def test_aggregate_text_and_each_path_stay_within_byte_limits(self) -> None:
++        collector = _FindingCollector()
++        long_unicode = "界" * 2_000
++        for index in range(200):
++            if not collector.add(
++                ValidationMessage("error", long_unicode, f"field.{long_unicode}.{index}")
++            ):
++                break
++
++        findings = collector.finalize()
++
++        assert len(findings) <= _MAX_FINDINGS
++        assert self._text_bytes(findings) <= _MAX_FINDING_TEXT_BYTES
++        assert all(
++            finding.path is None or len(finding.path.encode("utf-8")) <= _MAX_FINDING_PATH_BYTES
++            for finding in findings
++        )
++
++    def test_schema_iterator_consumes_only_remaining_plus_one(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        consumed = 0
++
++        class FakeError:
++            def __init__(self, index: int) -> None:
++                self.path = [f"field{index}"]
++                self.absolute_path = self.path
++                self.message = f"error {index}"
++
++        class FakeValidator:
++            def __init__(self, schema: dict) -> None:
++                del schema
++
++            def iter_errors(self, metadata: dict):
++                nonlocal consumed
++                del metadata
++                for index in range(200):
++                    consumed += 1
++                    yield FakeError(index)
++
++        monkeypatch.setattr(profile_validator, "Draft202012Validator", FakeValidator)
++        metadata = {"name": "agent", **{index: "value" for index in range(10)}}
++
++        findings = validate_frontmatter(metadata)
++
++        remaining_after_key_findings = (_MAX_FINDINGS - 1) - 10
++        assert consumed == remaining_after_key_findings + 1
++        assert len(findings) == _MAX_FINDINGS
++        assert findings[-1] == ValidationMessage("error", _OMISSION_MESSAGE)
++
++    def test_ordered_additional_properties_is_lazy_with_real_validator(self) -> None:
++        """The real keyword handler must not inspect the omitted tail."""
++        from itertools import islice
++
++        class CountingDict(dict):
++            def __init__(self) -> None:
++                super().__init__((f"srv{index:04}", {}) for index in range(300))
++                self.visited = 0
++
++            def items(self):
++                for item in super().items():
++                    self.visited += 1
++                    yield item
++
++        servers = CountingDict()
++        validator = profile_validator.Draft202012Validator(load_profile_schema())
++
++        errors = list(
++            islice(
++                validator.iter_errors({"name": "agent", "mcpServers": servers}),
++                _MAX_FINDINGS,
++            )
++        )
++
++        assert len(errors) == _MAX_FINDINGS
++        assert servers.visited == _MAX_FINDINGS
++
++
+diff --git a/test/services/test_profile_validator_integration.py b/test/services/test_profile_validator_integration.py
+new file mode 100644
+index 00000000..c1f01840
+--- /dev/null
++++ b/test/services/test_profile_validator_integration.py
+@@ -0,0 +1,64 @@
++"""Integration tests for profile_validator that require subprocess.
++
++Separated from the unit-tier test_profile_validator.py to satisfy the G2
++tier guard (no subprocess calls in unit-tier files).
++"""
++
++import json
++import os
++import subprocess
++import sys
++
++import pytest
++
++from cli_agent_orchestrator.services.profile_validator import (
++    _MAX_FINDINGS,
++    _OMISSION_MESSAGE,
++)
++
++pytestmark = pytest.mark.integration
++
++
++class TestAggregateFindingBudgetIntegration:
++    """Tests requiring subprocess to verify cross-process determinism."""
++
++    def test_schema_prefix_is_stable_across_hash_seeds(self) -> None:
++        """Truncation must select the same document-order prefix in every worker."""
++        script = """
++import json
++from cli_agent_orchestrator.services.profile_validator import validate_frontmatter
++
++metadata = {
++    "name": "agent",
++    "mcpServers": {f"srv{index:04}": {} for index in range(299, -1, -1)},
++}
++findings = validate_frontmatter(metadata)
++print(json.dumps([
++    {"severity": finding.severity, "message": finding.message, "path": finding.path}
++    for finding in findings
++]))
++"""
++        outputs = []
++        for seed in ("0", "1", "2", "3"):
++            environment = os.environ.copy()
++            environment["PYTHONHASHSEED"] = seed
++            completed = subprocess.run(
++                [sys.executable, "-c", script],
++                check=True,
++                capture_output=True,
++                text=True,
++                env=environment,
++            )
++            outputs.append(completed.stdout)
++
++        assert len(set(outputs)) == 1
++        findings = json.loads(outputs[0])
++        selected_document_prefix = [
++            f"mcpServers.srv{index:04}" for index in range(299, 299 - (_MAX_FINDINGS - 1), -1)
++        ]
++        assert [finding["path"] for finding in findings[:-1]] == sorted(selected_document_prefix)
++        assert findings[-1] == {
++            "severity": "error",
++            "message": _OMISSION_MESSAGE,
++            "path": None,
++        }
+diff --git a/test/test_constants.py b/test/test_constants.py
+index c14bf79f..95bb0d5c 100644
+--- a/test/test_constants.py
++++ b/test/test_constants.py
+@@ -428,6 +428,120 @@ class TestOriginAuthorityMalformedInput:
+             assert constants.is_http_origin_allowed("http://[", "localhost:9889") is False
+ 
+ 
++class TestSchemeAwareSameOrigin:
++    """Regression for #653 item 2: the same-origin branch compared authority
++    (``host[:port]``) only, so a request that arrived over HTTPS accepted a
++    plain-``http`` Origin as same-origin. Under RFC 6454 an origin is the
++    (scheme, host, port) triple, so ``http://h`` and ``https://h`` are
++    different origins and the downgrade should not match.
++
++    The check is deliberately one-directional. It rejects an ``http`` Origin on
++    an ``https`` request, which is unambiguous. It does NOT reject an ``https``
++    Origin on a request that merely *looks* plain-http to the server, because
++    that is the shape produced by an HTTPS-terminating proxy whose address is
++    not in ``TRUSTED_FORWARDER_IPS`` — uvicorn then ignores
++    ``X-Forwarded-Proto`` and reports ``scheme='http'`` for a request the
++    browser genuinely made over TLS. Rejecting that direction would break
++    working reverse-proxy and Codespaces deployments without closing a real
++    hole, since forging it requires already controlling the victim's own
++    origin over TLS.
++    """
++
++    def test_https_request_rejects_http_origin(self):
++        from cli_agent_orchestrator import constants
++
++        with patch.object(constants, "CORS_ORIGINS", []):
++            assert (
++                constants.is_http_origin_allowed(
++                    "http://localhost:8765", "localhost:8765", scheme="https"
++                )
++                is False
++            )
++
++    def test_https_request_accepts_https_origin(self):
++        from cli_agent_orchestrator import constants
++
++        with patch.object(constants, "CORS_ORIGINS", []):
++            assert (
++                constants.is_http_origin_allowed(
++                    "https://localhost:8765", "localhost:8765", scheme="https"
++                )
++                is True
++            )
++
++    def test_http_request_accepts_http_origin(self):
++        from cli_agent_orchestrator import constants
++
++        with patch.object(constants, "CORS_ORIGINS", []):
++            assert (
++                constants.is_http_origin_allowed(
++                    "http://localhost:8765", "localhost:8765", scheme="http"
++                )
++                is True
++            )
++
++    def test_untrusted_proxy_shape_still_allowed(self):
++        """``scheme='http'`` + an ``https`` Origin is the untrusted-proxy shape;
++        allowed deliberately so TLS-terminating deployments keep working."""
++        from cli_agent_orchestrator import constants
++
++        with patch.object(constants, "CORS_ORIGINS", []):
++            assert (
++                constants.is_http_origin_allowed(
++                    "https://localhost:8765", "localhost:8765", scheme="http"
++                )
++                is True
++            )
++
++    def test_omitting_scheme_preserves_previous_behaviour(self):
++        """Callers that do not pass a scheme keep the pre-#653 semantics."""
++        from cli_agent_orchestrator import constants
++
++        with patch.object(constants, "CORS_ORIGINS", []):
++            assert (
++                constants.is_http_origin_allowed("http://localhost:8765", "localhost:8765") is True
++            )
++
++    def test_explicit_allowlist_entry_is_not_scheme_gated(self):
++        """The scheme check guards the same-origin branch only; an operator who
++        lists an origin explicitly still gets it, as before."""
++        from cli_agent_orchestrator import constants
++
++        with patch.object(constants, "CORS_ORIGINS", ["http://localhost:8765"]):
++            assert (
++                constants.is_http_origin_allowed(
++                    "http://localhost:8765", "localhost:8765", scheme="https"
++                )
++                is True
++            )
++
++    def test_ws_handshake_rejects_http_origin_over_wss(self):
++        """The WS scope reports ``wss``/``ws``, which map onto the ``https``/
++        ``http`` origin schemes the browser serializes."""
++        from cli_agent_orchestrator import constants
++
++        with patch.object(constants, "CORS_ORIGINS", []):
++            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
++                assert (
++                    constants.is_ws_origin_allowed(
++                        "http://localhost:8765", "localhost:8765", scheme="wss"
++                    )
++                    is False
++                )
++
++    def test_ws_handshake_accepts_https_origin_over_wss(self):
++        from cli_agent_orchestrator import constants
++
++        with patch.object(constants, "CORS_ORIGINS", []):
++            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
++                assert (
++                    constants.is_ws_origin_allowed(
++                        "https://localhost:8765", "localhost:8765", scheme="wss"
++                    )
++                    is True
++                )
++
++
+ class TestPipeLivenessCheckIntervalClamp:
+     """Regression for the round-3 Copilot review on #397: PIPE_LIVENESS_CHECK_INTERVAL_S
+     feeds ``threading.Event.wait(timeout)`` in the watchdog's poll loop
+diff --git a/test/tier-census.json b/test/tier-census.json
+index db9d86f9..ae101b17 100644
+--- a/test/tier-census.json
++++ b/test/tier-census.json
+@@ -11633,6 +11633,7 @@
+     "test/utils/test_workflow_events.py::test_run_projection_frame_terminal_by_state": "unit",
+     "test/utils/test_workflow_events.py::test_run_event_terminal_regardless_of_state_field": "unit",
+     "test/utils/test_workflow_events.py::test_gap_frame_never_terminal": "unit",
+-    "test/utils/test_workflow_events.py::test_seq_non_integer_id_is_none": "unit"
++    "test/utils/test_workflow_events.py::test_seq_non_integer_id_is_none": "unit",
++    "test/services/test_profile_validator_integration.py::TestAggregateFindingBudgetIntegration::test_schema_prefix_is_stable_across_hash_seeds": "integration"
+   }
+ }
+diff --git a/test/utils/test_atomic_file.py b/test/utils/test_atomic_file.py
+index b1412147..c4de09b9 100644
+--- a/test/utils/test_atomic_file.py
++++ b/test/utils/test_atomic_file.py
+@@ -31,6 +31,7 @@ from cli_agent_orchestrator.utils.atomic_file import (
+     LockTimeoutError,
+     _file_lock,
+     _lock_path_for,
++    locked_atomic_delete,
+     locked_atomic_rewrite,
+     locked_atomic_write,
+ )
+@@ -698,3 +699,150 @@ def test_write_times_out_when_the_lock_is_held(tmp_path: Path) -> None:
+     with _file_lock(lock_path, timeout=5.0):
+         with pytest.raises(LockTimeoutError):
+             locked_atomic_write(target, "never lands", lock_timeout=0.2)
++
++
++def test_locked_atomic_write_must_exist_updates_an_existing_target(tmp_path: Path) -> None:
++    target = tmp_path / "f.txt"
++    target.write_text("old\n", encoding="utf-8")
++
++    locked_atomic_write(target, "new\n", must_exist=True)
++
++    assert target.read_text(encoding="utf-8") == "new\n"
++
++
++def test_locked_atomic_write_must_exist_refuses_to_create(tmp_path: Path) -> None:
++    target = tmp_path / "absent.txt"
++
++    with pytest.raises(FileNotFoundError):
++        locked_atomic_write(target, "new\n", must_exist=True)
++
++    assert not target.exists()
++
++
++def test_locked_atomic_write_rejects_the_contradictory_flag_pair(tmp_path: Path) -> None:
++    """``overwrite=False`` with ``must_exist=True`` can never succeed.
++
++    It demands a target that exists and simultaneously refuses to replace one, so
++    it is a caller bug rather than a runtime condition. Failing fast beats always
++    raising FileExistsError and letting the caller think the file was in the way.
++    """
++    target = tmp_path / "f.txt"
++
++    with pytest.raises(ValueError, match="never succeed"):
++        locked_atomic_write(target, "x\n", overwrite=False, must_exist=True)
++
++
++def test_locked_atomic_write_must_exist_leaves_no_temp_debris(tmp_path: Path) -> None:
++    """A refused update must not leave a partially written temp file behind."""
++    target = tmp_path / "absent.txt"
++
++    with pytest.raises(FileNotFoundError):
++        locked_atomic_write(target, "new\n", must_exist=True)
++
++    assert [p.name for p in tmp_path.iterdir() if p.name.startswith("absent")] == []
++
++
++def test_locked_atomic_write_must_exist_is_enforced_under_the_lock(tmp_path: Path) -> None:
++    """Two concurrent updaters of an absent target must both be refused.
++
++    If the existence test sat outside the critical section, a thread could observe
++    "absent", lose the race, and still publish, converting an update into a create.
++    """
++    import threading
++
++    target = tmp_path / "absent.txt"
++    barrier = threading.Barrier(2)
++    outcomes: list[str] = []
++    lock = threading.Lock()
++
++    def attempt(label: str) -> None:
++        barrier.wait()
++        try:
++            locked_atomic_write(target, f"{label}\n", must_exist=True)
++            with lock:
++                outcomes.append(f"wrote:{label}")
++        except FileNotFoundError:
++            with lock:
++                outcomes.append(f"refused:{label}")
++
++    threads = [threading.Thread(target=attempt, args=(n,)) for n in ("A", "B")]
++    for thread in threads:
++        thread.start()
++    for thread in threads:
++        thread.join()
++
++    assert sorted(outcomes) == ["refused:A", "refused:B"]
++    assert not target.exists()
++
++
++# --------------------------------------------------------------------------
++# locked_atomic_delete
++#
++# Added for the PR #585 review: locked_atomic_write's ``must_exist`` guarantee
++# is only real if deletion takes the SAME lock. An unlocked
++# exists()-then-unlink() can land between an update's existence check and its
++# os.replace, so the delete succeeds, the update republishes, and a deleted
++# file is back on disk holding the new content.
++# --------------------------------------------------------------------------
++
++
++def test_delete_removes_an_existing_file(tmp_path: Path) -> None:
++    target = tmp_path / "AGENTS.md"
++    target.write_text("bye\n", encoding="utf-8")
++
++    locked_atomic_delete(target)
++
++    assert not target.exists()
++
++
++def test_delete_raises_when_the_target_is_absent(tmp_path: Path) -> None:
++    """``must_exist`` defaults to True so a caller can map absence to its own error."""
++    with pytest.raises(FileNotFoundError):
++        locked_atomic_delete(tmp_path / "never-existed.md")
++
++
++def test_delete_is_idempotent_when_must_exist_is_false(tmp_path: Path) -> None:
++    target = tmp_path / "AGENTS.md"
++
++    locked_atomic_delete(target, must_exist=False)  # no raise
++
++    assert not target.exists()
++
++
++def test_delete_contends_on_the_same_lock_as_a_write(tmp_path: Path) -> None:
++    """The guarantee this helper exists for: one lock covers writes AND deletes.
++
++    Holding the target's lock directly, then asserting the delete times out,
++    proves ``locked_atomic_delete`` computes the same key via ``_lock_path_for``
++    that ``locked_atomic_write`` uses. A delete that keyed a different lock (or
++    took none) would return immediately and the file would be gone.
++    """
++    target = tmp_path / "AGENTS.md"
++    target.write_text("live\n", encoding="utf-8")
++
++    with _file_lock(_lock_path_for(target), 5.0):
++        with pytest.raises(LockTimeoutError):
++            locked_atomic_delete(target, lock_timeout=0.2)
++
++    assert target.exists(), "the delete must not have unlinked while the lock was held"
++
++
++def test_delete_does_not_disturb_the_lock_file_itself(tmp_path: Path) -> None:
++    """Removing the target must leave the lock inode intact.
++
++    ``fcntl.flock`` is per-inode, so if deleting a target also removed its lock
++    file, the next writer and the next deleter would lock different inodes and
++    stop conflicting. Lock files live under ``LOCK_DIR``, keyed by a hash of the
++    resolved target path, and are never unlinked.
++    """
++    target = tmp_path / "AGENTS.md"
++    target.write_text("live\n", encoding="utf-8")
++    locked_atomic_write(target, "live\n")
++    lock_path = _lock_path_for(target)
++    assert lock_path.exists()
++
++    locked_atomic_delete(target)
++
++    assert not target.exists()
++    assert lock_path.exists()
++    assert LOCK_DIR in lock_path.parents
