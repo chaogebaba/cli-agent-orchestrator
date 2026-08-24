@@ -3115,7 +3115,9 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if not terminal:
             logger.warning(f"Terminal metadata not found for terminal_id: {terminal_id}")
-            _terminal_metadata_cache[terminal_id] = (now, None)
+            # F351: Do NOT cache None results — the terminal may be mid-creation
+            # and the row not yet committed/visible. Caching None for the full
+            # TTL causes wait_until_status to miss newly-created terminals.
             return None
         logger.debug(
             f"Retrieved terminal metadata for {terminal_id}: provider={terminal.provider}, session={terminal.tmux_session}"

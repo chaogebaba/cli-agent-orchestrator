@@ -410,10 +410,10 @@ class TestF203ClassE_SilentForeverDeferral:
             db.add(TerminalModel(
                 id="sup_h3", tmux_session="cao-h3",
                 tmux_window="supervisor", provider="claude_code",
-                agent_profile="supervisor",
+                agent_profile="developer",
             ))
             db.add(MailboxModel(
-                id="mb_h3", session_name="cao-h3", role="supervisor",
+                id="mb_h3", session_name="cao-h3", role="worker",
                 current_terminal_id="sup_h3", generation=1,
                 consumed_through_id=0,
                 cc_inbox_path="/tmp/test.json",

@@ -203,6 +203,7 @@ def _subprocess_env(
             "CAO_API_PORT": str(port),
             "CAO_A2A_DISABLED": "true",
             "OTEL_SDK_DISABLED": "true",
+            "CAO_SENDER_TOKEN_DISABLED": "true",
             "PYTHONUNBUFFERED": "1",
             # F334 (#190): Test-spawned sessions carry a distinctive prefix
             # so incident triage can distinguish them from production sessions.

@@ -7128,6 +7128,12 @@ async def create_inbox_message_endpoint(
         )
 
     # ── F332: Sender-token authentication (before F129 drift block) ──
+    # F352: Sender-token enforcement. Skipped when CAO_SENDER_TOKEN_DISABLED
+    # is set (test subprocess servers that cannot inject tokens into callers).
+    _sender_token_disabled = os.environ.get("CAO_SENDER_TOKEN_DISABLED", "").strip().lower() in (
+        "1", "true", "yes",
+    )
+
     # If the caller presents a valid operator bearer (CAO_AUTH_LOCAL_TOKEN),
     # the terminal token check is bypassed — the operator is trusted.
     from cli_agent_orchestrator.security.auth import get_local_bearer
@@ -7139,7 +7145,7 @@ async def create_inbox_message_endpoint(
         and auth_header[7:] == operator_bearer
     )
 
-    if not has_operator_bearer:
+    if not _sender_token_disabled and not has_operator_bearer:
         presented_token = request.headers.get("x-cao-terminal-token")
         with SessionLocal() as _f332_db:
             from cli_agent_orchestrator.services.terminal_token_service import verify_sender_token

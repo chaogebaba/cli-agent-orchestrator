@@ -232,6 +232,33 @@ def _reset_backend_registry():
     registry._backend = original
 
 
+# ---------------------------------------------------------------------------
+# F352: Global sender-token bypass for tests not exercising enforcement
+# ---------------------------------------------------------------------------
+_F352_ENFORCEMENT_MODULES = frozenset((
+    "test_inbox_sender_token",
+    "test_f352_sender_token_injection",
+))
+
+
+@pytest.fixture(autouse=True)
+def _bypass_sender_token(request, monkeypatch):
+    """Bypass verify_sender_token for tests that don't exercise enforcement.
+
+    F352 sender-token enforcement rejects inbox POSTs without a valid
+    X-CAO-Terminal-Token header. Most tests don't test the enforcement itself
+    and should not be burdened with presenting tokens. The dedicated test modules
+    that DO test enforcement are excluded from this bypass.
+    """
+    mod_name = request.node.module.__name__.rsplit(".", 1)[-1]
+    if mod_name in _F352_ENFORCEMENT_MODULES:
+        return
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_token_service.verify_sender_token",
+        lambda _db, _sender_id, _presented: (True, ""),
+    )
+
+
 @pytest.fixture(autouse=True)
 def _sim_leak_guard():
     """F254 D14: suite-wide guard — no sim clock/RNG/backend leaks across tests.

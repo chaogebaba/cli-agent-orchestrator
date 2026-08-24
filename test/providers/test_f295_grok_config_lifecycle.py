@@ -7,11 +7,18 @@ AC4 — debounced change notice
 
 import hashlib
 import json
+import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+
+
+def _advance_mtime(path: Path) -> None:
+    """Ensure mtime advances by at least 1 second for coarse-grained filesystems."""
+    os.utime(path, (time.time() + 1, time.time() + 1))
 
 from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
 
@@ -345,9 +352,6 @@ class TestAC4ChangeNotice:
             watcher._snapshot_baseline()
 
             # Touch mtime without changing content
-            import os
-            import time
-
             time.sleep(0.01)
             os.utime(config, (time.time() + 1, time.time() + 1))
 
@@ -379,6 +383,7 @@ class TestAC4ChangeNotice:
 
             # Change content
             config.write_text('[model]\nname = "after"\n')
+            _advance_mtime(config)
 
             watcher._check_and_notify()
             mock_push.assert_called_once()
@@ -414,6 +419,7 @@ class TestAC4ChangeNotice:
 
             # Change content
             config.write_text('[model]\nname = "v2"\n')
+            _advance_mtime(config)
 
             watcher._check_and_notify()
             assert mock_push.call_count == 1
@@ -481,6 +487,7 @@ class TestF358RoutingKeyDetection:
                 '[models]\ndefault = "grok-4.6"\ndefault_reasoning_effort = "high"\n\n'
                 '[ui]\nyolo = false\n\n[skills]\ndisabled = ["tmux"]\n'
             )
+            _advance_mtime(config)
 
             watcher._check_and_notify()
             mock_push.assert_not_called()
@@ -509,6 +516,7 @@ class TestF358RoutingKeyDetection:
             watcher._snapshot_baseline()
 
             config.write_text('[models]\ndefault = "grok-4.7"\n')
+            _advance_mtime(config)
 
             watcher._check_and_notify()
             mock_push.assert_called_once()
@@ -533,6 +541,7 @@ class TestF358RoutingKeyDetection:
             watcher._snapshot_baseline()
 
             config.write_text('[models]\ndefault = "grok-4.6"\ndefault_reasoning_effort = "low"\n')
+            _advance_mtime(config)
 
             watcher._check_and_notify()
             mock_push.assert_called_once()
@@ -561,6 +570,7 @@ class TestF358RoutingKeyDetection:
             config.write_text(
                 '[models]\ndefault = "relay"\n\n[model.relay]\nbase_url = "http://b"\napi_backend = "chat"\n'
             )
+            _advance_mtime(config)
 
             watcher._check_and_notify()
             mock_push.assert_called_once()
@@ -592,6 +602,7 @@ class TestF358RoutingKeyDetection:
 
             new_text = '[models]\ndefault = "grok-4.7"\n'
             config.write_text(new_text)
+            _advance_mtime(config)
 
             watcher._check_and_notify()
             args = mock_push.call_args[0]
@@ -600,9 +611,6 @@ class TestF358RoutingKeyDetection:
 
     def test_malformed_toml_fails_open_once(self, tmp_path):
         """Parse failure notifies once (fail-open), not on every poll."""
-        import os
-        import time
-
         from cli_agent_orchestrator.services.grok_config_watcher import GrokConfigWatcher
 
         config = tmp_path / "config.toml"
@@ -626,6 +634,7 @@ class TestF358RoutingKeyDetection:
 
             # Corrupt the file — fail open with ONE notice
             config.write_text('[models]\ndefault = "unterminated\n')
+            _advance_mtime(config)
             watcher._check_and_notify()
             assert mock_push.call_count == 1
 
@@ -657,15 +666,18 @@ class TestF358RoutingKeyDetection:
 
             # Corrupt → one fail-open notice
             config.write_text("not [valid toml ===\n")
+            _advance_mtime(config)
             watcher._check_and_notify()
             assert mock_push.call_count == 1
 
             # Recover with SAME routing keys — no additional notice
             config.write_text('[models]\ndefault = "grok-4.6"\n[ui]\nyolo = true\n')
+            _advance_mtime(config)
             watcher._check_and_notify()
             assert mock_push.call_count == 1
 
             # Recovered state then changes a routing key — notice fires
             config.write_text('[models]\ndefault = "grok-4.7"\n[ui]\nyolo = true\n')
+            _advance_mtime(config)
             watcher._check_and_notify()
             assert mock_push.call_count == 2

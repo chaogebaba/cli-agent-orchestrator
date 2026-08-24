@@ -366,7 +366,11 @@ def test_probe_02_real_publication_races_have_one_winner_and_teardown_loser(
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.delete_terminal",
-        lambda terminal_id, _registry=None: deleted.append(terminal_id) or True,
+        lambda terminal_id, _registry=None: (
+            (_ for _ in ()).throw(ValueError(f"Terminal {terminal_id} not found"))
+            if terminal_id in deleted
+            else deleted.append(terminal_id) or True
+        ),
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.inbox_service.inbox_service.deliver_pending",

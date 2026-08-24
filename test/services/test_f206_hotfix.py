@@ -372,6 +372,10 @@ class TestH3ReresolveEscalated:
             patch(
                 "cli_agent_orchestrator.services.delivery_service.resolve_supervisor_target"
             ) as mock_resolve,
+            patch(
+                "cli_agent_orchestrator.services.delivery_service._is_supervisor_role_target",
+                return_value=False,
+            ),
         ):
             mock_resolve.return_value = DeliveryTarget(
                 terminal_id="sup_f206",

@@ -193,6 +193,8 @@ def test_ac1_flag_off_push_unchanged(scratch_db, monkeypatch):
         svc = InboxService.__new__(InboxService)
         svc._gone_lock = threading.Lock()
         svc._gone_streaks = {}
+        svc._tnf_lock = threading.Lock()
+        svc._terminal_not_found_streaks = {}
         svc.deliver_pending("sup-001")
 
     # Gate was called and returned False — push path was NOT short-circuited.
@@ -251,6 +253,8 @@ def test_ac2_flag_on_skips_push_leaves_pending(scratch_db, monkeypatch):
         svc = InboxService.__new__(InboxService)
         svc._gone_lock = threading.Lock()
         svc._gone_streaks = {}
+        svc._tnf_lock = threading.Lock()
+        svc._terminal_not_found_streaks = {}
         svc.deliver_pending("sup-001")
 
     # Push path NOT exercised
@@ -542,6 +546,8 @@ def test_ac8_reconciliation_sweep_does_not_fight_pull_mode(scratch_db, monkeypat
         svc = InboxService.__new__(InboxService)
         svc._gone_lock = threading.Lock()
         svc._gone_streaks = {}
+        svc._tnf_lock = threading.Lock()
+        svc._terminal_not_found_streaks = {}
         svc.deliver_pending("sup-001")
 
     # Pull gate skipped the push — no attempt opened
@@ -678,6 +684,8 @@ def test_p0_hotfix_supervisor_row_pushes_when_receiver_idle(scratch_db, monkeypa
         svc = InboxService.__new__(InboxService)
         svc._gone_lock = threading.Lock()
         svc._gone_streaks = {}
+        svc._tnf_lock = threading.Lock()
+        svc._terminal_not_found_streaks = {}
         svc.deliver_pending("sup-001")
 
     # The pull gate was evaluated and resolved False (push not short-circuited).
