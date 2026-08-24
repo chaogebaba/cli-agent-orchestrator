@@ -2010,17 +2010,16 @@ async def ws_supervisor_doorbell(websocket: WebSocket, terminal_id: str):
         await websocket.close(code=4401, reason="Missing terminal token")
         return
 
-    # Validate token against stored terminal token
-    from cli_agent_orchestrator.clients.database import get_terminal_metadata
+    # Validate token against stored auth_token (same path as X-CAO-Terminal-Token plane)
+    from cli_agent_orchestrator.clients.database import SessionLocal as _WSSessionLocal
+    from cli_agent_orchestrator.services.terminal_token_service import verify_sender_token
 
-    metadata = get_terminal_metadata(terminal_id)
-    if not metadata:
-        await websocket.close(code=4404, reason="Terminal not found")
-        return
-
-    stored_token = metadata.get("terminal_token")
-    if not stored_token or not _constant_time_compare(token, stored_token):
-        await websocket.close(code=4401, reason="Invalid terminal token")
+    with _WSSessionLocal() as _ws_db:
+        ok, _err_code = verify_sender_token(_ws_db, terminal_id, token)
+    if not ok:
+        reason = "Terminal not found" if _err_code == "E-SENDER-UNKNOWN" else "Invalid terminal token"
+        code = 4404 if _err_code == "E-SENDER-UNKNOWN" else 4401
+        await websocket.close(code=code, reason=reason)
         return
 
     await websocket.accept()
