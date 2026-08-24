@@ -17,6 +17,7 @@ Tests:
 from __future__ import annotations
 
 import fcntl
+import math
 import multiprocessing
 import multiprocessing.synchronize
 import os
@@ -315,6 +316,104 @@ class TestMaxSecondsParsing:
         """A garbage value uses the safe default rather than disabling."""
         monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "not-a-number")
         assert suite_slot._max_seconds() == suite_slot._DEFAULT_MAX_SECONDS
+
+    # -- Non-finite rejection (F437 R2 gate blocker) -----------------------
+    # float() happily parses "nan"/"inf"/"-inf", and overflows "1e309" to inf.
+    # nan would make the Timer fire immediately (SIGKILL on startup); inf would
+    # crash the Timer thread (OverflowError) leaving NO wall-clock bound. All
+    # must take the warned 3600 fallback, exactly like unparseable text.
+
+    def test_nan_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "nan")
+        assert suite_slot._max_seconds() == suite_slot._DEFAULT_MAX_SECONDS
+
+    def test_inf_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "inf")
+        assert suite_slot._max_seconds() == suite_slot._DEFAULT_MAX_SECONDS
+
+    def test_negative_inf_falls_back_to_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "-inf")
+        assert suite_slot._max_seconds() == suite_slot._DEFAULT_MAX_SECONDS
+
+    def test_overflow_literal_falls_back_to_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`1e309` overflows to inf in float() — must not survive as a bound."""
+        # Guard: confirm the literal really does overflow to inf, so this test
+        # exercises the isfinite() gate and not merely ValueError.
+        assert float("1e309") == float("inf")
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "1e309")
+        assert suite_slot._max_seconds() == suite_slot._DEFAULT_MAX_SECONDS
+
+
+class TestNonFiniteArmingBehavior:
+    """Behavioral proof the non-finite fix protects the watchdog (F437 R2).
+
+    These go beyond `_max_seconds()`'s return value: they arm the real
+    watchdog and observe that nan does NOT self-destruct immediately and
+    inf/overflow arm a genuine ~3600s bound (asserted via the alive daemon
+    timer's interval — never sleeping an hour).
+    """
+
+    def test_nan_does_not_fire_immediately(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With the fix, `nan` must arm a real 3600 bound, not fire at once.
+
+        A pre-fix `_max_seconds()` returned nan → threading.Timer(nan, ...)
+        fires on the next scheduler tick → the controller SIGKILLs its own
+        PGID on startup. We arm, then confirm the timer is still alive after
+        a short wait (it did NOT fire) and carries the fallback interval.
+        """
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "nan")
+        suite_slot._arm_watchdog()
+        try:
+            assert suite_slot._watchdog is not None
+            # Give any (buggy) immediate fire a chance to happen.
+            time.sleep(0.5)
+            assert suite_slot._watchdog.is_alive(), "nan armed a firing timer"
+            assert suite_slot._watchdog.interval == suite_slot._DEFAULT_MAX_SECONDS
+        finally:
+            suite_slot._cancel_watchdog()
+            assert suite_slot._watchdog is None
+
+    def test_inf_arms_real_bound_not_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`inf` must arm a genuine 3600 bound, not crash the timer thread.
+
+        A pre-fix `_max_seconds()` returned inf → threading.Timer(inf, ...)
+        raises OverflowError converting to the wait timeout → the daemon
+        thread dies → NO wall-clock bound. We confirm a live daemon timer
+        with the finite fallback interval instead.
+        """
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "inf")
+        suite_slot._arm_watchdog()
+        try:
+            assert suite_slot._watchdog is not None
+            assert suite_slot._watchdog.daemon is True
+            assert suite_slot._watchdog.is_alive()
+            assert suite_slot._watchdog.interval == suite_slot._DEFAULT_MAX_SECONDS
+            assert math.isfinite(suite_slot._watchdog.interval)
+        finally:
+            suite_slot._cancel_watchdog()
+            assert suite_slot._watchdog is None
+
+    def test_overflow_literal_arms_real_bound(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`1e309` (→inf) arms a finite 3600 bound, same as inf."""
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "1e309")
+        suite_slot._arm_watchdog()
+        try:
+            assert suite_slot._watchdog is not None
+            assert suite_slot._watchdog.is_alive()
+            assert suite_slot._watchdog.interval == suite_slot._DEFAULT_MAX_SECONDS
+        finally:
+            suite_slot._cancel_watchdog()
+            assert suite_slot._watchdog is None
 
 
 class TestArmingDecisions:

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import datetime
 import fcntl
+import math
 import os
 import signal
 import sys
@@ -63,21 +64,32 @@ def _max_seconds() -> float:
     """Resolve the wall-clock hard bound from the environment.
 
     Returns the configured number of seconds, or ``_DEFAULT_MAX_SECONDS``
-    when the env var is unset/blank/unparseable. A value <= 0 disables the
-    watchdog (returned verbatim so the caller can decide not to arm).
+    when the env var is unset/blank/unparseable/non-finite. A value <= 0
+    disables the watchdog (returned verbatim so the caller can decide not
+    to arm).
+
+    Non-finite values (``nan``, ``inf``, ``-inf``, and overflowing literals
+    like ``1e309`` which ``float()`` rounds to ``inf``) are rejected: ``nan``
+    would make the Timer fire immediately (SIGKILL on startup) and ``inf``
+    would crash the Timer thread (OverflowError → no bound at all). They get
+    the same warned 3600 fallback as unparseable text.
     """
     raw = os.environ.get(_MAX_SECONDS_ENV, "").strip()
     if not raw:
         return _DEFAULT_MAX_SECONDS
     try:
-        return float(raw)
+        value = float(raw)
     except (TypeError, ValueError):
-        # Unparseable → fall back to the safe default rather than disabling.
+        value = math.nan  # force the warned-fallback path below
+    if not math.isfinite(value):
+        # Unparseable or non-finite → safe default rather than disabling or
+        # firing immediately / crashing the timer thread.
         sys.stderr.write(
-            f"[suite-slot] WARNING: {_MAX_SECONDS_ENV}={raw!r} is not a number; "
-            f"using default {_DEFAULT_MAX_SECONDS:.0f}s\n"
+            f"[suite-slot] WARNING: {_MAX_SECONDS_ENV}={raw!r} is not a finite "
+            f"number; using default {_DEFAULT_MAX_SECONDS:.0f}s\n"
         )
         return _DEFAULT_MAX_SECONDS
+    return value
 
 
 def _watchdog_fire(max_seconds: float, armed_at: float) -> None:
