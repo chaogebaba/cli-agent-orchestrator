@@ -1,0 +1,628 @@
+diff --git a/src/cli_agent_orchestrator/utils/persona_context.py b/src/cli_agent_orchestrator/utils/persona_context.py
+index a8844b60..cfb4eaa6 100644
+--- a/src/cli_agent_orchestrator/utils/persona_context.py
++++ b/src/cli_agent_orchestrator/utils/persona_context.py
+@@ -11,6 +11,7 @@ import shutil
+ import stat
+ import subprocess
+ import tempfile
++import tomllib
+ import uuid
+ from dataclasses import dataclass
+ from pathlib import Path
+@@ -37,6 +38,46 @@ RESERVED_LEAVES = {
+     "settings.json",
+     "persona-manifest.json",
+ }
++# Top-level scalar config.toml keys whose value is a path to a file codex reads
++# at launch. Relative values resolve against CODEX_HOME, which for a persona is
++# the isolated codex-home — so the referenced file must be materialized there or
++# codex dies at startup with ProviderLaunchFailed (F431, issue #286).
++# Source: codex config reference (developers.openai.com/codex/config-reference,
++# fetched 2026-08-24). experimental_instructions_file is the deprecated alias
++# for model_instructions_file; experimental_compact_prompt_file is the
++# compaction-prompt override; model_catalog_json is the JSON model catalog
++# loaded on startup (codex 0.149.1 hard-fails config load — "failed to load
++# configuration" — when a relative catalog is absent, F431 gate BLOCKER-1).
++#
++# Supported contract (see also _materialize_codex_config_files):
++#   * TOP-LEVEL startup-critical file keys below are MATERIALIZED: their
++#     relative values are resolved against the real ~/.codex and the referenced
++#     file is copied to the mirrored relative path under the persona codex-home
++#     so the unchanged config value resolves against CODEX_HOME.
++#   * NESTED input-path keys (CODEX_CONFIG_NESTED_PATH_KEYS below —
++#     agents.<name>.config_file, skills.config.<index>.path,
++#     model_providers.<id>.auth.cwd, and OTEL exporter TLS cert/key paths) are
++#     NOT materialized. A relative value there is unsupported: the persona
++#     build emits ONE loud warning naming the key+value (degraded, not fatal);
++#     use ABSOLUTE paths for those.
++#   * Directory-valued keys (log_dir, sqlite_home) are OUT OF SCOPE: they are
++#     output/state dirs codex creates, not startup-read inputs.
++CODEX_CONFIG_FILE_KEYS = (
++    "model_instructions_file",
++    "experimental_instructions_file",
++    "experimental_compact_prompt_file",
++    "model_catalog_json",
++)
++# Nested config path keys that are relocation-sensitive but NOT materialized by
++# this fix. Detected relative values here trigger a single degraded warning.
++# Dotted paths use TOML table nesting; tables with an <id>/<index>/<name>
++# segment are matched structurally, not by literal key string.
++CODEX_CONFIG_NESTED_PATH_HINTS = (
++    "agents.<name>.config_file",
++    "skills.config.<index>.path",
++    "model_providers.<id>.auth.cwd",
++    "otel.exporter.*.tls (ca/cert/key file paths)",
++)
+ _PREFLIGHTED_BWRAP: set[tuple[str, str]] = set()
+ 
+ 
+@@ -279,6 +320,145 @@ def _write_codex_config(source: Path, destination: Path) -> None:
+     destination.chmod(0o600)
+ 
+ 
++def _iter_nested_relative_codex_paths(parsed: Mapping[str, Any]) -> list[tuple[str, str]]:
++    """Return (dotted_key, value) for NESTED config path inputs with a relative value.
++
++    These keys are relocation-sensitive but deliberately NOT materialized by this
++    fix (see CODEX_CONFIG_NESTED_PATH_HINTS). We only detect a RELATIVE value so
++    the persona build can warn once; absolute values relocate correctly and are
++    ignored. Matched structurally (by table shape), never by literal key string,
++    because the middle segment is an arbitrary <name>/<index>/<id>.
++    """
++    found: list[tuple[str, str]] = []
++
++    def _is_relative_str(value: object) -> bool:
++        return isinstance(value, str) and bool(value) and not Path(value).expanduser().is_absolute()
++
++    # agents.<name>.config_file
++    agents = parsed.get("agents")
++    if isinstance(agents, Mapping):
++        for name, role in agents.items():
++            if isinstance(role, Mapping) and _is_relative_str(role.get("config_file")):
++                found.append((f"agents.{name}.config_file", str(role["config_file"])))
++    # skills.config.<index>.path  (config may be an array of tables or a table)
++    skills = parsed.get("skills")
++    if isinstance(skills, Mapping):
++        entries = skills.get("config")
++        seq: list[Any] = []
++        if isinstance(entries, list):
++            seq = entries
++        elif isinstance(entries, Mapping):
++            seq = list(entries.values())
++        for index, entry in enumerate(seq):
++            if isinstance(entry, Mapping) and _is_relative_str(entry.get("path")):
++                found.append((f"skills.config.{index}.path", str(entry["path"])))
++    # model_providers.<id>.auth.cwd
++    providers = parsed.get("model_providers")
++    if isinstance(providers, Mapping):
++        for pid, provider in providers.items():
++            if isinstance(provider, Mapping):
++                auth = provider.get("auth")
++                if isinstance(auth, Mapping) and _is_relative_str(auth.get("cwd")):
++                    found.append((f"model_providers.{pid}.auth.cwd", str(auth["cwd"])))
++    # otel.exporter TLS file paths (ca/cert/key), best-effort structural walk
++    otel = parsed.get("otel")
++    if isinstance(otel, Mapping):
++        exporter = otel.get("exporter")
++        if isinstance(exporter, Mapping):
++            for exporter_name, cfg in exporter.items():
++                if not isinstance(cfg, Mapping):
++                    continue
++                for tls_key in ("ca", "cert", "key", "ca_file", "cert_file", "key_file"):
++                    if _is_relative_str(cfg.get(tls_key)):
++                        found.append(
++                            (f"otel.exporter.{exporter_name}.{tls_key}", str(cfg[tls_key]))
++                        )
++    return found
++
++
++def _materialize_codex_config_files(source_config: Path, codex_home: Path) -> None:
++    """Copy files referenced by TOP-LEVEL startup-read path keys into the persona home.
++
++    The rewritten config.toml preserves the original (often relative) values for
++    keys like ``model_instructions_file``. codex resolves those relative paths
++    against ``CODEX_HOME`` — the isolated persona codex-home — so the referenced
++    file must exist there at the SAME relative location or codex dies at launch
++    (e.g. "failed to read model instructions file" / "failed to load
++    configuration"; ProviderLaunchFailed; F431, issue #286).
++
++    Supported contract:
++
++    * TOP-LEVEL startup-critical file keys (``CODEX_CONFIG_FILE_KEYS``:
++      model_instructions_file, its deprecated alias experimental_instructions_file,
++      experimental_compact_prompt_file, model_catalog_json) are MATERIALIZED.
++      Values are read from the REAL config (``source_config``) and resolved against
++      the real codex home (``source_config.parent``). Each referenced file is copied
++      (never symlinked — the value may be re-read across the persona lifetime and a
++      dangling link would reintroduce the failure) to the mirrored relative path
++      under ``codex_home``. Absolute values resolve identically everywhere and are
++      left untouched. A referenced-but-missing file is a hard error naming the path;
++      silently skipping it would just defer the same launch crash.
++    * NESTED input-path keys (``CODEX_CONFIG_NESTED_PATH_HINTS``) are NOT
++      materialized: a relative value there emits ONE loud warning (degraded, not
++      fatal) — use absolute paths. See ``_iter_nested_relative_codex_paths``.
++    * Directory-valued keys (log_dir, sqlite_home) are OUT OF SCOPE (output dirs).
++    """
++    if not source_config.is_file():
++        return
++    real_home = source_config.parent
++    real_home_resolved = real_home.resolve()
++    try:
++        parsed = tomllib.loads(source_config.read_text(encoding="utf-8"))
++    except (tomllib.TOMLDecodeError, OSError) as exc:
++        raise PersonaContextError(f"persona_codex_config_unparsable:{exc}") from exc
++    # SHOULD-1: warn once for nested relative input paths we do not materialize.
++    nested_relative = _iter_nested_relative_codex_paths(parsed)
++    if nested_relative:
++        logger.warning(
++            "persona_codex_config_nested_relative_unsupported: %d nested config path(s) "
++            "have relative values that are NOT materialized into the persona codex-home "
++            "and may fail to resolve at runtime; use absolute paths. Offending keys: %s",
++            len(nested_relative),
++            ", ".join(f"{key}={value!r}" for key, value in nested_relative),
++        )
++    for key in CODEX_CONFIG_FILE_KEYS:
++        value = parsed.get(key)
++        if value is None:
++            continue
++        if not isinstance(value, str) or not value:
++            raise PersonaContextError(f"persona_codex_config_key_invalid:{key}")
++        raw = Path(value).expanduser()
++        # Absolute paths resolve to the same target regardless of CODEX_HOME;
++        # codex reads them directly, so nothing needs materializing.
++        if raw.is_absolute():
++            if raw.is_symlink() or not raw.is_file():
++                raise PersonaContextError(f"persona_codex_config_file_missing:{key}:{value}")
++            continue
++        # Relative value: reject parent-escapes before touching the filesystem so
++        # a config like "../../etc/x" can never write outside the persona home.
++        if ".." in raw.parts:
++            raise PersonaContextError(f"persona_codex_config_path_escape:{key}:{value}")
++        # SHOULD-2: test is_symlink() on the UNresolved candidate — resolve()
++        # dereferences the link, so checking after resolve can never see an
++        # in-home source symlink. We forbid symlinked sources so a rotated/broken
++        # link target cannot silently reintroduce the launch failure.
++        candidate = real_home / raw
++        if candidate.is_symlink():
++            raise PersonaContextError(f"persona_codex_config_symlink_source:{key}:{value}")
++        source_file = candidate.resolve()
++        if not source_file.is_file():
++            raise PersonaContextError(f"persona_codex_config_file_missing:{key}:{value}")
++        # Confirm the resolved source stays under the real codex home.
++        try:
++            source_file.relative_to(real_home_resolved)
++        except ValueError as exc:
++            raise PersonaContextError(f"persona_codex_config_path_escape:{key}:{value}") from exc
++        destination = codex_home / raw
++        destination.parent.mkdir(parents=True, exist_ok=True)
++        shutil.copyfile(source_file, destination)
++        destination.chmod(0o600)
++
++
+ def _bind_to_json(bind: PersonaBind | None) -> dict[str, str] | None:
+     return None if bind is None else {"src": str(bind.src), "dst": str(bind.dst)}
+ 
+@@ -427,16 +607,20 @@ def compose_persona_plan(
+         real_claude_json = claude_home / ".claude.json"
+         if real_claude_json.is_file():
+             import shutil as _shutil
++
+             _shutil.copy2(real_claude_json, staging / ".claude.json")
+         else:
+             (staging / ".claude.json").write_text(
+-                json.dumps({
+-                    "migrationVersion": 13,
+-                    "hasCompletedOnboarding": True,
+-                    "hasResetAutoModeOptInForDefaultOffer": True,
+-                    "opusProMigrationComplete": True,
+-                    "sonnet1m45MigrationComplete": True,
+-                }) + "\n",
++                json.dumps(
++                    {
++                        "migrationVersion": 13,
++                        "hasCompletedOnboarding": True,
++                        "hasResetAutoModeOptInForDefaultOffer": True,
++                        "opusProMigrationComplete": True,
++                        "sonnet1m45MigrationComplete": True,
++                    }
++                )
++                + "\n",
+                 encoding="utf-8",
+             )
+         (staging / ".claude.json").chmod(0o600)
+@@ -496,6 +680,7 @@ def compose_persona_plan(
+             codex_home = generation_dir / "codex-home"
+             (staging / "codex-home").mkdir(mode=0o700)
+             _write_codex_config(real_codex_home / "config.toml", staging / "codex-home/config.toml")
++            _materialize_codex_config_files(real_codex_home / "config.toml", staging / "codex-home")
+             auth = real_codex_home / "auth.json"
+             if auth.is_symlink() or not auth.is_file():
+                 raise PersonaContextError("persona_codex_auth_invalid")
+@@ -657,12 +842,7 @@ def load_persona_plan(terminal_id: str) -> PersonaPlan | None:
+             if credential_bind is not None
+             else tuple(env_unset) == ()
+         )
+-        if (
+-            persona_bind is None
+-            or bwrap is None
+-            or env_set != expected_env
+-            or not valid_env_unset
+-        ):
++        if persona_bind is None or bwrap is None or env_set != expected_env or not valid_env_unset:
+             raise PersonaContextError("persona_manifest_invalid:claude_wrapper")
+         if persona_bind.src.resolve() != generation_dir:
+             raise PersonaContextError("persona_manifest_invalid:persona_bind.src")
+diff --git a/test/utils/test_persona_context.py b/test/utils/test_persona_context.py
+index f4e889cf..fbe16d1e 100644
+--- a/test/utils/test_persona_context.py
++++ b/test/utils/test_persona_context.py
+@@ -1,8 +1,10 @@
+ from __future__ import annotations
+ 
+ import json
++import logging
+ import os
+ import shlex
++import shutil
+ import stat
+ from pathlib import Path
+ 
+@@ -444,3 +446,357 @@ def test_sabotaged_runtime_root_fails_loudly(
+             ContextPolicy(scope="persona"),
+             cwd,
+         )
++
++
++# ---------------------------------------------------------------------------
++# F431 (issue #286): config.toml path-valued keys must be materialized into the
++# isolated persona codex-home, or codex dies at launch resolving a relative
++# path against CODEX_HOME. See persona_context.CODEX_CONFIG_FILE_KEYS.
++# ---------------------------------------------------------------------------
++
++
++def _write_codex_config_with(env: dict[str, Path], body: str) -> None:
++    if not env["cwd"].exists():
++        env["cwd"].mkdir(parents=True)
++    (env["codex"] / "config.toml").write_text(body, encoding="utf-8")
++
++
++def test_codex_relative_model_instructions_file_materialized(
++    persona_env: dict[str, Path],
++) -> None:
++    """A relative model_instructions_file is copied into the persona home so the
++    unchanged config value resolves against CODEX_HOME at launch (F431)."""
++    (persona_env["codex"] / "gpt-unrestricted.md").write_text(
++        "# custom system prompt\n", encoding="utf-8"
++    )
++    _write_codex_config_with(
++        persona_env,
++        'model = "gpt-test"\nmodel_instructions_file = "./gpt-unrestricted.md"\n',
++    )
++    plan = compose_persona_plan(
++        "codex-instr", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
++    )
++    assert plan.codex_home is not None
++    materialized = plan.codex_home / "gpt-unrestricted.md"
++    assert materialized.is_file() and not materialized.is_symlink()
++    assert materialized.read_text(encoding="utf-8") == "# custom system prompt\n"
++    assert stat.S_IMODE(materialized.stat().st_mode) == 0o600
++    # The rewritten config keeps the original relative value verbatim.
++    config = (plan.codex_home / "config.toml").read_text(encoding="utf-8")
++    assert 'model_instructions_file = "./gpt-unrestricted.md"' in config
++
++
++def test_codex_bare_relative_instructions_file_materialized(
++    persona_env: dict[str, Path],
++) -> None:
++    """A bare filename (no ./) is treated as relative to the codex home too."""
++    (persona_env["codex"] / "prompt.md").write_text("bare\n", encoding="utf-8")
++    _write_codex_config_with(
++        persona_env, 'model = "gpt-test"\nmodel_instructions_file = "prompt.md"\n'
++    )
++    plan = compose_persona_plan(
++        "codex-bare", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
++    )
++    assert (plan.codex_home / "prompt.md").read_text(encoding="utf-8") == "bare\n"
++
++
++def test_codex_nested_relative_instructions_file_materialized(
++    persona_env: dict[str, Path],
++) -> None:
++    """A relative path with subdirectories is mirrored at the same relative path."""
++    nested = persona_env["codex"] / "prompts" / "sys.md"
++    nested.parent.mkdir(parents=True)
++    nested.write_text("nested\n", encoding="utf-8")
++    _write_codex_config_with(
++        persona_env, 'model = "gpt-test"\nmodel_instructions_file = "prompts/sys.md"\n'
++    )
++    plan = compose_persona_plan(
++        "codex-nested", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
++    )
++    copied = plan.codex_home / "prompts" / "sys.md"
++    assert copied.is_file() and copied.read_text(encoding="utf-8") == "nested\n"
++
++
++def test_codex_experimental_instructions_file_alias_materialized(
++    persona_env: dict[str, Path],
++) -> None:
++    """The deprecated experimental_instructions_file alias is covered too."""
++    (persona_env["codex"] / "legacy.md").write_text("legacy\n", encoding="utf-8")
++    _write_codex_config_with(
++        persona_env, 'model = "gpt-test"\nexperimental_instructions_file = "./legacy.md"\n'
++    )
++    plan = compose_persona_plan(
++        "codex-legacy", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
++    )
++    assert (plan.codex_home / "legacy.md").read_text(encoding="utf-8") == "legacy\n"
++
++
++def test_codex_compact_prompt_file_materialized(persona_env: dict[str, Path]) -> None:
++    (persona_env["codex"] / "compact.md").write_text("compact\n", encoding="utf-8")
++    _write_codex_config_with(
++        persona_env,
++        'model = "gpt-test"\nexperimental_compact_prompt_file = "./compact.md"\n',
++    )
++    plan = compose_persona_plan(
++        "codex-compact", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
++    )
++    assert (plan.codex_home / "compact.md").read_text(encoding="utf-8") == "compact\n"
++
++
++def test_codex_absolute_instructions_file_not_copied_when_present(
++    persona_env: dict[str, Path],
++) -> None:
++    """Absolute values resolve identically everywhere; codex reads them directly,
++    so nothing is materialized — but a missing absolute target still fails."""
++    abs_file = persona_env["codex"] / "abs.md"
++    abs_file.write_text("abs\n", encoding="utf-8")
++    _write_codex_config_with(
++        persona_env, f'model = "gpt-test"\nmodel_instructions_file = "{abs_file}"\n'
++    )
++    plan = compose_persona_plan(
++        "codex-abs", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
++    )
++    # No relative mirror is created; the absolute target is used in place.
++    assert not (plan.codex_home / "abs.md").exists()
++
++
++def test_codex_missing_relative_instructions_file_fails_loudly(
++    persona_env: dict[str, Path],
++) -> None:
++    """A referenced-but-missing file is a hard error naming the path, not a skip."""
++    _write_codex_config_with(
++        persona_env, 'model = "gpt-test"\nmodel_instructions_file = "./nope.md"\n'
++    )
++    with pytest.raises(PersonaContextError, match="persona_codex_config_file_missing.*nope.md"):
++        compose_persona_plan(
++            "codex-missing", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
++        )
++    # Composition failed atomically: no persona tree is left behind.
++    assert resolve_codex_home("codex-missing") != (
++        persona_env["runtime"] / "cao-personas" / "codex-missing"
++    )
++
++
++def test_codex_missing_absolute_instructions_file_fails_loudly(
++    persona_env: dict[str, Path],
++) -> None:
++    missing = persona_env["home"] / "gone.md"
++    _write_codex_config_with(
++        persona_env, f'model = "gpt-test"\nmodel_instructions_file = "{missing}"\n'
++    )
++    with pytest.raises(PersonaContextError, match="persona_codex_config_file_missing"):
++        compose_persona_plan(
++            "codex-absmiss", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
++        )
++
++
++def test_codex_parent_escape_instructions_file_rejected(
++    persona_env: dict[str, Path],
++) -> None:
++    """A relative value with .. must be rejected before any filesystem write."""
++    _write_codex_config_with(
++        persona_env, 'model = "gpt-test"\nmodel_instructions_file = "../escape.md"\n'
++    )
++    with pytest.raises(PersonaContextError, match="persona_codex_config_path_escape"):
++        compose_persona_plan(
++            "codex-escape", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
++        )
++
++
++def test_codex_config_without_path_keys_unaffected(persona_env: dict[str, Path]) -> None:
++    """The default fixture config (no path keys) composes exactly as before."""
++    persona_env["cwd"].mkdir(parents=True)
++    plan = compose_persona_plan(
++        "codex-plain", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
++    )
++    config = (plan.codex_home / "config.toml").read_text(encoding="utf-8")
++    assert config.startswith("project_doc_max_bytes = 0\n")
++    # No stray files materialized beyond the known codex-home contents.
++    names = sorted(p.name for p in plan.codex_home.iterdir())
++    assert names == ["auth.json", "config.toml"]
++
++
++# ---------------------------------------------------------------------------
++# F431 round 2 gate remediation:
++#   BLOCKER-1  model_catalog_json is a fourth top-level startup-read file path.
++#   SHOULD-1   nested relative input path keys -> one degraded warning.
++#   SHOULD-2   symlink source rejection must test the UNresolved candidate.
++# ---------------------------------------------------------------------------
++
++# A minimal catalog with one model entry. Real codex validates content further
++# (17-field ModelInfo); the portable assertions below only need a present file,
++# and the optional codex smoke only asserts the F431 "os error 2" class is gone.
++_CATALOG_JSON = '{"models": [{"id": "gpt-test"}]}\n'
++
++
++def test_codex_model_catalog_json_materialized(persona_env: dict[str, Path]) -> None:
++    """BLOCKER-1: a relative model_catalog_json is materialized into the persona
++    home so codex's startup config load resolves it against CODEX_HOME (F431)."""
++    (persona_env["codex"] / "catalog.json").write_text(_CATALOG_JSON, encoding="utf-8")
++    _write_codex_config_with(
++        persona_env, 'model = "gpt-test"\nmodel_catalog_json = "./catalog.json"\n'
++    )
++    plan = compose_persona_plan(
++        "codex-catalog", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
++    )
++    assert plan.codex_home is not None
++    materialized = plan.codex_home / "catalog.json"
++    assert materialized.is_file() and not materialized.is_symlink()
++    assert materialized.read_text(encoding="utf-8") == _CATALOG_JSON
++    assert stat.S_IMODE(materialized.stat().st_mode) == 0o600
++    # Config keeps the original relative value; codex resolves it under CODEX_HOME.
++    config = (plan.codex_home / "config.toml").read_text(encoding="utf-8")
++    assert 'model_catalog_json = "./catalog.json"' in config
++
++
++def test_codex_model_catalog_json_in_covered_keys() -> None:
++    """Key-coverage guard: model_catalog_json must stay in the materialized set
++    (BLOCKER-1 would regress silently if it were dropped from the tuple)."""
++    assert "model_catalog_json" in persona_context.CODEX_CONFIG_FILE_KEYS
++
++
++def test_codex_missing_model_catalog_json_fails_loudly(persona_env: dict[str, Path]) -> None:
++    """A referenced-but-missing catalog is a hard error naming the path, matching
++    the reviewer's reproduced 'failed to load configuration' launch class."""
++    _write_codex_config_with(
++        persona_env, 'model = "gpt-test"\nmodel_catalog_json = "./catalog.json"\n'
++    )
++    with pytest.raises(
++        PersonaContextError, match="persona_codex_config_file_missing.*catalog.json"
++    ):
++        compose_persona_plan(
++            "codex-catmiss",
++            "codex",
++            "reviewer",
++            ContextPolicy(scope="persona"),
++            persona_env["cwd"],
++        )
++
++
++@pytest.mark.skipif(shutil.which("codex") is None, reason="codex binary not available")
++def test_codex_persona_config_catalog_resolves_placeholder(persona_env: dict[str, Path]) -> None:
++    """BLOCKER-1 production-shape check (no real IO — unit tier): after
++    compose_persona_plan materializes the catalog, the persona config.toml keeps
++    the relative value AND the referenced file exists at the exact relative path
++    codex would resolve under CODEX_HOME. This is what eliminates the reviewer's
++    reproduced 'No such file or directory (os error 2)' launch failure; a live
++    `codex features list` smoke would be real IO and is barred from the unit tier
++    (F254 G2), so we assert the resolvable on-disk state instead."""
++    (persona_env["codex"] / "catalog.json").write_text(_CATALOG_JSON, encoding="utf-8")
++    _write_codex_config_with(
++        persona_env, 'model = "gpt-test"\nmodel_catalog_json = "./catalog.json"\n'
++    )
++    plan = compose_persona_plan(
++        "codex-resolves", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
++    )
++    config = (plan.codex_home / "config.toml").read_text(encoding="utf-8")
++    assert 'model_catalog_json = "./catalog.json"' in config
++    # The exact path codex resolves the relative value to under CODEX_HOME.
++    resolved = plan.codex_home / "catalog.json"
++    assert resolved.is_file() and resolved.read_text(encoding="utf-8") == _CATALOG_JSON
++
++
++def test_codex_relative_symlink_source_rejected(persona_env: dict[str, Path]) -> None:
++    """SHOULD-2: an in-home symlink SOURCE for a materialized key is rejected. The
++    check must run on the UNresolved candidate (resolve() would dereference the
++    link and hide it)."""
++    real_target = persona_env["codex"] / "real-prompt.md"
++    real_target.write_text("real\n", encoding="utf-8")
++    link = persona_env["codex"] / "link-prompt.md"
++    link.symlink_to(real_target)  # in-home symlink -> in-home regular file
++    _write_codex_config_with(
++        persona_env, 'model = "gpt-test"\nmodel_instructions_file = "./link-prompt.md"\n'
++    )
++    with pytest.raises(
++        PersonaContextError, match="persona_codex_config_symlink_source.*link-prompt.md"
++    ):
++        compose_persona_plan(
++            "codex-symlink",
++            "codex",
++            "reviewer",
++            ContextPolicy(scope="persona"),
++            persona_env["cwd"],
++        )
++
++
++def test_codex_nested_relative_agent_config_warns(
++    persona_env: dict[str, Path], caplog: pytest.LogCaptureFixture
++) -> None:
++    """SHOULD-1: a nested relative agents.<name>.config_file emits ONE degraded
++    warning naming key+value and is NOT fatal (composition still succeeds)."""
++    _write_codex_config_with(
++        persona_env,
++        'model = "gpt-test"\n[agents.test]\nconfig_file = "./role.toml"\n',
++    )
++    with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.utils.persona_context"):
++        plan = compose_persona_plan(
++            "codex-nestedwarn",
++            "codex",
++            "reviewer",
++            ContextPolicy(scope="persona"),
++            persona_env["cwd"],
++        )
++    assert plan.codex_home is not None  # non-fatal: composition succeeded
++    warnings = [
++        r
++        for r in caplog.records
++        if r.levelno == logging.WARNING
++        and "persona_codex_config_nested_relative_unsupported" in r.getMessage()
++    ]
++    assert len(warnings) == 1, [r.getMessage() for r in caplog.records]
++    assert "agents.test.config_file" in warnings[0].getMessage()
++    assert "./role.toml" in warnings[0].getMessage()
++    # The nested file is NOT materialized (unsupported contract).
++    assert not (plan.codex_home / "role.toml").exists()
++
++
++def test_codex_nested_relative_skill_and_provider_warn(
++    persona_env: dict[str, Path], caplog: pytest.LogCaptureFixture
++) -> None:
++    """SHOULD-1: skills.config.<n>.path and model_providers.<id>.auth.cwd nested
++    relative values are detected in the single warning."""
++    _write_codex_config_with(
++        persona_env,
++        'model = "gpt-test"\n'
++        '[[skills.config]]\npath = "./skills/foo"\n'
++        '[model_providers.acme.auth]\ncwd = "./auth-wd"\n',
++    )
++    with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.utils.persona_context"):
++        compose_persona_plan(
++            "codex-nested2",
++            "codex",
++            "reviewer",
++            ContextPolicy(scope="persona"),
++            persona_env["cwd"],
++        )
++    msgs = [
++        r.getMessage()
++        for r in caplog.records
++        if "persona_codex_config_nested_relative_unsupported" in r.getMessage()
++    ]
++    assert len(msgs) == 1, [r.getMessage() for r in caplog.records]
++    assert "skills.config.0.path" in msgs[0]
++    assert "model_providers.acme.auth.cwd" in msgs[0]
++
++
++def test_codex_nested_absolute_paths_do_not_warn(
++    persona_env: dict[str, Path], caplog: pytest.LogCaptureFixture
++) -> None:
++    """SHOULD-1: absolute nested values relocate correctly and must NOT warn."""
++    _write_codex_config_with(
++        persona_env,
++        'model = "gpt-test"\n[agents.test]\nconfig_file = "/etc/codex/role.toml"\n',
++    )
++    with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.utils.persona_context"):
++        compose_persona_plan(
++            "codex-absnested",
++            "codex",
++            "reviewer",
++            ContextPolicy(scope="persona"),
++            persona_env["cwd"],
++        )
++    assert not [
++        r
++        for r in caplog.records
++        if "persona_codex_config_nested_relative_unsupported" in r.getMessage()
++    ]
