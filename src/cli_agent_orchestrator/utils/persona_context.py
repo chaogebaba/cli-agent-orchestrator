@@ -11,6 +11,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import tomllib
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,21 @@ RESERVED_LEAVES = {
     "settings.json",
     "persona-manifest.json",
 }
+# Top-level scalar config.toml keys whose value is a path to a file codex reads
+# at launch. Relative values resolve against CODEX_HOME, which for a persona is
+# the isolated codex-home — so the referenced file must be materialized there or
+# codex dies at startup with ProviderLaunchFailed (F431, issue #286).
+# Source: codex config reference (developers.openai.com/codex/config-reference,
+# fetched 2026-08-24). experimental_instructions_file is the deprecated alias
+# for model_instructions_file; experimental_compact_prompt_file is the
+# compaction-prompt override. Directory-valued keys (log_dir, sqlite_home) and
+# nested-table paths are intentionally excluded: they are outputs or optional
+# layers, not launch-blocking instruction files.
+CODEX_CONFIG_FILE_KEYS = (
+    "model_instructions_file",
+    "experimental_instructions_file",
+    "experimental_compact_prompt_file",
+)
 _PREFLIGHTED_BWRAP: set[tuple[str, str]] = set()
 
 
@@ -279,6 +295,63 @@ def _write_codex_config(source: Path, destination: Path) -> None:
     destination.chmod(0o600)
 
 
+def _materialize_codex_config_files(source_config: Path, codex_home: Path) -> None:
+    """Copy files referenced by path-valued keys in config.toml into the persona home.
+
+    The rewritten config.toml preserves the original (often relative) values for
+    keys like ``model_instructions_file``. codex resolves those relative paths
+    against ``CODEX_HOME`` — the isolated persona codex-home — so the referenced
+    file must exist there at the SAME relative location or codex dies at launch
+    ("failed to read model instructions file", ProviderLaunchFailed; F431).
+
+    Values are read from the REAL config (``source_config``) and resolved against
+    the real codex home (``source_config.parent``). Each referenced file is copied
+    (never symlinked — the value may be re-read across the persona lifetime and a
+    dangling link would reintroduce the failure) to the mirrored relative path
+    under ``codex_home``. Absolute values resolve identically everywhere and are
+    left untouched. A referenced-but-missing file is a hard error naming the path;
+    silently skipping it would just defer the same launch crash.
+    """
+    if not source_config.is_file():
+        return
+    real_home = source_config.parent
+    try:
+        parsed = tomllib.loads(source_config.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, OSError) as exc:
+        raise PersonaContextError(f"persona_codex_config_unparsable:{exc}") from exc
+    for key in CODEX_CONFIG_FILE_KEYS:
+        value = parsed.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value:
+            raise PersonaContextError(f"persona_codex_config_key_invalid:{key}")
+        raw = Path(value).expanduser()
+        # Absolute paths resolve to the same target regardless of CODEX_HOME;
+        # codex reads them directly, so nothing needs materializing.
+        if raw.is_absolute():
+            source_file = raw
+            if source_file.is_symlink() or not source_file.is_file():
+                raise PersonaContextError(f"persona_codex_config_file_missing:{key}:{value}")
+            continue
+        # Relative value: reject parent-escapes before touching the filesystem so
+        # a config like "../../etc/x" can never write outside the persona home.
+        parts = raw.parts
+        if ".." in parts or raw.is_absolute():
+            raise PersonaContextError(f"persona_codex_config_path_escape:{key}:{value}")
+        source_file = (real_home / raw).resolve()
+        if source_file.is_symlink() or not source_file.is_file():
+            raise PersonaContextError(f"persona_codex_config_file_missing:{key}:{value}")
+        # Confirm the resolved source stays under the real codex home.
+        try:
+            source_file.relative_to(real_home.resolve())
+        except ValueError as exc:
+            raise PersonaContextError(f"persona_codex_config_path_escape:{key}:{value}") from exc
+        destination = codex_home / raw
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_file, destination)
+        destination.chmod(0o600)
+
+
 def _bind_to_json(bind: PersonaBind | None) -> dict[str, str] | None:
     return None if bind is None else {"src": str(bind.src), "dst": str(bind.dst)}
 
@@ -427,16 +500,20 @@ def compose_persona_plan(
         real_claude_json = claude_home / ".claude.json"
         if real_claude_json.is_file():
             import shutil as _shutil
+
             _shutil.copy2(real_claude_json, staging / ".claude.json")
         else:
             (staging / ".claude.json").write_text(
-                json.dumps({
-                    "migrationVersion": 13,
-                    "hasCompletedOnboarding": True,
-                    "hasResetAutoModeOptInForDefaultOffer": True,
-                    "opusProMigrationComplete": True,
-                    "sonnet1m45MigrationComplete": True,
-                }) + "\n",
+                json.dumps(
+                    {
+                        "migrationVersion": 13,
+                        "hasCompletedOnboarding": True,
+                        "hasResetAutoModeOptInForDefaultOffer": True,
+                        "opusProMigrationComplete": True,
+                        "sonnet1m45MigrationComplete": True,
+                    }
+                )
+                + "\n",
                 encoding="utf-8",
             )
         (staging / ".claude.json").chmod(0o600)
@@ -496,6 +573,7 @@ def compose_persona_plan(
             codex_home = generation_dir / "codex-home"
             (staging / "codex-home").mkdir(mode=0o700)
             _write_codex_config(real_codex_home / "config.toml", staging / "codex-home/config.toml")
+            _materialize_codex_config_files(real_codex_home / "config.toml", staging / "codex-home")
             auth = real_codex_home / "auth.json"
             if auth.is_symlink() or not auth.is_file():
                 raise PersonaContextError("persona_codex_auth_invalid")
@@ -657,12 +735,7 @@ def load_persona_plan(terminal_id: str) -> PersonaPlan | None:
             if credential_bind is not None
             else tuple(env_unset) == ()
         )
-        if (
-            persona_bind is None
-            or bwrap is None
-            or env_set != expected_env
-            or not valid_env_unset
-        ):
+        if persona_bind is None or bwrap is None or env_set != expected_env or not valid_env_unset:
             raise PersonaContextError("persona_manifest_invalid:claude_wrapper")
         if persona_bind.src.resolve() != generation_dir:
             raise PersonaContextError("persona_manifest_invalid:persona_bind.src")

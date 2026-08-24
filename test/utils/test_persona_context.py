@@ -444,3 +444,171 @@ def test_sabotaged_runtime_root_fails_loudly(
             ContextPolicy(scope="persona"),
             cwd,
         )
+
+
+# ---------------------------------------------------------------------------
+# F431 (issue #286): config.toml path-valued keys must be materialized into the
+# isolated persona codex-home, or codex dies at launch resolving a relative
+# path against CODEX_HOME. See persona_context.CODEX_CONFIG_FILE_KEYS.
+# ---------------------------------------------------------------------------
+
+
+def _write_codex_config_with(env: dict[str, Path], body: str) -> None:
+    if not env["cwd"].exists():
+        env["cwd"].mkdir(parents=True)
+    (env["codex"] / "config.toml").write_text(body, encoding="utf-8")
+
+
+def test_codex_relative_model_instructions_file_materialized(
+    persona_env: dict[str, Path],
+) -> None:
+    """A relative model_instructions_file is copied into the persona home so the
+    unchanged config value resolves against CODEX_HOME at launch (F431)."""
+    (persona_env["codex"] / "gpt-unrestricted.md").write_text(
+        "# custom system prompt\n", encoding="utf-8"
+    )
+    _write_codex_config_with(
+        persona_env,
+        'model = "gpt-test"\nmodel_instructions_file = "./gpt-unrestricted.md"\n',
+    )
+    plan = compose_persona_plan(
+        "codex-instr", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
+    )
+    assert plan.codex_home is not None
+    materialized = plan.codex_home / "gpt-unrestricted.md"
+    assert materialized.is_file() and not materialized.is_symlink()
+    assert materialized.read_text(encoding="utf-8") == "# custom system prompt\n"
+    assert stat.S_IMODE(materialized.stat().st_mode) == 0o600
+    # The rewritten config keeps the original relative value verbatim.
+    config = (plan.codex_home / "config.toml").read_text(encoding="utf-8")
+    assert 'model_instructions_file = "./gpt-unrestricted.md"' in config
+
+
+def test_codex_bare_relative_instructions_file_materialized(
+    persona_env: dict[str, Path],
+) -> None:
+    """A bare filename (no ./) is treated as relative to the codex home too."""
+    (persona_env["codex"] / "prompt.md").write_text("bare\n", encoding="utf-8")
+    _write_codex_config_with(
+        persona_env, 'model = "gpt-test"\nmodel_instructions_file = "prompt.md"\n'
+    )
+    plan = compose_persona_plan(
+        "codex-bare", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
+    )
+    assert (plan.codex_home / "prompt.md").read_text(encoding="utf-8") == "bare\n"
+
+
+def test_codex_nested_relative_instructions_file_materialized(
+    persona_env: dict[str, Path],
+) -> None:
+    """A relative path with subdirectories is mirrored at the same relative path."""
+    nested = persona_env["codex"] / "prompts" / "sys.md"
+    nested.parent.mkdir(parents=True)
+    nested.write_text("nested\n", encoding="utf-8")
+    _write_codex_config_with(
+        persona_env, 'model = "gpt-test"\nmodel_instructions_file = "prompts/sys.md"\n'
+    )
+    plan = compose_persona_plan(
+        "codex-nested", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
+    )
+    copied = plan.codex_home / "prompts" / "sys.md"
+    assert copied.is_file() and copied.read_text(encoding="utf-8") == "nested\n"
+
+
+def test_codex_experimental_instructions_file_alias_materialized(
+    persona_env: dict[str, Path],
+) -> None:
+    """The deprecated experimental_instructions_file alias is covered too."""
+    (persona_env["codex"] / "legacy.md").write_text("legacy\n", encoding="utf-8")
+    _write_codex_config_with(
+        persona_env, 'model = "gpt-test"\nexperimental_instructions_file = "./legacy.md"\n'
+    )
+    plan = compose_persona_plan(
+        "codex-legacy", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
+    )
+    assert (plan.codex_home / "legacy.md").read_text(encoding="utf-8") == "legacy\n"
+
+
+def test_codex_compact_prompt_file_materialized(persona_env: dict[str, Path]) -> None:
+    (persona_env["codex"] / "compact.md").write_text("compact\n", encoding="utf-8")
+    _write_codex_config_with(
+        persona_env,
+        'model = "gpt-test"\nexperimental_compact_prompt_file = "./compact.md"\n',
+    )
+    plan = compose_persona_plan(
+        "codex-compact", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
+    )
+    assert (plan.codex_home / "compact.md").read_text(encoding="utf-8") == "compact\n"
+
+
+def test_codex_absolute_instructions_file_not_copied_when_present(
+    persona_env: dict[str, Path],
+) -> None:
+    """Absolute values resolve identically everywhere; codex reads them directly,
+    so nothing is materialized — but a missing absolute target still fails."""
+    abs_file = persona_env["codex"] / "abs.md"
+    abs_file.write_text("abs\n", encoding="utf-8")
+    _write_codex_config_with(
+        persona_env, f'model = "gpt-test"\nmodel_instructions_file = "{abs_file}"\n'
+    )
+    plan = compose_persona_plan(
+        "codex-abs", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
+    )
+    # No relative mirror is created; the absolute target is used in place.
+    assert not (plan.codex_home / "abs.md").exists()
+
+
+def test_codex_missing_relative_instructions_file_fails_loudly(
+    persona_env: dict[str, Path],
+) -> None:
+    """A referenced-but-missing file is a hard error naming the path, not a skip."""
+    _write_codex_config_with(
+        persona_env, 'model = "gpt-test"\nmodel_instructions_file = "./nope.md"\n'
+    )
+    with pytest.raises(PersonaContextError, match="persona_codex_config_file_missing.*nope.md"):
+        compose_persona_plan(
+            "codex-missing", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
+        )
+    # Composition failed atomically: no persona tree is left behind.
+    assert resolve_codex_home("codex-missing") != (
+        persona_env["runtime"] / "cao-personas" / "codex-missing"
+    )
+
+
+def test_codex_missing_absolute_instructions_file_fails_loudly(
+    persona_env: dict[str, Path],
+) -> None:
+    missing = persona_env["home"] / "gone.md"
+    _write_codex_config_with(
+        persona_env, f'model = "gpt-test"\nmodel_instructions_file = "{missing}"\n'
+    )
+    with pytest.raises(PersonaContextError, match="persona_codex_config_file_missing"):
+        compose_persona_plan(
+            "codex-absmiss", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
+        )
+
+
+def test_codex_parent_escape_instructions_file_rejected(
+    persona_env: dict[str, Path],
+) -> None:
+    """A relative value with .. must be rejected before any filesystem write."""
+    _write_codex_config_with(
+        persona_env, 'model = "gpt-test"\nmodel_instructions_file = "../escape.md"\n'
+    )
+    with pytest.raises(PersonaContextError, match="persona_codex_config_path_escape"):
+        compose_persona_plan(
+            "codex-escape", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
+        )
+
+
+def test_codex_config_without_path_keys_unaffected(persona_env: dict[str, Path]) -> None:
+    """The default fixture config (no path keys) composes exactly as before."""
+    persona_env["cwd"].mkdir(parents=True)
+    plan = compose_persona_plan(
+        "codex-plain", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
+    )
+    config = (plan.codex_home / "config.toml").read_text(encoding="utf-8")
+    assert config.startswith("project_doc_max_bytes = 0\n")
+    # No stray files materialized beyond the known codex-home contents.
+    names = sorted(p.name for p in plan.codex_home.iterdir())
+    assert names == ["auth.json", "config.toml"]
