@@ -900,6 +900,16 @@ class TestConcurrencyRaces:
         asserts that ``stop_reader()`` is provably blocked on the held lock
         during that window — a mechanical proof the two sections share a
         critical section, not just a probabilistic absence of the bug.
+
+        F418: The mock ONLY blocks when ``manager._lock`` is held by the
+        calling thread — discriminating the target ``time.monotonic()`` call
+        (line 478, inside ``with self._lock:``) from other ``monotonic()``
+        calls in the same loop (batch_start assignment, coalesce-window
+        check) that execute OUTSIDE the lock. Without this guard, under
+        xdist CPU contention the mock could fire on an unlocked call first,
+        blocking the reader without holding ``_lock``, so ``stop_reader``
+        wouldn't actually contend — a false pass that becomes a flake when
+        the timing shifts.
         """
         monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
         fifo_path = tmp_path / "term-race.fifo"
@@ -916,8 +926,14 @@ class TestConcurrencyRaces:
         real_monotonic = time.monotonic
 
         def blocking_monotonic():
-            entered_write_section.set()
-            release_write_section.wait(timeout=2.0)
+            # Only block when the caller holds _lock — this is the critical
+            # section at line 478. All other monotonic() calls in the reader
+            # loop (batch_start, coalesce check) happen OUTSIDE the lock and
+            # must pass through immediately to avoid false interception under
+            # xdist CPU contention (F418 root cause).
+            if manager._lock.locked():
+                entered_write_section.set()
+                release_write_section.wait(timeout=5.0)
             return real_monotonic()
 
         stop_flag = threading.Event()
@@ -940,7 +956,7 @@ class TestConcurrencyRaces:
             wfd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
             try:
                 os.write(wfd, b"x")
-                assert entered_write_section.wait(timeout=2.0), (
+                assert entered_write_section.wait(timeout=5.0), (
                     "reader thread never reached the _last_data_at write — "
                     "test setup is broken, not exercising the race"
                 )
@@ -950,18 +966,18 @@ class TestConcurrencyRaces:
                 # If the check-then-write is atomic under _lock, stop_reader
                 # must block trying to acquire it (held by the reader thread,
                 # parked in blocking_monotonic) rather than racing ahead.
-                threading.Event().wait(0.1)
+                threading.Event().wait(0.15)
                 assert stopper.is_alive(), (
                     "stop_reader must be blocked on the lock held by the reader "
                     "thread's check-then-write, not proceeding concurrently"
                 )
 
                 release_write_section.set()
-                stopper.join(timeout=2.0)
+                stopper.join(timeout=3.0)
             finally:
                 os.close(wfd)
                 stop_flag.set()
-                reader.join(timeout=2.0)
+                reader.join(timeout=3.0)
 
         assert terminal_id not in manager._last_data_at, (
             "stop_reader's pop must win the race — an atomic check-then-write "
