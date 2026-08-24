@@ -4879,20 +4879,13 @@ def claim_deferred_init_failure(
                         resolve_inbox_receiver(db, cast(str, caller_id))
                     )
                     row.init_state = "init_failed_notified"
-                    db.add(
-                        InboxModel(
-                            **_stamp_enqueue_generation(
-                                db,
-                                {
-                                    "sender_id": terminal_id,
-                                    "receiver_id": receiver_cache,
-                                    "logical_receiver_id": logical_receiver_id,
-                                    "message": notice,
-                                    "orchestration_type": OrchestrationType.SEND_MESSAGE.value,
-                                    "status": MessageStatus.PENDING.value,
-                                },
-                            )
-                        )
+                    _insert_routed_inbox_row(
+                        db,
+                        sender_id=terminal_id,
+                        receiver_id=receiver_cache,
+                        logical_receiver_id=logical_receiver_id,
+                        message=notice,
+                        orchestration_type=OrchestrationType.SEND_MESSAGE,
                     )
                     status = "claimed_notified"
                 else:
@@ -5763,20 +5756,14 @@ def _fire_open_barrier_in_db(
         .all()
     )
     receiver_id, logical_receiver_id = owner
-    row_fields = _stamp_enqueue_generation(
+    combined = _insert_routed_inbox_row(
         db,
-        {
-            "sender_id": f"barrier:{barrier.id}",
-            "receiver_id": receiver_id,
-            "logical_receiver_id": logical_receiver_id,
-            "message": _render_callback_barrier(db, barrier, members, now),
-            "orchestration_type": OrchestrationType.SEND_MESSAGE.value,
-            "status": MessageStatus.PENDING.value,
-        },
+        sender_id=f"barrier:{barrier.id}",
+        receiver_id=receiver_id,
+        logical_receiver_id=logical_receiver_id,
+        message=_render_callback_barrier(db, barrier, members, now),
+        orchestration_type=OrchestrationType.SEND_MESSAGE,
     )
-    combined = InboxModel(**row_fields)
-    db.add(combined)
-    db.flush()
     db.query(InboxModel).filter(
         InboxModel.barrier_id == barrier.id,
         InboxModel.status == MessageStatus.HELD.value,
@@ -6300,20 +6287,14 @@ def insert_barrier_escalation_message(
         else:
             sender = f"watchdog:{terminal_id}"
             body = message
-        fields = _stamp_enqueue_generation(
+        row = _insert_routed_inbox_row(
             db,
-            {
-                "sender_id": sender,
-                "receiver_id": receiver_cache,
-                "logical_receiver_id": logical_receiver_id,
-                "message": body,
-                "orchestration_type": OrchestrationType.SEND_MESSAGE.value,
-                "status": MessageStatus.PENDING.value,
-            },
+            sender_id=sender,
+            receiver_id=receiver_cache,
+            logical_receiver_id=logical_receiver_id,
+            message=body,
+            orchestration_type=OrchestrationType.SEND_MESSAGE,
         )
-        row = InboxModel(**fields)
-        db.add(row)
-        db.flush()
         return WatchdogInsertResult("inserted", int(row.id))
 
 
@@ -6533,21 +6514,14 @@ def insert_identity_authority_notice(
             ):
                 db.rollback()
                 return NoticeInsertOutcome.FAILED_BEFORE_COMMIT
-            row = InboxModel(
-                **_stamp_enqueue_generation(
-                    db,
-                    {
-                        "sender_id": sender_id,
-                        "receiver_id": receiver_cache,
-                        "logical_receiver_id": logical_receiver_id,
-                        "message": message,
-                        "orchestration_type": OrchestrationType.SEND_MESSAGE.value,
-                        "status": MessageStatus.PENDING.value,
-                    },
-                )
+            row = _insert_routed_inbox_row(
+                db,
+                sender_id=sender_id,
+                receiver_id=receiver_cache,
+                logical_receiver_id=logical_receiver_id,
+                message=message,
+                orchestration_type=OrchestrationType.SEND_MESSAGE,
             )
-            db.add(row)
-            db.flush()
         except Exception:
             db.rollback()
             return NoticeInsertOutcome.FAILED_BEFORE_COMMIT
@@ -8111,25 +8085,18 @@ def _record_p5_orphan_notices(db: Any, rows: list[InboxModel]) -> tuple[int, int
             .first()
         )
         if existing is None:
-            db.add(
-                InboxModel(
-                    **_stamp_enqueue_generation(
-                        db,
-                        {
-                            "sender_id": notice_sender,
-                            "receiver_id": notice_receiver,
-                            "logical_receiver_id": logical_receiver_id,
-                            "message": (
-                                header
-                                + f"[message-trace] delivery to terminal {receiver_id} failed "
-                                f"because the receiver terminal no longer exists for "
-                                f"message(s) {ids}."
-                            ),
-                            "orchestration_type": OrchestrationType.SEND_MESSAGE.value,
-                            "status": MessageStatus.PENDING.value,
-                        },
-                    )
-                )
+            _insert_routed_inbox_row(
+                db,
+                sender_id=notice_sender,
+                receiver_id=notice_receiver,
+                logical_receiver_id=logical_receiver_id,
+                message=(
+                    header
+                    + f"[message-trace] delivery to terminal {receiver_id} failed "
+                    f"because the receiver terminal no longer exists for "
+                    f"message(s) {ids}."
+                ),
+                orchestration_type=OrchestrationType.SEND_MESSAGE,
             )
             notification_count += 1
     return notification_count, logged_only_count
@@ -8458,23 +8425,16 @@ def record_wpm1_stalled_notice(
             notice_receiver, logical_receiver_id, enqueue_generation = resolve_inbox_receiver(
                 db, recipient
             )
-            db.add(
-                InboxModel(
-                    **_stamp_enqueue_generation(
-                        db,
-                        {
-                            "sender_id": sender,
-                            "receiver_id": notice_receiver,
-                            "logical_receiver_id": logical_receiver_id,
-                            "message": header
-                            + "delivery stalled: receiver shows no progress / payload not yet "
-                            "confirmed; no reinjection will occur while unproven; will confirm "
-                            "if consumed",
-                            "orchestration_type": OrchestrationType.SEND_MESSAGE.value,
-                            "status": MessageStatus.PENDING.value,
-                        },
-                    )
-                )
+            _insert_routed_inbox_row(
+                db,
+                sender_id=sender,
+                receiver_id=notice_receiver,
+                logical_receiver_id=logical_receiver_id,
+                message=header
+                + "delivery stalled: receiver shows no progress / payload not yet "
+                "confirmed; no reinjection will occur while unproven; will confirm "
+                "if consumed",
+                orchestration_type=OrchestrationType.SEND_MESSAGE,
             )
         return "recorded"
 
@@ -8597,21 +8557,14 @@ def settle_wpm1_terminal_batch(
                             logical_receiver_id,
                             enqueue_generation,
                         ) = resolve_inbox_receiver(db, stalled.receiver_id)
-                        db.add(
-                            InboxModel(
-                                **_stamp_enqueue_generation(
-                                    db,
-                                    {
-                                        "sender_id": sender,
-                                        "receiver_id": notice_receiver,
-                                        "logical_receiver_id": logical_receiver_id,
-                                        "message": corrective_header
-                                        + "previously-stalled message was delivered",
-                                        "orchestration_type": OrchestrationType.SEND_MESSAGE.value,
-                                        "status": MessageStatus.PENDING.value,
-                                    },
-                                )
-                            )
+                        _insert_routed_inbox_row(
+                            db,
+                            sender_id=sender,
+                            receiver_id=notice_receiver,
+                            logical_receiver_id=logical_receiver_id,
+                            message=corrective_header
+                            + "previously-stalled message was delivered",
+                            orchestration_type=OrchestrationType.SEND_MESSAGE,
                         )
                 else:
                     logger.warning(
