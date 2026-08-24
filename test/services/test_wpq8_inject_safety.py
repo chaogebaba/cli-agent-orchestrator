@@ -674,16 +674,8 @@ def test_wpq11_inbox_writer_constructor_topology_drops_two_digest_seats():
     mailbox_owners, _ = _constructor_owners(root / "services" / "mailbox_service.py")
     owners = db_owners | mailbox_owners
     expected = {
-        "claim_deferred_init_failure",
-        "_fire_open_barrier_in_db",
         "_insert_routed_inbox_row",
-        "insert_barrier_escalation_message",
         "insert_watchdog_auto_resume_message",
-        "insert_identity_authority_notice",
-        "_record_p5_orphan_notices",
-        "record_wpm1_stalled_notice.operation",
-        "settle_wpm1_terminal_batch.operation",
-        "delete_mailbox",
     }
     assert owners == expected
 

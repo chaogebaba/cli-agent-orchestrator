@@ -1396,24 +1396,15 @@ def delete_mailbox(mailbox_id: str) -> dict[str, int]:
                             .first()
                         )
                         if prior is None:
-                            db.add(
-                                InboxModel(
-                                    **_stamp_enqueue_generation(
-                                        db,
-                                        {
-                                            "sender_id": f"message-trace:{mailbox_id}",
-                                            "receiver_id": receiver,
-                                            "logical_receiver_id": logical,
-                                            "message": header
-                                            + "delivery failed because the logical mailbox "
-                                            "was deleted",
-                                            "orchestration_type": (
-                                                OrchestrationType.SEND_MESSAGE.value
-                                            ),
-                                            "status": MessageStatus.PENDING.value,
-                                        },
-                                    )
-                                )
+                            _insert_routed_inbox_row(
+                                db,
+                                sender_id=f"message-trace:{mailbox_id}",
+                                receiver_id=receiver,
+                                logical_receiver_id=logical,
+                                message=header
+                                + "delivery failed because the logical mailbox "
+                                "was deleted",
+                                orchestration_type=OrchestrationType.SEND_MESSAGE,
                             )
                             notices += 1
                     if (
