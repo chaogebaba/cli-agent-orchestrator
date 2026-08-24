@@ -419,6 +419,7 @@ class TestAC4ChangeNotice:
 
             # Change content
             config.write_text('[model]\nname = "v2"\n')
+            _advance_mtime(config)
 
             watcher._check_and_notify()
             assert mock_push.call_count == 1
