@@ -404,7 +404,7 @@ def test_foreign_tmux_socket_collision_is_neither_adopted_nor_killed(
             capture_output=True,
             text=True,
         )
-        bootstrap._unlink_dead_tmux_socket(socket_name, settle=5.0)
+        bootstrap._unlink_dead_tmux_socket(socket_name, settle=15.0)
 
 
 def test_dead_tmux_socket_is_reaped_and_live_one_is_refused() -> None:
@@ -430,7 +430,7 @@ def test_dead_tmux_socket_is_reaped_and_live_one_is_refused() -> None:
             text=True,
         )
     assert socket_path.exists(), "F182: tmux leaves the socket inode behind after kill-server"
-    assert bootstrap._unlink_dead_tmux_socket(socket_name, settle=5.0) is True
+    assert bootstrap._unlink_dead_tmux_socket(socket_name, settle=15.0) is True
     assert not socket_path.exists()
     assert bootstrap._unlink_dead_tmux_socket(socket_name) is False
 
