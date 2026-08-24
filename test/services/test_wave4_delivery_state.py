@@ -974,6 +974,10 @@ def test_probe_15_prior_hit_suppression_precedes_every_open_kind():
 
 
 def test_probe_16_frozen_drain_sql_fixture_ratios():
+    import shutil
+
+    if not shutil.which("sqlite3"):
+        pytest.skip("sqlite3 CLI binary not installed (apt install sqlite3)")
     from test.conftest import ROOT_REPO
     if ROOT_REPO is None:
         pytest.skip("root repo not found (worktree without .git context)")
