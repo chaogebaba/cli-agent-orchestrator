@@ -894,22 +894,33 @@ class TestConcurrencyRaces:
         across create/stop churn that ``_watchdog_loop`` (which only iterates
         ``_pane_probe``) will never revisit or clean up.
 
-        This forces the exact interleaving via a synchronization barrier
-        (blocking ``time.monotonic()`` while the reader thread holds the lock
-        for the write) instead of relying on timing luck, and additionally
-        asserts that ``stop_reader()`` is provably blocked on the held lock
-        during that window — a mechanical proof the two sections share a
-        critical section, not just a probabilistic absence of the bug.
+        F418 round 2 — injection point: patches ``_last_data_at.__setitem__``
+        (the actual dict write) rather than ``time.monotonic()``. This couples
+        the interception directly to the ASSIGNMENT, not a proxy. The mock
+        signals the test thread from inside the dict write, proving the write
+        happens under the lock because:
+          (a) total lock removal → the mock fires but ``_lock`` is unheld, so
+              ``stop_reader`` races through its pop before the write completes
+              → ``terminal_id not in _readers`` after the pause → fast-red
+          (b) lock moved off the membership-check/write pair → same: the mock
+              fires outside the lock, stop_reader is NOT blocked on the lock
+              → pop completes → fast-red
 
-        F418: The mock ONLY blocks when ``manager._lock`` is held by the
-        calling thread — discriminating the target ``time.monotonic()`` call
-        (line 478, inside ``with self._lock:``) from other ``monotonic()``
-        calls in the same loop (batch_start assignment, coalesce-window
-        check) that execute OUTSIDE the lock. Without this guard, under
-        xdist CPU contention the mock could fire on an unlocked call first,
-        blocking the reader without holding ``_lock``, so ``stop_reader``
-        wouldn't actually contend — a false pass that becomes a flake when
-        the timing shifts.
+        The critical assertion is that ``terminal_id`` is STILL in
+        ``manager._readers`` while the assignment is in flight — proving the
+        lock holds off ``stop_reader``'s pop. This is not achievable without
+        the assignment being under the lock.
+
+        Flake root cause (original 2026-08-24 ~07:45Z, ``-n 4``): the old
+        ``blocking_monotonic`` mock used ``release_write_section.wait(timeout=2.0)``
+        — a bounded hold on the lock. Under xdist CPU starvation exceeding 2s
+        between the barrier succeeding and the stopper assertion, the mock's
+        wait timed out, the reader released the lock, and ``stop_reader``
+        completed before the test thread resumed. The assertion
+        ``stopper.is_alive()`` then failed — a setup-timing failure presenting
+        as a concurrency assertion failure. The fix uses an unbounded Event.wait
+        (no timeout) so the lock is held deterministically until the test
+        explicitly releases it.
         """
         monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
         fifo_path = tmp_path / "term-race.fifo"
@@ -921,30 +932,32 @@ class TestConcurrencyRaces:
         manager._readers[terminal_id] = threading.Event()
         manager._last_data_at[terminal_id] = 0.0
 
-        entered_write_section = threading.Event()
-        release_write_section = threading.Event()
-        real_monotonic = time.monotonic
+        # --- Injection: intercept __setitem__ on _last_data_at ---
+        # This fires exactly when the production code does
+        #   self._last_data_at[terminal_id] = time.monotonic()
+        # If that write is under _lock, we hold the lock by blocking here,
+        # which prevents stop_reader from acquiring _lock and popping the entry.
+        assignment_entered = threading.Event()
+        assignment_release = threading.Event()
+        real_setitem = dict.__setitem__
 
-        def blocking_monotonic():
-            # Only block when the caller holds _lock — this is the critical
-            # section at line 478. All other monotonic() calls in the reader
-            # loop (batch_start, coalesce check) happen OUTSIDE the lock and
-            # must pass through immediately to avoid false interception under
-            # xdist CPU contention (F418 root cause).
-            if manager._lock.locked():
-                entered_write_section.set()
-                release_write_section.wait(timeout=5.0)
-            return real_monotonic()
+        class InstrumentedDict(dict):
+            """A dict subclass that intercepts writes to the target key."""
+
+            def __setitem__(self, key, value):
+                if key == terminal_id and not assignment_release.is_set():
+                    assignment_entered.set()
+                    # Unbounded wait — only the test thread releases this.
+                    # No timeout means CPU starvation cannot expire the hold.
+                    assignment_release.wait()
+                real_setitem(self, key, value)
+
+        instrumented = InstrumentedDict(manager._last_data_at)
+        manager._last_data_at = instrumented
 
         stop_flag = threading.Event()
 
-        with (
-            patch("cli_agent_orchestrator.services.fifo_reader.bus.publish"),
-            patch(
-                "cli_agent_orchestrator.services.fifo_reader.time.monotonic",
-                side_effect=blocking_monotonic,
-            ),
-        ):
+        with patch("cli_agent_orchestrator.services.fifo_reader.bus.publish"):
             reader = threading.Thread(
                 target=manager._reader_loop,
                 args=(terminal_id, fifo_path, stop_flag),
@@ -956,29 +969,59 @@ class TestConcurrencyRaces:
             wfd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
             try:
                 os.write(wfd, b"x")
-                assert entered_write_section.wait(timeout=5.0), (
-                    "reader thread never reached the _last_data_at write — "
+                assert assignment_entered.wait(timeout=5.0), (
+                    "reader thread never reached the _last_data_at assignment — "
                     "test setup is broken, not exercising the race"
                 )
 
+                # The reader thread is now parked INSIDE __setitem__, which
+                # (in correct code) executes inside the `with self._lock:`
+                # block. Start the stopper: if the assignment is protected by
+                # _lock, stop_reader will block trying to acquire it and the
+                # pop will NOT have happened yet.
                 stopper = threading.Thread(target=manager.stop_reader, args=(terminal_id,))
                 stopper.start()
-                # If the check-then-write is atomic under _lock, stop_reader
-                # must block trying to acquire it (held by the reader thread,
-                # parked in blocking_monotonic) rather than racing ahead.
-                threading.Event().wait(0.15)
-                assert stopper.is_alive(), (
-                    "stop_reader must be blocked on the lock held by the reader "
-                    "thread's check-then-write, not proceeding concurrently"
+
+                # Give stopper time to either block on _lock (correct) or
+                # race through the pop (broken). 0.5s is generous — if the
+                # lock is not held, stop_reader completes in <1ms.
+                threading.Event().wait(0.5)
+
+                # CRITICAL ASSERTION: if the assignment is under _lock,
+                # stop_reader's `with self._lock:` is blocked, so the pop
+                # hasn't happened — terminal_id is still in _readers.
+                # If the lock is NOT held (mutant), stop_reader already
+                # raced through and popped it → fast-red.
+                assert terminal_id in manager._readers, (
+                    "stop_reader's pop raced past the assignment — the "
+                    "check-then-write is NOT protected by _lock (the lock "
+                    "does not cover the assignment)"
                 )
 
-                release_write_section.set()
-                stopper.join(timeout=3.0)
+                # Secondary: stopper must still be alive (blocked on _lock).
+                assert stopper.is_alive(), (
+                    "stop_reader must be blocked on _lock held by the reader "
+                    "thread's check-then-write section, not racing ahead"
+                )
+
             finally:
+                # Always release the mock so the reader can unblock and exit.
+                assignment_release.set()
+                # Give stopper time to complete after lock release.
+                stopper.join(timeout=5.0)
                 os.close(wfd)
                 stop_flag.set()
-                reader.join(timeout=3.0)
+                reader.join(timeout=5.0)
 
+        # Post-join assertions: both threads must have exited cleanly.
+        assert not stopper.is_alive(), (
+            "stop_reader did not complete within 5s after lock release"
+        )
+        assert not reader.is_alive(), (
+            "reader thread did not exit within 5s after stop_flag"
+        )
+
+        # After stop_reader completes, the terminal must be fully cleaned.
         assert terminal_id not in manager._last_data_at, (
             "stop_reader's pop must win the race — an atomic check-then-write "
             "must not resurrect the entry after teardown"
