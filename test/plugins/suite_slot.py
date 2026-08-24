@@ -16,6 +16,20 @@ Design:
 - Stale-lock safety: flock(2) releases on process death automatically —
   no pid-liveness heuristics on top.
 
+Self-destruct watchdog (F437, issue #292):
+- Per-test timeouts (pytest-timeout) do NOT bound wall clock: a hung
+  subprocess wait, a collection hang, or a C-level block escapes them.
+  A runaway run once held this slot for 6h46m.
+- The controller process that ACQUIRES the lock arms a daemon watchdog
+  (threading.Timer) for CAO_SUITE_SLOT_MAX_SECONDS (env, default 3600;
+  value <= 0 disables). On fire: print a loud diagnostic to stderr
+  (holder identity + elapsed) then hard-kill its own process group via
+  os.killpg(SIGKILL) — so xdist workers die with it. flock then releases
+  automatically, freeing the slot.
+- Armed ONLY when the lock was actually acquired: the CI path and xdist
+  workers (which skip acquisition) never arm — box-run's own -w covers
+  those.
+
 Registered via the ``pytest_plugins`` tuple in ``test/conftest.py``.
 """
 
@@ -24,7 +38,10 @@ from __future__ import annotations
 import datetime
 import fcntl
 import os
+import signal
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -33,6 +50,103 @@ _LOCK_PATH = Path("/data/cao-scratch/.suite-slot.lock")
 
 # Sentinel to track our lock fd across configure/unconfigure
 _lock_fd: int | None = None
+
+# Self-destruct watchdog state (controller process only)
+_watchdog: threading.Timer | None = None
+
+# Env knob for the wall-clock hard bound; default 1 hour.
+_MAX_SECONDS_ENV = "CAO_SUITE_SLOT_MAX_SECONDS"
+_DEFAULT_MAX_SECONDS = 3600.0
+
+
+def _max_seconds() -> float:
+    """Resolve the wall-clock hard bound from the environment.
+
+    Returns the configured number of seconds, or ``_DEFAULT_MAX_SECONDS``
+    when the env var is unset/blank/unparseable. A value <= 0 disables the
+    watchdog (returned verbatim so the caller can decide not to arm).
+    """
+    raw = os.environ.get(_MAX_SECONDS_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_MAX_SECONDS
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        # Unparseable → fall back to the safe default rather than disabling.
+        sys.stderr.write(
+            f"[suite-slot] WARNING: {_MAX_SECONDS_ENV}={raw!r} is not a number; "
+            f"using default {_DEFAULT_MAX_SECONDS:.0f}s\n"
+        )
+        return _DEFAULT_MAX_SECONDS
+
+
+def _watchdog_fire(max_seconds: float, armed_at: float) -> None:
+    """Loudly self-destruct the whole process group when the bound is hit.
+
+    flock(2) releases automatically once this process group dies, freeing
+    the suite slot for the next run.
+    """
+    elapsed = time.monotonic() - armed_at
+    holder_info = _read_holder_info()
+    banner = (
+        "\n"
+        "==================== SUITE-SLOT WATCHDOG ====================\n"
+        f"[suite-slot] SELF-DESTRUCT: wall-clock bound of {max_seconds:.0f}s exceeded\n"
+        f"[suite-slot]   elapsed:   {elapsed:.1f}s\n"
+        f"[suite-slot]   holder:    {holder_info}\n"
+        f"[suite-slot]   controller pid={os.getpid()} pgid={os.getpgrp()}\n"
+        "[suite-slot] hard-killing process group (SIGKILL) — slot will be freed\n"
+        "=============================================================\n"
+    )
+    try:
+        sys.stderr.write(banner)
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+    # Hard-kill our own process group so xdist workers die with us.
+    try:
+        os.killpg(os.getpgrp(), signal.SIGKILL)
+    except Exception:
+        # Fallback: at least take this process down hard.
+        os._exit(137)
+
+
+def _arm_watchdog() -> None:
+    """Arm the self-destruct watchdog if a positive bound is configured.
+
+    Caller MUST hold the acquired lock. Sets the module-global ``_watchdog``
+    so ``pytest_unconfigure`` can cancel it on a clean finish.
+    """
+    global _watchdog
+
+    max_seconds = _max_seconds()
+    if max_seconds <= 0:
+        sys.stderr.write(
+            f"[suite-slot] watchdog disabled ({_MAX_SECONDS_ENV}={max_seconds:.0f})\n"
+        )
+        return
+
+    armed_at = time.monotonic()
+    timer = threading.Timer(max_seconds, _watchdog_fire, args=(max_seconds, armed_at))
+    timer.daemon = True
+    timer.name = "suite-slot-watchdog"
+    timer.start()
+    _watchdog = timer
+    sys.stderr.write(
+        f"[suite-slot] watchdog armed — self-destruct in {max_seconds:.0f}s\n"
+    )
+
+
+def _cancel_watchdog() -> None:
+    """Cancel a pending watchdog timer (clean finish before the bound)."""
+    global _watchdog
+    if _watchdog is not None:
+        try:
+            _watchdog.cancel()
+        except Exception:
+            pass
+        _watchdog = None
 
 
 def _is_xdist_worker(config: pytest.Config) -> bool:
@@ -101,10 +215,15 @@ def pytest_configure(config: pytest.Config) -> None:
 
     _lock_fd = fd
 
+    # Lock is genuinely held now — arm the wall-clock self-destruct watchdog.
+    _arm_watchdog()
+
 
 def pytest_unconfigure(config: pytest.Config) -> None:
     """Release the suite slot lock."""
     global _lock_fd
+    # Cancel the watchdog first: we finished within the bound.
+    _cancel_watchdog()
     if _lock_fd is not None:
         try:
             fcntl.flock(_lock_fd, fcntl.LOCK_UN)

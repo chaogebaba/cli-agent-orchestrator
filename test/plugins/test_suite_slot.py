@@ -6,6 +6,12 @@ Tests:
 3. Contention with wait mode (CAO_SUITE_SLOT_WAIT=1) — eventually acquires.
 4. CI env var skips locking entirely.
 5. xdist worker processes do not attempt locking.
+6. Watchdog env parsing (CAO_SUITE_SLOT_MAX_SECONDS) — default/blank/bad/<=0.
+7. Arming decisions — armed only on real acquisition; not when disabled;
+   cancelled on clean unconfigure; NOT armed on CI / xdist / contention.
+8. Integration: a subprocess pytest run whose test sleeps past the bound
+   has its whole process group SIGKILLed ~on time, with the diagnostic,
+   and the slot lock is freed afterwards.
 """
 
 from __future__ import annotations
@@ -14,6 +20,7 @@ import fcntl
 import multiprocessing
 import multiprocessing.synchronize
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -31,9 +38,13 @@ def _isolate_lockfile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(suite_slot, "_LOCK_PATH", lock_path)
     # Reset module state
     monkeypatch.setattr(suite_slot, "_lock_fd", None)
+    monkeypatch.setattr(suite_slot, "_watchdog", None)
     # Ensure CI is not set (tests simulate non-CI)
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("CAO_SUITE_SLOT_WAIT", raising=False)
+    # Neutralize the wall-clock watchdog for tests that acquire the real lock:
+    # disable it so an armed daemon Timer can't SIGKILL the pytest runner.
+    monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "0")
 
 
 def _make_config(*, is_worker: bool = False) -> MagicMock:
@@ -259,3 +270,199 @@ class TestSkipConditions:
         suite_slot.pytest_configure(config)
         assert suite_slot._lock_fd is not None
         suite_slot.pytest_unconfigure(config)
+
+
+
+# ---------------------------------------------------------------------------
+# F437 (issue #292): self-destruct watchdog
+# ---------------------------------------------------------------------------
+
+
+class TestMaxSecondsParsing:
+    """CAO_SUITE_SLOT_MAX_SECONDS env parsing (`_max_seconds`)."""
+
+    def test_default_when_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CAO_SUITE_SLOT_MAX_SECONDS", raising=False)
+        assert suite_slot._max_seconds() == suite_slot._DEFAULT_MAX_SECONDS
+
+    def test_default_is_one_hour(self) -> None:
+        assert suite_slot._DEFAULT_MAX_SECONDS == 3600.0
+
+    def test_blank_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "   ")
+        assert suite_slot._max_seconds() == suite_slot._DEFAULT_MAX_SECONDS
+
+    def test_explicit_positive_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "120")
+        assert suite_slot._max_seconds() == 120.0
+
+    def test_fractional_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "2.5")
+        assert suite_slot._max_seconds() == 2.5
+
+    def test_zero_disables(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """<= 0 is returned verbatim so the caller can decide not to arm."""
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "0")
+        assert suite_slot._max_seconds() == 0.0
+
+    def test_negative_disables(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "-1")
+        assert suite_slot._max_seconds() == -1.0
+
+    def test_unparseable_falls_back_to_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A garbage value uses the safe default rather than disabling."""
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "not-a-number")
+        assert suite_slot._max_seconds() == suite_slot._DEFAULT_MAX_SECONDS
+
+
+class TestArmingDecisions:
+    """`_arm_watchdog` / `_cancel_watchdog` behavior (no real fire)."""
+
+    def test_arm_creates_daemon_timer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "3600")
+        try:
+            suite_slot._arm_watchdog()
+            assert suite_slot._watchdog is not None
+            assert suite_slot._watchdog.daemon is True
+            assert suite_slot._watchdog.is_alive()
+        finally:
+            suite_slot._cancel_watchdog()
+            assert suite_slot._watchdog is None
+
+    def test_disabled_when_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "0")
+        suite_slot._arm_watchdog()
+        assert suite_slot._watchdog is None
+
+    def test_disabled_when_negative(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "-5")
+        suite_slot._arm_watchdog()
+        assert suite_slot._watchdog is None
+
+    def test_cancel_is_idempotent(self) -> None:
+        suite_slot._cancel_watchdog()
+        suite_slot._cancel_watchdog()
+        assert suite_slot._watchdog is None
+
+    def test_configure_arms_when_lock_acquired(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The controller arms a live watchdog once it holds the lock."""
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "3600")
+        config = _make_config()
+        suite_slot.pytest_configure(config)
+        try:
+            assert suite_slot._lock_fd is not None
+            assert suite_slot._watchdog is not None
+            assert suite_slot._watchdog.is_alive()
+        finally:
+            suite_slot.pytest_unconfigure(config)
+        # Clean unconfigure cancels + clears the watchdog.
+        assert suite_slot._watchdog is None
+
+    def test_configure_does_not_arm_when_disabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "0")
+        config = _make_config()
+        suite_slot.pytest_configure(config)
+        try:
+            assert suite_slot._lock_fd is not None
+            assert suite_slot._watchdog is None
+        finally:
+            suite_slot.pytest_unconfigure(config)
+
+    def test_no_arm_on_ci(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CI path skips acquisition — must never arm the self-destruct."""
+        monkeypatch.setenv("CI", "true")
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "3600")
+        config = _make_config()
+        suite_slot.pytest_configure(config)
+        assert suite_slot._lock_fd is None
+        assert suite_slot._watchdog is None
+
+    def test_no_arm_on_xdist_worker(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """xdist workers skip acquisition — must never arm the self-destruct."""
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "3600")
+        config = _make_config(is_worker=True)
+        suite_slot.pytest_configure(config)
+        assert suite_slot._lock_fd is None
+        assert suite_slot._watchdog is None
+
+
+class TestWatchdogIntegration:
+    """End-to-end: a runaway run self-destructs and frees the slot.
+
+    Spawns a real child pytest whose single test sleeps far past a 2s bound.
+    The watchdog must SIGKILL the child's whole process group ~on time, emit
+    the diagnostic, and leave the lock free for the next acquirer.
+    """
+
+    def test_runaway_run_self_destructs_and_frees_slot(self, tmp_path: Path) -> None:
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        lock_path = tmp_path / ".suite-slot.lock"
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+
+        # A conftest that repoints the plugin's lockfile and registers it,
+        # so the child exercises the real acquire → arm → fire path.
+        conftest = run_dir / "conftest.py"
+        conftest.write_text(
+            "import sys, pathlib\n"
+            f"sys.path.insert(0, {str(repo_root)!r})\n"
+            "from test.plugins import suite_slot\n"
+            f"suite_slot._LOCK_PATH = pathlib.Path({str(lock_path)!r})\n"
+            "pytest_plugins = ('test.plugins.suite_slot',)\n"
+        )
+        # A test that hangs well past the 2s bound (would run ~120s).
+        (run_dir / "test_hang.py").write_text(
+            "import time\n"
+            "def test_sleep_forever():\n"
+            "    time.sleep(120)\n"
+        )
+
+        env = {k: v for k, v in os.environ.items() if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
+        env["CAO_SUITE_SLOT_MAX_SECONDS"] = "2"
+
+        # start_new_session=True → child is its own process-group leader, so
+        # the watchdog's killpg targets the child tree, not this test runner.
+        start = time.monotonic()
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-s", "test_hang.py"],
+            cwd=str(run_dir),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            out, _ = proc.communicate(timeout=25)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, _ = proc.communicate()
+            pytest.fail(f"watchdog did not fire; child hung. Output:\n{out}")
+
+        elapsed = time.monotonic() - start
+
+        # Killed by SIGKILL → negative return code -9 (process-group kill).
+        assert proc.returncode == -signal.SIGKILL, (
+            f"expected SIGKILL, got returncode={proc.returncode}\n{out}"
+        )
+        # Fired ~on the 2s bound, comfortably under the 30s incident ceiling.
+        assert elapsed < 20, f"took too long ({elapsed:.1f}s):\n{out}"
+        # Loud diagnostic present.
+        assert "SUITE-SLOT WATCHDOG" in out, out
+        assert "SELF-DESTRUCT" in out, out
+
+        # Slot freed: the lock is immediately re-acquirable non-blocking.
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o666)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
