@@ -550,6 +550,26 @@ class BaseProvider(ABC):
         The default implementation is a no-op (always allows the paste).
         """
 
+    def verify_submission_after_send(
+        self,
+        metadata: dict[str, Any],
+        backend: Any,
+    ) -> None:
+        """Provider hook called immediately after send_keys pastes+submits a message.
+
+        Gives TUI providers a chance to confirm the paste was actually SUBMITTED
+        (the submit Enter was not lost to a paste-vs-Enter render race) and to
+        recover by re-sending Enter when — and only when — a durable "still
+        drafted, not submitted" marker is observed on the pane. See
+        ``CodexProvider.verify_submission_after_send`` for the F435 recovery.
+
+        The default implementation is a no-op: providers with no observed
+        submit race are unaffected. Implementations MUST be idempotent — they
+        must never blind-Enter a composer that already submitted, and should
+        raise a clear error naming the terminal if submission cannot be
+        confirmed after bounded retries.
+        """
+
     def _restore_dispatch_locked(self, snapshot: dict[str, float | bool]) -> None:
         self._task_dispatched = bool(snapshot["task_dispatched"])
         self._last_dispatch_time = float(snapshot["last_dispatch_time"])

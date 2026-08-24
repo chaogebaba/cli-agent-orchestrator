@@ -4526,6 +4526,13 @@ def send_input(
             status_monitor.commit_dispatch(dispatch_txn)
             if provider:
                 provider.mark_input_received()
+                # F435: confirm the paste actually submitted (the submit Enter
+                # is occasionally lost to a paste-vs-Enter render race under
+                # concurrent codex dispatch). Provider-scoped: the default hook
+                # is a no-op, so non-codex providers are unaffected. Runs before
+                # any human-draft restore so a re-Enter can only ever resubmit
+                # the task, never a restored draft.
+                provider.verify_submission_after_send(metadata, backend)
         if preserved_draft is not None:
             preserved_draft.restore(backend)
 
@@ -4702,6 +4709,13 @@ def send_prepared_input(
         raise
     else:
         status_monitor.commit_dispatch(dispatch_txn)
+        if provider:
+            # F435: confirm the paste actually submitted before we treat the
+            # injection as complete. Provider-scoped no-op default keeps every
+            # non-codex provider unaffected. Runs before mark_injection_completed
+            # / on_submitted / draft restore so recovery re-Enter only ever
+            # resubmits the task.
+            provider.verify_submission_after_send(metadata, backend)
     injection_observation = status_monitor.mark_injection_completed(terminal_id)
     if on_submitted is not None:
         on_submitted(injection_observation)

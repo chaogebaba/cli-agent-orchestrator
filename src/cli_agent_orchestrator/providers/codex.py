@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from cli_agent_orchestrator.utils.persona_context import PersonaPlan
 
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.constants import BLOCKED_WAIT_CAP_S, CAO_HOME_DIR
+from cli_agent_orchestrator.constants import BLOCKED_WAIT_CAP_S, CAO_HOME_DIR, PYTE_SCREEN_ROWS
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
 from cli_agent_orchestrator.providers.base import (
     BaseProvider,
@@ -403,6 +403,33 @@ CODEX_EMPTY_COMPOSER_PLACEHOLDERS = {
 # CSI SGR sequences only (colour/intensity). Used to walk dim state on
 # escape-preserving capture-pane (-e) lines without treating cursor CSI as text.
 _SGR_CSI_RE = re.compile(r"\x1b\[([0-9;]*)m")
+
+# --- F435: paste-submit race recovery -------------------------------------
+# When several codex TUIs initialize/receive input concurrently, the submit
+# Enter after a bracketed paste is sometimes lost to a render race: the task
+# text lands in the composer as a "[Pasted Content NNNN chars]" chip but is
+# never submitted. The pane then sits idle at the drafted chip until the
+# stalled-callback watchdog fires (~120s) or a human spots it.
+#
+# The stuck signature is the composer prompt line carrying the paste chip:
+#   › [Pasted Content 3048 chars]
+# A SUBMITTED composer instead shows an empty idle placeholder (e.g.
+# "› Ask Codex to do anything") or the Working/Thinking spinner
+# ("• Working (0s • esc to interrupt)"). We recover by re-sending Enter ONLY
+# while the stuck chip is still present — never blind-Enter a submitted
+# composer (idempotent, no double-submit).
+CODEX_PASTE_CHIP_PATTERN = re.compile(r"[›»]\s*\[Pasted Content\s+\d+\s+chars\]")
+# Grace before the first submission check: give the TUI a beat to register the
+# paste and process the submit Enter under load.
+CODEX_SUBMIT_VERIFY_GRACE_SECONDS = 2.0
+# Bounded re-Enter attempts once the stuck chip is confirmed present.
+CODEX_SUBMIT_VERIFY_MAX_RETRIES = 3
+# Backoff between re-Enter attempts (seconds); grows per attempt.
+CODEX_SUBMIT_VERIFY_BACKOFF_SECONDS = 1.0
+
+
+class CodexSubmitStuckError(Exception):
+    """Raised when a codex composer never submits a pasted task after retries."""
 
 
 def _apply_sgr_params_to_dim(params: str, dim: bool) -> bool:
@@ -1940,7 +1967,7 @@ class CodexProvider(BaseProvider):
     @property
     def resolved_model(self) -> Optional[str]:
         """Return the effective model resolved during command build."""
-        return getattr(self, '_resolved_model', None)
+        return getattr(self, "_resolved_model", None)
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
@@ -2004,7 +2031,10 @@ class CodexProvider(BaseProvider):
                 signals.append(
                     ScreenSignal("progress", "TUI_PROGRESS_PATTERN", index, row, "corroborable")
                 )
-            if legacy_status == TerminalStatus.WAITING_USER_ANSWER and TRUST_SELECTOR_PATTERN.search(row):
+            if (
+                legacy_status == TerminalStatus.WAITING_USER_ANSWER
+                and TRUST_SELECTOR_PATTERN.search(row)
+            ):
                 signals.append(ScreenSignal("waiting", "TRUST_SELECTOR_PATTERN", index))
             if (
                 not progress_rows
@@ -2256,6 +2286,100 @@ class CodexProvider(BaseProvider):
         if draft.strip() in CODEX_EMPTY_COMPOSER_PLACEHOLDERS:
             return ""
         return draft
+
+    @staticmethod
+    def _pane_shows_pasted_chip(captured: str) -> bool:
+        """Whether the captured pane still shows an unsubmitted paste chip.
+
+        The stuck F435 signature is the composer prompt line carrying the
+        ``[Pasted Content NNNN chars]`` chip. A submitted composer never shows
+        this — it shows an empty idle placeholder or the Working spinner — so
+        the chip's PRESENCE is a durable, idempotent gate for re-sending Enter.
+
+        Escapes are stripped first so SGR-wrapped chips still match. Matching
+        is intentionally lenient about the prompt glyph (``›``/``»``) since the
+        glyph varies across codex releases.
+        """
+        if not captured:
+            return False
+        clean = strip_terminal_escapes(captured)
+        return CODEX_PASTE_CHIP_PATTERN.search(clean) is not None
+
+    def verify_submission_after_send(
+        self,
+        metadata: dict[str, Any],
+        backend: Any,
+    ) -> None:
+        """F435: confirm the pasted task submitted; re-Enter if it stuck.
+
+        After a bracketed paste + submit Enter, a render race can drop the
+        Enter, leaving the task drafted as a ``[Pasted Content NNNN chars]``
+        chip that never submits (the pane sits idle until the stalled-callback
+        watchdog fires ~120s later). This verifies submission and recovers:
+
+        * Wait a short grace, then capture the pane.
+        * If the stuck chip is ABSENT, the submit took — return (no extra Enter).
+        * While the stuck chip is PRESENT, re-send Enter and re-verify, with
+          bounded retries and backoff.
+        * If still stuck after the retries, raise ``CodexSubmitStuckError``
+          naming the terminal.
+
+        Idempotent by construction: Enter is only ever re-sent while the stuck
+        chip is observed, so a composer that already submitted is never
+        blind-Entered.
+        """
+        session = metadata["tmux_session"]
+        window = metadata["tmux_window"]
+
+        def _capture() -> str:
+            try:
+                return backend.get_history(
+                    session,
+                    window,
+                    tail_lines=PYTE_SCREEN_ROWS,
+                    strip_escapes=False,
+                )
+            except Exception:
+                logger.warning(
+                    "F435 submit-verify: pane capture failed for terminal %s",
+                    self.terminal_id,
+                )
+                return ""
+
+        time.sleep(CODEX_SUBMIT_VERIFY_GRACE_SECONDS)
+        if not self._pane_shows_pasted_chip(_capture()):
+            return  # Submitted normally — no recovery needed, no extra Enter.
+
+        for attempt in range(1, CODEX_SUBMIT_VERIFY_MAX_RETRIES + 1):
+            logger.warning(
+                "F435 submit-verify: paste chip still drafted on terminal %s "
+                "(attempt %d/%d); re-sending Enter",
+                self.terminal_id,
+                attempt,
+                CODEX_SUBMIT_VERIFY_MAX_RETRIES,
+            )
+            try:
+                backend.send_special_key(session, window, "Enter")
+            except Exception as exc:
+                logger.warning(
+                    "F435 submit-verify: re-Enter failed for terminal %s: %s",
+                    self.terminal_id,
+                    exc,
+                )
+            time.sleep(CODEX_SUBMIT_VERIFY_BACKOFF_SECONDS * attempt)
+            if not self._pane_shows_pasted_chip(_capture()):
+                logger.info(
+                    "F435 submit-verify: terminal %s submitted after %d re-Enter(s)",
+                    self.terminal_id,
+                    attempt,
+                )
+                return
+
+        raise CodexSubmitStuckError(
+            f"Codex terminal {self.terminal_id} did not submit the pasted task after "
+            f"{CODEX_SUBMIT_VERIFY_MAX_RETRIES} re-Enter attempts; the composer is still "
+            f"showing an unsubmitted '[Pasted Content ...]' chip"
+        )
 
     @staticmethod
     def _raw_after_prompt_glyph(raw_line: str) -> str:
