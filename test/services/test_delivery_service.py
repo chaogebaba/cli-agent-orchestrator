@@ -1,0 +1,521 @@
+"""F427: canonical focused roster for delivery_service.py.
+
+F408's "delivery" mutation shard listed test_delivery_fsm_stateful.py plus
+teammate-push files. Those never import this module (wave-2 coverage JSON:
+teammate_push 50.5%, delivery_service absent; 190/190 mutants SURVIVED).
+inbox/session/terminal each have test_<module>_service.py; delivery did not.
+
+This file is that missing roster: module-level import (collection loads the
+subject) plus Eq_NotEq pins for the snapshot-surviving control-flow surfaces
+(FSM analog of == "stop" / == "hit" / == "settled": empty/nonempty, rang,
+confirmed_dead, OPEN, delivered, mailbox_id scope).
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from cli_agent_orchestrator.clients.database import (
+    Base,
+    DeliveryObligationModel,
+    InboxMessageTraceEventModel,
+    InboxModel,
+    MailboxIncarnationModel,
+    MailboxModel,
+    PaneExitTombstoneModel,
+    TerminalModel,
+    _utcnow,
+)
+from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.services import delivery_service
+from cli_agent_orchestrator.services.delivery_service import (
+    DeliveryTarget,
+    LadderResult,
+    _drive_one_obligation,
+    _find_live_successor,
+    _fire_escalation_display_message,
+    _get_pending_oldest,
+    _refire_draft_state,
+    attempt_rung1,
+    attempt_rung2,
+    convergence_tick,
+    emit_trace_or_collapse,
+)
+
+# Collection of this file MUST load delivery_service. Do not lazy-import it.
+assert delivery_service.__name__ == "cli_agent_orchestrator.services.delivery_service"
+
+
+@pytest.fixture
+def ds_db(monkeypatch):
+    """In-memory schema with SessionLocal patched on the subject module."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    TestSession = sessionmaker(bind=engine)
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.SessionLocal", TestSession)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.delivery_service.SessionLocal", TestSession
+    )
+    return TestSession
+
+
+def _seed_terminal_mailbox(
+    db,
+    *,
+    tid: str = "sup1",
+    mb: str = "mb1",
+    role: str = "supervisor",
+    generation: int = 1,
+) -> None:
+    db.add(
+        TerminalModel(
+            id=tid,
+            tmux_session="cao-test",
+            tmux_window=tid,
+            provider="claude_code",
+            agent_profile=role,
+        )
+    )
+    db.add(
+        MailboxModel(
+            id=mb,
+            session_name="cao-test",
+            role=role,
+            current_terminal_id=tid,
+            generation=generation,
+            consumed_through_id=0,
+        )
+    )
+    db.add(
+        MailboxIncarnationModel(
+            mailbox_id=mb,
+            generation=generation,
+            terminal_id=tid,
+        )
+    )
+
+
+def _add_inbox(
+    db,
+    *,
+    row_id: int,
+    mailbox_id: str,
+    status: str = "pending",
+    receiver_id: str = "sup1",
+) -> None:
+    db.add(
+        InboxModel(
+            id=row_id,
+            sender_id="worker01",
+            receiver_id=receiver_id,
+            logical_receiver_id=mailbox_id,
+            message="hello",
+            status=status,
+            orchestration_type=OrchestrationType.SEND_MESSAGE.value,
+        )
+    )
+
+
+def _add_obligation(
+    db,
+    *,
+    row_id: int,
+    mailbox_id: str,
+    state: str = "OPEN",
+    next_attempt_at: datetime | None = None,
+) -> None:
+    now = _utcnow()
+    db.add(
+        DeliveryObligationModel(
+            inbox_row_id=row_id,
+            mailbox_id=mailbox_id,
+            state=state,
+            accepted_at=now,
+            next_attempt_at=next_attempt_at if next_attempt_at is not None else now,
+            attempts=0,
+        )
+    )
+
+
+def _live_target(**overrides) -> DeliveryTarget:
+    base = dict(
+        terminal_id="sup1",
+        tmux_session="cao-test",
+        tmux_window="supervisor",
+        cc_inbox_path="/tmp/test-inbox/team-lead.json",
+        has_registry=True,
+        liveness="presumed_live",
+    )
+    base.update(overrides)
+    return DeliveryTarget(**base)
+
+
+def _draft_provider(state: str) -> MagicMock:
+    provider = MagicMock()
+    provider.read_composer_draft_authority.return_value = (state, False)
+    return provider
+
+
+def _tombstone(db, terminal_id: str, generation: int = 1) -> None:
+    now = datetime.now(timezone.utc)
+    db.add(
+        PaneExitTombstoneModel(
+            id=f"ts-{terminal_id}",
+            incarnation_id=f"inc-{terminal_id}",
+            terminal_id=terminal_id,
+            terminal_generation=generation,
+            session_name="cao-test",
+            session_incarnation="epoch:1",
+            scope="window_gone",
+            proc_status="unavailable",
+            exit_evidence_status="unavailable_no_waiter",
+            memory_status="unavailable",
+            writer="observation",
+            schema_version=1,
+            complete=False,
+            observed_at=now,
+            written_at=now,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Suite-shape contract
+# ---------------------------------------------------------------------------
+
+
+def test_focused_roster_imports_delivery_service_module():
+    """Collection of test_delivery_service.py must bind the subject module."""
+    assert hasattr(delivery_service, "attempt_rung1")
+    assert hasattr(delivery_service, "convergence_tick")
+    assert delivery_service.attempt_rung1.__module__.endswith("delivery_service")
+
+
+# ---------------------------------------------------------------------------
+# attempt_rung1: result == "rang" / liveness == "confirmed_dead"
+# Snapshot survivors: Eq_Lt [395,18] (`== "rang"` → `<`); AddNot [348,7]
+# ---------------------------------------------------------------------------
+
+
+def test_attempt_rung1_rang_is_delivered(tmp_path):
+    """Native ring 'rang' is the delivered/proceed path. Kills `== "rang"` → `<`/`!=`."""
+    inbox = tmp_path / "inbox" / "team-lead.json"
+    inbox.parent.mkdir(parents=True)
+    target = _live_target(cc_inbox_path=str(inbox))
+    with patch(
+        "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
+        return_value="rang",
+    ) as ring:
+        result = attempt_rung1(target, 42)
+    ring.assert_called_once_with("sup1", 42)
+    assert result.delivered is True
+    assert result.decision == "proceed"
+    assert result.reason is None
+
+
+def test_attempt_rung1_non_rang_is_deferred(tmp_path):
+    inbox = tmp_path / "inbox" / "team-lead.json"
+    inbox.parent.mkdir(parents=True)
+    target = _live_target(cc_inbox_path=str(inbox))
+    with patch(
+        "cli_agent_orchestrator.services.doorbell_service._attempt_native_ring",
+        return_value="wake_unverified",
+    ):
+        result = attempt_rung1(target, 42)
+    assert result.delivered is False
+    assert result.decision == "defer"
+    assert result.reason == "wake_unverified"
+
+
+def test_attempt_rung1_confirmed_dead_settles_without_ring():
+    """confirmed_dead short-circuits before native ring. Kills AddNot on the predicate."""
+    target = _live_target(liveness="confirmed_dead")
+    with patch("cli_agent_orchestrator.services.doorbell_service._attempt_native_ring") as ring:
+        result = attempt_rung1(target, 7)
+    ring.assert_not_called()
+    assert result.delivered is False
+    assert result.decision == "settle"
+    assert result.reason == "target_confirmed_dead"
+
+
+# ---------------------------------------------------------------------------
+# attempt_rung2: liveness == "confirmed_dead"
+# Snapshot survivor: Eq_IsNot [430,23] (`==` → `is not`)
+# ---------------------------------------------------------------------------
+
+
+def test_attempt_rung2_confirmed_dead_skips_send_keys():
+    target = _live_target(liveness="confirmed_dead")
+    with patch("cli_agent_orchestrator.clients.tmux.tmux_client.send_keys") as send:
+        result = attempt_rung2(target, 7)
+    send.assert_not_called()
+    assert result.delivered is False
+    assert result.decision == "settle"
+    assert result.reason == "target_confirmed_dead"
+
+
+# ---------------------------------------------------------------------------
+# _refire_draft_state: state == "empty" / == "nonempty"
+# Snapshot survivor: Eq_NotEq [567,13] (`== "empty"` → `!=`)
+# Campaign item-10 pattern (stop/hit analog).
+# ---------------------------------------------------------------------------
+
+
+def test_refire_empty_composer_clears_injection():
+    target = _live_target()
+    with patch(
+        "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
+        return_value=_draft_provider("empty"),
+    ):
+        assert _refire_draft_state(target) is None
+
+
+def test_refire_nonempty_composer_is_user_draft_present():
+    target = _live_target()
+    with patch(
+        "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
+        return_value=_draft_provider("nonempty"),
+    ):
+        assert _refire_draft_state(target) == "user_draft_present"
+
+
+def test_refire_unknown_composer_state_is_unresolved():
+    target = _live_target()
+    with patch(
+        "cli_agent_orchestrator.providers.manager.provider_manager.get_provider",
+        return_value=_draft_provider("garbled"),
+    ):
+        assert _refire_draft_state(target) == "draft_unresolved"
+
+
+# ---------------------------------------------------------------------------
+# convergence_tick: state == "OPEN"
+# Snapshot survivor: Eq_NotEq [672,46]
+# ---------------------------------------------------------------------------
+
+
+def test_convergence_tick_drives_only_open_due_obligations(ds_db):
+    now = _utcnow()
+    past = now - timedelta(seconds=30)
+    future = now + timedelta(hours=1)
+    with ds_db() as db:
+        _seed_terminal_mailbox(db)
+        _add_inbox(db, row_id=1, mailbox_id="mb1")
+        _add_inbox(db, row_id=2, mailbox_id="mb1")
+        _add_inbox(db, row_id=3, mailbox_id="mb1")
+        _add_inbox(db, row_id=4, mailbox_id="mb1")
+        _add_obligation(db, row_id=1, mailbox_id="mb1", state="OPEN", next_attempt_at=past)
+        _add_obligation(db, row_id=2, mailbox_id="mb1", state="OPEN", next_attempt_at=future)
+        _add_obligation(db, row_id=3, mailbox_id="mb1", state="ESCALATED", next_attempt_at=past)
+        _add_obligation(db, row_id=4, mailbox_id="mb1", state="ACKED", next_attempt_at=past)
+        db.commit()
+
+    driven: list[tuple[int, str]] = []
+
+    def _capture(_db, obl, *_args, **_kwargs):
+        driven.append((obl.inbox_row_id, obl.state))
+
+    with (
+        patch.object(delivery_service, "_drive_one_obligation", side_effect=_capture),
+        patch.object(delivery_service, "_check_stranded"),
+        patch.object(delivery_service, "_settle_dead_target_obligations"),
+        patch.object(delivery_service, "_fire_due_nudges"),
+        patch.object(delivery_service, "_oneshot_rearm_boundaries"),
+        patch.object(delivery_service, "_update_pending_indicators"),
+        patch.object(delivery_service, "_check_health_warnings"),
+        patch.object(delivery_service, "_reresolve_escalated"),
+        patch.object(delivery_service, "_check_uds_late_bind"),
+    ):
+        convergence_tick()
+
+    assert driven == [(1, "OPEN")]
+
+
+# ---------------------------------------------------------------------------
+# _drive_one_obligation: status == "delivered" (settled analog)
+#                    and logical_receiver_id == obl.mailbox_id
+# Snapshot survivor: Eq_NotEq [1012,43]
+# ---------------------------------------------------------------------------
+
+
+def test_drive_one_delivered_inbox_skips_transport(ds_db):
+    now = _utcnow()
+    with ds_db() as db:
+        _seed_terminal_mailbox(db)
+        _add_inbox(db, row_id=1, mailbox_id="mb1", status="delivered")
+        _add_obligation(db, row_id=1, mailbox_id="mb1", state="OPEN", next_attempt_at=now)
+        db.commit()
+
+    with (
+        patch.object(delivery_service, "attempt_rung1") as rung1,
+        patch.object(delivery_service, "resolve_supervisor_target") as resolve,
+    ):
+        with ds_db() as db:
+            obl = db.query(DeliveryObligationModel).one()
+            _drive_one_obligation(db, obl, now, 120.0, "shadow")
+            db.commit()
+            refreshed = db.query(DeliveryObligationModel).one()
+            assert refreshed.state == "OPEN"
+            assert refreshed.attempts == 1
+            assert refreshed.next_attempt_at is not None
+            # SQLite may strip tzinfo; compare as naive instants.
+            nxt = refreshed.next_attempt_at
+            if nxt.tzinfo is None:
+                nxt = nxt.replace(tzinfo=timezone.utc)
+            assert nxt >= now + timedelta(seconds=30)
+
+    rung1.assert_not_called()
+    resolve.assert_not_called()
+
+
+def test_drive_one_pending_count_scoped_to_obligation_mailbox(ds_db):
+    now = _utcnow()
+    with ds_db() as db:
+        _seed_terminal_mailbox(db, tid="sup1", mb="mb1", role="supervisor")
+        _seed_terminal_mailbox(db, tid="wrk1", mb="mb2", role="worker")
+        _add_inbox(db, row_id=1, mailbox_id="mb1", receiver_id="sup1")
+        _add_inbox(db, row_id=2, mailbox_id="mb1", receiver_id="sup1")
+        _add_inbox(db, row_id=3, mailbox_id="mb2", receiver_id="wrk1")
+        _add_obligation(db, row_id=1, mailbox_id="mb1", state="OPEN", next_attempt_at=now)
+        db.commit()
+
+    armed: dict = {}
+
+    def _arm(**kwargs):
+        armed.update(kwargs)
+
+    with (
+        patch.object(
+            delivery_service,
+            "attempt_rung1",
+            return_value=LadderResult(False, "transport_attempt", "defer", "no_registry_records"),
+        ),
+        patch("cli_agent_orchestrator.services.nudge_discipline.nudge_discipline") as nd,
+    ):
+        nd.arm_or_coalesce.side_effect = lambda **kw: _arm(**kw)
+        with ds_db() as db:
+            obl = db.query(DeliveryObligationModel).one()
+            _drive_one_obligation(db, obl, now, 120.0, "shadow")
+
+    assert armed.get("message_count") == 2
+    assert armed.get("oldest_inbox_row_id") == 1
+    assert armed.get("mailbox_id") == "mb1"
+
+
+# ---------------------------------------------------------------------------
+# _get_pending_oldest: logical_receiver_id == mailbox_id
+# Snapshot survivor: Eq_NotEq [804,51]
+# ---------------------------------------------------------------------------
+
+
+def test_get_pending_oldest_scoped_to_mailbox(ds_db):
+    with ds_db() as db:
+        _seed_terminal_mailbox(db, tid="sup1", mb="mb_a", role="supervisor")
+        _seed_terminal_mailbox(db, tid="wrk1", mb="mb_b", role="worker")
+        _add_inbox(db, row_id=10, mailbox_id="mb_a", receiver_id="sup1")
+        _add_inbox(db, row_id=11, mailbox_id="mb_a", receiver_id="sup1")
+        _add_inbox(db, row_id=12, mailbox_id="mb_a", status="delivered", receiver_id="sup1")
+        _add_inbox(db, row_id=20, mailbox_id="mb_b", receiver_id="wrk1")
+        db.commit()
+
+    assert _get_pending_oldest("mb_a") == (2, 10)
+    assert _get_pending_oldest("mb_b") == (1, 20)
+
+
+# ---------------------------------------------------------------------------
+# emit_trace_or_collapse: phase == phase
+# Snapshot survivor: Eq_NotEq [183,46]
+# ---------------------------------------------------------------------------
+
+
+def test_emit_trace_or_collapse_matches_on_phase(ds_db):
+    with ds_db() as db:
+        _add_inbox(db, row_id=1, mailbox_id="mb1")
+        db.commit()
+        emit_trace_or_collapse(1, "resolve", "proceed", None, db)
+        emit_trace_or_collapse(1, "resolve", "proceed", None, db)
+        emit_trace_or_collapse(1, "transport_attempt", "proceed", None, db)
+        db.commit()
+        rows = db.query(InboxMessageTraceEventModel).all()
+
+    resolve_rows = [r for r in rows if r.phase == "resolve"]
+    transport_rows = [r for r in rows if r.phase == "transport_attempt"]
+    assert len(resolve_rows) == 1
+    assert resolve_rows[0].payload.get("count") == 2
+    assert len(transport_rows) == 1
+    assert "count" not in (transport_rows[0].payload or {})
+
+
+# ---------------------------------------------------------------------------
+# _fire_escalation_display_message: liveness == "confirmed_dead"
+# Snapshot survivor: Eq_NotEq [1146,52]
+# ---------------------------------------------------------------------------
+
+
+def test_fire_escalation_display_skips_tmux_when_confirmed_dead():
+    target = _live_target(liveness="confirmed_dead")
+    with patch.object(delivery_service.subprocess, "run") as run:
+        _fire_escalation_display_message(target, 9, 3)
+    run.assert_not_called()
+
+
+def test_fire_escalation_display_calls_tmux_when_presumed_live():
+    target = _live_target(liveness="presumed_live")
+    completed = MagicMock(returncode=0, stderr=b"")
+    with (
+        patch.object(delivery_service.subprocess, "run", return_value=completed) as run,
+        patch(
+            "cli_agent_orchestrator.utils.tmux_command.tmux_argv",
+            return_value=["tmux", "display-message"],
+        ),
+    ):
+        _fire_escalation_display_message(target, 9, 3)
+    run.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# _find_live_successor: candidate_tid == dead_terminal_id
+# Snapshot survivor: Eq_NotEq [1370,25]
+# ---------------------------------------------------------------------------
+
+
+def test_find_live_successor_skips_the_dead_terminal(ds_db):
+    with ds_db() as db:
+        db.add(
+            TerminalModel(
+                id="dead1",
+                tmux_session="cao-test",
+                tmux_window="dead1",
+                provider="claude_code",
+                agent_profile="supervisor",
+            )
+        )
+        db.add(
+            TerminalModel(
+                id="live2",
+                tmux_session="cao-test",
+                tmux_window="live2",
+                provider="claude_code",
+                agent_profile="supervisor",
+            )
+        )
+        db.add(
+            MailboxModel(
+                id="mb1",
+                session_name="cao-test",
+                role="supervisor",
+                current_terminal_id="live2",
+                generation=2,
+                consumed_through_id=0,
+            )
+        )
+        db.add(MailboxIncarnationModel(mailbox_id="mb1", generation=1, terminal_id="dead1"))
+        db.add(MailboxIncarnationModel(mailbox_id="mb1", generation=2, terminal_id="live2"))
+        _tombstone(db, "dead1", generation=1)
+        db.commit()
+        assert _find_live_successor(db, "mb1", "dead1") == "live2"
