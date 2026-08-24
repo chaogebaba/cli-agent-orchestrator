@@ -1,0 +1,318 @@
+diff --git a/test/services/test_f425_push_guard_kills.py b/test/services/test_f425_push_guard_kills.py
+new file mode 100644
+index 00000000..f4f32a1e
+--- /dev/null
++++ b/test/services/test_f425_push_guard_kills.py
+@@ -0,0 +1,312 @@
++"""F425 (#280) mutation kill tests — teammate_push read/dedup guards.
++
++Pins the f408-mutation-campaign survivors (items 5-7 of
++`orchestrator/tmp/orch/f408-mutation-campaign.md`), each test mapped to the
++exact mutant it must kill:
++
++1. `mark_cc_inbox_entries_read` — `from == _TEAMMATE_FROM` [657,37] (Eq_NotEq):
++   would mark FOREIGN entries read.
++2. `mark_cc_inbox_entries_read` — `entry["read"] = True` [658,36]
++   (ReplaceTrueWithFalse): never acks (persisted bit stays False).
++3. `write_supervisor_callback_notification` — new-entry `"read": False`
++   [128,16] (ReplaceFalseWithTrue): callback lands already-read.
++4. `write_supervisor_callback_notification` — mkdir `exist_ok=True`
++   [135,55] (ReplaceTrueWithFalse): fails when parent dir already exists.
++5. `write_supervisor_callback_notification` — `existing.get("msg_id") == msg_id`
++   [162,15] (AddNot): dedup search inverted (D12 file-level dedup).
++6. `_write_inbox_entry` — F175 `if entry_msg_id:` [489,11] (AddNot):
++   dedup loop only runs when msg_id is MISSING; duplicate appends of real
++   ids go through.
++
++Every test drives the real production function against a tmp_path inbox file
++(no mocks on the write path) so an applied mutant turns the assertion red.
++"""
++
++from __future__ import annotations
++
++import json
++import time
++from datetime import datetime, timezone
++from pathlib import Path
++from typing import Any, Dict, List
++
++from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
++from cli_agent_orchestrator.services.teammate_push_service import (
++    _TEAMMATE_FROM,
++    _build_entry,
++    _write_inbox_entry,
++    callback_notification_id,
++    mark_cc_inbox_entries_read,
++    write_supervisor_callback_notification,
++)
++
++_NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
++MAILBOX_ID = "mb_f425"
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++
++def _make_message(
++    msg_id: int = 1,
++    sender_id: str = "worker-01",
++    message: str = "Task completed successfully",
++) -> InboxMessage:
++    """Create a minimal InboxMessage for testing (same shape as bridge tests)."""
++    return InboxMessage(
++        id=msg_id,
++        sender_id=sender_id,
++        receiver_id="sup-001",
++        message=message,
++        orchestration_type=OrchestrationType.SEND_MESSAGE,
++        status=MessageStatus.PENDING,
++        created_at=_NOW,
++    )
++
++
++def _make_cao_entry(row_id: int, *, read: bool = False) -> Dict[str, Any]:
++    """Build a CC inbox entry matching what teammate_push writes for row_id."""
++    return {
++        "type": "message",
++        "from": _TEAMMATE_FROM,
++        "text": f"[CAO:worker-{row_id}] completed\n\n---\nMessage {row_id} ready.",
++        "timestamp": "2026-08-24T08:00:00+00:00",
++        "summary": f"worker-{row_id}: completed",
++        "read": read,
++        "msgV": 1,
++        "msg_id": callback_notification_id(MAILBOX_ID, row_id),
++    }
++
++
++def _make_foreign_entry(row_id: int) -> Dict[str, Any]:
++    """Foreign entry: same deterministic msg_id but NOT authored by CAO.
++
++    Collision of msg_id with a CAO entry is exactly the case the
++    `from == _TEAMMATE_FROM` guard protects: mark-read must never touch
++    entries CAO did not author, even on msg_id match.
++    """
++    return {
++        "type": "message",
++        "from": "human-user",
++        "text": f"Foreign message {row_id}",
++        "timestamp": "2026-08-24T07:00:00+00:00",
++        "summary": f"Human message {row_id}",
++        "read": False,
++        "msgV": 1,
++        "msg_id": callback_notification_id(MAILBOX_ID, row_id),
++    }
++
++
++def _write_entries(inbox_path: Path, entries: List[Dict[str, Any]]) -> None:
++    """Write entries to the inbox file."""
++    inbox_path.parent.mkdir(parents=True, exist_ok=True)
++    inbox_path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
++
++
++def _read_entries(inbox_path: Path) -> List[Dict[str, Any]]:
++    """Read entries from the inbox file."""
++    return json.loads(inbox_path.read_text(encoding="utf-8"))
++
++# ---------------------------------------------------------------------------
++# Mutant 1 — mark_cc_inbox_entries_read `from == _TEAMMATE_FROM` -> `!=` [657,37]
++# ---------------------------------------------------------------------------
++
++
++def test_mark_read_leaves_foreign_entries_unread_on_msg_id_collision(tmp_path: Path) -> None:
++    """Foreign `from` entries are never marked read, even on exact msg_id match.
++
++    Kills Eq_NotEq [657,37]: under the mutant the foreign entry is acked and
++    the CAO entry is left unread.
++    """
++    inbox_path = tmp_path / "team-lead.json"
++    cao_entry = _make_cao_entry(100)
++    foreign_entry = _make_foreign_entry(100)  # same deterministic msg_id
++    _write_entries(inbox_path, [cao_entry, foreign_entry])
++
++    marked = mark_cc_inbox_entries_read(
++        inbox_path=inbox_path,
++        mailbox_id=MAILBOX_ID,
++        acked_row_ids=[100],
++    )
++
++    entries = _read_entries(inbox_path)
++    by_from = {e["from"]: e for e in entries}
++    # Exactly one entry acked: the CAO-authored one.
++    assert marked == 1
++    assert by_from[_TEAMMATE_FROM]["read"] is True
++    # Foreign entry untouched despite identical msg_id.
++    assert by_from["human-user"]["read"] is False
++
++
++# ---------------------------------------------------------------------------
++# Mutant 2 — mark_cc_inbox_entries_read `entry["read"] = True` -> False [658,36]
++# ---------------------------------------------------------------------------
++
++
++def test_mark_read_persists_read_bit_true_on_disk(tmp_path: Path) -> None:
++    """The acked entry's persisted `read` bit must actually flip to True.
++
++    Kills ReplaceTrueWithFalse [658,36]: the mutant reports marked==1 but
++    writes `read: False` back — the file-level assertion goes red.
++    """
++    inbox_path = tmp_path / "team-lead.json"
++    entry = _make_cao_entry(200)
++    assert entry["read"] is False
++    _write_entries(inbox_path, [entry])
++
++    marked = mark_cc_inbox_entries_read(
++        inbox_path=inbox_path,
++        mailbox_id=MAILBOX_ID,
++        acked_row_ids=[200],
++    )
++
++    assert marked == 1
++    entries = _read_entries(inbox_path)
++    assert len(entries) == 1
++    assert entries[0]["read"] is True
++
++
++# ---------------------------------------------------------------------------
++# Mutant 3 — write_supervisor_callback_notification `"read": False` -> True [128,16]
++# ---------------------------------------------------------------------------
++
++
++def test_callback_notification_lands_unread(tmp_path: Path) -> None:
++    """A fresh callback entry must land with read=False (unread for the CC UI).
++
++    Kills ReplaceFalseWithTrue [128,16]: the callback would land already-read
++    and never surface in the supervisor's inbox UI.
++    """
++    inbox_path = tmp_path / "teams" / "s1" / "team-lead.json"
++    message = _make_message(msg_id=300)
++
++    result = write_supervisor_callback_notification(
++        inbox_path=inbox_path,
++        mailbox_id=MAILBOX_ID,
++        message=message,
++        deadline_mono=time.monotonic() + 5.0,
++    )
++
++    assert result.kind == "written"
++    entries = _read_entries(inbox_path)
++    assert len(entries) == 1
++    assert entries[0]["read"] is False
++    assert entries[0]["msg_id"] == callback_notification_id(MAILBOX_ID, 300)
++
++
++# ---------------------------------------------------------------------------
++# Mutant 4 — write_supervisor_callback_notification mkdir exist_ok=True -> False [135,55]
++# ---------------------------------------------------------------------------
++
++
++def test_callback_write_succeeds_when_parent_dir_already_exists(tmp_path: Path) -> None:
++    """A pre-existing parent directory must not fail the write.
++
++    Kills ReplaceTrueWithFalse [135,55]: mkdir(exist_ok=False) raises
++    FileExistsError (an OSError) on the existing dir, degrading a healthy
++    first write into retryable_failure.
++    """
++    inbox_path = tmp_path / "teams" / "s2" / "team-lead.json"
++    inbox_path.parent.mkdir(parents=True, exist_ok=True)
++    assert inbox_path.parent.is_dir()
++
++    result = write_supervisor_callback_notification(
++        inbox_path=inbox_path,
++        mailbox_id=MAILBOX_ID,
++        message=_make_message(msg_id=400),
++        deadline_mono=time.monotonic() + 5.0,
++    )
++
++    assert result.kind == "written"
++    assert len(_read_entries(inbox_path)) == 1
++
++
++# ---------------------------------------------------------------------------
++# Mutant 5 — write_supervisor_callback_notification msg_id match inverted [162,15]
++# ---------------------------------------------------------------------------
++
++
++def test_callback_second_write_same_msg_id_is_already_present(tmp_path: Path) -> None:
++    """D12 dedup: re-writing the same (mailbox, row) is already_present.
++
++    Kills AddNot [162,15]: with the match inverted, the duplicate write finds
++    no match, appends a second entry, and reports "written".
++    """
++    inbox_path = tmp_path / "team-lead.json"
++    message = _make_message(msg_id=500)
++
++    r1 = write_supervisor_callback_notification(
++        inbox_path=inbox_path,
++        mailbox_id=MAILBOX_ID,
++        message=message,
++        deadline_mono=time.monotonic() + 5.0,
++    )
++    r2 = write_supervisor_callback_notification(
++        inbox_path=inbox_path,
++        mailbox_id=MAILBOX_ID,
++        message=message,
++        deadline_mono=time.monotonic() + 5.0,
++    )
++
++    assert r1.kind == "written"
++    assert r2.kind == "already_present"
++    entries = _read_entries(inbox_path)
++    assert len(entries) == 1
++
++
++def test_callback_new_msg_id_alongside_other_entries_is_written(tmp_path: Path) -> None:
++    """A genuinely new msg_id must be written even when other entries exist.
++
++    Kills AddNot [162,15] from the other side: with the match inverted, the
++    different-msg_id entry matches the `!=` predicate and the content check
++    turns a healthy first-of-kind write into identity_conflict.
++    """
++    inbox_path = tmp_path / "team-lead.json"
++    # Seed with an entry for a DIFFERENT row (different deterministic msg_id).
++    _write_entries(inbox_path, [_make_cao_entry(600)])
++
++    result = write_supervisor_callback_notification(
++        inbox_path=inbox_path,
++        mailbox_id=MAILBOX_ID,
++        message=_make_message(msg_id=601),
++        deadline_mono=time.monotonic() + 5.0,
++    )
++
++    assert result.kind == "written"
++    entries = _read_entries(inbox_path)
++    assert len(entries) == 2
++    msg_ids = {e["msg_id"] for e in entries}
++    assert msg_ids == {
++        callback_notification_id(MAILBOX_ID, 600),
++        callback_notification_id(MAILBOX_ID, 601),
++    }
++
++
++# ---------------------------------------------------------------------------
++# Mutant 6 — _write_inbox_entry F175 `if entry_msg_id:` -> `if not entry_msg_id:` [489,11]
++# ---------------------------------------------------------------------------
++
++
++def test_legacy_write_inbox_entry_dedups_real_msg_id(tmp_path: Path) -> None:
++    """F175: file-level dedup must run when the entry HAS a real msg_id.
++
++    Kills AddNot [489,11]: the mutant only dedups entries whose msg_id is
++    missing, so two distinct entry dicts sharing a deterministic msg_id
++    (e.g. rebuilt after a high-water clobber) would both append.
++    """
++    inbox_path = tmp_path / "team-lead.json"
++    # Two distinct entry dicts (different previews) sharing the same
++    # deterministic msg_id — exactly the F175 duplicate-append shape.
++    e1 = _build_entry("w1", "first sweep", 1, mailbox_id=MAILBOX_ID, first_row_id=700)
++    e2 = _build_entry("w1", "rebuilt after clobber", 1, mailbox_id=MAILBOX_ID, first_row_id=700)
++    assert e1["msg_id"] == e2["msg_id"]
++    assert e1["text"] != e2["text"]
++
++    assert _write_inbox_entry(inbox_path, e1) is True
++    assert _write_inbox_entry(inbox_path, e2) is True  # idempotent success
++
++    entries = _read_entries(inbox_path)
++    assert len(entries) == 1
++    assert entries[0]["msg_id"] == callback_notification_id(MAILBOX_ID, 700)
