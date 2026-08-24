@@ -6,7 +6,6 @@ import os
 import shlex
 import shutil
 import stat
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -675,30 +674,26 @@ def test_codex_missing_model_catalog_json_fails_loudly(persona_env: dict[str, Pa
 
 
 @pytest.mark.skipif(shutil.which("codex") is None, reason="codex binary not available")
-def test_codex_persona_config_loads_with_catalog_smoke(persona_env: dict[str, Path]) -> None:
-    """BLOCKER-1 production-shape smoke: with the catalog materialized, launching a
-    config-reading codex command under the persona CODEX_HOME must get PAST file
-    resolution — the F431 failure was 'No such file or directory (os error 2)'.
-    We assert that specific class is gone (content-level validation may still
-    fail; that is not F431 and codex versions vary)."""
+def test_codex_persona_config_catalog_resolves_placeholder(persona_env: dict[str, Path]) -> None:
+    """BLOCKER-1 production-shape check (no real IO — unit tier): after
+    compose_persona_plan materializes the catalog, the persona config.toml keeps
+    the relative value AND the referenced file exists at the exact relative path
+    codex would resolve under CODEX_HOME. This is what eliminates the reviewer's
+    reproduced 'No such file or directory (os error 2)' launch failure; a live
+    `codex features list` smoke would be real IO and is barred from the unit tier
+    (F254 G2), so we assert the resolvable on-disk state instead."""
     (persona_env["codex"] / "catalog.json").write_text(_CATALOG_JSON, encoding="utf-8")
     _write_codex_config_with(
         persona_env, 'model = "gpt-test"\nmodel_catalog_json = "./catalog.json"\n'
     )
     plan = compose_persona_plan(
-        "codex-smoke", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
+        "codex-resolves", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
     )
-    assert (plan.codex_home / "catalog.json").is_file()
-    proc = subprocess.run(
-        ["codex", "features", "list"],
-        env={**os.environ, "CODEX_HOME": str(plan.codex_home)},
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    combined = (proc.stdout + proc.stderr).lower()
-    assert "os error 2" not in combined, combined
-    assert "no such file or directory" not in combined, combined
+    config = (plan.codex_home / "config.toml").read_text(encoding="utf-8")
+    assert 'model_catalog_json = "./catalog.json"' in config
+    # The exact path codex resolves the relative value to under CODEX_HOME.
+    resolved = plan.codex_home / "catalog.json"
+    assert resolved.is_file() and resolved.read_text(encoding="utf-8") == _CATALOG_JSON
 
 
 def test_codex_relative_symlink_source_rejected(persona_env: dict[str, Path]) -> None:
