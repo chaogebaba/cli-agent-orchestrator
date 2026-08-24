@@ -15,11 +15,15 @@ The route-level atomicity ("no terminal row, no tmux window") is a direct
 consequence of raising BEFORE any resource is created in ``create_terminal``:
 the guard runs immediately after ``require_provider_admitted`` and before the
 tmux/DB/worktree/provider path, so a refusal has nothing to unwind. That
-ordering is asserted by ``test_enforced_before_any_side_effect``.
+ordering is asserted at the REAL seam by
+``TestRealSeam::test_enforced_before_any_side_effect``, and the concurrent
+admission race (F439 round 2 / BLOCKER 1) is pinned by
+``TestConcurrentAdmission::test_concurrent_cap_minus_one_admits_exactly_one``.
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -258,3 +262,495 @@ class TestCreateTerminalGuardPredicate:
                 working_directory="/nonexistent/does/not/exist/f439",
             )
         assert not isinstance(ei.value, _CapSentinel)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Real-seam tests (F439 round 2): drive the REAL async create_terminal with its
+# resource dependencies stubbed, so the REAL admission lock + REAL cap count run.
+# ─────────────────────────────────────────────────────────────────────────────
+
+import contextlib
+import itertools
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.services.session_lifecycle_lease import SessionLifecycleLeaseToken
+
+EXISTING_WORKER = "eeee0001"
+
+
+@contextlib.contextmanager
+def _real_seam(published_rows, *, cap, id_counter, count_hook=None, status_map=None):
+    """Patch create_terminal's resource deps while keeping the real lock + count.
+
+    ``published_rows`` is the shared live fleet: the patched ``db_create_terminal``
+    appends the new row to it, and the patched ``list_terminals_by_session``
+    returns it — so the cap count reflects real publication ordering. ``count_hook``
+    (optional) is awaited/called inside the count to force an interleaving that a
+    lock-less implementation would lose. ``status_map`` maps terminal id -> live
+    status (default PROCESSING = busy, no reap candidates).
+    """
+    status_map = status_map or {}
+
+    def _list(session_name):
+        return list(published_rows)
+
+    def _status(tid):
+        return status_map.get(tid, TerminalStatus.PROCESSING)
+
+    def _db_create(terminal_id, tmux_session, tmux_window, provider, *args, **kw):
+        # create_terminal calls positionally: (tid, session, window, provider,
+        # agent_profile, allowed_tools, caller_id=..., ...). Read profile from
+        # the positional tail and caller_id from kwargs.
+        agent_profile = args[0] if args else kw.get("agent_profile")
+        published_rows.append(
+            {
+                "id": terminal_id,
+                "agent_profile": agent_profile,
+                "caller_id": kw.get("caller_id"),
+                "last_active": None,
+            }
+        )
+        return {"id": terminal_id}
+
+    orig_count = ts._count_worker_terminals
+
+    def _counting(session_name, supervisor_id):
+        if count_hook is not None:
+            count_hook()
+        return orig_count(session_name, supervisor_id)
+
+    backend = MagicMock()
+    backend.session_exists.return_value = True
+    backend.create_window.side_effect = lambda session, window, *a, **k: window
+    backend.supports_event_inbox.return_value = False
+    backend.set_window_parent = None
+
+    provider = AsyncMock()
+    provider.initialize.return_value = True
+    provider.shell_baseline = None
+
+    def _resolve_cap(*a, **k):
+        return cap
+
+    def _gen_id():
+        return next(id_counter)
+
+    with (
+        patch.object(ts, "_resolve_worker_terminal_cap", _resolve_cap),
+        patch.object(ts, "list_terminals_by_session", _list),
+        patch.object(ts, "_count_worker_terminals", _counting),
+        patch.object(ts, "db_create_terminal", _db_create),
+        patch.object(ts, "delete_terminals_by_session", MagicMock()),
+        patch.object(ts, "generate_terminal_id", _gen_id),
+        patch.object(ts, "generate_window_name", lambda profile, tid: f"{profile}-{tid}"),
+        patch.object(ts.status_monitor, "get_status", _status),
+        patch.object(ts, "provider_manager") as pm,
+        patch.object(ts, "fifo_manager", MagicMock()),
+        patch.object(ts, "_schedule_deferred_init", MagicMock()),
+        patch.object(
+            ts,
+            "load_agent_profile",
+            lambda name: AgentProfile(name="developer", description="dev"),
+        ),
+        patch.object(
+            ts,
+            "get_provider_class",
+            lambda name: type(
+                "Cap",
+                (),
+                {"supports_seed_resume_identity": False, "has_process_child": False},
+            ),
+        ),
+        patch(
+            "cli_agent_orchestrator.services.session_lifecycle_lease."
+            "acquire_session_lifecycle_shared",
+            lambda session_name: SessionLifecycleLeaseToken(
+                session_name=session_name, mode="shared", nonce="t"
+            ),
+        ),
+        patch(
+            "cli_agent_orchestrator.services.session_lifecycle_lease."
+            "release_session_lifecycle_lease",
+            lambda token: None,
+        ),
+        patch("cli_agent_orchestrator.backends.registry._backend", backend),
+    ):
+        pm.create_provider.return_value = provider
+        yield {"backend": backend, "provider": provider, "pm": pm}
+
+
+async def _create_worker(session="cao-race", tmpdir="/tmp"):
+    return await ts.create_terminal(
+        provider="mock_cli",
+        agent_profile="developer",
+        session_name=session,
+        new_session=False,
+        caller_id=SUPERVISOR,
+        working_directory=tmpdir,
+    )
+
+
+class TestConcurrentAdmission:
+    """F439 round 2 / BLOCKER 1: concurrent creates must not oversubscribe."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_cap_minus_one_admits_exactly_one(self, tmp_path):
+        """cap 2, one existing worker, N concurrent real creates → exactly ONE
+        success and N-1 TerminalCapExceeded; the fleet grows by exactly one.
+
+        A yield inside the count (count_hook = asyncio.sleep(0) via a sync shim)
+        would let a lock-less implementation interleave all N past the check; the
+        per-session admission lock serializes count→publication so only the first
+        admits and the rest observe the committed row.
+        """
+        published = [
+            {
+                "id": EXISTING_WORKER,
+                "agent_profile": "developer",
+                "caller_id": SUPERVISOR,
+                "last_active": None,
+            },
+        ]
+        ids = itertools.count(1)
+
+        def _id():
+            return f"new0{next(ids):04d}"
+
+        # itertools-style counter object exposing __next__ for generate_terminal_id
+        class _C:
+            def __next__(self):
+                return _id()
+
+        n = 4
+        # Force interleaving: every count yields control to the loop once.
+        yielded = {"n": 0}
+
+        def _hook():
+            yielded["n"] += 1
+
+        with _real_seam(published, cap=2, id_counter=_C(), count_hook=_hook) as seam:
+            results = await asyncio.gather(
+                *[_create_worker(tmpdir=str(tmp_path)) for _ in range(n)],
+                return_exceptions=True,
+            )
+
+        successes = [r for r in results if not isinstance(r, BaseException)]
+        cap_errors = [r for r in results if isinstance(r, TerminalCapExceeded)]
+        others = [
+            r
+            for r in results
+            if isinstance(r, BaseException) and not isinstance(r, TerminalCapExceeded)
+        ]
+
+        assert others == [], f"unexpected errors: {others}"
+        assert len(successes) == 1, f"expected exactly 1 admit, got {len(successes)}"
+        assert len(cap_errors) == n - 1, f"expected {n - 1} refusals, got {len(cap_errors)}"
+        # No orphans: the fleet grew by exactly the one admitted worker.
+        assert len(published) == 2  # the pre-existing worker + exactly one new row
+        # Each refusal carried the structured surface.
+        for e in cap_errors:
+            assert e.code == "E-TERMINAL-CAP"
+            assert e.cap == 2
+
+    @pytest.mark.asyncio
+    async def test_concurrent_under_cap_all_admitted(self, tmp_path):
+        """cap 10, no existing workers, 4 concurrent creates → all 4 admitted,
+        fleet grows by 4 (the lock serializes but never falsely refuses)."""
+        published = []
+        ids = itertools.count(1)
+
+        class _C:
+            def __next__(self):
+                return f"ok0{next(ids):04d}"
+
+        with _real_seam(published, cap=10, id_counter=_C()):
+            results = await asyncio.gather(
+                *[_create_worker(tmpdir=str(tmp_path)) for _ in range(4)],
+                return_exceptions=True,
+            )
+        assert all(not isinstance(r, BaseException) for r in results), results
+        assert len(published) == 4
+
+    def test_thread_based_race_admits_exactly_one(self, tmp_path):
+        """Mirror the gate's harness EXACTLY: 4 THREADS, each its own event loop,
+        a threading.Barrier in the count dependency so all four observe the same
+        pre-create snapshot. This is the scenario an asyncio.Lock CANNOT close
+        (per-loop locks don't serialize across loops) — the process-wide
+        threading.Lock must. Required: exactly one success, three refusals, and
+        the fleet grows by exactly one (no orphan rows).
+
+        Patches are installed ONCE in the main thread (``unittest.mock.patch``
+        mutates shared module state and is NOT thread-safe if applied per
+        worker), with thread-safe fakes; the workers only call create_terminal.
+        """
+        import contextlib as _ctx
+        import threading
+
+        published = [
+            {
+                "id": EXISTING_WORKER,
+                "agent_profile": "developer",
+                "caller_id": SUPERVISOR,
+                "last_active": None,
+            },
+        ]
+        pub_lock = threading.Lock()
+        ids = itertools.count(1)
+        id_lock = threading.Lock()
+        barrier = threading.Barrier(4)
+        results: list = []
+        res_lock = threading.Lock()
+
+        def _list(session_name):
+            with pub_lock:
+                return list(published)
+
+        def _gen_id():
+            with id_lock:
+                return f"thr0{next(ids):04d}"
+
+        def _db_create(terminal_id, *a, **kw):
+            with pub_lock:
+                published.append(
+                    {
+                        "id": terminal_id,
+                        "agent_profile": "developer",
+                        "caller_id": SUPERVISOR,
+                        "last_active": None,
+                    }
+                )
+            return {"id": terminal_id}
+
+        orig_count = ts._count_worker_terminals
+
+        def _counting(session_name, supervisor_id):
+            return orig_count(session_name, supervisor_id)
+
+        backend = MagicMock()
+        backend.session_exists.return_value = True
+        backend.create_window.side_effect = lambda session, window, *a, **k: window
+        backend.supports_event_inbox.return_value = False
+        backend.set_window_parent = None
+
+        provider = AsyncMock()
+        provider.initialize.return_value = True
+        provider.shell_baseline = None
+        pm = MagicMock()
+        pm.create_provider.return_value = provider
+
+        def _worker():
+            # Barrier OUTSIDE the create call so all four threads slam the
+            # admission seam together; the process-wide lock then serializes
+            # them. (A barrier inside the counted critical section would
+            # deadlock, since the lock admits one thread at a time.)
+            try:
+                barrier.wait(timeout=5)
+            except threading.BrokenBarrierError:
+                pass
+            try:
+                r = asyncio.run(
+                    ts.create_terminal(
+                        provider="mock_cli",
+                        agent_profile="developer",
+                        session_name="cao-thr",
+                        new_session=False,
+                        caller_id=SUPERVISOR,
+                        working_directory=str(tmp_path),
+                    )
+                )
+                with res_lock:
+                    results.append(("ok", getattr(r, "id", r)))
+            except TerminalCapExceeded as e:
+                with res_lock:
+                    results.append(("cap", e.cap))
+            except BaseException as e:  # noqa: BLE001
+                with res_lock:
+                    results.append(("err", repr(e)))
+
+        with _ctx.ExitStack() as stack:
+            for target, repl in [
+                ("_resolve_worker_terminal_cap", lambda *a, **k: 2),
+                ("list_terminals_by_session", _list),
+                ("_count_worker_terminals", _counting),
+                ("db_create_terminal", _db_create),
+                ("delete_terminals_by_session", MagicMock()),
+                ("generate_terminal_id", _gen_id),
+                ("generate_window_name", lambda p, t: f"{p}-{t}"),
+                ("provider_manager", pm),
+                ("fifo_manager", MagicMock()),
+                ("_schedule_deferred_init", MagicMock()),
+                ("load_agent_profile", lambda n: AgentProfile(name="developer", description="d")),
+                (
+                    "get_provider_class",
+                    lambda n: type(
+                        "C",
+                        (),
+                        {"supports_seed_resume_identity": False, "has_process_child": False},
+                    ),
+                ),
+            ]:
+                stack.enter_context(patch.object(ts, target, repl))
+            stack.enter_context(
+                patch.object(ts.status_monitor, "get_status", lambda tid: TerminalStatus.PROCESSING)
+            )
+            stack.enter_context(
+                patch(
+                    "cli_agent_orchestrator.services.session_lifecycle_lease."
+                    "acquire_session_lifecycle_shared",
+                    lambda s: SessionLifecycleLeaseToken(session_name=s, mode="shared", nonce="t"),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "cli_agent_orchestrator.services.session_lifecycle_lease."
+                    "release_session_lifecycle_lease",
+                    lambda t: None,
+                )
+            )
+            stack.enter_context(patch("cli_agent_orchestrator.backends.registry._backend", backend))
+
+            threads = [threading.Thread(target=_worker) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+
+        oks = [r for r in results if r[0] == "ok"]
+        caps = [r for r in results if r[0] == "cap"]
+        errs = [r for r in results if r[0] == "err"]
+        assert errs == [], f"unexpected errors: {errs}"
+        assert len(oks) == 1, f"expected exactly 1 admit, got {len(oks)}: {results}"
+        assert len(caps) == 3, f"expected 3 refusals, got {len(caps)}: {results}"
+        # No orphans: exactly one new row beyond the pre-existing worker.
+        assert len(published) == 2
+
+    @pytest.mark.asyncio
+    async def test_concurrent_under_cap_all_admitted(self, tmp_path):
+        """cap 10, no existing workers, 4 concurrent creates → all 4 admitted,
+        fleet grows by 4 (the lock serializes but never falsely refuses)."""
+        published = []
+        ids = itertools.count(1)
+
+        class _C:
+            def __next__(self):
+                return f"ok0{next(ids):04d}"
+
+        with _real_seam(published, cap=10, id_counter=_C()):
+            results = await asyncio.gather(
+                *[_create_worker(tmpdir=str(tmp_path)) for _ in range(4)],
+                return_exceptions=True,
+            )
+        assert all(not isinstance(r, BaseException) for r in results), results
+        assert len(published) == 4
+
+
+class TestRealSeam:
+    """Real-seam handoff/side-effect/boundary coverage (F439 round 2 SHOULD)."""
+
+    @pytest.mark.asyncio
+    async def test_enforced_before_any_side_effect(self, tmp_path):
+        """At cap, the REAL create_terminal raises TerminalCapExceeded and creates
+        NO db row, NO tmux window, NO provider — nothing to unwind."""
+        published = [
+            {
+                "id": "eeee0001",
+                "agent_profile": "developer",
+                "caller_id": SUPERVISOR,
+                "last_active": None,
+            },
+            {
+                "id": "eeee0002",
+                "agent_profile": "developer",
+                "caller_id": SUPERVISOR,
+                "last_active": None,
+            },
+        ]
+
+        class _C:
+            def __next__(self):
+                return "should-not-be-used"
+
+        with _real_seam(published, cap=2, id_counter=_C()) as seam:
+            with pytest.raises(TerminalCapExceeded) as ei:
+                await _create_worker(tmpdir=str(tmp_path))
+
+        assert ei.value.current_count == 2
+        # No side effects: fleet unchanged, no window created, no provider built.
+        assert len(published) == 2
+        seam["backend"].create_window.assert_not_called()
+        seam["pm"].create_provider.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_handoff_run_step_reaches_cap_seam(self, tmp_path):
+        """A real run_agent_step (handoff) at cap raises TerminalCapExceeded and
+        creates no row/window — the handoff path shares the same seam as assign."""
+        from cli_agent_orchestrator.services import agent_step
+
+        published = [
+            {
+                "id": "eeee0001",
+                "agent_profile": "developer",
+                "caller_id": SUPERVISOR,
+                "last_active": None,
+            },
+            {
+                "id": "eeee0002",
+                "agent_profile": "developer",
+                "caller_id": SUPERVISOR,
+                "last_active": None,
+            },
+        ]
+
+        class _C:
+            def __next__(self):
+                return "should-not-be-used"
+
+        with _real_seam(published, cap=2, id_counter=_C()) as seam:
+            with patch.object(ts, "seed_resume_bootstrap", new=AsyncMock(return_value=None)):
+                with pytest.raises(TerminalCapExceeded):
+                    await agent_step.run_agent_step(
+                        provider="mock_cli",
+                        agent="developer",
+                        prompt="do work",
+                        session_name="cao-race",
+                        caller_id=SUPERVISOR,
+                        working_directory=str(tmp_path),
+                    )
+        assert len(published) == 2
+        seam["backend"].create_window.assert_not_called()
+
+    def test_missing_last_active_yields_null_idle_since(self, patch_session):
+        """An IDLE worker row with last_active=None → idle_since is null."""
+        patch_session(
+            rows=[
+                {
+                    "id": "bbbbbbbb",
+                    "agent_profile": "developer",
+                    "caller_id": SUPERVISOR,
+                    "last_active": None,
+                }
+            ],
+            status={"bbbbbbbb": TerminalStatus.IDLE},
+        )
+        count, candidates = _count_worker_terminals(SESSION, SUPERVISOR)
+        assert count == 1
+        assert candidates[0]["idle_since"] is None
+
+    def test_provider_not_ready_row_counts(self, patch_session):
+        """A provider-not-ready (UNKNOWN) worker still counts toward the cap and
+        is NOT offered as a reap candidate (only IDLE workers are)."""
+        patch_session(
+            rows=[
+                {
+                    "id": "bbbbbbbb",
+                    "agent_profile": "developer",
+                    "caller_id": SUPERVISOR,
+                    "last_active": None,
+                },
+            ],
+            status={"bbbbbbbb": TerminalStatus.UNKNOWN},
+        )
+        count, candidates = _count_worker_terminals(SESSION, SUPERVISOR)
+        assert count == 1
+        assert candidates == []

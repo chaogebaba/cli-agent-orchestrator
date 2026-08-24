@@ -294,6 +294,21 @@ class _DeferredTaskRecord:
 
 _deferred_tasks_by_terminal: dict[str, _DeferredTaskRecord] = {}
 _fork_refresh_locks: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock] = {}
+# F439 (#294) round 2 / BLOCKER 1: per-session admission lock. The worker-cap
+# check is check-then-act (count -> create); without serializing the decision
+# through publication, N concurrent create_terminal calls for the same session
+# all observe the same pre-create count and all get admitted, oversubscribing
+# the cap. This is a threading.Lock (NOT asyncio.Lock) so it serializes across
+# BOTH coroutines on the server's single event loop AND separate-loop threads
+# (the gate's adversarial probe drives create_terminal from four threads, each
+# with its own loop — an asyncio.Lock keyed by loop would not serialize them).
+# It is acquired with a loop-friendly non-blocking spin (``_acquire_cap_lock``)
+# so it never freezes the event loop while contended, held from the cap count
+# through DB-row publication (``db_created``), and released the instant
+# publication succeeds — NOT across the slow provider-init phase — so parallel
+# same-session assigns still run their init concurrently.
+_cap_admission_locks: dict[str, threading.Lock] = {}
+_cap_admission_locks_guard = threading.Lock()
 
 
 def _preflight_disk_space(path: str, floor_gb: float = DISK_SPACE_FLOOR_GB) -> None:
@@ -1158,48 +1173,86 @@ async def create_terminal(
     # never workers and are never counted. session_name is always supplied by
     # both assign (POST /sessions/{s}/terminals) and handoff (run-step) on this
     # path, so the guard is exact.
-    if new_session is False and caller_id and session_name:
-        _enforce_worker_terminal_cap(session_name, caller_id)
-    if working_directory is not None:
-        # Expand and resolve early so the preflight disk-space check and
-        # worktree path-override see an absolute, canonical path. Relative
-        # paths (e.g. ".") are resolved via os.getcwd() at this point.
-        expanded = os.path.realpath(os.path.abspath(os.path.expanduser(working_directory)))
-        try:
-            working_directory = resolve_and_validate_path(expanded, description="Working directory")
-        except ValueError as exc:
-            raise ValueError(f"invalid_working_directory: {exc}") from exc
-    else:
-        working_directory = resolve_and_validate_path(os.getcwd(), description="Working directory")
-    _preflight_disk_space(working_directory)
-    provider_class = get_provider_class(provider)
-    if provider_class.supports_seed_resume_identity is True and fork_context is None:
-        raise RuntimeError("seed_required")
-    resume_uuid = (
-        fork_context.session_uuid
-        if fork_context is not None and fork_context.mode == "resume"
-        else None
-    )
-    if not session_name:
-        session_name = generate_session_name()
-    if new_session and not session_name.startswith(SESSION_PREFIX):
-        session_name = f"{SESSION_PREFIX}{session_name}"
-    owned_lifecycle_lease = False
-    owned_uuid_lease = False
-    if resume_uuid:
-        (
-            uuid_lease_token,
-            owned_uuid_lease,
-            session_lifecycle_lease_token,
-            owned_lifecycle_lease,
-        ) = _acquire_resume_creation_authority(
-            session_name,
-            resume_uuid,
-            uuid_lease_token,
-            session_lifecycle_lease_token,
-            fallback_source_terminal_id,
-            fallback_source_lease_token,
+    # F439 (#294) round 2 / BLOCKER 1: hold a per-session admission lock across
+    # the count -> admission -> row-publication window so concurrent same-session
+    # creates cannot all observe the same stale count and oversubscribe the cap.
+    # Acquired BEFORE the count; released the instant the DB row is published
+    # (``_release_cap_lock`` after ``db_created = True``), or on ANY earlier
+    # failure via ``_release_cap_lock`` in the rollback/except seams. Releasing
+    # at publication (not at function end) keeps the slow provider-init phase
+    # OUT of the critical section, so parallel same-session assigns still run
+    # their init concurrently.
+    _cap_lock: Optional[threading.Lock] = None
+    _cap_capped = new_session is False and bool(caller_id) and bool(session_name)
+
+    def _release_cap_lock() -> None:
+        nonlocal _cap_lock
+        if _cap_lock is not None:
+            _cap_lock.release()
+            _cap_lock = None
+
+    if _cap_capped:
+        _cap_lock = _cap_admission_lock(session_name)  # type: ignore[arg-type]
+        await _acquire_cap_lock(_cap_lock)
+    try:
+        if _cap_capped:
+            # Enforce BEFORE any resource is created — no tmux window, no DB row,
+            # no worktree, no provider init — so a refusal is atomic and leaves
+            # nothing to unwind (mirrors the authority-pin pre-init refusal).
+            _enforce_worker_terminal_cap(session_name, caller_id)  # type: ignore[arg-type]
+        if working_directory is not None:
+            # Expand and resolve early so the preflight disk-space check and
+            # worktree path-override see an absolute, canonical path. Relative
+            # paths (e.g. ".") are resolved via os.getcwd() at this point.
+            expanded = os.path.realpath(os.path.abspath(os.path.expanduser(working_directory)))
+            try:
+                working_directory = resolve_and_validate_path(
+                    expanded, description="Working directory"
+                )
+            except ValueError as exc:
+                raise ValueError(f"invalid_working_directory: {exc}") from exc
+        else:
+            working_directory = resolve_and_validate_path(
+                os.getcwd(), description="Working directory"
+            )
+        _preflight_disk_space(working_directory)
+        provider_class = get_provider_class(provider)
+        if provider_class.supports_seed_resume_identity is True and fork_context is None:
+            raise RuntimeError("seed_required")
+        resume_uuid = (
+            fork_context.session_uuid
+            if fork_context is not None and fork_context.mode == "resume"
+            else None
         )
+        if not session_name:
+            session_name = generate_session_name()
+        if new_session and not session_name.startswith(SESSION_PREFIX):
+            session_name = f"{SESSION_PREFIX}{session_name}"
+        owned_lifecycle_lease = False
+        owned_uuid_lease = False
+        if resume_uuid:
+            (
+                uuid_lease_token,
+                owned_uuid_lease,
+                session_lifecycle_lease_token,
+                owned_lifecycle_lease,
+            ) = _acquire_resume_creation_authority(
+                session_name,
+                resume_uuid,
+                uuid_lease_token,
+                session_lifecycle_lease_token,
+                fallback_source_terminal_id,
+                fallback_source_lease_token,
+            )
+    except BaseException:
+        # Any failure in the count/admission OR the pre-publication preamble
+        # (working-dir validation, disk preflight, provider-class resolution,
+        # resume authority) must release the admission lock — none of these
+        # created a countable row, so a leaked lock would deadlock the next
+        # same-session create. The big creation ``try`` below has its own
+        # ``finally`` for the publication region.
+        _release_cap_lock()
+        raise
 
     try:
         try:
@@ -1869,6 +1922,12 @@ async def create_terminal(
             owned_lifecycle_lease = False
             session_lifecycle_lease_token = None
         db_created = True
+        # F439 (#294) round 2 / BLOCKER 1: the row is now durably published, so
+        # a concurrent same-session create will count it. Release the admission
+        # lock HERE — before the slow provider-init phase below — so parallel
+        # same-session assigns still initialize concurrently. Idempotent; the
+        # outer ``finally`` re-checks and is a no-op once released.
+        _release_cap_lock()
 
         # The live snapshot is transactional launch context. Build it only after
         # the terminal row and output plumbing exist, so it includes itself and a
@@ -2286,6 +2345,12 @@ async def create_terminal(
                 worktree_service.remove_worktree, worktree_repo_root, terminal_id
             )
         raise
+    finally:
+        # F439 (#294) round 2 / BLOCKER 1: guarantee the per-session admission
+        # lock is released on EVERY exit of the create body — success (already
+        # released right after ``db_created``), rollback, or an early
+        # pre-publication raise inside this try. Idempotent via the held-check.
+        _release_cap_lock()
 
 
 _PERSIST_FAILURE_CODES = {
@@ -3206,6 +3271,36 @@ def _fork_refresh_lock(base_name: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _fork_refresh_locks[key] = lock
     return lock
+
+
+def _cap_admission_lock(session_name: str) -> threading.Lock:
+    """Return the per-session admission lock (F439 #294, BLOCKER 1).
+
+    A process-wide ``threading.Lock`` (not asyncio) keyed by session, so it
+    serializes the worker-cap count -> admission -> row-publication window
+    across coroutines AND separate-loop threads alike. The map itself is guarded
+    by ``_cap_admission_locks_guard`` so two racers creating the per-session lock
+    cannot each make a different one.
+    """
+    with _cap_admission_locks_guard:
+        lock = _cap_admission_locks.get(session_name)
+        if lock is None:
+            lock = threading.Lock()
+            _cap_admission_locks[session_name] = lock
+        return lock
+
+
+async def _acquire_cap_lock(lock: threading.Lock) -> None:
+    """Acquire a ``threading.Lock`` without ever freezing the event loop.
+
+    A blocking ``lock.acquire()`` inside a coroutine would stall the whole loop
+    while contended (and could deadlock against the holder if the holder is
+    awaiting on the same loop). Instead spin with a non-blocking try and yield
+    control between attempts, so other coroutines (including the current
+    holder's continuation) keep running until the lock frees.
+    """
+    while not lock.acquire(blocking=False):
+        await asyncio.sleep(0.005)
 
 
 def _dispatch_base_refresh(
