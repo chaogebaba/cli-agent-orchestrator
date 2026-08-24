@@ -1,0 +1,1671 @@
+diff --git a/src/cli_agent_orchestrator/api/main.py b/src/cli_agent_orchestrator/api/main.py
+index 86a5946e..93e3cac2 100644
+--- a/src/cli_agent_orchestrator/api/main.py
++++ b/src/cli_agent_orchestrator/api/main.py
+@@ -185,6 +185,7 @@ from cli_agent_orchestrator.services.terminal_guard_service import (
+ from cli_agent_orchestrator.services.terminal_service import (
+     TERMINAL_RANGE_MAX_LENGTH,
+     OutputMode,
++    TerminalCapExceeded,
+     TerminalInputBlockedError,
+ )
+ from cli_agent_orchestrator.services.workflow_journal import (
+@@ -2085,7 +2086,9 @@ async def ws_supervisor_doorbell(websocket: WebSocket, terminal_id: str):
+     with _WSSessionLocal() as _ws_db:
+         ok, _err_code = verify_sender_token(_ws_db, terminal_id, token)
+     if not ok:
+-        reason = "Terminal not found" if _err_code == "E-SENDER-UNKNOWN" else "Invalid terminal token"
++        reason = (
++            "Terminal not found" if _err_code == "E-SENDER-UNKNOWN" else "Invalid terminal token"
++        )
+         code = 4404 if _err_code == "E-SENDER-UNKNOWN" else 4401
+         await websocket.close(code=code, reason=reason)
+         return
+@@ -4148,6 +4151,12 @@ async def create_terminal_in_session(
+         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
+         # orchestration_type) — propagate as-is instead of masking as a 500.
+         raise
++    except TerminalCapExceeded as e:
++        # F439 (#294): the worker-terminal cap refused BEFORE any resource was
++        # created. 409 Conflict with the structured E-TERMINAL-CAP detail (code,
++        # current_count, cap, reap_candidates) so the supervisor can reap-then-
++        # retry. No terminal row, no tmux window exists to unwind.
++        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=e.detail())
+     except KiroCapabilityError as e:
+         # Subclasses ValueError, so must precede the generic arm below —
+         # a capability rejection is a bad request, not a missing resource. Matches
+@@ -5066,6 +5075,16 @@ async def run_step(
+             status_code=code,
+             detail={"message": str(e), "kind": e.kind, "terminal_id": e.terminal_id},
+         )
++    except TerminalCapExceeded as e:
++        # F439 (#294): the worker-terminal cap refused this handoff BEFORE any
++        # terminal was created (mirrors the assign path). 409 with the same
++        # E-TERMINAL-CAP structured detail; kind="terminal_cap" keeps it
++        # distinguishable from the route's other 409s (diverged /
++        # decision_required / input). No terminal ran, so nothing is settled.
++        detail = e.detail()
++        detail["kind"] = "terminal_cap"
++        detail["terminal_id"] = None
++        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+     except (TimeoutError, TerminalInputBlockedError) as e:
+         # TerminalInputBlockedError (PR #539) is kept a DISTINCT type from
+         # TimeoutError rather than collapsed into it, because
+@@ -7384,8 +7403,12 @@ async def delete_terminal(
+         # D12: Typed, logged, structurally non-empty errors
+         detail_str = str(e)
+         code = detail_str if detail_str else "unknown_runtime_error"
+-        if code in ("resume_in_progress", "rebind_in_progress",
+-                    "cascade_quiesce_unstable", "cascade_outside_caller_subtree"):
++        if code in (
++            "resume_in_progress",
++            "rebind_in_progress",
++            "cascade_quiesce_unstable",
++            "cascade_outside_caller_subtree",
++        ):
+             raise HTTPException(
+                 status_code=status.HTTP_409_CONFLICT,
+                 detail=code,
+@@ -7441,12 +7464,15 @@ async def create_inbox_message_endpoint(
+     # F352: Sender-token enforcement. Skipped when CAO_SENDER_TOKEN_DISABLED
+     # is set (test subprocess servers that cannot inject tokens into callers).
+     _sender_token_disabled = os.environ.get("CAO_SENDER_TOKEN_DISABLED", "").strip().lower() in (
+-        "1", "true", "yes",
++        "1",
++        "true",
++        "yes",
+     )
+ 
+     # If the caller presents a valid operator bearer (CAO_AUTH_LOCAL_TOKEN),
+     # the terminal token check is bypassed — the operator is trusted.
+     from cli_agent_orchestrator.security.auth import get_local_bearer
++
+     operator_bearer = get_local_bearer()
+     auth_header = request.headers.get("authorization", "")
+     has_operator_bearer = (
+@@ -7459,6 +7485,7 @@ async def create_inbox_message_endpoint(
+         presented_token = request.headers.get("x-cao-terminal-token")
+         with SessionLocal() as _f332_db:
+             from cli_agent_orchestrator.services.terminal_token_service import verify_sender_token
++
+             ok, error_code = verify_sender_token(_f332_db, sender_id, presented_token)
+             if not ok:
+                 logger.warning(
+@@ -7499,10 +7526,9 @@ async def create_inbox_message_endpoint(
+     sender_terminal = None
+     try:
+         from cli_agent_orchestrator.clients.database import SessionLocal as _f129_session
++
+         with _f129_session() as _f129_db:
+-            sender_terminal = (
+-                _f129_db.query(TerminalModel).filter_by(id=sender_id).first()
+-            )
++            sender_terminal = _f129_db.query(TerminalModel).filter_by(id=sender_id).first()
+             if sender_terminal is not None:
+                 from cli_agent_orchestrator.services.authority_pin_service import (
+                     FrozenPinValidation,
+@@ -7525,9 +7551,7 @@ async def create_inbox_message_endpoint(
+                             },
+                         }
+                     # Check caller terminal still exists
+-                    caller_terminal = (
+-                        _f129_db.query(TerminalModel).filter_by(id=caller_id).first()
+-                    )
++                    caller_terminal = _f129_db.query(TerminalModel).filter_by(id=caller_id).first()
+                     if caller_terminal is None:
+                         return {
+                             "success": False,
+@@ -7539,6 +7563,7 @@ async def create_inbox_message_endpoint(
+                     # Dedup: check if drift notice already delivered
+                     drift_sender_key = f"cao-system:drift:{sender_id}"
+                     from cli_agent_orchestrator.clients.database import InboxModel as _f129_inbox
++
+                     existing = (
+                         _f129_db.query(_f129_inbox)
+                         .filter(
+diff --git a/src/cli_agent_orchestrator/mcp_server/server.py b/src/cli_agent_orchestrator/mcp_server/server.py
+index 41686e70..9e8fb1dd 100644
+--- a/src/cli_agent_orchestrator/mcp_server/server.py
++++ b/src/cli_agent_orchestrator/mcp_server/server.py
+@@ -1017,6 +1017,57 @@ def _extract_structured_detail(response: requests.Response, fallback: str) -> st
+     return detail if isinstance(detail, str) and detail else fallback
+ 
+ 
++def _extract_terminal_cap_detail(response: "requests.Response | None") -> Optional[Dict[str, Any]]:
++    """Return the E-TERMINAL-CAP structured detail from a 409 response, else None.
++
++    F439 (#294): the server refuses over-cap assign/handoff with a 409 whose
++    ``detail`` carries ``code="E-TERMINAL-CAP"`` plus ``current_count``, ``cap``
++    and ``reap_candidates``. This recognizes that shape (on either route — the
++    assign route's plain detail, or the run-step route's detail that also adds a
++    ``kind``) so the caller can render the reap-candidate surface rather than
++    losing it to a bare error string.
++    """
++    if response is None:
++        return None
++    try:
++        detail = response.json().get("detail")
++    except ValueError:
++        return None
++    if isinstance(detail, dict) and detail.get("code") == "E-TERMINAL-CAP":
++        return detail
++    return None
++
++
++def _render_terminal_cap_message(detail: Dict[str, Any], action: str) -> str:
++    """Render an E-TERMINAL-CAP detail into a supervisor-facing message.
++
++    Lists the idle reap candidates (id, display_name, idle-since) so the
++    supervisor can reap-then-retry — the server never auto-reaps.
++    """
++    current = detail.get("current_count")
++    cap = detail.get("cap")
++    candidates = detail.get("reap_candidates") or []
++    lines = [
++        f"{action} refused (E-TERMINAL-CAP): {current} live worker terminal(s) "
++        f"at cap {cap}. No terminal was created. Reap an idle worker with "
++        f"delete_terminal, then retry — the server never auto-reaps."
++    ]
++    if candidates:
++        lines.append("Idle reap candidates:")
++        for cand in candidates:
++            idle_since = cand.get("idle_since")
++            suffix = f" (idle since {idle_since})" if idle_since else ""
++            lines.append(
++                f"  - {cand.get('display_name', cand.get('id'))} " f"[{cand.get('id')}]{suffix}"
++            )
++    else:
++        lines.append(
++            "No idle workers to reap — every worker is busy; wait for one to "
++            "finish or raise CAO_MAX_WORKER_TERMINALS."
++        )
++    return "\n".join(lines)
++
++
+ def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
+     """Fetch a skill body from cao-server and return content or a structured error."""
+     try:
+@@ -1225,6 +1276,20 @@ async def _handoff_impl(
+             )
+ 
+         if response.status_code != 200:
++            # F439 (#294): the worker-terminal cap refuses handoff with a 409
++            # E-TERMINAL-CAP; render the reap-candidate surface (no terminal was
++            # created, so there is nothing to delete).
++            cap_detail = _extract_terminal_cap_detail(response)
++            if cap_detail is not None:
++                return HandoffResult(
++                    success=False,
++                    message=_render_terminal_cap_message(cap_detail, "Handoff"),
++                    output=None,
++                    terminal_id=None,
++                    display_name=None,
++                    window_name=None,
++                    resolved_model=None,
++                )
+             # Map the boundary's HTTPException back into a HandoffResult. The
+             # run-step endpoint returns a STRUCTURED detail object
+             # ({message, kind, terminal_id}) so we read terminal_id and the
+@@ -1237,10 +1302,7 @@ async def _handoff_impl(
+             # (504 -> timeout, 502 -> error).
+             _dn = display_name(tid, agent_profile) if tid else "unknown"
+             if kind == "input_blocked":
+-                msg = (
+-                    f"Handoff blocked: {_dn} is waiting on a dialog "
+-                    f"({structured_detail})"
+-                )
++                msg = f"Handoff blocked: {_dn} is waiting on a dialog " f"({structured_detail})"
+             elif kind == "waiting_user_input":
+                 msg = (
+                     f"Handoff blocked: worker is waiting for user input "
+@@ -1277,6 +1339,7 @@ async def _handoff_impl(
+         if terminal_id:
+             try:
+                 from cli_agent_orchestrator.services.terminal_service import get_terminal_metadata
++
+                 _hm = get_terminal_metadata(terminal_id)
+                 if _hm:
+                     _f127_handoff_model = _hm.get("resolved_model")
+@@ -1319,6 +1382,7 @@ async def interrupt_terminal(
+ 
+     try:
+         from cli_agent_orchestrator.services.terminal_service import get_terminal_metadata
++
+         metadata = get_terminal_metadata(terminal_id)
+         if not metadata:
+             return {"success": False, "terminal_id": terminal_id, "message": "Terminal not found"}
+@@ -1335,6 +1399,7 @@ async def interrupt_terminal(
+ 
+         # Guard: only interrupt PROCESSING terminals
+         from cli_agent_orchestrator.services.status_monitor import status_monitor
++
+         current_status = status_monitor.get_status(terminal_id).value
+         if current_status != "processing":
+             return {
+@@ -1347,6 +1412,7 @@ async def interrupt_terminal(
+ 
+         # Get provider interrupt keys
+         from cli_agent_orchestrator.providers.manager import get_provider_class
++
+         provider_type = metadata.get("provider", "")
+         provider_cls = get_provider_class(provider_type)
+         keys = provider_cls.interrupt_keys
+@@ -1734,6 +1800,7 @@ def _assign_impl(
+         if agent_profile:
+             try:
+                 from cli_agent_orchestrator.services.terminal_service import get_terminal_metadata
++
+                 _f127_meta = get_terminal_metadata(terminal_id)
+                 if _f127_meta:
+                     _f127_resolved = _f127_meta.get("resolved_model")
+@@ -1763,6 +1830,16 @@ def _assign_impl(
+         return result
+ 
+     except requests.HTTPError as exc:
++        cap_detail = _extract_terminal_cap_detail(exc.response)
++        if cap_detail is not None:
++            # F439 (#294): render the reap-candidate surface, and echo the
++            # structured fields so programmatic callers can branch on them.
++            return {
++                "success": False,
++                "terminal_id": None,
++                "error": cap_detail,
++                "message": _render_terminal_cap_message(cap_detail, "Assignment"),
++            }
+         detail = (
+             _extract_error_detail(exc.response, str(exc)) if exc.response is not None else str(exc)
+         )
+@@ -4267,10 +4344,11 @@ from cli_agent_orchestrator.plugins.registry import register_mcp_server_surfaces
+ register_mcp_server_surfaces(mcp)
+ 
+ 
++from typing import Sequence as _Seq  # noqa: E402
++
+ # --- Deterministic tools/list ordering (MCP 2026-07-28: servers SHOULD return
+ # tools/list in deterministic order for prompt-cache stability) ---
+ from fastmcp.server.middleware import Middleware as _Middleware  # noqa: E402
+-from typing import Sequence as _Seq  # noqa: E402
+ 
+ 
+ class _DeterministicToolOrder(_Middleware):
+diff --git a/src/cli_agent_orchestrator/services/config_service.py b/src/cli_agent_orchestrator/services/config_service.py
+index ec3b1e63..6dcb3917 100644
+--- a/src/cli_agent_orchestrator/services/config_service.py
++++ b/src/cli_agent_orchestrator/services/config_service.py
+@@ -152,6 +152,9 @@ _LEGACY_KEY_MAP: Dict[str, Tuple[str, ...]] = {
+ _OWNED_DEFAULTS: Dict[str, Any] = {
+     "terminal.backend": "tmux",
+     "terminal.herdr_session": "cao",
++    # F439 (#294): default worker-terminal cap when neither env nor
++    # settings.json sets it.
++    "orchestrator.max_worker_terminals": 10,
+     "apps.enabled": False,
+     "apps.static_dir": None,
+     "auth.jwks_uri": "",
+@@ -171,6 +174,9 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
+ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
+     "CAO_TERMINAL_BACKEND": ("terminal.backend", "str", "tmux"),
+     "CAO_HERDR_SESSION": ("terminal.herdr_session", "str", "cao"),
++    # F439 (#294): server-side worker-terminal cap. <=0 disables. env beats
++    # settings.json (orchestrator.max_worker_terminals) beats this default 10.
++    "CAO_MAX_WORKER_TERMINALS": ("orchestrator.max_worker_terminals", "int", 10),
+     "CAO_MCP_APPS_ENABLED": ("apps.enabled", "bool", False),
+     "CAO_MCP_APPS_STATIC_DIR": ("apps.static_dir", "str", None),
+     "CAO_AUTH_JWKS_URI": ("auth.jwks_uri", "str", ""),
+diff --git a/src/cli_agent_orchestrator/services/terminal_service.py b/src/cli_agent_orchestrator/services/terminal_service.py
+index 42b90808..ae3d3356 100644
+--- a/src/cli_agent_orchestrator/services/terminal_service.py
++++ b/src/cli_agent_orchestrator/services/terminal_service.py
+@@ -142,6 +142,7 @@ from cli_agent_orchestrator.utils.sandbox_guard import (
+ )
+ from cli_agent_orchestrator.utils.skills import build_skill_catalog
+ from cli_agent_orchestrator.utils.terminal import (
++    display_name,
+     generate_session_name,
+     generate_terminal_id,
+     generate_window_name,
+@@ -151,6 +152,45 @@ from cli_agent_orchestrator.utils.terminal import (
+ logger = logging.getLogger(__name__)
+ 
+ 
++class TerminalCapExceeded(RuntimeError):
++    """F439 (#294): raised when a worker terminal would exceed the session cap.
++
++    Fail-closed structured error. Carries the counting surface the supervisor
++    needs to reap-then-retry (the server never auto-reaps): the current live
++    worker count, the resolved cap, and the idle worker terminals that are the
++    natural reap candidates. Both HTTP boundaries (``POST
++    /sessions/{s}/terminals`` and ``POST /terminals/run-step``) map this to a
++    409 whose ``detail`` carries ``code="E-TERMINAL-CAP"`` plus these fields.
++    """
++
++    code = "E-TERMINAL-CAP"
++
++    def __init__(
++        self,
++        current_count: int,
++        cap: int,
++        reap_candidates: List[Dict[str, Any]],
++    ) -> None:
++        self.current_count = current_count
++        self.cap = cap
++        self.reap_candidates = reap_candidates
++        super().__init__(
++            f"worker-terminal cap reached: {current_count} live worker terminal(s) "
++            f"at cap {cap}. Reap an idle worker (delete_terminal) then retry; the "
++            f"server never auto-reaps."
++        )
++
++    def detail(self) -> Dict[str, Any]:
++        """Structured HTTP detail body carrying the reap-candidate surface."""
++        return {
++            "code": self.code,
++            "message": str(self),
++            "current_count": self.current_count,
++            "cap": self.cap,
++            "reap_candidates": self.reap_candidates,
++        }
++
++
+ class IdentityAmbiguousError(RuntimeError):
+     """Raised when purge_stale_terminal_records finds multiple windows claiming the same terminal ID.
+ 
+@@ -254,6 +294,21 @@ class _DeferredTaskRecord:
+ 
+ _deferred_tasks_by_terminal: dict[str, _DeferredTaskRecord] = {}
+ _fork_refresh_locks: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock] = {}
++# F439 (#294) round 2 / BLOCKER 1: per-session admission lock. The worker-cap
++# check is check-then-act (count -> create); without serializing the decision
++# through publication, N concurrent create_terminal calls for the same session
++# all observe the same pre-create count and all get admitted, oversubscribing
++# the cap. This is a threading.Lock (NOT asyncio.Lock) so it serializes across
++# BOTH coroutines on the server's single event loop AND separate-loop threads
++# (the gate's adversarial probe drives create_terminal from four threads, each
++# with its own loop — an asyncio.Lock keyed by loop would not serialize them).
++# It is acquired with a loop-friendly non-blocking spin (``_acquire_cap_lock``)
++# so it never freezes the event loop while contended, held from the cap count
++# through DB-row publication (``db_created``), and released the instant
++# publication succeeds — NOT across the slow provider-init phase — so parallel
++# same-session assigns still run their init concurrently.
++_cap_admission_locks: dict[str, threading.Lock] = {}
++_cap_admission_locks_guard = threading.Lock()
+ 
+ 
+ def _preflight_disk_space(path: str, floor_gb: float = DISK_SPACE_FLOOR_GB) -> None:
+@@ -929,6 +984,93 @@ def _resolve_working_directory(working_directory: Optional[str]) -> str:
+     )
+ 
+ 
++def _resolve_worker_terminal_cap() -> int:
++    """Resolve the worker-terminal cap (F439 #294).
++
++    Precedence: ``CAO_MAX_WORKER_TERMINALS`` env > ``orchestrator.max_worker_terminals``
++    in settings.json > built-in default 10. Delegates entirely to ConfigService
++    so the precedence chain is the single one the rest of the server uses — no
++    new config file, no bespoke env read. A ``<= 0`` value disables the cap
++    (callers treat that as "no limit").
++    """
++    from cli_agent_orchestrator.services.config_service import ConfigService
++
++    try:
++        cap = int(ConfigService.get("orchestrator.max_worker_terminals", default=10))
++    except (TypeError, ValueError):
++        # A malformed settings.json value must not brick terminal creation;
++        # fall back to the built-in default rather than raising.
++        logger.warning("invalid orchestrator.max_worker_terminals; using default cap 10")
++        cap = 10
++    return cap
++
++
++def _count_worker_terminals(
++    session_name: str, supervisor_id: Optional[str]
++) -> tuple[int, List[Dict[str, Any]]]:
++    """Count live worker terminals in a session, excluding the supervisor.
++
++    Derived from live state on every call (no persistent counter), so it
++    survives a server restart. A "worker" is every terminal row in the session
++    other than ``supervisor_id`` (the terminal doing the assign/handoff). Idle
++    workers COUNT toward the cap — their RAM cost is real — but are ALSO
++    returned as reap candidates so the supervisor can reap-then-retry.
++
++    Returns ``(count, reap_candidates)`` where each candidate is
++    ``{"id", "display_name", "idle_since"}`` for a worker whose live status is
++    IDLE. ``idle_since`` is the row's ``last_active`` ISO string (best-effort;
++    None when unavailable).
++    """
++    rows = list_terminals_by_session(session_name)
++    count = 0
++    reap_candidates: List[Dict[str, Any]] = []
++    for row in rows:
++        tid = row.get("id")
++        if not tid or tid == supervisor_id:
++            # The supervisor's own terminal is never a worker and never counted.
++            continue
++        count += 1
++        try:
++            live_status = status_monitor.get_status(tid)
++        except Exception:
++            live_status = None
++        if live_status == TerminalStatus.IDLE:
++            last_active = row.get("last_active")
++            idle_since: Optional[str] = None
++            if isinstance(last_active, datetime):
++                idle_since = last_active.isoformat()
++            elif last_active is not None:
++                idle_since = str(last_active)
++            reap_candidates.append(
++                {
++                    "id": tid,
++                    "display_name": display_name(tid, row.get("agent_profile")),
++                    "idle_since": idle_since,
++                }
++            )
++    return count, reap_candidates
++
++
++def _enforce_worker_terminal_cap(session_name: str, supervisor_id: Optional[str]) -> None:
++    """Refuse fail-closed when a new worker would breach the session cap (F439).
++
++    Called ONLY for supervisor-created workers joining an existing session
++    (``new_session=False`` and ``caller_id`` set) — operator-launched terminals
++    and the supervisor itself are never capped. Raises ``TerminalCapExceeded``
++    BEFORE any tmux window, DB row, worktree, or provider init exists (same
++    fail-before-side-effects atomicity as the authority-pin refusal path), so a
++    refusal leaves no resource to unwind.
++
++    A cap of ``<= 0`` disables enforcement entirely.
++    """
++    cap = _resolve_worker_terminal_cap()
++    if cap <= 0:
++        return
++    count, reap_candidates = _count_worker_terminals(session_name, supervisor_id)
++    if count >= cap:
++        raise TerminalCapExceeded(current_count=count, cap=cap, reap_candidates=reap_candidates)
++
++
+ async def create_terminal(
+     provider: str,
+     agent_profile: str,
+@@ -1022,46 +1164,95 @@ async def create_terminal(
+         TimeoutError: If provider initialization times out
+     """
+     require_provider_admitted(provider)
+-    if working_directory is not None:
+-        # Expand and resolve early so the preflight disk-space check and
+-        # worktree path-override see an absolute, canonical path. Relative
+-        # paths (e.g. ".") are resolved via os.getcwd() at this point.
+-        expanded = os.path.realpath(os.path.abspath(os.path.expanduser(working_directory)))
+-        try:
+-            working_directory = resolve_and_validate_path(expanded, description="Working directory")
+-        except ValueError as exc:
+-            raise ValueError(f"invalid_working_directory: {exc}") from exc
+-    else:
+-        working_directory = resolve_and_validate_path(os.getcwd(), description="Working directory")
+-    _preflight_disk_space(working_directory)
+-    provider_class = get_provider_class(provider)
+-    if provider_class.supports_seed_resume_identity is True and fork_context is None:
+-        raise RuntimeError("seed_required")
+-    resume_uuid = (
+-        fork_context.session_uuid
+-        if fork_context is not None and fork_context.mode == "resume"
+-        else None
+-    )
+-    if not session_name:
+-        session_name = generate_session_name()
+-    if new_session and not session_name.startswith(SESSION_PREFIX):
+-        session_name = f"{SESSION_PREFIX}{session_name}"
+-    owned_lifecycle_lease = False
+-    owned_uuid_lease = False
+-    if resume_uuid:
+-        (
+-            uuid_lease_token,
+-            owned_uuid_lease,
+-            session_lifecycle_lease_token,
+-            owned_lifecycle_lease,
+-        ) = _acquire_resume_creation_authority(
+-            session_name,
+-            resume_uuid,
+-            uuid_lease_token,
+-            session_lifecycle_lease_token,
+-            fallback_source_terminal_id,
+-            fallback_source_lease_token,
++    # F439 (#294): enforce the worker-terminal cap BEFORE any resource is
++    # created — no tmux window, no DB row, no worktree, no provider init — so a
++    # refusal is atomic and leaves nothing to unwind (mirrors the authority-pin
++    # pre-init refusal). Only supervisor-created workers joining an EXISTING
++    # session are capped: new_session=True (operator/new-session launches) and
++    # caller_id=None (operator-launched terminals, the supervisor itself) are
++    # never workers and are never counted. session_name is always supplied by
++    # both assign (POST /sessions/{s}/terminals) and handoff (run-step) on this
++    # path, so the guard is exact.
++    # F439 (#294) round 2 / BLOCKER 1: hold a per-session admission lock across
++    # the count -> admission -> row-publication window so concurrent same-session
++    # creates cannot all observe the same stale count and oversubscribe the cap.
++    # Acquired BEFORE the count; released the instant the DB row is published
++    # (``_release_cap_lock`` after ``db_created = True``), or on ANY earlier
++    # failure via ``_release_cap_lock`` in the rollback/except seams. Releasing
++    # at publication (not at function end) keeps the slow provider-init phase
++    # OUT of the critical section, so parallel same-session assigns still run
++    # their init concurrently.
++    _cap_lock: Optional[threading.Lock] = None
++    _cap_capped = new_session is False and bool(caller_id) and bool(session_name)
++
++    def _release_cap_lock() -> None:
++        nonlocal _cap_lock
++        if _cap_lock is not None:
++            _cap_lock.release()
++            _cap_lock = None
++
++    if _cap_capped:
++        _cap_lock = _cap_admission_lock(session_name)  # type: ignore[arg-type]
++        await _acquire_cap_lock(_cap_lock)
++    try:
++        if _cap_capped:
++            # Enforce BEFORE any resource is created — no tmux window, no DB row,
++            # no worktree, no provider init — so a refusal is atomic and leaves
++            # nothing to unwind (mirrors the authority-pin pre-init refusal).
++            _enforce_worker_terminal_cap(session_name, caller_id)  # type: ignore[arg-type]
++        if working_directory is not None:
++            # Expand and resolve early so the preflight disk-space check and
++            # worktree path-override see an absolute, canonical path. Relative
++            # paths (e.g. ".") are resolved via os.getcwd() at this point.
++            expanded = os.path.realpath(os.path.abspath(os.path.expanduser(working_directory)))
++            try:
++                working_directory = resolve_and_validate_path(
++                    expanded, description="Working directory"
++                )
++            except ValueError as exc:
++                raise ValueError(f"invalid_working_directory: {exc}") from exc
++        else:
++            working_directory = resolve_and_validate_path(
++                os.getcwd(), description="Working directory"
++            )
++        _preflight_disk_space(working_directory)
++        provider_class = get_provider_class(provider)
++        if provider_class.supports_seed_resume_identity is True and fork_context is None:
++            raise RuntimeError("seed_required")
++        resume_uuid = (
++            fork_context.session_uuid
++            if fork_context is not None and fork_context.mode == "resume"
++            else None
+         )
++        if not session_name:
++            session_name = generate_session_name()
++        if new_session and not session_name.startswith(SESSION_PREFIX):
++            session_name = f"{SESSION_PREFIX}{session_name}"
++        owned_lifecycle_lease = False
++        owned_uuid_lease = False
++        if resume_uuid:
++            (
++                uuid_lease_token,
++                owned_uuid_lease,
++                session_lifecycle_lease_token,
++                owned_lifecycle_lease,
++            ) = _acquire_resume_creation_authority(
++                session_name,
++                resume_uuid,
++                uuid_lease_token,
++                session_lifecycle_lease_token,
++                fallback_source_terminal_id,
++                fallback_source_lease_token,
++            )
++    except BaseException:
++        # Any failure in the count/admission OR the pre-publication preamble
++        # (working-dir validation, disk preflight, provider-class resolution,
++        # resume authority) must release the admission lock — none of these
++        # created a countable row, so a leaked lock would deadlock the next
++        # same-session create. The big creation ``try`` below has its own
++        # ``finally`` for the publication region.
++        _release_cap_lock()
++        raise
+ 
+     try:
+         try:
+@@ -1731,6 +1922,12 @@ async def create_terminal(
+             owned_lifecycle_lease = False
+             session_lifecycle_lease_token = None
+         db_created = True
++        # F439 (#294) round 2 / BLOCKER 1: the row is now durably published, so
++        # a concurrent same-session create will count it. Release the admission
++        # lock HERE — before the slow provider-init phase below — so parallel
++        # same-session assigns still initialize concurrently. Idempotent; the
++        # outer ``finally`` re-checks and is a no-op once released.
++        _release_cap_lock()
+ 
+         # The live snapshot is transactional launch context. Build it only after
+         # the terminal row and output plumbing exist, so it includes itself and a
+@@ -2148,6 +2345,12 @@ async def create_terminal(
+                 worktree_service.remove_worktree, worktree_repo_root, terminal_id
+             )
+         raise
++    finally:
++        # F439 (#294) round 2 / BLOCKER 1: guarantee the per-session admission
++        # lock is released on EVERY exit of the create body — success (already
++        # released right after ``db_created``), rollback, or an early
++        # pre-publication raise inside this try. Idempotent via the held-check.
++        _release_cap_lock()
+ 
+ 
+ _PERSIST_FAILURE_CODES = {
+@@ -3070,6 +3273,36 @@ def _fork_refresh_lock(base_name: str) -> asyncio.Lock:
+     return lock
+ 
+ 
++def _cap_admission_lock(session_name: str) -> threading.Lock:
++    """Return the per-session admission lock (F439 #294, BLOCKER 1).
++
++    A process-wide ``threading.Lock`` (not asyncio) keyed by session, so it
++    serializes the worker-cap count -> admission -> row-publication window
++    across coroutines AND separate-loop threads alike. The map itself is guarded
++    by ``_cap_admission_locks_guard`` so two racers creating the per-session lock
++    cannot each make a different one.
++    """
++    with _cap_admission_locks_guard:
++        lock = _cap_admission_locks.get(session_name)
++        if lock is None:
++            lock = threading.Lock()
++            _cap_admission_locks[session_name] = lock
++        return lock
++
++
++async def _acquire_cap_lock(lock: threading.Lock) -> None:
++    """Acquire a ``threading.Lock`` without ever freezing the event loop.
++
++    A blocking ``lock.acquire()`` inside a coroutine would stall the whole loop
++    while contended (and could deadlock against the holder if the holder is
++    awaiting on the same loop). Instead spin with a non-blocking try and yield
++    control between attempts, so other coroutines (including the current
++    holder's continuation) keep running until the lock frees.
++    """
++    while not lock.acquire(blocking=False):
++        await asyncio.sleep(0.005)
++
++
+ def _dispatch_base_refresh(
+     base_terminal_id: str,
+     message: str,
+diff --git a/test/api/test_api_endpoints.py b/test/api/test_api_endpoints.py
+index 8f855660..17ab9e89 100644
+--- a/test/api/test_api_endpoints.py
++++ b/test/api/test_api_endpoints.py
+@@ -864,6 +864,33 @@ class TestCreateTerminalInSession:
+         assert response.status_code == 500
+         assert "Failed to create terminal" in response.json()["detail"]
+ 
++    def test_create_terminal_cap_exceeded_returns_409_structured(self, client):
++        """F439 (#294): TerminalCapExceeded maps to 409 with E-TERMINAL-CAP detail."""
++        from cli_agent_orchestrator.services.terminal_service import TerminalCapExceeded
++
++        candidates = [
++            {"id": "bbbbbbbb", "display_name": "developer-bbbbbbbb", "idle_since": None},
++        ]
++        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
++            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
++            mock_svc.create_terminal = AsyncMock(
++                side_effect=TerminalCapExceeded(
++                    current_count=10, cap=10, reap_candidates=candidates
++                )
++            )
++
++            response = client.post(
++                "/sessions/test-session/terminals",
++                params={"provider": "kiro_cli", "agent_profile": "developer"},
++            )
++
++        assert response.status_code == 409
++        detail = response.json()["detail"]
++        assert detail["code"] == "E-TERMINAL-CAP"
++        assert detail["current_count"] == 10
++        assert detail["cap"] == 10
++        assert detail["reap_candidates"] == candidates
++
+ 
+ class TestListTerminalsInSession:
+     """Tests for GET /sessions/{session_name}/terminals endpoint."""
+diff --git a/test/mcp_server/test_terminal_cap_render.py b/test/mcp_server/test_terminal_cap_render.py
+new file mode 100644
+index 00000000..b1528e70
+--- /dev/null
++++ b/test/mcp_server/test_terminal_cap_render.py
+@@ -0,0 +1,131 @@
++"""F439 (#294): MCP-side rendering of the E-TERMINAL-CAP structured error.
++
++The server refuses over-cap assign/handoff with a 409 whose ``detail`` carries
++``code="E-TERMINAL-CAP"`` plus ``current_count``, ``cap`` and
++``reap_candidates``. The MCP tools must surface that reap-candidate surface to
++the supervisor rather than swallowing it into a bare error string (the default
++``_extract_error_detail`` returns only STRING details, so without the dedicated
++handling the structured payload would be lost).
++"""
++
++from __future__ import annotations
++
++from unittest.mock import MagicMock, patch
++
++import pytest
++import requests
++
++from cli_agent_orchestrator.mcp_server.server import (
++    _extract_terminal_cap_detail,
++    _render_terminal_cap_message,
++)
++
++CAP_DETAIL = {
++    "code": "E-TERMINAL-CAP",
++    "message": "worker-terminal cap reached: 10 live worker terminal(s) at cap 10.",
++    "current_count": 10,
++    "cap": 10,
++    "reap_candidates": [
++        {
++            "id": "bbbbbbbb",
++            "display_name": "developer-bbbbbbbb",
++            "idle_since": "2026-01-01T00:00:00+00:00",
++        },
++        {"id": "cccccccc", "display_name": "reviewer-cccccccc", "idle_since": None},
++    ],
++}
++
++
++def _resp(status_code: int, detail):
++    r = MagicMock(spec=requests.Response)
++    r.status_code = status_code
++    r.json.return_value = {"detail": detail}
++    return r
++
++
++class TestExtractCapDetail:
++    def test_recognizes_cap_detail(self):
++        assert _extract_terminal_cap_detail(_resp(409, CAP_DETAIL)) == CAP_DETAIL
++
++    def test_recognizes_cap_detail_with_extra_kind(self):
++        """run-step route adds kind/terminal_id; still recognized by code."""
++        d = dict(CAP_DETAIL, kind="terminal_cap", terminal_id=None)
++        assert _extract_terminal_cap_detail(_resp(409, d)) == d
++
++    def test_none_for_other_error(self):
++        assert _extract_terminal_cap_detail(_resp(404, "no such terminal")) is None
++
++    def test_none_for_other_structured_error(self):
++        other = {"code": "E-SENDER-TOKEN", "message": "bad token"}
++        assert _extract_terminal_cap_detail(_resp(401, other)) is None
++
++    def test_none_for_missing_response(self):
++        assert _extract_terminal_cap_detail(None) is None
++
++    def test_none_for_non_json_body(self):
++        r = MagicMock(spec=requests.Response)
++        r.json.side_effect = ValueError("no json")
++        assert _extract_terminal_cap_detail(r) is None
++
++
++class TestRenderCapMessage:
++    def test_lists_candidates(self):
++        msg = _render_terminal_cap_message(CAP_DETAIL, "Assignment")
++        assert "E-TERMINAL-CAP" in msg
++        assert "cap 10" in msg
++        assert "developer-bbbbbbbb" in msg
++        assert "reviewer-cccccccc" in msg
++        assert "idle since 2026-01-01T00:00:00+00:00" in msg
++        assert "never auto-reaps" in msg
++
++    def test_no_candidates_hint(self):
++        detail = dict(CAP_DETAIL, reap_candidates=[])
++        msg = _render_terminal_cap_message(detail, "Handoff")
++        assert "No idle workers to reap" in msg
++        assert "CAO_MAX_WORKER_TERMINALS" in msg
++
++
++class TestAssignSurfacesCap:
++    """_assign_impl renders the cap error when the create POST returns 409."""
++
++    def test_assign_returns_cap_envelope(self, monkeypatch, tmp_path):
++        monkeypatch.setenv("CAO_TERMINAL_ID", "a1b2c3d4")
++        monkeypatch.setenv("CAO_ENDPOINT", "http://127.0.0.1:19999")
++
++        # Supervisor lookup GET succeeds.
++        get_resp = MagicMock()
++        get_resp.status_code = 200
++        get_resp.json.return_value = {
++            "id": "a1b2c3d4",
++            "provider": "mock_cli",
++            "session_name": "test-session",
++            "status": "idle",
++            "allowed_tools": None,
++        }
++        get_resp.raise_for_status = MagicMock()
++
++        # Create POST returns a 409 E-TERMINAL-CAP; raise_for_status raises.
++        post_resp = MagicMock(spec=requests.Response)
++        post_resp.status_code = 409
++        post_resp.json.return_value = {"detail": CAP_DETAIL}
++        http_err = requests.HTTPError("409 Client Error")
++        http_err.response = post_resp
++        post_resp.raise_for_status = MagicMock(side_effect=http_err)
++
++        with patch("cli_agent_orchestrator.mcp_server.server.cao_http") as mock_http:
++            mock_http.get.return_value = get_resp
++            mock_http.post.return_value = post_resp
++
++            from cli_agent_orchestrator.mcp_server.server import _assign_impl
++
++            result = _assign_impl(
++                agent_profile="developer",
++                message="brief",
++                working_directory=str(tmp_path),
++            )
++
++        assert result["success"] is False
++        assert result["terminal_id"] is None  # nothing was created
++        assert result["error"]["code"] == "E-TERMINAL-CAP"
++        assert result["error"]["current_count"] == 10
++        assert "developer-bbbbbbbb" in result["message"]
+diff --git a/test/services/test_config_service.py b/test/services/test_config_service.py
+index f06b0e69..cec0879b 100644
+--- a/test/services/test_config_service.py
++++ b/test/services/test_config_service.py
+@@ -95,6 +95,43 @@ class TestLegacyMigration:
+         assert ConfigService.get("terminal.backend") == "tmux"
+ 
+ 
++class TestWorkerTerminalCapConfig:
++    """F439 (#294): CAO_MAX_WORKER_TERMINALS > orchestrator.max_worker_terminals > 10."""
++
++    def test_default_is_ten(self, _isolated_settings):
++        assert ConfigService.get("orchestrator.max_worker_terminals", default=10) == 10
++
++    def test_file_value_beats_default(self, _isolated_settings):
++        _isolated_settings["settings"].write_text(
++            json.dumps({"orchestrator": {"max_worker_terminals": 5}})
++        )
++        assert ConfigService.get("orchestrator.max_worker_terminals", default=10) == 5
++
++    def test_env_beats_file(self, _isolated_settings, monkeypatch):
++        _isolated_settings["settings"].write_text(
++            json.dumps({"orchestrator": {"max_worker_terminals": 5}})
++        )
++        monkeypatch.setenv("CAO_MAX_WORKER_TERMINALS", "3")
++        assert ConfigService.get("orchestrator.max_worker_terminals", default=10) == 3
++
++    def test_env_beats_default_when_no_file(self, _isolated_settings, monkeypatch):
++        monkeypatch.setenv("CAO_MAX_WORKER_TERMINALS", "7")
++        assert ConfigService.get("orchestrator.max_worker_terminals", default=10) == 7
++
++    def test_zero_disables_via_env(self, _isolated_settings, monkeypatch):
++        monkeypatch.setenv("CAO_MAX_WORKER_TERMINALS", "0")
++        assert ConfigService.get("orchestrator.max_worker_terminals", default=10) == 0
++
++    def test_negative_disables_via_file(self, _isolated_settings):
++        _isolated_settings["settings"].write_text(
++            json.dumps({"orchestrator": {"max_worker_terminals": -1}})
++        )
++        assert ConfigService.get("orchestrator.max_worker_terminals", default=10) == -1
++
++    def test_path_is_in_list_all(self, _isolated_settings):
++        assert "orchestrator.max_worker_terminals" in ConfigService.list_all()
++
++
+ class TestMemoryCompileModeConflict:
+     """CAO_MEMORY_COMPILE_MODE must win over a conflicting settings.json value."""
+ 
+diff --git a/test/services/test_worker_terminal_cap.py b/test/services/test_worker_terminal_cap.py
+new file mode 100644
+index 00000000..a50834fd
+--- /dev/null
++++ b/test/services/test_worker_terminal_cap.py
+@@ -0,0 +1,756 @@
++"""F439 (#294): server-side worker-terminal cap on assign/handoff.
++
++These tests drive the counting + enforcement seam in ``terminal_service``
++directly (fast, no tmux): the cap is DERIVED from live state on every call
++(no persistent counter), so a restart cannot desync it. The AC cases:
++
++- cap reached -> TerminalCapExceeded with structured E-TERMINAL-CAP payload
++  (current_count, cap, reap_candidates) and NO side effect (nothing created);
++- reap one idle worker -> the same call now succeeds (count drops below cap);
++- supervisor terminal is NEVER counted;
++- idle/warm workers COUNT toward the cap but ARE listed as reap candidates;
++- cap <= 0 disables enforcement entirely (env=0 and negative file value).
++
++The route-level atomicity ("no terminal row, no tmux window") is a direct
++consequence of raising BEFORE any resource is created in ``create_terminal``:
++the guard runs immediately after ``require_provider_admitted`` and before the
++tmux/DB/worktree/provider path, so a refusal has nothing to unwind. That
++ordering is asserted at the REAL seam by
++``TestRealSeam::test_enforced_before_any_side_effect``, and the concurrent
++admission race (F439 round 2 / BLOCKER 1) is pinned by
++``TestConcurrentAdmission::test_concurrent_cap_minus_one_admits_exactly_one``.
++"""
++
++from __future__ import annotations
++
++import asyncio
++from datetime import datetime, timezone
++
++import pytest
++
++from cli_agent_orchestrator.models.terminal import TerminalStatus
++from cli_agent_orchestrator.services import terminal_service as ts
++from cli_agent_orchestrator.services.terminal_service import (
++    TerminalCapExceeded,
++    _count_worker_terminals,
++    _enforce_worker_terminal_cap,
++    _resolve_worker_terminal_cap,
++)
++
++SUPERVISOR = "aaaaaaaa"
++SESSION = "cao-test"
++
++
++def _row(tid: str, profile: str = "developer", caller_id: str | None = SUPERVISOR):
++    """A minimal terminal row shaped like list_terminals_by_session returns."""
++    return {
++        "id": tid,
++        "agent_profile": profile,
++        "caller_id": caller_id,
++        "last_active": datetime(2026, 1, 1, tzinfo=timezone.utc),
++    }
++
++
++@pytest.fixture
++def patch_session(monkeypatch):
++    """Patch the live-state sources the counter reads: the session row list and
++    per-terminal live status. Returns a setter the tests use to define the fleet.
++    """
++    state: dict[str, object] = {"rows": [], "status": {}}
++
++    def _list(session_name):
++        return list(state["rows"])
++
++    def _status(tid):
++        return state["status"].get(tid, TerminalStatus.PROCESSING)
++
++    monkeypatch.setattr(ts, "list_terminals_by_session", _list)
++    monkeypatch.setattr(ts.status_monitor, "get_status", _status)
++
++    def _set(rows, status=None):
++        state["rows"] = rows
++        state["status"] = status or {}
++
++    return _set
++
++
++class TestResolveCap:
++    """_resolve_worker_terminal_cap delegates to ConfigService precedence."""
++
++    def test_default_ten(self, monkeypatch):
++        monkeypatch.setattr(
++            "cli_agent_orchestrator.services.config_service.ConfigService.get",
++            staticmethod(lambda path, default=None, override=None: default),
++        )
++        assert _resolve_worker_terminal_cap() == 10
++
++    def test_env_value(self, monkeypatch):
++        monkeypatch.setattr(
++            "cli_agent_orchestrator.services.config_service.ConfigService.get",
++            staticmethod(lambda path, default=None, override=None: 3),
++        )
++        assert _resolve_worker_terminal_cap() == 3
++
++    def test_malformed_falls_back_to_ten(self, monkeypatch):
++        monkeypatch.setattr(
++            "cli_agent_orchestrator.services.config_service.ConfigService.get",
++            staticmethod(lambda path, default=None, override=None: "not-an-int"),
++        )
++        assert _resolve_worker_terminal_cap() == 10
++
++
++class TestCounting:
++    """_count_worker_terminals derives the count from live state."""
++
++    def test_supervisor_never_counted(self, patch_session):
++        patch_session(
++            rows=[_row(SUPERVISOR, "supervisor", caller_id=None), _row("bbbbbbbb")],
++            status={SUPERVISOR: TerminalStatus.IDLE, "bbbbbbbb": TerminalStatus.PROCESSING},
++        )
++        count, candidates = _count_worker_terminals(SESSION, SUPERVISOR)
++        assert count == 1  # only the worker, not the supervisor
++        assert [c["id"] for c in candidates] == []  # the one worker is busy
++
++    def test_idle_workers_count_but_are_reap_candidates(self, patch_session):
++        patch_session(
++            rows=[
++                _row(SUPERVISOR, "supervisor", caller_id=None),
++                _row("bbbbbbbb"),
++                _row("cccccccc"),
++            ],
++            status={
++                "bbbbbbbb": TerminalStatus.IDLE,
++                "cccccccc": TerminalStatus.PROCESSING,
++            },
++        )
++        count, candidates = _count_worker_terminals(SESSION, SUPERVISOR)
++        assert count == 2  # idle worker still counts toward RAM pressure
++        ids = [c["id"] for c in candidates]
++        assert ids == ["bbbbbbbb"]  # only the idle one is a reap candidate
++        cand = candidates[0]
++        assert cand["display_name"] == "developer-bbbbbbbb"
++        assert cand["idle_since"] is not None
++
++    def test_empty_session(self, patch_session):
++        patch_session(rows=[], status={})
++        count, candidates = _count_worker_terminals(SESSION, SUPERVISOR)
++        assert count == 0
++        assert candidates == []
++
++
++class TestEnforcement:
++    """_enforce_worker_terminal_cap fail-closes at/over cap; disabled at <=0."""
++
++    def _cap(self, monkeypatch, value):
++        monkeypatch.setattr(
++            "cli_agent_orchestrator.services.config_service.ConfigService.get",
++            staticmethod(lambda path, default=None, override=None: value),
++        )
++
++    def test_under_cap_allows(self, patch_session, monkeypatch):
++        self._cap(monkeypatch, 3)
++        patch_session(rows=[_row("bbbbbbbb"), _row("cccccccc")])
++        # 2 workers, cap 3 -> no raise
++        _enforce_worker_terminal_cap(SESSION, SUPERVISOR)
++
++    def test_at_cap_refuses_with_structured_payload(self, patch_session, monkeypatch):
++        self._cap(monkeypatch, 2)
++        patch_session(
++            rows=[_row("bbbbbbbb"), _row("cccccccc")],
++            status={"bbbbbbbb": TerminalStatus.IDLE, "cccccccc": TerminalStatus.PROCESSING},
++        )
++        with pytest.raises(TerminalCapExceeded) as ei:
++            _enforce_worker_terminal_cap(SESSION, SUPERVISOR)
++        exc = ei.value
++        assert exc.code == "E-TERMINAL-CAP"
++        assert exc.current_count == 2
++        assert exc.cap == 2
++        # the idle worker is offered as a reap candidate
++        assert [c["id"] for c in exc.reap_candidates] == ["bbbbbbbb"]
++        detail = exc.detail()
++        assert detail["code"] == "E-TERMINAL-CAP"
++        assert detail["current_count"] == 2
++        assert detail["cap"] == 2
++        assert detail["reap_candidates"][0]["display_name"] == "developer-bbbbbbbb"
++
++    def test_reap_one_then_succeeds(self, patch_session, monkeypatch):
++        """Cap reached -> refuse; reap one worker -> the same call now succeeds."""
++        self._cap(monkeypatch, 2)
++        patch_session(rows=[_row("bbbbbbbb"), _row("cccccccc")])
++        with pytest.raises(TerminalCapExceeded):
++            _enforce_worker_terminal_cap(SESSION, SUPERVISOR)
++        # Supervisor reaps one idle worker -> the fleet drops to 1 worker.
++        patch_session(rows=[_row("cccccccc")])
++        _enforce_worker_terminal_cap(SESSION, SUPERVISOR)  # no raise
++
++    def test_zero_disables(self, patch_session, monkeypatch):
++        self._cap(monkeypatch, 0)
++        patch_session(rows=[_row(f"{i:08x}") for i in range(50)])
++        _enforce_worker_terminal_cap(SESSION, SUPERVISOR)  # no raise, cap disabled
++
++    def test_negative_disables(self, patch_session, monkeypatch):
++        self._cap(monkeypatch, -1)
++        patch_session(rows=[_row(f"{i:08x}") for i in range(50)])
++        _enforce_worker_terminal_cap(SESSION, SUPERVISOR)  # no raise
++
++    def test_over_cap_refuses(self, patch_session, monkeypatch):
++        """count strictly greater than cap still refuses (>= semantics)."""
++        self._cap(monkeypatch, 1)
++        patch_session(rows=[_row("bbbbbbbb"), _row("cccccccc")])
++        with pytest.raises(TerminalCapExceeded) as ei:
++            _enforce_worker_terminal_cap(SESSION, SUPERVISOR)
++        assert ei.value.current_count == 2
++        assert ei.value.cap == 1
++
++
++class _CapSentinel(RuntimeError):
++    """Marker raised by the patched enforcer so tests can prove it was reached."""
++
++
++class TestCreateTerminalGuardPredicate:
++    """create_terminal calls the enforcer ONLY for supervisor-created workers
++    joining an EXISTING session (new_session=False AND caller_id set AND
++    session_name set). Operator launches and the supervisor itself are exempt.
++    """
++
++    @pytest.fixture(autouse=True)
++    def _patch_enforcer(self, monkeypatch):
++        def _raise(session_name, supervisor_id):
++            raise _CapSentinel(f"enforced:{session_name}:{supervisor_id}")
++
++        monkeypatch.setattr(ts, "_enforce_worker_terminal_cap", _raise)
++        # Neutralize provider admission so the guard is the first thing reached.
++        monkeypatch.setattr(ts, "require_provider_admitted", lambda provider: None)
++
++    async def _call(self, **kwargs):
++        return await ts.create_terminal(
++            provider="mock_cli",
++            agent_profile="developer",
++            **kwargs,
++        )
++
++    @pytest.mark.asyncio
++    async def test_assign_shape_is_enforced(self):
++        """new_session=False + caller_id + session_name -> enforcer runs."""
++        with pytest.raises(_CapSentinel, match="enforced:cao-test:aaaaaaaa"):
++            await self._call(
++                session_name="cao-test",
++                new_session=False,
++                caller_id=SUPERVISOR,
++            )
++
++    @pytest.mark.asyncio
++    async def test_operator_new_session_is_exempt(self):
++        """new_session=True (operator launch) -> enforcer NOT reached."""
++        with pytest.raises(Exception) as ei:
++            await self._call(
++                session_name="cao-test",
++                new_session=True,
++                caller_id=None,
++                working_directory="/nonexistent/does/not/exist/f439",
++            )
++        assert not isinstance(ei.value, _CapSentinel)
++
++    @pytest.mark.asyncio
++    async def test_no_caller_id_is_exempt(self):
++        """new_session=False but caller_id=None (not a supervised worker)."""
++        with pytest.raises(Exception) as ei:
++            await self._call(
++                session_name="cao-test",
++                new_session=False,
++                caller_id=None,
++                working_directory="/nonexistent/does/not/exist/f439",
++            )
++        assert not isinstance(ei.value, _CapSentinel)
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Real-seam tests (F439 round 2): drive the REAL async create_terminal with its
++# resource dependencies stubbed, so the REAL admission lock + REAL cap count run.
++# ─────────────────────────────────────────────────────────────────────────────
++
++import contextlib
++import itertools
++from unittest.mock import AsyncMock, MagicMock, patch
++
++from cli_agent_orchestrator.models.agent_profile import AgentProfile
++from cli_agent_orchestrator.services.session_lifecycle_lease import SessionLifecycleLeaseToken
++
++EXISTING_WORKER = "eeee0001"
++
++
++@contextlib.contextmanager
++def _real_seam(published_rows, *, cap, id_counter, count_hook=None, status_map=None):
++    """Patch create_terminal's resource deps while keeping the real lock + count.
++
++    ``published_rows`` is the shared live fleet: the patched ``db_create_terminal``
++    appends the new row to it, and the patched ``list_terminals_by_session``
++    returns it — so the cap count reflects real publication ordering. ``count_hook``
++    (optional) is awaited/called inside the count to force an interleaving that a
++    lock-less implementation would lose. ``status_map`` maps terminal id -> live
++    status (default PROCESSING = busy, no reap candidates).
++    """
++    status_map = status_map or {}
++
++    def _list(session_name):
++        return list(published_rows)
++
++    def _status(tid):
++        return status_map.get(tid, TerminalStatus.PROCESSING)
++
++    def _db_create(terminal_id, tmux_session, tmux_window, provider, *args, **kw):
++        # create_terminal calls positionally: (tid, session, window, provider,
++        # agent_profile, allowed_tools, caller_id=..., ...). Read profile from
++        # the positional tail and caller_id from kwargs.
++        agent_profile = args[0] if args else kw.get("agent_profile")
++        published_rows.append(
++            {
++                "id": terminal_id,
++                "agent_profile": agent_profile,
++                "caller_id": kw.get("caller_id"),
++                "last_active": None,
++            }
++        )
++        return {"id": terminal_id}
++
++    orig_count = ts._count_worker_terminals
++
++    def _counting(session_name, supervisor_id):
++        if count_hook is not None:
++            count_hook()
++        return orig_count(session_name, supervisor_id)
++
++    backend = MagicMock()
++    backend.session_exists.return_value = True
++    backend.create_window.side_effect = lambda session, window, *a, **k: window
++    backend.supports_event_inbox.return_value = False
++    backend.set_window_parent = None
++
++    provider = AsyncMock()
++    provider.initialize.return_value = True
++    provider.shell_baseline = None
++
++    def _resolve_cap(*a, **k):
++        return cap
++
++    def _gen_id():
++        return next(id_counter)
++
++    with (
++        patch.object(ts, "_resolve_worker_terminal_cap", _resolve_cap),
++        patch.object(ts, "list_terminals_by_session", _list),
++        patch.object(ts, "_count_worker_terminals", _counting),
++        patch.object(ts, "db_create_terminal", _db_create),
++        patch.object(ts, "delete_terminals_by_session", MagicMock()),
++        patch.object(ts, "generate_terminal_id", _gen_id),
++        patch.object(ts, "generate_window_name", lambda profile, tid: f"{profile}-{tid}"),
++        patch.object(ts.status_monitor, "get_status", _status),
++        patch.object(ts, "provider_manager") as pm,
++        patch.object(ts, "fifo_manager", MagicMock()),
++        patch.object(ts, "_schedule_deferred_init", MagicMock()),
++        patch.object(
++            ts,
++            "load_agent_profile",
++            lambda name: AgentProfile(name="developer", description="dev"),
++        ),
++        patch.object(
++            ts,
++            "get_provider_class",
++            lambda name: type(
++                "Cap",
++                (),
++                {"supports_seed_resume_identity": False, "has_process_child": False},
++            ),
++        ),
++        patch(
++            "cli_agent_orchestrator.services.session_lifecycle_lease."
++            "acquire_session_lifecycle_shared",
++            lambda session_name: SessionLifecycleLeaseToken(
++                session_name=session_name, mode="shared", nonce="t"
++            ),
++        ),
++        patch(
++            "cli_agent_orchestrator.services.session_lifecycle_lease."
++            "release_session_lifecycle_lease",
++            lambda token: None,
++        ),
++        patch("cli_agent_orchestrator.backends.registry._backend", backend),
++    ):
++        pm.create_provider.return_value = provider
++        yield {"backend": backend, "provider": provider, "pm": pm}
++
++
++async def _create_worker(session="cao-race", tmpdir="/tmp"):
++    return await ts.create_terminal(
++        provider="mock_cli",
++        agent_profile="developer",
++        session_name=session,
++        new_session=False,
++        caller_id=SUPERVISOR,
++        working_directory=tmpdir,
++    )
++
++
++class TestConcurrentAdmission:
++    """F439 round 2 / BLOCKER 1: concurrent creates must not oversubscribe."""
++
++    @pytest.mark.asyncio
++    async def test_concurrent_cap_minus_one_admits_exactly_one(self, tmp_path):
++        """cap 2, one existing worker, N concurrent real creates → exactly ONE
++        success and N-1 TerminalCapExceeded; the fleet grows by exactly one.
++
++        A yield inside the count (count_hook = asyncio.sleep(0) via a sync shim)
++        would let a lock-less implementation interleave all N past the check; the
++        per-session admission lock serializes count→publication so only the first
++        admits and the rest observe the committed row.
++        """
++        published = [
++            {
++                "id": EXISTING_WORKER,
++                "agent_profile": "developer",
++                "caller_id": SUPERVISOR,
++                "last_active": None,
++            },
++        ]
++        ids = itertools.count(1)
++
++        def _id():
++            return f"new0{next(ids):04d}"
++
++        # itertools-style counter object exposing __next__ for generate_terminal_id
++        class _C:
++            def __next__(self):
++                return _id()
++
++        n = 4
++        # Force interleaving: every count yields control to the loop once.
++        yielded = {"n": 0}
++
++        def _hook():
++            yielded["n"] += 1
++
++        with _real_seam(published, cap=2, id_counter=_C(), count_hook=_hook) as seam:
++            results = await asyncio.gather(
++                *[_create_worker(tmpdir=str(tmp_path)) for _ in range(n)],
++                return_exceptions=True,
++            )
++
++        successes = [r for r in results if not isinstance(r, BaseException)]
++        cap_errors = [r for r in results if isinstance(r, TerminalCapExceeded)]
++        others = [
++            r
++            for r in results
++            if isinstance(r, BaseException) and not isinstance(r, TerminalCapExceeded)
++        ]
++
++        assert others == [], f"unexpected errors: {others}"
++        assert len(successes) == 1, f"expected exactly 1 admit, got {len(successes)}"
++        assert len(cap_errors) == n - 1, f"expected {n - 1} refusals, got {len(cap_errors)}"
++        # No orphans: the fleet grew by exactly the one admitted worker.
++        assert len(published) == 2  # the pre-existing worker + exactly one new row
++        # Each refusal carried the structured surface.
++        for e in cap_errors:
++            assert e.code == "E-TERMINAL-CAP"
++            assert e.cap == 2
++
++    @pytest.mark.asyncio
++    async def test_concurrent_under_cap_all_admitted(self, tmp_path):
++        """cap 10, no existing workers, 4 concurrent creates → all 4 admitted,
++        fleet grows by 4 (the lock serializes but never falsely refuses)."""
++        published = []
++        ids = itertools.count(1)
++
++        class _C:
++            def __next__(self):
++                return f"ok0{next(ids):04d}"
++
++        with _real_seam(published, cap=10, id_counter=_C()):
++            results = await asyncio.gather(
++                *[_create_worker(tmpdir=str(tmp_path)) for _ in range(4)],
++                return_exceptions=True,
++            )
++        assert all(not isinstance(r, BaseException) for r in results), results
++        assert len(published) == 4
++
++    def test_thread_based_race_admits_exactly_one(self, tmp_path):
++        """Mirror the gate's harness EXACTLY: 4 THREADS, each its own event loop,
++        a threading.Barrier in the count dependency so all four observe the same
++        pre-create snapshot. This is the scenario an asyncio.Lock CANNOT close
++        (per-loop locks don't serialize across loops) — the process-wide
++        threading.Lock must. Required: exactly one success, three refusals, and
++        the fleet grows by exactly one (no orphan rows).
++
++        Patches are installed ONCE in the main thread (``unittest.mock.patch``
++        mutates shared module state and is NOT thread-safe if applied per
++        worker), with thread-safe fakes; the workers only call create_terminal.
++        """
++        import contextlib as _ctx
++        import threading
++
++        published = [
++            {
++                "id": EXISTING_WORKER,
++                "agent_profile": "developer",
++                "caller_id": SUPERVISOR,
++                "last_active": None,
++            },
++        ]
++        pub_lock = threading.Lock()
++        ids = itertools.count(1)
++        id_lock = threading.Lock()
++        barrier = threading.Barrier(4)
++        results: list = []
++        res_lock = threading.Lock()
++
++        def _list(session_name):
++            with pub_lock:
++                return list(published)
++
++        def _gen_id():
++            with id_lock:
++                return f"thr0{next(ids):04d}"
++
++        def _db_create(terminal_id, *a, **kw):
++            with pub_lock:
++                published.append(
++                    {
++                        "id": terminal_id,
++                        "agent_profile": "developer",
++                        "caller_id": SUPERVISOR,
++                        "last_active": None,
++                    }
++                )
++            return {"id": terminal_id}
++
++        orig_count = ts._count_worker_terminals
++
++        def _counting(session_name, supervisor_id):
++            return orig_count(session_name, supervisor_id)
++
++        backend = MagicMock()
++        backend.session_exists.return_value = True
++        backend.create_window.side_effect = lambda session, window, *a, **k: window
++        backend.supports_event_inbox.return_value = False
++        backend.set_window_parent = None
++
++        provider = AsyncMock()
++        provider.initialize.return_value = True
++        provider.shell_baseline = None
++        pm = MagicMock()
++        pm.create_provider.return_value = provider
++
++        def _worker():
++            # Barrier OUTSIDE the create call so all four threads slam the
++            # admission seam together; the process-wide lock then serializes
++            # them. (A barrier inside the counted critical section would
++            # deadlock, since the lock admits one thread at a time.)
++            try:
++                barrier.wait(timeout=5)
++            except threading.BrokenBarrierError:
++                pass
++            try:
++                r = asyncio.run(
++                    ts.create_terminal(
++                        provider="mock_cli",
++                        agent_profile="developer",
++                        session_name="cao-thr",
++                        new_session=False,
++                        caller_id=SUPERVISOR,
++                        working_directory=str(tmp_path),
++                    )
++                )
++                with res_lock:
++                    results.append(("ok", getattr(r, "id", r)))
++            except TerminalCapExceeded as e:
++                with res_lock:
++                    results.append(("cap", e.cap))
++            except BaseException as e:  # noqa: BLE001
++                with res_lock:
++                    results.append(("err", repr(e)))
++
++        with _ctx.ExitStack() as stack:
++            for target, repl in [
++                ("_resolve_worker_terminal_cap", lambda *a, **k: 2),
++                ("list_terminals_by_session", _list),
++                ("_count_worker_terminals", _counting),
++                ("db_create_terminal", _db_create),
++                ("delete_terminals_by_session", MagicMock()),
++                ("generate_terminal_id", _gen_id),
++                ("generate_window_name", lambda p, t: f"{p}-{t}"),
++                ("provider_manager", pm),
++                ("fifo_manager", MagicMock()),
++                ("_schedule_deferred_init", MagicMock()),
++                ("load_agent_profile", lambda n: AgentProfile(name="developer", description="d")),
++                (
++                    "get_provider_class",
++                    lambda n: type(
++                        "C",
++                        (),
++                        {"supports_seed_resume_identity": False, "has_process_child": False},
++                    ),
++                ),
++            ]:
++                stack.enter_context(patch.object(ts, target, repl))
++            stack.enter_context(
++                patch.object(ts.status_monitor, "get_status", lambda tid: TerminalStatus.PROCESSING)
++            )
++            stack.enter_context(
++                patch(
++                    "cli_agent_orchestrator.services.session_lifecycle_lease."
++                    "acquire_session_lifecycle_shared",
++                    lambda s: SessionLifecycleLeaseToken(session_name=s, mode="shared", nonce="t"),
++                )
++            )
++            stack.enter_context(
++                patch(
++                    "cli_agent_orchestrator.services.session_lifecycle_lease."
++                    "release_session_lifecycle_lease",
++                    lambda t: None,
++                )
++            )
++            stack.enter_context(patch("cli_agent_orchestrator.backends.registry._backend", backend))
++
++            threads = [threading.Thread(target=_worker) for _ in range(4)]
++            for t in threads:
++                t.start()
++            for t in threads:
++                t.join(timeout=30)
++
++        oks = [r for r in results if r[0] == "ok"]
++        caps = [r for r in results if r[0] == "cap"]
++        errs = [r for r in results if r[0] == "err"]
++        assert errs == [], f"unexpected errors: {errs}"
++        assert len(oks) == 1, f"expected exactly 1 admit, got {len(oks)}: {results}"
++        assert len(caps) == 3, f"expected 3 refusals, got {len(caps)}: {results}"
++        # No orphans: exactly one new row beyond the pre-existing worker.
++        assert len(published) == 2
++
++    @pytest.mark.asyncio
++    async def test_concurrent_under_cap_all_admitted(self, tmp_path):
++        """cap 10, no existing workers, 4 concurrent creates → all 4 admitted,
++        fleet grows by 4 (the lock serializes but never falsely refuses)."""
++        published = []
++        ids = itertools.count(1)
++
++        class _C:
++            def __next__(self):
++                return f"ok0{next(ids):04d}"
++
++        with _real_seam(published, cap=10, id_counter=_C()):
++            results = await asyncio.gather(
++                *[_create_worker(tmpdir=str(tmp_path)) for _ in range(4)],
++                return_exceptions=True,
++            )
++        assert all(not isinstance(r, BaseException) for r in results), results
++        assert len(published) == 4
++
++
++class TestRealSeam:
++    """Real-seam handoff/side-effect/boundary coverage (F439 round 2 SHOULD)."""
++
++    @pytest.mark.asyncio
++    async def test_enforced_before_any_side_effect(self, tmp_path):
++        """At cap, the REAL create_terminal raises TerminalCapExceeded and creates
++        NO db row, NO tmux window, NO provider — nothing to unwind."""
++        published = [
++            {
++                "id": "eeee0001",
++                "agent_profile": "developer",
++                "caller_id": SUPERVISOR,
++                "last_active": None,
++            },
++            {
++                "id": "eeee0002",
++                "agent_profile": "developer",
++                "caller_id": SUPERVISOR,
++                "last_active": None,
++            },
++        ]
++
++        class _C:
++            def __next__(self):
++                return "should-not-be-used"
++
++        with _real_seam(published, cap=2, id_counter=_C()) as seam:
++            with pytest.raises(TerminalCapExceeded) as ei:
++                await _create_worker(tmpdir=str(tmp_path))
++
++        assert ei.value.current_count == 2
++        # No side effects: fleet unchanged, no window created, no provider built.
++        assert len(published) == 2
++        seam["backend"].create_window.assert_not_called()
++        seam["pm"].create_provider.assert_not_called()
++
++    @pytest.mark.asyncio
++    async def test_handoff_run_step_reaches_cap_seam(self, tmp_path):
++        """A real run_agent_step (handoff) at cap raises TerminalCapExceeded and
++        creates no row/window — the handoff path shares the same seam as assign."""
++        from cli_agent_orchestrator.services import agent_step
++
++        published = [
++            {
++                "id": "eeee0001",
++                "agent_profile": "developer",
++                "caller_id": SUPERVISOR,
++                "last_active": None,
++            },
++            {
++                "id": "eeee0002",
++                "agent_profile": "developer",
++                "caller_id": SUPERVISOR,
++                "last_active": None,
++            },
++        ]
++
++        class _C:
++            def __next__(self):
++                return "should-not-be-used"
++
++        with _real_seam(published, cap=2, id_counter=_C()) as seam:
++            with patch.object(ts, "seed_resume_bootstrap", new=AsyncMock(return_value=None)):
++                with pytest.raises(TerminalCapExceeded):
++                    await agent_step.run_agent_step(
++                        provider="mock_cli",
++                        agent="developer",
++                        prompt="do work",
++                        session_name="cao-race",
++                        caller_id=SUPERVISOR,
++                        working_directory=str(tmp_path),
++                    )
++        assert len(published) == 2
++        seam["backend"].create_window.assert_not_called()
++
++    def test_missing_last_active_yields_null_idle_since(self, patch_session):
++        """An IDLE worker row with last_active=None → idle_since is null."""
++        patch_session(
++            rows=[
++                {
++                    "id": "bbbbbbbb",
++                    "agent_profile": "developer",
++                    "caller_id": SUPERVISOR,
++                    "last_active": None,
++                }
++            ],
++            status={"bbbbbbbb": TerminalStatus.IDLE},
++        )
++        count, candidates = _count_worker_terminals(SESSION, SUPERVISOR)
++        assert count == 1
++        assert candidates[0]["idle_since"] is None
++
++    def test_provider_not_ready_row_counts(self, patch_session):
++        """A provider-not-ready (UNKNOWN) worker still counts toward the cap and
++        is NOT offered as a reap candidate (only IDLE workers are)."""
++        patch_session(
++            rows=[
++                {
++                    "id": "bbbbbbbb",
++                    "agent_profile": "developer",
++                    "caller_id": SUPERVISOR,
++                    "last_active": None,
++                },
++            ],
++            status={"bbbbbbbb": TerminalStatus.UNKNOWN},
++        )
++        count, candidates = _count_worker_terminals(SESSION, SUPERVISOR)
++        assert count == 1
++        assert candidates == []
