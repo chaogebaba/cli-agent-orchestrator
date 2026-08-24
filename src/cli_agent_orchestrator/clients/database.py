@@ -4874,6 +4874,9 @@ def claim_deferred_init_failure(
                     }
                 receiver_exists = _receiver_is_terminal_or_mailbox_address(db, caller_id)
                 row.init_failure_token = failure_token
+                # Mark barrier member GONE before inbox insert: matching must not
+                # see AWAITING for a failed deferred-init member.
+                _mark_barrier_member_gone_in_db(db, terminal_id)
                 if receiver_exists:
                     receiver_cache, logical_receiver_id, enqueue_generation = (
                         resolve_inbox_receiver(db, cast(str, caller_id))
@@ -4891,7 +4894,6 @@ def claim_deferred_init_failure(
                 else:
                     row.init_state = "init_failed_caller_gone"
                     status = "claimed_caller_gone"
-                _mark_barrier_member_gone_in_db(db, terminal_id)
                 db.flush()
                 db.commit()
                 invalidate_terminal_metadata_cache(terminal_id)

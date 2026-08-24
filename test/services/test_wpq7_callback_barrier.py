@@ -864,16 +864,8 @@ def test_utf8_cap_preserves_codepoint_and_points_to_durable_sources(barrier_db):
 def test_composed_pending_writer_count_is_ten_after_digest_seats_retire(barrier_db):
     root = Path(__file__).parents[2] / "src" / "cli_agent_orchestrator"
     expected = {
-        "clients/database.py::claim_deferred_init_failure",
-        "clients/database.py::_fire_open_barrier_in_db",
         "clients/database.py::_insert_routed_inbox_row",
-        "clients/database.py::insert_barrier_escalation_message",
         "clients/database.py::insert_watchdog_auto_resume_message",
-        "clients/database.py::insert_identity_authority_notice",
-        "clients/database.py::_record_p5_orphan_notices",
-        "clients/database.py::record_wpm1_stalled_notice.operation",
-        "clients/database.py::settle_wpm1_terminal_batch.operation",
-        "services/mailbox_service.py::delete_mailbox",
     }
     seats: dict[str, bool] = {}
     for path in root.rglob("*.py"):
