@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shlex
+import shutil
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -612,3 +615,193 @@ def test_codex_config_without_path_keys_unaffected(persona_env: dict[str, Path])
     # No stray files materialized beyond the known codex-home contents.
     names = sorted(p.name for p in plan.codex_home.iterdir())
     assert names == ["auth.json", "config.toml"]
+
+
+# ---------------------------------------------------------------------------
+# F431 round 2 gate remediation:
+#   BLOCKER-1  model_catalog_json is a fourth top-level startup-read file path.
+#   SHOULD-1   nested relative input path keys -> one degraded warning.
+#   SHOULD-2   symlink source rejection must test the UNresolved candidate.
+# ---------------------------------------------------------------------------
+
+# A minimal catalog with one model entry. Real codex validates content further
+# (17-field ModelInfo); the portable assertions below only need a present file,
+# and the optional codex smoke only asserts the F431 "os error 2" class is gone.
+_CATALOG_JSON = '{"models": [{"id": "gpt-test"}]}\n'
+
+
+def test_codex_model_catalog_json_materialized(persona_env: dict[str, Path]) -> None:
+    """BLOCKER-1: a relative model_catalog_json is materialized into the persona
+    home so codex's startup config load resolves it against CODEX_HOME (F431)."""
+    (persona_env["codex"] / "catalog.json").write_text(_CATALOG_JSON, encoding="utf-8")
+    _write_codex_config_with(
+        persona_env, 'model = "gpt-test"\nmodel_catalog_json = "./catalog.json"\n'
+    )
+    plan = compose_persona_plan(
+        "codex-catalog", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
+    )
+    assert plan.codex_home is not None
+    materialized = plan.codex_home / "catalog.json"
+    assert materialized.is_file() and not materialized.is_symlink()
+    assert materialized.read_text(encoding="utf-8") == _CATALOG_JSON
+    assert stat.S_IMODE(materialized.stat().st_mode) == 0o600
+    # Config keeps the original relative value; codex resolves it under CODEX_HOME.
+    config = (plan.codex_home / "config.toml").read_text(encoding="utf-8")
+    assert 'model_catalog_json = "./catalog.json"' in config
+
+
+def test_codex_model_catalog_json_in_covered_keys() -> None:
+    """Key-coverage guard: model_catalog_json must stay in the materialized set
+    (BLOCKER-1 would regress silently if it were dropped from the tuple)."""
+    assert "model_catalog_json" in persona_context.CODEX_CONFIG_FILE_KEYS
+
+
+def test_codex_missing_model_catalog_json_fails_loudly(persona_env: dict[str, Path]) -> None:
+    """A referenced-but-missing catalog is a hard error naming the path, matching
+    the reviewer's reproduced 'failed to load configuration' launch class."""
+    _write_codex_config_with(
+        persona_env, 'model = "gpt-test"\nmodel_catalog_json = "./catalog.json"\n'
+    )
+    with pytest.raises(
+        PersonaContextError, match="persona_codex_config_file_missing.*catalog.json"
+    ):
+        compose_persona_plan(
+            "codex-catmiss",
+            "codex",
+            "reviewer",
+            ContextPolicy(scope="persona"),
+            persona_env["cwd"],
+        )
+
+
+@pytest.mark.skipif(shutil.which("codex") is None, reason="codex binary not available")
+def test_codex_persona_config_loads_with_catalog_smoke(persona_env: dict[str, Path]) -> None:
+    """BLOCKER-1 production-shape smoke: with the catalog materialized, launching a
+    config-reading codex command under the persona CODEX_HOME must get PAST file
+    resolution — the F431 failure was 'No such file or directory (os error 2)'.
+    We assert that specific class is gone (content-level validation may still
+    fail; that is not F431 and codex versions vary)."""
+    (persona_env["codex"] / "catalog.json").write_text(_CATALOG_JSON, encoding="utf-8")
+    _write_codex_config_with(
+        persona_env, 'model = "gpt-test"\nmodel_catalog_json = "./catalog.json"\n'
+    )
+    plan = compose_persona_plan(
+        "codex-smoke", "codex", "reviewer", ContextPolicy(scope="persona"), persona_env["cwd"]
+    )
+    assert (plan.codex_home / "catalog.json").is_file()
+    proc = subprocess.run(
+        ["codex", "features", "list"],
+        env={**os.environ, "CODEX_HOME": str(plan.codex_home)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    combined = (proc.stdout + proc.stderr).lower()
+    assert "os error 2" not in combined, combined
+    assert "no such file or directory" not in combined, combined
+
+
+def test_codex_relative_symlink_source_rejected(persona_env: dict[str, Path]) -> None:
+    """SHOULD-2: an in-home symlink SOURCE for a materialized key is rejected. The
+    check must run on the UNresolved candidate (resolve() would dereference the
+    link and hide it)."""
+    real_target = persona_env["codex"] / "real-prompt.md"
+    real_target.write_text("real\n", encoding="utf-8")
+    link = persona_env["codex"] / "link-prompt.md"
+    link.symlink_to(real_target)  # in-home symlink -> in-home regular file
+    _write_codex_config_with(
+        persona_env, 'model = "gpt-test"\nmodel_instructions_file = "./link-prompt.md"\n'
+    )
+    with pytest.raises(
+        PersonaContextError, match="persona_codex_config_symlink_source.*link-prompt.md"
+    ):
+        compose_persona_plan(
+            "codex-symlink",
+            "codex",
+            "reviewer",
+            ContextPolicy(scope="persona"),
+            persona_env["cwd"],
+        )
+
+
+def test_codex_nested_relative_agent_config_warns(
+    persona_env: dict[str, Path], caplog: pytest.LogCaptureFixture
+) -> None:
+    """SHOULD-1: a nested relative agents.<name>.config_file emits ONE degraded
+    warning naming key+value and is NOT fatal (composition still succeeds)."""
+    _write_codex_config_with(
+        persona_env,
+        'model = "gpt-test"\n[agents.test]\nconfig_file = "./role.toml"\n',
+    )
+    with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.utils.persona_context"):
+        plan = compose_persona_plan(
+            "codex-nestedwarn",
+            "codex",
+            "reviewer",
+            ContextPolicy(scope="persona"),
+            persona_env["cwd"],
+        )
+    assert plan.codex_home is not None  # non-fatal: composition succeeded
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+        and "persona_codex_config_nested_relative_unsupported" in r.getMessage()
+    ]
+    assert len(warnings) == 1, [r.getMessage() for r in caplog.records]
+    assert "agents.test.config_file" in warnings[0].getMessage()
+    assert "./role.toml" in warnings[0].getMessage()
+    # The nested file is NOT materialized (unsupported contract).
+    assert not (plan.codex_home / "role.toml").exists()
+
+
+def test_codex_nested_relative_skill_and_provider_warn(
+    persona_env: dict[str, Path], caplog: pytest.LogCaptureFixture
+) -> None:
+    """SHOULD-1: skills.config.<n>.path and model_providers.<id>.auth.cwd nested
+    relative values are detected in the single warning."""
+    _write_codex_config_with(
+        persona_env,
+        'model = "gpt-test"\n'
+        '[[skills.config]]\npath = "./skills/foo"\n'
+        '[model_providers.acme.auth]\ncwd = "./auth-wd"\n',
+    )
+    with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.utils.persona_context"):
+        compose_persona_plan(
+            "codex-nested2",
+            "codex",
+            "reviewer",
+            ContextPolicy(scope="persona"),
+            persona_env["cwd"],
+        )
+    msgs = [
+        r.getMessage()
+        for r in caplog.records
+        if "persona_codex_config_nested_relative_unsupported" in r.getMessage()
+    ]
+    assert len(msgs) == 1, [r.getMessage() for r in caplog.records]
+    assert "skills.config.0.path" in msgs[0]
+    assert "model_providers.acme.auth.cwd" in msgs[0]
+
+
+def test_codex_nested_absolute_paths_do_not_warn(
+    persona_env: dict[str, Path], caplog: pytest.LogCaptureFixture
+) -> None:
+    """SHOULD-1: absolute nested values relocate correctly and must NOT warn."""
+    _write_codex_config_with(
+        persona_env,
+        'model = "gpt-test"\n[agents.test]\nconfig_file = "/etc/codex/role.toml"\n',
+    )
+    with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.utils.persona_context"):
+        compose_persona_plan(
+            "codex-absnested",
+            "codex",
+            "reviewer",
+            ContextPolicy(scope="persona"),
+            persona_env["cwd"],
+        )
+    assert not [
+        r
+        for r in caplog.records
+        if "persona_codex_config_nested_relative_unsupported" in r.getMessage()
+    ]

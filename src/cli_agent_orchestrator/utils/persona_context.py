@@ -45,13 +45,38 @@ RESERVED_LEAVES = {
 # Source: codex config reference (developers.openai.com/codex/config-reference,
 # fetched 2026-08-24). experimental_instructions_file is the deprecated alias
 # for model_instructions_file; experimental_compact_prompt_file is the
-# compaction-prompt override. Directory-valued keys (log_dir, sqlite_home) and
-# nested-table paths are intentionally excluded: they are outputs or optional
-# layers, not launch-blocking instruction files.
+# compaction-prompt override; model_catalog_json is the JSON model catalog
+# loaded on startup (codex 0.149.1 hard-fails config load — "failed to load
+# configuration" — when a relative catalog is absent, F431 gate BLOCKER-1).
+#
+# Supported contract (see also _materialize_codex_config_files):
+#   * TOP-LEVEL startup-critical file keys below are MATERIALIZED: their
+#     relative values are resolved against the real ~/.codex and the referenced
+#     file is copied to the mirrored relative path under the persona codex-home
+#     so the unchanged config value resolves against CODEX_HOME.
+#   * NESTED input-path keys (CODEX_CONFIG_NESTED_PATH_KEYS below —
+#     agents.<name>.config_file, skills.config.<index>.path,
+#     model_providers.<id>.auth.cwd, and OTEL exporter TLS cert/key paths) are
+#     NOT materialized. A relative value there is unsupported: the persona
+#     build emits ONE loud warning naming the key+value (degraded, not fatal);
+#     use ABSOLUTE paths for those.
+#   * Directory-valued keys (log_dir, sqlite_home) are OUT OF SCOPE: they are
+#     output/state dirs codex creates, not startup-read inputs.
 CODEX_CONFIG_FILE_KEYS = (
     "model_instructions_file",
     "experimental_instructions_file",
     "experimental_compact_prompt_file",
+    "model_catalog_json",
+)
+# Nested config path keys that are relocation-sensitive but NOT materialized by
+# this fix. Detected relative values here trigger a single degraded warning.
+# Dotted paths use TOML table nesting; tables with an <id>/<index>/<name>
+# segment are matched structurally, not by literal key string.
+CODEX_CONFIG_NESTED_PATH_HINTS = (
+    "agents.<name>.config_file",
+    "skills.config.<index>.path",
+    "model_providers.<id>.auth.cwd",
+    "otel.exporter.*.tls (ca/cert/key file paths)",
 )
 _PREFLIGHTED_BWRAP: set[tuple[str, str]] = set()
 
@@ -295,30 +320,107 @@ def _write_codex_config(source: Path, destination: Path) -> None:
     destination.chmod(0o600)
 
 
+def _iter_nested_relative_codex_paths(parsed: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """Return (dotted_key, value) for NESTED config path inputs with a relative value.
+
+    These keys are relocation-sensitive but deliberately NOT materialized by this
+    fix (see CODEX_CONFIG_NESTED_PATH_HINTS). We only detect a RELATIVE value so
+    the persona build can warn once; absolute values relocate correctly and are
+    ignored. Matched structurally (by table shape), never by literal key string,
+    because the middle segment is an arbitrary <name>/<index>/<id>.
+    """
+    found: list[tuple[str, str]] = []
+
+    def _is_relative_str(value: object) -> bool:
+        return isinstance(value, str) and bool(value) and not Path(value).expanduser().is_absolute()
+
+    # agents.<name>.config_file
+    agents = parsed.get("agents")
+    if isinstance(agents, Mapping):
+        for name, role in agents.items():
+            if isinstance(role, Mapping) and _is_relative_str(role.get("config_file")):
+                found.append((f"agents.{name}.config_file", str(role["config_file"])))
+    # skills.config.<index>.path  (config may be an array of tables or a table)
+    skills = parsed.get("skills")
+    if isinstance(skills, Mapping):
+        entries = skills.get("config")
+        seq: list[Any] = []
+        if isinstance(entries, list):
+            seq = entries
+        elif isinstance(entries, Mapping):
+            seq = list(entries.values())
+        for index, entry in enumerate(seq):
+            if isinstance(entry, Mapping) and _is_relative_str(entry.get("path")):
+                found.append((f"skills.config.{index}.path", str(entry["path"])))
+    # model_providers.<id>.auth.cwd
+    providers = parsed.get("model_providers")
+    if isinstance(providers, Mapping):
+        for pid, provider in providers.items():
+            if isinstance(provider, Mapping):
+                auth = provider.get("auth")
+                if isinstance(auth, Mapping) and _is_relative_str(auth.get("cwd")):
+                    found.append((f"model_providers.{pid}.auth.cwd", str(auth["cwd"])))
+    # otel.exporter TLS file paths (ca/cert/key), best-effort structural walk
+    otel = parsed.get("otel")
+    if isinstance(otel, Mapping):
+        exporter = otel.get("exporter")
+        if isinstance(exporter, Mapping):
+            for exporter_name, cfg in exporter.items():
+                if not isinstance(cfg, Mapping):
+                    continue
+                for tls_key in ("ca", "cert", "key", "ca_file", "cert_file", "key_file"):
+                    if _is_relative_str(cfg.get(tls_key)):
+                        found.append(
+                            (f"otel.exporter.{exporter_name}.{tls_key}", str(cfg[tls_key]))
+                        )
+    return found
+
+
 def _materialize_codex_config_files(source_config: Path, codex_home: Path) -> None:
-    """Copy files referenced by path-valued keys in config.toml into the persona home.
+    """Copy files referenced by TOP-LEVEL startup-read path keys into the persona home.
 
     The rewritten config.toml preserves the original (often relative) values for
     keys like ``model_instructions_file``. codex resolves those relative paths
     against ``CODEX_HOME`` — the isolated persona codex-home — so the referenced
     file must exist there at the SAME relative location or codex dies at launch
-    ("failed to read model instructions file", ProviderLaunchFailed; F431).
+    (e.g. "failed to read model instructions file" / "failed to load
+    configuration"; ProviderLaunchFailed; F431, issue #286).
 
-    Values are read from the REAL config (``source_config``) and resolved against
-    the real codex home (``source_config.parent``). Each referenced file is copied
-    (never symlinked — the value may be re-read across the persona lifetime and a
-    dangling link would reintroduce the failure) to the mirrored relative path
-    under ``codex_home``. Absolute values resolve identically everywhere and are
-    left untouched. A referenced-but-missing file is a hard error naming the path;
-    silently skipping it would just defer the same launch crash.
+    Supported contract:
+
+    * TOP-LEVEL startup-critical file keys (``CODEX_CONFIG_FILE_KEYS``:
+      model_instructions_file, its deprecated alias experimental_instructions_file,
+      experimental_compact_prompt_file, model_catalog_json) are MATERIALIZED.
+      Values are read from the REAL config (``source_config``) and resolved against
+      the real codex home (``source_config.parent``). Each referenced file is copied
+      (never symlinked — the value may be re-read across the persona lifetime and a
+      dangling link would reintroduce the failure) to the mirrored relative path
+      under ``codex_home``. Absolute values resolve identically everywhere and are
+      left untouched. A referenced-but-missing file is a hard error naming the path;
+      silently skipping it would just defer the same launch crash.
+    * NESTED input-path keys (``CODEX_CONFIG_NESTED_PATH_HINTS``) are NOT
+      materialized: a relative value there emits ONE loud warning (degraded, not
+      fatal) — use absolute paths. See ``_iter_nested_relative_codex_paths``.
+    * Directory-valued keys (log_dir, sqlite_home) are OUT OF SCOPE (output dirs).
     """
     if not source_config.is_file():
         return
     real_home = source_config.parent
+    real_home_resolved = real_home.resolve()
     try:
         parsed = tomllib.loads(source_config.read_text(encoding="utf-8"))
     except (tomllib.TOMLDecodeError, OSError) as exc:
         raise PersonaContextError(f"persona_codex_config_unparsable:{exc}") from exc
+    # SHOULD-1: warn once for nested relative input paths we do not materialize.
+    nested_relative = _iter_nested_relative_codex_paths(parsed)
+    if nested_relative:
+        logger.warning(
+            "persona_codex_config_nested_relative_unsupported: %d nested config path(s) "
+            "have relative values that are NOT materialized into the persona codex-home "
+            "and may fail to resolve at runtime; use absolute paths. Offending keys: %s",
+            len(nested_relative),
+            ", ".join(f"{key}={value!r}" for key, value in nested_relative),
+        )
     for key in CODEX_CONFIG_FILE_KEYS:
         value = parsed.get(key)
         if value is None:
@@ -329,21 +431,26 @@ def _materialize_codex_config_files(source_config: Path, codex_home: Path) -> No
         # Absolute paths resolve to the same target regardless of CODEX_HOME;
         # codex reads them directly, so nothing needs materializing.
         if raw.is_absolute():
-            source_file = raw
-            if source_file.is_symlink() or not source_file.is_file():
+            if raw.is_symlink() or not raw.is_file():
                 raise PersonaContextError(f"persona_codex_config_file_missing:{key}:{value}")
             continue
         # Relative value: reject parent-escapes before touching the filesystem so
         # a config like "../../etc/x" can never write outside the persona home.
-        parts = raw.parts
-        if ".." in parts or raw.is_absolute():
+        if ".." in raw.parts:
             raise PersonaContextError(f"persona_codex_config_path_escape:{key}:{value}")
-        source_file = (real_home / raw).resolve()
-        if source_file.is_symlink() or not source_file.is_file():
+        # SHOULD-2: test is_symlink() on the UNresolved candidate — resolve()
+        # dereferences the link, so checking after resolve can never see an
+        # in-home source symlink. We forbid symlinked sources so a rotated/broken
+        # link target cannot silently reintroduce the launch failure.
+        candidate = real_home / raw
+        if candidate.is_symlink():
+            raise PersonaContextError(f"persona_codex_config_symlink_source:{key}:{value}")
+        source_file = candidate.resolve()
+        if not source_file.is_file():
             raise PersonaContextError(f"persona_codex_config_file_missing:{key}:{value}")
         # Confirm the resolved source stays under the real codex home.
         try:
-            source_file.relative_to(real_home.resolve())
+            source_file.relative_to(real_home_resolved)
         except ValueError as exc:
             raise PersonaContextError(f"persona_codex_config_path_escape:{key}:{value}") from exc
         destination = codex_home / raw
