@@ -864,6 +864,33 @@ class TestCreateTerminalInSession:
         assert response.status_code == 500
         assert "Failed to create terminal" in response.json()["detail"]
 
+    def test_create_terminal_cap_exceeded_returns_409_structured(self, client):
+        """F439 (#294): TerminalCapExceeded maps to 409 with E-TERMINAL-CAP detail."""
+        from cli_agent_orchestrator.services.terminal_service import TerminalCapExceeded
+
+        candidates = [
+            {"id": "bbbbbbbb", "display_name": "developer-bbbbbbbb", "idle_since": None},
+        ]
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.seed_resume_bootstrap = AsyncMock(return_value=None)
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=TerminalCapExceeded(
+                    current_count=10, cap=10, reap_candidates=candidates
+                )
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={"provider": "kiro_cli", "agent_profile": "developer"},
+            )
+
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert detail["code"] == "E-TERMINAL-CAP"
+        assert detail["current_count"] == 10
+        assert detail["cap"] == 10
+        assert detail["reap_candidates"] == candidates
+
 
 class TestListTerminalsInSession:
     """Tests for GET /sessions/{session_name}/terminals endpoint."""

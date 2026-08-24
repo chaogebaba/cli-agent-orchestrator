@@ -142,6 +142,7 @@ from cli_agent_orchestrator.utils.sandbox_guard import (
 )
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
+    display_name,
     generate_session_name,
     generate_terminal_id,
     generate_window_name,
@@ -149,6 +150,45 @@ from cli_agent_orchestrator.utils.terminal import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class TerminalCapExceeded(RuntimeError):
+    """F439 (#294): raised when a worker terminal would exceed the session cap.
+
+    Fail-closed structured error. Carries the counting surface the supervisor
+    needs to reap-then-retry (the server never auto-reaps): the current live
+    worker count, the resolved cap, and the idle worker terminals that are the
+    natural reap candidates. Both HTTP boundaries (``POST
+    /sessions/{s}/terminals`` and ``POST /terminals/run-step``) map this to a
+    409 whose ``detail`` carries ``code="E-TERMINAL-CAP"`` plus these fields.
+    """
+
+    code = "E-TERMINAL-CAP"
+
+    def __init__(
+        self,
+        current_count: int,
+        cap: int,
+        reap_candidates: List[Dict[str, Any]],
+    ) -> None:
+        self.current_count = current_count
+        self.cap = cap
+        self.reap_candidates = reap_candidates
+        super().__init__(
+            f"worker-terminal cap reached: {current_count} live worker terminal(s) "
+            f"at cap {cap}. Reap an idle worker (delete_terminal) then retry; the "
+            f"server never auto-reaps."
+        )
+
+    def detail(self) -> Dict[str, Any]:
+        """Structured HTTP detail body carrying the reap-candidate surface."""
+        return {
+            "code": self.code,
+            "message": str(self),
+            "current_count": self.current_count,
+            "cap": self.cap,
+            "reap_candidates": self.reap_candidates,
+        }
 
 
 class IdentityAmbiguousError(RuntimeError):
@@ -929,6 +969,93 @@ def _resolve_working_directory(working_directory: Optional[str]) -> str:
     )
 
 
+def _resolve_worker_terminal_cap() -> int:
+    """Resolve the worker-terminal cap (F439 #294).
+
+    Precedence: ``CAO_MAX_WORKER_TERMINALS`` env > ``orchestrator.max_worker_terminals``
+    in settings.json > built-in default 10. Delegates entirely to ConfigService
+    so the precedence chain is the single one the rest of the server uses — no
+    new config file, no bespoke env read. A ``<= 0`` value disables the cap
+    (callers treat that as "no limit").
+    """
+    from cli_agent_orchestrator.services.config_service import ConfigService
+
+    try:
+        cap = int(ConfigService.get("orchestrator.max_worker_terminals", default=10))
+    except (TypeError, ValueError):
+        # A malformed settings.json value must not brick terminal creation;
+        # fall back to the built-in default rather than raising.
+        logger.warning("invalid orchestrator.max_worker_terminals; using default cap 10")
+        cap = 10
+    return cap
+
+
+def _count_worker_terminals(
+    session_name: str, supervisor_id: Optional[str]
+) -> tuple[int, List[Dict[str, Any]]]:
+    """Count live worker terminals in a session, excluding the supervisor.
+
+    Derived from live state on every call (no persistent counter), so it
+    survives a server restart. A "worker" is every terminal row in the session
+    other than ``supervisor_id`` (the terminal doing the assign/handoff). Idle
+    workers COUNT toward the cap — their RAM cost is real — but are ALSO
+    returned as reap candidates so the supervisor can reap-then-retry.
+
+    Returns ``(count, reap_candidates)`` where each candidate is
+    ``{"id", "display_name", "idle_since"}`` for a worker whose live status is
+    IDLE. ``idle_since`` is the row's ``last_active`` ISO string (best-effort;
+    None when unavailable).
+    """
+    rows = list_terminals_by_session(session_name)
+    count = 0
+    reap_candidates: List[Dict[str, Any]] = []
+    for row in rows:
+        tid = row.get("id")
+        if not tid or tid == supervisor_id:
+            # The supervisor's own terminal is never a worker and never counted.
+            continue
+        count += 1
+        try:
+            live_status = status_monitor.get_status(tid)
+        except Exception:
+            live_status = None
+        if live_status == TerminalStatus.IDLE:
+            last_active = row.get("last_active")
+            idle_since: Optional[str] = None
+            if isinstance(last_active, datetime):
+                idle_since = last_active.isoformat()
+            elif last_active is not None:
+                idle_since = str(last_active)
+            reap_candidates.append(
+                {
+                    "id": tid,
+                    "display_name": display_name(tid, row.get("agent_profile")),
+                    "idle_since": idle_since,
+                }
+            )
+    return count, reap_candidates
+
+
+def _enforce_worker_terminal_cap(session_name: str, supervisor_id: Optional[str]) -> None:
+    """Refuse fail-closed when a new worker would breach the session cap (F439).
+
+    Called ONLY for supervisor-created workers joining an existing session
+    (``new_session=False`` and ``caller_id`` set) — operator-launched terminals
+    and the supervisor itself are never capped. Raises ``TerminalCapExceeded``
+    BEFORE any tmux window, DB row, worktree, or provider init exists (same
+    fail-before-side-effects atomicity as the authority-pin refusal path), so a
+    refusal leaves no resource to unwind.
+
+    A cap of ``<= 0`` disables enforcement entirely.
+    """
+    cap = _resolve_worker_terminal_cap()
+    if cap <= 0:
+        return
+    count, reap_candidates = _count_worker_terminals(session_name, supervisor_id)
+    if count >= cap:
+        raise TerminalCapExceeded(current_count=count, cap=cap, reap_candidates=reap_candidates)
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -1022,6 +1149,17 @@ async def create_terminal(
         TimeoutError: If provider initialization times out
     """
     require_provider_admitted(provider)
+    # F439 (#294): enforce the worker-terminal cap BEFORE any resource is
+    # created — no tmux window, no DB row, no worktree, no provider init — so a
+    # refusal is atomic and leaves nothing to unwind (mirrors the authority-pin
+    # pre-init refusal). Only supervisor-created workers joining an EXISTING
+    # session are capped: new_session=True (operator/new-session launches) and
+    # caller_id=None (operator-launched terminals, the supervisor itself) are
+    # never workers and are never counted. session_name is always supplied by
+    # both assign (POST /sessions/{s}/terminals) and handoff (run-step) on this
+    # path, so the guard is exact.
+    if new_session is False and caller_id and session_name:
+        _enforce_worker_terminal_cap(session_name, caller_id)
     if working_directory is not None:
         # Expand and resolve early so the preflight disk-space check and
         # worktree path-override see an absolute, canonical path. Relative
