@@ -894,22 +894,32 @@ class TestConcurrencyRaces:
         across create/stop churn that ``_watchdog_loop`` (which only iterates
         ``_pane_probe``) will never revisit or clean up.
 
-        F418 round 2 — injection point: patches ``_last_data_at.__setitem__``
-        (the actual dict write) rather than ``time.monotonic()``. This couples
-        the interception directly to the ASSIGNMENT, not a proxy. The mock
-        signals the test thread from inside the dict write, proving the write
-        happens under the lock because:
+        F418 round 3 — injection point: patches ``_readers.__contains__`` (the
+        membership DECISION) rather than the later ``_last_data_at.__setitem__``
+        assignment. Round 2 paused on the assignment, which a mutant that moves
+        ONLY ``if terminal_id in self._readers:`` outside ``_lock`` (leaving the
+        writes inside) survived: by the time __setitem__ fired it had already
+        acquired ``_lock``, so the test could not observe the unlocked check.
+        Pausing on the membership test itself parks the reader at the decision
+        point, coupling the sync to the check as well as (transitively) the
+        write that follows it. The mock signals the test thread from inside the
+        ``in`` test, proving check AND write share ONE ``_lock`` acquisition:
           (a) total lock removal → the mock fires but ``_lock`` is unheld, so
-              ``stop_reader`` races through its pop before the write completes
+              ``stop_reader`` races through its pop while the reader is parked
               → ``terminal_id not in _readers`` after the pause → fast-red
-          (b) lock moved off the membership-check/write pair → same: the mock
-              fires outside the lock, stop_reader is NOT blocked on the lock
-              → pop completes → fast-red
+          (b) lock around the timestamp only → the check runs unlocked, so the
+              mock fires outside the lock and stop_reader is NOT blocked → pop
+              completes → fast-red
+          (c) ``stop_reader`` pop moved outside its own ``_lock`` → the pop
+              does not wait for the lock the reader holds → fast-red
+          (d) only the membership check moved outside ``_lock`` → the reader is
+              parked at the check WITHOUT holding ``_lock``, so ``stop_reader``
+              acquires it and pops → fast-red (the case round 2 missed)
 
         The critical assertion is that ``terminal_id`` is STILL in
-        ``manager._readers`` while the assignment is in flight — proving the
-        lock holds off ``stop_reader``'s pop. This is not achievable without
-        the assignment being under the lock.
+        ``manager._readers`` while the membership check is in flight — proving
+        the lock holds off ``stop_reader``'s pop from the DECISION onward. This
+        is not achievable unless the check shares the assignment's lock.
 
         Flake root cause (original 2026-08-24 ~07:45Z, ``-n 4``): the old
         ``blocking_monotonic`` mock used ``release_write_section.wait(timeout=2.0)``
@@ -932,30 +942,78 @@ class TestConcurrencyRaces:
         manager._readers[terminal_id] = threading.Event()
         manager._last_data_at[terminal_id] = 0.0
 
-        # --- Injection: intercept __setitem__ on _last_data_at ---
-        # This fires exactly when the production code does
-        #   self._last_data_at[terminal_id] = time.monotonic()
-        # If that write is under _lock, we hold the lock by blocking here,
-        # which prevents stop_reader from acquiring _lock and popping the entry.
-        assignment_entered = threading.Event()
-        assignment_release = threading.Event()
-        real_setitem = dict.__setitem__
+        # --- Injection: intercept __contains__ on _readers ---
+        # F418 round 3: the sync point is coupled to the membership DECISION
+        # (``if terminal_id in self._readers:``), NOT the later assignment. The
+        # round-2 injection paused on ``_last_data_at.__setitem__`` — but a
+        # mutant that moves ONLY the membership check outside ``_lock`` while
+        # leaving the assignment under ``_lock`` (mutant D) has already acquired
+        # ``_lock`` by the time __setitem__ fires, so it survived. Pausing on
+        # the membership test itself parks the reader at the DECISION point:
+        #
+        #   with self._lock:                 # correct: lock held here
+        #       if terminal_id in self._readers:   # <-- we pause HERE
+        #           self._last_data_at[...] = ...  # assignment
+        #
+        # While the reader is parked mid-``__contains__``:
+        #   * correct code holds ``_lock`` (the check is inside it) → a
+        #     concurrent ``stop_reader`` blocks on ``_lock`` and CANNOT pop →
+        #     ``terminal_id`` stays in ``_readers`` and the stopper stays alive;
+        #   * any mutant that runs the membership check OUTSIDE ``_lock``
+        #     (mutant A: whole region unlocked; mutant B: lock only around the
+        #     timestamp; mutant D: only the check moved out) does NOT hold
+        #     ``_lock`` at the pause, so ``stop_reader`` acquires it and pops
+        #     immediately → ``terminal_id`` is GONE and the stopper has already
+        #     finished → fast-red on the atomicity assertion below;
+        #   * mutant C (``stop_reader``'s ``_readers.pop`` moved outside its own
+        #     ``_lock``) pops without waiting for the lock the reader holds, so
+        #     the entry vanishes while the reader is parked → same fast-red.
+        #
+        # ``__contains__`` (not ``__getitem__``/``get``) is the exact operator
+        # the production ``in`` test compiles to, so the interception is coupled
+        # to the real decision and nothing else.
+        check_entered = threading.Event()
+        check_release = threading.Event()
+        real_contains = dict.__contains__
 
-        class InstrumentedDict(dict):
-            """A dict subclass that intercepts writes to the target key."""
+        class InstrumentedReaders(dict):
+            """A dict subclass that intercepts the ``in`` membership test.
 
-            def __setitem__(self, key, value):
-                if key == terminal_id and not assignment_release.is_set():
-                    assignment_entered.set()
-                    # Unbounded wait — only the test thread releases this.
-                    # No timeout means CPU starvation cannot expire the hold.
-                    assignment_release.wait()
-                real_setitem(self, key, value)
+            Parks the calling thread the first time production evaluates
+            ``terminal_id in self._readers`` — i.e. at the membership DECISION.
+            The real result is returned only after the test releases the hold,
+            so control flow past the check is unchanged.
+            """
 
-        instrumented = InstrumentedDict(manager._last_data_at)
-        manager._last_data_at = instrumented
+            def __contains__(self, key):
+                # One-shot: pause ONLY the first ``terminal_id`` membership
+                # test (the reader thread's decision). Gate on ``check_entered``
+                # so the test thread's own ``terminal_id in manager._readers``
+                # assertions later in the body pass straight through to the
+                # real dict instead of re-entering this wait and deadlocking.
+                if (
+                    key == terminal_id
+                    and not check_entered.is_set()
+                    and not check_release.is_set()
+                ):
+                    check_entered.set()
+                    # Unbounded wait — only the test thread releases this. No
+                    # timeout means CPU starvation cannot expire the hold and
+                    # turn a scheduling delay into a false concurrency failure.
+                    check_release.wait()
+                return real_contains(self, key)
+
+        manager._readers = InstrumentedReaders(manager._readers)
 
         stop_flag = threading.Event()
+        # F418 round 3 cleanup fix: bind these BEFORE the try so the ``finally``
+        # can reference them unconditionally even if the setup barrier below
+        # fails before they are (re)assigned. The round-2 body left ``stopper``
+        # unbound on the setup-failure path, so ``stopper.join()`` in the
+        # ``finally`` raised UnboundLocalError, masking the real assertion and
+        # skipping fd/reader teardown.
+        stopper = None
+        wfd = None
 
         with patch("cli_agent_orchestrator.services.fifo_reader.bus.publish"):
             reader = threading.Thread(
@@ -964,38 +1022,41 @@ class TestConcurrencyRaces:
                 daemon=True,
             )
             reader.start()
-            threading.Event().wait(0.1)  # let the reader open its fds
-
-            wfd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
             try:
+                threading.Event().wait(0.1)  # let the reader open its fds
+
+                wfd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
                 os.write(wfd, b"x")
-                assert assignment_entered.wait(timeout=5.0), (
-                    "reader thread never reached the _last_data_at assignment — "
-                    "test setup is broken, not exercising the race"
+                assert check_entered.wait(timeout=5.0), (
+                    "reader thread never reached the `terminal_id in "
+                    "self._readers` membership check — test setup is broken, "
+                    "not exercising the race"
                 )
 
-                # The reader thread is now parked INSIDE __setitem__, which
-                # (in correct code) executes inside the `with self._lock:`
-                # block. Start the stopper: if the assignment is protected by
-                # _lock, stop_reader will block trying to acquire it and the
-                # pop will NOT have happened yet.
+                # The reader thread is now parked INSIDE __contains__, i.e. at
+                # the membership DECISION which (in correct code) runs inside
+                # the `with self._lock:` block. Start the stopper: if the check
+                # is protected by _lock, stop_reader blocks trying to acquire it
+                # and the pop has NOT happened yet.
                 stopper = threading.Thread(target=manager.stop_reader, args=(terminal_id,))
                 stopper.start()
 
-                # Give stopper time to either block on _lock (correct) or
-                # race through the pop (broken). 0.5s is generous — if the
-                # lock is not held, stop_reader completes in <1ms.
+                # Give stopper time to either block on _lock (correct) or race
+                # through the pop (broken). 0.5s is generous — if the lock is
+                # not held, stop_reader completes in <1ms.
                 threading.Event().wait(0.5)
 
-                # CRITICAL ASSERTION: if the assignment is under _lock,
-                # stop_reader's `with self._lock:` is blocked, so the pop
-                # hasn't happened — terminal_id is still in _readers.
-                # If the lock is NOT held (mutant), stop_reader already
-                # raced through and popped it → fast-red.
+                # CRITICAL ASSERTION: if the membership check runs under _lock,
+                # stop_reader's `with self._lock:` (or, for mutant C, its own
+                # pop) is blocked, so the pop hasn't happened — terminal_id is
+                # still in _readers. If the check is NOT under the same lock
+                # acquisition as the write (mutant A/B/D) or stop_reader pops
+                # outside the lock (mutant C), the pop already won → fast-red.
                 assert terminal_id in manager._readers, (
-                    "stop_reader's pop raced past the assignment — the "
-                    "check-then-write is NOT protected by _lock (the lock "
-                    "does not cover the assignment)"
+                    "stop_reader's pop raced past the membership check — the "
+                    "check-then-write is NOT one atomic critical section under "
+                    "_lock (the membership decision is not covered by the lock "
+                    "that guards the assignment)"
                 )
 
                 # Secondary: stopper must still be alive (blocked on _lock).
@@ -1005,16 +1066,20 @@ class TestConcurrencyRaces:
                 )
 
             finally:
-                # Always release the mock so the reader can unblock and exit.
-                assignment_release.set()
-                # Give stopper time to complete after lock release.
-                stopper.join(timeout=5.0)
-                os.close(wfd)
+                # Always release the mock so the reader can unblock and exit,
+                # then tear everything down. Each step is guarded/ordered so a
+                # failure on the setup path (stopper/wfd never assigned) still
+                # completes fd + reader cleanup — no UnboundLocalError, no leak.
+                check_release.set()
+                if stopper is not None:
+                    stopper.join(timeout=5.0)
+                if wfd is not None:
+                    os.close(wfd)
                 stop_flag.set()
                 reader.join(timeout=5.0)
 
         # Post-join assertions: both threads must have exited cleanly.
-        assert not stopper.is_alive(), (
+        assert stopper is not None and not stopper.is_alive(), (
             "stop_reader did not complete within 5s after lock release"
         )
         assert not reader.is_alive(), (
