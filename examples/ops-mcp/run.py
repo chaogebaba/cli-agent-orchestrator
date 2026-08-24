@@ -54,13 +54,13 @@ def parse_tool_result(result: CallToolResult) -> Any:
     otherwise falls back to concatenated text blocks, parsed as JSON when
     possible. Errors are returned as a dict so callers handle one shape.
     """
-    if result.structuredContent is not None:
-        return result.structuredContent
+    if result.structured_content is not None:
+        return result.structured_content
 
     texts = [block.text for block in result.content if isinstance(block, TextContent)]
     combined = "\n".join(texts)
 
-    if result.isError:
+    if result.is_error:
         return {"success": False, "message": combined or "tool reported an error"}
 
     try:
