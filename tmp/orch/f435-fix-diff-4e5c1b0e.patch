@@ -1,0 +1,471 @@
+diff --git a/src/cli_agent_orchestrator/providers/base.py b/src/cli_agent_orchestrator/providers/base.py
+index 52d2c6b1..72701007 100644
+--- a/src/cli_agent_orchestrator/providers/base.py
++++ b/src/cli_agent_orchestrator/providers/base.py
+@@ -550,6 +550,26 @@ class BaseProvider(ABC):
+         The default implementation is a no-op (always allows the paste).
+         """
+ 
++    def verify_submission_after_send(
++        self,
++        metadata: dict[str, Any],
++        backend: Any,
++    ) -> None:
++        """Provider hook called immediately after send_keys pastes+submits a message.
++
++        Gives TUI providers a chance to confirm the paste was actually SUBMITTED
++        (the submit Enter was not lost to a paste-vs-Enter render race) and to
++        recover by re-sending Enter when — and only when — a durable "still
++        drafted, not submitted" marker is observed on the pane. See
++        ``CodexProvider.verify_submission_after_send`` for the F435 recovery.
++
++        The default implementation is a no-op: providers with no observed
++        submit race are unaffected. Implementations MUST be idempotent — they
++        must never blind-Enter a composer that already submitted, and should
++        raise a clear error naming the terminal if submission cannot be
++        confirmed after bounded retries.
++        """
++
+     def _restore_dispatch_locked(self, snapshot: dict[str, float | bool]) -> None:
+         self._task_dispatched = bool(snapshot["task_dispatched"])
+         self._last_dispatch_time = float(snapshot["last_dispatch_time"])
+diff --git a/src/cli_agent_orchestrator/providers/codex.py b/src/cli_agent_orchestrator/providers/codex.py
+index 75c33d0b..58e4dca1 100644
+--- a/src/cli_agent_orchestrator/providers/codex.py
++++ b/src/cli_agent_orchestrator/providers/codex.py
+@@ -15,7 +15,7 @@ if TYPE_CHECKING:
+     from cli_agent_orchestrator.utils.persona_context import PersonaPlan
+ 
+ from cli_agent_orchestrator.backends.registry import get_backend
+-from cli_agent_orchestrator.constants import BLOCKED_WAIT_CAP_S, CAO_HOME_DIR
++from cli_agent_orchestrator.constants import BLOCKED_WAIT_CAP_S, CAO_HOME_DIR, PYTE_SCREEN_ROWS
+ from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
+ from cli_agent_orchestrator.providers.base import (
+     BaseProvider,
+@@ -404,6 +404,33 @@ CODEX_EMPTY_COMPOSER_PLACEHOLDERS = {
+ # escape-preserving capture-pane (-e) lines without treating cursor CSI as text.
+ _SGR_CSI_RE = re.compile(r"\x1b\[([0-9;]*)m")
+ 
++# --- F435: paste-submit race recovery -------------------------------------
++# When several codex TUIs initialize/receive input concurrently, the submit
++# Enter after a bracketed paste is sometimes lost to a render race: the task
++# text lands in the composer as a "[Pasted Content NNNN chars]" chip but is
++# never submitted. The pane then sits idle at the drafted chip until the
++# stalled-callback watchdog fires (~120s) or a human spots it.
++#
++# The stuck signature is the composer prompt line carrying the paste chip:
++#   › [Pasted Content 3048 chars]
++# A SUBMITTED composer instead shows an empty idle placeholder (e.g.
++# "› Ask Codex to do anything") or the Working/Thinking spinner
++# ("• Working (0s • esc to interrupt)"). We recover by re-sending Enter ONLY
++# while the stuck chip is still present — never blind-Enter a submitted
++# composer (idempotent, no double-submit).
++CODEX_PASTE_CHIP_PATTERN = re.compile(r"[›»]\s*\[Pasted Content\s+\d+\s+chars\]")
++# Grace before the first submission check: give the TUI a beat to register the
++# paste and process the submit Enter under load.
++CODEX_SUBMIT_VERIFY_GRACE_SECONDS = 2.0
++# Bounded re-Enter attempts once the stuck chip is confirmed present.
++CODEX_SUBMIT_VERIFY_MAX_RETRIES = 3
++# Backoff between re-Enter attempts (seconds); grows per attempt.
++CODEX_SUBMIT_VERIFY_BACKOFF_SECONDS = 1.0
++
++
++class CodexSubmitStuckError(Exception):
++    """Raised when a codex composer never submits a pasted task after retries."""
++
+ 
+ def _apply_sgr_params_to_dim(params: str, dim: bool) -> bool:
+     """Update dim/faint state from one SGR parameter list.
+@@ -1940,7 +1967,7 @@ class CodexProvider(BaseProvider):
+     @property
+     def resolved_model(self) -> Optional[str]:
+         """Return the effective model resolved during command build."""
+-        return getattr(self, '_resolved_model', None)
++        return getattr(self, "_resolved_model", None)
+ 
+     @property
+     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
+@@ -2004,7 +2031,10 @@ class CodexProvider(BaseProvider):
+                 signals.append(
+                     ScreenSignal("progress", "TUI_PROGRESS_PATTERN", index, row, "corroborable")
+                 )
+-            if legacy_status == TerminalStatus.WAITING_USER_ANSWER and TRUST_SELECTOR_PATTERN.search(row):
++            if (
++                legacy_status == TerminalStatus.WAITING_USER_ANSWER
++                and TRUST_SELECTOR_PATTERN.search(row)
++            ):
+                 signals.append(ScreenSignal("waiting", "TRUST_SELECTOR_PATTERN", index))
+             if (
+                 not progress_rows
+@@ -2257,6 +2287,100 @@ class CodexProvider(BaseProvider):
+             return ""
+         return draft
+ 
++    @staticmethod
++    def _pane_shows_pasted_chip(captured: str) -> bool:
++        """Whether the captured pane still shows an unsubmitted paste chip.
++
++        The stuck F435 signature is the composer prompt line carrying the
++        ``[Pasted Content NNNN chars]`` chip. A submitted composer never shows
++        this — it shows an empty idle placeholder or the Working spinner — so
++        the chip's PRESENCE is a durable, idempotent gate for re-sending Enter.
++
++        Escapes are stripped first so SGR-wrapped chips still match. Matching
++        is intentionally lenient about the prompt glyph (``›``/``»``) since the
++        glyph varies across codex releases.
++        """
++        if not captured:
++            return False
++        clean = strip_terminal_escapes(captured)
++        return CODEX_PASTE_CHIP_PATTERN.search(clean) is not None
++
++    def verify_submission_after_send(
++        self,
++        metadata: dict[str, Any],
++        backend: Any,
++    ) -> None:
++        """F435: confirm the pasted task submitted; re-Enter if it stuck.
++
++        After a bracketed paste + submit Enter, a render race can drop the
++        Enter, leaving the task drafted as a ``[Pasted Content NNNN chars]``
++        chip that never submits (the pane sits idle until the stalled-callback
++        watchdog fires ~120s later). This verifies submission and recovers:
++
++        * Wait a short grace, then capture the pane.
++        * If the stuck chip is ABSENT, the submit took — return (no extra Enter).
++        * While the stuck chip is PRESENT, re-send Enter and re-verify, with
++          bounded retries and backoff.
++        * If still stuck after the retries, raise ``CodexSubmitStuckError``
++          naming the terminal.
++
++        Idempotent by construction: Enter is only ever re-sent while the stuck
++        chip is observed, so a composer that already submitted is never
++        blind-Entered.
++        """
++        session = metadata["tmux_session"]
++        window = metadata["tmux_window"]
++
++        def _capture() -> str:
++            try:
++                return backend.get_history(
++                    session,
++                    window,
++                    tail_lines=PYTE_SCREEN_ROWS,
++                    strip_escapes=False,
++                )
++            except Exception:
++                logger.warning(
++                    "F435 submit-verify: pane capture failed for terminal %s",
++                    self.terminal_id,
++                )
++                return ""
++
++        time.sleep(CODEX_SUBMIT_VERIFY_GRACE_SECONDS)
++        if not self._pane_shows_pasted_chip(_capture()):
++            return  # Submitted normally — no recovery needed, no extra Enter.
++
++        for attempt in range(1, CODEX_SUBMIT_VERIFY_MAX_RETRIES + 1):
++            logger.warning(
++                "F435 submit-verify: paste chip still drafted on terminal %s "
++                "(attempt %d/%d); re-sending Enter",
++                self.terminal_id,
++                attempt,
++                CODEX_SUBMIT_VERIFY_MAX_RETRIES,
++            )
++            try:
++                backend.send_special_key(session, window, "Enter")
++            except Exception as exc:
++                logger.warning(
++                    "F435 submit-verify: re-Enter failed for terminal %s: %s",
++                    self.terminal_id,
++                    exc,
++                )
++            time.sleep(CODEX_SUBMIT_VERIFY_BACKOFF_SECONDS * attempt)
++            if not self._pane_shows_pasted_chip(_capture()):
++                logger.info(
++                    "F435 submit-verify: terminal %s submitted after %d re-Enter(s)",
++                    self.terminal_id,
++                    attempt,
++                )
++                return
++
++        raise CodexSubmitStuckError(
++            f"Codex terminal {self.terminal_id} did not submit the pasted task after "
++            f"{CODEX_SUBMIT_VERIFY_MAX_RETRIES} re-Enter attempts; the composer is still "
++            f"showing an unsubmitted '[Pasted Content ...]' chip"
++        )
++
+     @staticmethod
+     def _raw_after_prompt_glyph(raw_line: str) -> str:
+         """Return the raw substring after the composer ``›`` glyph (CSI-aware)."""
+diff --git a/src/cli_agent_orchestrator/services/terminal_service.py b/src/cli_agent_orchestrator/services/terminal_service.py
+index 42b90808..2efc6b7a 100644
+--- a/src/cli_agent_orchestrator/services/terminal_service.py
++++ b/src/cli_agent_orchestrator/services/terminal_service.py
+@@ -4526,6 +4526,13 @@ def send_input(
+             status_monitor.commit_dispatch(dispatch_txn)
+             if provider:
+                 provider.mark_input_received()
++                # F435: confirm the paste actually submitted (the submit Enter
++                # is occasionally lost to a paste-vs-Enter render race under
++                # concurrent codex dispatch). Provider-scoped: the default hook
++                # is a no-op, so non-codex providers are unaffected. Runs before
++                # any human-draft restore so a re-Enter can only ever resubmit
++                # the task, never a restored draft.
++                provider.verify_submission_after_send(metadata, backend)
+         if preserved_draft is not None:
+             preserved_draft.restore(backend)
+ 
+@@ -4702,6 +4709,13 @@ def send_prepared_input(
+         raise
+     else:
+         status_monitor.commit_dispatch(dispatch_txn)
++        if provider:
++            # F435: confirm the paste actually submitted before we treat the
++            # injection as complete. Provider-scoped no-op default keeps every
++            # non-codex provider unaffected. Runs before mark_injection_completed
++            # / on_submitted / draft restore so recovery re-Enter only ever
++            # resubmits the task.
++            provider.verify_submission_after_send(metadata, backend)
+     injection_observation = status_monitor.mark_injection_completed(terminal_id)
+     if on_submitted is not None:
+         on_submitted(injection_observation)
+diff --git a/test/providers/fixtures/codex_f435_stuck_paste_pane.txt b/test/providers/fixtures/codex_f435_stuck_paste_pane.txt
+new file mode 100644
+index 00000000..76db8377
+--- /dev/null
++++ b/test/providers/fixtures/codex_f435_stuck_paste_pane.txt
+@@ -0,0 +1,29 @@
++
++
++cli-subagents on  quirks-merge-train [⇡] via 🐍 v3.14.7 on ☁️  user@example.com
++❯
++
++cli-subagents on  quirks-merge-train [⇡] via 🐍 v3.14.7 on ☁️  user@example.com
++❯ echo ready
++ready
++
++╭──────────────────────────────────────────────────╮
++│ >_ OpenAI Codex (v0.149.1)                       │
++│                                                  │
++│ model:       gpt-5.6-sol high   /model to change │
++│ directory:   ~/VScode_projects/cli-subagents     │
++│ permissions: YOLO mode                           │
++╰──────────────────────────────────────────────────╯
++
++  Tip: New Use /fast to enable our fastest inference with increased plan usage.
++
++
++› Reply exactly: SEED_OK then stop.
++
++
++• SEED_OK
++
++
++› [Pasted Content 3048 chars]
++
++  ~/VScode_projects/cli-subagents · quirks-merge-train · gpt-5.6-sol high
+diff --git a/test/providers/test_codex_submit_verify_f435.py b/test/providers/test_codex_submit_verify_f435.py
+new file mode 100644
+index 00000000..733a1cf2
+--- /dev/null
++++ b/test/providers/test_codex_submit_verify_f435.py
+@@ -0,0 +1,198 @@
++"""F435: codex paste-submit race recovery (verify_submission_after_send).
++
++Symptom: dispatching a task to a codex TUI worker pastes the message into the
++composer, but the submit Enter is sometimes lost under concurrent multi-assign
++— the pane sits at ``› [Pasted Content NNNN chars]`` until the stalled-callback
++watchdog fires (~120s). Fix: after the send, verify the paste submitted; while
++the stuck chip is present, re-send Enter with bounded retries; raise a clear
++error if it never submits. Idempotent — never blind-Enter a submitted composer.
++
++These tests drive the provider's real ``verify_submission_after_send`` entry
++point with a mocked tmux backend and assert the observable Enter re-sends.
++"""
++
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from cli_agent_orchestrator.providers.codex import (
++    CODEX_PASTE_CHIP_PATTERN,
++    CODEX_SUBMIT_VERIFY_MAX_RETRIES,
++    CodexProvider,
++    CodexSubmitStuckError,
++)
++
++FIXTURES_DIR = Path(__file__).parent / "fixtures"
++
++# Composer prompt lines Codex renders once the pasted task HAS submitted: an
++# empty idle placeholder, or the Working/Thinking spinner.
++SUBMITTED_PLACEHOLDER_PANE = (
++    "• SEED_OK\n"
++    "\n"
++    "› Ask Codex to do anything\n"
++    "\n"
++    "  ~/VScode_projects/cli-subagents · main · gpt-5.6-sol high\n"
++)
++SUBMITTED_WORKING_PANE = (
++    "• SEED_OK\n"
++    "\n"
++    "• Working (0s • esc to interrupt)\n"
++    "\n"
++    "  ~/VScode_projects/cli-subagents · main · gpt-5.6-sol high\n"
++)
++# The stuck signature: task pasted as a chip, never submitted.
++STUCK_CHIP_PANE = (
++    "• SEED_OK\n"
++    "\n"
++    "› [Pasted Content 3048 chars]\n"
++    "\n"
++    "  ~/VScode_projects/cli-subagents · main · gpt-5.6-sol high\n"
++)
++
++METADATA = {"tmux_session": "sess", "tmux_window": "win"}
++
++
++@pytest.fixture(autouse=True)
++def _no_sleep():
++    """Neutralize the grace/backoff sleeps so retries run instantly."""
++    with patch("cli_agent_orchestrator.providers.codex.time.sleep", return_value=None):
++        yield
++
++
++def _provider() -> CodexProvider:
++    return CodexProvider("term1234", "sess", "win")
++
++
++def _backend_returning(*panes: str) -> MagicMock:
++    """Backend whose successive get_history calls return the given panes.
++
++    The last pane repeats for any calls beyond the supplied sequence.
++    """
++    backend = MagicMock()
++    seq = list(panes)
++
++    def _get_history(session, window, tail_lines=None, strip_escapes=False):
++        return seq.pop(0) if len(seq) > 1 else seq[0]
++
++    backend.get_history.side_effect = _get_history
++    return backend
++
++
++def _enter_calls(backend: MagicMock) -> int:
++    return sum(
++        1
++        for call in backend.send_special_key.call_args_list
++        if "Enter" in call.args or call.kwargs.get("key") == "Enter"
++    )
++
++
++# --- regex against the REAL pane sample from the issue --------------------
++
++
++def test_chip_regex_matches_real_issue_pane_sample():
++    """The stuck-marker regex must match the verbatim pane capture from #290."""
++    sample = (FIXTURES_DIR / "codex_f435_stuck_paste_pane.txt").read_text(encoding="utf-8")
++    assert CODEX_PASTE_CHIP_PATTERN.search(sample) is not None
++    assert CodexProvider._pane_shows_pasted_chip(sample) is True
++
++
++def test_chip_regex_ignores_submitted_states():
++    assert CodexProvider._pane_shows_pasted_chip(SUBMITTED_PLACEHOLDER_PANE) is False
++    assert CodexProvider._pane_shows_pasted_chip(SUBMITTED_WORKING_PANE) is False
++    assert CodexProvider._pane_shows_pasted_chip("") is False
++
++
++def test_chip_regex_matches_various_char_counts_and_glyphs():
++    assert CodexProvider._pane_shows_pasted_chip("› [Pasted Content 12 chars]") is True
++    assert CodexProvider._pane_shows_pasted_chip("» [Pasted Content 999999 chars]") is True
++
++
++# --- submitted immediately → no extra Enter -------------------------------
++
++
++def test_submitted_immediately_sends_no_extra_enter():
++    provider = _provider()
++    backend = _backend_returning(SUBMITTED_PLACEHOLDER_PANE)
++
++    provider.verify_submission_after_send(METADATA, backend)
++
++    backend.send_special_key.assert_not_called()
++
++
++def test_submitted_working_spinner_sends_no_extra_enter():
++    provider = _provider()
++    backend = _backend_returning(SUBMITTED_WORKING_PANE)
++
++    provider.verify_submission_after_send(METADATA, backend)
++
++    backend.send_special_key.assert_not_called()
++
++
++# --- stuck then recovered → exactly the Enters needed ---------------------
++
++
++def test_stuck_then_recovered_after_one_reenter():
++    provider = _provider()
++    # grace-check sees stuck; after one re-Enter the re-verify sees submitted.
++    backend = _backend_returning(STUCK_CHIP_PANE, SUBMITTED_PLACEHOLDER_PANE)
++
++    provider.verify_submission_after_send(METADATA, backend)
++
++    assert _enter_calls(backend) == 1
++
++
++def test_stuck_then_recovered_after_two_reenters():
++    provider = _provider()
++    backend = _backend_returning(
++        STUCK_CHIP_PANE,  # initial grace check
++        STUCK_CHIP_PANE,  # re-verify after 1st Enter: still stuck
++        SUBMITTED_WORKING_PANE,  # re-verify after 2nd Enter: submitted
++    )
++
++    provider.verify_submission_after_send(METADATA, backend)
++
++    assert _enter_calls(backend) == 2
++
++
++# --- stuck forever → clear error naming the terminal ----------------------
++
++
++def test_stuck_forever_raises_after_bounded_retries():
++    provider = _provider()
++    backend = _backend_returning(STUCK_CHIP_PANE)  # always stuck
++
++    with pytest.raises(CodexSubmitStuckError) as excinfo:
++        provider.verify_submission_after_send(METADATA, backend)
++
++    # Bounded: exactly MAX_RETRIES re-Enters, no more.
++    assert _enter_calls(backend) == CODEX_SUBMIT_VERIFY_MAX_RETRIES
++    assert "term1234" in str(excinfo.value)
++
++
++# --- capture failure must not blind-Enter (idempotence safety) ------------
++
++
++def test_capture_failure_is_treated_as_not_stuck():
++    """If the pane cannot be captured, we must NOT re-Enter (could double-submit)."""
++    provider = _provider()
++    backend = MagicMock()
++    backend.get_history.side_effect = RuntimeError("tmux gone")
++
++    provider.verify_submission_after_send(METADATA, backend)
++
++    backend.send_special_key.assert_not_called()
++
++
++# --- default hook is a no-op for other providers --------------------------
++
++
++def test_base_provider_hook_is_noop():
++    from cli_agent_orchestrator.providers.base import BaseProvider
++
++    # The base hook exists and does nothing (non-codex providers unaffected).
++    assert BaseProvider.verify_submission_after_send.__doc__ is not None
++    backend = MagicMock()
++    # Call via an unbound reference with a dummy self to prove no side effects.
++    BaseProvider.verify_submission_after_send(object(), METADATA, backend)
++    backend.send_special_key.assert_not_called()
