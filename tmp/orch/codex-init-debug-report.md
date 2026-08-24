@@ -92,7 +92,8 @@ test/services/test_f110_deferred_init_watchdog.py — 7 passed
 Rollout files are created at FIRST TURN, not thread start. The fix's sessions
 symlink does NOT mask this into a hard failure:
 - Empty glob through symlink → `RetryableArtifactValidation("session_artifact_missing")` — same retryable error as without symlink
-- Retry window: 60s (`artifact_validate_deadline_s`), 2s poll interval → ~30 retries
+- Retry window: 60s (`artifact_validate_deadline_s`), poll_interval=0.4s default
+  (deferred path overrides to POLL_INTERVAL=2.0s) → 30–150 retries depending on path
 - The symlink is to a directory (not a file); it doesn't change the glob's semantics for absent files
 
 No adjustment needed — existing retry window tolerates first-turn latency.

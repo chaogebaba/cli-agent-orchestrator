@@ -11,12 +11,9 @@ Fix: CODEX_HOME added to _BLOCKED_PREFIX_ALLOWLIST in tmux.py, and a sessions
 symlink is created in the persona codex-home during compose.
 """
 
-import os
 import json
-import tempfile
+import os
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 
@@ -31,7 +28,9 @@ class TestCodexHomeAllowlist:
 
     def test_codex_home_passes_merge_extra_env(self):
         env: dict[str, str] = {}
-        TmuxClient._merge_extra_env(env, {"CODEX_HOME": "/run/user/1000/cao-personas/abc/current/gen-1/codex-home"})
+        TmuxClient._merge_extra_env(
+            env, {"CODEX_HOME": "/run/user/1000/cao-personas/abc/current/gen-1/codex-home"}
+        )
         assert env["CODEX_HOME"] == "/run/user/1000/cao-personas/abc/current/gen-1/codex-home"
 
     def test_other_codex_prefixed_vars_still_blocked(self):
@@ -55,11 +54,18 @@ class TestPersonaCodexHomeSessionsSymlink:
         # Put a fake rollout in sessions
         rollout = sessions_dir / "2026" / "08" / "24"
         rollout.mkdir(parents=True)
-        rollout_file = rollout / "rollout-2026-08-24T05-43-21-01a03327-3263-76d3-80df-532ba0fd16dd.jsonl"
-        rollout_file.write_text(json.dumps({
-            "type": "session_meta",
-            "payload": {"id": "01a03327-3263-76d3-80df-532ba0fd16dd", "cwd": "/work"},
-        }) + "\n")
+        rollout_file = (
+            rollout / "rollout-2026-08-24T05-43-21-01a03327-3263-76d3-80df-532ba0fd16dd.jsonl"
+        )
+        rollout_file.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {"id": "01a03327-3263-76d3-80df-532ba0fd16dd", "cwd": "/work"},
+                }
+            )
+            + "\n"
+        )
 
         # Replicate the compose_persona_plan codex-home setup logic
         codex_staging = tmp_path / "staging" / "codex-home"
@@ -78,9 +84,11 @@ class TestPersonaCodexHomeSessionsSymlink:
         assert (codex_staging / "sessions").is_symlink()
         assert (codex_staging / "sessions").resolve() == sessions_dir.resolve()
         # The rollout is findable via the symlink
-        found = list((codex_staging / "sessions").glob(
-            "**/rollout-*01a03327-3263-76d3-80df-532ba0fd16dd*.jsonl"
-        ))
+        found = list(
+            (codex_staging / "sessions").glob(
+                "**/rollout-*01a03327-3263-76d3-80df-532ba0fd16dd*.jsonl"
+            )
+        )
         assert len(found) == 1
         assert found[0].name == rollout_file.name
 
@@ -97,10 +105,15 @@ class TestValidateSessionArtifactWithPersonaHome:
         sessions_dir.mkdir(parents=True)
         uuid = "01a03327-3263-76d3-80df-532ba0fd16dd"
         rollout = sessions_dir / f"rollout-2026-08-24T05-43-21-{uuid}.jsonl"
-        rollout.write_text(json.dumps({
-            "type": "session_meta",
-            "payload": {"id": uuid, "cwd": "/work"},
-        }) + "\n")
+        rollout.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {"id": uuid, "cwd": "/work"},
+                }
+            )
+            + "\n"
+        )
 
         # Persona codex-home with sessions symlink
         persona_home = tmp_path / "persona-codex-home"
@@ -119,8 +132,8 @@ class TestValidateSessionArtifactWithPersonaHome:
 
     def test_fails_without_symlink(self, tmp_path, monkeypatch):
         """Without sessions symlink, validation raises RetryableArtifactValidation."""
-        from cli_agent_orchestrator.providers.codex import CodexProvider
         from cli_agent_orchestrator.providers.base import RetryableArtifactValidation
+        from cli_agent_orchestrator.providers.codex import CodexProvider
 
         # Empty persona codex-home (no sessions dir at all)
         persona_home = tmp_path / "persona-codex-home"
