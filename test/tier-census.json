@@ -11633,6 +11633,7 @@
     "test/utils/test_workflow_events.py::test_run_projection_frame_terminal_by_state": "unit",
     "test/utils/test_workflow_events.py::test_run_event_terminal_regardless_of_state_field": "unit",
     "test/utils/test_workflow_events.py::test_gap_frame_never_terminal": "unit",
-    "test/utils/test_workflow_events.py::test_seq_non_integer_id_is_none": "unit"
+    "test/utils/test_workflow_events.py::test_seq_non_integer_id_is_none": "unit",
+    "test/services/test_profile_validator_integration.py::TestAggregateFindingBudgetIntegration::test_schema_prefix_is_stable_across_hash_seeds": "integration"
   }
 }
