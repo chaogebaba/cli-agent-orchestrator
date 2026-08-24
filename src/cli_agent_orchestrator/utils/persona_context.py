@@ -500,6 +500,12 @@ def compose_persona_plan(
             if auth.is_symlink() or not auth.is_file():
                 raise PersonaContextError("persona_codex_auth_invalid")
             os.symlink(str(auth.resolve()), staging / "codex-home/auth.json")
+            # Symlink sessions/ so `codex resume` (with CODEX_HOME pointing here)
+            # can find rollouts created by seed_resume_identity (which runs
+            # without persona env and writes to the production home's sessions/).
+            real_sessions = real_codex_home / "sessions"
+            if real_sessions.is_dir():
+                os.symlink(str(real_sessions), staging / "codex-home/sessions")
             for leaf, source in leaf_sources:
                 shutil.copyfile(source, staging / "codex-home" / leaf)
                 (staging / "codex-home" / leaf).chmod(0o600)
