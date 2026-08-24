@@ -460,6 +460,10 @@ class TestAC6EBoundEscalation:
         delivery_service._escalate still calls attempt_rung2 directly with
         is_escalation=True, bypassing nudge_discipline entirely. The nudge
         discipline cannot suppress or delay escalation (D5).
+
+        F401: Uses worker profile because supervisor-role targets now take a
+        distinct escalation path (F210 D14 — supervisor_role_exempt) that
+        never calls attempt_rung2.
         """
         from unittest.mock import MagicMock, patch
 
@@ -490,16 +494,16 @@ class TestAC6EBoundEscalation:
                 TerminalModel(
                     id="sup1",
                     tmux_session="cao-test",
-                    tmux_window="supervisor",
+                    tmux_window="worker-w",
                     provider="kiro_cli",
-                    agent_profile="supervisor",
+                    agent_profile="developer",
                 )
             )
             db.add(
                 MailboxModel(
                     id="mb1",
                     session_name="cao-test",
-                    role="supervisor",
+                    role="worker",
                     current_terminal_id="sup1",
                     generation=1,
                     consumed_through_id=0,
