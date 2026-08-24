@@ -315,6 +315,11 @@ class TmuxClient:
             "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
             "CLAUDE_CODE_SKIP_VERTEX_AUTH",
             "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+            # CODEX_HOME is the config/session directory — not a nesting vector.
+            # Persona isolation injects it via sandbox_guard; dropping it breaks
+            # the session-artifact validator (it resolves persona codex_home while
+            # the codex binary falls back to ~/.codex).
+            "CODEX_HOME",
         }
     )
     # Per-var value cap (PR #246) — keeps the full tmux ``new-session -e`` /
