@@ -28,8 +28,43 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  # F407: probe for online self-hosted runners labeled 'box'. If at least one is
+  # online, route the suite there (faster, our hardware). Otherwise fall back to
+  # GH-hosted ubuntu-latest. Pattern precedent: elizaos/eliza#17812,
+  # qwenlm/qwen-code#5620 (ternary fromJSON idiom with a probe job).
+  check-runners:
     runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      runner: ${{ steps.probe.outputs.runner }}
+    steps:
+      - name: Probe for online box runners
+        id: probe
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_PROBE_TOKEN }}
+        run: |
+          # Query self-hosted runners for this repo, filter to label=box + status=online.
+          # RUNNER_PROBE_TOKEN has repo scope (needed for runners API); falls back to
+          # GITHUB_TOKEN which may 403 — in that case default to GH-hosted.
+          ONLINE=$(gh api "repos/${{ github.repository }}/actions/runners" \
+            --jq '[.runners[] | select(.status == "online") | select(.labels[].name == "box")] | length' \
+            2>&1 || echo "0")
+          # If the API returned an error string, treat as 0
+          if ! echo "$ONLINE" | grep -qE '^[0-9]+$'; then
+            ONLINE=0
+          fi
+          echo "Online box runners: $ONLINE"
+          if [ "${ONLINE:-0}" -gt 0 ]; then
+            echo 'runner=["self-hosted","Linux","X64","box"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'runner=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    needs: [check-runners]
+    runs-on: ${{ fromJSON(needs.check-runners.outputs.runner) }}
     timeout-minutes: 20
     # AC3.9: least-privilege — id-token + attestations at JOB level only.
     permissions:
@@ -302,7 +337,7 @@ jobs:
               "skipped": "${{ env.SUITE_SKIPPED }}",
               "failures": "${{ env.SUITE_FAILURES }}",
               "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-              "runner_image": "ubuntu-latest",
+              "runner_image": "${{ needs.check-runners.outputs.runner }}",
               "python_version": "3.14",
               "wall_time_seconds": "${{ env.SUITE_WALL_TIME }}",
               "timestamp": "${{ env.SUITE_TIMESTAMP }}"
