@@ -429,7 +429,19 @@ CODEX_SUBMIT_VERIFY_BACKOFF_SECONDS = 1.0
 
 
 class CodexSubmitStuckError(Exception):
-    """Raised when a codex composer never submits a pasted task after retries."""
+    """Raised when a codex composer never submits a pasted task after retries.
+
+    The send seams (``terminal_service.send_input`` /
+    ``send_prepared_input``) raise this from INSIDE the dispatch transaction so
+    it drives ``abort_dispatch`` — a coherent rollback, not a half-committed
+    send (BLOCKER B2). Those seams then translate it into a
+    ``DeliveryDeferredError`` so the inbox delivery layer treats it as a
+    retry-safe deferred delivery rather than a hard crash or a pretend-success.
+    Defined as a plain ``Exception`` here (not a ``DeliveryDeferredError``
+    subclass) to avoid a provider→draft_guard→status_monitor→manager→provider
+    import cycle; the translation lives in the seam, which already imports
+    ``DeliveryDeferredError``.
+    """
 
 
 def _apply_sgr_params_to_dim(params: str, dim: bool) -> bool:
@@ -2289,21 +2301,61 @@ class CodexProvider(BaseProvider):
 
     @staticmethod
     def _pane_shows_pasted_chip(captured: str) -> bool:
-        """Whether the captured pane still shows an unsubmitted paste chip.
+        """Whether the ACTIVE composer still shows an unsubmitted paste chip.
 
-        The stuck F435 signature is the composer prompt line carrying the
-        ``[Pasted Content NNNN chars]`` chip. A submitted composer never shows
-        this — it shows an empty idle placeholder or the Working spinner — so
-        the chip's PRESENCE is a durable, idempotent gate for re-sending Enter.
+        The stuck F435 signature is the CURRENT composer row carrying the
+        ``[Pasted Content NNNN chars]`` chip. A submitted composer instead shows
+        an empty idle placeholder or the Working/Thinking spinner, so the chip's
+        presence in the active composer is a durable, idempotent gate for
+        re-sending Enter.
 
-        Escapes are stripped first so SGR-wrapped chips still match. Matching
-        is intentionally lenient about the prompt glyph (``›``/``»``) since the
-        glyph varies across codex releases.
+        Composer-SCOPED (BLOCKER B1): the chip is matched ONLY within the active
+        composer region at the bottom of the rendered pane, never against the
+        whole 200-row capture. A HISTORICAL chip that has scrolled up into
+        transcript history — with the current composer now empty or showing the
+        Working spinner — must NOT be read as stuck, or recovery would blind a
+        submitted composer with an extra Enter (a double-submit).
+
+        Scoping mirrors ``read_composer_draft``: locate the TUI footer, then the
+        last ``›``/``»`` composer row in the small window just above it, and test
+        the chip pattern on that row plus its continuation rows up to the footer.
+        Escapes are stripped first so an SGR-wrapped chip still matches.
+
+        Note this deliberately does NOT inherit ``read_composer_draft``'s
+        "assistant output above the prompt ⇒ defer (None)" ownership rule: that
+        rule protects human-draft stash/restore against ambiguous ownership, but
+        the ``[Pasted Content N chars]`` chip is unambiguous CAO-injected chrome
+        (never user/assistant prose), and the real stuck pane always has the
+        SEED_OK assistant bullet above the composer.
         """
         if not captured:
             return False
-        clean = strip_terminal_escapes(captured)
-        return CODEX_PASTE_CHIP_PATTERN.search(clean) is not None
+        raw_lines = [line.rstrip("\r") for line in captured.splitlines()]
+        plain_lines = [strip_terminal_escapes(line).rstrip() for line in raw_lines]
+
+        footer_idx = _find_tui_footer_index(plain_lines)
+        if footer_idx is None:
+            footer_idx = len(plain_lines)
+
+        # Identify the ACTIVE composer row using the same strict adjacency the
+        # status/extraction paths use: walk up from the footer through only
+        # blank / "? for shortcuts" rows to a ``›``/``»`` composer row. Any
+        # other content (e.g. a ``• Working`` spinner, an assistant bullet)
+        # between the footer and a prompt row rejects the anchor — so a
+        # HISTORICAL chip that has scrolled up into transcript history is never
+        # mistaken for the current composer (BLOCKER B1).
+        prompt_idx = _find_composer_anchor_index(plain_lines, footer_idx)
+        if prompt_idx is None:
+            return False
+
+        # Match the chip only on the active composer region: the anchored prompt
+        # row and any continuation rows up to the footer. The chip is single-line
+        # in practice; scanning the region is safe and future-proof.
+        search_end = footer_idx
+        while search_end > 0 and not plain_lines[search_end - 1].strip():
+            search_end -= 1
+        region = "\n".join(plain_lines[prompt_idx:search_end])
+        return CODEX_PASTE_CHIP_PATTERN.search(region) is not None
 
     def verify_submission_after_send(
         self,

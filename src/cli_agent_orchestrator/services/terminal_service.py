@@ -94,6 +94,7 @@ from cli_agent_orchestrator.providers.base import (
     RetryableArtifactValidation,
     TerminalArtifactValidation,
 )
+from cli_agent_orchestrator.providers.codex import CodexSubmitStuckError
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
     probe_kiro_capabilities,
@@ -4519,6 +4520,22 @@ def send_input(
                 force_bracketed_paste=True,
                 submit_delay=provider.paste_submit_delay if provider else 0.3,
             )
+            # F435: confirm the paste actually SUBMITTED before committing the
+            # dispatch (the submit Enter is occasionally lost to a paste-vs-Enter
+            # render race under concurrent codex dispatch). Runs INSIDE the
+            # transaction so a stuck-forever verdict drives abort_dispatch — a
+            # coherent rollback, never a half-committed send (BLOCKER B2).
+            # Provider-scoped: the default hook is a no-op, so non-codex
+            # providers are unaffected.
+            if provider:
+                provider.verify_submission_after_send(metadata, backend)
+        except CodexSubmitStuckError as stuck:
+            status_monitor.abort_dispatch(dispatch_txn)
+            # Retry-safe deferred outcome: the dispatch is rolled back and the
+            # terminal is left coherent (not pretend-submitted). Surface as a
+            # DeliveryDeferredError so the inbox delivery layer redelivers later
+            # rather than treating this as a hard crash.
+            raise DeliveryDeferredError(str(stuck)) from stuck
         except BaseException:
             status_monitor.abort_dispatch(dispatch_txn)
             raise
@@ -4526,13 +4543,6 @@ def send_input(
             status_monitor.commit_dispatch(dispatch_txn)
             if provider:
                 provider.mark_input_received()
-                # F435: confirm the paste actually submitted (the submit Enter
-                # is occasionally lost to a paste-vs-Enter render race under
-                # concurrent codex dispatch). Provider-scoped: the default hook
-                # is a no-op, so non-codex providers are unaffected. Runs before
-                # any human-draft restore so a re-Enter can only ever resubmit
-                # the task, never a restored draft.
-                provider.verify_submission_after_send(metadata, backend)
         if preserved_draft is not None:
             preserved_draft.restore(backend)
 
@@ -4708,14 +4718,23 @@ def send_prepared_input(
         status_monitor.abort_dispatch(dispatch_txn)
         raise
     else:
+        try:
+            # F435: confirm the paste actually SUBMITTED before committing the
+            # dispatch. Runs INSIDE the transaction so a stuck-forever verdict
+            # aborts coherently instead of committing a send whose submit never
+            # landed (BLOCKER B2). Provider-scoped no-op default keeps every
+            # non-codex provider unaffected. On success, commit — only then do
+            # mark_injection_completed / on_submitted publish the submission
+            # boundary, and only then is the human draft restored.
+            if provider:
+                provider.verify_submission_after_send(metadata, backend)
+        except CodexSubmitStuckError as stuck:
+            status_monitor.abort_dispatch(dispatch_txn)
+            raise DeliveryDeferredError(str(stuck)) from stuck
+        except BaseException:
+            status_monitor.abort_dispatch(dispatch_txn)
+            raise
         status_monitor.commit_dispatch(dispatch_txn)
-        if provider:
-            # F435: confirm the paste actually submitted before we treat the
-            # injection as complete. Provider-scoped no-op default keeps every
-            # non-codex provider unaffected. Runs before mark_injection_completed
-            # / on_submitted / draft restore so recovery re-Enter only ever
-            # resubmits the task.
-            provider.verify_submission_after_send(metadata, backend)
     injection_observation = status_monitor.mark_injection_completed(terminal_id)
     if on_submitted is not None:
         on_submitted(injection_observation)

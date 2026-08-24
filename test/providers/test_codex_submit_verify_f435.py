@@ -49,6 +49,34 @@ STUCK_CHIP_PANE = (
     "\n"
     "  ~/VScode_projects/cli-subagents · main · gpt-5.6-sol high\n"
 )
+# BLOCKER B1 scrollback-negatives: a HISTORICAL chip that has scrolled up into
+# transcript history, with the CURRENT composer now empty / Working. These MUST
+# read not-stuck — otherwise recovery blinds an already-submitted composer with
+# an extra Enter (a double-submit). The chip is real and valid; only its
+# POSITION (not adjacent to the footer) makes it history rather than the
+# active composer.
+HISTORICAL_CHIP_THEN_EMPTY_PANE = (
+    "• SEED_OK\n"
+    "\n"
+    "› [Pasted Content 4600 chars]\n"
+    "\n"
+    "• Finished the previous task.\n"
+    "\n"
+    "› Ask Codex to do anything\n"
+    "\n"
+    "  ~/VScode_projects/cli-subagents · main · gpt-5.6-sol high\n"
+)
+HISTORICAL_CHIP_THEN_WORKING_PANE = (
+    "• SEED_OK\n"
+    "\n"
+    "› [Pasted Content 4600 chars]\n"
+    "\n"
+    "• SEED_OK received, starting.\n"
+    "\n"
+    "• Working (3s • esc to interrupt)\n"
+    "\n"
+    "  ~/VScode_projects/cli-subagents · main · gpt-5.6-sol high\n"
+)
 
 METADATA = {"tmux_session": "sess", "tmux_window": "win"}
 
@@ -103,9 +131,43 @@ def test_chip_regex_ignores_submitted_states():
     assert CodexProvider._pane_shows_pasted_chip("") is False
 
 
-def test_chip_regex_matches_various_char_counts_and_glyphs():
-    assert CodexProvider._pane_shows_pasted_chip("› [Pasted Content 12 chars]") is True
-    assert CodexProvider._pane_shows_pasted_chip("» [Pasted Content 999999 chars]") is True
+def test_active_chip_matches_in_anchored_composer():
+    """The chip is detected when it is the ACTIVE composer row (footer-anchored)."""
+    for count in (12, 3048, 999999):
+        pane = (
+            "• SEED_OK\n"
+            "\n"
+            f"› [Pasted Content {count} chars]\n"
+            "\n"
+            "  ~/x · main · gpt-5.6-sol high\n"
+        )
+        assert CodexProvider._pane_shows_pasted_chip(pane) is True
+
+
+# --- BLOCKER B1: composer-scoped detection (scrollback negatives) ----------
+
+
+def test_historical_chip_with_empty_composer_is_not_stuck():
+    """A chip in scrollback + an EMPTY active composer must read not-stuck.
+
+    Whole-pane grep would return stuck here and drive a blind extra Enter into
+    an already-submitted composer — the double-submit B1 forbids.
+    """
+    assert CodexProvider._pane_shows_pasted_chip(HISTORICAL_CHIP_THEN_EMPTY_PANE) is False
+
+
+def test_historical_chip_with_working_composer_is_not_stuck():
+    """A chip in scrollback + a Working spinner active must read not-stuck."""
+    assert CodexProvider._pane_shows_pasted_chip(HISTORICAL_CHIP_THEN_WORKING_PANE) is False
+
+
+def test_historical_chip_negatives_send_no_enter_through_the_hook():
+    """End-to-end via the hook: historical-chip panes never re-Enter."""
+    for pane in (HISTORICAL_CHIP_THEN_EMPTY_PANE, HISTORICAL_CHIP_THEN_WORKING_PANE):
+        provider = _provider()
+        backend = _backend_returning(pane)
+        provider.verify_submission_after_send(METADATA, backend)
+        backend.send_special_key.assert_not_called()
 
 
 # --- submitted immediately → no extra Enter -------------------------------
