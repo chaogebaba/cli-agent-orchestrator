@@ -1,9 +1,9 @@
 
 
-cli-subagents on  quirks-merge-train [⇡] via 🐍 v3.14.7 on ☁️  quiye8584@gmail.com
+cli-subagents on  quirks-merge-train [⇡] via 🐍 v3.14.7 on ☁️  user@example.com
 ❯
 
-cli-subagents on  quirks-merge-train [⇡] via 🐍 v3.14.7 on ☁️  quiye8584@gmail.com
+cli-subagents on  quirks-merge-train [⇡] via 🐍 v3.14.7 on ☁️  user@example.com
 ❯ echo ready
 ready
 
