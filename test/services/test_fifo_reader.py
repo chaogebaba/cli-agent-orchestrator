@@ -112,7 +112,18 @@ class TestReaderThreadLifecycle:
         fifo_path = tmp_path / "term-data.fifo"
 
         for payload in (b"first", b"second"):
-            wfd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+            # F401: On loaded boxes the reader thread may not have opened the
+            # read end yet when we try O_WRONLY|O_NONBLOCK (yields ENXIO).
+            # Retry briefly to tolerate thread scheduling latency.
+            open_deadline = time.monotonic() + 3.0
+            wfd = -1
+            while time.monotonic() < open_deadline:
+                try:
+                    wfd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+                    break
+                except OSError:
+                    threading.Event().wait(0.05)
+            assert wfd >= 0, "FIFO reader did not open read end in time"
             os.write(wfd, payload)
             os.close(wfd)
             # Wait for the reader's select loop to pick the chunk up.
