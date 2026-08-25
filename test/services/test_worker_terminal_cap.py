@@ -1374,3 +1374,339 @@ class TestR6RetainedRegistryIsBoundedButTiny:
         # every retained gen is monotonic (>= 1 after one cycle).
         for session in sessions:
             assert ts._cap_gen[session] >= 1
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# F439 r8: Double-cancel cap-token ownership transfer regression
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# F439 r8: Double-cancel cap-token ownership transfer regression
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestR8DoubleCancelCapOwnership:
+    """F439 r8 BLOCKER: a repeat cancellation must NOT release the cap token
+    while the shielded create worker's backend may still exist.
+
+    The invariant: a reservation stays live until its worker's backend resource
+    is destroyed or published. The double-cancel path must transfer release
+    ownership to the replacement compensator, and no peer may reserve until
+    that compensator completes the rollback.
+    """
+
+    @pytest.mark.asyncio
+    async def test_double_cancel_holds_token_until_backend_destroyed(self, tmp_path):
+        """Deterministic double-cancel schedule: assert peer's reserve BLOCKS
+        until worker 1's backend is destroyed; no ordering yields two live
+        backends under cap 1."""
+        session = "cao-r8-dblcancel"
+        _reset_cap_session(session)
+        rows: list[dict] = [_row(SUPERVISOR, profile="supervisor")]
+        ids = iter([f"r8w{i:05d}" for i in range(1, 10)])
+        wd = str(tmp_path)
+
+        worker_blocked = _threading.Event()
+        worker_proceed = _threading.Event()
+        backend_created: list[str] = []
+        backend_killed: list[str] = []
+
+        with _real_seam(rows, cap=1, id_counter=ids) as seam:
+            def blocking_create_window(session_name, window_name, *a, **k):
+                backend_created.append(window_name)
+                worker_blocked.set()
+                worker_proceed.wait(timeout=30)
+                return window_name
+
+            seam["backend"].create_window.side_effect = blocking_create_window
+
+            def track_kill(session_name, window_name, **k):
+                backend_killed.append(window_name)
+                return True
+
+            seam["backend"].kill_window = MagicMock(side_effect=track_kill)
+            seam["backend"].kill_session = MagicMock(side_effect=track_kill)
+
+            with patch.object(ts, "db_delete_terminal", MagicMock(side_effect=lambda tid: rows.__setitem__(slice(None), [r for r in rows if r.get("id") != tid]))):
+                task1 = asyncio.ensure_future(_create_worker(session=session, tmpdir=wd))
+                await asyncio.to_thread(worker_blocked.wait, 10)
+                assert len(backend_created) == 1
+
+                # First cancel: CancelledError at shield(create_worker). The task
+                # enters the compensator's shield await.
+                task1.cancel()
+                await asyncio.sleep(0)  # let task process first cancel
+
+                # Second cancel: CancelledError at shield(compensator). This
+                # triggers the ownership transfer in our r8 fix.
+                task1.cancel()
+
+                with pytest.raises(asyncio.CancelledError):
+                    await task1
+
+                assert not worker_proceed.is_set()
+
+                # Token still held — peer refused at cap 1.
+                with pytest.raises(TerminalCapExceeded) as refused:
+                    await _reserve_worker_slot(session, SUPERVISOR)
+                assert refused.value.current_count >= 1
+
+                # Unblock worker → compensator completes rollback
+                worker_proceed.set()
+                for _ in range(50):
+                    await asyncio.sleep(0.01)
+
+                assert len(backend_killed) >= 1, "compensator should have destroyed backend"
+
+                # Token released — peer can now reserve.
+                token2 = await _reserve_worker_slot(session, SUPERVISOR)
+                assert token2 is not None
+                _release_worker_slot(session, None, token=token2, published=False)
+
+        _reset_cap_session(session)
+
+    @pytest.mark.asyncio
+    async def test_double_cancel_no_two_live_backends_under_cap_1(self, tmp_path):
+        """No ordering yields two live backends under cap 1. The peer's backend
+        creation must not start until worker 1's is destroyed."""
+        session = "cao-r8-nooverlap"
+        _reset_cap_session(session)
+        rows: list[dict] = [_row(SUPERVISOR, profile="supervisor")]
+        ids = iter([f"r8o{i:05d}" for i in range(1, 10)])
+        wd = str(tmp_path)
+
+        worker_blocked = _threading.Event()
+        worker_proceed = _threading.Event()
+        backend_events: list[tuple[str, str]] = []
+        max_concurrent_backends = [0]
+        current_live = [0]
+
+        with _real_seam(rows, cap=1, id_counter=ids) as seam:
+            create_lock = _threading.Lock()
+
+            def tracked_create_window(session_name, window_name, *a, **k):
+                with create_lock:
+                    current_live[0] += 1
+                    if current_live[0] > max_concurrent_backends[0]:
+                        max_concurrent_backends[0] = current_live[0]
+                    backend_events.append(("create", window_name))
+                if not worker_blocked.is_set():
+                    worker_blocked.set()
+                    worker_proceed.wait(timeout=30)
+                return window_name
+
+            def tracked_kill(session_name, window_name, **k):
+                with create_lock:
+                    current_live[0] -= 1
+                    backend_events.append(("kill", window_name))
+                return True
+
+            seam["backend"].create_window.side_effect = tracked_create_window
+            seam["backend"].kill_window = MagicMock(side_effect=tracked_kill)
+            seam["backend"].kill_session = MagicMock(side_effect=tracked_kill)
+
+            with patch.object(ts, "db_delete_terminal", MagicMock(side_effect=lambda tid: rows.__setitem__(slice(None), [r for r in rows if r.get("id") != tid]))):
+                task1 = asyncio.ensure_future(_create_worker(session=session, tmpdir=wd))
+                await asyncio.to_thread(worker_blocked.wait, 10)
+
+                # Double cancel
+                task1.cancel()
+                await asyncio.sleep(0)
+                task1.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task1
+
+                # Peer refused while token held
+                with pytest.raises(TerminalCapExceeded):
+                    await _reserve_worker_slot(session, SUPERVISOR)
+
+                # Unblock worker 1
+                worker_proceed.set()
+                for _ in range(50):
+                    await asyncio.sleep(0.01)
+
+                # Worker 2 now succeeds
+                task2 = asyncio.ensure_future(_create_worker(session=session, tmpdir=wd))
+                await task2
+
+            assert max_concurrent_backends[0] <= 1, (
+                f"Over-admission: {max_concurrent_backends[0]} concurrent backends "
+                f"under cap 1. Events: {backend_events}"
+            )
+            create_indices = [i for i, (a, _) in enumerate(backend_events) if a == "create"]
+            kill_indices = [i for i, (a, _) in enumerate(backend_events) if a == "kill"]
+            assert len(create_indices) >= 2
+            assert len(kill_indices) >= 1
+            assert kill_indices[0] < create_indices[1], (
+                f"Backend 2 created before backend 1 killed: {backend_events}"
+            )
+
+        _reset_cap_session(session)
+
+    @pytest.mark.asyncio
+    async def test_single_cancel_releases_token_once(self, tmp_path):
+        """Single cancel (no double-cancel): compensator runs to completion,
+        outer finally releases the token. Exactly one release."""
+        session = "cao-r8-singlecancel"
+        _reset_cap_session(session)
+        rows: list[dict] = [_row(SUPERVISOR, profile="supervisor")]
+        ids = iter([f"r8s{i:05d}" for i in range(1, 10)])
+        wd = str(tmp_path)
+
+        worker_blocked = _threading.Event()
+        worker_proceed = _threading.Event()
+        release_calls: list[tuple] = []
+        orig_release = ts._release_worker_slot
+
+        def tracked_release(session_name, terminal_id, *, token, published):
+            release_calls.append((session_name, terminal_id, token, published))
+            return orig_release(session_name, terminal_id, token=token, published=published)
+
+        with _real_seam(rows, cap=1, id_counter=ids) as seam:
+            def blocking_create(session_name, window_name, *a, **k):
+                worker_blocked.set()
+                worker_proceed.wait(timeout=30)
+                return window_name
+
+            seam["backend"].create_window.side_effect = blocking_create
+            seam["backend"].kill_window = MagicMock(return_value=True)
+            seam["backend"].kill_session = MagicMock(return_value=True)
+
+            with patch.object(ts, "db_delete_terminal", MagicMock()):
+                with patch.object(ts, "_release_worker_slot", tracked_release):
+                    task1 = asyncio.ensure_future(_create_worker(session=session, tmpdir=wd))
+                    await asyncio.to_thread(worker_blocked.wait, 10)
+
+                    # Unblock immediately so compensator completes fast
+                    worker_proceed.set()
+
+                    # Single cancel only
+                    task1.cancel()
+                    # The task catches CancelledError, awaits shield(compensator)
+                    # which completes (worker done), then the outer finally runs.
+                    with pytest.raises(asyncio.CancelledError):
+                        await task1
+
+                    # Let any background tasks complete
+                    for _ in range(30):
+                        await asyncio.sleep(0.01)
+
+            session_releases = [c for c in release_calls if c[0] == session]
+            assert len(session_releases) == 1, (
+                f"Expected exactly 1 release, got {len(session_releases)}: {session_releases}"
+            )
+
+        _reset_cap_session(session)
+
+    @pytest.mark.asyncio
+    async def test_double_cancel_releases_token_once(self, tmp_path):
+        """Double cancel: token released exactly once by the replacement
+        compensator, never by the outer finally."""
+        session = "cao-r8-dblrelease"
+        _reset_cap_session(session)
+        rows: list[dict] = [_row(SUPERVISOR, profile="supervisor")]
+        ids = iter([f"r8d{i:05d}" for i in range(1, 10)])
+        wd = str(tmp_path)
+
+        worker_blocked = _threading.Event()
+        worker_proceed = _threading.Event()
+        release_calls: list[tuple] = []
+        orig_release = ts._release_worker_slot
+
+        def tracked_release(session_name, terminal_id, *, token, published):
+            release_calls.append((session_name, terminal_id, token, published))
+            return orig_release(session_name, terminal_id, token=token, published=published)
+
+        with _real_seam(rows, cap=1, id_counter=ids) as seam:
+            def blocking_create(session_name, window_name, *a, **k):
+                worker_blocked.set()
+                worker_proceed.wait(timeout=30)
+                return window_name
+
+            seam["backend"].create_window.side_effect = blocking_create
+            seam["backend"].kill_window = MagicMock(return_value=True)
+            seam["backend"].kill_session = MagicMock(return_value=True)
+
+            with patch.object(ts, "db_delete_terminal", MagicMock()):
+                with patch.object(ts, "_release_worker_slot", tracked_release):
+                    task1 = asyncio.ensure_future(_create_worker(session=session, tmpdir=wd))
+                    await asyncio.to_thread(worker_blocked.wait, 10)
+
+                    # Double cancel
+                    task1.cancel()
+                    await asyncio.sleep(0)
+                    task1.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task1
+
+                    # No release yet (worker still blocked)
+                    session_releases_before = [c for c in release_calls if c[0] == session]
+                    assert len(session_releases_before) == 0, (
+                        f"Token released before backend destroyed: {session_releases_before}"
+                    )
+
+                    # Unblock → compensator releases
+                    worker_proceed.set()
+                    for _ in range(50):
+                        await asyncio.sleep(0.01)
+
+                session_releases = [c for c in release_calls if c[0] == session]
+                assert len(session_releases) == 1, (
+                    f"Expected exactly 1 release, got {len(session_releases)}: {session_releases}"
+                )
+
+        _reset_cap_session(session)
+
+    @pytest.mark.asyncio
+    async def test_compensator_crash_still_releases_token(self, tmp_path):
+        """If the compensator's rollback crashes, the token is still released
+        (via the finally in _finish_and_roll_back_cancelled_create)."""
+        session = "cao-r8-compcrash"
+        _reset_cap_session(session)
+        rows: list[dict] = [_row(SUPERVISOR, profile="supervisor")]
+        ids = iter([f"r8c{i:05d}" for i in range(1, 10)])
+        wd = str(tmp_path)
+
+        worker_blocked = _threading.Event()
+        worker_proceed = _threading.Event()
+
+        with _real_seam(rows, cap=1, id_counter=ids) as seam:
+            def blocking_create(session_name, window_name, *a, **k):
+                worker_blocked.set()
+                worker_proceed.wait(timeout=30)
+                return window_name
+
+            seam["backend"].create_window.side_effect = blocking_create
+            seam["backend"].kill_window = MagicMock(side_effect=RuntimeError("kill crashed"))
+            seam["backend"].kill_session = MagicMock(side_effect=RuntimeError("kill crashed"))
+
+            with patch.object(ts, "db_delete_terminal", MagicMock(side_effect=RuntimeError("db crashed"))):
+                task1 = asyncio.ensure_future(_create_worker(session=session, tmpdir=wd))
+                await asyncio.to_thread(worker_blocked.wait, 10)
+
+                # Double cancel
+                task1.cancel()
+                await asyncio.sleep(0)
+                task1.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task1
+
+                # Token still held
+                with pytest.raises(TerminalCapExceeded):
+                    await _reserve_worker_slot(session, SUPERVISOR)
+
+                # Unblock → compensator crashes but finally releases
+                worker_proceed.set()
+                for _ in range(50):
+                    await asyncio.sleep(0.01)
+
+            # Token released despite crash (verified via ledger, not via reserve
+            # — the DB row may still be live, so reserve could still refuse based
+            # on the live row count; what matters is the RESERVATION is gone).
+            assert not _cap_reservations.get(session), (
+                "reservation should be released even after compensator crash"
+            )
+
+        _reset_cap_session(session)

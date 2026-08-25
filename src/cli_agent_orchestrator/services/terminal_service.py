@@ -1233,6 +1233,8 @@ async def _finish_and_roll_back_cancelled_create(
     create_worker: "asyncio.Task[Tuple[str, bool, bool]]",
     session_name: str,
     terminal_id: str,
+    *,
+    cap_release: "Optional[Tuple[str, Optional[str], Optional[int]]]" = None,
 ) -> None:
     """Await the un-cancellable create worker, then compensate its outcome.
 
@@ -1240,18 +1242,40 @@ async def _finish_and_roll_back_cancelled_create(
     resource back and never wrote the row — nothing to do. If it RETURNED, it
     built a session/window and committed a row that no caller will ever hear
     about; roll both back under the lifecycle lock.
+
+    F439 (#294) round 8: when ``cap_release`` is provided (a tuple of
+    ``(session_name, terminal_id, token)``), this compensator OWNS the cap
+    reservation and MUST release it exactly once after the backend resource is
+    destroyed (or after confirming the worker raised without creating one).
+    This is the ownership-transfer path for the repeat-cancellation schedule:
+    the outer finally no longer holds the reservation, so only this
+    compensator may release it — guaranteeing the cap token stays live until
+    the backend is provably gone.
     """
     try:
-        window_name, session_created, _ = await create_worker
-    except BaseException:
-        return
-    await asyncio.to_thread(
-        _roll_back_cancelled_create,
-        session_name,
-        terminal_id,
-        window_name,
-        created_session=session_created,
-    )
+        try:
+            window_name, session_created, _ = await create_worker
+        except BaseException:
+            # Worker raised → its locked closure already rolled back the backend.
+            # No backend exists to guard; release below via finally.
+            return
+        # Worker succeeded → roll back backend + row, THEN release below.
+        await asyncio.to_thread(
+            _roll_back_cancelled_create,
+            session_name,
+            terminal_id,
+            window_name,
+            created_session=session_created,
+        )
+    finally:
+        # Release the cap token exactly once — whether the worker raised, the
+        # rollback succeeded, or the rollback itself crashed (best-effort: the
+        # backend may be stuck, but holding the token forever would deadlock the
+        # cap for the session). The ``finally`` guarantees no leak path.
+        if cap_release is not None:
+            _release_worker_slot(
+                cap_release[0], cap_release[1], token=cap_release[2], published=False
+            )
 
 def _resolve_worker_terminal_cap() -> int:
     """Resolve the worker-terminal cap (F439 #294).
@@ -2344,10 +2368,26 @@ async def create_terminal(
                 try:
                     await asyncio.shield(compensator)
                 except asyncio.CancelledError:
-                    # A repeat cancellation landed while the compensator ran; the
-                    # shielded task still completes on the loop. The ORIGINAL
-                    # cancellation is re-raised below either way.
-                    pass
+                    # F439 (#294) round 8: a repeat cancellation detached the
+                    # compensator while it (and its shielded create_worker) still
+                    # run in the background. The outer ``finally`` must NOT release
+                    # the cap token — the backend may still exist. Transfer
+                    # ownership of the reservation to the compensator: clear
+                    # ``_cap_reserved`` so the outer finally is a no-op, then fire
+                    # a NEW compensator that carries the release parameters and
+                    # will call ``_release_worker_slot`` exactly once after the
+                    # backend is destroyed. The original (now-detached) compensator
+                    # does NOT hold cap_release (it was spawned without it), so it
+                    # cannot double-release; only this replacement owns the token.
+                    _cap_reserved = False
+                    asyncio.ensure_future(
+                        _finish_and_roll_back_cancelled_create(
+                            create_worker,
+                            session_name,
+                            terminal_id,
+                            cap_release=(session_name, terminal_id, _cap_token),  # type: ignore[arg-type]
+                        )
+                    )
             raise
 
         # The registry row now exists (published inside the locked closure). Drop
@@ -2846,6 +2886,10 @@ async def create_terminal(
         # reservation is retired on EVERY exit of the create body — success
         # (already retired right after ``db_created``), rollback, or an early
         # pre-publication raise inside this try. Idempotent via ``_cap_reserved``.
+        # F439 (#294) round 8: on the double-cancel path, ``_cap_reserved`` was
+        # cleared and ownership transferred to the replacement compensator, so
+        # this call is a no-op and the token stays live until the backend is
+        # provably gone.
         _release_cap_lock()
 
 
