@@ -3038,6 +3038,9 @@ class CodexProvider(BaseProvider):
             nonlocal rollout_path
             if rollout_path is not None:
                 return rollout_path
+            # No UUID and no resume seed means no rollout file to find.
+            if not session_uuid and not self.resume_session_uuid():
+                return None
             # File may not exist yet at dispatch (fresh session). Poll for creation.
             deadline = time.monotonic() + CODEX_ROLLOUT_CREATION_TIMEOUT_SECONDS
             while time.monotonic() < deadline:
