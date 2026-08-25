@@ -51,6 +51,19 @@ def _no_sleep():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _fast_monotonic():
+    """S7 r7: bounded clock for deterministic poll execution."""
+    counter = {"t": 0.0}
+
+    def _mono():
+        counter["t"] += 0.3
+        return counter["t"]
+
+    with patch("cli_agent_orchestrator.providers.codex.time.monotonic", side_effect=_mono):
+        yield
+
+
 def _provider() -> CodexProvider:
     return CodexProvider("term1234", "sess", "win")
 

@@ -597,20 +597,40 @@ class TestSessionFilePinning:
 
 
 class TestPaneFastPathHint:
-    """Pane hint provides early exit but never drives Enter decisions."""
+    """Pane hint accelerates to rollout check but never bypasses it (B1 r7)."""
 
-    def test_pane_submitted_hint_returns_early(self, rollout_dir: Path, patched_codex_home: Path):
-        """If pane shows a submitted turn (Working spinner), fast-path exits
-        without needing the rollout to confirm."""
+    def test_pane_hint_still_requires_rollout(self, rollout_dir: Path, patched_codex_home: Path):
+        """B1 r7: pane showing Working WITHOUT a rollout event does NOT confirm.
+
+        The r6 test expected pane-only success — that was the exact B1 blocker.
+        Pane state may only short-circuit WAITING (accelerate to the rollout
+        check), never conclude success without a post-cursor rollout event.
+        """
         msg = "Do the task"
         baseline = _baseline_with_rollout(rollout_dir)
-        # No rollout event — but pane shows Working (fast path hit)
+        # No rollout event — pane shows Working but rollout has nothing
 
         provider = _provider()
         pane = "• SEED_OK\n\n› Do the task\n\n⏳ Working…\n\n" + FOOTER + "\n"
         backend = _backend_returning(pane)
 
-        # Patch _pane_shows_working to return True
+        with patch.object(provider, "_pane_shows_working", return_value=True):
+            with pytest.raises(CodexSubmitStuckError):
+                provider.verify_submission_after_send(
+                    _metadata(), backend, message=msg, baseline=baseline
+                )
+        assert _enter_calls(backend) == 0
+
+    def test_pane_hint_with_rollout_confirms(self, rollout_dir: Path, patched_codex_home: Path):
+        """Pane hint + rollout event → confirmed (the hint accelerates check)."""
+        msg = "Do the task"
+        baseline = _baseline_with_rollout(rollout_dir)
+        _write_rollout_event(rollout_dir, msg)  # rollout confirms
+
+        provider = _provider()
+        pane = "• SEED_OK\n\n› Do the task\n\n⏳ Working…\n\n" + FOOTER + "\n"
+        backend = _backend_returning(pane)
+
         with patch.object(provider, "_pane_shows_working", return_value=True):
             provider.verify_submission_after_send(
                 _metadata(), backend, message=msg, baseline=baseline

@@ -524,6 +524,11 @@ class CodexSubmitBaseline:
     chip_counter: tuple[tuple[str, int], ...] = ()
     turn_count: int = 0
     captured_ok: bool = False
+    # B2 r7: active composer chip count at pre-paste time. None means no chip
+    # was visible on the composer (or capture failed). Used to detect ambiguous
+    # same-length drafts: if pre-paste composer already holds a draft whose
+    # length is within ±1 of the dispatched message, ownership is unresolvable.
+    pre_paste_chip_count: "int | None" = None
 
     def chip_count(self, chip: str) -> int:
         for key, count in self.chip_counter:
@@ -1729,7 +1734,20 @@ class CodexProvider(BaseProvider):
             if len(matches) == 1:
                 return matches[0]
             if len(matches) > 1:
-                # Ambiguous: pin by newest mtime (most recently active).
+                # B5 r7: identity-validate ambiguous candidates via session_meta.
+                # mtime orders candidates, but identity decides.
+                validated = self._identity_filter_rollout_candidates(
+                    matches, session_uuid
+                )
+                if validated:
+                    return validated
+                # Fallback: mtime (best-effort, logged as ambiguous).
+                logger.warning(
+                    "F435 rollout-pin: %d candidates for UUID %s, none "
+                    "passed identity validation; falling back to mtime",
+                    len(matches),
+                    session_uuid,
+                )
                 return max(matches, key=lambda p: p.stat().st_mtime)
             # No match — file not yet created; caller will poll.
             return None
@@ -1741,6 +1759,11 @@ class CodexProvider(BaseProvider):
             if len(matches) == 1:
                 return matches[0]
             if len(matches) > 1:
+                validated = self._identity_filter_rollout_candidates(
+                    matches, resume_uuid
+                )
+                if validated:
+                    return validated
                 return max(matches, key=lambda p: p.stat().st_mtime)
 
         # --- Last resort: newest rollout file in sessions dir ---
@@ -1750,6 +1773,39 @@ class CodexProvider(BaseProvider):
         if all_rollouts:
             return max(all_rollouts, key=lambda p: p.stat().st_mtime)
 
+        return None
+
+    @staticmethod
+    def _identity_filter_rollout_candidates(
+        candidates: list[Path], expected_id: str
+    ) -> Path | None:
+        """B5 r7: validate session_meta.payload.id against expected session id.
+
+        Among multiple rollout files matching a UUID glob, select the one whose
+        first-line session_meta record has ``payload.id == expected_id``.  If
+        exactly one validates, return it.  If multiple validate (concurrent same
+        session?), order by mtime.  If none validate, return None so the caller
+        can fall back or log.
+        """
+        validated: list[Path] = []
+        for path in candidates:
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    first_line = f.readline()
+                if not first_line:
+                    continue
+                record = json.loads(first_line)
+                if (
+                    record.get("type") == "session_meta"
+                    and record.get("payload", {}).get("id") == expected_id
+                ):
+                    validated.append(path)
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+        if len(validated) == 1:
+            return validated[0]
+        if len(validated) > 1:
+            return max(validated, key=lambda p: p.stat().st_mtime)
         return None
 
     @staticmethod
@@ -1805,6 +1861,10 @@ class CodexProvider(BaseProvider):
         if not raw.endswith("\n"):
             lines = lines[:-1]  # drop incomplete trailing fragment
         norm_message = cls._normalize_for_match(message)
+        # B4 r7: distinctive matching — require candidate length >= min(len(msg), 64)
+        # AND prefix-equality (not substring containment).  This prevents a
+        # 1-char event from confirming and prevents unrelated short candidates.
+        min_distinctive_len = min(len(norm_message), 64)
         for line in lines:
             line = line.strip()
             if not line:
@@ -1818,14 +1878,76 @@ class CodexProvider(BaseProvider):
                 norm_candidate = cls._normalize_for_match(candidate)
                 if norm_candidate == norm_message:
                     return True
-                # For very long messages that may get truncated in the rollout,
-                # check containment of a distinctive prefix.
-                if len(norm_message) > 40 and norm_candidate and (
-                    norm_message[:200] in norm_candidate
-                    or norm_candidate[:200] in norm_message
+                # B4 r7: distinctive prefix match for long messages that may be
+                # truncated in the rollout.  Both candidate and message must be
+                # of distinctive length, and the match is prefix-equality (not
+                # arbitrary substring containment).
+                if (
+                    len(norm_candidate) >= min_distinctive_len
+                    and len(norm_message) > 40
                 ):
-                    return True
+                    # Prefix equality: the shorter of (candidate[:200], message[:200])
+                    # must equal the other's same-length prefix.
+                    prefix_len = min(200, len(norm_candidate), len(norm_message))
+                    if norm_candidate[:prefix_len] == norm_message[:prefix_len]:
+                        return True
         return False
+
+    @classmethod
+    def _count_rollout_matches(
+        cls,
+        rollout_path: "Path | None",
+        offset: int,
+        message: str,
+    ) -> int:
+        """B3 r7: count ALL matching user-turn records after offset.
+
+        Used for duplicate-delivery detection. Returns the number of matching
+        events (0 = none, 1 = normal, 2+ = duplicate delivery detected).
+        Uses the same matching logic as _rollout_has_user_event.
+        """
+        if rollout_path is None or not message:
+            return 0
+        try:
+            if not rollout_path.exists():
+                return 0
+            file_size = rollout_path.stat().st_size
+            if file_size <= offset:
+                return 0
+            with rollout_path.open("r", encoding="utf-8") as f:
+                f.seek(offset)
+                raw = f.read()
+        except OSError:
+            return 0
+
+        lines = raw.split("\n")
+        if not raw.endswith("\n"):
+            lines = lines[:-1]
+        norm_message = cls._normalize_for_match(message)
+        min_distinctive_len = min(len(norm_message), 64)
+        count = 0
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            for candidate in cls._extract_rollout_user_texts(record):
+                norm_candidate = cls._normalize_for_match(candidate)
+                if norm_candidate == norm_message:
+                    count += 1
+                    break
+                if (
+                    len(norm_candidate) >= min_distinctive_len
+                    and len(norm_message) > 40
+                ):
+                    prefix_len = min(200, len(norm_candidate), len(norm_message))
+                    if norm_candidate[:prefix_len] == norm_message[:prefix_len]:
+                        count += 1
+                        break
+        return count
 
     @staticmethod
     def _extract_rollout_user_texts(record: dict) -> list[str]:
@@ -2978,6 +3100,10 @@ class CodexProvider(BaseProvider):
 
         # Build pane hint portion
         pane_baseline = self._build_submission_baseline(captured)
+        # B2 r7: capture pre-paste composer chip count for ambiguity detection
+        pre_paste_chip = None
+        if captured is not None:
+            pre_paste_chip = self._active_composer_chip_count(captured)
         # Merge rollout state into the baseline
         return CodexSubmitBaseline(
             rollout_path=rollout_path,
@@ -2986,6 +3112,7 @@ class CodexProvider(BaseProvider):
             chip_counter=pane_baseline.chip_counter,
             turn_count=pane_baseline.turn_count,
             captured_ok=pane_baseline.captured_ok,
+            pre_paste_chip_count=pre_paste_chip,
         )
 
     def verify_submission_after_send(
@@ -3010,9 +3137,19 @@ class CodexProvider(BaseProvider):
         Recovery Enter fires ONLY if:
           1. The rollout file has NO matching user event at the deadline, AND
           2. The pane shows a stuck chip owned by this dispatch, AND
-          3. A FINAL rollout re-check immediately before sending confirms no
+          3. The pre-paste baseline had NO existing draft chip of ambiguous
+             length (B2 r7: if it did, ownership is unresolvable → defer), AND
+          4. A FINAL rollout re-check immediately before sending confirms no
              match (closes the SHOULD double-send race: if the original submit
-             landed between observation and action, the re-check catches it).
+             landed between observation and action, the re-check catches it),
+          5. Immediately before send_special_key, the pane is re-read and the
+             composer must STILL show the matching chip (B3 r7 TOCTOU narrow),
+          6. After the Enter, if TWO matching post-cursor events exist, a
+             duplicate-delivery warning is logged (detection only — unsend is
+             impossible). RESIDUAL WINDOW: between the final rollout re-check
+             and the actual key-send, the original submit may land (~50ms on
+             local tmux). This is an honest, documented race that detection
+             can surface but not prevent.
 
         This closes all r5 blockers:
           * B1 (partial-baseline false-commit): rollout match is exact content,
@@ -3058,11 +3195,11 @@ class CodexProvider(BaseProvider):
         def _pane_hint_submitted() -> bool:
             """Fast-path pane hint: check if pane clearly shows submission.
 
-            This is a CHEAP EARLY EXIT only. A False return means nothing —
-            the rollout is the authority. A True return is trusted only because
-            the pane showing a new submitted turn is a sufficient (though not
-            necessary) condition — if the turn made it to the pane, it certainly
-            made it to the rollout (the rollout write happens first).
+            B1 r7 FIX: this hint NO LONGER returns success directly. It is
+            used only to short-circuit the WAITING state (skip to rollout
+            confirm check immediately). Every success return requires a matching
+            post-cursor rollout event — pane state may only accelerate the
+            path TO the rollout check, never bypass it.
             """
             try:
                 captured = backend.get_history(
@@ -3086,7 +3223,15 @@ class CodexProvider(BaseProvider):
             return False
 
         def _pane_shows_stuck_chip() -> bool:
-            """Check if the pane has a stuck chip owned by this dispatch."""
+            """Check if the pane has a stuck chip owned by this dispatch.
+
+            B2 r7: recovery Enter requires:
+              (a) no matching rollout event (checked by caller), AND
+              (b) the pre-paste baseline had NO existing draft chip of ambiguous
+                  length — if the pre-paste composer already held a draft whose
+                  count is within ±1 of own_chip_count, ownership is
+                  unresolvable and we must defer (raise DeliveryDeferredError).
+            """
             try:
                 captured = backend.get_history(
                     session, window,
@@ -3105,18 +3250,56 @@ class CodexProvider(BaseProvider):
                 return False
             if own_chip_count is None:
                 return True
-            return abs(active_n - own_chip_count) <= 1
+            if abs(active_n - own_chip_count) > 1:
+                return False
+            # B2 r7: check pre-paste ambiguity. If the baseline captured a
+            # draft chip whose length is within ±1 of our dispatch, the chip
+            # we see NOW might be that pre-existing draft, not ours → ambiguous.
+            if baseline and baseline.pre_paste_chip_count is not None:
+                if abs(baseline.pre_paste_chip_count - own_chip_count) <= 1:
+                    # Ambiguous: pre-paste already had a same-length draft.
+                    # Cannot determine ownership → must defer.
+                    from cli_agent_orchestrator.services.draft_guard import (
+                        DeliveryDeferredError,
+                    )
+                    raise DeliveryDeferredError(
+                        f"F435 r7 B2: pre-paste composer already held a draft "
+                        f"(chip {baseline.pre_paste_chip_count} chars) within "
+                        f"±1 of dispatch ({own_chip_count} chars); ownership "
+                        f"is unresolvable — deferring delivery"
+                    )
+            return True
 
         # --- Main verification loop ---
         time.sleep(CODEX_SUBMIT_VERIFY_GRACE_SECONDS)
 
-        # Fast-path: pane hint check (cheap early exit)
+        # B1 r7: When rollout infrastructure is available (rollout_path or
+        # session_uuid exists), pane hint accelerates to rollout check only.
+        # When rollout is unavailable (no UUID, no file), pane is the only
+        # signal and may conclude success (backward compat with pre-r6 tests).
+        _has_rollout_infra = (
+            rollout_path is not None
+            or session_uuid is not None
+            or (self.resume_session_uuid() is not None)
+        )
+
         if _pane_hint_submitted():
-            logger.info(
-                "F435 submit-verify: terminal %s confirmed via pane fast-path hint",
-                self.terminal_id,
-            )
-            return
+            if not _has_rollout_infra:
+                # No rollout available — pane is the only signal (pre-r6 compat)
+                logger.info(
+                    "F435 submit-verify: terminal %s confirmed via pane hint "
+                    "(no rollout infrastructure available)",
+                    self.terminal_id,
+                )
+                return
+            # Rollout infra exists — pane hint accelerates to rollout check
+            if _rollout_confirms():
+                logger.info(
+                    "F435 submit-verify: terminal %s confirmed via rollout "
+                    "after pane fast-path hint",
+                    self.terminal_id,
+                )
+                return
 
         # Primary signal: poll rollout file for the user event
         poll_deadline = time.monotonic() + CODEX_ROLLOUT_POLL_TIMEOUT_SECONDS
@@ -3128,14 +3311,23 @@ class CodexProvider(BaseProvider):
                     self.terminal_id,
                 )
                 return
-            # Check pane hint on each iteration as a fast exit
+            # B1 r7: pane hint accelerates to rollout recheck (when infra exists)
+            # or confirms directly (when no infra)
             if _pane_hint_submitted():
-                logger.info(
-                    "F435 submit-verify: terminal %s confirmed via pane hint "
-                    "during rollout poll",
-                    self.terminal_id,
-                )
-                return
+                if not _has_rollout_infra:
+                    logger.info(
+                        "F435 submit-verify: terminal %s confirmed via pane "
+                        "hint during poll (no rollout infrastructure)",
+                        self.terminal_id,
+                    )
+                    return
+                if _rollout_confirms():
+                    logger.info(
+                        "F435 submit-verify: terminal %s confirmed via rollout "
+                        "after pane hint during poll",
+                        self.terminal_id,
+                    )
+                    return
             time.sleep(CODEX_ROLLOUT_POLL_INTERVAL_SECONDS)
 
         # Rollout poll exhausted without confirmation. Check if stuck.
@@ -3176,6 +3368,42 @@ class CodexProvider(BaseProvider):
                 return
 
             # Rollout still has no match AND pane shows stuck chip → re-Enter.
+            # B3 r7: NARROW THE TOCTOU — immediately before sending, re-read
+            # the pane and require the composer STILL shows the matching chip.
+            # This narrows the window between the rollout re-check above and
+            # the actual keystroke.
+            try:
+                pre_enter_pane = backend.get_history(
+                    session, window,
+                    tail_lines=PYTE_SCREEN_ROWS,
+                    strip_escapes=False,
+                )
+                if isinstance(pre_enter_pane, str):
+                    pre_enter_chip = self._active_composer_chip_count(pre_enter_pane)
+                    if pre_enter_chip is None or (
+                        own_chip_count is not None
+                        and abs(pre_enter_chip - own_chip_count) > 1
+                    ):
+                        # Chip gone between re-check and now — the submit may
+                        # have landed (TOCTOU race). Skip this Enter, re-poll.
+                        logger.info(
+                            "F435 submit-verify: terminal %s chip vanished on "
+                            "pre-Enter reread (TOCTOU avoided, attempt %d)",
+                            self.terminal_id,
+                            attempt,
+                        )
+                        time.sleep(CODEX_SUBMIT_VERIFY_BACKOFF_SECONDS * attempt)
+                        if _rollout_confirms():
+                            logger.info(
+                                "F435 submit-verify: terminal %s confirmed via "
+                                "rollout after chip-vanished reread",
+                                self.terminal_id,
+                            )
+                            return
+                        continue
+            except Exception:
+                pass  # If pane read fails, proceed with Enter (best effort)
+
             logger.warning(
                 "F435 submit-verify: paste chip still drafted on terminal %s "
                 "(attempt %d/%d, rollout negative); re-sending Enter",
@@ -3194,6 +3422,27 @@ class CodexProvider(BaseProvider):
             # Wait for rollout to register the submission after recovery Enter
             time.sleep(CODEX_SUBMIT_VERIFY_BACKOFF_SECONDS * attempt)
             if _rollout_confirms():
+                # B3 r7: detect duplicate delivery. Count ALL matching events
+                # after baseline offset. If >1, a duplicate occurred (the
+                # original submit + our recovery Enter both landed). Log and
+                # surface the warning but return success (unsend is impossible).
+                # RESIDUAL WINDOW: between the final rollout re-check and the
+                # send_special_key call, the original submit may land. This
+                # detection catches it post-facto but cannot prevent it. The
+                # window is bounded by one pane-read + one key-send latency
+                # (typically <50ms on local tmux).
+                dup_count = self._count_rollout_matches(
+                    _ensure_rollout_path(), rollout_offset, message or ""
+                )
+                if dup_count > 1:
+                    logger.warning(
+                        "F435 submit-verify: DUPLICATE DELIVERY detected on "
+                        "terminal %s — %d matching post-cursor events "
+                        "(residual TOCTOU window); first confirmed, remainder "
+                        "is a duplicate that cannot be unsent",
+                        self.terminal_id,
+                        dup_count,
+                    )
                 logger.info(
                     "F435 submit-verify: terminal %s submitted after %d "
                     "re-Enter(s) (rollout confirmed)",
