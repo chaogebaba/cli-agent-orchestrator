@@ -1959,6 +1959,10 @@ async def create_terminal(
                 "terminal_id": terminal_id,
                 "provisioned_at": _dt.now(_tz.utc).isoformat(),
             }
+            # F452 (#307): Export the provisioned worktree path so workers can
+            # discover their isolated checkout programmatically instead of
+            # improvising scratch worktrees under /tmp.
+            env_vars["CAO_WORKTREE"] = working_directory
         else:
             _worktree_info_dict = None
 

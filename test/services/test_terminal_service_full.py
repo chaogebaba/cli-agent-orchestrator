@@ -1307,6 +1307,117 @@ class TestCreateTerminalWorktree:
 
         mock_worktree_service.remove_worktree.assert_called_once_with("/repo", "test1234")
 
+    # --- F452 (#307): CAO_WORKTREE env export ---
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.resolve_and_validate_path",
+        side_effect=lambda path, **kwargs: path,
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service._preflight_disk_space")
+    @patch("cli_agent_orchestrator.services.terminal_service.worktree_service")
+    async def test_use_worktree_exports_cao_worktree_in_spawn_env(
+        self,
+        mock_worktree_service,
+        _mock_preflight_disk,
+        _mock_resolve_path,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        tmp_path,
+    ):
+        """F452: worktree-provisioned workers get CAO_WORKTREE in their env."""
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = True
+        mock_tmux.create_window.return_value = "developer-abcd"
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+        source_dir = tmp_path / "src"
+        source_dir.mkdir(parents=True)
+        worktree_dir = tmp_path / "worktrees" / "test1234"
+        worktree_dir.mkdir(parents=True)
+        mock_worktree_service.find_repo_root.return_value = "/repo"
+        mock_worktree_service.create_worktree.return_value = str(worktree_dir)
+
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-existing",
+            working_directory=str(source_dir),
+            use_worktree=True,
+        )
+
+        # The extra_env passed to create_window must contain CAO_WORKTREE
+        # pointing at the provisioned worktree path.
+        extra_env = mock_tmux.create_window.call_args.kwargs["extra_env"]
+        assert extra_env["CAO_WORKTREE"] == str(worktree_dir)
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.worktree_service")
+    async def test_plain_assign_does_not_export_cao_worktree(
+        self,
+        mock_worktree_service,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+    ):
+        """F452: non-worktree workers must NOT have CAO_WORKTREE in their env."""
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = True
+        mock_tmux.create_window.return_value = "developer-abcd"
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        await create_terminal("kiro_cli", "developer", session_name="cao-existing")
+
+        # CAO_WORKTREE must be absent (not empty, absent) from the spawn env.
+        extra_env = mock_tmux.create_window.call_args.kwargs["extra_env"]
+        assert "CAO_WORKTREE" not in extra_env
+
 
 class TestCreateTerminalEnvVars:
     """Tests for env_vars handling on both session paths (issues #248/#408).
