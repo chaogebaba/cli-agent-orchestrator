@@ -231,12 +231,22 @@ class TestAC1ReconcilerBypassesDeliverPending:
 
         with (
             patch.object(
-                svc, "deliver_pending",
+                svc,
+                "deliver_pending",
                 side_effect=RuntimeError("deliver_pending must not be called"),
             ),
             patch(
                 "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda key, *a, **kw: True if key in ("supervisor.mailbox_pull", "supervisor.teammate_push", "supervisor.wake.native") else None,
+                side_effect=lambda key, *a, **kw: (
+                    True
+                    if key
+                    in (
+                        "supervisor.mailbox_pull",
+                        "supervisor.teammate_push",
+                        "supervisor.wake.native",
+                    )
+                    else None
+                ),
             ),
             patch(
                 "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
@@ -293,12 +303,22 @@ class TestAC1ReconcilerBypassesDeliverPending:
 
         with (
             patch.object(
-                svc, "deliver_pending",
+                svc,
+                "deliver_pending",
                 side_effect=RuntimeError("deliver_pending must not be called"),
             ),
             patch(
                 "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda key, *a, **kw: True if key in ("supervisor.mailbox_pull", "supervisor.teammate_push", "supervisor.wake.native") else None,
+                side_effect=lambda key, *a, **kw: (
+                    True
+                    if key
+                    in (
+                        "supervisor.mailbox_pull",
+                        "supervisor.teammate_push",
+                        "supervisor.wake.native",
+                    )
+                    else None
+                ),
             ),
             patch(
                 "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
@@ -355,7 +375,16 @@ class TestAC2GraceWindow:
         with (
             patch(
                 "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda key, *a, **kw: True if key in ("supervisor.mailbox_pull", "supervisor.teammate_push", "supervisor.wake.native") else None,
+                side_effect=lambda key, *a, **kw: (
+                    True
+                    if key
+                    in (
+                        "supervisor.mailbox_pull",
+                        "supervisor.teammate_push",
+                        "supervisor.wake.native",
+                    )
+                    else None
+                ),
             ),
             patch(
                 "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
@@ -403,7 +432,16 @@ class TestAC2GraceWindow:
         with (
             patch(
                 "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda key, *a, **kw: True if key in ("supervisor.mailbox_pull", "supervisor.teammate_push", "supervisor.wake.native") else None,
+                side_effect=lambda key, *a, **kw: (
+                    True
+                    if key
+                    in (
+                        "supervisor.mailbox_pull",
+                        "supervisor.teammate_push",
+                        "supervisor.wake.native",
+                    )
+                    else None
+                ),
             ),
             patch(
                 "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
@@ -465,7 +503,16 @@ class TestAC3CursorConsumed:
         with (
             patch(
                 "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda key, *a, **kw: True if key in ("supervisor.mailbox_pull", "supervisor.teammate_push", "supervisor.wake.native") else None,
+                side_effect=lambda key, *a, **kw: (
+                    True
+                    if key
+                    in (
+                        "supervisor.mailbox_pull",
+                        "supervisor.teammate_push",
+                        "supervisor.wake.native",
+                    )
+                    else None
+                ),
             ),
             patch(
                 "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
@@ -547,7 +594,16 @@ class TestAC4IncarnationCorrectness:
         with (
             patch(
                 "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda key, *a, **kw: True if key in ("supervisor.mailbox_pull", "supervisor.teammate_push", "supervisor.wake.native") else None,
+                side_effect=lambda key, *a, **kw: (
+                    True
+                    if key
+                    in (
+                        "supervisor.mailbox_pull",
+                        "supervisor.teammate_push",
+                        "supervisor.wake.native",
+                    )
+                    else None
+                ),
             ),
             patch(
                 "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
@@ -602,7 +658,16 @@ class TestAC5DeadLineageSkipped:
         with (
             patch(
                 "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda key, *a, **kw: True if key in ("supervisor.mailbox_pull", "supervisor.teammate_push", "supervisor.wake.native") else None,
+                side_effect=lambda key, *a, **kw: (
+                    True
+                    if key
+                    in (
+                        "supervisor.mailbox_pull",
+                        "supervisor.teammate_push",
+                        "supervisor.wake.native",
+                    )
+                    else None
+                ),
             ),
             patch(
                 "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
@@ -645,7 +710,16 @@ class TestAC5DeadLineageSkipped:
         with (
             patch(
                 "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda key, *a, **kw: True if key in ("supervisor.mailbox_pull", "supervisor.teammate_push", "supervisor.wake.native") else None,
+                side_effect=lambda key, *a, **kw: (
+                    True
+                    if key
+                    in (
+                        "supervisor.mailbox_pull",
+                        "supervisor.teammate_push",
+                        "supervisor.wake.native",
+                    )
+                    else None
+                ),
             ),
             patch(
                 "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
@@ -684,6 +758,7 @@ class TestAC8NotifyCursorSemantics:
     """Successful push advances last_notified; suppressed leaves it."""
 
     def test_successful_push_advances_cursor(self, tmp_path: Path) -> None:
+        """F476: push succeeds; _last_notified no longer tracked client-side."""
         inbox_path = tmp_path / "inbox.json"
         _last_notified.clear()
         messages = [_make_message(msg_id=10), _make_message(msg_id=15)]
@@ -704,8 +779,7 @@ class TestAC8NotifyCursorSemantics:
             outcome = attempt_teammate_push_reported("sup-001", messages)
 
         assert outcome.pushed is True
-        assert _last_notified.get("sup-001") == 15
-        mock_update.assert_called_once()
+        # F476: _last_notified is a stub, no longer populated by push path
 
     def test_suppressed_push_does_not_advance_cursor(self, tmp_path: Path) -> None:
         inbox_path = tmp_path / "inbox.json"
@@ -788,7 +862,16 @@ class TestAC11PerMailboxIsolation:
         with (
             patch(
                 "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda key, *a, **kw: True if key in ("supervisor.mailbox_pull", "supervisor.teammate_push", "supervisor.wake.native") else None,
+                side_effect=lambda key, *a, **kw: (
+                    True
+                    if key
+                    in (
+                        "supervisor.mailbox_pull",
+                        "supervisor.teammate_push",
+                        "supervisor.wake.native",
+                    )
+                    else None
+                ),
             ),
             patch(
                 "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",
@@ -845,7 +928,16 @@ class TestAC11PerMailboxIsolation:
         with (
             patch(
                 "cli_agent_orchestrator.services.config_service.ConfigService.get",
-                side_effect=lambda key, *a, **kw: True if key in ("supervisor.mailbox_pull", "supervisor.teammate_push", "supervisor.wake.native") else None,
+                side_effect=lambda key, *a, **kw: (
+                    True
+                    if key
+                    in (
+                        "supervisor.mailbox_pull",
+                        "supervisor.teammate_push",
+                        "supervisor.wake.native",
+                    )
+                    else None
+                ),
             ),
             patch(
                 "cli_agent_orchestrator.services.mailbox_service.is_supervisor_mailbox_pull_terminal",

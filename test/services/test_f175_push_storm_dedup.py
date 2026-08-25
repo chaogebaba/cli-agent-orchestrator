@@ -190,10 +190,10 @@ class TestFileLevelDedup:
 
 
 class TestDoorbellColumnIsolation:
-    """Doorbell high-water stored in dedicated column, not metadata_json."""
+    """F476: Doorbell dedup is now server-side; stubs use in-memory dict only."""
 
     def test_persist_and_read_doorbell_row_id(self):
-        """Accessors use dedicated DB column path."""
+        """Stubs use in-memory dict (no DB interaction per F476 D8)."""
         from cli_agent_orchestrator.services.doorbell_service import (
             _get_last_doorbell_row_id,
             _last_doorbell_row_id,
@@ -203,18 +203,8 @@ class TestDoorbellColumnIsolation:
         tid = "doorbell-test-01"
         _last_doorbell_row_id.pop(tid, None)
 
-        with (
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.get_terminal_last_doorbell_row_id",
-                return_value=0,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id",
-            ) as mock_set,
-        ):
-            assert _get_last_doorbell_row_id(tid) == 0
-            _persist_last_doorbell_row_id(tid, 999)
-            mock_set.assert_called_once_with(tid, 999)
-            assert _last_doorbell_row_id[tid] == 999
+        assert _get_last_doorbell_row_id(tid) == 0
+        _persist_last_doorbell_row_id(tid, 999)
+        assert _last_doorbell_row_id[tid] == 999
 
         _last_doorbell_row_id.pop(tid, None)
