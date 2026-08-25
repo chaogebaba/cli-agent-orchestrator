@@ -365,6 +365,10 @@ def _hermetic_cao_env(monkeypatch):
     # HTTP clients must not inherit the enclosing CAO sandbox binding.
     monkeypatch.delenv("CAO_ENDPOINT", raising=False)
     monkeypatch.delenv("CAO_INSTANCE_ID", raising=False)
+    # F469: tmux_argv() reads this at call-time; leaking a real socket into
+    # tests that don't explicitly set one would route tmux commands to the
+    # enclosing CAO session's server instead of the test's isolated server.
+    monkeypatch.delenv("CAO_TMUX_SOCKET", raising=False)
 
 
 @pytest.fixture(autouse=True)
