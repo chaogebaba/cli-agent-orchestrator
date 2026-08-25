@@ -259,7 +259,7 @@ class TestF186ReconcilerPassesFlag:
         inbox_path = tmp_path / "inbox.json"
         doorbell_calls = []
 
-        def _capture_doorbell(terminal_id, max_row_id, *, written_count=0, caller_holds_no_delivery_lock=False):
+        def _capture_doorbell(terminal_id, max_row_id, *, written_count=0, caller_holds_no_delivery_lock=False, **kwargs):
             doorbell_calls.append({
                 "terminal_id": terminal_id,
                 "max_row_id": max_row_id,
@@ -367,7 +367,7 @@ class TestF186ReconcilerPassesFlag:
 
         doorbell_results = []
 
-        def _capture_ring(terminal_id, max_row_id, *, written_count=0, caller_holds_no_delivery_lock=False):
+        def _capture_ring(terminal_id, max_row_id, *, written_count=0, caller_holds_no_delivery_lock=False, **kwargs):
             """Intercept the doorbell call and verify the flag."""
             doorbell_results.append({
                 "terminal_id": terminal_id,

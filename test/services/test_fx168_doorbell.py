@@ -262,7 +262,7 @@ class TestAC6ReplayRowRings:
         doorbell_calls = []
         original_ring = ring_supervisor_doorbell.__wrapped__ if hasattr(ring_supervisor_doorbell, '__wrapped__') else None
 
-        def tracking_ring(tid, max_row_id, *, written_count=0):
+        def tracking_ring(tid, max_row_id, *, written_count=0, **kwargs):
             doorbell_calls.append((tid, max_row_id, written_count))
             return "rang"
 
@@ -694,7 +694,7 @@ class TestFx168ReconcilerRealSqlite:
         # Patch dependencies
         doorbell_calls = []
 
-        def mock_ring(tid, max_id, *, written_count=0, caller_holds_no_delivery_lock=False):
+        def mock_ring(tid, max_id, *, written_count=0, caller_holds_no_delivery_lock=False, **kwargs):
             doorbell_calls.append((tid, max_id, written_count))
             return "rang"
 
@@ -810,7 +810,7 @@ class TestFx168ReconcilerRealSqlite:
 
         doorbell_calls = []
 
-        def mock_ring(tid, max_id, *, written_count=0, caller_holds_no_delivery_lock=False):
+        def mock_ring(tid, max_id, *, written_count=0, caller_holds_no_delivery_lock=False, **kwargs):
             doorbell_calls.append((tid, max_id, written_count))
             return "rang"
 
