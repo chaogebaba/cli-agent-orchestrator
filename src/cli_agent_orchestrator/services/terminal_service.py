@@ -322,46 +322,82 @@ _fork_refresh_locks: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock] =
 # published its row AND released its reservation; the delayed racer then resumed
 # with a snapshot that missed the peer's row and a ledger that no longer showed
 # the peer's reservation, so it saw neither representation of the peer's slot and
-# admitted from a stale count — 3 workers at cap 2.
+# admitted from a stale count — 3 workers at cap 2. Round 4 fixed that with a
+# publish EPOCH, but the epoch bump landed AFTER the row was already visible, so
+# for the instant between "row visible" and "reservation retired + epoch bumped"
+# one worker occupied TWO admission units (a live row AND a held reservation) and
+# a concurrent peer was SPURIOUSLY refused at cap-minus-one.
 #
-# The round-4 repair makes the reservation-to-row handoff atomic WITHOUT
-# serializing the barriered listing, via a per-session monotonic PUBLISH EPOCH
-# incremented under the admission lock every time a row is published (in the same
-# critical section that retires the publishing reservation). Every racer records
-# the epoch it observed when it took its lock-free snapshot; at reserve time,
-# under the lock, the authoritative admitted total is
+# F439 (#294) round 5 / BLOCKER 1 — LEDGER-AUTHORITATIVE ADMISSION. The root
+# cause of every round-2..4 bug is the same: the admission count mixed two
+# independent sources of truth — the async DB listing and the in-memory
+# reservation ledger — and NO ordering of {row-visible, epoch-bump,
+# reservation-drop} across those two subsystems keeps the sum exact at every
+# instant (each ordering has a mirror bug: r4 double-counts → spurious refuse; a
+# pre-publish bump under-counts → over-admits). Round 5 collapses them into ONE
+# fenced quantity.
 #
-#     snapshot_live_count
-#       + (epoch_now - snapshot_epoch)   # rows published AFTER my snapshot that
-#                                        # my stale listing could not see
-#       + reservations                   # peers' booked-but-unpublished slots
+#   admission truth = the fenced ledger during in-flight windows;
+#   the DB listing SEEDS and RECONCILES the live count — it never counts a live
+#   worker that a still-held reservation already accounts for.
 #
-# so a peer's slot is ALWAYS visible to a delayed racer — as a reservation before
-# the peer publishes, and as an epoch delta after it publishes — with no double
-# count (publication moves the slot from ``reservations`` to the epoch delta in
-# one locked step). The listing itself stays lock-free, so the gate's
-# barrier-inside-listing probe still has all N racers reach the barrier at once.
+# The admitted total, computed under the per-session admission lock, is
+#
+#     reservations                         # every booked-but-in-flight slot
+#       + live                             # DB worker rows NOT attributable to a
+#                                          # still-held reservation's terminal id
+#
+# where ``live`` is DERIVED FRESH from the lock-free listing on every decision
+# (``sum(row.id not in publishing_ids)``), so a stale in-memory count can never
+# accumulate: a ledger entry with no backing DB row simply stops being counted
+# (drift self-heals toward DB truth), and a DB row with no ledger entry (server
+# restart, external/direct create) is counted exactly once. A reservation is
+# counted once via ``reservations`` and its row — visible or not — is EXCLUDED
+# from ``live`` via ``publishing_ids``, so the same worker is never both a
+# reservation and a live row. When the row is durably published the reservation
+# is retired and its id leaves ``publishing_ids`` in the SAME locked step, moving
+# the unit from ``reservations`` to ``live`` with no observable instant of double-
+# or under-count (the row is already visible on both sides of the flip). The
+# listing stays lock-free (the gate's barrier-inside-listing probe still has all
+# N racers reach the barrier at once); a per-session GENERATION counter, read
+# before and after the lock-free listing (a seqlock), guarantees the
+# ``(worker_ids, ledger)`` pair used for the decision is internally consistent,
+# with a bounded retry + lock-held fallback so a reader cannot be starved by
+# sustained publish churn.
 _cap_admission_locks: dict[str, threading.Lock] = {}
 _cap_admission_locks_guard = threading.Lock()
-# Per-session count of admissions granted but whose DB row is not yet published.
-# Mutated ONLY while holding that session's ``_cap_admission_lock``. Keyed by
-# session_name; a session's entry is removed when its reservation count returns
-# to zero AND its publish epoch is quiescent so the map does not grow unbounded.
+# Per-session count of admissions granted but not yet fully published+retired
+# (the in-flight units). Mutated ONLY while holding that session's
+# ``_cap_admission_lock``. A session's entry is removed once it returns to zero
+# and the session is quiescent so the map does not grow unbounded.
 _cap_reservations: dict[str, int] = {}
-# F439 (#294) round 4 / BLOCKER 1: per-session monotonic count of worker rows
-# published since this ledger entry was created. Mutated ONLY while holding that
-# session's ``_cap_admission_lock``, and ONLY on a publication (not on a failed
-# create — a rollback publishes no countable row, so it must not bump the epoch).
-# A racer folds ``epoch_now - snapshot_epoch`` into its admitted total so a row
-# published after its lock-free snapshot is still counted even though the stale
-# listing missed it. Cleared together with the reservation entry once the session
-# is fully quiescent (no reservations AND no racer mid-flight).
-_cap_publish_epoch: dict[str, int] = {}
-# In-flight admission attempts per session: incremented when a reservation is
-# booked, decremented when it is retired (publish OR failure). While > 0 a racer
-# may still hold a snapshot epoch that the ledger must be able to diff against, so
-# the epoch entry is retained; it is dropped only when this returns to zero.
-_cap_inflight: dict[str, int] = {}
+# F439 (#294) round 5 / BLOCKER 1: per-session set of terminal ids whose slot is
+# a still-held reservation whose DB row MAY already be visible. A row in this set
+# is EXCLUDED from the DB-derived ``live`` count so the worker is counted exactly
+# once (via ``reservations``); the id is registered BEFORE the row is published
+# (excluding a not-yet-visible row is a harmless no-op) and removed in the SAME
+# locked step that retires the reservation on publish, so there is no window where
+# the row is counted both as a reservation and as a live row. Mutated ONLY under
+# the lock.
+_cap_publishing_ids: dict[str, set[str]] = {}
+# F439 (#294) round 5 / BLOCKER 1 + SHOULD 1: per-session monotonic generation,
+# bumped under the admission lock on EVERY ledger mutation (reserve, publish
+# transition, release). A racer reads it before and after its lock-free listing;
+# an unchanged generation proves no ledger transition raced the listing, so the
+# ``(worker_ids, reservations, publishing_ids)`` tuple is a coherent snapshot.
+# Bounded retries then a lock-held fallback (see ``_reserve_worker_slot``) give a
+# hard progress guarantee under sustained publish churn. Dropped with the session
+# when quiescent.
+_cap_gen: dict[str, int] = {}
+# F439 (#294) round 5 / SHOULD 1: hard bound on the admission seqlock's lock-free
+# retries. Beyond this many generation-mismatch re-lists, the reserve path takes
+# the listing UNDER the admission lock (a raced-free, guaranteed-progress
+# fallback) so sustained publish churn cannot starve a reader. Large enough that
+# normal concurrency (and the gate's one-shot barrier probe) never reaches it.
+_CAP_SEQLOCK_MAX_RETRIES = 64
+# Shared immutable empty set for the "no publishing ids" fast path so the hot
+# admission read allocates nothing.
+_EMPTY_ID_SET: frozenset[str] = frozenset()
 
 
 def _preflight_disk_space(path: str, floor_gb: float = DISK_SPACE_FLOOR_GB) -> None:
@@ -1073,16 +1109,37 @@ def _count_worker_terminals(
     ``{"id", "display_name", "idle_since"}`` for a worker whose live status is
     IDLE. ``idle_since`` is the row's ``last_active`` ISO string (best-effort;
     None when unavailable).
+
+    This 2-tuple shape is a frozen probe contract; the admission path uses
+    ``_count_worker_terminals_detailed`` (below) when it also needs the worker id
+    set for the F439 r5 ledger-authoritative live count.
+    """
+    count, reap_candidates, _ids = _count_worker_terminals_detailed(session_name, supervisor_id)
+    return count, reap_candidates
+
+
+def _count_worker_terminals_detailed(
+    session_name: str, supervisor_id: Optional[str]
+) -> tuple[int, List[Dict[str, Any]], List[str]]:
+    """As ``_count_worker_terminals`` but also returns the worker terminal ids.
+
+    F439 (#294) round 5 / BLOCKER 1: the admission path derives the
+    ledger-authoritative ``live`` count as the number of these worker rows whose
+    id is NOT a still-held reservation (``_cap_publishing_ids``), so it needs the
+    id set, not just the count. Kept separate from ``_count_worker_terminals`` so
+    that function's frozen 2-tuple return shape is unchanged.
     """
     rows = list_terminals_by_session(session_name)
     count = 0
     reap_candidates: List[Dict[str, Any]] = []
+    worker_ids: List[str] = []
     for row in rows:
         tid = row.get("id")
         if not tid or tid == supervisor_id:
             # The supervisor's own terminal is never a worker and never counted.
             continue
         count += 1
+        worker_ids.append(tid)
         try:
             live_status = status_monitor.get_status(tid)
         except Exception:
@@ -1101,7 +1158,7 @@ def _count_worker_terminals(
                     "idle_since": idle_since,
                 }
             )
-    return count, reap_candidates
+    return count, reap_candidates, worker_ids
 
 
 def _enforce_worker_terminal_cap(session_name: str, supervisor_id: Optional[str]) -> None:
@@ -1232,20 +1289,31 @@ async def create_terminal(
     # the admission lock — every concurrent same-session racer counts at once
     # (and reaches any barrier the gate probe installs in the listing). The
     # per-session admission lock guards ONLY the tiny reservation ledger.
-    # F439 (#294) round 4 / BLOCKER 1: the reservation-to-row handoff is made
-    # atomic via a per-session publish EPOCH (see the ledger comment on
-    # ``_cap_publish_epoch``). ``_reserve_worker_slot`` returns the epoch this
-    # create observed at snapshot time; the release closure threads it back so
-    # the publishing release can bump the epoch in the SAME locked step that
-    # retires the reservation, and a delayed racer's stale snapshot still counts
-    # this row via ``epoch_now - snapshot_epoch``. Retired the instant the DB row
+    # F439 (#294) round 5 / BLOCKER 1: admission is LEDGER-AUTHORITATIVE (see the
+    # ledger comment on ``_cap_publishing_ids``). ``_reserve_worker_slot`` books
+    # one in-flight unit; ``_cap_mark_publishing`` registers this create's
+    # terminal id the instant BEFORE its DB row is published so the now-visible
+    # row is excluded from the DB-derived live count (counted once via the held
+    # reservation); ``_release_cap_lock`` then retires the reservation and drops
+    # the id in one locked step, moving the unit from ``reservations`` to the live
+    # count with no double- or under-count window. Retired the instant the DB row
     # is published (``published=True``) or on ANY earlier failure via the
-    # rollback/except seams (``published=False`` — a rollback publishes no row,
-    # so it must not bump the epoch), so a concurrent racer's in-flight admit is
-    # always visible as either a reservation or an epoch delta.
+    # rollback/except seams (``published=False``); either way the DB listing is
+    # the authority for whether the row is live.
     _cap_capped = new_session is False and bool(caller_id) and bool(session_name)
     _cap_reserved = False
-    _cap_snapshot_epoch: int = 0
+    _cap_publishing_marked = False
+
+    def _cap_mark_publishing() -> None:
+        # Register this create's terminal id as a reserved-but-publishing slot
+        # BEFORE its row is made visible, so the row is excluded from the live
+        # count for the whole reservation->publish window. Idempotent; only marks
+        # when a reservation is actually held. ``terminal_id`` is read at call
+        # time (after it is generated below).
+        nonlocal _cap_publishing_marked
+        if _cap_reserved and not _cap_publishing_marked and terminal_id:
+            _cap_publishing_marked = True
+            _mark_publishing(session_name, terminal_id)  # type: ignore[arg-type]
 
     def _release_cap_lock(published: bool = False) -> None:
         # Retire this create's worker-slot reservation exactly once. Idempotent
@@ -1253,26 +1321,29 @@ async def create_terminal(
         # ``db_created`` with ``published=True``), the rollback ``except``, and
         # the outer ``finally`` (both ``published=False``) can all call it
         # without double-decrementing the ledger. Only the FIRST call takes
-        # effect: on success that is the publishing release, so the epoch is
-        # bumped exactly once; on failure only the ``published=False`` releases
-        # fire, so no phantom row is ever counted.
+        # effect. In one locked step it decrements ``reservations`` and drops this
+        # create's terminal id from ``_cap_publishing_ids``; on success the row is
+        # already visible so the unit moves to the DB-derived live count with no
+        # gap, on failure the id (if marked) simply stops excluding a rolled-back
+        # row. ``terminal_id`` may be None on a very early failure (before id
+        # generation), which ``_release_worker_slot`` tolerates.
         nonlocal _cap_reserved
         if _cap_reserved:
             _cap_reserved = False
             _release_worker_slot(
                 session_name,  # type: ignore[arg-type]
-                _cap_snapshot_epoch,
+                terminal_id,
                 published=published,
             )
 
     if _cap_capped:
-        # Lock-free count + locked reserve. Raises TerminalCapExceeded fail-closed
-        # BEFORE any resource is created when the session is at cap. Returns the
-        # observed publish epoch (None when the cap is disabled).
-        _reserved_epoch = await _reserve_worker_slot(session_name, caller_id)  # type: ignore[arg-type]
-        if _reserved_epoch is not None:
+        # Lock-free listing + locked ledger-authoritative reserve. Raises
+        # TerminalCapExceeded fail-closed BEFORE any resource is created when the
+        # session is at cap. Returns True when a reservation was booked (None when
+        # the cap is disabled).
+        _reserved = await _reserve_worker_slot(session_name, caller_id)  # type: ignore[arg-type]
+        if _reserved:
             _cap_reserved = True
-            _cap_snapshot_epoch = _reserved_epoch
     try:
         if working_directory is not None:
             # Expand and resolve early so the preflight disk-space check and
@@ -1834,6 +1905,12 @@ async def create_terminal(
             # F129: Pass authority_files through to the DB publication function
             if authority_files:
                 init_fields["authority_files"] = authority_files
+            # F439 (#294) round 5 / BLOCKER 1: mark this create's terminal id as a
+            # reserved-but-publishing slot BEFORE the row is made visible below.
+            # From this instant the row — the moment it appears in the listing —
+            # is excluded from the DB-derived live count, so the worker is counted
+            # exactly once (via its held reservation) with no double-count window.
+            _cap_mark_publishing()
             delivery_authority = get_delivery_lock(terminal_id)
             mailbox_authority = get_mailbox_authority_lock(session_name, "supervisor")
             with delivery_authority:
@@ -2020,18 +2097,16 @@ async def create_terminal(
             owned_lifecycle_lease = False
             session_lifecycle_lease_token = None
         db_created = True
-        # F439 (#294) round 3 / BLOCKER: the row is now durably published, so a
-        # concurrent same-session create's lock-free count will include it.
-        # Retire this create's reservation HERE — before the slow provider-init
-        # phase below — so it is not double-counted (live row + reservation) and
-        # so parallel same-session assigns still initialize concurrently.
-        # Idempotent; the outer ``finally`` re-checks and is a no-op once retired.
-        # F439 (#294) round 4 / BLOCKER 1: ``published=True`` bumps the per-session
-        # publish epoch in the SAME locked step that retires this reservation, so
-        # a delayed racer whose lock-free snapshot predates this row still counts
-        # it via ``epoch_now - snapshot_epoch`` and cannot admit from a stale
-        # count. The slot moves atomically from ``reservations`` to the epoch
-        # delta — never invisible, never double-counted.
+        # F439 (#294) round 5 / BLOCKER 1: the row is now durably published and
+        # visible in the listing. Retire this create's reservation HERE — before
+        # the slow provider-init phase below — in one locked step that also drops
+        # this terminal id from ``_cap_publishing_ids``. The row was already
+        # visible when it was excluded (via ``_cap_mark_publishing`` above), so
+        # dropping the exclusion now moves the unit from ``reservations`` to the
+        # DB-derived live count with NO observable instant of double- or
+        # under-count. Idempotent; the outer ``finally`` re-checks and is a no-op
+        # once retired. Retiring here (not after provider init) also lets parallel
+        # same-session assigns keep initializing concurrently.
         _release_cap_lock(published=True)
 
         # The live snapshot is transactional launch context. Build it only after
@@ -3408,124 +3483,165 @@ async def _acquire_cap_lock(lock: threading.Lock) -> None:
         await asyncio.sleep(0.005)
 
 
-async def _reserve_worker_slot(session_name: str, supervisor_id: Optional[str]) -> Optional[int]:
-    """Atomically reserve one worker slot, or raise ``TerminalCapExceeded`` (F439 r4).
+async def _reserve_worker_slot(session_name: str, supervisor_id: Optional[str]) -> Optional[bool]:
+    """Atomically reserve one worker slot, or raise ``TerminalCapExceeded``.
 
-    Splits the admission decision into a lock-free COUNT and a locked RESERVE so
-    the slow, observable ``list_terminals_by_session`` callout inside the count
-    is NOT serialized by the admission lock (round-3 BLOCKER: the gate probe
-    patches a barrier inside that listing and every racer must reach it):
+    F439 (#294) round 5 / BLOCKER 1 — LEDGER-AUTHORITATIVE. Splits the admission
+    decision into a lock-free COUNT and a locked RESERVE so the slow, observable
+    ``list_terminals_by_session`` callout is NOT serialized by the admission lock
+    (round-3 BLOCKER: the gate probe patches a barrier inside that listing and
+    every racer must reach it concurrently):
 
-    1. Lock-free ``_count_worker_terminals`` — every concurrent racer counts at
-       once (and all reach any barrier the probe installed in the listing). The
-       count is bracketed by an epoch read BEFORE and AFTER (a seqlock): if a row
-       was published DURING the count the two epochs differ and the count is
-       retried, so the ``(count, snapshot_epoch)`` pair is always internally
-       consistent — ``snapshot_epoch`` is exactly the number of publications that
-       ``count`` already reflects.
+    1. Lock-free ``_count_worker_terminals_detailed`` — every concurrent racer
+       lists at once (and all reach any barrier the probe installed). It returns
+       the worker terminal ids so the admitted total can EXCLUDE rows that a
+       still-held reservation already accounts for. The listing is bracketed by a
+       per-session GENERATION read BEFORE and AFTER (a seqlock): if any ledger
+       transition (reserve / publish / release) raced the listing the two
+       generations differ and the listing is retried, so the ``(worker_ids,
+       ledger)`` pair is always internally consistent.
 
     2. Under the per-session admission lock, compute the authoritative admitted
-       total as ``count + (epoch_now - snapshot_epoch) + reservations`` (F439 r4
-       / BLOCKER 1). The epoch delta counts rows PUBLISHED AFTER this racer's
-       consistent snapshot that the stale listing could not see; ``reservations``
-       counts peers' booked-but-unpublished slots. A peer's slot is therefore
-       ALWAYS visible — as a reservation before it publishes and as an epoch
-       delta after — so a delayed racer cannot admit from a stale count. If the
-       total ``>= cap`` refuse fail-closed BEFORE any resource exists; otherwise
-       book a reservation and return.
+       total as ``reservations + live`` where ``live`` is the number of listed
+       worker rows whose id is NOT in ``_cap_publishing_ids`` (a reserved worker
+       whose row may already be visible). A reserved worker is counted exactly
+       once — via ``reservations`` — and its row, visible or not, is excluded
+       from ``live``; a non-reserved row (an external/restart/direct create) is
+       counted exactly once via ``live``. There is therefore no ordering window
+       where a worker is both a reservation and a live row (r4's BLOCKER) or
+       neither (a pre-publish-bump under-count). If the total ``>= cap`` refuse
+       fail-closed BEFORE any resource exists; otherwise book a reservation and
+       return. A plain reserve does NOT bump the generation (it changes neither
+       the listing nor the exclusion set), which preserves the r3 barrier
+       property; only ``_mark_publishing`` and ``_release_worker_slot`` bump it.
 
-    ``inflight`` is incremented for this racer BEFORE its count (lock-free entry),
-    so while any racer is mid-flight the session's epoch entry is retained and a
-    delayed racer always has a live epoch to diff its ``snapshot_epoch`` against.
-    It is decremented in ``_release_worker_slot`` on publish or failure.
+    SHOULD 1: the seqlock retry is BOUNDED (``_CAP_SEQLOCK_MAX_RETRIES``); on
+    exhaustion it falls back to taking the listing UNDER the lock, which cannot
+    be raced (a guaranteed-progress path) at the cost of briefly serializing the
+    listing. The bound is generous enough that normal concurrency (including the
+    gate's one-shot barrier probe) always settles on the lock-free fast path;
+    only pathological sustained publish churn reaches the fallback.
 
-    Returns the consistent ``snapshot_epoch`` (``int``) when a reservation was
-    booked (the caller MUST later call ``_release_worker_slot`` exactly once, on
-    publish or on any failure). Returns ``None`` — no count, no reservation — when
-    the cap is ``<= 0`` (disabled).
+    Returns ``True`` when a reservation was booked (the caller MUST later call
+    ``_release_worker_slot`` exactly once, on publish or on any failure). Returns
+    ``None`` — no count, no reservation — when the cap is ``<= 0`` (disabled).
     """
     cap = _resolve_worker_terminal_cap()
     if cap <= 0:
         return None
     lock = _cap_admission_lock(session_name)
 
-    # Register this racer as in-flight and take a consistent (count, epoch) pair.
-    # The epoch is read under the lock; the count is lock-free (barrier-friendly).
-    # Bracket the count with a before/after epoch read (seqlock): a publication
-    # DURING the count would change the epoch, so retry until the pair is stable.
-    await _acquire_cap_lock(lock)
+    def _admit_under_lock(worker_ids: List[str]) -> None:
+        # PRE: lock held. Compute the ledger-authoritative admitted total from a
+        # coherent (worker_ids, publishing_ids) pair and book a reservation or
+        # refuse. ``reservations`` is read FRESH here under the lock (never from
+        # the snapshot), so a peer's concurrent reserve is always reflected; only
+        # the ``worker_ids``/``publishing_ids`` correspondence needs the seqlock,
+        # which is why a plain reserve does NOT bump the generation (it changes
+        # neither the listing nor the exclusion set) — only publish transitions
+        # (``_mark_publishing`` / ``_release_worker_slot``) do. Not bumping here
+        # is also what keeps the r3 barrier property intact: N concurrent racers
+        # each list exactly once and all reach the in-listing barrier together.
+        reserved = _cap_reservations.get(session_name, 0)
+        publishing = _cap_publishing_ids.get(session_name, _EMPTY_ID_SET)
+        # ``live`` = listed rows NOT already accounted for by a held reservation.
+        live = sum(1 for wid in worker_ids if wid not in publishing)
+        admitted = reserved + live
+        if admitted >= cap:
+            raise TerminalCapExceeded(
+                current_count=admitted, cap=cap, reap_candidates=reap_candidates
+            )
+        _cap_reservations[session_name] = reserved + 1
+
+    # Seqlock: bracket the lock-free listing with a generation read so the
+    # (worker_ids, ledger) pair used for the decision is internally consistent.
+    retries = 0
+    while True:
+        with lock:
+            gen_before = _cap_gen.get(session_name, 0)
+        # (1) Lock-free listing: runs concurrently for every racer. Do NOT hold
+        # the admission lock across this callout (the r3 barrier property).
+        count, reap_candidates, worker_ids = _count_worker_terminals_detailed(
+            session_name, supervisor_id
+        )
+        await _acquire_cap_lock(lock)
+        try:
+            gen_after = _cap_gen.get(session_name, 0)
+            if gen_before == gen_after:
+                # (2) Consistent snapshot: decide + book atomically under the lock.
+                _admit_under_lock(worker_ids)
+                return True
+            if retries >= _CAP_SEQLOCK_MAX_RETRIES:
+                # SHOULD 1 fallback: the ledger kept changing under us. Take the
+                # listing UNDER the lock so it cannot be raced — guaranteed
+                # progress. This briefly serializes the (rare) contended listing.
+                _count, _reap, worker_ids = _count_worker_terminals_detailed(
+                    session_name, supervisor_id
+                )
+                reap_candidates = _reap
+                _admit_under_lock(worker_ids)
+                return True
+        finally:
+            lock.release()
+        retries += 1
+        # A ledger transition raced the listing; yield and re-list so the pair is
+        # coherent (or take the bounded lock-held fallback on the next lap).
+        await asyncio.sleep(0)
+
+
+def _mark_publishing(session_name: str, terminal_id: str) -> None:
+    """Register ``terminal_id`` as a reserved slot whose row is about to publish.
+
+    F439 (#294) round 5 / BLOCKER 1: called under NO external lock, immediately
+    BEFORE the DB row is made visible. Adds the id to ``_cap_publishing_ids`` so
+    the row — the instant it becomes visible — is EXCLUDED from the DB-derived
+    ``live`` count and the worker keeps being counted exactly once (via its held
+    reservation). Registering the id before the row exists is a harmless no-op
+    for counting (excluding an absent row removes nothing), which is precisely
+    why there is no double-count window: the exclusion is in place before the row
+    can appear. Bumps the generation so a concurrent racer's seqlock re-lists.
+    Idempotent.
+    """
+    lock = _cap_admission_lock(session_name)
+    lock.acquire()
     try:
-        _cap_inflight[session_name] = _cap_inflight.get(session_name, 0) + 1
+        ids = _cap_publishing_ids.get(session_name)
+        if ids is None:
+            ids = set()
+            _cap_publishing_ids[session_name] = ids
+        if terminal_id not in ids:
+            ids.add(terminal_id)
+            _cap_gen[session_name] = _cap_gen.get(session_name, 0) + 1
     finally:
         lock.release()
 
-    try:
-        while True:
-            with lock:
-                epoch_before = _cap_publish_epoch.get(session_name, 0)
-            # (1) Lock-free count: the observable listing runs concurrently for
-            # every racer. Do NOT hold the admission lock across this callout.
-            count, reap_candidates = _count_worker_terminals(session_name, supervisor_id)
-            with lock:
-                epoch_after = _cap_publish_epoch.get(session_name, 0)
-            if epoch_before == epoch_after:
-                snapshot_epoch = epoch_before
-                break
-            # A publish landed during the count; the snapshot may be inconsistent.
-            # Yield and re-count so (count, snapshot_epoch) is a coherent pair.
-            await asyncio.sleep(0)
 
-        # (2) Locked reserve. No await between reading epoch_now/reserved and the
-        # decision, so the compute-decide-book step is atomic under the lock.
-        await _acquire_cap_lock(lock)
-        try:
-            epoch_now = _cap_publish_epoch.get(session_name, 0)
-            reserved = _cap_reservations.get(session_name, 0)
-            # Rows published AFTER this racer's consistent snapshot that its stale
-            # listing could not see, plus peers' booked-but-unpublished slots.
-            admitted = count + (epoch_now - snapshot_epoch) + reserved
-            if admitted >= cap:
-                raise TerminalCapExceeded(
-                    current_count=admitted, cap=cap, reap_candidates=reap_candidates
-                )
-            _cap_reservations[session_name] = reserved + 1
-            return snapshot_epoch
-        finally:
-            lock.release()
-    except BaseException:
-        # Refused (or an unexpected failure) before booking: retire this racer's
-        # in-flight registration so the epoch entry can be reclaimed once quiescent.
-        # No reservation was booked on this path, so decrement inflight directly
-        # (``_release_worker_slot`` is only for booked reservations).
-        with lock:
-            inflight = _cap_inflight.get(session_name, 0) - 1
-            if inflight > 0:
-                _cap_inflight[session_name] = inflight
-            else:
-                _cap_inflight.pop(session_name, None)
-                if session_name not in _cap_reservations:
-                    _cap_publish_epoch.pop(session_name, None)
-        raise
-
-
-def _release_worker_slot(session_name: str, snapshot_epoch: int, *, published: bool) -> None:
-    """Retire one reservation booked by ``_reserve_worker_slot`` (F439 r4).
+def _release_worker_slot(session_name: str, terminal_id: Optional[str], *, published: bool) -> None:
+    """Retire one reservation booked by ``_reserve_worker_slot`` (F439 r5).
 
     Called exactly once per booked reservation — the instant the DB row is
-    published (``published=True``) or on ANY failure/rollback (``published=False``).
+    durably published (``published=True``) or on ANY failure/rollback
+    (``published=False``).
 
-    F439 r4 / BLOCKER 1: when ``published=True`` this bumps the per-session
-    publish epoch in the SAME locked critical section that decrements the
-    reservation, so the slot moves atomically from ``reservations`` to the epoch
-    delta and is never simultaneously invisible to a concurrent racer's stale
-    snapshot. A failure (``published=False``) publishes no countable row, so it
-    must NOT bump the epoch — it only releases the reservation.
+    F439 (#294) round 5 / BLOCKER 1: this is the ledger transition. In ONE locked
+    step it decrements ``reservations`` and discards ``terminal_id`` from
+    ``_cap_publishing_ids``. On the publish path the row is already visible, so
+    dropping it from ``publishing_ids`` moves the unit from ``reservations`` to
+    the DB-derived ``live`` count with no observable gap (the row is counted on
+    both sides — as a reservation before, as a live row after). On the failure
+    path the row was rolled back (or never inserted), so removing the id from
+    ``publishing_ids`` simply stops excluding a row that no longer exists; no
+    phantom unit is stranded either way. ``published`` is retained for symmetry
+    and callsite intent but the transition is identical — the DB listing is the
+    authority for whether the row is live, not this flag.
 
     Idempotent-safe against a session with no live reservations (never goes
-    negative). The reservation, in-flight, and epoch entries for a session are
-    dropped together ONLY when the session is fully quiescent (no reservations
-    AND no racer still mid-flight), so a delayed racer's ``snapshot_epoch`` always
-    has a live epoch to diff against while any admission is in progress.
+    negative). Bumps the generation so a concurrent racer's seqlock re-lists.
+
+    SHOULD 2: when the session becomes fully quiescent (no reservations, no
+    publishing ids) every per-session ledger entry — including the admission LOCK
+    itself — is reclaimed, so a long-running server with many distinct session
+    names does not grow an unbounded lock registry.
     """
     lock = _cap_admission_lock(session_name)
     lock.acquire()
@@ -3535,20 +3651,38 @@ def _release_worker_slot(session_name: str, snapshot_epoch: int, *, published: b
             _cap_reservations[session_name] = remaining
         else:
             _cap_reservations.pop(session_name, None)
-        if published:
-            _cap_publish_epoch[session_name] = _cap_publish_epoch.get(session_name, 0) + 1
-        inflight = _cap_inflight.get(session_name, 0) - 1
-        if inflight > 0:
-            _cap_inflight[session_name] = inflight
-        else:
-            # Fully quiescent: no reservation outstanding and no racer mid-flight.
-            # Safe to forget the epoch — no live snapshot can diff against it — so
-            # the ledger does not grow unbounded across many short-lived sessions.
-            _cap_inflight.pop(session_name, None)
-            if session_name not in _cap_reservations:
-                _cap_publish_epoch.pop(session_name, None)
+        if terminal_id is not None:
+            ids = _cap_publishing_ids.get(session_name)
+            if ids is not None:
+                ids.discard(terminal_id)
+                if not ids:
+                    _cap_publishing_ids.pop(session_name, None)
+        _cap_gen[session_name] = _cap_gen.get(session_name, 0) + 1
+        _maybe_reclaim_cap_session(session_name)
     finally:
         lock.release()
+
+
+def _maybe_reclaim_cap_session(session_name: str) -> None:
+    """Drop all per-session cap ledger state once the session is quiescent.
+
+    PRE: the caller holds ``session_name``'s admission lock. F439 (#294) round 5
+    / SHOULD 2: a session is quiescent when it holds no reservation and no
+    publishing id. At that point the generation counter and — crucially — the
+    admission LOCK entry carry no live state, so they are removed together to
+    bound the per-session registries. The lock object the caller currently holds
+    remains valid for the rest of this critical section; a later admission for
+    the same session name simply creates a fresh lock via ``_cap_admission_lock``.
+    """
+    if _cap_reservations.get(session_name):
+        return
+    if _cap_publishing_ids.get(session_name):
+        return
+    _cap_gen.pop(session_name, None)
+    _cap_publishing_ids.pop(session_name, None)
+    _cap_reservations.pop(session_name, None)
+    with _cap_admission_locks_guard:
+        _cap_admission_locks.pop(session_name, None)
 
 
 def _dispatch_base_refresh(
