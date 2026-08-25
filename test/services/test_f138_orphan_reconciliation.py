@@ -2808,6 +2808,9 @@ class TestD17PreIssuanceFence:
             "cli_agent_orchestrator.services.orphan_reconcile_service._is_server_or_ancestor",
             return_value=False,
         ), patch(
+            "cli_agent_orchestrator.services.orphan_reconcile_service._is_descendant_of_server",
+            return_value=True,
+        ), patch(
             "cli_agent_orchestrator.services.orphan_reconcile_service._read_boot_id",
             return_value="same-boot",
         ):
@@ -2837,6 +2840,9 @@ class TestD17PreIssuanceFence:
         ), patch(
             "cli_agent_orchestrator.services.orphan_reconcile_service._is_server_or_ancestor",
             return_value=False,
+        ), patch(
+            "cli_agent_orchestrator.services.orphan_reconcile_service._is_descendant_of_server",
+            return_value=True,
         ), patch(
             "cli_agent_orchestrator.services.orphan_reconcile_service._read_boot_id",
             return_value="same-boot",
@@ -2868,6 +2874,9 @@ class TestD17PreIssuanceFence:
         ), patch(
             "cli_agent_orchestrator.services.orphan_reconcile_service._is_server_or_ancestor",
             return_value=False,
+        ), patch(
+            "cli_agent_orchestrator.services.orphan_reconcile_service._is_descendant_of_server",
+            return_value=True,
         ), patch(
             "cli_agent_orchestrator.services.orphan_reconcile_service._read_boot_id",
             return_value=None,  # unreadable
