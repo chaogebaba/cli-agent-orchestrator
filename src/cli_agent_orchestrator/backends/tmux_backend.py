@@ -95,7 +95,149 @@ class TmuxBackend(TerminalBackend):
             ) from e
 
     def kill_window(self, session_name: str, window_name: str) -> bool:
+        # F469: park attached clients viewing this window on a stable window
+        # before killing, so tmux doesn't yank them to an arbitrary adjacent one.
+        self._park_clients_off_window(session_name, window_name)
         return self._client.kill_window(session_name, window_name)
+
+    # ── F469 client-parking helper ───────────────────────────────────────
+
+    def _park_clients_off_window(self, session_name: str, window_name: str) -> None:
+        """Move clients currently viewing *window_name* to a stable window.
+
+        Best-effort: any tmux error in the parking step is swallowed so that
+        the subsequent kill is never blocked by a parking failure.
+        """
+        import subprocess
+
+        try:
+            # Discover which window index/id corresponds to window_name
+            target_idx = self._resolve_window_index(session_name, window_name)
+            if target_idx is None:
+                logger.debug("F469: _resolve_window_index returned None for %s:%s",
+                             session_name, window_name)
+                return  # window doesn't exist or can't be resolved — nothing to park
+
+            # List clients attached to this session whose current window matches
+            clients_on_target = self._clients_on_window(session_name, target_idx)
+            if not clients_on_target:
+                logger.debug("F469: no clients on window idx=%s for %s:%s",
+                             target_idx, session_name, window_name)
+                return  # no client viewing this window — fast path
+
+            # Park each client on a stable window.
+            logger.debug("F469: parking %d client(s) off %s:%s (idx=%s)",
+                         len(clients_on_target), session_name, window_name, target_idx)
+            for client_tty in clients_on_target:
+                self._park_single_client(session_name, client_tty, target_idx)
+        except Exception as exc:
+            # Graceful degradation: parking must never block the kill.
+            logger.debug(
+                "F469: failed to park clients off %s:%s (non-fatal, proceeding to kill): %s",
+                session_name,
+                window_name,
+                exc,
+            )
+
+    def _resolve_window_index(self, session_name: str, window_name: str) -> str | None:
+        """Return the window_index of *window_name* within *session_name*, or None."""
+        import subprocess
+
+        proc = subprocess.run(
+            tmux_argv(
+                "list-windows", "-t", session_name,
+                "-F", "#{window_name}\t#{window_index}",
+            ),
+            capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode != 0:
+            logger.debug(
+                "F469: list-windows failed for %s (rc=%d, stderr=%s)",
+                session_name, proc.returncode, proc.stderr.strip(),
+            )
+            return None
+        for line in proc.stdout.splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) == 2 and parts[0] == window_name:
+                return parts[1]
+        logger.debug(
+            "F469: window %r not found in list-windows output for %s: %r",
+            window_name, session_name, proc.stdout,
+        )
+        return None
+
+    def _clients_on_window(self, session_name: str, window_index: str) -> list[str]:
+        """Return client tty names whose current window matches *window_index*."""
+        import subprocess
+
+        proc = subprocess.run(
+            tmux_argv(
+                "list-clients", "-t", session_name,
+                "-F", "#{client_tty}\t#{window_index}",
+            ),
+            capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode != 0:
+            return []
+        result = []
+        for line in proc.stdout.splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) == 2 and parts[1] == window_index:
+                result.append(parts[0])
+        return result
+
+    def _park_single_client(
+        self, session_name: str, client_tty: str, killed_index: str
+    ) -> None:
+        """Move one client to a stable window via switch-client. Best-effort."""
+        import subprocess
+
+        try:
+            # Try window 0 first (supervisor seat — predictable landing)
+            if killed_index != "0":
+                proc = subprocess.run(
+                    tmux_argv(
+                        "switch-client", "-c", client_tty,
+                        "-t", f"{session_name}:0",
+                    ),
+                    capture_output=True, text=True, timeout=3,
+                )
+                if proc.returncode == 0:
+                    return  # parked on supervisor seat
+
+            # Fallback: find any surviving window that isn't the target
+            surviving = self._any_surviving_window(session_name, killed_index)
+            if surviving is not None:
+                subprocess.run(
+                    tmux_argv(
+                        "switch-client", "-c", client_tty,
+                        "-t", f"{session_name}:{surviving}",
+                    ),
+                    capture_output=True, text=True, timeout=3,
+                )
+        except Exception:
+            pass  # best-effort — never block the kill
+
+    def _any_surviving_window(
+        self, session_name: str, killed_index: str
+    ) -> str | None:
+        """Return the index of any window that isn't the one being killed."""
+        import subprocess
+
+        proc = subprocess.run(
+            tmux_argv(
+                "list-windows", "-t", session_name,
+                "-F", "#{window_index}",
+            ),
+            capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode != 0:
+            return None
+        for line in proc.stdout.splitlines():
+            idx = line.strip()
+            if idx and idx != killed_index:
+                return idx
+        return None
 
     def window_liveness(self, session_name: str, window_name: str) -> str:
         import subprocess
