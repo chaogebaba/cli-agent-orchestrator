@@ -2322,9 +2322,20 @@ class InboxService:
                 if _should_teammate_push(terminal_id):
                     # F457: acked-row dedupe — re-verify messages are still PENDING
                     # before pushing (kills late/duplicate pings for consumed rows).
-                    still_pending = get_pending_messages_by_ids(
-                        terminal_id, [m.id for m in messages]
-                    )
+                    # F457-r2 S1: fail-open on DB errors — fall back to original
+                    # messages list, mirroring _is_row_still_pending's fail-open.
+                    try:
+                        still_pending = get_pending_messages_by_ids(
+                            terminal_id, [m.id for m in messages]
+                        )
+                    except Exception as _db_exc:
+                        logger.debug(
+                            "f457_recheck_db_error terminal=%s error=%s "
+                            "action=fail_open_with_original_messages",
+                            terminal_id,
+                            _db_exc,
+                        )
+                        still_pending = messages
                     if not still_pending:
                         logger.debug(
                             "f457_push_suppressed terminal=%s decision=skipped_acked "
@@ -3487,6 +3498,16 @@ class InboxService:
                     )
                     for s in pending_scalars
                 ]
+
+                # F457-r2 B1: unified gate — wake.native=false suppresses reconciler push
+                # (mirrors the deliver_pending gate at :2315).
+                if not ConfigService.get("supervisor.wake.native", default=True):
+                    logger.debug(
+                        "f457_reconciler_push_suppressed terminal=%s "
+                        "reason=wake_native_disabled",
+                        mb.current_terminal_id,
+                    )
+                    continue
 
                 # D4: call the reported form directly
                 outcome: PushOutcome = attempt_teammate_push_reported(

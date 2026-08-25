@@ -387,6 +387,30 @@ def attempt_rung1(
             reason="path_unusable",
         )
 
+    # F457-r2 B2: unified gate — wake.native=false suppresses rung1 native ring
+    # (mirrors ring_supervisor_doorbell's config check; inline because the doorbell's
+    # cursor-dedup logic structurally conflicts with convergence_tick retry semantics).
+    from cli_agent_orchestrator.services.config_service import ConfigService as _CS
+
+    if not _CS.get("supervisor.wake.native", default=True):
+        return LadderResult(
+            delivered=False,
+            phase="transport_attempt",
+            decision="skipped_disabled",
+            reason="wake_native_disabled",
+        )
+
+    # F457-r2 B2: acked-row dedupe — skip ring if the row is no longer PENDING.
+    from cli_agent_orchestrator.services.doorbell_service import _is_row_still_pending
+
+    if not _is_row_still_pending(inbox_row_id):
+        return LadderResult(
+            delivered=False,
+            phase="transport_attempt",
+            decision="skipped_acked",
+            reason="row_not_pending",
+        )
+
     # Attempt native ring via the existing doorbell machinery
     try:
         from cli_agent_orchestrator.services.doorbell_service import _attempt_native_ring
