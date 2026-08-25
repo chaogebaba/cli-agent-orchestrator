@@ -377,26 +377,58 @@ def check_version_guard(record: RegistryRecord) -> Optional[str]:
     return None
 
 
+# F459: Max message body bytes embedded in the native bridge message.
+_F459_MAX_BODY_BYTES = 8192
+
+
 def build_wake_payload(
     worker_name: str,
     inbox_row_id: int,
     *,
     priority: Optional[str] = None,
+    message_body: Optional[str] = None,
+    sender_display_name: Optional[str] = None,
 ) -> str:
-    """D5/D7: build the single JSON line for the socket write."""
+    """D5/D7/F459: build the single JSON line for the socket write.
+
+    F459: When message_body is provided, the bridge message carries the actual
+    worker callback text (defensively truncated to 8KB) instead of a generic ping.
+    sender_display_name overrides the from-name (the worker's display name).
+    """
     if priority is None:
         priority = ConfigService.get("supervisor.wake.priority", default="next")
 
     sender_name = _sanitize_sender_name(worker_name)
     sender_address = f"bridge:cao-{sender_name}"
 
-    # D7: fixed text, no worker-authored content
-    body_text = f"[cao] Callback from {sender_name} (message id {inbox_row_id}). Run any command to surface and ack it."
+    # F459: from-name = worker display name (not "cao-" prefixed)
+    from_name = _sanitize_sender_name(sender_display_name) if sender_display_name else sender_name
+
+    # F459: payload-carrying body (or legacy fixed text for fallback callers)
+    if message_body is not None:
+        # Defensive truncation to 8KB with tail pointer
+        if len(message_body) > _F459_MAX_BODY_BYTES:
+            body_text = (
+                message_body[:_F459_MAX_BODY_BYTES]
+                + f"\n\n[truncated — full text: inbox row {inbox_row_id}]"
+            )
+        else:
+            body_text = message_body
+    else:
+        # Legacy: no content provided — generic ping (pre-F459 callers)
+        body_text = (
+            f"[cao] Callback from {from_name} (message id {inbox_row_id}). "
+            f"Run any command to surface and ack it."
+        )
+
+    # F459: summary = first line (for collapsed render)
+    summary_line = body_text.split("\n", 1)[0][:120]
 
     # D5: cross-session-message wrapper
     content = (
         f'<cross-session-message from="{sender_address}" from-session="" '
-        f'hop-chain="" from-name="cao-{sender_name}" from-mode="bridge">\n'
+        f'hop-chain="" from-name="{from_name}" from-mode="bridge" '
+        f'summary="{summary_line}">\n'
         f"{body_text}\n"
         f"</cross-session-message>"
     )
