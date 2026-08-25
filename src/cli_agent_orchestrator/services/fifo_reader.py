@@ -17,6 +17,7 @@ from cli_agent_orchestrator.constants import (
     PIPE_LIVENESS_CHECK_INTERVAL_S,
     PIPE_LIVENESS_COLD_START_GRACE_S,
     PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS,
+    PIPE_LIVENESS_MAX_PROBE_FAILURES,
     PIPE_LIVENESS_MAX_REARM_FAILURES,
     PIPE_LIVENESS_STALL_CHECKS,
 )
@@ -212,6 +213,12 @@ class FifoManager:
         self._f138_report_failures: Dict[str, int] = {}
         # D20: Per-terminal one-shot attention marker.
         self._f138_attention_sent: Dict[str, bool] = {}
+        # Consecutive liveness-*probe* failures per terminal (probe() raised — the
+        # session/window/whole tmux server is gone). Reset on any successful probe;
+        # once it hits PIPE_LIVENESS_MAX_PROBE_FAILURES the terminal is dropped from
+        # the watchdog instead of re-probing (and logging a traceback) every tick
+        # forever (harness-control#845).
+        self._probe_failures: Dict[str, int] = {}
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: Optional[threading.Thread] = None
 
@@ -333,6 +340,7 @@ class FifoManager:
         self._f138_authority.pop(terminal_id, None)
         self._f138_report_failures.pop(terminal_id, None)
         self._f138_attention_sent.pop(terminal_id, None)
+        self._probe_failures.pop(terminal_id, None)
 
     def stop_reader(self, terminal_id: str) -> None:
         """Stop the reader thread (if running) and delete the FIFO file.
@@ -532,6 +540,50 @@ class FifoManager:
         thread = self._watchdog_thread
         if thread is not None:
             thread.join(timeout=2.0)
+
+    def _bound_probe_failure(
+        self, terminal_id: str, dispatch_epoch: int | None = None
+    ) -> None:
+        """#598: Bound the probe-throws-because-gone liveness storm.
+
+        The session/window/whole tmux server is gone, so probe() raises
+        (e.g. libtmux ObjectDoesNotExist) and will keep raising every tick.
+        Nothing downstream (the re-arm / cold-start counters) is ever reached on
+        this path, so without a dedicated bound a dead terminal produces an
+        unbounded per-tick traceback storm across every ghost terminal
+        (harness-control#845). Bound it exactly like the re-arm and cold-start
+        give-up paths: count consecutive probe failures and, after
+        PIPE_LIVENESS_MAX_PROBE_FAILURES, drop the terminal from the watchdog,
+        emitting ONE summary WARNING instead of a traceback per tick.
+        """
+        with self._lock:
+            # stop_reader() may have unenrolled this terminal while probe()
+            # was in flight; don't resurrect state for a terminal that's gone.
+            if terminal_id not in self._pane_probe:
+                return
+            failures = self._probe_failures.get(terminal_id, 0) + 1
+            if failures >= PIPE_LIVENESS_MAX_PROBE_FAILURES:
+                # Full drop via the shared unenroll helper so every per-enrollment
+                # dict (including fork F138 state) is cleared consistently.
+                self._unenroll(terminal_id)
+                give_up = True
+            else:
+                self._probe_failures[terminal_id] = failures
+                give_up = False
+        if give_up:
+            logger.warning(
+                "pipe-pane liveness probe for terminal %s failed %d consecutive "
+                "times (session/window/server gone); dropping it from the watchdog",
+                terminal_id,
+                PIPE_LIVENESS_MAX_PROBE_FAILURES,
+            )
+        else:
+            logger.debug(
+                "pipe-pane liveness probe for terminal %s failed (%d/%d); will retry",
+                terminal_id,
+                failures,
+                PIPE_LIVENESS_MAX_PROBE_FAILURES,
+            )
 
     def _f138_definitive_absence(self, terminal_id: str, scope_hint: str | None = None) -> None:
         """D15/D20: Handle a definitive session/window-not-found from probe().
@@ -942,7 +994,13 @@ class FifoManager:
                 elif msg.startswith("Window '"):
                     hint = "window"
                 return self._f138_definitive_absence(terminal_id, scope_hint=hint)
-            # Unknown ValueError shape: reset counter, re-raise to watchdog handler.
+            # Unknown ValueError shape: reset counter, re-raise to the watchdog
+            # handler. This is the fork's D15 contract — an unrecognized ValueError
+            # is a genuine fault to surface, NOT the gone-session storm #598 bounds
+            # (that path raises libtmux ObjectDoesNotExist / a non-ValueError, caught
+            # by the generic handler below). Keeping the two distinct preserves both
+            # invariants: D15 propagation for unknown ValueErrors, #598 bounding for
+            # a probe that keeps raising because the session/window/server is gone.
             self._f138_probe_gone_count.pop(terminal_id, None)
             raise
         except Exception:
@@ -952,9 +1010,20 @@ class FifoManager:
                     current_authority = self._f138_authority.get(terminal_id)
                     if current_authority is None or current_authority.epoch != dispatch_epoch:
                         return  # Stale — discard
-            # Any other exception (TmuxLookupError, OSError, etc.): reset counter, re-raise.
+            # The session/window/whole tmux server is gone, so probe() raises
+            # (e.g. libtmux ObjectDoesNotExist) and will keep raising every tick.
+            # Nothing downstream (the re-arm / cold-start counters) is ever reached
+            # on this path, so without a dedicated bound a dead terminal produces an
+            # unbounded per-tick traceback storm across every ghost terminal
+            # (harness-control#845). Bound it exactly like the re-arm and cold-start
+            # give-up paths (#598): count, never propagate, drop at the cap.
+            #
+            # D15 reset RETAINED (merge decision): a failed probe is NOT evidence
+            # of definitive absence, so clear the definitive-absence counter here —
+            # that reset is load-bearing for orphan-reconciliation correctness and
+            # is independent of #598's decision to bound rather than propagate.
             self._f138_probe_gone_count.pop(terminal_id, None)
-            raise
+            return self._bound_probe_failure(terminal_id, dispatch_epoch)
         now = time.monotonic()
 
         # D19: Check epoch staleness after probe returns — if authority has changed
@@ -984,6 +1053,10 @@ class FifoManager:
             # and never cleaned up, leaking slowly across create/stop churn.
             if terminal_id not in self._pane_probe:
                 return
+            # probe() succeeded — the session is reachable again, so clear any
+            # accumulated probe-failure strikes (harness-control#845): a brief
+            # transient must never accumulate across recoveries into a false drop.
+            self._probe_failures.pop(terminal_id, None)
             last_data_at = self._last_data_at.get(terminal_id, 0.0)
 
             # ---- cold-start check (harness-control#93) ----

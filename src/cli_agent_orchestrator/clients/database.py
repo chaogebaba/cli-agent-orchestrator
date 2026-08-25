@@ -5342,6 +5342,27 @@ def _stamp_enqueue_generation(db: Any, row_fields: dict[str, Any]) -> dict[str, 
     return fields
 
 
+def delete_terminals_by_ids(terminal_ids: List[str]) -> int:
+    """Delete specific terminal rows by id. Returns the number deleted.
+
+    Unlike ``delete_terminals_by_session`` (which deletes EVERY row for a
+    session name), this deletes only the given ids. Session teardown uses it to
+    scope its reconciliation sweep to the incarnation it started tearing down,
+    so a concurrent same-name recreate — whose rows carry freshly generated ids
+    — is never swept (#498).
+    """
+    if not terminal_ids:
+        return 0
+    with SessionLocal() as db:
+        deleted = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.id.in_(terminal_ids))
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        return deleted
+
+
 def _inbox_message_from_row(row: Any) -> InboxMessage:
     return InboxMessage(
         id=row.id,

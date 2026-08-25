@@ -185,8 +185,12 @@ class TestCreateTerminalHerdrRegistration:
         "site,code,post_publish",
         [
             ("window", "window_create_failed", False),
-            ("fifo_reader", "fifo_create_failed", False),
-            ("pipe_pane", "fifo_create_failed", False),
+            # A1 (#498) publishes the registry row INSIDE the lifecycle-locked
+            # closure, BEFORE the FIFO/pipe-pane is wired up. A FIFO failure
+            # therefore now occurs post-publish, so the outer rollback deletes the
+            # committed row (previously the row did not yet exist at this point).
+            ("fifo_reader", "fifo_create_failed", True),
+            ("pipe_pane", "fifo_create_failed", True),
             ("db", "db_publish_failed", False),
             ("context", "context_build_failed", True),
             ("provider", "provider_construct_failed", True),

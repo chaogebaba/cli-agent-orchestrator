@@ -914,6 +914,7 @@ class TestDeleteSession:
         self, mock_backend, mock_list, mock_preflight, mock_delete
     ):
         mock_backend.return_value.session_exists.return_value = True
+        mock_backend.return_value.session_exists_strict.return_value = True
         mock_list.return_value = [{"id": "plain"}, {"id": "protected"}]
         mock_preflight.side_effect = [None, ValueError("protected")]
 
@@ -942,6 +943,7 @@ class TestDeleteSession:
         the backend session and returns the Dict result shape.
         """
         mock_get_backend.return_value.session_exists.side_effect = [True, False, False]
+        mock_get_backend.return_value.session_exists_strict.side_effect = [True, False, False]
         mock_list_terminals.return_value = [
             {"id": "terminal1"},
             {"id": "terminal2"},
@@ -967,6 +969,7 @@ class TestDeleteSession:
         """Backend session already gone — delete_session should not raise and not
         call kill_session, but still tear down each terminal via delete_terminal."""
         mock_get_backend.return_value.session_exists.return_value = False
+        mock_get_backend.return_value.session_exists_strict.return_value = False
         mock_list_terminals.return_value = [{"id": "terminal1"}]
 
         result = delete_session("cao-test")
@@ -983,6 +986,7 @@ class TestDeleteSession:
     ):
         """Test deleting session with no terminals."""
         mock_get_backend.return_value.session_exists.side_effect = [True, False, False]
+        mock_get_backend.return_value.session_exists_strict.side_effect = [True, False, False]
         mock_list_terminals.return_value = []
 
         result = delete_session("cao-test")
@@ -996,6 +1000,7 @@ class TestDeleteSession:
     def test_delete_session_error(self, mock_get_backend, mock_list_terminals):
         """Test deleting session with error."""
         mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists_strict.return_value = True
         mock_list_terminals.side_effect = Exception("Database error")
 
         with pytest.raises(Exception, match="Database error"):
@@ -1009,6 +1014,7 @@ class TestDeleteSession:
     ):
         """Test that delete_session continues even when terminal teardown fails for some terminals."""
         mock_get_backend.return_value.session_exists.side_effect = [True, False, False]
+        mock_get_backend.return_value.session_exists_strict.side_effect = [True, False, False]
         mock_list_terminals.return_value = [
             {"id": "terminal1"},
             {"id": "terminal2"},
@@ -1040,6 +1046,7 @@ class TestDeleteSession:
         """If tmux still reports the session after graceful cleanup, kill it again."""
         backend = mock_get_backend.return_value
         backend.session_exists.side_effect = [True, True, False, False]
+        backend.session_exists_strict.side_effect = [True, True, False, False]
         mock_list_terminals.return_value = []
 
         result = delete_session("cao-test")
@@ -1059,6 +1066,7 @@ class TestDeleteSession:
         """A still-live tmux session is an error so callers do not relaunch into 400."""
         backend = mock_get_backend.return_value
         backend.session_exists.return_value = True
+        backend.session_exists_strict.return_value = True
         mock_list_terminals.return_value = []
 
         with pytest.raises(RuntimeError, match="still exists after teardown"):
@@ -1074,6 +1082,7 @@ class TestDeleteSession:
     ):
         """An explicit retryable teardown result must not be reported deleted."""
         mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists_strict.return_value = True
         mock_list_terminals.return_value = [{"id": "grok-terminal"}]
         mock_delete_terminal.return_value = False
 
@@ -1093,6 +1102,7 @@ class TestDeleteSession:
     ):
         """Test that delete_session tears down every terminal in the session."""
         mock_get_backend.return_value.session_exists.side_effect = [True, False, False]
+        mock_get_backend.return_value.session_exists_strict.side_effect = [True, False, False]
         mock_list_terminals.return_value = [
             {"id": "term-aaa"},
             {"id": "term-bbb"},
@@ -1111,3 +1121,108 @@ class TestDeleteSession:
             "term-ccc",
             "term-ddd",
         ]
+
+
+
+class TestCancelledCreateRollsBackRichPublication:
+    """#498 merge (A1) constraint 1: a create whose awaiter is cancelled AFTER the
+    off-loop closure committed must roll back EVERY terminal-owned artifact the
+    fork's rich publication writes — not just a plain terminals row.
+
+    The closure publishes, in one transaction: the terminals row (carrying the
+    F332 ``auth_token`` column), a fork ``warm_intents`` row, and a
+    ``callback_barrier_member`` binding. The compensator
+    (``_roll_back_cancelled_create`` -> ``db_delete_terminal`` ->
+    ``delete_terminal_and_warm_intent``) must leave none of them orphaned:
+
+    * terminals row (and with it the auth_token) — DELETED.
+    * warm_intents row — DELETED.
+    * callback_barrier_member — SETTLED to GONE (not left AWAITING). The row is
+      retained by design as the settled record that fires/short-circuits the
+      barrier; "orphaned" would be an AWAITING member for a terminal that no
+      longer exists, which is exactly what this prevents.
+    """
+
+    def test_compensator_removes_warm_intent_barrier_member_and_auth_row(
+        self, real_session_db, monkeypatch
+    ):
+        from datetime import datetime, timezone
+
+        from cli_agent_orchestrator.clients import database as _db
+
+        session_name = "cao-cancel-rollback"
+        caller_id = "caller01"
+        worker_id = "worker01"
+        window_name = "developer-worker01"
+
+        # Backend is mocked: the compensator's _roll_back_backend_create_locked
+        # kills the session/window this create made. We only care that it does
+        # not raise and that the DB artifacts are gone afterward.
+        backend = MagicMock()
+        backend.kill_session.return_value = True
+        backend.kill_window.return_value = True
+        monkeypatch.setattr(backend_registry, "_backend", backend)
+
+        # Seed a caller terminal + its mailbox so the barrier owner resolves, then
+        # publish the worker exactly as the locked closure would: warm intent +
+        # dispatch barrier + auth token, all in one publication.
+        _db.create_terminal(
+            caller_id,
+            session_name,
+            "supervisor-caller01",
+            "kiro_cli",
+            "code_supervisor",
+            ["*"],
+        )
+        _db.create_terminal_with_warm_intent(
+            terminal_id=worker_id,
+            tmux_session=session_name,
+            tmux_window=window_name,
+            provider="kiro_cli",
+            agent_profile="developer",
+            allowed_tools=["*"],
+            caller_id=caller_id,
+            parent_base_name="base-dev",
+            fork_mode="fork",
+            dispatch_barrier={"label": "cancel-rollback-barrier", "timeout_seconds": 60},
+            auth_token="secret-token-xyz",
+        )
+
+        # Sanity: every artifact the rich publication writes is present.
+        with _db.SessionLocal() as db:
+            assert db.query(_db.TerminalModel).filter_by(id=worker_id).count() == 1
+            assert (
+                db.query(_db.TerminalModel).filter_by(id=worker_id).one().auth_token
+                == "secret-token-xyz"
+            )
+            assert (
+                db.query(_db.WarmIntentModel).filter_by(worker_terminal_id=worker_id).count() == 1
+            )
+            member = (
+                db.query(_db.CallbackBarrierMemberModel).filter_by(terminal_id=worker_id).one()
+            )
+            assert member.state == "AWAITING"
+
+        # The awaiter was cancelled after the worker committed: compensate.
+        terminal_service._roll_back_cancelled_create(
+            session_name,
+            worker_id,
+            window_name,
+            created_session=True,
+        )
+
+        # Backend rollback fired for the session this create made.
+        backend.kill_session.assert_called_once_with(session_name)
+
+        # Zero terminal + warm-intent rows survive (auth_token dies with the row);
+        # the barrier member is settled to GONE rather than left AWAITING.
+        with _db.SessionLocal() as db:
+            assert db.query(_db.TerminalModel).filter_by(id=worker_id).count() == 0
+            assert (
+                db.query(_db.WarmIntentModel).filter_by(worker_terminal_id=worker_id).count() == 0
+            )
+            members = (
+                db.query(_db.CallbackBarrierMemberModel).filter_by(terminal_id=worker_id).all()
+            )
+            assert all(m.state == "GONE" for m in members)
+            assert not any(m.state == "AWAITING" for m in members)

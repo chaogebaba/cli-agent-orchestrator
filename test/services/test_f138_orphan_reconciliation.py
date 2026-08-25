@@ -2279,8 +2279,27 @@ class TestD15DefinitiveAbsence:
             manager._check_pipe_liveness("t-unk")  # unknown → reset + raise
         assert manager._f138_probe_gone_count.get("t-unk") is None  # reset
 
-    def test_other_exception_resets_and_propagates(self, tmp_path, monkeypatch):
-        """Non-ValueError exceptions reset counter and propagate."""
+    def test_other_exception_resets_and_is_bounded(self, tmp_path, monkeypatch):
+        """Non-ValueError probe exceptions reset the definitive-absence counter and
+        are BOUNDED (not propagated).
+
+        Merge decision (upstream #598 + fork D15): #598's storm-bound owns the
+        generic-exception path — a probe that keeps raising because the
+        session/window/whole tmux server is gone must never propagate to
+        _watchdog_loop (whose ``except Exception: logger.exception`` would log a
+        full traceback per terminal per tick — the 578k-line storm). It is caught,
+        counted, and the terminal is dropped at PIPE_LIVENESS_MAX_PROBE_FAILURES.
+
+        D15's RESET semantic is RETAINED and is what this still pins: a failed
+        probe is NOT evidence of definitive absence, so the definitive-absence
+        counter is cleared on this path (load-bearing for orphan reconciliation).
+        This test was ``test_other_exception_resets_and_propagates`` pre-merge;
+        the propagate half collided head-on with #598 and was adapted to
+        bounded-drop, the reset half is unchanged.
+        """
+        import cli_agent_orchestrator.services.fifo_reader as fr
+
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_MAX_PROBE_FAILURES", 3)
         manager = self._make_manager(tmp_path, monkeypatch)
 
         call_count = [0]
@@ -2296,9 +2315,18 @@ class TestD15DefinitiveAbsence:
         manager._last_data_at["t-rt"] = time.monotonic()
 
         manager._check_pipe_liveness("t-rt")  # definitive (count=1)
-        with pytest.raises(RuntimeError, match="tmux binary"):
-            manager._check_pipe_liveness("t-rt")  # other → reset + raise
-        assert manager._f138_probe_gone_count.get("t-rt") is None
+        # Generic exception: reset the definitive-absence counter, and DO NOT
+        # propagate (bounded per #598) — each call returns normally.
+        manager._check_pipe_liveness("t-rt")  # other → reset + counted (1/3)
+        assert manager._f138_probe_gone_count.get("t-rt") is None  # D15 reset retained
+        assert manager._probe_failures.get("t-rt") == 1  # #598 counting
+
+        # Keep failing until the cap: the terminal is dropped from the watchdog
+        # with no propagation, exactly like the re-arm / cold-start give-up paths.
+        manager._check_pipe_liveness("t-rt")  # 2/3
+        manager._check_pipe_liveness("t-rt")  # 3/3 → drop
+        assert "t-rt" not in manager._pane_probe
+        assert "t-rt" not in manager._probe_failures
 
     def test_terminal_reuse_starts_clean(self, tmp_path, monkeypatch):
         """After unenroll + re-registration, counter starts at 0."""
