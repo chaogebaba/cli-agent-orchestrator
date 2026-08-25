@@ -23,11 +23,11 @@ from cli_agent_orchestrator.clients.tmux import TmuxClient
 class TestCodexHomeAllowlist:
     """CODEX_HOME must pass through the blocked-prefix filter only with explicit escape."""
 
-    def test_codex_home_blocked_by_prefix(self):
+    def test_codex_home_blocked_by_prefix(self) -> None:
         """CODEX_HOME is blocked by the CODEX_ prefix — no wholesale allowlist."""
         assert TmuxClient._is_blocked_env_key("CODEX_HOME") is True
 
-    def test_codex_home_passes_with_allowed_blocked_values(self):
+    def test_codex_home_passes_with_allowed_blocked_values(self) -> None:
         """Persona-context CODEX_HOME passes when caller threads the value explicitly."""
         persona_home = "/run/user/1000/cao-personas/abc/current/gen-1/codex-home"
         env: dict[str, str] = {}
@@ -38,7 +38,7 @@ class TestCodexHomeAllowlist:
         )
         assert env["CODEX_HOME"] == persona_home
 
-    def test_codex_home_rejected_without_allowed_blocked_values(self):
+    def test_codex_home_rejected_without_allowed_blocked_values(self) -> None:
         """Without explicit escape, CODEX_HOME is dropped even with a valid-looking path."""
         env: dict[str, str] = {}
         TmuxClient._merge_extra_env(
@@ -46,7 +46,7 @@ class TestCodexHomeAllowlist:
         )
         assert "CODEX_HOME" not in env
 
-    def test_other_codex_prefixed_vars_still_blocked(self):
+    def test_other_codex_prefixed_vars_still_blocked(self) -> None:
         """CODEX_TOKEN and similar must still be blocked."""
         assert TmuxClient._is_blocked_env_key("CODEX_TOKEN") is True
         assert TmuxClient._is_blocked_env_key("CODEX_SESSION_ID") is True
@@ -55,7 +55,7 @@ class TestCodexHomeAllowlist:
 class TestPersonaCodexHomeSessionsSymlink:
     """The persona codex-home must include a sessions symlink to production home."""
 
-    def test_sessions_symlink_created_during_compose(self, tmp_path, monkeypatch):
+    def test_sessions_symlink_created_during_compose(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """compose_persona_plan creates sessions symlink in codex-home."""
         # Set up fake production codex home with sessions dir
         fake_codex_home = tmp_path / "codex-home-prod"
@@ -109,7 +109,7 @@ class TestPersonaCodexHomeSessionsSymlink:
 class TestValidateSessionArtifactWithPersonaHome:
     """validate_session_artifact must find rollouts through persona home symlink."""
 
-    def test_finds_rollout_via_sessions_symlink(self, tmp_path, monkeypatch):
+    def test_finds_rollout_via_sessions_symlink(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """When persona codex-home has sessions → production symlink, validation passes."""
         from cli_agent_orchestrator.providers.codex import CodexProvider
 
@@ -143,7 +143,7 @@ class TestValidateSessionArtifactWithPersonaHome:
         # Should NOT raise
         provider.validate_session_artifact(uuid, "/work")
 
-    def test_fails_without_symlink(self, tmp_path, monkeypatch):
+    def test_fails_without_symlink(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Without sessions symlink, validation raises RetryableArtifactValidation."""
         from cli_agent_orchestrator.providers.base import RetryableArtifactValidation
         from cli_agent_orchestrator.providers.codex import CodexProvider
@@ -167,13 +167,13 @@ class TestValidateSessionArtifactWithPersonaHome:
 class TestCodexHomeArbitraryValueDropped:
     """Regression: arbitrary CODEX_HOME (neither plane nor persona) must be dropped."""
 
-    def test_arbitrary_codex_home_dropped_no_escape(self):
+    def test_arbitrary_codex_home_dropped_no_escape(self) -> None:
         """A random CODEX_HOME value with no allowed_blocked_values is dropped."""
         env: dict[str, str] = {}
         TmuxClient._merge_extra_env(env, {"CODEX_HOME": "/tmp/attacker/.codex"})
         assert "CODEX_HOME" not in env
 
-    def test_arbitrary_codex_home_dropped_wrong_allowed_value(self):
+    def test_arbitrary_codex_home_dropped_wrong_allowed_value(self) -> None:
         """CODEX_HOME dropped when value doesn't match allowed_blocked_values."""
         env: dict[str, str] = {}
         TmuxClient._merge_extra_env(
@@ -183,7 +183,7 @@ class TestCodexHomeArbitraryValueDropped:
         )
         assert "CODEX_HOME" not in env
 
-    def test_arbitrary_codex_home_dropped_with_plane_mismatch(self, monkeypatch):
+    def test_arbitrary_codex_home_dropped_with_plane_mismatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """CODEX_HOME dropped when value doesn't match plane environment either."""
         from cli_agent_orchestrator.utils import provider_plane
 

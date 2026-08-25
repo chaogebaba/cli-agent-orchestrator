@@ -106,6 +106,8 @@ class FakeBackend(TerminalBackend):
         terminal_id: str,
         working_directory: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        terminal_token: Optional[str] = None,
+        allowed_blocked_values: Optional[Dict[str, str]] = None,
     ) -> str:
         with self._lock:
             self._sessions[session_name] = {window_name}
@@ -136,6 +138,8 @@ class FakeBackend(TerminalBackend):
         working_directory: Optional[str] = None,
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        terminal_token: Optional[str] = None,
+        allowed_blocked_values: Optional[Dict[str, str]] = None,
     ) -> str:
         with self._lock:
             if session_name not in self._sessions:
