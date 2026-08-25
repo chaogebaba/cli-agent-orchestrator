@@ -330,6 +330,7 @@ class HerdrBackend(TerminalBackend):
         working_directory: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
         terminal_token: Optional[str] = None,
+        allowed_blocked_values: Optional[Dict[str, str]] = None,
     ) -> str:
         """Create a herdr workspace (= CAO session) with an initial tab."""
         import os
@@ -341,7 +342,7 @@ class HerdrBackend(TerminalBackend):
             args.extend(["--cwd", working_directory])
         # Inject CAO identity + operator-forwarded env natively via --env
         # (replaces the former shell ``export`` send-text injection).
-        args.extend(self._build_env_args(terminal_id, session_name, extra_env, terminal_token=terminal_token))
+        args.extend(self._build_env_args(terminal_id, session_name, extra_env, terminal_token=terminal_token, allowed_blocked_values=allowed_blocked_values))
 
         result = self._run_herdr(args)
 
@@ -484,6 +485,7 @@ class HerdrBackend(TerminalBackend):
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
         terminal_token: Optional[str] = None,
+        allowed_blocked_values: Optional[Dict[str, str]] = None,
     ) -> str:
         """Create a new tab in the workspace."""
         import os
@@ -498,7 +500,7 @@ class HerdrBackend(TerminalBackend):
             args.extend(["--cwd", working_directory])
         # Inject CAO identity + operator-forwarded env natively via --env
         # (replaces the former shell ``export`` send-text injection).
-        args.extend(self._build_env_args(terminal_id, session_name, extra_env, terminal_token=terminal_token))
+        args.extend(self._build_env_args(terminal_id, session_name, extra_env, terminal_token=terminal_token, allowed_blocked_values=allowed_blocked_values))
 
         result = self._run_herdr(args)
 
@@ -1010,6 +1012,7 @@ class HerdrBackend(TerminalBackend):
         session_name: str,
         extra_env: Optional[Dict[str, str]] = None,
         terminal_token: Optional[str] = None,
+        allowed_blocked_values: Optional[Dict[str, str]] = None,
     ) -> List[str]:
         """Build ``--env KEY=VALUE`` argument pairs for a create command.
 
@@ -1021,6 +1024,12 @@ class HerdrBackend(TerminalBackend):
         replaces the former shell ``export`` injection, removing the
         command-line injection surface.
 
+        ``allowed_blocked_values`` is an explicit per-key escape hatch for vars
+        that match a blocked prefix but carry a known-safe value (e.g.
+        CODEX_HOME injected by persona-context). Only the exact value listed is
+        permitted; any other value is dropped with the standard warning. This
+        mirrors the identical escape in TmuxClient._merge_extra_env.
+
         Note: on herdr, env VALUES pass through the herdr arg sanitizer, which
         rejects shell metacharacters and control chars. A value containing e.g.
         ``$ ; | & ! * ? < >`` will fail terminal creation on herdr (fail-closed),
@@ -1030,9 +1039,26 @@ class HerdrBackend(TerminalBackend):
         """
         from cli_agent_orchestrator.clients.tmux import TmuxClient
 
+        _allowed = allowed_blocked_values or {}
         env: Dict[str, str] = {}
         for key, value in (extra_env or {}).items():
             if TmuxClient._is_blocked_env_key(key):
+                # Plane-pin escape: value matches provider_plane_environment().
+                if os.environ.get("CAO_INSTANCE_ID", "").strip() and key in {
+                    "CODEX_HOME",
+                    "CLAUDE_CONFIG_DIR",
+                }:
+                    from cli_agent_orchestrator.utils.provider_plane import (
+                        provider_plane_environment,
+                    )
+
+                    if provider_plane_environment().get(key) == value:
+                        env[key] = value
+                        continue
+                # Caller-threaded escape: value matches an explicitly allowed value.
+                if key in _allowed and _allowed[key] == value:
+                    env[key] = value
+                    continue
                 logger.warning("Dropping forwarded env var with blocked prefix: %s", key)
                 continue
             if len(value.encode("utf-8")) >= TmuxClient._MAX_ENV_VALUE_BYTES:

@@ -619,11 +619,6 @@ class TmuxClient:
             "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
             "CLAUDE_CODE_SKIP_VERTEX_AUTH",
             "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
-            # CODEX_HOME is the config/session directory — not a nesting vector.
-            # Persona isolation injects it via sandbox_guard; dropping it breaks
-            # the session-artifact validator (it resolves persona codex_home while
-            # the codex binary falls back to ~/.codex).
-            "CODEX_HOME",
         }
     )
     # Per-var value cap (PR #246) — keeps the full tmux ``new-session -e`` /
@@ -639,18 +634,32 @@ class TmuxClient:
 
     @classmethod
     def _merge_extra_env(
-        cls, environment: Dict[str, str], extra_env: Optional[Dict[str, str]]
+        cls,
+        environment: Dict[str, str],
+        extra_env: Optional[Dict[str, str]],
+        *,
+        allowed_blocked_values: Optional[Dict[str, str]] = None,
     ) -> None:
         """Merge operator-supplied env vars into ``environment`` in place.
 
         Mirrors the safety constraints applied to inherited env (blocked
         prefixes, 2048-byte value cap) so a malformed --env entry cannot
         slip past the validation that runs at the CLI boundary.
+
+        ``allowed_blocked_values`` is an explicit per-key escape hatch for vars
+        that match a blocked prefix but carry a known-safe value (e.g.
+        CODEX_HOME injected by persona-context or the provider plane). Only the
+        exact value listed is permitted; any other value is dropped with the
+        standard warning. This keeps the filter closed-by-default while letting
+        callers thread specific known-good values from upstream (persona plan,
+        plane env) without a global allowlist.
         """
         if not extra_env:
             return
+        _allowed = allowed_blocked_values or {}
         for key, value in extra_env.items():
             if cls._is_blocked_env_key(key):
+                # Plane-pin escape: value matches provider_plane_environment().
                 if os.environ.get("CAO_INSTANCE_ID", "").strip() and key in {
                     "CODEX_HOME",
                     "CLAUDE_CONFIG_DIR",
@@ -662,6 +671,10 @@ class TmuxClient:
                     if provider_plane_environment().get(key) == value:
                         environment[key] = value
                         continue
+                # Caller-threaded escape: value matches an explicitly allowed value.
+                if key in _allowed and _allowed[key] == value:
+                    environment[key] = value
+                    continue
                 logger.warning("Dropping forwarded env var with blocked prefix: %s", key)
                 continue
             if len(value.encode("utf-8")) >= cls._MAX_ENV_VALUE_BYTES:
@@ -681,6 +694,7 @@ class TmuxClient:
         working_directory: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
         terminal_token: Optional[str] = None,
+        allowed_blocked_values: Optional[Dict[str, str]] = None,
     ) -> str:
         """Create detached tmux session with initial window and return window name."""
         try:
@@ -718,7 +732,9 @@ class TmuxClient:
             # the inherited slice and override on key collision, so an
             # explicit ``--env AWS_REGION=us-west-2`` wins over the inherited
             # value. See issue #248.
-            self._merge_extra_env(environment, extra_env)
+            self._merge_extra_env(
+                environment, extra_env, allowed_blocked_values=allowed_blocked_values
+            )
             environment["CAO_TERMINAL_ID"] = terminal_id
             if terminal_token:
                 environment["CAO_TERMINAL_TOKEN"] = terminal_token
@@ -808,6 +824,7 @@ class TmuxClient:
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
         terminal_token: Optional[str] = None,
+        allowed_blocked_values: Optional[Dict[str, str]] = None,
     ) -> str:
         """Create window in session and return window name.
 
@@ -823,7 +840,9 @@ class TmuxClient:
                 raise ValueError(f"Session '{session_name}' not found")
 
             window_env: dict[str, str] = {}
-            self._merge_extra_env(window_env, extra_env)
+            self._merge_extra_env(
+                window_env, extra_env, allowed_blocked_values=allowed_blocked_values
+            )
             window_env["CAO_TERMINAL_ID"] = terminal_id
             if terminal_token:
                 window_env["CAO_TERMINAL_TOKEN"] = terminal_token

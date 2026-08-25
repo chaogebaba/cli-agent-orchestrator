@@ -1420,3 +1420,134 @@ class TestEnvValueRedaction:
         msg = str(exc.value)
         assert "s3cr3t$token" not in msg
         assert "<redacted>" in msg
+
+
+
+# --- Herdr allowed_blocked_values propagation (F450 r2) ---
+
+
+class TestHerdrAllowedBlockedValues:
+    """Regression: allowed_blocked_values must be threaded through _build_env_args.
+
+    Without this fix, a persona CODEX_HOME passed via terminal_service is dropped
+    by the blocked-prefix filter in Herdr's env construction, reverting d5640c95.
+    """
+
+    @pytest.fixture
+    def backend(self) -> "HerdrBackend":
+        with patch(
+            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
+            return_value=True,
+        ):
+            return HerdrBackend(send_delay_ms=0)
+
+    def test_persona_codex_home_accepted_via_allowed_blocked_values(
+        self, backend: "HerdrBackend"
+    ) -> None:
+        """CODEX_HOME with exact allowed value passes through _build_env_args."""
+        persona_home = "/run/user/1000/cao-personas/abc/gen-1/codex-home"
+        args = backend._build_env_args(
+            "tid1",
+            "sess",
+            extra_env={"CODEX_HOME": persona_home},
+            allowed_blocked_values={"CODEX_HOME": persona_home},
+        )
+        joined = " ".join(args)
+        assert f"CODEX_HOME={persona_home}" in joined
+
+    def test_arbitrary_codex_home_dropped_without_escape(
+        self, backend: "HerdrBackend"
+    ) -> None:
+        """CODEX_HOME with no allowed_blocked_values is dropped."""
+        args = backend._build_env_args(
+            "tid1",
+            "sess",
+            extra_env={"CODEX_HOME": "/tmp/attacker/.codex"},
+        )
+        joined = " ".join(args)
+        assert "CODEX_HOME" not in joined
+
+    def test_mismatched_allowed_value_still_dropped(
+        self, backend: "HerdrBackend"
+    ) -> None:
+        """CODEX_HOME dropped when value doesn't match allowed_blocked_values."""
+        args = backend._build_env_args(
+            "tid1",
+            "sess",
+            extra_env={"CODEX_HOME": "/tmp/attacker/.codex"},
+            allowed_blocked_values={"CODEX_HOME": "/legit/persona/codex-home"},
+        )
+        joined = " ".join(args)
+        assert "CODEX_HOME" not in joined
+
+    @patch("subprocess.run")
+    def test_create_session_threads_allowed_blocked_values(
+        self, mock_run: "MagicMock", backend: "HerdrBackend"
+    ) -> None:
+        """create_session propagates allowed_blocked_values into env construction."""
+        ws_resp = _completed(
+            json.dumps(
+                {
+                    "id": "cli:workspace:create",
+                    "result": {
+                        "workspace_id": "w_new",
+                        "root_pane": {
+                            "pane_id": "w_new-1",
+                            "workspace_id": "w_new",
+                            "tab_id": "tab-0",
+                        },
+                        "type": "workspace_created",
+                    },
+                }
+            )
+        )
+        mock_run.side_effect = [ws_resp, _completed()]  # create + tab rename
+
+        persona_home = "/run/user/1000/cao-personas/abc/gen-1/codex-home"
+        backend.create_session(
+            "cao-proj",
+            "win-0",
+            "tid1",
+            "/work",
+            extra_env={"CODEX_HOME": persona_home},
+            allowed_blocked_values={"CODEX_HOME": persona_home},
+        )
+
+        cmd = mock_run.call_args_list[0][0][0]
+        assert f"CODEX_HOME={persona_home}" in cmd
+
+    @patch("subprocess.run")
+    def test_create_window_threads_allowed_blocked_values(
+        self, mock_run: "MagicMock", backend: "HerdrBackend"
+    ) -> None:
+        """create_window propagates allowed_blocked_values into env construction."""
+        ws = [{"label": "cao-proj", "workspace_id": "w1"}]
+        tab_resp = _completed(
+            json.dumps(
+                {
+                    "id": "cli:tab:create",
+                    "result": {
+                        "root_pane": {"pane_id": "p-new", "workspace_id": "w1", "tab_id": "t1"},
+                        "type": "tab_created",
+                    },
+                }
+            )
+        )
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),  # resolve workspace
+            tab_resp,  # tab create
+        ]
+
+        persona_home = "/run/user/1000/cao-personas/abc/gen-1/codex-home"
+        backend.create_window(
+            "cao-proj",
+            "win-1",
+            "tid2",
+            "/work",
+            extra_env={"CODEX_HOME": persona_home},
+            allowed_blocked_values={"CODEX_HOME": persona_home},
+        )
+
+        # tab create call is the second subprocess call
+        cmd = mock_run.call_args_list[1][0][0]
+        assert f"CODEX_HOME={persona_home}" in cmd
