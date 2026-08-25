@@ -574,21 +574,16 @@ class TestSessionFilePinning:
 
         assert provider._resolve_rollout_file(None) == rollout
 
-    def test_no_uuid_no_resume_uses_newest(self, patched_codex_home: Path):
-        """No UUID, no resume seed → newest rollout file returned."""
+    def test_no_uuid_no_resume_returns_none(self, patched_codex_home: Path):
+        """No UUID, no resume seed → returns None immediately (avoids DB)."""
         sessions = patched_codex_home / "sessions"
         (sessions / "a").mkdir(parents=True)
-        (sessions / "b").mkdir(parents=True)
-        older = sessions / "a" / "rollout-aaa.jsonl"
-        newer = sessions / "b" / "rollout-bbb.jsonl"
-        older.write_text("{}\n")
+        newer = sessions / "a" / "rollout-aaa.jsonl"
         newer.write_text("{}\n")
-        os.utime(older, (1000, 1000))
-        os.utime(newer, (2000, 2000))
 
         provider = _provider()
         provider._fork_context = None
-        assert provider._resolve_rollout_file(None) == newer
+        assert provider._resolve_rollout_file(None) is None
 
     def test_no_sessions_dir_returns_none(self, patched_codex_home: Path):
         """No sessions directory → None (poll for creation)."""

@@ -1706,7 +1706,16 @@ class CodexProvider(BaseProvider):
           3. No UUID (fresh session before capture): fall back to the resume
              seed (``self._fork_context.session_uuid`` when mode == resume), or
              the single newest rollout file in the sessions dir.
+
+        Returns None without touching the filesystem/DB when no UUID is
+        available and no resume seed exists (test/DB-free environments).
         """
+        # Early exit: no UUID and no resume seed → nothing to resolve.
+        if not session_uuid:
+            resume_uuid = self.resume_session_uuid()
+            if not resume_uuid:
+                return None
+
         try:
             sessions_dir = _resolved_codex_home(getattr(self, "terminal_id", None)) / "sessions"
         except Exception:
