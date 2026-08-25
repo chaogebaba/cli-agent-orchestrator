@@ -289,7 +289,8 @@ class TestF186ReconcilerPassesFlag:
             patch(
                 "cli_agent_orchestrator.services.config_service.ConfigService.get",
                 side_effect=lambda key, *a, **kw: True if key in (
-                    "supervisor.mailbox_pull", "supervisor.teammate_push"
+                    "supervisor.mailbox_pull", "supervisor.teammate_push",
+                    "supervisor.wake.native",
                 ) else None,
             ),
             patch(
@@ -400,7 +401,8 @@ class TestF186ReconcilerPassesFlag:
             patch(
                 "cli_agent_orchestrator.services.config_service.ConfigService.get",
                 side_effect=lambda key, *a, **kw: True if key in (
-                    "supervisor.mailbox_pull", "supervisor.teammate_push"
+                    "supervisor.mailbox_pull", "supervisor.teammate_push",
+                    "supervisor.wake.native",
                 ) else None,
             ),
             patch(

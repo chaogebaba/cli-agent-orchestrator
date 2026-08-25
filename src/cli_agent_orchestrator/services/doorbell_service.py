@@ -71,6 +71,31 @@ def _rate_limited_warn(terminal_id: str, reason: str, row_id: int) -> None:
     )
 
 
+def _is_row_still_pending(row_id: int) -> bool:
+    """F457: Re-check whether a specific inbox row is still PENDING at ring time.
+
+    Returns True if the row exists and is PENDING, False otherwise (acked/delivered/gone).
+    Fail-open on DB errors to avoid blocking the doorbell on transient failures.
+    """
+    try:
+        from cli_agent_orchestrator.clients.database import SessionLocal
+        from cli_agent_orchestrator.models.database import InboxModel
+        from cli_agent_orchestrator.models.inbox import MessageStatus
+
+        with SessionLocal() as db:
+            status = (
+                db.query(InboxModel.status)
+                .filter(InboxModel.id == row_id)
+                .scalar()
+            )
+            if status is None:
+                return False
+            return status == MessageStatus.PENDING.value
+    except Exception:
+        # Fail-open: if DB is unavailable, allow the ring to proceed.
+        return True
+
+
 def ring_supervisor_doorbell(
     terminal_id: str,
     max_written_row_id: int,
@@ -113,6 +138,14 @@ def ring_supervisor_doorbell(
             terminal_id, max_written_row_id,
         )
         return "skipped_dedup"
+
+    # F457: acked-row dedupe — skip the wake if the row is no longer PENDING.
+    if not _is_row_still_pending(max_written_row_id):
+        logger.info(
+            "f170_doorbell terminal=%s decision=skipped_acked reason=row_not_pending row=%s",
+            terminal_id, max_written_row_id,
+        )
+        return "skipped_acked"
 
     # FX170 D1: attempt native socket ring first (D2: no _should_teammate_push gate).
     native_enabled = ConfigService.get("supervisor.wake.native", default=True)

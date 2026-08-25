@@ -452,6 +452,13 @@ class TestFix4DeadD9Removed:
                 "cli_agent_orchestrator.services.inbox_service.begin_delivery_attempt",
                 MagicMock(),
             ),
+            patch(
+                "cli_agent_orchestrator.services.config_service.ConfigService.get",
+                side_effect=lambda k, default=None: True if k == "supervisor.wake.native" else default,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages_by_ids"
+            ) as mock_recheck,
         ):
             mock_lock = MagicMock()
             mock_lock.acquire.return_value = True
@@ -462,6 +469,7 @@ class TestFix4DeadD9Removed:
             mock_pull.return_value = True
             mock_should.return_value = True
             mock_push.return_value = True  # push succeeded
+            mock_recheck.return_value = [_msg()]  # F457: rows still pending
 
             service.deliver_pending(_TERMINAL_ID)
 
