@@ -3,12 +3,22 @@
 Symptom: dispatching a task to a codex TUI worker pastes the message into the
 composer, but the submit Enter is sometimes lost under concurrent multi-assign
 — the pane sits at ``› [Pasted Content NNNN chars]`` until the stalled-callback
-watchdog fires (~120s). Fix: after the send, verify the paste submitted; while
+watchdog fires (~120s). Fix: after the send, CONFIRM the paste submitted; while
 the stuck chip is present, re-send Enter with bounded retries; raise a clear
-error if it never submits. Idempotent — never blind-Enter a submitted composer.
+error if submission is never confirmed. Idempotent — never blind-Enter a
+submitted composer.
+
+r3 (round-2 gate BLOCKERS): confirmation now requires POSITIVE evidence that
+the composer submitted — the Working/Thinking spinner, or a chip→cleared
+TRANSITION — never the mere ABSENCE of the chip on a single capture. A stale
+pre-paste empty frame (BLOCKER B1) and a FAILED capture (BLOCKER B2) are both
+INDETERMINATE and must NOT commit as success; when submission cannot be
+positively confirmed within the bound, the hook raises ``CodexSubmitStuckError``
+so the send seam aborts the dispatch (retry-safe deferred delivery).
 
 These tests drive the provider's real ``verify_submission_after_send`` entry
-point with a mocked tmux backend and assert the observable Enter re-sends.
+point with a mocked tmux backend and assert the observable Enter re-sends and
+the confirmed/unconfirmed verdict.
 """
 
 from pathlib import Path
@@ -49,6 +59,11 @@ STUCK_CHIP_PANE = (
     "\n"
     "  ~/VScode_projects/cli-subagents · main · gpt-5.6-sol high\n"
 )
+# BLOCKER B1 visibility-lag stale frame: the FIRST post-send capture can still
+# be the pre-paste EMPTY composer — the chip has not rendered yet. Identical by
+# absence to a post-submit empty composer, so it must NOT be read as submitted
+# on its own; the durable chip appears on a later frame.
+STALE_PREPASTE_EMPTY_PANE = SUBMITTED_PLACEHOLDER_PANE
 # BLOCKER B1 scrollback-negatives: a HISTORICAL chip that has scrolled up into
 # transcript history, with the CURRENT composer now empty / Working. These MUST
 # read not-stuck — otherwise recovery blinds an already-submitted composer with
@@ -144,6 +159,32 @@ def test_active_chip_matches_in_anchored_composer():
         assert CodexProvider._pane_shows_pasted_chip(pane) is True
 
 
+# --- r3 positive-submission observers -------------------------------------
+
+
+def test_working_spinner_is_positive_submission():
+    """The Working/Thinking spinner is the unambiguous positive submit signal."""
+    assert CodexProvider._pane_shows_working(SUBMITTED_WORKING_PANE) is True
+    assert CodexProvider._pane_shows_working(HISTORICAL_CHIP_THEN_WORKING_PANE) is True
+    # A stuck chip / empty composer is NOT the spinner.
+    assert CodexProvider._pane_shows_working(STUCK_CHIP_PANE) is False
+    assert CodexProvider._pane_shows_working(SUBMITTED_PLACEHOLDER_PANE) is False
+    assert CodexProvider._pane_shows_working("") is False
+
+
+def test_cleared_composer_is_recognized_only_as_a_transition_signal():
+    """A cleared active composer is detected, but is only trusted post-chip.
+
+    ``_pane_shows_cleared_composer`` is True for an empty placeholder / empty
+    prompt, but that is DELIBERATELY not sufficient for submission on its own —
+    the hook requires a prior chip sighting (a chip→cleared transition) before
+    treating a cleared composer as submitted. This is what closes BLOCKER B1.
+    """
+    assert CodexProvider._pane_shows_cleared_composer(SUBMITTED_PLACEHOLDER_PANE) is True
+    assert CodexProvider._pane_shows_cleared_composer(STUCK_CHIP_PANE) is False
+    assert CodexProvider._pane_shows_cleared_composer("") is False
+
+
 # --- BLOCKER B1: composer-scoped detection (scrollback negatives) ----------
 
 
@@ -161,28 +202,22 @@ def test_historical_chip_with_working_composer_is_not_stuck():
     assert CodexProvider._pane_shows_pasted_chip(HISTORICAL_CHIP_THEN_WORKING_PANE) is False
 
 
-def test_historical_chip_negatives_send_no_enter_through_the_hook():
-    """End-to-end via the hook: historical-chip panes never re-Enter."""
-    for pane in (HISTORICAL_CHIP_THEN_EMPTY_PANE, HISTORICAL_CHIP_THEN_WORKING_PANE):
-        provider = _provider()
-        backend = _backend_returning(pane)
-        provider.verify_submission_after_send(METADATA, backend)
-        backend.send_special_key.assert_not_called()
+def test_historical_chip_then_working_confirms_without_enter():
+    """A scrollback chip with an active Working spinner confirms submission.
 
-
-# --- submitted immediately → no extra Enter -------------------------------
-
-
-def test_submitted_immediately_sends_no_extra_enter():
+    The spinner is positive evidence, so the hook returns without a re-Enter.
+    """
     provider = _provider()
-    backend = _backend_returning(SUBMITTED_PLACEHOLDER_PANE)
-
+    backend = _backend_returning(HISTORICAL_CHIP_THEN_WORKING_PANE)
     provider.verify_submission_after_send(METADATA, backend)
-
     backend.send_special_key.assert_not_called()
 
 
+# --- submitted immediately (POSITIVE evidence) → no extra Enter -----------
+
+
 def test_submitted_working_spinner_sends_no_extra_enter():
+    """The Working spinner is positive proof: confirm, send no extra Enter."""
     provider = _provider()
     backend = _backend_returning(SUBMITTED_WORKING_PANE)
 
@@ -191,12 +226,63 @@ def test_submitted_working_spinner_sends_no_extra_enter():
     backend.send_special_key.assert_not_called()
 
 
+# --- BLOCKER B1: a stale pre-paste empty frame must NOT commit as success --
+
+
+def test_stale_prepaste_empty_first_frame_is_not_accepted_as_success():
+    """The r2 bug: first capture is the stale pre-paste empty composer.
+
+    Absence of the chip on that first frame is NOT submission proof. The chip
+    renders on the next frame; the hook must re-observe, see the durable chip,
+    re-Enter, and only confirm on a positive transition — not return success
+    off the stale frame with zero Enters (the exact r2 failure).
+    """
+    provider = _provider()
+    # Frame 1: stale pre-paste empty composer (chip not rendered yet).
+    # Frames 2+: the durable stuck chip, until a re-Enter clears it.
+    panes = [STALE_PREPASTE_EMPTY_PANE, STUCK_CHIP_PANE]
+    reentered = {"done": False}
+
+    backend = MagicMock()
+
+    def _get_history(session, window, tail_lines=None, strip_escapes=False):
+        if reentered["done"]:
+            return SUBMITTED_WORKING_PANE
+        return panes.pop(0) if panes else STUCK_CHIP_PANE
+
+    def _send_special_key(session, window, key):
+        if key == "Enter":
+            reentered["done"] = True
+
+    backend.get_history.side_effect = _get_history
+    backend.send_special_key.side_effect = _send_special_key
+
+    provider.verify_submission_after_send(METADATA, backend)
+
+    # Recovery happened: at least one re-Enter, and it unstuck (Working seen).
+    assert _enter_calls(backend) >= 1
+
+
 # --- stuck then recovered → exactly the Enters needed ---------------------
 
 
 def test_stuck_then_recovered_after_one_reenter():
     provider = _provider()
-    # grace-check sees stuck; after one re-Enter the re-verify sees submitted.
+    # grace poll sees the chip (stuck); after one re-Enter the re-verify sees
+    # the Working spinner (positive submission).
+    backend = _backend_returning(STUCK_CHIP_PANE, SUBMITTED_WORKING_PANE)
+
+    provider.verify_submission_after_send(METADATA, backend)
+
+    assert _enter_calls(backend) == 1
+
+
+def test_stuck_then_cleared_composer_after_chip_is_submission():
+    """chip→cleared transition (not spinner) is accepted as submission."""
+    provider = _provider()
+    # grace poll: stuck chip; after one re-Enter: composer cleared to the
+    # empty placeholder. Because the chip was positively seen first, the
+    # cleared composer is a real submit transition, not a stale frame.
     backend = _backend_returning(STUCK_CHIP_PANE, SUBMITTED_PLACEHOLDER_PANE)
 
     provider.verify_submission_after_send(METADATA, backend)
@@ -207,7 +293,7 @@ def test_stuck_then_recovered_after_one_reenter():
 def test_stuck_then_recovered_after_two_reenters():
     provider = _provider()
     backend = _backend_returning(
-        STUCK_CHIP_PANE,  # initial grace check
+        STUCK_CHIP_PANE,  # initial grace poll
         STUCK_CHIP_PANE,  # re-verify after 1st Enter: still stuck
         SUBMITTED_WORKING_PANE,  # re-verify after 2nd Enter: submitted
     )
@@ -232,14 +318,42 @@ def test_stuck_forever_raises_after_bounded_retries():
     assert "term1234" in str(excinfo.value)
 
 
-# --- capture failure must not blind-Enter (idempotence safety) ------------
+# --- BLOCKER B2: capture failure is delivery-UNCONFIRMED (must raise) ------
 
 
-def test_capture_failure_is_treated_as_not_stuck():
-    """If the pane cannot be captured, we must NOT re-Enter (could double-submit)."""
+def test_capture_failure_raises_unconfirmed_and_sends_no_blind_enter():
+    """If the pane can NEVER be captured, submission is unconfirmed.
+
+    r2 swallowed the exception into "" and committed pretend-success. r3 must
+    treat the failure as INDETERMINATE — never blind-Enter (could double-submit)
+    AND never commit — and, since no positive submission is ever observed,
+    raise ``CodexSubmitStuckError`` so the seam aborts/defers the dispatch.
+    """
     provider = _provider()
     backend = MagicMock()
-    backend.get_history.side_effect = RuntimeError("tmux gone")
+    backend.get_history.side_effect = RuntimeError("concurrent pane capture unavailable")
+
+    with pytest.raises(CodexSubmitStuckError) as excinfo:
+        provider.verify_submission_after_send(METADATA, backend)
+
+    backend.send_special_key.assert_not_called()
+    assert "term1234" in str(excinfo.value)
+
+
+def test_capture_failure_then_recovery_is_confirmed():
+    """A transient capture failure that later resolves to a positive state
+    is confirmed without a spurious raise (bounded re-observation)."""
+    provider = _provider()
+    calls = {"n": 0}
+    backend = MagicMock()
+
+    def _get_history(session, window, tail_lines=None, strip_escapes=False):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise RuntimeError("transient tmux hiccup")
+        return SUBMITTED_WORKING_PANE
+
+    backend.get_history.side_effect = _get_history
 
     provider.verify_submission_after_send(METADATA, backend)
 

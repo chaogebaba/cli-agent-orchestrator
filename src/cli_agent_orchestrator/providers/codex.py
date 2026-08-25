@@ -426,6 +426,30 @@ CODEX_SUBMIT_VERIFY_GRACE_SECONDS = 2.0
 CODEX_SUBMIT_VERIFY_MAX_RETRIES = 3
 # Backoff between re-Enter attempts (seconds); grows per attempt.
 CODEX_SUBMIT_VERIFY_BACKOFF_SECONDS = 1.0
+# BLOCKER B1/B2 (r3): confirmation now requires POSITIVE evidence that the
+# composer submitted, never mere absence of the chip. A single post-send
+# capture can be a stale pre-paste frame (empty composer, chip not rendered
+# yet) or a failed capture — treating either as success reopens the concurrent
+# submit-loss window. Each capture is classified into three states:
+#   submitted     — positive boundary crossed (empty idle placeholder/prompt in
+#                   the active composer, or the Working/Thinking spinner).
+#   stuck         — the active composer still carries the unsubmitted paste chip.
+#   indeterminate — neither observed yet (stale pre-paste frame, mid-redraw, or
+#                   a capture failure). NOT success: must be resolved by bounded
+#                   re-observation before the grace window, and re-Enter + poll
+#                   after it; if it never resolves to `submitted`, delivery is
+#                   UNCONFIRMED and we raise CodexSubmitStuckError.
+CODEX_SUBMIT_STATE_SUBMITTED = "submitted"
+CODEX_SUBMIT_STATE_STUCK = "stuck"
+CODEX_SUBMIT_STATE_INDETERMINATE = "indeterminate"
+# Bounded re-observation polls for the grace window (BLOCKER B1): after the
+# grace sleep we poll a few times for a POSITIVE submitted/stuck verdict before
+# concluding indeterminate, so a stale pre-paste first frame cannot commit as
+# success — a later frame that renders the durable chip is caught.
+CODEX_SUBMIT_VERIFY_POLL_ATTEMPTS = 4
+# Interval between confirmation polls (seconds), for both the initial grace
+# window and the post-re-Enter re-verification.
+CODEX_SUBMIT_VERIFY_POLL_INTERVAL_SECONDS = 0.5
 
 
 class CodexSubmitStuckError(Exception):
@@ -2357,52 +2381,187 @@ class CodexProvider(BaseProvider):
         region = "\n".join(plain_lines[prompt_idx:search_end])
         return CODEX_PASTE_CHIP_PATTERN.search(region) is not None
 
+    @staticmethod
+    def _pane_shows_working(captured: str) -> bool:
+        """Whether the pane shows the Working/Thinking progress spinner.
+
+        The spinner (``• Working (0s • esc to interrupt)``) means the agent has
+        BEGUN the turn — reachable only after the pasted task submitted. This is
+        the single unambiguous positive submission signal that a stale pre-paste
+        frame can never exhibit (BLOCKER B1): an empty composer, by contrast, is
+        indistinguishable pre-paste vs. post-submit, so absence of the chip is
+        NOT evidence of submission.
+        """
+        if not captured:
+            return False
+        for line in captured.splitlines():
+            if re.search(TUI_PROGRESS_PATTERN, strip_terminal_escapes(line)):
+                return True
+        return False
+
+    @staticmethod
+    def _pane_shows_cleared_composer(captured: str) -> bool:
+        """Whether the ACTIVE composer is an empty idle prompt / placeholder.
+
+        Composer-scoped exactly like ``_pane_shows_pasted_chip`` (footer anchor).
+        This is NOT positive submission proof on its own — a stale pre-paste
+        frame renders the same empty prompt — so the caller only treats a
+        cleared composer as ``submitted`` once it has POSITIVELY observed the
+        chip first and then seen it cleared (a chip→cleared TRANSITION, BLOCKER
+        B1). Used solely to detect that transition.
+        """
+        if not captured:
+            return False
+        raw_lines = [line.rstrip("\r") for line in captured.splitlines()]
+        plain_lines = [strip_terminal_escapes(line).rstrip() for line in raw_lines]
+        footer_idx = _find_tui_footer_index(plain_lines)
+        if footer_idx is None:
+            footer_idx = len(plain_lines)
+        prompt_idx = _find_composer_anchor_index(plain_lines, footer_idx)
+        if prompt_idx is None:
+            return False
+        composer_row = plain_lines[prompt_idx].strip()
+        if re.fullmatch(IDLE_PROMPT_STRICT_PATTERN, composer_row, re.IGNORECASE) is not None:
+            return True
+        return _is_known_composer_placeholder(plain_lines[prompt_idx])
+
     def verify_submission_after_send(
         self,
         metadata: dict[str, Any],
         backend: Any,
     ) -> None:
-        """F435: confirm the pasted task submitted; re-Enter if it stuck.
+        """F435: confirm the pasted task SUBMITTED; re-Enter if it stuck.
 
         After a bracketed paste + submit Enter, a render race can drop the
         Enter, leaving the task drafted as a ``[Pasted Content NNNN chars]``
         chip that never submits (the pane sits idle until the stalled-callback
-        watchdog fires ~120s later). This verifies submission and recovers:
+        watchdog fires ~120s later). This confirms submission and recovers.
 
-        * Wait a short grace, then capture the pane.
-        * If the stuck chip is ABSENT, the submit took — return (no extra Enter).
-        * While the stuck chip is PRESENT, re-send Enter and re-verify, with
-          bounded retries and backoff.
-        * If still stuck after the retries, raise ``CodexSubmitStuckError``
-          naming the terminal.
+        r3 rewrite (BLOCKERS B1+B2): confirmation requires POSITIVE evidence
+        that the composer submitted — never the mere absence of the chip. Each
+        capture is classified ``submitted`` / ``stuck`` / ``indeterminate``:
+
+        * ``submitted`` — a durable state transition (Working/Thinking spinner,
+          or the active composer cleared back to an empty prompt/placeholder).
+          Only this returns success.
+        * ``stuck`` — the active composer still carries the chip. Re-send Enter.
+        * ``indeterminate`` — a stale pre-paste frame, a mid-redraw frame, or a
+          FAILED capture. NOT success: re-observe within a bound.
+
+        Flow: after the grace sleep, poll a bounded number of times for a
+        positive ``submitted``/``stuck`` verdict (so a stale pre-paste first
+        frame can never commit as success — BLOCKER B1). While ``stuck``,
+        re-send Enter and re-verify with bounded retries. If we never obtain a
+        positive ``submitted`` observation — including when every capture
+        failed (BLOCKER B2) — delivery is UNCONFIRMED and we raise
+        ``CodexSubmitStuckError`` so the send seam aborts the dispatch and
+        surfaces a retry-safe ``DeliveryDeferredError`` rather than a
+        pretend-success.
 
         Idempotent by construction: Enter is only ever re-sent while the stuck
-        chip is observed, so a composer that already submitted is never
-        blind-Entered.
+        chip is positively observed, so a composer that already submitted is
+        never blind-Entered.
         """
         session = metadata["tmux_session"]
         window = metadata["tmux_window"]
 
-        def _capture() -> str:
+        def _capture() -> str | None:
+            """Capture the pane, or ``None`` on failure (BLOCKER B2).
+
+            A failed capture is NOT an empty pane — conflating the two lets an
+            unobservable send masquerade as an empty (submitted-looking)
+            composer. Returning ``None`` keeps capture failure classified as
+            indeterminate so it can never commit as success.
+            """
             try:
-                return backend.get_history(
+                captured = backend.get_history(
                     session,
                     window,
                     tail_lines=PYTE_SCREEN_ROWS,
                     strip_escapes=False,
                 )
-            except Exception:
+                return captured if isinstance(captured, str) else None
+            except Exception as exc:
                 logger.warning(
-                    "F435 submit-verify: pane capture failed for terminal %s",
+                    "F435 submit-verify: pane capture failed for terminal %s: %s",
                     self.terminal_id,
+                    exc,
                 )
-                return ""
+                return None
+
+        # Chip-seen latch (BLOCKER B1): a bare empty/placeholder composer is
+        # ambiguous — it looks identical pre-paste and post-submit — so it is
+        # only accepted as submission AFTER we have positively observed the chip
+        # and then seen it cleared (a chip→cleared TRANSITION). The Working
+        # spinner is accepted unconditionally: it is unreachable without submit.
+        chip_seen = False
+
+        def _observe() -> str:
+            """One capture → submitted / stuck / indeterminate (chip-aware)."""
+            nonlocal chip_seen
+            captured = _capture()
+            if captured is None:
+                return CODEX_SUBMIT_STATE_INDETERMINATE  # capture failed (B2)
+            if self._pane_shows_working(captured):
+                return CODEX_SUBMIT_STATE_SUBMITTED  # unambiguous: turn started
+            if self._pane_shows_pasted_chip(captured):
+                chip_seen = True
+                return CODEX_SUBMIT_STATE_STUCK
+            if chip_seen and self._pane_shows_cleared_composer(captured):
+                # We saw the chip, and it is now gone from the active composer:
+                # a real submit transition, not a stale pre-paste empty frame.
+                return CODEX_SUBMIT_STATE_SUBMITTED
+            return CODEX_SUBMIT_STATE_INDETERMINATE
+
+        def _poll_state() -> str:
+            """Poll for a POSITIVE submitted/stuck verdict within a bound.
+
+            Returns the first ``submitted`` or ``stuck`` verdict seen; if every
+            poll is indeterminate (stale frame / capture failure), returns
+            ``indeterminate`` — the caller must NOT treat that as success.
+            """
+            state = CODEX_SUBMIT_STATE_INDETERMINATE
+            for poll in range(CODEX_SUBMIT_VERIFY_POLL_ATTEMPTS):
+                state = _observe()
+                if state != CODEX_SUBMIT_STATE_INDETERMINATE:
+                    return state
+                if poll < CODEX_SUBMIT_VERIFY_POLL_ATTEMPTS - 1:
+                    time.sleep(CODEX_SUBMIT_VERIFY_POLL_INTERVAL_SECONDS)
+            return state
 
         time.sleep(CODEX_SUBMIT_VERIFY_GRACE_SECONDS)
-        if not self._pane_shows_pasted_chip(_capture()):
-            return  # Submitted normally — no recovery needed, no extra Enter.
+        state = _poll_state()
+        if state == CODEX_SUBMIT_STATE_SUBMITTED:
+            return  # Positive submission evidence — no recovery, no extra Enter.
 
         for attempt in range(1, CODEX_SUBMIT_VERIFY_MAX_RETRIES + 1):
+            if state != CODEX_SUBMIT_STATE_STUCK:
+                # No positive verdict yet: either a stale/mid-redraw frame or a
+                # failed capture (indeterminate). We must NOT blind-Enter an
+                # unobservable composer (could double-submit) and must NOT
+                # pretend-commit. Re-poll one bounded round; if it resolves to
+                # submitted we are done, otherwise fall through toward the
+                # unconfirmed raise.
+                logger.warning(
+                    "F435 submit-verify: submission unconfirmed on terminal %s "
+                    "(attempt %d/%d, state=%s); re-polling without blind Enter",
+                    self.terminal_id,
+                    attempt,
+                    CODEX_SUBMIT_VERIFY_MAX_RETRIES,
+                    state,
+                )
+                time.sleep(CODEX_SUBMIT_VERIFY_BACKOFF_SECONDS * attempt)
+                state = _poll_state()
+                if state == CODEX_SUBMIT_STATE_SUBMITTED:
+                    logger.info(
+                        "F435 submit-verify: terminal %s confirmed submitted after "
+                        "re-poll",
+                        self.terminal_id,
+                    )
+                    return
+                continue
+
+            # state == STUCK: the chip is positively present. Re-send Enter.
             logger.warning(
                 "F435 submit-verify: paste chip still drafted on terminal %s "
                 "(attempt %d/%d); re-sending Enter",
@@ -2419,7 +2578,8 @@ class CodexProvider(BaseProvider):
                     exc,
                 )
             time.sleep(CODEX_SUBMIT_VERIFY_BACKOFF_SECONDS * attempt)
-            if not self._pane_shows_pasted_chip(_capture()):
+            state = _poll_state()
+            if state == CODEX_SUBMIT_STATE_SUBMITTED:
                 logger.info(
                     "F435 submit-verify: terminal %s submitted after %d re-Enter(s)",
                     self.terminal_id,
@@ -2428,9 +2588,10 @@ class CodexProvider(BaseProvider):
                 return
 
         raise CodexSubmitStuckError(
-            f"Codex terminal {self.terminal_id} did not submit the pasted task after "
-            f"{CODEX_SUBMIT_VERIFY_MAX_RETRIES} re-Enter attempts; the composer is still "
-            f"showing an unsubmitted '[Pasted Content ...]' chip"
+            f"Codex terminal {self.terminal_id} did not confirm submission of the "
+            f"pasted task after {CODEX_SUBMIT_VERIFY_MAX_RETRIES} recovery attempts; "
+            f"the last observed composer state was '{state}' (no positive "
+            f"submitted/working transition), so delivery is unconfirmed"
         )
 
     @staticmethod
