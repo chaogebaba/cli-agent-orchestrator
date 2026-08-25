@@ -9864,11 +9864,6 @@ def commit_wake(
             if wake_notified_at is None and through_id > current_cursor:
                 # Another commit already cleared the lease
                 return WakeCommitResult(kind="lease_lost", reason="lease_already_cleared")
-            if wake_notified_id != 0 and through_id > current_cursor:
-                # Check claimed_high_water matches our claim
-                if wake_notified_id > through_id:
-                    # A newer claimant took the lease
-                    return WakeCommitResult(kind="lease_lost", reason="newer_claimant")
 
             now = _utcnow()
 
@@ -9877,8 +9872,8 @@ def commit_wake(
                 mailbox.callback_notified_through_id = through_id
 
                 # D4: streak management
-                # Reset streak when through_id exceeds previously committed wake_notified_id
-                if through_id > wake_notified_id:
+                # Reset streak when through_id advances the cursor (new forward content)
+                if through_id > current_cursor:
                     mailbox.wake_streak = 0
                 else:
                     mailbox.wake_streak = int(mailbox.wake_streak or 0) + 1
