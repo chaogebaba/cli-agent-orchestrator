@@ -10,8 +10,13 @@ Tests:
 7. Arming decisions — armed only on real acquisition; not when disabled;
    cancelled on clean unconfigure; NOT armed on CI / xdist / contention.
 8. Integration: a subprocess pytest run whose test sleeps past the bound
-   has its whole process group SIGKILLed ~on time, with the diagnostic,
-   and the slot lock is freed afterwards.
+   is killed ~on time, with the diagnostic, and the slot lock is freed.
+9. Ancestor survival (F445): watchdog kills descendants, not ancestors.
+10. Descendant death (F445 R2 SHOULD): a REAL child spawned by pytest dies.
+11. Daemon/setsid escape (F445 R2 BLOCKER 1): a double-fork/setsid child
+    that lives past a ledger sampling interval is killed by the ledger.
+12. PID-reuse guard (F445 R2 BLOCKER 2): a ledger entry whose pid was
+    recycled (different starttime) is never signaled.
 """
 
 from __future__ import annotations
@@ -40,6 +45,11 @@ def _isolate_lockfile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Reset module state
     monkeypatch.setattr(suite_slot, "_lock_fd", None)
     monkeypatch.setattr(suite_slot, "_watchdog", None)
+    monkeypatch.setattr(suite_slot, "_ledger_thread", None)
+    monkeypatch.setattr(suite_slot, "_armed_pgid", None)
+    # Clear ledger
+    suite_slot._ledger.clear()
+    suite_slot._ledger_stop.set()  # stop any leftover sampler
     # Ensure CI is not set (tests simulate non-CI)
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("CAO_SUITE_SLOT_WAIT", raising=False)
@@ -430,6 +440,28 @@ class TestArmingDecisions:
             suite_slot._cancel_watchdog()
             assert suite_slot._watchdog is None
 
+    def test_arm_creates_ledger_sampler(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Arming starts the background ledger sampler thread."""
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "3600")
+        try:
+            suite_slot._arm_watchdog()
+            assert suite_slot._ledger_thread is not None
+            assert suite_slot._ledger_thread.is_alive()
+            assert suite_slot._ledger_thread.daemon is True
+        finally:
+            suite_slot._cancel_watchdog()
+            assert suite_slot._ledger_thread is None
+
+    def test_arm_sets_pgid(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Arming records the armed pgid (== our current pgid after setpgid)."""
+        monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "3600")
+        try:
+            suite_slot._arm_watchdog()
+            assert suite_slot._armed_pgid is not None
+            assert suite_slot._armed_pgid == os.getpgrp()
+        finally:
+            suite_slot._cancel_watchdog()
+
     def test_disabled_when_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CAO_SUITE_SLOT_MAX_SECONDS", "0")
         suite_slot._arm_watchdog()
@@ -497,10 +529,10 @@ class TestWatchdogIntegration:
     """End-to-end: a runaway run self-destructs and frees the slot.
 
     Spawns a real child pytest whose single test sleeps far past a 2s bound.
-    The watchdog must SIGKILL the child's whole process group ~on time, emit
-    the diagnostic, and leave the lock free for the next acquirer.
+    The watchdog fires os.killpg on the pytest process group, then os._exit(137).
     """
 
+    @pytest.mark.slow
     def test_runaway_run_self_destructs_and_frees_slot(self, tmp_path: Path) -> None:
         repo_root = Path(__file__).resolve().parent.parent.parent
         lock_path = tmp_path / ".suite-slot.lock"
@@ -527,11 +559,14 @@ class TestWatchdogIntegration:
         env = {k: v for k, v in os.environ.items() if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
         env["CAO_SUITE_SLOT_MAX_SECONDS"] = "2"
 
-        # start_new_session=True → child is its own process-group leader, so
-        # the watchdog's killpg targets the child tree, not this test runner.
+        # start_new_session=True → child is already its own session leader,
+        # so setpgid(0,0) in _arm_watchdog may EPERM and fall through. That's
+        # fine: it still gets a fresh pgid via the setsid. The watchdog
+        # killpg targets that group.
         start = time.monotonic()
         proc = subprocess.Popen(
-            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-s", "test_hang.py"],
+            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
+             "-p", "no:libtmux", "-s", "test_hang.py"],
             cwd=str(run_dir),
             env=env,
             stdout=subprocess.PIPE,
@@ -548,9 +583,14 @@ class TestWatchdogIntegration:
 
         elapsed = time.monotonic() - start
 
-        # Killed by SIGKILL → negative return code -9 (process-group kill).
-        assert proc.returncode == -signal.SIGKILL, (
-            f"expected SIGKILL, got returncode={proc.returncode}\n{out}"
+        # Killed by watchdog. Two valid exit paths:
+        #   -9 (SIGKILL): os.killpg delivers SIGKILL to our own group before
+        #       os._exit(137) executes — this is the common case when the
+        #       process IS in the killpg target group.
+        #   137: os._exit(137) runs first (e.g. if the killpg was already
+        #       delivered but didn't terminate us before os._exit).
+        assert proc.returncode in (-9, 137), (
+            f"expected -9 or 137 (watchdog kill), got returncode={proc.returncode}\n{out}"
         )
         # Fired ~on the 2s bound, comfortably under the 30s incident ceiling.
         assert elapsed < 20, f"took too long ({elapsed:.1f}s):\n{out}"
@@ -565,3 +605,552 @@ class TestWatchdogIntegration:
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+
+
+
+# ---------------------------------------------------------------------------
+# F445 (issue #300): watchdog must never kill ancestors
+# ---------------------------------------------------------------------------
+
+
+class TestWatchdogAncestorSafety:
+    """F445 regression: watchdog kills only the pytest subtree, ancestors survive.
+
+    The pre-fix code used os.killpg(os.getpgrp(), SIGKILL) which, when pytest
+    shared a process group with the agent TUI, killed the entire pane. The fix
+    calls os.setpgid(0,0) at arming to create a fresh process group, then
+    os.killpg targets ONLY that new group — ancestors remain in the old group.
+    """
+
+    @pytest.mark.slow
+    def test_ancestor_survives_watchdog_fire(self, tmp_path: Path) -> None:
+        """Spawn a parent (simulating TUI ancestor) that forks a child running
+        pytest with a short watchdog. The parent MUST survive after the child
+        is killed by the watchdog — this is the core F445 invariant.
+        """
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        lock_path = tmp_path / "slot.lock"
+        marker_file = tmp_path / "ancestor_alive"
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+
+        # conftest that registers the plugin with repointed lockfile
+        (run_dir / "conftest.py").write_text(
+            "import sys, pathlib\n"
+            f"sys.path.insert(0, {str(repo_root)!r})\n"
+            "from test.plugins import suite_slot\n"
+            f"suite_slot._LOCK_PATH = pathlib.Path({str(lock_path)!r})\n"
+            "pytest_plugins = ('test.plugins.suite_slot',)\n"
+        )
+        # test that hangs past the 2s watchdog
+        (run_dir / "test_hang.py").write_text(
+            "import time\n"
+            "def test_hang():\n"
+            "    time.sleep(60)\n"
+        )
+
+        # Parent script: spawns pytest as a child (same pgid — no
+        # start_new_session), waits for it to die, then writes marker.
+        # The pytest child calls setpgid(0,0) at arming, moving itself
+        # to a new pgid. The killpg targets that new group — the parent
+        # stays in the original group and is never signaled.
+        parent_script = tmp_path / "parent.py"
+        parent_script.write_text(
+            "import os, sys, subprocess\n"
+            f"env = {{**os.environ, 'CAO_SUITE_SLOT_MAX_SECONDS': '2',\n"
+            f"        'CAO_SUITE_SLOT_LOCK': {str(lock_path)!r}}}\n"
+            "env.pop('CI', None)\n"
+            "env.pop('CAO_SUITE_SLOT_WAIT', None)\n"
+            "child = subprocess.Popen(\n"
+            f"    [sys.executable, '-m', 'pytest', '-p', 'no:cacheprovider',\n"
+            f"     '-p', 'no:libtmux', '-s', 'test_hang.py'],\n"
+            f"    cwd={str(run_dir)!r},\n"
+            "    env=env,\n"
+            "    stdout=subprocess.PIPE,\n"
+            "    stderr=subprocess.STDOUT,\n"
+            ")\n"
+            "child.wait()\n"
+            "# If we reach here, we survived the watchdog!\n"
+            f"open({str(marker_file)!r}, 'w').write(f'alive:{{os.getpid()}}')\n"
+        )
+
+        # Run the parent — do NOT use start_new_session so parent and child
+        # initially share a pgid (the dangerous scenario the bug exploited).
+        result = subprocess.run(
+            [sys.executable, str(parent_script)],
+            timeout=30,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, (
+            f"Parent died (rc={result.returncode}) — watchdog killed ancestor!\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        assert marker_file.exists(), (
+            "Ancestor marker not written — ancestor was killed by watchdog"
+        )
+        content = marker_file.read_text()
+        assert content.startswith("alive:"), f"Unexpected marker: {content}"
+
+    @pytest.mark.slow
+    def test_watchdog_exit_code_is_kill(self, tmp_path: Path) -> None:
+        """The watchdog-killed pytest process exits via SIGKILL or os._exit(137)."""
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        lock_path = tmp_path / "slot.lock"
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+
+        (run_dir / "conftest.py").write_text(
+            "import sys, pathlib\n"
+            f"sys.path.insert(0, {str(repo_root)!r})\n"
+            "from test.plugins import suite_slot\n"
+            f"suite_slot._LOCK_PATH = pathlib.Path({str(lock_path)!r})\n"
+            "pytest_plugins = ('test.plugins.suite_slot',)\n"
+        )
+        (run_dir / "test_hang.py").write_text(
+            "import time\n"
+            "def test_hang():\n"
+            "    time.sleep(300)\n"
+        )
+
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
+        env["CAO_SUITE_SLOT_MAX_SECONDS"] = "2"
+        env["CAO_SUITE_SLOT_LOCK"] = str(lock_path)
+
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
+             "-p", "no:libtmux", "-s", "test_hang.py"],
+            cwd=str(run_dir),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            pytest.fail("watchdog did not fire within 15s")
+
+        # os.killpg(our_pgid, SIGKILL) kills us with -9 before os._exit(137)
+        # can run, OR os._exit(137) wins the race. Both are valid.
+        assert proc.returncode in (-9, 137), (
+            f"Expected -9 or 137 from watchdog, got {proc.returncode}"
+        )
+
+
+class TestWatchdogDisarmOnNormalCompletion:
+    """F445 regression: normal test completion disarms the watchdog cleanly."""
+
+    def test_clean_exit_no_watchdog_fire(self, tmp_path: Path) -> None:
+        """A fast test run exits 0 — watchdog never fires."""
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        lock_path = tmp_path / "slot.lock"
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+
+        (run_dir / "conftest.py").write_text(
+            "import sys, pathlib\n"
+            f"sys.path.insert(0, {str(repo_root)!r})\n"
+            "from test.plugins import suite_slot\n"
+            f"suite_slot._LOCK_PATH = pathlib.Path({str(lock_path)!r})\n"
+            "pytest_plugins = ('test.plugins.suite_slot',)\n"
+        )
+        (run_dir / "test_fast.py").write_text(
+            "def test_quick():\n"
+            "    assert 1 + 1 == 2\n"
+        )
+
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
+        env["CAO_SUITE_SLOT_MAX_SECONDS"] = "30"
+        env["CAO_SUITE_SLOT_LOCK"] = str(lock_path)
+
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
+             "-p", "no:libtmux", "-s", "test_fast.py"],
+            cwd=str(run_dir),
+            env=env,
+            timeout=15,
+            capture_output=True,
+            text=True,
+            start_new_session=True,
+        )
+
+        assert result.returncode == 0, (
+            f"Expected clean exit 0, got rc={result.returncode}\n"
+            f"output: {result.stdout}\n{result.stderr}"
+        )
+
+    def test_lock_freed_after_normal_run(self, tmp_path: Path) -> None:
+        """After normal completion, the lock file is not held."""
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        lock_path = tmp_path / "slot.lock"
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+
+        (run_dir / "conftest.py").write_text(
+            "import sys, pathlib\n"
+            f"sys.path.insert(0, {str(repo_root)!r})\n"
+            "from test.plugins import suite_slot\n"
+            f"suite_slot._LOCK_PATH = pathlib.Path({str(lock_path)!r})\n"
+            "pytest_plugins = ('test.plugins.suite_slot',)\n"
+        )
+        (run_dir / "test_pass.py").write_text(
+            "def test_pass():\n"
+            "    pass\n"
+        )
+
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
+        env["CAO_SUITE_SLOT_MAX_SECONDS"] = "30"
+        env["CAO_SUITE_SLOT_LOCK"] = str(lock_path)
+
+        subprocess.run(
+            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
+             "-p", "no:libtmux", "-s", "test_pass.py"],
+            cwd=str(run_dir),
+            env=env,
+            timeout=15,
+            capture_output=True,
+            start_new_session=True,
+        )
+
+        # Lock must be free — acquire non-blocking
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o666)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except BlockingIOError:
+            pytest.fail("Lock file still held after normal pytest exit")
+        finally:
+            os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# F445 R2: descendant death, daemon escape, pid-reuse guard
+# ---------------------------------------------------------------------------
+
+
+class TestDescendantDeath:
+    """F445 R2 SHOULD: watchdog kills a REAL descendant of pytest.
+
+    Spawns a pytest that forks a child (sleep subprocess), then the watchdog
+    fires — the child MUST die. This proves the pgid-based kill actually
+    terminates real children, not just that pytest exits 137.
+    """
+
+    @pytest.mark.slow
+    def test_real_descendant_killed_on_watchdog_fire(self, tmp_path: Path) -> None:
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        lock_path = tmp_path / "slot.lock"
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        pid_file = tmp_path / "child.pid"
+
+        (run_dir / "conftest.py").write_text(
+            "import sys, pathlib\n"
+            f"sys.path.insert(0, {str(repo_root)!r})\n"
+            "from test.plugins import suite_slot\n"
+            f"suite_slot._LOCK_PATH = pathlib.Path({str(lock_path)!r})\n"
+            "pytest_plugins = ('test.plugins.suite_slot',)\n"
+        )
+        # Test that spawns a child process and writes its PID to a file,
+        # then sleeps past the watchdog bound.
+        (run_dir / "test_spawn_child.py").write_text(
+            "import subprocess, sys, time, os\n"
+            f"PID_FILE = {str(pid_file)!r}\n"
+            "def test_spawn_and_hang():\n"
+            "    child = subprocess.Popen(\n"
+            "        [sys.executable, '-c', 'import time; time.sleep(300)'],\n"
+            "    )\n"
+            "    with open(PID_FILE, 'w') as f:\n"
+            "        f.write(str(child.pid))\n"
+            "    time.sleep(300)  # hang past watchdog\n"
+        )
+
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
+        env["CAO_SUITE_SLOT_MAX_SECONDS"] = "2"
+
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
+             "-p", "no:libtmux", "-s", "test_spawn_child.py"],
+            cwd=str(run_dir),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            out, _ = proc.communicate(timeout=25)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, _ = proc.communicate()
+            pytest.fail(f"watchdog did not fire; child hung. Output:\n{out}")
+
+        assert proc.returncode in (-9, 137), f"Expected -9 or 137, got {proc.returncode}\n{out}"
+        assert pid_file.exists(), "Child PID file not written — test didn't spawn child"
+        child_pid = int(pid_file.read_text().strip())
+        # Give the kernel a moment to clean up
+        time.sleep(0.2)
+        # os.kill(pid, 0) raises OSError(ESRCH) if process does not exist.
+        with pytest.raises(OSError):
+            os.kill(child_pid, 0)
+
+
+class TestDaemonSetsidEscape:
+    """F445 R2 BLOCKER 1: setsid child caught by the ledger.
+
+    A test spawns a child that initially lives in our pgid (and gets sampled
+    by the ledger), then later calls setsid() to escape the group. The ledger
+    retains the (pid, starttime) from when it was still in our group, so on
+    fire the watchdog kills it via the ledger's secondary kill loop.
+
+    This covers the realistic case where a subprocess runs for a while
+    (sampled at least once) then daemonizes mid-flight.
+    """
+
+    @pytest.mark.slow
+    @pytest.mark.timeout(25)
+    def test_setsid_daemon_killed_by_ledger(self, tmp_path: Path) -> None:
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        lock_path = tmp_path / "slot.lock"
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        daemon_pid_file = tmp_path / "daemon.pid"
+
+        (run_dir / "conftest.py").write_text(
+            "import sys, pathlib\n"
+            f"sys.path.insert(0, {str(repo_root)!r})\n"
+            "from test.plugins import suite_slot\n"
+            f"suite_slot._LOCK_PATH = pathlib.Path({str(lock_path)!r})\n"
+            "pytest_plugins = ('test.plugins.suite_slot',)\n"
+        )
+        # Test spawns a child that:
+        #   1. Writes its PID (sampled by ledger while in our pgid)
+        #   2. Sleeps 3s so the ledger (2s interval) samples it
+        #   3. Calls setsid() to escape the process group
+        #   4. Sleeps forever (should be killed by ledger at fire time)
+        # Watchdog bound: 6s (> 3s child sleep + sampling margin).
+        (run_dir / "test_daemon.py").write_text(
+            "import os, sys, time\n"
+            f"DAEMON_PID_FILE = {str(daemon_pid_file)!r}\n"
+            "def test_spawn_daemon():\n"
+            "    # Fork a child that stays in our pgid initially\n"
+            "    pid = os.fork()\n"
+            "    if pid == 0:\n"
+            "        # Child: detach from ALL inherited fds so pipes don't\n"
+            "        # keep the parent's communicate() hanging after we setsid.\n"
+            "        devnull = os.open(os.devnull, os.O_RDWR)\n"
+            "        os.dup2(devnull, 0)\n"
+            "        os.dup2(devnull, 1)\n"
+            "        os.dup2(devnull, 2)\n"
+            "        os.close(devnull)\n"
+            "        os.closerange(3, 1024)  # close inherited pipe fds\n"
+            "        # Write PID, sleep to be sampled, then setsid\n"
+            "        with open(DAEMON_PID_FILE, 'w') as f:\n"
+            "            f.write(str(os.getpid()))\n"
+            "        time.sleep(3)  # long enough for ledger to sample us\n"
+            "        os.setsid()    # escape the pgid\n"
+            "        time.sleep(300)  # hang forever\n"
+            "        os._exit(0)\n"
+            "    else:\n"
+            "        # Parent: wait for child to be running and sampled\n"
+            "        time.sleep(4)\n"
+            "        # Now hang past the watchdog bound\n"
+            "        time.sleep(300)\n"
+        )
+
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
+        # 6s bound: child sleeps 3s in our pgid (ledger samples at 2s),
+        # then setsids. Watchdog fires at 6s — ledger has the entry from
+        # when the child was still in our group.
+        env["CAO_SUITE_SLOT_MAX_SECONDS"] = "6"
+
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
+             "-p", "no:libtmux", "-s", "test_daemon.py"],
+            cwd=str(run_dir),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            out, _ = proc.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                out, _ = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                out = "(communicate timed out even after kill)"
+            # Also clean up the daemon if it's still alive
+            if daemon_pid_file.exists():
+                try:
+                    dpid = int(daemon_pid_file.read_text().strip())
+                    os.kill(dpid, signal.SIGKILL)
+                except (OSError, ValueError):
+                    pass
+            pytest.fail(f"watchdog did not fire within 20s. Output:\n{out}")
+
+        assert proc.returncode in (-9, 137), (
+            f"Expected -9 or 137, got {proc.returncode}\n{out}"
+        )
+
+        # Read daemon PID and confirm it was killed by the ledger.
+        assert daemon_pid_file.exists(), (
+            "Daemon PID file not written — daemon didn't start"
+        )
+        daemon_pid = int(daemon_pid_file.read_text().strip())
+        # Give the kernel a moment
+        time.sleep(0.5)
+        with pytest.raises(OSError):
+            os.kill(daemon_pid, 0)
+
+
+class TestPidReuseGuard:
+    """F445 R2 BLOCKER 2: stale ledger entry with recycled PID is skipped.
+
+    Simulates a pid-reuse scenario: a ledger entry records (pid, starttime_A),
+    but by fire time that pid has been recycled and now has starttime_B.
+    The watchdog must NOT signal it.
+    """
+
+    def test_stale_entry_not_killed(self, tmp_path: Path) -> None:
+        """A ledger entry whose starttime no longer matches is never signaled."""
+        import unittest.mock
+
+        # Create a sentinel process (a sleep) that we can verify survives.
+        sentinel = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            start_new_session=True,
+        )
+        sentinel_pid = sentinel.pid
+
+        try:
+            # Read the sentinel's real starttime.
+            real_starttime = suite_slot._get_starttime(sentinel_pid)
+            assert real_starttime is not None
+
+            # Put a WRONG starttime in the ledger for this pid — simulates
+            # the scenario where the original process died and the pid was
+            # recycled (new process has a different starttime).
+            wrong_starttime = real_starttime + 99999
+            with suite_slot._ledger_lock:
+                suite_slot._ledger[sentinel_pid] = wrong_starttime
+
+            # Set armed_pgid to something that won't match the sentinel's pgid
+            # so killpg doesn't accidentally hit it either.
+            suite_slot._armed_pgid = os.getpid()
+
+            # Patch os._exit so we don't actually die, and killpg so we don't
+            # kill our own group.
+            with unittest.mock.patch("os._exit") as mock_exit, \
+                 unittest.mock.patch("os.killpg") as mock_killpg:
+                suite_slot._watchdog_fire(10.0, time.monotonic() - 11.0)
+
+            # The sentinel must still be alive — it was NOT killed.
+            assert sentinel.poll() is None, (
+                f"Sentinel was killed! rc={sentinel.returncode}. "
+                "PID-reuse guard failed — stale entry was signaled."
+            )
+        finally:
+            sentinel.terminate()
+            sentinel.wait(timeout=5)
+
+    def test_matching_entry_is_killed(self, tmp_path: Path) -> None:
+        """A ledger entry whose starttime DOES match gets signaled."""
+        import unittest.mock
+
+        # Create a target process.
+        target = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            start_new_session=True,
+        )
+        target_pid = target.pid
+
+        try:
+            # Read the target's real starttime and put it in the ledger.
+            real_starttime = suite_slot._get_starttime(target_pid)
+            assert real_starttime is not None
+
+            with suite_slot._ledger_lock:
+                suite_slot._ledger[target_pid] = real_starttime
+
+            suite_slot._armed_pgid = os.getpid()
+
+            # Patch os._exit and killpg so we don't die or hit our own group.
+            with unittest.mock.patch("os._exit"), \
+                 unittest.mock.patch("os.killpg"):
+                suite_slot._watchdog_fire(10.0, time.monotonic() - 11.0)
+
+            # The target should have been killed.
+            time.sleep(0.3)
+            assert target.poll() is not None, (
+                "Target was NOT killed — ledger kill with matching starttime failed."
+            )
+            assert target.returncode == -signal.SIGKILL
+        finally:
+            if target.poll() is None:
+                target.terminate()
+                target.wait(timeout=5)
+
+
+class TestLedgerSampling:
+    """Unit tests for the ledger sampling mechanism."""
+
+    def test_sample_records_child_process(self, tmp_path: Path) -> None:
+        """_sample_ledger captures a direct child's (pid, starttime)."""
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+        )
+        try:
+            my_pid = os.getpid()
+            my_pgid = os.getpgrp()
+            suite_slot._ledger.clear()
+            suite_slot._sample_ledger(my_pid, my_pgid)
+
+            with suite_slot._ledger_lock:
+                assert child.pid in suite_slot._ledger
+                recorded_st = suite_slot._ledger[child.pid]
+
+            real_st = suite_slot._get_starttime(child.pid)
+            assert recorded_st == real_st
+        finally:
+            child.terminate()
+            child.wait(timeout=5)
+
+    def test_sample_ledger_monotonic_growth(self, tmp_path: Path) -> None:
+        """Ledger entries are never removed — only added."""
+        child1 = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+        )
+        try:
+            my_pid = os.getpid()
+            my_pgid = os.getpgrp()
+            suite_slot._ledger.clear()
+            suite_slot._sample_ledger(my_pid, my_pgid)
+
+            with suite_slot._ledger_lock:
+                assert child1.pid in suite_slot._ledger
+                size_after_first = len(suite_slot._ledger)
+
+            # Kill child1 and sample again — entry should persist.
+            child1.terminate()
+            child1.wait(timeout=5)
+
+            suite_slot._sample_ledger(my_pid, my_pgid)
+            with suite_slot._ledger_lock:
+                assert child1.pid in suite_slot._ledger
+                assert len(suite_slot._ledger) >= size_after_first
+        finally:
+            if child1.poll() is None:
+                child1.terminate()
+                child1.wait(timeout=5)
