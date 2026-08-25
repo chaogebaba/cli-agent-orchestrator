@@ -87,7 +87,7 @@ class TmuxLookupError(RuntimeError):
 # means no sessions on it, so this is a CONFIRMED absence. Treating it as an
 # error instead would strand registry rows left by a long-dead server forever —
 # ``delete_session`` would raise on every retry and never reconcile them.
-_NO_SERVER_STDERR_MARKERS = ("no server running",)
+_NO_SERVER_STDERR_MARKERS = ("no server running", "server exited unexpectedly")
 
 # The socket path does not exist (ENOENT). On its own this is NOT an absence: a
 # tmux server keeps serving its socket after the PATH has been unlinked — the

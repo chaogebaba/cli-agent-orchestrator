@@ -195,8 +195,10 @@ def seed_waiting_message(db_factory, mailbox_id, receiver_id, age_s):
         )
         db.add(msg)
         db.flush()
-        db.add(
-            DeliveryObligationModel(
+        # F413 after_insert listener may have auto-created the obligation
+        obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).first()
+        if obl is None:
+            obl = DeliveryObligationModel(
                 inbox_row_id=msg.id,
                 mailbox_id=mailbox_id,
                 state="OPEN",
@@ -205,7 +207,12 @@ def seed_waiting_message(db_factory, mailbox_id, receiver_id, age_s):
                 next_attempt_at=now - timedelta(seconds=1),
                 attempts=1,
             )
-        )
+            db.add(obl)
+        else:
+            obl.accepted_at = now - timedelta(seconds=age_s)
+            obl.first_attempt_at = now - timedelta(seconds=age_s)
+            obl.next_attempt_at = now - timedelta(seconds=1)
+            obl.attempts = 1
         db.commit()
         return msg.id
 

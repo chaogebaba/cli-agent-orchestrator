@@ -265,6 +265,7 @@ class TestClaudeCodeNativeAgentBuildPath:
         p._skill_prompt = None
         p._fork_context = None
         p._persona_plan = None
+        p._resume_session_id = None
         p.allocated_session_uuid = "test-uuid-1234"
 
         # Create a profile with native_agent set

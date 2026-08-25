@@ -251,7 +251,10 @@ class TestCreateTerminalHerdrRegistration:
             elif site == "db":
                 m.db_create_terminal.side_effect = RuntimeError("boom")
             elif site == "context":
-                m.load_agent_profile.return_value = SimpleNamespace(
+                from cli_agent_orchestrator.models.agent_profile import AgentProfile as _AP
+                m.load_agent_profile.return_value = _AP(
+                    name="developer",
+                    description="test",
                     sessionBrief="required",
                     skills=None,
                     allowedTools=None,

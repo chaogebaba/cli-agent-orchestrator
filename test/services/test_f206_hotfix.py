@@ -86,7 +86,7 @@ class TestH1CountFix:
         """_update_pending_indicators runs without AttributeError on DeliveryObligationModel.id."""
         db_factory = supervisor_f206
         with db_factory() as db:
-            # Create an OPEN obligation
+            # Create an OPEN obligation (auto-created by F413 after_insert listener)
             msg = InboxModel(
                 sender_id="worker01",
                 receiver_id="sup_f206",
@@ -96,16 +96,6 @@ class TestH1CountFix:
                 orchestration_type=OrchestrationType.SEND_MESSAGE.value,
             )
             db.add(msg)
-            db.flush()
-            db.add(
-                DeliveryObligationModel(
-                    inbox_row_id=msg.id,
-                    mailbox_id="mb_f206",
-                    state="OPEN",
-                    accepted_at=_utcnow(),
-                    next_attempt_at=_utcnow(),
-                )
-            )
             db.commit()
 
         # Patch boundary_pull_service to capture calls
@@ -159,16 +149,13 @@ class TestH2EscalationDisplayMessage:
             )
             db.add(msg)
             db.flush()
-            obl = DeliveryObligationModel(
-                inbox_row_id=msg.id,
-                mailbox_id="mb_f206",
-                state="OPEN",
-                accepted_at=_utcnow() - timedelta(seconds=35),
-                first_attempt_at=_utcnow() - timedelta(seconds=34),
-                next_attempt_at=_utcnow() - timedelta(seconds=1),
-                attempts=6,
-            )
-            db.add(obl)
+            # Update the auto-created obligation to the state needed for escalation
+            obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
+            obl.state = "OPEN"
+            obl.accepted_at = _utcnow() - timedelta(seconds=35)
+            obl.first_attempt_at = _utcnow() - timedelta(seconds=34)
+            obl.next_attempt_at = _utcnow() - timedelta(seconds=1)
+            obl.attempts = 6
             db.commit()
             msg_id = msg.id
 
@@ -249,16 +236,13 @@ class TestH2EscalationDisplayMessage:
             )
             db.add(msg)
             db.flush()
-            obl = DeliveryObligationModel(
-                inbox_row_id=msg.id,
-                mailbox_id="mb_f206",
-                state="OPEN",
-                accepted_at=_utcnow() - timedelta(seconds=35),
-                first_attempt_at=_utcnow() - timedelta(seconds=34),
-                next_attempt_at=_utcnow() - timedelta(seconds=1),
-                attempts=6,
-            )
-            db.add(obl)
+            # Update the auto-created obligation to the state needed for escalation
+            obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
+            obl.state = "OPEN"
+            obl.accepted_at = _utcnow() - timedelta(seconds=35)
+            obl.first_attempt_at = _utcnow() - timedelta(seconds=34)
+            obl.next_attempt_at = _utcnow() - timedelta(seconds=1)
+            obl.attempts = 6
             db.commit()
             msg_id = msg.id
 
@@ -343,19 +327,15 @@ class TestH3ReresolveEscalated:
             )
             db.add(msg)
             db.flush()
-            # Create an ESCALATED obligation with next_attempt_at in the past
-            obl = DeliveryObligationModel(
-                inbox_row_id=msg.id,
-                mailbox_id="mb_f206",
-                state="ESCALATED",
-                accepted_at=now - timedelta(seconds=60),
-                first_attempt_at=now - timedelta(seconds=59),
-                terminal_at=now - timedelta(seconds=30),
-                terminal_reason="user_draft_present",
-                next_attempt_at=now - timedelta(seconds=1),  # due
-                attempts=6,
-            )
-            db.add(obl)
+            # Update the auto-created obligation to ESCALATED state
+            obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
+            obl.state = "ESCALATED"
+            obl.accepted_at = now - timedelta(seconds=60)
+            obl.first_attempt_at = now - timedelta(seconds=59)
+            obl.terminal_at = now - timedelta(seconds=30)
+            obl.terminal_reason = "user_draft_present"
+            obl.next_attempt_at = now - timedelta(seconds=1)  # due
+            obl.attempts = 6
             db.commit()
             msg_id = msg.id
 
@@ -415,18 +395,15 @@ class TestH3ReresolveEscalated:
             )
             db.add(msg)
             db.flush()
-            obl = DeliveryObligationModel(
-                inbox_row_id=msg.id,
-                mailbox_id="mb_f206",
-                state="ESCALATED",
-                accepted_at=now - timedelta(seconds=60),
-                first_attempt_at=now - timedelta(seconds=59),
-                terminal_at=now - timedelta(seconds=30),
-                terminal_reason="user_draft_present",
-                next_attempt_at=now - timedelta(seconds=1),
-                attempts=6,
-            )
-            db.add(obl)
+            # Update the auto-created obligation to ESCALATED state
+            obl = db.query(DeliveryObligationModel).filter_by(inbox_row_id=msg.id).one()
+            obl.state = "ESCALATED"
+            obl.accepted_at = now - timedelta(seconds=60)
+            obl.first_attempt_at = now - timedelta(seconds=59)
+            obl.terminal_at = now - timedelta(seconds=30)
+            obl.terminal_reason = "user_draft_present"
+            obl.next_attempt_at = now - timedelta(seconds=1)
+            obl.attempts = 6
             db.commit()
             msg_id = msg.id
 

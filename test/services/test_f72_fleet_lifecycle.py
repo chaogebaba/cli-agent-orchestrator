@@ -27,6 +27,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.services import fleet_service, terminal_service
 from cli_agent_orchestrator.services.session_lifecycle_lease import (
     acquire_session_lifecycle_exclusive,
@@ -687,10 +688,11 @@ def test_managed_create_mode_matrix_before_and_after_publication(monkeypatch, mo
     monkeypatch.setattr(
         terminal_service,
         "load_agent_profile",
-        lambda _name: SimpleNamespace(
+        lambda _name: AgentProfile(
+            name="developer",
+            description="test",
             sessionBrief=None,
             lifecycle=("sticky" if mode == "fork" else "ephemeral" if mode == "cold" else None),
-            contextPolicy=None,
             allowedTools=None,
             mcpServers=None,
             role=None,

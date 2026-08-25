@@ -598,9 +598,25 @@ def _f413_after_insert(mapper: Any, connection: Any, target: Any) -> None:
     if result.first() is None:
         return
 
-    # Create obligation via Core insert
+    # Create obligation via Core insert (idempotent — skip if already exists)
     now = _utcnow()
     row_id = int(target.id)
+    existing_obl = connection.execute(
+        select(DeliveryObligationModel.__table__.c.inbox_row_id).where(
+            DeliveryObligationModel.__table__.c.inbox_row_id == row_id,
+        )
+    ).first()
+    if existing_obl is not None:
+        _touch_supervisor_pending_flag()
+        # D3: Stash doorbell even on idempotent hit
+        from sqlalchemy.orm import Session as _Session
+
+        sess = _Session.object_session(target)
+        if sess is not None:
+            stash = sess.info.setdefault(_F413_DOORBELL_STASH_KEY, [])
+            preview = (target.message or "").split("\n", 1)[0]
+            stash.append((logical_receiver_id, row_id, preview[:120]))
+        return
     connection.execute(
         insert(DeliveryObligationModel.__table__).values(
             inbox_row_id=row_id,
