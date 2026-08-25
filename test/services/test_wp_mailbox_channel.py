@@ -287,7 +287,10 @@ def test_ac3_ack_settles_drained_rows_exactly_once(scratch_db, monkeypatch):
     result = ack_messages("sup-001", up_to)
     assert result["changed"] is True
     assert result["consumed_through_id"] == up_to
-    assert result["settled_count"] == 2
+    # F413: settled_count now includes both inbox rows (2) and their delivery
+    # obligations (2) settled to ACKED — the ORM listener creates obligations for
+    # every qualifying PENDING supervisor-directed row.
+    assert result["settled_count"] == 4
 
     # Verify rows are DELIVERED
     with scratch_db() as db:
