@@ -96,12 +96,60 @@ def _is_row_still_pending(row_id: int) -> bool:
         return True
 
 
+def _mark_socket_delivered(row_id: int) -> None:
+    """F459: Record that this row was socket-delivered via native bridge message.
+
+    Stores a timestamp in the inbox_message_trace table so the drain hook can
+    detect rows that already reached the supervisor via the native channel and
+    skip re-injecting them as a duplicate digest.
+    """
+    try:
+        from cli_agent_orchestrator.clients.database import SessionLocal, InboxMessageTraceEventModel
+
+        with SessionLocal() as db:
+            db.add(InboxMessageTraceEventModel(
+                message_id=row_id,
+                kind="f459.socket_delivered",
+                phase="socket_delivered",
+                decision="proceed",
+                reason=None,
+                payload={},
+            ))
+            db.commit()
+    except Exception:
+        logger.debug("f459 mark_socket_delivered failed for row %s", row_id, exc_info=True)
+
+
+def is_socket_delivered(row_id: int) -> bool:
+    """F459: Check whether a row was already socket-delivered via native bridge.
+
+    Used by the drain hook to suppress duplicate surfaces.
+    """
+    try:
+        from cli_agent_orchestrator.clients.database import SessionLocal, InboxMessageTraceEventModel
+
+        with SessionLocal() as db:
+            exists = (
+                db.query(InboxMessageTraceEventModel.id)
+                .filter(
+                    InboxMessageTraceEventModel.message_id == row_id,
+                    InboxMessageTraceEventModel.kind == "f459.socket_delivered",
+                )
+                .first()
+            )
+            return exists is not None
+    except Exception:
+        return False
+
+
 def ring_supervisor_doorbell(
     terminal_id: str,
     max_written_row_id: int,
     *,
     written_count: int = 0,
     caller_holds_no_delivery_lock: bool = False,
+    message_body: str | None = None,
+    sender_display_name: str | None = None,
 ) -> str:
     """Ring the supervisor after a callback write.
 
@@ -110,10 +158,8 @@ def ring_supervisor_doorbell(
     Returns: rang, fallback, skipped_dedup, skipped_disabled, error.
 
     F186: caller_holds_no_delivery_lock=True skips G1 in the fallback path.
-    Use from call sites that provably do NOT hold the terminal's delivery lock
-    (e.g. the fx158 reconciler ride-along). The G1 gate exists to exclude the
-    rebind window; callers outside that window pass True to avoid the systematic
-    lock-contention skip that fx168 FIX-4 identified.
+    F459: message_body/sender_display_name carry the worker's actual callback
+    text and display name through to the native bridge message.
     """
     # D10 (fx168): outer switch — off means no bell of any kind.
     if not ConfigService.get("supervisor.doorbell", default=True):
@@ -151,13 +197,23 @@ def ring_supervisor_doorbell(
     native_enabled = ConfigService.get("supervisor.wake.native", default=True)
     if native_enabled:
         try:
-            decision = _attempt_native_ring(terminal_id, max_written_row_id)
+            decision = _attempt_native_ring(
+                terminal_id, max_written_row_id,
+                message_body=message_body,
+                sender_display_name=sender_display_name,
+            )
         except Exception as exc:
             logger.debug("f170_doorbell native exception: %s", exc)
             decision = None
 
         if decision == "rang":
             _persist_last_doorbell_row_id(terminal_id, max_written_row_id)
+            # F459: mark row as socket-delivered (best-effort)
+            if message_body is not None:
+                try:
+                    _mark_socket_delivered(max_written_row_id)
+                except Exception:
+                    pass
             return "rang"
         # decision is None or a refusal reason — fall through to fx168
         native_refusal = decision
@@ -213,9 +269,16 @@ def ring_supervisor_doorbell(
     return fallback_decision
 
 
-def _attempt_native_ring(terminal_id: str, max_written_row_id: int) -> Optional[str]:
+def _attempt_native_ring(
+    terminal_id: str,
+    max_written_row_id: int,
+    *,
+    message_body: str | None = None,
+    sender_display_name: str | None = None,
+) -> Optional[str]:
     """FX170 D1: resolve → version guard → socket write → verify.
 
+    F459: message_body/sender_display_name passed through to build_wake_payload.
     Returns "rang" on success, a refusal reason string on failure, or None
     if resolution cannot proceed (triggers fallback).
     """
@@ -262,8 +325,12 @@ def _attempt_native_ring(terminal_id: str, max_written_row_id: int) -> Optional[
         return ver_refusal
 
     # D5: build payload
-    # Worker name: use the terminal_id as the sender name
-    payload = build_wake_payload(terminal_id, max_written_row_id)
+    # F459: pass message_body and sender_display_name for payload-carrying wake
+    payload = build_wake_payload(
+        terminal_id, max_written_row_id,
+        message_body=message_body,
+        sender_display_name=sender_display_name,
+    )
 
     # D8: sample pre-write status for verification
     pre_status_updated_at = record.status_updated_at
