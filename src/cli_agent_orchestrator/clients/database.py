@@ -3521,7 +3521,28 @@ def read_terminal_system_metadata(terminal_id: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # F175: Dedicated dedup high-water accessors (clobber-proof)
 # F476 D5: Readers/writers REMOVED — columns kept for backward compat.
+# Stubs retained for test-patch compatibility (patch targets exist, are no-ops).
 # ---------------------------------------------------------------------------
+
+
+def get_terminal_last_notified_inbox_id(terminal_id: str) -> int:
+    """F476: STUB — returns 0. Retained as patch target for legacy tests."""
+    return 0
+
+
+def set_terminal_last_notified_inbox_id(terminal_id: str, message_id: int) -> bool:
+    """F476: STUB — no-op. Retained as patch target for legacy tests."""
+    return True
+
+
+def get_terminal_last_doorbell_row_id(terminal_id: str) -> int:
+    """F476: STUB — returns 0. Retained as patch target for legacy tests."""
+    return 0
+
+
+def set_terminal_last_doorbell_row_id(terminal_id: str, row_id: int) -> bool:
+    """F476: STUB — no-op. Retained as patch target for legacy tests."""
+    return True
 
 
 def set_terminal_worktree_info(terminal_id: str, info: Dict[str, str]) -> None:

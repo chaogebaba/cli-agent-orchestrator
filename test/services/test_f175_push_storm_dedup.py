@@ -1,14 +1,10 @@
-"""F175 regression tests — teammate-push append storm and metadata clobber.
+"""F175 regression tests — teammate-push deterministic identity and file-level dedup.
 
-Proves:
-1. Storm scenario: N sweeps with the same unconsumed row produce exactly 1 inbox
-   file entry (not N duplicates).
-2. Metadata-clobber scenario: supervisor whole-dict replace of terminal metadata
-   between sweeps does NOT reset the dedup high-water (no re-append).
+F476 update: Client-side high-water dedup (last_notified_inbox_id) has been removed.
+Server-side wake cursor (claim_unnotified_wake / commit_wake) replaces it.
+Remaining tests validate:
 3. Deterministic msg_id: _build_entry with mailbox context produces stable uuid5.
 4. File-level dedup in _write_inbox_entry: duplicate msg_id appends are idempotent.
-
-All tests MUST FAIL when the fix is reverted.
 """
 
 from __future__ import annotations
@@ -19,7 +15,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -27,12 +23,10 @@ from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, Orc
 from cli_agent_orchestrator.services.teammate_push_service import (
     F136_CALLBACK_NAMESPACE,
     _build_entry,
-    _last_notified,
     _write_inbox_entry,
     attempt_teammate_push_reported,
     callback_notification_id,
 )
-
 
 TERMINAL_ID = "f175test"
 MAILBOX_ID = "mb-f175-test"
@@ -49,14 +43,6 @@ def _make_message(msg_id: int = 5360, sender_id: str = "kiro_dev-71f9d3d9") -> I
         created_at=datetime(2026, 8, 13, 6, 27, 0, tzinfo=timezone.utc),
         logical_receiver_id=MAILBOX_ID,
     )
-
-
-@pytest.fixture(autouse=True)
-def _clean_last_notified():
-    """Clear in-memory dedup dict before each test."""
-    _last_notified.pop(TERMINAL_ID, None)
-    yield
-    _last_notified.pop(TERMINAL_ID, None)
 
 
 @pytest.fixture
@@ -78,62 +64,15 @@ def _metadata_with_inbox(inbox_path: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Test 1: Storm scenario — N sweeps, 1 unconsumed row → exactly 1 entry
+# Test 1: File-level dedup — deterministic msg_id prevents duplicate appends
 # ---------------------------------------------------------------------------
 
 
-class TestStormScenario:
-    """Supervisor busy, N sweep invocations for the same unconsumed row."""
+class TestFileLevelDedup:
+    """File-level dedup via deterministic msg_id prevents duplicate entries."""
 
-    def test_n_sweeps_produce_exactly_one_entry(self, inbox_dir):
-        """Simulate 30 reconciler sweeps while the supervisor is busy.
-
-        After fix: exactly 1 inbox file entry (first sweep writes, rest dedup).
-        Before fix: 30 entries (uuid4 msg_id + metadata-clobbered high-water).
-        """
-        msg = _make_message(msg_id=5360)
-        meta = _metadata_with_inbox(str(inbox_dir))
-
-        # Patch DB accessors — simulate no prior notification
-        with (
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata",
-                return_value=meta,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.get_terminal_last_notified_inbox_id",
-                return_value=0,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id",
-            ) as mock_set,
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
-                return_value=0,  # not consumed yet
-            ),
-        ):
-            outcomes = []
-            for sweep in range(30):
-                outcome = attempt_teammate_push_reported(TERMINAL_ID, [msg], mailbox_id=MAILBOX_ID)
-                outcomes.append(outcome)
-
-            # First sweep should push
-            assert outcomes[0].pushed is True
-            assert outcomes[0].reason == "pushed"
-
-            # All subsequent should be deduped (already_notified via in-memory fallback)
-            for i, oc in enumerate(outcomes[1:], 1):
-                assert oc.pushed is False, f"sweep {i} should not push"
-                assert oc.reason == "already_notified"
-
-            # Inbox file has exactly 1 entry
-            entries = json.loads(inbox_dir.read_text())
-            assert len(entries) == 1
-
-    def test_file_level_dedup_prevents_duplicates_even_without_highwater(self, inbox_dir):
-        """Even if in-memory dict is cleared between sweeps (simulating restart),
-        the file-level msg_id dedup prevents duplicate appends.
-        """
+    def test_file_level_dedup_prevents_duplicates(self, inbox_dir):
+        """Even with no in-memory state, deterministic msg_id prevents file duplicates."""
         msg = _make_message(msg_id=5360)
         meta = _metadata_with_inbox(str(inbox_dir))
 
@@ -141,13 +80,6 @@ class TestStormScenario:
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_terminal_metadata",
                 return_value=meta,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.get_terminal_last_notified_inbox_id",
-                return_value=0,  # Always returns 0 (simulates DB clobber)
-            ),
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id",
             ),
             patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
@@ -155,16 +87,11 @@ class TestStormScenario:
             ),
         ):
             # First push — writes to file
-            _last_notified.pop(TERMINAL_ID, None)
             o1 = attempt_teammate_push_reported(TERMINAL_ID, [msg], mailbox_id=MAILBOX_ID)
             assert o1.pushed is True
 
-            # Simulate loss of in-memory state (restart)
-            _last_notified.pop(TERMINAL_ID, None)
-
             # Second push — file-level dedup catches it via deterministic msg_id
             o2 = attempt_teammate_push_reported(TERMINAL_ID, [msg], mailbox_id=MAILBOX_ID)
-            # Should still "succeed" (idempotent) but file has only 1 entry
             assert o2.pushed is True  # _write_inbox_entry returns True for already-present
 
             entries = json.loads(inbox_dir.read_text())
@@ -172,30 +99,17 @@ class TestStormScenario:
 
 
 # ---------------------------------------------------------------------------
-# Test 2: Metadata clobber scenario — supervisor replace between sweeps
+# Test 2: Consumption cursor dedup
 # ---------------------------------------------------------------------------
 
 
-class TestMetadataClobberScenario:
-    """Supervisor update_metadata (whole-dict replace) cannot reset dedup."""
+class TestConsumptionCursorDedup:
+    """Messages below consumption cursor are filtered out."""
 
-    def test_supervisor_replace_does_not_reset_highwater(self, inbox_dir):
-        """After first push writes to dedicated column, supervisor's
-        update_terminal_metadata(id, {cc_team_inbox_path: ..., task: ...})
-        does NOT erase last_notified_inbox_id because it lives in a separate column.
-        """
+    def test_consumed_messages_not_pushed(self, inbox_dir):
+        """Messages with id <= consumption cursor are not pushed."""
         msg = _make_message(msg_id=5360)
         meta = _metadata_with_inbox(str(inbox_dir))
-
-        # Track the stored value
-        stored_notified = [0]
-
-        def mock_get_notified(tid):
-            return stored_notified[0]
-
-        def mock_set_notified(tid, val):
-            stored_notified[0] = val
-            return True
 
         with (
             patch(
@@ -203,37 +117,13 @@ class TestMetadataClobberScenario:
                 return_value=meta,
             ),
             patch(
-                "cli_agent_orchestrator.services.teammate_push_service.get_terminal_last_notified_inbox_id",
-                side_effect=mock_get_notified,
-            ),
-            patch(
-                "cli_agent_orchestrator.services.teammate_push_service.set_terminal_last_notified_inbox_id",
-                side_effect=mock_set_notified,
-            ),
-            patch(
                 "cli_agent_orchestrator.services.teammate_push_service.get_mailbox_consumption_cursor",
-                return_value=0,
+                return_value=6000,  # above the message id
             ),
         ):
-            # First sweep pushes
-            _last_notified.pop(TERMINAL_ID, None)
-            o1 = attempt_teammate_push_reported(TERMINAL_ID, [msg], mailbox_id=MAILBOX_ID)
-            assert o1.pushed is True
-            assert stored_notified[0] == 5360
-
-            # Simulate supervisor clobber: in the old code this would have
-            # reset metadata["last_notified_inbox_id"] to None. With dedicated
-            # column, stored_notified stays at 5360.
-            # (We don't touch stored_notified — that's the point)
-
-            # Second sweep — should be deduped
-            _last_notified.pop(TERMINAL_ID, None)
-            o2 = attempt_teammate_push_reported(TERMINAL_ID, [msg], mailbox_id=MAILBOX_ID)
-            assert o2.pushed is False
-            assert o2.reason == "already_notified"
-
-            entries = json.loads(inbox_dir.read_text())
-            assert len(entries) == 1
+            outcome = attempt_teammate_push_reported(TERMINAL_ID, [msg], mailbox_id=MAILBOX_ID)
+            assert outcome.pushed is False
+            assert outcome.reason == "consumed"
 
 
 # ---------------------------------------------------------------------------

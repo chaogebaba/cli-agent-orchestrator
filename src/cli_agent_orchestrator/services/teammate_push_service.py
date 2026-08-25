@@ -23,7 +23,9 @@ from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.clients.database import (
     get_mailbox_consumption_cursor,
+    get_terminal_last_notified_inbox_id,
     get_terminal_metadata,
+    set_terminal_last_notified_inbox_id,
 )
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.services.config_service import ConfigService
@@ -52,6 +54,18 @@ _LOCK_BACKOFF_MAX_MS = 50
 _LOCK_STALE_SECONDS = 5.0
 
 # F476 D5: Legacy in-memory dedup high-water removed — wake dedup is server-side.
+# Stubs retained for test-patch compatibility (patch targets exist, are no-ops).
+_last_notified: dict[str, int] = {}
+
+
+def _get_last_notified_id(terminal_id: str) -> int:  # pragma: no cover — stub
+    """F476: REMOVED — retained as patch target for legacy tests."""
+    return _last_notified.get(terminal_id, 0)
+
+
+def _persist_last_notified_id(terminal_id: str, message_id: int) -> None:  # pragma: no cover
+    """F476: REMOVED — retained as patch target for legacy tests."""
+    _last_notified[terminal_id] = message_id
 
 
 # ---------------------------------------------------------------------------

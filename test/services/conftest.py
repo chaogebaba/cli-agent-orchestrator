@@ -74,9 +74,12 @@ def real_sqlite_env(tmp_path, monkeypatch):
         delivery_service,
         doorbell_service,
         inbox_service,
+        teammate_push_service,
     )
 
     _shadow_caches = (
+        teammate_push_service._last_notified,
+        doorbell_service._last_doorbell_row_id,
         doorbell_service._last_warn_time,
         inbox_service._failure_streaks,
         delivery_service._health_warning_dedup,
