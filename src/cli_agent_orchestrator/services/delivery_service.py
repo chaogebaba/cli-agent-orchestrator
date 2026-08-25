@@ -214,7 +214,15 @@ def emit_trace_or_collapse(
 
 
 def create_obligation(inbox_row_id: int, mailbox_id: str, db: Session) -> None:
-    """Create obligation in the same transaction as the message (D1 atomic)."""
+    """Create obligation in the same transaction as the message (D1 atomic).
+
+    F413: idempotent — if obligation already exists (created by the ORM listener),
+    this is a no-op. The listener is the primary creation path; this function is
+    retained for backward compatibility with tests and edge-case producers.
+    """
+    existing = db.query(DeliveryObligationModel).filter_by(inbox_row_id=inbox_row_id).first()
+    if existing is not None:
+        return
     db.add(
         DeliveryObligationModel(
             inbox_row_id=inbox_row_id,
