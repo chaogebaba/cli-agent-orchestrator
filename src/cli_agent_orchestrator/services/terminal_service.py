@@ -1427,7 +1427,7 @@ async def create_terminal(
     kiro_capability_probe: Optional[Callable[[KiroEngine, set[str]], KiroCapabilities]] = None,
     model: Optional[str] = None,
     lifecycle: str | None = None,
-    use_worktree: bool = False,
+    use_worktree: Optional[bool] = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     authority_files: Optional[List[Dict[str, str]]] = None,
@@ -1659,6 +1659,13 @@ async def create_terminal(
         resolved_lifecycle = lifecycle or profile_lifecycle or "ephemeral"
         if resolved_lifecycle not in {"ephemeral", "sticky"}:
             raise ValueError("invalid_terminal_lifecycle")
+
+        # F416 (#271): resolve use_worktree from profile default when caller
+        # did not pass an explicit value (None). Explicit True/False always wins.
+        if use_worktree is None:
+            profile_default_worktree = getattr(early_profile, "default_use_worktree", None)
+            use_worktree = bool(profile_default_worktree)
+        # At this point use_worktree is always a bool.
 
         # Existing-session managed creates take shared authority before any
         # create_window call. The direct CLI restore path is intentionally

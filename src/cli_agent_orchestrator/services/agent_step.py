@@ -338,7 +338,7 @@ async def run_agent_step(
     cancel_event: Optional[asyncio.Event] = None,
     engine: Optional[KiroEngine | str] = None,
     model: Optional[str] = None,
-    use_worktree: bool = False,
+    use_worktree: Optional[bool] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 

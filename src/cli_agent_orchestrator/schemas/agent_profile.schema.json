@@ -196,6 +196,11 @@
     },
     "useLegacyMcpJson": {
       "type": "boolean"
+    },
+    "default_use_worktree": {
+      "type": "boolean",
+      "default": false,
+      "description": "F416: When true, assign/handoff spawns for this profile provision an isolated git worktree unless the caller explicitly passes use_worktree. Follows the lifecycle-default precedent."
     }
   },
   "additionalProperties": false

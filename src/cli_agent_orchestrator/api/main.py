@@ -555,8 +555,8 @@ class RunStepRequest(BaseModel):
         default=None,
         description="Resolved allowed-tools list for a freshly created terminal (handoff inheritance)",
     )
-    use_worktree: bool = Field(
-        default=False,
+    use_worktree: Optional[bool] = Field(
+        default=None,
         description=(
             "Issue #100 Phase 1: provision an isolated git worktree for a freshly "
             "created terminal instead of sharing working_directory as given. "
@@ -4025,7 +4025,7 @@ async def create_terminal_in_session(
     caller_id: Optional[TerminalId] = None,
     defer_init: bool = False,
     model: Optional[str] = None,
-    use_worktree: bool = False,
+    use_worktree: Optional[bool] = None,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -4866,7 +4866,7 @@ async def run_step(
                         None if body.allowed_tools is None else tuple(body.allowed_tools)
                     ),
                     effective_working_directory=effective_working_directory,
-                    use_worktree=body.use_worktree,
+                    use_worktree=body.use_worktree or False,
                     # DERIVED, never the raw id (``step-fingerprint`` BR-6). Always
                     # False on this tier today, because ``env_vars`` with a
                     # ``reuse_terminal_id`` is already a 422 — computed rather than

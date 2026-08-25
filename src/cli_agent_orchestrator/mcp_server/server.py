@@ -334,7 +334,7 @@ def _create_terminal(
     park_warm: bool = False,
     model: Optional[str] = None,
     lifecycle: Literal["ephemeral", "sticky"] | None = None,
-    use_worktree: bool = False,
+    use_worktree: Optional[bool] = None,
     authority_files: Optional[List[Dict[str, str]]] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
@@ -407,8 +407,10 @@ def _create_terminal(
             params["engine"] = engine
         if model and model.strip():
             params["model"] = model
-        if use_worktree:
-            params["use_worktree"] = "true"
+        if use_worktree is not None:
+            params["use_worktree"] = "true" if use_worktree else "false"
+
+
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
@@ -1178,7 +1180,7 @@ async def _handoff_impl(
     working_directory: Optional[str] = None,
     engine: Optional[str] = None,
     model: Optional[str] = None,
-    use_worktree: bool = False,
+    use_worktree: Optional[bool] = None,
 ) -> HandoffResult:
     """Implementation of handoff logic.
 
@@ -1243,8 +1245,10 @@ async def _handoff_impl(
             "prompt": shaped_message,
             "teardown": True,
             "timeout": float(timeout),
-            "use_worktree": use_worktree,
+
         }
+        if use_worktree is not None:
+            payload["use_worktree"] = use_worktree
         if ctx.session_name:
             payload["session_name"] = ctx.session_name
         if ctx.caller_id:
@@ -1482,11 +1486,11 @@ async def handoff(
         description="Optional working directory where the agent should execute",
     ),
     model: Optional[str] = Field(default=None, description=_model_field_desc),
-    use_worktree: bool = Field(
-        default=False,
+    use_worktree: Optional[bool] = Field(
+        default=None,
         description=(
             "If true, provision an isolated git worktree for this handoff instead of "
-            "sharing the supervisor's working directory. Default false."
+            "sharing the supervisor's working directory. Default false; omit to use the profile's default_use_worktree setting."
         ),
     ),
 ) -> HandoffResult:
@@ -1590,7 +1594,7 @@ def _assign_impl(
     model: Optional[str] = None,
     lifecycle: Literal["ephemeral", "sticky"] | None = None,
     engine: Optional[str] = None,
-    use_worktree: bool = False,
+    use_worktree: Optional[bool] = None,
     authority_files: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
@@ -1989,11 +1993,11 @@ async def assign(
     engine: Optional[str] = Field(
         default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
     ),
-    use_worktree: bool = Field(
-        default=False,
+    use_worktree: Optional[bool] = Field(
+        default=None,
         description=(
             "If true, provision an isolated git worktree for this worker instead of "
-            "sharing the supervisor's working directory. Default false."
+            "sharing the supervisor's working directory. Default false; omit to use the profile's default_use_worktree setting."
         ),
     ),
     authority_files: Optional[List[Dict[str, str]]] = Field(
