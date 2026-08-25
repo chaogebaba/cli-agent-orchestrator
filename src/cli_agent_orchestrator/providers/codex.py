@@ -1707,7 +1707,10 @@ class CodexProvider(BaseProvider):
              seed (``self._fork_context.session_uuid`` when mode == resume), or
              the single newest rollout file in the sessions dir.
         """
-        sessions_dir = _resolved_codex_home(getattr(self, "terminal_id", None)) / "sessions"
+        try:
+            sessions_dir = _resolved_codex_home(getattr(self, "terminal_id", None)) / "sessions"
+        except Exception:
+            return None
         if not sessions_dir.is_dir():
             return None
 
