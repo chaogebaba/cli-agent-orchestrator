@@ -554,6 +554,7 @@ class BaseProvider(ABC):
         self,
         metadata: dict[str, Any],
         backend: Any,
+        message: str | None = None,
     ) -> None:
         """Provider hook called immediately after send_keys pastes+submits a message.
 
@@ -562,6 +563,13 @@ class BaseProvider(ABC):
         recover by re-sending Enter when — and only when — a durable "still
         drafted, not submitted" marker is observed on the pane. See
         ``CodexProvider.verify_submission_after_send`` for the F435 recovery.
+
+        ``message`` is the exact task text that was pasted. TUI providers use it
+        to anchor confirmation on a DURABLE scrollback-content boundary — the
+        pasted task echoed as a SUBMITTED user turn above the active composer —
+        which is positive, position-stable evidence in both directions
+        (F435 r4). It is optional so callers that cannot supply it (and the
+        no-op default) are unaffected.
 
         The default implementation is a no-op: providers with no observed
         submit race are unaffected. Implementations MUST be idempotent — they

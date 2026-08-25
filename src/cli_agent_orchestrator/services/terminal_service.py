@@ -4528,7 +4528,7 @@ def send_input(
             # Provider-scoped: the default hook is a no-op, so non-codex
             # providers are unaffected.
             if provider:
-                provider.verify_submission_after_send(metadata, backend)
+                provider.verify_submission_after_send(metadata, backend, message=message)
         except CodexSubmitStuckError as stuck:
             status_monitor.abort_dispatch(dispatch_txn)
             # Retry-safe deferred outcome: the dispatch is rolled back and the
@@ -4727,7 +4727,7 @@ def send_prepared_input(
             # mark_injection_completed / on_submitted publish the submission
             # boundary, and only then is the human draft restored.
             if provider:
-                provider.verify_submission_after_send(metadata, backend)
+                provider.verify_submission_after_send(metadata, backend, message=message)
         except CodexSubmitStuckError as stuck:
             status_monitor.abort_dispatch(dispatch_txn)
             raise DeliveryDeferredError(str(stuck)) from stuck

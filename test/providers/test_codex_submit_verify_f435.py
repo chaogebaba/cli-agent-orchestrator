@@ -278,12 +278,31 @@ def test_stuck_then_recovered_after_one_reenter():
 
 
 def test_stuck_then_cleared_composer_after_chip_is_submission():
-    """chip→cleared transition (not spinner) is accepted as submission."""
+    """A chip→cleared transition is submission ONLY with a submitted turn.
+
+    r4 (BLOCKER 2): a bare cleared composer is NOT submission evidence — the
+    r3 chip→cleared latch false-committed unrelated clears. Confirmation now
+    requires the pasted task to appear as a submitted turn in scrollback. Here
+    the recovered pane shows the submitted chip echoed into history above the
+    now-empty composer, so it is a real submit transition and confirms after
+    exactly one re-Enter. (The no-submit control lives in
+    ``test_codex_submit_verify_f435_r4.py::test_B_chip_then_unrelated_clear_*``.)
+    """
     provider = _provider()
-    # grace poll: stuck chip; after one re-Enter: composer cleared to the
-    # empty placeholder. Because the chip was positively seen first, the
-    # cleared composer is a real submit transition, not a stale frame.
-    backend = _backend_returning(STUCK_CHIP_PANE, SUBMITTED_PLACEHOLDER_PANE)
+    # A recovered pane: the pasted chip has scrolled up into a submitted turn
+    # (history), the assistant answered, and the active composer is now empty.
+    recovered_submitted_pane = (
+        "• SEED_OK\n"
+        "\n"
+        "› [Pasted Content 3048 chars]\n"  # submitted turn (history)
+        "\n"
+        "• On it.\n"
+        "\n"
+        "› Ask Codex to do anything\n"  # empty active composer
+        "\n"
+        "  ~/VScode_projects/cli-subagents · main · gpt-5.6-sol high\n"
+    )
+    backend = _backend_returning(STUCK_CHIP_PANE, recovered_submitted_pane)
 
     provider.verify_submission_after_send(METADATA, backend)
 
