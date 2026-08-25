@@ -162,7 +162,11 @@ async def test_required_brief_is_built_after_db_and_fifo_and_before_provider(mon
     )
     result = await svc.create_terminal("codex", "supervisor", new_session=True)
     assert result.id == "term0001"
-    assert order == ["window", "fifo", "db", "manifest", "provider"]
+    # A1 (#498): the registry row is published inside the lifecycle-locked closure
+    # (right after the tmux create), BEFORE the FIFO/pipe-pane is wired up — so
+    # "db" now precedes "fifo". The brief is still built after db+fifo and before
+    # the provider initializes.
+    assert order == ["window", "db", "fifo", "manifest", "provider"]
     assert "term0001" in provider_kwargs["skill_prompt"]
 
 
@@ -228,8 +232,10 @@ async def test_required_core_failure_rolls_back_sync_and_deferred(
         await svc.create_terminal(
             "codex", "supervisor", new_session=True, defer_init=defer_init
         )
+    # A1 (#498): row published inside the locked closure (after the tmux create,
+    # before FIFO), so "db" precedes "fifo". Rollback order is unchanged.
     assert calls == [
-        "window", "fifo", "db", "delete-db", "stop-pipe", "stop-fifo", "session"
+        "window", "db", "fifo", "delete-db", "stop-pipe", "stop-fifo", "session"
     ]
     create_provider.assert_not_called()
     assert not list(tmp_path.glob("*prompt*"))
