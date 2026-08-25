@@ -89,6 +89,7 @@ class ProviderManager:
             fork_context,
             persona_plan,
             engine,
+            resume_session_id,
         )
         self.commit_provider(terminal_id, provider)
         return provider
@@ -106,6 +107,7 @@ class ProviderManager:
         fork_context: Optional[ForkContext] = None,
         persona_plan: "PersonaPlan | None | object" = _NO_PERSONA_PLAN,
         engine: Optional[KiroEngine] = None,
+        resume_session_id: Optional[str] = None,
     ) -> BaseProvider:
         """Construct without mutating the live terminal mapping."""
         try:
