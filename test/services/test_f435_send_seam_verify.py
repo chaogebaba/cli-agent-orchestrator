@@ -79,7 +79,7 @@ def _codex_like_provider(events: list[str], *, stuck: bool) -> MagicMock:
     provider.paste_submit_delay = 0.0
     provider.assume_processing_on_dispatch = False
 
-    def _verify(metadata, backend):
+    def _verify(metadata, backend, message=None):
         events.append("verify")
         if stuck:
             raise CodexSubmitStuckError(
@@ -122,6 +122,10 @@ def test_send_input_invokes_verify_hook_once(monkeypatch):
     assert terminal_service.send_input("term1234", "task") is True
 
     provider.verify_submission_after_send.assert_called_once()
+    # r4: the pasted task text is threaded through so the hook can anchor on
+    # the scrollback-content submission boundary. A regression that drops the
+    # message argument turns this RED.
+    assert provider.verify_submission_after_send.call_args.kwargs.get("message") == "task"
     # verify runs AFTER the paste and BEFORE the commit.
     assert events == ["send_keys", "verify", "commit"]
 
@@ -179,6 +183,8 @@ def test_send_prepared_input_invokes_verify_hook_once(monkeypatch):
     terminal_service.send_prepared_input("term1234", "payload", on_submitted=submitted_calls.append)
 
     provider.verify_submission_after_send.assert_called_once()
+    # r4: the prepared payload text is threaded through as the message anchor.
+    assert provider.verify_submission_after_send.call_args.kwargs.get("message") == "payload"
     # verify BEFORE commit; boundary published only after commit.
     assert events == ["send_keys", "verify", "commit", "mark_injection_completed"]
     assert len(submitted_calls) == 1
