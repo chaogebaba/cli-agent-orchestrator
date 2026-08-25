@@ -15,6 +15,21 @@ import time
 
 import pytest
 
+
+def _wait_for_client(env, *, timeout=3.0, interval=0.1):
+    """Poll until tmux reports an attached client, return its tty.
+
+    pty.fork() + tmux attach is asynchronous — the client registration can take
+    longer than a fixed sleep under CPU contention (full xdist suite).
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        tty = env.output("list-clients", "-F", "#{client_tty}")
+        if tty:
+            return tty
+        time.sleep(interval)
+    return ""
+
 # Force serial execution — these tests use pty.fork() which is incompatible with
 # xdist worker parallelism (shared socket namespace).
 pytestmark = pytest.mark.xdist_group("f469-tmux-parking")
@@ -91,8 +106,7 @@ class TestF469ParkClientsOnKill:
             os.execvp("tmux", ["tmux", "-L", env.name, "attach-session", "-t", "test"])
 
         try:
-            time.sleep(0.5)
-            client_tty = env.output("list-clients", "-F", "#{client_tty}")
+            client_tty = _wait_for_client(env)
             assert client_tty, "No client attached"
 
             # Move client to win1
@@ -136,8 +150,7 @@ class TestF469ParkClientsOnKill:
             os.execvp("tmux", ["tmux", "-L", env.name, "attach-session", "-t", "test"])
 
         try:
-            time.sleep(0.5)
-            client_tty = env.output("list-clients", "-F", "#{client_tty}")
+            client_tty = _wait_for_client(env)
             assert client_tty
 
             # Park client on win0 (not the target)
@@ -201,8 +214,7 @@ class TestF469ParkClientsOnKill:
             os.execvp("tmux", ["tmux", "-L", env.name, "attach-session", "-t", "test"])
 
         try:
-            time.sleep(0.5)
-            client_tty = env.output("list-clients", "-F", "#{client_tty}")
+            client_tty = _wait_for_client(env)
             assert client_tty
 
             # Park client on win0

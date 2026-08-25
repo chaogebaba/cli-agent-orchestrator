@@ -265,7 +265,13 @@ class TestConfirmedAnswers:
             ["tmux", "-S", str(tmux_socket), "kill-server"], capture_output=True, check=True
         )
 
-        assert client.session_exists_strict("cao-alive") is False
+        # kill-server is asynchronous: the command returns once the server
+        # begins shutdown, but under heavy CPU contention (full xdist suite)
+        # the server may still respond to queries for a brief window.  Poll
+        # until the server is actually unreachable.
+        assert _wait_until(
+            lambda: client.session_exists_strict("cao-alive") is False, timeout=3.0
+        )
 
 
 class TestUnanswerableLookupsFailClosed:
