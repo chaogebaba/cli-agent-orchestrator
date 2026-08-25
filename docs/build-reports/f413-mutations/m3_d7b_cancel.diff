@@ -1,4 +1,0 @@
-1c1
-<             _f413_qualify_and_create(db, _cancel_flip_rows)
----
->             pass  # MUTANT: _f413_qualify_and_create disabled

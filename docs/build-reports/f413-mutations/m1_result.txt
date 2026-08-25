@@ -1,3 +1,0 @@
-exit_code=1
-9 failed, 5 passed
-key tests killed: TestAC1RawAdd, TestPredicateUnit::test_pending_with_receiver
