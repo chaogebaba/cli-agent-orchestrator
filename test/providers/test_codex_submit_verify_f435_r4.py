@@ -241,29 +241,66 @@ def test_B_negative_control_real_submitted_turn_confirms():
 
 
 def test_C_stale_postsubmit_chip_frame_sends_no_extra_enter():
-    """After submission the scrollback shows the submitted turn; a lagged
-    capture still shows the chip on the composer.
+    """A stale post-submit chip frame must not drive a SECOND Enter.
 
-    r3's ``_poll_state`` returned STUCK on that stale chip and sent another
-    Enter (double delivery). r4 must consult the scrollback boundary: the
-    submitted turn is present, so the pane is 'already submitted' and NO
+    Reproduces the gate's C probe: the first recovery Enter is accepted and the
+    task submits (its turn now sits in scrollback), but the very next capture
+    LAGS the TUI by one redraw and still shows the chip on the active composer
+    with NO spinner yet. r3 read that stale frame as STUCK and sent a SECOND
+    Enter — a double delivery. r4 checks the durable scrollback boundary FIRST:
+    the submitted turn is present, so the pane is 'already submitted' and no
     further Enter is sent.
+
+    On r3 this fails as ``enters == 2`` (or a raise); on r4 it is exactly the
+    one Enter that submitted, and no more.
     """
     provider = _provider()
-    # First (and every) capture: the submitted turn IS in scrollback, but a
-    # stale chip ALSO lingers on the active-composer row of the same frame.
-    stale_frame = (
+    # Frame 1: genuinely stuck (chip on active composer, nothing in history).
+    # Frames 2+: a STALE post-submit frame — the submitted turn is now in
+    # scrollback history, but the active composer STILL shows the chip (lagged
+    # capture) and there is NO spinner to disambiguate.
+    stale_after_submit = (
         "• SEED_OK\n"
         "\n"
         "› [Pasted Content 3048 chars]\n"  # submitted turn (history)
         "\n"
-        "• Working (1s • esc to interrupt)\n"
+        "• Reading the task…\n"
         "\n"
         "› [Pasted Content 3048 chars]\n"  # STALE chip still on active composer
         "\n"
         "  ~/VScode_projects/cli-subagents · main · gpt-5.6-sol high\n"
     )
-    backend = _backend_returning(stale_frame)
+    backend = _backend_returning(STUCK_CHIP_PANE, stale_after_submit)
+
+    _verify(provider, backend)  # must NOT raise
+
+    # r4 sends exactly the one Enter that submitted; the stale chip frame does
+    # NOT trigger a second Enter (BLOCKER 3).
+    assert _enter_calls(backend) == 1
+
+
+def test_C_stale_chip_with_submitted_turn_confirms_without_any_enter():
+    """A first-capture stale chip that already has a submitted turn in
+    scrollback confirms with ZERO Enters.
+
+    This is the purest B3 shape: the paste submitted on the ORIGINAL Enter, the
+    turn is in history, yet the first capture still shows the chip on the active
+    composer. r3 sends a (double-delivery) recovery Enter here; r4 reads the
+    scrollback boundary and sends none.
+    """
+    provider = _provider()
+    stale_first_frame = (
+        "• SEED_OK\n"
+        "\n"
+        "› [Pasted Content 3048 chars]\n"  # submitted turn (history)
+        "\n"
+        "• Reading the task…\n"
+        "\n"
+        "› [Pasted Content 3048 chars]\n"  # STALE chip on active composer
+        "\n"
+        "  ~/VScode_projects/cli-subagents · main · gpt-5.6-sol high\n"
+    )
+    backend = _backend_returning(stale_first_frame)
 
     _verify(provider, backend)  # must NOT raise
 
