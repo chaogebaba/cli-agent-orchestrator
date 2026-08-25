@@ -915,7 +915,7 @@ class TestTerminalCreationWithWorkingDirectory:
 
             assert response.status_code == 201
             call_kwargs = mock_svc.create_terminal.call_args.kwargs
-            assert call_kwargs.get("use_worktree") is False
+            assert call_kwargs.get("use_worktree") is None
 
     def test_create_terminal_in_session_worktree_error_maps_to_400(self, client):
         """A working_directory that isn't a git repo is a client-input

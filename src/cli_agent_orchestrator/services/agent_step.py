@@ -338,7 +338,7 @@ async def run_agent_step(
     cancel_event: Optional[asyncio.Event] = None,
     engine: Optional[KiroEngine | str] = None,
     model: Optional[str] = None,
-    use_worktree: bool = False,
+    use_worktree: Optional[bool] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -506,7 +506,7 @@ async def run_agent_step(
             engine=engine.value if isinstance(engine, KiroEngine) else engine,
             allowed_tools=None if allowed_tools is None else tuple(allowed_tools),
             effective_working_directory=working_directory,
-            use_worktree=use_worktree,
+            use_worktree=use_worktree or False,
             reused_terminal=not created_here,
             timeout=timeout,
         )

@@ -224,12 +224,12 @@ class TestHandoffOutcomes:
         # The single combined call requests server-side teardown.
         assert mock_requests.post.call_args[1]["json"]["teardown"] is True
 
+
     @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
-    def test_use_worktree_defaults_to_false_in_the_payload(self, mock_provider, _nudge):
-        """issue #100 Phase 1: unconditionally present in the payload (unlike
-        the Optional fields above) so the server always sees an explicit
-        value, matching RunStepRequest's own unconditional default."""
+    def test_use_worktree_omitted_not_in_payload(self, mock_provider, _nudge):
+        """F416: when use_worktree is omitted (None), it is NOT sent in the payload
+        so the server resolves from profile default."""
         mock_provider.return_value = _ctx("kiro_cli")
 
         with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
@@ -237,8 +237,7 @@ class TestHandoffOutcomes:
             mock_requests.Timeout = Exception
             asyncio.run(_handoff_impl("developer", "Do task"))
 
-        assert mock_requests.post.call_args[1]["json"]["use_worktree"] is False
-
+        assert "use_worktree" not in mock_requests.post.call_args[1]["json"]
     @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
     def test_use_worktree_true_reaches_the_payload(self, mock_provider, _nudge):

@@ -381,7 +381,7 @@ class TestRunStepEndpoint:
             resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
 
         assert resp.status_code == 200
-        assert m_run.await_args.kwargs["use_worktree"] is False
+        assert m_run.await_args.kwargs["use_worktree"] is None
 
     def test_use_worktree_true_is_forwarded(self, client):
         result = AgentStepResult(

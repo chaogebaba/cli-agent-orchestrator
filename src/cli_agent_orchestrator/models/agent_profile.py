@@ -166,3 +166,10 @@ class AgentProfile(BaseModel):
     # disabled because those workers are outside CAO's profile, callback, and
     # terminal-accounting boundaries.
     grokNativeWorkflows: Optional[bool] = None
+
+    # F416 (#271): profile-level worktree default. When True, assign/handoff
+    # spawns for this profile provision an isolated git worktree unless the
+    # caller explicitly passes use_worktree=False. Follows the lifecycle-default
+    # precedent: explicit caller value always wins, profile default is the
+    # fallback, absence means False.
+    default_use_worktree: Optional[bool] = None
