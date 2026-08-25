@@ -18,7 +18,7 @@ profile's field. Explicit True/False from the caller always wins.
 | `src/cli_agent_orchestrator/models/agent_profile.py` | L170-175 | New `default_use_worktree` field |
 | `src/cli_agent_orchestrator/schemas/agent_profile.schema.json` | L200-205 | JSON schema entry |
 | `src/cli_agent_orchestrator/services/terminal_service.py` | L1663-1668 | Resolution logic (parallel to lifecycle L1659) |
-| `src/cli_agent_orchestrator/services/agent_step.py` | L341 | Type change `bool=False` → `Optional[bool]=None` |
+| `src/cli_agent_orchestrator/services/agent_step.py` | L341, L509 | Type change + `or False` coercion at fingerprint site (S1) |
 | `src/cli_agent_orchestrator/api/main.py` | L558, L4028 | RunStepRequest + endpoint param type |
 | `src/cli_agent_orchestrator/mcp_server/server.py` | L337,L1181,L1485,L1593,L1992 | MCP tool/impl type changes |
 
