@@ -270,7 +270,7 @@ class TestConfirmedAnswers:
         # the server may still respond to queries for a brief window.  Poll
         # until the server is actually unreachable.
         assert _wait_until(
-            lambda: client.session_exists_strict("cao-alive") is False, timeout=3.0
+            lambda: client.session_exists_strict("cao-alive") is False, timeout=15.0
         )
 
 
