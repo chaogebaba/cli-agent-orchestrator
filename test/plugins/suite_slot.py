@@ -16,16 +16,19 @@ Design:
 - Stale-lock safety: flock(2) releases on process death automatically —
   no pid-liveness heuristics on top.
 
-Self-destruct watchdog (F437, issue #292):
+Self-destruct watchdog (F437, issue #292; F445 fix, issue #300):
 - Per-test timeouts (pytest-timeout) do NOT bound wall clock: a hung
   subprocess wait, a collection hang, or a C-level block escapes them.
   A runaway run once held this slot for 6h46m.
 - The controller process that ACQUIRES the lock arms a daemon watchdog
   (threading.Timer) for CAO_SUITE_SLOT_MAX_SECONDS (env, default 3600;
   value <= 0 disables). On fire: print a loud diagnostic to stderr
-  (holder identity + elapsed) then hard-kill its own process group via
-  os.killpg(SIGKILL) — so xdist workers die with it. flock then releases
-  automatically, freeing the slot.
+  (holder identity + elapsed) then hard-kill the pytest DESCENDANT TREE
+  only (BFS walk of /proc from os.getpid()) + terminate self via
+  os._exit. Ancestors (including a shared agent-TUI process group) are
+  NEVER signaled — fixes the 2026-08-24 incident where killpg(getpgrp)
+  took down the entire codex reviewer pane. flock releases automatically
+  on process exit, freeing the slot.
 - Armed ONLY when the lock was actually acquired: the CI path and xdist
   workers (which skip acquisition) never arm — box-run's own -w covers
   those.
@@ -92,22 +95,68 @@ def _max_seconds() -> float:
     return value
 
 
-def _watchdog_fire(max_seconds: float, armed_at: float) -> None:
-    """Loudly self-destruct the whole process group when the bound is hit.
+def _get_descendant_pids(root_pid: int) -> list[int]:
+    """Return all descendant PIDs of *root_pid* by BFS-walking /proc.
 
-    flock(2) releases automatically once this process group dies, freeing
-    the suite slot for the next run.
+    Only returns processes that are strictly below *root_pid* in the tree —
+    never *root_pid* itself, and never any ancestor.
+    """
+    descendants: list[int] = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return descendants
+    # Build parent→children map from /proc/*/stat
+    parent_map: dict[int, list[int]] = {}
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                stat_data = f.read().decode("utf-8", errors="replace")
+            # Format: pid (comm) state ppid ...
+            # comm may contain parens; find last ')' then split remaining fields
+            close_paren = stat_data.rfind(")")
+            fields = stat_data[close_paren + 2:].split()
+            ppid = int(fields[1])  # state=fields[0], ppid=fields[1]
+            parent_map.setdefault(ppid, []).append(pid)
+        except (OSError, IndexError, ValueError):
+            continue
+    # BFS from root_pid's children
+    queue = list(parent_map.get(root_pid, []))
+    visited: set[int] = set()
+    while queue:
+        pid = queue.pop(0)
+        if pid in visited:
+            continue
+        visited.add(pid)
+        descendants.append(pid)
+        queue.extend(parent_map.get(pid, []))
+    return descendants
+
+
+def _watchdog_fire(max_seconds: float, armed_at: float) -> None:
+    """Kill the pytest descendant tree and terminate self on watchdog expiry.
+
+    Walks /proc to find all descendants of this process (os.getpid()),
+    SIGKILLs them, then terminates self via os._exit. Ancestors — including
+    a shared agent-TUI process group — are NEVER signaled.
+
+    flock(2) releases automatically once this process exits, freeing the
+    suite slot for the next run.
     """
     elapsed = time.monotonic() - armed_at
     holder_info = _read_holder_info()
+    my_pid = os.getpid()
     banner = (
         "\n"
         "==================== SUITE-SLOT WATCHDOG ====================\n"
         f"[suite-slot] SELF-DESTRUCT: wall-clock bound of {max_seconds:.0f}s exceeded\n"
         f"[suite-slot]   elapsed:   {elapsed:.1f}s\n"
         f"[suite-slot]   holder:    {holder_info}\n"
-        f"[suite-slot]   controller pid={os.getpid()} pgid={os.getpgrp()}\n"
-        "[suite-slot] hard-killing process group (SIGKILL) — slot will be freed\n"
+        f"[suite-slot]   controller pid={my_pid} pgid={os.getpgrp()}\n"
+        "[suite-slot] killing descendant tree + self (ancestors safe)\n"
         "=============================================================\n"
     )
     try:
@@ -116,12 +165,17 @@ def _watchdog_fire(max_seconds: float, armed_at: float) -> None:
     except Exception:
         pass
 
-    # Hard-kill our own process group so xdist workers die with us.
-    try:
-        os.killpg(os.getpgrp(), signal.SIGKILL)
-    except Exception:
-        # Fallback: at least take this process down hard.
-        os._exit(137)
+    # Kill only our descendants — never ancestors, never the shared pgid.
+    descendants = _get_descendant_pids(my_pid)
+    for pid in reversed(descendants):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+    # Terminate self hard — os._exit skips atexit/cleanup but that is
+    # intentional for a hard watchdog timeout. Exit code 137 mirrors SIGKILL.
+    os._exit(137)
 
 
 def _arm_watchdog() -> None:

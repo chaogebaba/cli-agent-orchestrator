@@ -501,6 +501,7 @@ class TestWatchdogIntegration:
     the diagnostic, and leave the lock free for the next acquirer.
     """
 
+    @pytest.mark.slow
     def test_runaway_run_self_destructs_and_frees_slot(self, tmp_path: Path) -> None:
         repo_root = Path(__file__).resolve().parent.parent.parent
         lock_path = tmp_path / ".suite-slot.lock"
@@ -531,7 +532,8 @@ class TestWatchdogIntegration:
         # the watchdog's killpg targets the child tree, not this test runner.
         start = time.monotonic()
         proc = subprocess.Popen(
-            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-s", "test_hang.py"],
+            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
+             "-p", "no:libtmux", "-s", "test_hang.py"],
             cwd=str(run_dir),
             env=env,
             stdout=subprocess.PIPE,
@@ -548,9 +550,11 @@ class TestWatchdogIntegration:
 
         elapsed = time.monotonic() - start
 
-        # Killed by SIGKILL → negative return code -9 (process-group kill).
-        assert proc.returncode == -signal.SIGKILL, (
-            f"expected SIGKILL, got returncode={proc.returncode}\n{out}"
+        # Killed by watchdog → os._exit(137) from the process itself.
+        # With start_new_session=True the child is its own pgid leader; the
+        # watchdog kills descendants then os._exit(137).
+        assert proc.returncode == 137, (
+            f"expected exit 137 (watchdog os._exit), got returncode={proc.returncode}\n{out}"
         )
         # Fired ~on the 2s bound, comfortably under the 30s incident ceiling.
         assert elapsed < 20, f"took too long ({elapsed:.1f}s):\n{out}"
@@ -563,5 +567,222 @@ class TestWatchdogIntegration:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+
+# ---------------------------------------------------------------------------
+# F445 (issue #300): watchdog must never kill ancestors
+# ---------------------------------------------------------------------------
+
+
+class TestWatchdogAncestorSafety:
+    """F445 regression: watchdog kills only the pytest subtree, ancestors survive.
+
+    The pre-fix code used os.killpg(os.getpgrp(), SIGKILL) which, when pytest
+    shared a process group with the agent TUI, killed the entire pane. The fix
+    walks /proc descendants of os.getpid() only.
+    """
+
+    @pytest.mark.slow
+    def test_ancestor_survives_watchdog_fire(self, tmp_path: Path) -> None:
+        """Spawn a parent (simulating TUI ancestor) that forks a child running
+        pytest with a short watchdog. The parent MUST survive after the child
+        is killed by the watchdog — this is the core F445 invariant.
+        """
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        lock_path = tmp_path / "slot.lock"
+        marker_file = tmp_path / "ancestor_alive"
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+
+        # conftest that registers the plugin with repointed lockfile
+        (run_dir / "conftest.py").write_text(
+            "import sys, pathlib\n"
+            f"sys.path.insert(0, {str(repo_root)!r})\n"
+            "from test.plugins import suite_slot\n"
+            f"suite_slot._LOCK_PATH = pathlib.Path({str(lock_path)!r})\n"
+            "pytest_plugins = ('test.plugins.suite_slot',)\n"
+        )
+        # test that hangs past the 2s watchdog
+        (run_dir / "test_hang.py").write_text(
+            "import time\n"
+            "def test_hang():\n"
+            "    time.sleep(60)\n"
+        )
+
+        # Parent script: spawns pytest as a child (same pgid — no
+        # start_new_session), waits for it to die, then writes marker.
+        parent_script = tmp_path / "parent.py"
+        parent_script.write_text(
+            "import os, sys, subprocess\n"
+            f"env = {{**os.environ, 'CAO_SUITE_SLOT_MAX_SECONDS': '2',\n"
+            f"        'CAO_SUITE_SLOT_LOCK': {str(lock_path)!r}}}\n"
+            "env.pop('CI', None)\n"
+            "env.pop('CAO_SUITE_SLOT_WAIT', None)\n"
+            "child = subprocess.Popen(\n"
+            f"    [sys.executable, '-m', 'pytest', '-p', 'no:cacheprovider',\n"
+            f"     '-p', 'no:libtmux', '-s', 'test_hang.py'],\n"
+            f"    cwd={str(run_dir)!r},\n"
+            "    env=env,\n"
+            "    stdout=subprocess.PIPE,\n"
+            "    stderr=subprocess.STDOUT,\n"
+            ")\n"
+            "child.wait()\n"
+            "# If we reach here, we survived the watchdog!\n"
+            f"open({str(marker_file)!r}, 'w').write(f'alive:{{os.getpid()}}')\n"
+        )
+
+        # Run the parent — do NOT use start_new_session so parent and child
+        # share a pgid (the dangerous scenario the bug exploited).
+        result = subprocess.run(
+            [sys.executable, str(parent_script)],
+            timeout=30,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, (
+            f"Parent died (rc={result.returncode}) — watchdog killed ancestor!\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        assert marker_file.exists(), (
+            "Ancestor marker not written — ancestor was killed by watchdog"
+        )
+        content = marker_file.read_text()
+        assert content.startswith("alive:"), f"Unexpected marker: {content}"
+
+    @pytest.mark.slow
+    def test_watchdog_exit_code_is_137(self, tmp_path: Path) -> None:
+        """The watchdog-killed pytest process exits with code 137 (os._exit)."""
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        lock_path = tmp_path / "slot.lock"
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+
+        (run_dir / "conftest.py").write_text(
+            "import sys, pathlib\n"
+            f"sys.path.insert(0, {str(repo_root)!r})\n"
+            "from test.plugins import suite_slot\n"
+            f"suite_slot._LOCK_PATH = pathlib.Path({str(lock_path)!r})\n"
+            "pytest_plugins = ('test.plugins.suite_slot',)\n"
+        )
+        (run_dir / "test_hang.py").write_text(
+            "import time\n"
+            "def test_hang():\n"
+            "    time.sleep(300)\n"
+        )
+
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
+        env["CAO_SUITE_SLOT_MAX_SECONDS"] = "2"
+        env["CAO_SUITE_SLOT_LOCK"] = str(lock_path)
+
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
+             "-p", "no:libtmux", "-s", "test_hang.py"],
+            cwd=str(run_dir),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            pytest.fail("watchdog did not fire within 15s")
+
+        assert proc.returncode == 137, (
+            f"Expected 137 from os._exit, got {proc.returncode}"
+        )
+
+
+class TestWatchdogDisarmOnNormalCompletion:
+    """F445 regression: normal test completion disarms the watchdog cleanly."""
+
+    def test_clean_exit_no_watchdog_fire(self, tmp_path: Path) -> None:
+        """A fast test run exits 0 — watchdog never fires."""
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        lock_path = tmp_path / "slot.lock"
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+
+        (run_dir / "conftest.py").write_text(
+            "import sys, pathlib\n"
+            f"sys.path.insert(0, {str(repo_root)!r})\n"
+            "from test.plugins import suite_slot\n"
+            f"suite_slot._LOCK_PATH = pathlib.Path({str(lock_path)!r})\n"
+            "pytest_plugins = ('test.plugins.suite_slot',)\n"
+        )
+        (run_dir / "test_fast.py").write_text(
+            "def test_quick():\n"
+            "    assert 1 + 1 == 2\n"
+        )
+
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
+        env["CAO_SUITE_SLOT_MAX_SECONDS"] = "30"
+        env["CAO_SUITE_SLOT_LOCK"] = str(lock_path)
+
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
+             "-p", "no:libtmux", "-s", "test_fast.py"],
+            cwd=str(run_dir),
+            env=env,
+            timeout=15,
+            capture_output=True,
+            text=True,
+            start_new_session=True,
+        )
+
+        assert result.returncode == 0, (
+            f"Expected clean exit 0, got rc={result.returncode}\n"
+            f"output: {result.stdout}\n{result.stderr}"
+        )
+
+    def test_lock_freed_after_normal_run(self, tmp_path: Path) -> None:
+        """After normal completion, the lock file is not held."""
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        lock_path = tmp_path / "slot.lock"
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+
+        (run_dir / "conftest.py").write_text(
+            "import sys, pathlib\n"
+            f"sys.path.insert(0, {str(repo_root)!r})\n"
+            "from test.plugins import suite_slot\n"
+            f"suite_slot._LOCK_PATH = pathlib.Path({str(lock_path)!r})\n"
+            "pytest_plugins = ('test.plugins.suite_slot',)\n"
+        )
+        (run_dir / "test_pass.py").write_text(
+            "def test_pass():\n"
+            "    pass\n"
+        )
+
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("CI", "CAO_SUITE_SLOT_WAIT")}
+        env["CAO_SUITE_SLOT_MAX_SECONDS"] = "30"
+        env["CAO_SUITE_SLOT_LOCK"] = str(lock_path)
+
+        subprocess.run(
+            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
+             "-p", "no:libtmux", "-s", "test_pass.py"],
+            cwd=str(run_dir),
+            env=env,
+            timeout=15,
+            capture_output=True,
+            start_new_session=True,
+        )
+
+        # Lock must be free — acquire non-blocking
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o666)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except BlockingIOError:
+            pytest.fail("Lock file still held after normal pytest exit")
         finally:
             os.close(fd)
