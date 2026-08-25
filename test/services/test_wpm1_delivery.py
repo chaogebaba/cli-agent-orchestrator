@@ -523,7 +523,6 @@ def test_wpm1_cleanup_retains_settlement_just_inside_correct_utc_cutoff(
             return local_now.replace(tzinfo=local_zone).astimezone(tz)
 
     monkeypatch.setattr(cleanup_service, "datetime", FixedDateTime)
-    monkeypatch.setattr(cleanup_service, "get_localzone", lambda: local_zone)
     monkeypatch.setattr(cleanup_service, "SessionLocal", wpm1_db)
     monkeypatch.setattr(cleanup_service, "TERMINAL_LOG_DIR", tmp_path / "terminal")
     monkeypatch.setattr(cleanup_service, "LOG_DIR", tmp_path / "logs")

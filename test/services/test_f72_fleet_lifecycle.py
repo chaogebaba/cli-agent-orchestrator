@@ -518,28 +518,66 @@ def test_fleet_reports_exact_multilevel_depths(f72_env):
     assert depths == {"11111111": 0, "22222222": 1, "33333333": 2}
 
 
-def test_fleet_since_last_input_converts_local_naive_clock_to_utc(f72_env, monkeypatch):
+def test_fleet_since_last_input_treats_naive_db_clock_as_utc(f72_env, monkeypatch):
+    """Naive last_active from DB is UTC-at-rest; since_last_input must reflect true delta."""
     sessions, backend = f72_env
     add_terminal(backend, "11111111")
-    local_zone = ZoneInfo("Asia/Kolkata")
     now_utc = datetime(2026, 8, 6, 6, 30, tzinfo=timezone.utc)
-    local_last_active = now_utc.astimezone(local_zone).replace(tzinfo=None) - timedelta(seconds=120)
+    # Store a naive-UTC value 120s in the past (DB convention: naive = UTC)
+    naive_last_active = (now_utc - timedelta(seconds=120)).replace(tzinfo=None)
     with sessions.begin() as db:
-        db.get(TerminalModel, "11111111").last_active = local_last_active
+        db.get(TerminalModel, "11111111").last_active = naive_last_active
 
     class FixedDateTime(datetime):
         @classmethod
         def now(cls, tz=None):
             if tz is not None:
                 return now_utc.astimezone(tz)
-            return now_utc.astimezone(local_zone).replace(tzinfo=None)
+            return now_utc.replace(tzinfo=None)
 
     monkeypatch.setattr(fleet_service, "datetime", FixedDateTime)
-    monkeypatch.setattr(fleet_service, "get_localzone", lambda: local_zone)
 
     result = fleet_service.build_fleet("cao-f72")
 
     assert result["terminals"][0]["since_last_input"] == pytest.approx(120.0, abs=1.0)
+
+
+@pytest.mark.parametrize("tz_name,utc_offset_hours", [
+    ("America/New_York", -4),
+    ("Asia/Kolkata", 5.5),
+    ("Europe/Berlin", 2),
+    ("Pacific/Auckland", 12),
+])
+def test_f467_since_last_input_correct_regardless_of_host_tz(
+    f72_env, monkeypatch, tz_name, utc_offset_hours
+):
+    """F467: naive-UTC last_active N seconds ago → since_last_input ≈ N on any host TZ."""
+    sessions, backend = f72_env
+    add_terminal(backend, "11111111")
+    now_utc = datetime(2026, 8, 10, 12, 0, 0, tzinfo=timezone.utc)
+    delta_seconds = 45.0
+    # DB stores naive UTC
+    naive_last_active = (now_utc - timedelta(seconds=delta_seconds)).replace(tzinfo=None)
+    with sessions.begin() as db:
+        db.get(TerminalModel, "11111111").last_active = naive_last_active
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is not None:
+                return now_utc.astimezone(tz)
+            return now_utc.replace(tzinfo=None)
+
+    monkeypatch.setattr(fleet_service, "datetime", FixedDateTime)
+
+    result = fleet_service.build_fleet("cao-f72")
+
+    assert result["terminals"][0]["since_last_input"] == pytest.approx(
+        delta_seconds, abs=1.0
+    ), (
+        f"On TZ={tz_name} (UTC{utc_offset_hours:+}), since_last_input should be "
+        f"~{delta_seconds}s but got {result['terminals'][0]['since_last_input']}"
+    )
 
 
 def test_fleet_drill_projection_is_under_8192_bytes_with_profile_count_recorded(f72_env):

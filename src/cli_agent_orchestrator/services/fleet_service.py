@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from tzlocal import get_localzone
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
@@ -183,12 +182,7 @@ def build_fleet(session_name: str) -> dict[str, Any]:
             status = TerminalStatus.ERROR
         last_active = row.get("last_active")
         if last_active is not None:
-            if last_active.tzinfo is None:
-                last_active = last_active.replace(tzinfo=get_localzone(), fold=0).astimezone(
-                    timezone.utc
-                )
-            else:
-                last_active = last_active.astimezone(timezone.utc)
+            last_active = _as_utc(last_active)
             since_last_input = max(0.0, (now - last_active).total_seconds())
         else:
             since_last_input = None
