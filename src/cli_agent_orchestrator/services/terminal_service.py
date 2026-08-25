@@ -405,6 +405,16 @@ _fork_refresh_locks: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock] =
 # ``_release_worker_slot`` / ``_live_worker_count``.
 _cap_admission_locks: dict[str, threading.Lock] = {}
 _cap_admission_locks_guard = threading.Lock()
+# F451 (#306): process-lifetime cardinality metric for the cap registry.
+# Tracks the number of distinct session names that have ever entered the
+# registry (locks/gen/token_seq). When the count crosses a power-of-two
+# threshold (starting at CAO_CAP_REGISTRY_WARN_CARDINALITY, default 512),
+# ONE warning is logged per crossing. Never refuses, never reclaims.
+_CAP_REGISTRY_WARN_CARDINALITY: int = int(
+    os.environ.get("CAO_CAP_REGISTRY_WARN_CARDINALITY", "512")
+)
+_cap_registry_cardinality: int = 0
+_cap_registry_warned_at: int = 0  # highest crossing already warned
 # F439 (#294) round 6 / BLOCKER 2: per-session SET of live reservation tokens.
 # Each ``_reserve_worker_slot`` issues one unique token (from ``_cap_token_seq``)
 # and adds it here; ``_release_worker_slot`` removes exactly that token. The
@@ -434,10 +444,12 @@ _cap_publishing_ids: dict[str, dict[str, int]] = {}
 # lifetime alongside the lock+gen (see B1); its memory cost is one int.
 _cap_token_seq: dict[str, int] = {}
 # F439 (#294) round 5 / BLOCKER 1 + SHOULD 1: per-session monotonic generation,
-# bumped under the admission lock on EVERY ledger mutation (reserve, publish
-# transition, release). A racer reads it before and after its lock-free listing;
-# an unchanged generation proves no ledger transition raced the listing, so the
-# ``(worker_ids, reservations, publishing_ids)`` tuple is a coherent snapshot.
+# bumped under the admission lock on publish transitions and releases (NOT on a
+# plain reserve — a reserve changes neither the listing nor the exclusion set,
+# preserving the r3 barrier property). A racer reads it before and after its
+# lock-free listing; an unchanged generation proves no ledger transition raced
+# the listing, so the ``(worker_ids, reservations, publishing_ids)`` tuple is a
+# coherent snapshot.
 # Bounded retries then a lock-held fallback (see ``_reserve_worker_slot``) give a
 # hard progress guarantee under sustained publish churn.
 # F439 (#294) round 6 / BLOCKER 1: the generation is NEVER removed once created
@@ -3835,13 +3847,56 @@ def _cap_admission_lock(session_name: str) -> threading.Lock:
     across coroutines AND separate-loop threads alike. The map itself is guarded
     by ``_cap_admission_locks_guard`` so two racers creating the per-session lock
     cannot each make a different one.
+
+    F451 (#306): on first entry for a new session name, increments the
+    process-lifetime cardinality counter and logs a warning at each
+    power-of-two crossing of ``_CAP_REGISTRY_WARN_CARDINALITY`` (512, 1024, …).
     """
+    global _cap_registry_cardinality, _cap_registry_warned_at
     with _cap_admission_locks_guard:
         lock = _cap_admission_locks.get(session_name)
         if lock is None:
             lock = threading.Lock()
             _cap_admission_locks[session_name] = lock
+            # F451: track distinct-session cardinality
+            _cap_registry_cardinality += 1
+            _check_cap_registry_cardinality()
         return lock
+
+
+def _check_cap_registry_cardinality() -> None:
+    """Log ONE warning per power-of-two crossing of the cardinality threshold.
+
+    F451 (#306): the cap registry (_cap_admission_locks, _cap_gen, _cap_token_seq)
+    retains one entry per distinct session name for the process lifetime (deliberate
+    r6 tradeoff — reclamation was the ABA source). This metric surfaces unbounded
+    growth WITHOUT refusing or reclaiming.
+
+    PRE: caller holds ``_cap_admission_locks_guard``.
+    Threshold <= 0 disables the metric entirely.
+    """
+    global _cap_registry_warned_at
+    threshold = _CAP_REGISTRY_WARN_CARDINALITY
+    if threshold <= 0:
+        return
+    count = _cap_registry_cardinality
+    if count < threshold:
+        return
+    # Find the highest power-of-two multiple of threshold that count has crossed.
+    # E.g., threshold=512: crossings are 512, 1024, 2048, …
+    # crossing = threshold * 2^k where 2^k = largest power of 2 <= (count // threshold)
+    ratio = count // threshold
+    # Largest power of two <= ratio
+    crossing = threshold * (1 << (ratio.bit_length() - 1))
+    if crossing > _cap_registry_warned_at:
+        _cap_registry_warned_at = crossing
+        logger.warning(
+            "cap_registry_cardinality_high: %d distinct session names in "
+            "process-lifetime cap registry (threshold=%d). This is informational — "
+            "no admission is refused. Investigate session-name churn if unexpected.",
+            count,
+            crossing,
+        )
 
 
 async def _acquire_cap_lock(lock: threading.Lock) -> None:
