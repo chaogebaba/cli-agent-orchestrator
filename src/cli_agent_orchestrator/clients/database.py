@@ -38,7 +38,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import DeclarativeBase, Session, declarative_base, deferred, sessionmaker
-from sqlalchemy.orm.exc import ObjectDeletedError, DetachedInstanceError, StaleDataError
+from sqlalchemy.orm.exc import DetachedInstanceError, ObjectDeletedError, StaleDataError
 from tzlocal import get_localzone
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
@@ -368,9 +368,7 @@ class InboxModel(Base):
     barrier_id = deferred(Column(Integer, nullable=True))
     barrier_member_key = deferred(Column(String, nullable=True))
     created_at = Column(DateTime(timezone=True), default=_utcnow)
-    __table_args__ = (
-        Index("ix_inbox_sender_receiver", "sender_id", "receiver_id"),
-    )
+    __table_args__ = (Index("ix_inbox_sender_receiver", "sender_id", "receiver_id"),)
 
 
 class CallbackBarrierModel(Base):
@@ -649,12 +647,14 @@ def _f413_after_insert(mapper: Any, connection: Any, target: Any) -> None:
     if sess is not None:
         stash = sess.info.setdefault(_F413_DOORBELL_STASH_KEY, [])
         preview = (target.message or "").split("\n", 1)[0]
-        stash.append((
-            target.receiver_id,
-            row_id,
-            (target.sender_id or "")[:8],
-            preview,
-        ))
+        stash.append(
+            (
+                target.receiver_id,
+                row_id,
+                (target.sender_id or "")[:8],
+                preview,
+            )
+        )
 
 
 def _f413_after_commit(session: Any) -> None:
@@ -1303,6 +1303,7 @@ def _ensure_db_dir() -> None:
 # Module-level singletons
 _ensure_db_dir()
 
+
 # ── F334 (#190): Production DB fence ──────────────────────────────────────────
 # If PYTEST_CURRENT_TEST is set (pytest injects this automatically), refuse to
 # bind the real production DATABASE_FILE unless explicitly overridden. This
@@ -1315,6 +1316,7 @@ def _fence_production_db() -> None:
     if os.environ.get("CAO_ALLOW_PROD_DB_IN_TESTS") == "1":
         return  # explicit override — operator knows what they're doing
     import pwd
+
     # Use the REAL user home from passwd (immune to HOME env override)
     real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     prod_db_dir = (real_home / ".aws" / "cli-agent-orchestrator" / "db").resolve()
@@ -1455,12 +1457,16 @@ def _migrate_f218_dead_supervisor_safety() -> None:
                     server_boot_id TEXT
                 )
             """))
-            connection.execute(text(
-                "CREATE INDEX ix_tombstone_session ON pane_exit_tombstones(session_name, session_incarnation)"
-            ))
-            connection.execute(text(
-                "CREATE INDEX ix_tombstone_terminal ON pane_exit_tombstones(terminal_id, terminal_generation)"
-            ))
+            connection.execute(
+                text(
+                    "CREATE INDEX ix_tombstone_session ON pane_exit_tombstones(session_name, session_incarnation)"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE INDEX ix_tombstone_terminal ON pane_exit_tombstones(terminal_id, terminal_generation)"
+                )
+            )
 
         if "session_degradations" not in existing_tables:
             connection.execute(text("""
@@ -1534,19 +1540,19 @@ def _migrate_f129_frozen_authority() -> None:
         columns = [row[1] for row in result.fetchall()]
 
         if "frozen" not in columns:
-            connection.execute(text(
-                "ALTER TABLE authority_pin "
-                "ADD COLUMN frozen BOOLEAN NOT NULL DEFAULT 0"
-            ))
+            connection.execute(
+                text("ALTER TABLE authority_pin " "ADD COLUMN frozen BOOLEAN NOT NULL DEFAULT 0")
+            )
             # Existing rows receive frozen=0 (FALSE) via DEFAULT — they remain
             # mutable pins, preserving backward compatibility.
 
         # ── Step 2: Add covering index if missing ──
-        connection.execute(text(
-            "CREATE INDEX IF NOT EXISTS ix_inbox_sender_receiver "
-            "ON inbox (sender_id, receiver_id)"
-        ))
-
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_inbox_sender_receiver "
+                "ON inbox (sender_id, receiver_id)"
+            )
+        )
 
 
 def _migrate_f127_resolved_model() -> None:
@@ -1572,32 +1578,34 @@ def _migrate_terminal_auth_token() -> None:
 def _migrate_fx191_trace_extension() -> None:
     """FX191 D7: Add phase/decision/reason columns to inbox_message_trace_event."""
     with engine.begin() as connection:
-        columns = connection.execute(
-            text("PRAGMA table_info(inbox_message_trace_event)")
-        ).mappings().all()
+        columns = (
+            connection.execute(text("PRAGMA table_info(inbox_message_trace_event)"))
+            .mappings()
+            .all()
+        )
         col_names = {col["name"] for col in columns}
         if "phase" not in col_names:
-            connection.execute(
-                text("ALTER TABLE inbox_message_trace_event ADD COLUMN phase TEXT")
-            )
+            connection.execute(text("ALTER TABLE inbox_message_trace_event ADD COLUMN phase TEXT"))
         if "decision" not in col_names:
             connection.execute(
                 text("ALTER TABLE inbox_message_trace_event ADD COLUMN decision TEXT")
             )
         if "reason" not in col_names:
-            connection.execute(
-                text("ALTER TABLE inbox_message_trace_event ADD COLUMN reason TEXT")
-            )
+            connection.execute(text("ALTER TABLE inbox_message_trace_event ADD COLUMN reason TEXT"))
         # Add the partial index for fx191 phase/decision if not present
         indexes = connection.execute(
-            text("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='inbox_message_trace_event'")
+            text(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='inbox_message_trace_event'"
+            )
         ).fetchall()
         idx_names = {r[0] for r in indexes}
         if "ix_inbox_message_trace_event_fx191_phase_decision" not in idx_names:
-            connection.execute(text(
-                "CREATE INDEX ix_inbox_message_trace_event_fx191_phase_decision "
-                "ON inbox_message_trace_event(phase, decision) WHERE phase IS NOT NULL"
-            ))
+            connection.execute(
+                text(
+                    "CREATE INDEX ix_inbox_message_trace_event_fx191_phase_decision "
+                    "ON inbox_message_trace_event(phase, decision) WHERE phase IS NOT NULL"
+                )
+            )
 
 
 def _migrate_f175_dedup_columns() -> None:
@@ -1630,9 +1638,7 @@ def _migrate_f136_callback_delivery() -> None:
                 text("ALTER TABLE mailboxes ADD COLUMN callback_notified_through_id INTEGER")
             )
         if "cc_inbox_path" not in col_names:
-            connection.execute(
-                text("ALTER TABLE mailboxes ADD COLUMN cc_inbox_path TEXT")
-            )
+            connection.execute(text("ALTER TABLE mailboxes ADD COLUMN cc_inbox_path TEXT"))
         if "cc_inbox_path_version" not in col_names:
             connection.execute(
                 text(
@@ -1641,7 +1647,9 @@ def _migrate_f136_callback_delivery() -> None:
             )
         # Replay queue table
         tables = connection.execute(
-            text("SELECT name FROM sqlite_master WHERE type='table' AND name='callback_replay_queue'")
+            text(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='callback_replay_queue'"
+            )
         ).fetchall()
         if not tables:
             connection.execute(
@@ -3332,9 +3340,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
         group = _json.loads(terminal.group) if terminal.group else None
         metadata = _json.loads(terminal.metadata_json) if terminal.metadata_json else None
         worktree_info_raw = (
-            _json.loads(terminal.worktree_info)
-            if isinstance(terminal.worktree_info, str)
-            else None
+            _json.loads(terminal.worktree_info) if isinstance(terminal.worktree_info, str) else None
         )
         result: Dict[str, Any] = {
             "id": terminal.id,
@@ -3708,41 +3714,41 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
         results = []
         for t in terminals:
             try:
-                results.append({
-                    "id": t.id,
-                    "tmux_session": t.tmux_session,
-                    "tmux_window": t.tmux_window,
-                    "provider": t.provider,
-                    "agent_profile": t.agent_profile,
-                    "working_directory": t.working_directory,
-                    "allowed_tools": (
-                        __import__("json").loads(t.allowed_tools)
-                        if isinstance(t.allowed_tools, str) and t.allowed_tools
-                        else None
-                    ),
-                    "shell_command": t.shell_command,
-                    "caller_id": t.caller_id,
-                    "caller_mailbox_id": t.caller_mailbox_id,
-                    "lifecycle": t.lifecycle,
-                    "reparented_from": t.reparented_from,
-                    "provider_session_id": t.provider_session_id,
-                    "recovery_state": t.recovery_state,
-                    "recovery_error": t.recovery_error,
-                    "recovery_updated_at": t.recovery_updated_at,
-                    "fallback_terminal_id": t.fallback_terminal_id,
-                    "init_state": t.init_state,
-                    "init_started_at": t.init_started_at,
-                    "init_owner_epoch": t.init_owner_epoch,
-                    "init_failure_token": t.init_failure_token,
-                    "init_deadline_s": t.init_deadline_s,
-                    "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
-                    "last_active": t.last_active,
-                    "metadata": (
-                        __import__("json").loads(t.metadata_json)
-                        if t.metadata_json
-                        else None
-                    ),
-                })
+                results.append(
+                    {
+                        "id": t.id,
+                        "tmux_session": t.tmux_session,
+                        "tmux_window": t.tmux_window,
+                        "provider": t.provider,
+                        "agent_profile": t.agent_profile,
+                        "working_directory": t.working_directory,
+                        "allowed_tools": (
+                            __import__("json").loads(t.allowed_tools)
+                            if isinstance(t.allowed_tools, str) and t.allowed_tools
+                            else None
+                        ),
+                        "shell_command": t.shell_command,
+                        "caller_id": t.caller_id,
+                        "caller_mailbox_id": t.caller_mailbox_id,
+                        "lifecycle": t.lifecycle,
+                        "reparented_from": t.reparented_from,
+                        "provider_session_id": t.provider_session_id,
+                        "recovery_state": t.recovery_state,
+                        "recovery_error": t.recovery_error,
+                        "recovery_updated_at": t.recovery_updated_at,
+                        "fallback_terminal_id": t.fallback_terminal_id,
+                        "init_state": t.init_state,
+                        "init_started_at": t.init_started_at,
+                        "init_owner_epoch": t.init_owner_epoch,
+                        "init_failure_token": t.init_failure_token,
+                        "init_deadline_s": t.init_deadline_s,
+                        "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
+                        "last_active": t.last_active,
+                        "metadata": (
+                            __import__("json").loads(t.metadata_json) if t.metadata_json else None
+                        ),
+                    }
+                )
             except (ObjectDeletedError, DetachedInstanceError, StaleDataError) as exc:
                 # F264: skip stale/zombie rows whose attribute load raises
                 # ObjectDeletedError (or similar) instead of crashing the pass
@@ -3774,7 +3780,6 @@ def update_terminal_shell_command(terminal_id: str, shell_command: str) -> bool:
             invalidate_terminal_metadata_cache(terminal_id)
             return True
         return False
-
 
 
 def update_terminal_resolved_model(terminal_id: str, resolved_model: str) -> bool:
@@ -3903,8 +3908,8 @@ def _reactivate_parked_rows_in_db(
                 mailbox.updated_at = _utcnow()
             # Collect IDs before bulk update
             logical_ids = [
-                row_id for (row_id,) in
-                db.query(InboxModel.id)
+                row_id
+                for (row_id,) in db.query(InboxModel.id)
                 .filter(
                     InboxModel.status == MessageStatus.PARKED.value,
                     InboxModel.logical_receiver_id == incarnation.mailbox_id,
@@ -3925,8 +3930,8 @@ def _reactivate_parked_rows_in_db(
                 reactivated_ids.extend(logical_ids)
     # Also reactivate non-logical (direct) parked rows
     direct_ids = [
-        row_id for (row_id,) in
-        db.query(InboxModel.id)
+        row_id
+        for (row_id,) in db.query(InboxModel.id)
         .filter(
             InboxModel.status == MessageStatus.PARKED.value,
             InboxModel.logical_receiver_id.is_(None),
@@ -3992,7 +3997,9 @@ def settle_terminal_rebound(
                     cursor_val = int(mb.callback_notified_through_id)
                     below = [rid for rid in reactivated_ids if rid <= cursor_val]
                     if below:
-                        enqueue_callback_replay(db, mailbox_id=str(inc.mailbox_id), inbox_row_ids=below)
+                        enqueue_callback_replay(
+                            db, mailbox_id=str(inc.mailbox_id), inbox_row_ids=below
+                        )
         _f138_old_inc_id = _old_inc.id if _old_inc is not None else None
         _result_generation = int(row.lifecycle_generation)
     # F138: Queue reconciliation job for old incarnation after DB commit
@@ -4183,18 +4190,26 @@ def settle_terminal_fallback(old_terminal_id: str, new_terminal_id: str) -> int:
         changed += len(reactivated_ids)
         # F136-D3: enqueue replay for reactivated rows below cursor
         if reactivated_ids:
-            inc = db.query(MailboxIncarnationModel).filter_by(terminal_id=new_terminal_id).one_or_none()
+            inc = (
+                db.query(MailboxIncarnationModel)
+                .filter_by(terminal_id=new_terminal_id)
+                .one_or_none()
+            )
             if inc:
                 mb_row: Any = db.query(MailboxModel).filter_by(id=inc.mailbox_id).one_or_none()
                 if mb_row and mb_row.callback_notified_through_id is not None:
                     cursor_val = int(mb_row.callback_notified_through_id)
                     below = [rid for rid in reactivated_ids if rid <= cursor_val]
                     if below:
-                        enqueue_callback_replay(db, mailbox_id=str(inc.mailbox_id), inbox_row_ids=below)
+                        enqueue_callback_replay(
+                            db, mailbox_id=str(inc.mailbox_id), inbox_row_ids=below
+                        )
         # S4: query child IDs before bulk update so we can invalidate their caches
         child_ids = [
             row.id
-            for row in db.query(TerminalModel.id).filter(TerminalModel.caller_id == old_terminal_id).all()
+            for row in db.query(TerminalModel.id)
+            .filter(TerminalModel.caller_id == old_terminal_id)
+            .all()
         ]
         changed += (
             db.query(TerminalModel)
@@ -4512,9 +4527,9 @@ def delete_terminal_and_warm_intent(
                 row.enqueue_generation = target_generation or int(target.lifecycle_generation)
                 row.status = MessageStatus.PENDING.value
                 row.failure_reason = None
-                _reap_flipped_rows.append((
-                    MessageStatus.PENDING.value, int(row.id), target_mailbox_id
-                ))
+                _reap_flipped_rows.append(
+                    (MessageStatus.PENDING.value, int(row.id), target_mailbox_id)
+                )
         # F413 D7b: create obligations for flipped rows
         if _reap_flipped_rows:
             db.flush()
@@ -4533,10 +4548,12 @@ def delete_terminal_and_warm_intent(
             # F413 D7b: collect rows before bulk flip so we can create obligations
             _barrier_flip_rows = [
                 (MessageStatus.PENDING.value, int(r.id), r.logical_receiver_id)
-                for r in db.query(InboxModel).filter(
+                for r in db.query(InboxModel)
+                .filter(
                     InboxModel.barrier_id == barrier.id,
                     InboxModel.status == MessageStatus.HELD.value,
-                ).all()
+                )
+                .all()
             ]
             db.query(InboxModel).filter(
                 InboxModel.barrier_id == barrier.id,
@@ -4562,7 +4579,9 @@ def delete_terminal_and_warm_intent(
         # B3: query child IDs before bulk update so we can invalidate their caches
         child_ids = [
             row.id
-            for row in db.query(TerminalModel.id).filter(TerminalModel.caller_id == terminal_id).all()
+            for row in db.query(TerminalModel.id)
+            .filter(TerminalModel.caller_id == terminal_id)
+            .all()
         ]
         child_values = {
             TerminalModel.caller_id: target.id if target is not None else None,
@@ -5500,7 +5519,9 @@ def list_ready_backlog_observations() -> list[ReadyBacklogObservation]:
                 ReadyBacklogObservation(
                     receiver_id=receiver_id,
                     oldest_message_id=oldest.id,
-                    oldest_pending_age_seconds=max(0.0, (now - _as_utc(oldest.created_at)).total_seconds()),
+                    oldest_pending_age_seconds=max(
+                        0.0, (now - _as_utc(oldest.created_at)).total_seconds()
+                    ),
                     has_open_delivering_attempt=has_open,
                     attempt_fingerprint=(count, started, settled, last),
                 )
@@ -6374,10 +6395,12 @@ def cancel_callback_barrier(
         # F413 D7b: collect qualifying rows before bulk flip
         _cancel_flip_rows = [
             (MessageStatus.PENDING.value, int(r.id), r.logical_receiver_id)
-            for r in db.query(InboxModel).filter(
+            for r in db.query(InboxModel)
+            .filter(
                 InboxModel.barrier_id == barrier.id,
                 InboxModel.status == MessageStatus.HELD.value,
-            ).all()
+            )
+            .all()
         ]
         released = (
             db.query(InboxModel)
@@ -6544,6 +6567,47 @@ def insert_barrier_escalation_message(
             orchestration_type=OrchestrationType.SEND_MESSAGE,
         )
         return WatchdogInsertResult("inserted", int(row.id))
+
+
+# F475: callback deduplication window (seconds).
+_F475_CALLBACK_DEDUP_WINDOW_S = 60
+
+
+def _f475_is_duplicate_callback(sender_id: str, receiver_id: str) -> bool:
+    """Return True if the sender already sent a callback to receiver within the window."""
+    cutoff = _utcnow() - __import__("datetime").timedelta(seconds=_F475_CALLBACK_DEDUP_WINDOW_S)
+    with SessionLocal() as db:
+        existing = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.sender_id == sender_id,
+                InboxModel.receiver_id == receiver_id,
+                InboxModel.orchestration_type == OrchestrationType.SEND_MESSAGE.value,
+                InboxModel.created_at >= cutoff,
+            )
+            .first()
+        )
+        return existing is not None
+
+
+def _f475_get_recent_callback(sender_id: str, receiver_id: str) -> "InboxMessage | None":
+    """Return the most recent callback message within the dedup window, or None."""
+    cutoff = _utcnow() - __import__("datetime").timedelta(seconds=_F475_CALLBACK_DEDUP_WINDOW_S)
+    with SessionLocal() as db:
+        existing = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.sender_id == sender_id,
+                InboxModel.receiver_id == receiver_id,
+                InboxModel.orchestration_type == OrchestrationType.SEND_MESSAGE.value,
+                InboxModel.created_at >= cutoff,
+            )
+            .order_by(InboxModel.created_at.desc())
+            .first()
+        )
+        if existing is None:
+            return None
+        return _inbox_message_from_row(existing)
 
 
 def create_inbox_message(
@@ -8339,8 +8403,7 @@ def _record_p5_orphan_notices(db: Any, rows: list[InboxModel]) -> tuple[int, int
                 receiver_id=notice_receiver,
                 logical_receiver_id=logical_receiver_id,
                 message=(
-                    header
-                    + f"[message-trace] delivery to terminal {receiver_id} failed "
+                    header + f"[message-trace] delivery to terminal {receiver_id} failed "
                     f"because the receiver terminal no longer exists for "
                     f"message(s) {ids}."
                 ),
@@ -8678,8 +8741,7 @@ def record_wpm1_stalled_notice(
                 sender_id=sender,
                 receiver_id=notice_receiver,
                 logical_receiver_id=logical_receiver_id,
-                message=header
-                + "delivery stalled: receiver shows no progress / payload not yet "
+                message=header + "delivery stalled: receiver shows no progress / payload not yet "
                 "confirmed; no reinjection will occur while unproven; will confirm "
                 "if consumed",
                 orchestration_type=OrchestrationType.SEND_MESSAGE,
@@ -8810,8 +8872,7 @@ def settle_wpm1_terminal_batch(
                             sender_id=sender,
                             receiver_id=notice_receiver,
                             logical_receiver_id=logical_receiver_id,
-                            message=corrective_header
-                            + "previously-stalled message was delivered",
+                            message=corrective_header + "previously-stalled message was delivered",
                             orchestration_type=OrchestrationType.SEND_MESSAGE,
                         )
                 else:
@@ -9206,7 +9267,11 @@ def get_supervisor_callback_batch(
                 .filter_by(id=mailbox_id)
                 .one_or_none()
             )
-            if _pre is not None and _pre.cc_inbox_path and _pre.callback_notified_through_id is not None:
+            if (
+                _pre is not None
+                and _pre.cc_inbox_path
+                and _pre.callback_notified_through_id is not None
+            ):
                 if _pre.current_terminal_id == terminal_id and int(_pre.generation) == generation:
                     _cursor_val = int(_pre.callback_notified_through_id)
                     _has_work = db.query(
@@ -9254,27 +9319,38 @@ def get_supervisor_callback_batch(
             mailbox: Any = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
             if mailbox is None:
                 return CallbackBatchResult(
-                    kind="stale_authority", rows=(), has_more=False,
-                    cursor=None, inbox_path=None, path_version=0,
-                    bootstrap_mode=None, reason="unknown_mailbox",
+                    kind="stale_authority",
+                    rows=(),
+                    has_more=False,
+                    cursor=None,
+                    inbox_path=None,
+                    path_version=0,
+                    bootstrap_mode=None,
+                    reason="unknown_mailbox",
                 )
-            if (
-                mailbox.current_terminal_id != terminal_id
-                or int(mailbox.generation) != generation
-            ):
+            if mailbox.current_terminal_id != terminal_id or int(mailbox.generation) != generation:
                 return CallbackBatchResult(
-                    kind="stale_authority", rows=(), has_more=False,
-                    cursor=None, inbox_path=None, path_version=0,
-                    bootstrap_mode=None, reason="terminal_or_generation_mismatch",
+                    kind="stale_authority",
+                    rows=(),
+                    has_more=False,
+                    cursor=None,
+                    inbox_path=None,
+                    path_version=0,
+                    bootstrap_mode=None,
+                    reason="terminal_or_generation_mismatch",
                 )
 
             inbox_path = mailbox.cc_inbox_path
             if not inbox_path:
                 return CallbackBatchResult(
-                    kind="no_path", rows=(), has_more=False,
+                    kind="no_path",
+                    rows=(),
+                    has_more=False,
                     cursor=mailbox.callback_notified_through_id,
-                    inbox_path=None, path_version=int(mailbox.cc_inbox_path_version),
-                    bootstrap_mode=None, reason="no_inbox_path_configured",
+                    inbox_path=None,
+                    path_version=int(mailbox.cc_inbox_path_version),
+                    bootstrap_mode=None,
+                    reason="no_inbox_path_configured",
                 )
 
             path_version = int(mailbox.cc_inbox_path_version)
@@ -9306,7 +9382,9 @@ def get_supervisor_callback_batch(
             # F157 hotfix: also respect consumed_through_id so acked messages
             # are never re-pushed by the callback runner.
             notified_cursor = mailbox.callback_notified_through_id
-            consumption_cursor = int(mailbox.consumed_through_id) if mailbox.consumed_through_id else 0
+            consumption_cursor = (
+                int(mailbox.consumed_through_id) if mailbox.consumed_through_id else 0
+            )
             cursor = notified_cursor
             if cursor is None:
                 min_id_row = (
@@ -9369,7 +9447,7 @@ def get_supervisor_callback_batch(
             ).fetchall()
 
             replay_batch: list[CallbackBatchRow] = []
-            for row in replay_rows_raw[: limit]:
+            for row in replay_rows_raw[:limit]:
                 replay_batch.append(
                     CallbackBatchRow(
                         inbox_row_id=int(row[0]),
@@ -9398,12 +9476,15 @@ def get_supervisor_callback_batch(
                         "LIMIT :lim"
                     ),
                     {
-                        "mb": mailbox_id, "tid": terminal_id,
-                        "gen": generation, "cursor": cursor, "lim": remaining + 1,
+                        "mb": mailbox_id,
+                        "tid": terminal_id,
+                        "gen": generation,
+                        "cursor": cursor,
+                        "lim": remaining + 1,
                     },
                 ).fetchall()
 
-                for row in forward_rows_raw[: remaining]:
+                for row in forward_rows_raw[:remaining]:
                     forward_batch.append(
                         CallbackBatchRow(
                             inbox_row_id=int(row[0]),
@@ -9430,9 +9511,14 @@ def get_supervisor_callback_batch(
     except OperationalError as exc:
         logger.warning("f136_callback_batch_db_error: %s", exc)
         return CallbackBatchResult(
-            kind="retryable_failure", rows=(), has_more=False,
-            cursor=None, inbox_path=None, path_version=0,
-            bootstrap_mode=None, reason=f"db_error: {exc}",
+            kind="retryable_failure",
+            rows=(),
+            has_more=False,
+            cursor=None,
+            inbox_path=None,
+            path_version=0,
+            bootstrap_mode=None,
+            reason=f"db_error: {exc}",
         )
 
 
@@ -9458,10 +9544,7 @@ def commit_supervisor_callback_progress(
             if mailbox is None:
                 return CallbackProgressResult(kind="stale_authority", reason="unknown_mailbox")
 
-            if (
-                mailbox.current_terminal_id != terminal_id
-                or int(mailbox.generation) != generation
-            ):
+            if mailbox.current_terminal_id != terminal_id or int(mailbox.generation) != generation:
                 return CallbackProgressResult(
                     kind="stale_authority", reason="terminal_or_generation_mismatch"
                 )
@@ -9481,7 +9564,9 @@ def commit_supervisor_callback_progress(
                     mailbox.callback_notified_through_id = new_cursor
                     mailbox.updated_at = _utcnow()
                     db.commit()
-                    return CallbackProgressResult(kind="advanced_monotonic", reason="cas_bypass_monotonic")
+                    return CallbackProgressResult(
+                        kind="advanced_monotonic", reason="cas_bypass_monotonic"
+                    )
                 return CallbackProgressResult(kind="cas_mismatch", reason="cursor_mismatch")
 
             # Advance cursor (equal is valid for replay-only progress)
@@ -9574,9 +9659,7 @@ def _migrate_f138_issuance_context(connection) -> None:
     """D17: Add issuance_ticks and issuance_boot_id to process_incarnations if missing."""
     existing_cols = {
         row[1]
-        for row in connection.execute(
-            text("PRAGMA table_info('process_incarnations')")
-        ).fetchall()
+        for row in connection.execute(text("PRAGMA table_info('process_incarnations')")).fetchall()
     }
     if "issuance_ticks" not in existing_cols:
         connection.execute(
@@ -9592,9 +9675,7 @@ def _migrate_f166_notify_count(connection) -> None:
     """F166 D7: Add notify_count to orphan_reconcile_jobs if missing (idempotent)."""
     existing_cols = {
         row[1]
-        for row in connection.execute(
-            text("PRAGMA table_info('orphan_reconcile_jobs')")
-        ).fetchall()
+        for row in connection.execute(text("PRAGMA table_info('orphan_reconcile_jobs')")).fetchall()
     }
     if "notify_count" not in existing_cols:
         connection.execute(
@@ -9659,20 +9740,15 @@ def f138_record_liveness_observation(
     )
 
 
-def f138_request_reconciliation(
-    *, incarnation_id: str, source: str
-) -> "JobRequestResult":
+def f138_request_reconciliation(*, incarnation_id: str, source: str) -> "JobRequestResult":
     """Insert a unique reconciliation job for an incarnation."""
     import uuid as _uuid
+
     from cli_agent_orchestrator.services.orphan_reconcile_service import JobRequestResult
 
     now = _utcnow()
     with SessionLocal.begin() as db:
-        inc = (
-            db.query(ProcessIncarnationModel)
-            .filter_by(id=incarnation_id)
-            .one_or_none()
-        )
+        inc = db.query(ProcessIncarnationModel).filter_by(id=incarnation_id).one_or_none()
         if inc is None:
             return JobRequestResult(created=False, job_id=None, detail="incarnation_not_found")
         if inc.state not in ("active", "reconcile_pending"):
@@ -9682,14 +9758,10 @@ def f138_request_reconciliation(
 
         # Check if job already exists
         existing = (
-            db.query(OrphanReconcileJobModel)
-            .filter_by(incarnation_id=incarnation_id)
-            .one_or_none()
+            db.query(OrphanReconcileJobModel).filter_by(incarnation_id=incarnation_id).one_or_none()
         )
         if existing is not None:
-            return JobRequestResult(
-                created=False, job_id=existing.id, detail="job_already_exists"
-            )
+            return JobRequestResult(created=False, job_id=existing.id, detail="job_already_exists")
 
         # Mark incarnation reconcile_pending
         if inc.state == "active":
@@ -9752,11 +9824,7 @@ def f138_claim_jobs(*, limit: int, lease_duration_s: float) -> list[dict[str, st
 def f138_get_incarnation_for_job(incarnation_id: str) -> dict[str, Any] | None:
     """Fetch incarnation data needed for reconciliation."""
     with SessionLocal() as db:
-        inc = (
-            db.query(ProcessIncarnationModel)
-            .filter_by(id=incarnation_id)
-            .one_or_none()
-        )
+        inc = db.query(ProcessIncarnationModel).filter_by(id=incarnation_id).one_or_none()
         if inc is None:
             return None
         return {
@@ -9841,11 +9909,7 @@ def f138_mark_incarnation_reconciled(incarnation_id: str) -> None:
     """Mark incarnation state as reconciled."""
     now = _utcnow()
     with SessionLocal.begin() as db:
-        inc = (
-            db.query(ProcessIncarnationModel)
-            .filter_by(id=incarnation_id)
-            .one_or_none()
-        )
+        inc = db.query(ProcessIncarnationModel).filter_by(id=incarnation_id).one_or_none()
         if inc is not None:
             inc.state = "reconciled"
             inc.reconciled_at = now
@@ -9874,6 +9938,7 @@ def f138_startup_recovery() -> None:
 
         # Sweep stale 'launching' incarnations
         import datetime as _dt
+
         from cli_agent_orchestrator.services.orphan_reconcile_service import (
             INCARNATION_LAUNCH_STALE_SECONDS,
         )
@@ -9892,17 +9957,11 @@ def f138_startup_recovery() -> None:
             from cli_agent_orchestrator.backends.registry import get_backend
 
             try:
-                metadata = (
-                    db.query(TerminalModel)
-                    .filter_by(id=inc.terminal_id)
-                    .one_or_none()
-                )
+                metadata = db.query(TerminalModel).filter_by(id=inc.terminal_id).one_or_none()
                 if metadata is None:
                     # D24: missing terminal row is NOT proof of safe abandon —
                     # force-queue for post-transaction reconciliation instead.
-                    _force_queue_ids.append(
-                        (inc.id, "startup_stale_missing_terminal")
-                    )
+                    _force_queue_ids.append((inc.id, "startup_stale_missing_terminal"))
                     logger.info(
                         "f138_startup_stale_missing_terminal incarnation=%s terminal=%s",
                         inc.id,
@@ -9941,9 +10000,7 @@ def f138_startup_recovery() -> None:
                 )
         except Exception:
             # DB error propagates as warning — no teardown authority granted
-            logger.warning(
-                "f138_startup_force_queue_failed incarnation=%s", inc_id, exc_info=True
-            )
+            logger.warning("f138_startup_force_queue_failed incarnation=%s", inc_id, exc_info=True)
 
 
 # --- F138 incarnation reservation/activation helpers --------------------------
@@ -10007,11 +10064,7 @@ def f138_abandon_incarnation(incarnation_id: str) -> None:
     """Mark incarnation as abandoned (launch failure)."""
     now = _utcnow()
     with SessionLocal.begin() as db:
-        inc = (
-            db.query(ProcessIncarnationModel)
-            .filter_by(id=incarnation_id)
-            .one_or_none()
-        )
+        inc = db.query(ProcessIncarnationModel).filter_by(id=incarnation_id).one_or_none()
         if inc is not None and inc.state == "launching":
             inc.state = "abandoned"
             inc.reconciled_at = now
@@ -10040,11 +10093,7 @@ def f138_update_incarnation_pane(
 ) -> None:
     """Update diagnostic pane PID/start ticks after window creation."""
     with SessionLocal.begin() as db:
-        inc = (
-            db.query(ProcessIncarnationModel)
-            .filter_by(id=incarnation_id)
-            .one_or_none()
-        )
+        inc = db.query(ProcessIncarnationModel).filter_by(id=incarnation_id).one_or_none()
         if inc is not None:
             inc.pane_pid = pane_pid
             inc.pane_start_ticks = pane_start_ticks
@@ -10071,11 +10120,7 @@ def f138_strict_activate(incarnation_id: str) -> ActivationResult:
     """
     now = _utcnow()
     with SessionLocal.begin() as db:
-        inc = (
-            db.query(ProcessIncarnationModel)
-            .filter_by(id=incarnation_id)
-            .one_or_none()
-        )
+        inc = db.query(ProcessIncarnationModel).filter_by(id=incarnation_id).one_or_none()
         if inc is None:
             return ActivationResult(outcome="missing")
         if inc.state == "active":
@@ -10118,11 +10163,7 @@ def f138_force_reconcile_incarnation(incarnation_id: str, source: str) -> ForceR
     result: ForceReconcileResult
 
     with SessionLocal.begin() as db:
-        inc = (
-            db.query(ProcessIncarnationModel)
-            .filter_by(id=incarnation_id)
-            .one_or_none()
-        )
+        inc = db.query(ProcessIncarnationModel).filter_by(id=incarnation_id).one_or_none()
         if inc is None:
             return ForceReconcileResult(
                 outcome="non_durable_missing",
@@ -10131,9 +10172,7 @@ def f138_force_reconcile_incarnation(incarnation_id: str, source: str) -> ForceR
 
         # Check existing job first (needed for reconciled-row classification)
         existing = (
-            db.query(OrphanReconcileJobModel)
-            .filter_by(incarnation_id=incarnation_id)
-            .one_or_none()
+            db.query(OrphanReconcileJobModel).filter_by(incarnation_id=incarnation_id).one_or_none()
         )
 
         # Already fully reconciled — but only proven if succeeded job exists
@@ -10268,9 +10307,7 @@ def f138_emit_attention_message(
         create_inbox_message(terminal_id, supervisor_id, message)
         return True
     except Exception:
-        logger.warning(
-            "f138_attention_failed terminal=%s", terminal_id, exc_info=True
-        )
+        logger.warning("f138_attention_failed terminal=%s", terminal_id, exc_info=True)
         return False
 
 

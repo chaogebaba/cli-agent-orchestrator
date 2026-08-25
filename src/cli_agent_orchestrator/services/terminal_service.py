@@ -40,9 +40,11 @@ from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
-from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
     create_terminal_with_warm_intent,
+)
+from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
+from cli_agent_orchestrator.clients.database import (
     delete_terminal_and_warm_intent,
     delete_terminals_by_session,
     get_ready_provider_session,
@@ -1290,6 +1292,7 @@ async def _finish_and_roll_back_cancelled_create(
                 cap_release[0], cap_release[1], token=cap_release[2], published=False
             )
 
+
 def _resolve_worker_terminal_cap() -> int:
     """Resolve the worker-terminal cap (F439 #294).
 
@@ -2399,9 +2402,7 @@ async def create_terminal(
         except asyncio.CancelledError:
             if not create_worker.cancelled():
                 compensator = asyncio.ensure_future(
-                    _finish_and_roll_back_cancelled_create(
-                        create_worker, session_name, terminal_id
-                    )
+                    _finish_and_roll_back_cancelled_create(create_worker, session_name, terminal_id)
                 )
                 try:
                     await asyncio.shield(compensator)
@@ -2502,7 +2503,6 @@ async def create_terminal(
             # Enter produces a fresh prompt line that flows through the pipe.
             get_backend().send_special_key(session_name, window_name, "Enter")
 
-
         # The live snapshot is transactional launch context. Build it only after
         # the terminal row and output plumbing exist, so it includes itself and a
         # required-profile failure can unwind every preceding allocation.
@@ -2596,6 +2596,14 @@ async def create_terminal(
             published_snapshot = get_terminal_metadata(terminal_id)
             if published_snapshot is None:
                 raise RuntimeError("terminal_metadata_missing")
+            # F487: persist park_warm on the terminal so the watchdog can
+            # unconditionally suppress episode creation for warm-parked lanes.
+            if park_warm:
+                from cli_agent_orchestrator.clients.database import (
+                    merge_terminal_system_metadata,
+                )
+
+                merge_terminal_system_metadata(terminal_id, {"park_warm": True})
             _schedule_deferred_init(
                 provider_instance,
                 terminal_id,
