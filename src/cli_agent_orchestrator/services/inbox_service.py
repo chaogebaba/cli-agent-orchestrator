@@ -2308,10 +2308,34 @@ class InboxService:
                     _should_teammate_push,
                     attempt_teammate_push,
                 )
+                from cli_agent_orchestrator.services.config_service import ConfigService as _CS
+
+                # F457: unified gate — wake.native=false suppresses teammate push
+                # (same gate the doorbell native ring honors).
+                if not _CS.get("supervisor.wake.native", default=True):
+                    logger.debug(
+                        "f457_push_suppressed terminal=%s reason=wake_native_disabled",
+                        terminal_id,
+                    )
+                    return
 
                 if _should_teammate_push(terminal_id):
+                    # F457: acked-row dedupe — re-verify messages are still PENDING
+                    # before pushing (kills late/duplicate pings for consumed rows).
+                    still_pending = get_pending_messages_by_ids(
+                        terminal_id, [m.id for m in messages]
+                    )
+                    if not still_pending:
+                        logger.debug(
+                            "f457_push_suppressed terminal=%s decision=skipped_acked "
+                            "reason=rows_not_pending ids=%s",
+                            terminal_id,
+                            [m.id for m in messages],
+                        )
+                        return
+
                     try:
-                        attempt_teammate_push(terminal_id, messages)
+                        attempt_teammate_push(terminal_id, still_pending)
                         # fx168 FIX-4: Removed dead D9 doorbell call. deliver_pending
                         # holds delivery_lock here; ring_supervisor_doorbell's G1 gate
                         # tries the same non-reentrant lock → always "skipped_gate".
