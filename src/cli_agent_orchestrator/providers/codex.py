@@ -8,6 +8,8 @@ import re
 import shlex
 import subprocess
 import time
+from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -15,7 +17,7 @@ if TYPE_CHECKING:
     from cli_agent_orchestrator.utils.persona_context import PersonaPlan
 
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.constants import BLOCKED_WAIT_CAP_S, CAO_HOME_DIR
+from cli_agent_orchestrator.constants import BLOCKED_WAIT_CAP_S, CAO_HOME_DIR, PYTE_SCREEN_ROWS
 from cli_agent_orchestrator.models.terminal import ForkContext, TerminalStatus
 from cli_agent_orchestrator.providers.base import (
     BaseProvider,
@@ -403,6 +405,152 @@ CODEX_EMPTY_COMPOSER_PLACEHOLDERS = {
 # CSI SGR sequences only (colour/intensity). Used to walk dim state on
 # escape-preserving capture-pane (-e) lines without treating cursor CSI as text.
 _SGR_CSI_RE = re.compile(r"\x1b\[([0-9;]*)m")
+
+# --- F435: paste-submit race recovery -------------------------------------
+# When several codex TUIs initialize/receive input concurrently, the submit
+# Enter after a bracketed paste is sometimes lost to a render race: the task
+# text lands in the composer as a "[Pasted Content NNNN chars]" chip but is
+# never submitted. The pane then sits idle at the drafted chip until the
+# stalled-callback watchdog fires (~120s) or a human spots it.
+#
+# The stuck signature is the composer prompt line carrying the paste chip:
+#   › [Pasted Content 3048 chars]
+# A SUBMITTED composer instead shows an empty idle placeholder (e.g.
+# "› Ask Codex to do anything") or the Working/Thinking spinner
+# ("• Working (0s • esc to interrupt)"). We recover by re-sending Enter ONLY
+# while the stuck chip is still present — never blind-Enter a submitted
+# composer (idempotent, no double-submit).
+CODEX_PASTE_CHIP_PATTERN = re.compile(r"[›»]\s*\[Pasted Content\s+\d+\s+chars\]")
+# Grace before the first submission check: give the TUI a beat to register the
+# paste and process the submit Enter under load.
+CODEX_SUBMIT_VERIFY_GRACE_SECONDS = 2.0
+# Bounded re-Enter attempts once the stuck chip is confirmed present.
+CODEX_SUBMIT_VERIFY_MAX_RETRIES = 3
+# Backoff between re-Enter attempts (seconds); grows per attempt.
+CODEX_SUBMIT_VERIFY_BACKOFF_SECONDS = 1.0
+# BLOCKER B1/B2 (r3): confirmation now requires POSITIVE evidence that the
+# composer submitted, never mere absence of the chip. A single post-send
+# capture can be a stale pre-paste frame (empty composer, chip not rendered
+# yet) or a failed capture — treating either as success reopens the concurrent
+# submit-loss window. Each capture is classified into three states:
+#   submitted     — positive boundary crossed (empty idle placeholder/prompt in
+#                   the active composer, or the Working/Thinking spinner).
+#   stuck         — the active composer still carries the unsubmitted paste chip.
+#   indeterminate — neither observed yet (stale pre-paste frame, mid-redraw, or
+#                   a capture failure). NOT success: must be resolved by bounded
+#                   re-observation before the grace window, and re-Enter + poll
+#                   after it; if it never resolves to `submitted`, delivery is
+#                   UNCONFIRMED and we raise CodexSubmitStuckError.
+CODEX_SUBMIT_STATE_SUBMITTED = "submitted"
+CODEX_SUBMIT_STATE_STUCK = "stuck"
+CODEX_SUBMIT_STATE_INDETERMINATE = "indeterminate"
+# Bounded re-observation polls for the grace window (BLOCKER B1): after the
+# grace sleep we poll a few times for a POSITIVE submitted/stuck verdict before
+# concluding indeterminate, so a stale pre-paste first frame cannot commit as
+# success — a later frame that renders the durable chip is caught.
+CODEX_SUBMIT_VERIFY_POLL_ATTEMPTS = 4
+# Interval between confirmation polls (seconds), for both the initial grace
+# window and the post-re-Enter re-verification.
+CODEX_SUBMIT_VERIFY_POLL_INTERVAL_SECONDS = 0.5
+# BLOCKERS 1/2/3 (r4): the durable submission boundary is the pasted task
+# echoed as a SUBMITTED user turn in scrollback (its collapsed chip, or its raw
+# text). For the raw-text case we match a distinctive normalized PREFIX of the
+# task so pane soft-wrap / truncation does not defeat the check while an
+# unrelated short line cannot coincidentally match. Messages shorter than the
+# minimum are matched only via the unambiguous chip echo (and secondary
+# spinner), never by raw text.
+CODEX_SUBMIT_TASK_SIGNATURE_MIN_CHARS = 12
+CODEX_SUBMIT_TASK_SIGNATURE_CHARS = 40
+# r5 (BLOCKERS 1/2/3 root cause: no DISPATCH-RELATIVE boundary). r4's
+# submission predicate scanned ALL captured history with no pre-send cursor, so
+# any historical paste chip / identical task / identical 40-char prefix
+# false-confirmed the CURRENT unsent chip (B1); wrapped continuations were
+# discarded and short tasks produced no signature (B2); and a fixed 200-row tail
+# could evict the evidence while an unrelated active draft got recovery Enters
+# (B3). r5 makes the evidence dispatch-relative by BASELINE DIFF: immediately
+# BEFORE the paste/submit we capture a baseline observation of the pane (the set
+# of submitted-user-turn fingerprints already present, plus a turn-count
+# watermark). Submission evidence is then a NEW submitted-turn artifact that was
+# ABSENT from that baseline. Historical collisions live in the baseline and are
+# excluded BY CONSTRUCTION (kills B1); wrap is normalized before fingerprinting
+# (B2); and a watermark that shows scrollback advanced/evicted past the capture
+# window is INDETERMINATE → bounded → defer, never a blind Enter into a busy
+# pane (B3).
+#
+# Full-history capture rows for the baseline so eviction of the *baseline* set
+# is itself observable as a shrunk watermark rather than a silent miss.
+CODEX_SUBMIT_BASELINE_TAIL_LINES = 500
+
+# ---------------------------------------------------------------------------
+# r6 STRUCTURAL ROLLOUT SIGNAL — replaces pane heuristics as PRIMARY signal.
+# ---------------------------------------------------------------------------
+# Maximum time (seconds) to poll the rollout JSONL for the user-event record.
+# This bounds the total verify window. The rollout write is typically flushed
+# within 1–2s of the submit landing in Codex, but can lag under load.
+CODEX_ROLLOUT_POLL_TIMEOUT_SECONDS = 12.0
+# Interval between rollout file polls (seconds).
+CODEX_ROLLOUT_POLL_INTERVAL_SECONDS = 0.3
+# Maximum time to wait for the rollout file to be created (fresh session start
+# where the file may not exist at dispatch time yet).
+CODEX_ROLLOUT_CREATION_TIMEOUT_SECONDS = 8.0
+
+
+@dataclass(frozen=True)
+class CodexSubmitBaseline:
+    """A dispatch-relative snapshot taken BEFORE the paste/submit.
+
+    r6 (DIRECTION CHANGE): the PRIMARY confirmation signal is now STRUCTURAL —
+    the Codex session rollout JSONL file gains a user-turn record whose content
+    matches the dispatched message. Pane-content heuristics are retained ONLY as
+    a fast-path early-exit hint (if pane clearly shows submission, skip waiting
+    for the rollout write to flush). Correctness NEVER depends on pane content.
+
+    Fields:
+      * ``rollout_path`` — resolved Path to the session's rollout JSONL file at
+        baseline time.  ``None`` if the file could not be resolved (poll for
+        creation during verify).
+      * ``rollout_offset`` — byte offset at end of the rollout file at baseline
+        time.  New user events from this dispatch will appear AFTER this offset.
+        A dispatch-relative cursor: any record written after this point is new.
+      * ``turn_fingerprints`` — (legacy hint) normalized pane turn fingerprints.
+      * ``chip_counter`` — (legacy hint) chip multiset.
+      * ``turn_count`` — (legacy hint) submitted turn count watermark.
+      * ``captured_ok`` — (legacy hint) False if pane baseline capture failed.
+    """
+
+    rollout_path: "Path | None" = None
+    rollout_offset: int = 0
+    turn_fingerprints: frozenset[str] = field(default_factory=frozenset)
+    chip_counter: tuple[tuple[str, int], ...] = ()
+    turn_count: int = 0
+    captured_ok: bool = False
+    # B2 r7: active composer chip count at pre-paste time. None means no chip
+    # was visible on the composer (or capture failed). Used to detect ambiguous
+    # same-length drafts: if pre-paste composer already holds a draft whose
+    # length is within ±1 of the dispatched message, ownership is unresolvable.
+    pre_paste_chip_count: "int | None" = None
+
+    def chip_count(self, chip: str) -> int:
+        for key, count in self.chip_counter:
+            if key == chip:
+                return count
+        return 0
+
+
+class CodexSubmitStuckError(Exception):
+    """Raised when a codex composer never submits a pasted task after retries.
+
+    The send seams (``terminal_service.send_input`` /
+    ``send_prepared_input``) raise this from INSIDE the dispatch transaction so
+    it drives ``abort_dispatch`` — a coherent rollback, not a half-committed
+    send (BLOCKER B2). Those seams then translate it into a
+    ``DeliveryDeferredError`` so the inbox delivery layer treats it as a
+    retry-safe deferred delivery rather than a hard crash or a pretend-success.
+    Defined as a plain ``Exception`` here (not a ``DeliveryDeferredError``
+    subclass) to avoid a provider→draft_guard→status_monitor→manager→provider
+    import cycle; the translation lives in the seam, which already imports
+    ``DeliveryDeferredError``.
+    """
 
 
 def _apply_sgr_params_to_dim(params: str, dim: bool) -> bool:
@@ -1546,6 +1694,313 @@ class CodexProvider(BaseProvider):
         ):
             raise TerminalArtifactValidation("session_artifact_identity_invalid")
 
+    # ------------------------------------------------------------------
+    # F435 r6 — STRUCTURAL rollout confirmation helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_rollout_file(self, session_uuid: str | None) -> Path | None:
+        """Locate the rollout JSONL for the given session UUID.
+
+        Returns the single matching path, or ``None`` if not (yet) resolvable.
+
+        Resolution strategy:
+          1. Exact UUID match (glob ``rollout-*{uuid}*.jsonl``) — unambiguous
+             when exactly one file matches.
+          2. Ambiguous multi-match: pin by NEWEST mtime (the most recently
+             written rollout file for this UUID is the active session).
+          3. No UUID (fresh session before capture): fall back to the resume
+             seed (``self._fork_context.session_uuid`` when mode == resume), or
+             the single newest rollout file in the sessions dir.
+
+        Returns None without touching the filesystem/DB when no UUID is
+        available and no resume seed exists (test/DB-free environments).
+        """
+        # Early exit: no UUID and no resume seed → nothing to resolve.
+        if not session_uuid:
+            resume_uuid = self.resume_session_uuid()
+            if not resume_uuid:
+                return None
+
+        try:
+            sessions_dir = _resolved_codex_home(getattr(self, "terminal_id", None)) / "sessions"
+        except Exception:
+            return None
+        if not sessions_dir.is_dir():
+            return None
+
+        # --- Try explicit UUID first ---
+        if session_uuid:
+            matches = list(sessions_dir.glob(f"**/rollout-*{session_uuid}*.jsonl"))
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                # B5 r7: identity-validate ambiguous candidates via session_meta.
+                # mtime orders candidates, but identity decides.
+                validated = self._identity_filter_rollout_candidates(
+                    matches, session_uuid
+                )
+                if validated:
+                    return validated
+                # Fallback: mtime (best-effort, logged as ambiguous).
+                logger.warning(
+                    "F435 rollout-pin: %d candidates for UUID %s, none "
+                    "passed identity validation; falling back to mtime",
+                    len(matches),
+                    session_uuid,
+                )
+                return max(matches, key=lambda p: p.stat().st_mtime)
+            # No match — file not yet created; caller will poll.
+            return None
+
+        # --- No UUID: try resume seed ---
+        resume_uuid = self.resume_session_uuid()
+        if resume_uuid:
+            matches = list(sessions_dir.glob(f"**/rollout-*{resume_uuid}*.jsonl"))
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                validated = self._identity_filter_rollout_candidates(
+                    matches, resume_uuid
+                )
+                if validated:
+                    return validated
+                return max(matches, key=lambda p: p.stat().st_mtime)
+
+        # --- Last resort: newest rollout file in sessions dir ---
+        all_rollouts = list(sessions_dir.glob("**/rollout-*.jsonl"))
+        if len(all_rollouts) == 1:
+            return all_rollouts[0]
+        if all_rollouts:
+            return max(all_rollouts, key=lambda p: p.stat().st_mtime)
+
+        return None
+
+    @staticmethod
+    def _identity_filter_rollout_candidates(
+        candidates: list[Path], expected_id: str
+    ) -> Path | None:
+        """B5 r7: validate session_meta.payload.id against expected session id.
+
+        Among multiple rollout files matching a UUID glob, select the one whose
+        first-line session_meta record has ``payload.id == expected_id``.  If
+        exactly one validates, return it.  If multiple validate (concurrent same
+        session?), order by mtime.  If none validate, return None so the caller
+        can fall back or log.
+        """
+        validated: list[Path] = []
+        for path in candidates:
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    first_line = f.readline()
+                if not first_line:
+                    continue
+                record = json.loads(first_line)
+                if (
+                    record.get("type") == "session_meta"
+                    and record.get("payload", {}).get("id") == expected_id
+                ):
+                    validated.append(path)
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+        if len(validated) == 1:
+            return validated[0]
+        if len(validated) > 1:
+            return max(validated, key=lambda p: p.stat().st_mtime)
+        return None
+
+    @staticmethod
+    def _rollout_file_offset(rollout_path: Path | None) -> int:
+        """Return current end-of-file byte offset, or 0 if unresolvable."""
+        if rollout_path is None:
+            return 0
+        try:
+            return rollout_path.stat().st_size
+        except OSError:
+            return 0
+
+    @staticmethod
+    def _normalize_for_match(text: str) -> str:
+        """Collapse whitespace for content comparison (rollout vs dispatch)."""
+        return re.sub(r"\s+", " ", text).strip()
+
+    @classmethod
+    def _rollout_has_user_event(
+        cls,
+        rollout_path: Path | None,
+        offset: int,
+        message: str,
+    ) -> bool:
+        """Check if the rollout JSONL has a user-turn record matching ``message``.
+
+        Reads only COMPLETE lines (ending in newline) starting from ``offset``
+        to handle partial-line writes safely. Matches by normalized content
+        comparison (whitespace-collapsed equality or containment for long
+        messages).
+
+        Returns True if a matching user event is found after offset.
+        """
+        if rollout_path is None or not message:
+            return False
+        try:
+            if not rollout_path.exists():
+                return False
+            file_size = rollout_path.stat().st_size
+            if file_size <= offset:
+                return False
+            with rollout_path.open("r", encoding="utf-8") as f:
+                f.seek(offset)
+                raw = f.read()
+        except OSError:
+            return False
+
+        # Only process complete lines (ending in \n) — a partial last line is
+        # an in-progress write and must not be parsed.  If the raw chunk ends
+        # with \n, every segment is complete; otherwise discard the trailing
+        # fragment.
+        lines = raw.split("\n")
+        if not raw.endswith("\n"):
+            lines = lines[:-1]  # drop incomplete trailing fragment
+        norm_message = cls._normalize_for_match(message)
+        # B4 r7: distinctive matching — require candidate length >= min(len(msg), 64)
+        # AND prefix-equality (not substring containment).  This prevents a
+        # 1-char event from confirming and prevents unrelated short candidates.
+        min_distinctive_len = min(len(norm_message), 64)
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            # Check all known Codex user-turn record formats:
+            for candidate in cls._extract_rollout_user_texts(record):
+                norm_candidate = cls._normalize_for_match(candidate)
+                if norm_candidate == norm_message:
+                    return True
+                # B4 r7: distinctive prefix match for long messages that may be
+                # truncated in the rollout.  Both candidate and message must be
+                # of distinctive length, and the match is prefix-equality (not
+                # arbitrary substring containment).
+                if (
+                    len(norm_candidate) >= min_distinctive_len
+                    and len(norm_message) > 40
+                ):
+                    # Prefix equality: the shorter of (candidate[:200], message[:200])
+                    # must equal the other's same-length prefix.
+                    prefix_len = min(200, len(norm_candidate), len(norm_message))
+                    if norm_candidate[:prefix_len] == norm_message[:prefix_len]:
+                        return True
+        return False
+
+    @classmethod
+    def _count_rollout_matches(
+        cls,
+        rollout_path: "Path | None",
+        offset: int,
+        message: str,
+    ) -> int:
+        """B3 r7: count ALL matching user-turn records after offset.
+
+        Used for duplicate-delivery detection. Returns the number of matching
+        events (0 = none, 1 = normal, 2+ = duplicate delivery detected).
+        Uses the same matching logic as _rollout_has_user_event.
+        """
+        if rollout_path is None or not message:
+            return 0
+        try:
+            if not rollout_path.exists():
+                return 0
+            file_size = rollout_path.stat().st_size
+            if file_size <= offset:
+                return 0
+            with rollout_path.open("r", encoding="utf-8") as f:
+                f.seek(offset)
+                raw = f.read()
+        except OSError:
+            return 0
+
+        lines = raw.split("\n")
+        if not raw.endswith("\n"):
+            lines = lines[:-1]
+        norm_message = cls._normalize_for_match(message)
+        min_distinctive_len = min(len(norm_message), 64)
+        count = 0
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            for candidate in cls._extract_rollout_user_texts(record):
+                norm_candidate = cls._normalize_for_match(candidate)
+                if norm_candidate == norm_message:
+                    count += 1
+                    break
+                if (
+                    len(norm_candidate) >= min_distinctive_len
+                    and len(norm_message) > 40
+                ):
+                    prefix_len = min(200, len(norm_candidate), len(norm_message))
+                    if norm_candidate[:prefix_len] == norm_message[:prefix_len]:
+                        count += 1
+                        break
+        return count
+
+    @staticmethod
+    def _extract_rollout_user_texts(record: dict) -> list[str]:
+        """Extract user-message text candidates from a rollout JSONL record.
+
+        Covers the known Codex rollout formats:
+          * type=event_msg, payload.type=user_message, payload.message=<str>
+          * type=response_item, payload.role=user, payload.content=[...]
+          * type=user, message=<str or dict with content>
+        """
+        texts: list[str] = []
+        record_type = record.get("type")
+        payload = record.get("payload")
+
+        if record_type == "event_msg" and isinstance(payload, dict):
+            if payload.get("type") == "user_message":
+                msg = payload.get("message")
+                if isinstance(msg, str):
+                    texts.append(msg)
+
+        elif record_type == "response_item" and isinstance(payload, dict):
+            if payload.get("role") == "user":
+                content = payload.get("content")
+                if isinstance(content, str):
+                    texts.append(content)
+                elif isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict):
+                            text = item.get("text")
+                            if isinstance(text, str):
+                                texts.append(text)
+                        elif isinstance(item, str):
+                            texts.append(item)
+
+        elif record_type == "user":
+            msg = record.get("message")
+            if isinstance(msg, str):
+                texts.append(msg)
+            elif isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, str):
+                    texts.append(content)
+                elif isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict):
+                            text = item.get("text")
+                            if isinstance(text, str):
+                                texts.append(text)
+                        elif isinstance(item, str):
+                            texts.append(item)
+
+        return texts
+
     def auth_state_path(self) -> Path | None:
         return _resolved_codex_home(getattr(self, "terminal_id", None)) / "auth.json"
 
@@ -1940,7 +2395,7 @@ class CodexProvider(BaseProvider):
     @property
     def resolved_model(self) -> Optional[str]:
         """Return the effective model resolved during command build."""
-        return getattr(self, '_resolved_model', None)
+        return getattr(self, "_resolved_model", None)
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
@@ -2004,7 +2459,10 @@ class CodexProvider(BaseProvider):
                 signals.append(
                     ScreenSignal("progress", "TUI_PROGRESS_PATTERN", index, row, "corroborable")
                 )
-            if legacy_status == TerminalStatus.WAITING_USER_ANSWER and TRUST_SELECTOR_PATTERN.search(row):
+            if (
+                legacy_status == TerminalStatus.WAITING_USER_ANSWER
+                and TRUST_SELECTOR_PATTERN.search(row)
+            ):
                 signals.append(ScreenSignal("waiting", "TRUST_SELECTOR_PATTERN", index))
             if (
                 not progress_rows
@@ -2256,6 +2714,757 @@ class CodexProvider(BaseProvider):
         if draft.strip() in CODEX_EMPTY_COMPOSER_PLACEHOLDERS:
             return ""
         return draft
+
+    @staticmethod
+    def _pane_shows_pasted_chip(captured: str) -> bool:
+        """Whether the ACTIVE composer still shows an unsubmitted paste chip.
+
+        The stuck F435 signature is the CURRENT composer row carrying the
+        ``[Pasted Content NNNN chars]`` chip. A submitted composer instead shows
+        an empty idle placeholder or the Working/Thinking spinner, so the chip's
+        presence in the active composer is a durable, idempotent gate for
+        re-sending Enter.
+
+        Composer-SCOPED (BLOCKER B1): the chip is matched ONLY within the active
+        composer region at the bottom of the rendered pane, never against the
+        whole 200-row capture. A HISTORICAL chip that has scrolled up into
+        transcript history — with the current composer now empty or showing the
+        Working spinner — must NOT be read as stuck, or recovery would blind a
+        submitted composer with an extra Enter (a double-submit).
+
+        Scoping mirrors ``read_composer_draft``: locate the TUI footer, then the
+        last ``›``/``»`` composer row in the small window just above it, and test
+        the chip pattern on that row plus its continuation rows up to the footer.
+        Escapes are stripped first so an SGR-wrapped chip still matches.
+
+        Note this deliberately does NOT inherit ``read_composer_draft``'s
+        "assistant output above the prompt ⇒ defer (None)" ownership rule: that
+        rule protects human-draft stash/restore against ambiguous ownership, but
+        the ``[Pasted Content N chars]`` chip is unambiguous CAO-injected chrome
+        (never user/assistant prose), and the real stuck pane always has the
+        SEED_OK assistant bullet above the composer.
+        """
+        if not captured:
+            return False
+        raw_lines = [line.rstrip("\r") for line in captured.splitlines()]
+        plain_lines = [strip_terminal_escapes(line).rstrip() for line in raw_lines]
+
+        footer_idx = _find_tui_footer_index(plain_lines)
+        if footer_idx is None:
+            footer_idx = len(plain_lines)
+
+        # Identify the ACTIVE composer row using the same strict adjacency the
+        # status/extraction paths use: walk up from the footer through only
+        # blank / "? for shortcuts" rows to a ``›``/``»`` composer row. Any
+        # other content (e.g. a ``• Working`` spinner, an assistant bullet)
+        # between the footer and a prompt row rejects the anchor — so a
+        # HISTORICAL chip that has scrolled up into transcript history is never
+        # mistaken for the current composer (BLOCKER B1).
+        prompt_idx = _find_composer_anchor_index(plain_lines, footer_idx)
+        if prompt_idx is None:
+            return False
+
+        # Match the chip only on the active composer region: the anchored prompt
+        # row and any continuation rows up to the footer. The chip is single-line
+        # in practice; scanning the region is safe and future-proof.
+        search_end = footer_idx
+        while search_end > 0 and not plain_lines[search_end - 1].strip():
+            search_end -= 1
+        region = "\n".join(plain_lines[prompt_idx:search_end])
+        return CODEX_PASTE_CHIP_PATTERN.search(region) is not None
+
+    @staticmethod
+    def _active_composer_chip_count(captured: str) -> int | None:
+        """Return the ``[Pasted Content N chars]`` count on the ACTIVE composer.
+
+        ``None`` when no chip is on the active composer (or it cannot be
+        anchored). Used to prove OWNERSHIP before a recovery Enter (BLOCKER 3):
+        we only re-Enter a stuck chip whose char-count matches the current
+        dispatch, so an UNRELATED queued/steering draft that happens to own the
+        composer is never blind-Entered mid-run.
+        """
+        if not captured:
+            return None
+        raw_lines = [line.rstrip("\r") for line in captured.splitlines()]
+        plain_lines = [strip_terminal_escapes(line).rstrip() for line in raw_lines]
+        footer_idx = _find_tui_footer_index(plain_lines)
+        if footer_idx is None:
+            footer_idx = len(plain_lines)
+        prompt_idx = _find_composer_anchor_index(plain_lines, footer_idx)
+        if prompt_idx is None:
+            return None
+        search_end = footer_idx
+        while search_end > 0 and not plain_lines[search_end - 1].strip():
+            search_end -= 1
+        region = "\n".join(plain_lines[prompt_idx:search_end])
+        match = re.search(r"\[Pasted Content\s+(\d+)\s+chars\]", region)
+        return int(match.group(1)) if match is not None else None
+
+    @staticmethod
+    def _pane_shows_working(captured: str) -> bool:
+        """Whether the pane shows the Working/Thinking progress spinner.
+
+        The spinner (``• Working (0s • esc to interrupt)``) means the agent has
+        BEGUN the turn — reachable only after the pasted task submitted. This is
+        the single unambiguous positive submission signal that a stale pre-paste
+        frame can never exhibit (BLOCKER B1): an empty composer, by contrast, is
+        indistinguishable pre-paste vs. post-submit, so absence of the chip is
+        NOT evidence of submission.
+        """
+        if not captured:
+            return False
+        for line in captured.splitlines():
+            if re.search(TUI_PROGRESS_PATTERN, strip_terminal_escapes(line)):
+                return True
+        return False
+
+    @staticmethod
+    def _pane_shows_cleared_composer(captured: str) -> bool:
+        """Whether the ACTIVE composer is an empty idle prompt / placeholder.
+
+        Composer-scoped exactly like ``_pane_shows_pasted_chip`` (footer anchor).
+        This is NOT positive submission proof on its own — a stale pre-paste
+        frame renders the same empty prompt — so the caller only treats a
+        cleared composer as ``submitted`` once it has POSITIVELY observed the
+        chip first and then seen it cleared (a chip→cleared TRANSITION, BLOCKER
+        B1). Used solely to detect that transition.
+        """
+        if not captured:
+            return False
+        raw_lines = [line.rstrip("\r") for line in captured.splitlines()]
+        plain_lines = [strip_terminal_escapes(line).rstrip() for line in raw_lines]
+        footer_idx = _find_tui_footer_index(plain_lines)
+        if footer_idx is None:
+            footer_idx = len(plain_lines)
+        prompt_idx = _find_composer_anchor_index(plain_lines, footer_idx)
+        if prompt_idx is None:
+            return False
+        composer_row = plain_lines[prompt_idx].strip()
+        if re.fullmatch(IDLE_PROMPT_STRICT_PATTERN, composer_row, re.IGNORECASE) is not None:
+            return True
+        return _is_known_composer_placeholder(plain_lines[prompt_idx])
+
+    @staticmethod
+    def _extract_submitted_turns(captured: str) -> tuple[list[str], int, list[int]]:
+        """Parse submitted user turns from a capture, wrap-joined and normalized.
+
+        Returns ``(fingerprints, prompt_idx_or_-1, chip_counts)`` where:
+
+          * ``fingerprints`` is the normalized, wrap-joined content of every
+            submitted ``›``/``»`` user turn STRICTLY ABOVE the active composer
+            (history). Each entry strips the ``›`` head glyph and CONCATENATES
+            the head body with its wrapped continuation rows (soft-wrap breaks
+            mid-character with no inserted separator), then collapses internal
+            whitespace — so a turn that soft-wrapped across visual rows produces
+            the SAME fingerprint as its unwrapped text (BLOCKER 2: wrapped
+            continuations are no longer discarded, and no phantom separator is
+            introduced at the wrap column).
+          * ``prompt_idx_or_-1`` is the active-composer anchor index, or ``-1``
+            when no active composer can be anchored (history-less capture).
+          * ``chip_counts`` is the ``[Pasted Content N chars]`` char-count found
+            on each submitted turn's head row (for chip-multiset accounting).
+
+        History-scoped by the same footer/composer anchor the rest of the module
+        uses, so a chip or task text still sitting on the ACTIVE composer row is
+        never mistaken for a submitted turn.
+        """
+        if not captured:
+            return [], -1, []
+        raw_lines = [line.rstrip("\r") for line in captured.splitlines()]
+        plain_lines = [strip_terminal_escapes(line).rstrip() for line in raw_lines]
+
+        footer_idx = _find_tui_footer_index(plain_lines)
+        if footer_idx is None:
+            footer_idx = len(plain_lines)
+        prompt_idx = _find_composer_anchor_index(plain_lines, footer_idx)
+        if prompt_idx is None:
+            return [], -1, []
+
+        history = plain_lines[:prompt_idx]
+        if not history:
+            return [], prompt_idx, []
+
+        fingerprints: list[str] = []
+        chip_counts: list[int] = []
+        i = 0
+        n = len(history)
+        while i < n:
+            row = history[i]
+            if re.match(r"^\s*[›»]\s+\S", row) is None:
+                i += 1
+                continue
+            # Start of a submitted user turn. Absorb wrapped continuation rows:
+            # non-empty rows that are NOT themselves a new ``›`` head, an
+            # assistant/tool bullet, or an idle prompt. A blank row ends the turn.
+            head = row
+            # Strip the leading ``›``/``»`` glyph (and one following space) so the
+            # head body concatenates cleanly with continuation rows.
+            head_body = re.sub(r"^\s*[›»]\s?", "", head)
+            block_parts = [head_body]
+            j = i + 1
+            while j < n:
+                nxt = history[j]
+                if not nxt.strip():
+                    break
+                if re.match(r"^\s*[›»]\s", nxt) is not None:
+                    break
+                if re.match(ASSISTANT_PREFIX_PATTERN, nxt, re.IGNORECASE) is not None:
+                    break
+                block_parts.append(nxt)
+                j += 1
+            # Soft-wrap reconstruction: concatenate with NO separator so the
+            # wrap column does not introduce a phantom space, then collapse
+            # internal whitespace runs for a stable fingerprint.
+            block = "".join(block_parts)
+            fingerprints.append(CodexProvider._normalize_pane_text(block))
+            chip_match = CODEX_PASTE_CHIP_PATTERN.search(head)
+            if chip_match is not None:
+                num = re.search(r"(\d+)\s+chars", head)
+                chip_counts.append(int(num.group(1)) if num else -1)
+            i = j
+        return fingerprints, prompt_idx, chip_counts
+
+    @staticmethod
+    def _build_submission_baseline(captured: str | None) -> CodexSubmitBaseline:
+        """Build a dispatch-relative baseline from a PRE-send pane capture.
+
+        A ``None`` capture (failed baseline read) yields ``captured_ok=False`` so
+        the post-send verifier treats every subsequent verdict as indeterminate
+        (never success) — a missing baseline cannot be used to manufacture a
+        NEW-turn confirmation.
+        """
+        if captured is None:
+            return CodexSubmitBaseline()
+        fingerprints, _prompt_idx, chip_counts = CodexProvider._extract_submitted_turns(captured)
+        chip_counter = Counter(
+            f"[Pasted Content {c} chars]" for c in chip_counts if c >= 0
+        )
+        return CodexSubmitBaseline(
+            turn_fingerprints=frozenset(fingerprints),
+            chip_counter=tuple(sorted(chip_counter.items())),
+            turn_count=len(fingerprints),
+            captured_ok=True,
+        )
+
+    @staticmethod
+    def _pane_shows_new_submitted_task(
+        captured: str,
+        message: str | None,
+        baseline: CodexSubmitBaseline | None,
+    ) -> str:
+        """Classify a POST-send capture relative to the pre-send ``baseline``.
+
+        This is the r5 dispatch-relative submission boundary. Returns one of:
+
+          * ``CODEX_SUBMIT_STATE_SUBMITTED`` — a submitted user turn is present
+            that was ABSENT from the baseline AND is attributable to the current
+            dispatch: a chip whose ``[Pasted Content N chars]`` count now exceeds
+            its baseline multiset count, OR (for messages long enough to have a
+            distinctive signature) a new turn whose text contains the task
+            signature, OR — when the task is too short for a signature — simply
+            ANY new submitted turn absent from the baseline (a short task still
+            produces a NEW turn artifact). Historical collisions are in the
+            baseline and excluded by construction (BLOCKER 1).
+          * ``CODEX_SUBMIT_STATE_INDETERMINATE`` — the baseline is missing/failed,
+            OR the post-send capture shows FEWER submitted turns than the
+            baseline watermark (turns evicted from the tail → the evidence window
+            is unreliable). Never treated as success; the caller re-observes
+            within a bound and, failing that, defers (BLOCKER 3: never a blind
+            Enter into a pane whose scrollback advanced past capture).
+          * ``""`` (empty) — no new submitted turn yet, but the window is intact
+            (watermark not shrunk). The caller consults the active-composer state
+            (stuck chip vs. cleared) to decide.
+
+        Wrap is normalized before comparison so a soft-wrapped submitted turn
+        matches its baseline/absent fingerprint (BLOCKER 2).
+        """
+        if baseline is None or not baseline.captured_ok:
+            # No dispatch-relative reference ⇒ cannot prove a NEW turn.
+            return CODEX_SUBMIT_STATE_INDETERMINATE
+        if not captured:
+            return CODEX_SUBMIT_STATE_INDETERMINATE
+
+        fingerprints, prompt_idx, chip_counts = CodexProvider._extract_submitted_turns(captured)
+        if prompt_idx == -1:
+            # No anchorable active composer: we cannot separate history from the
+            # live draft this frame. Do not guess; re-observe.
+            return CODEX_SUBMIT_STATE_INDETERMINATE
+
+        # BLOCKER 3 watermark: if the current capture shows FEWER submitted turns
+        # than the baseline, the tail evicted history — the window is unreliable
+        # and absence of the current turn is ambiguous. Indeterminate → bounded
+        # → defer; never a blind Enter into a busy/scrolled pane.
+        if len(fingerprints) < baseline.turn_count:
+            return CODEX_SUBMIT_STATE_INDETERMINATE
+
+        # A submitted turn NEW relative to the baseline (fingerprint set diff).
+        new_fingerprints = [fp for fp in fingerprints if fp not in baseline.turn_fingerprints]
+
+        # 1) Chip echo: a new [Pasted Content N chars] occurrence beyond the
+        #    baseline multiset for that exact N. A same-N repeat dispatch only
+        #    counts once the post-send count exceeds the baseline count, so a
+        #    pre-existing identical chip cannot confirm (BLOCKER 1: same-N).
+        post_chip_counter = Counter(
+            f"[Pasted Content {c} chars]" for c in chip_counts if c >= 0
+        )
+        for chip, post_count in post_chip_counter.items():
+            if post_count > baseline.chip_count(chip):
+                return CODEX_SUBMIT_STATE_SUBMITTED
+
+        if not new_fingerprints:
+            # No new submitted turn appeared; window intact. Defer to composer
+            # state (stuck/cleared) in the caller.
+            return ""
+
+        # 2) Raw-text echo: for a message long enough to have a distinctive
+        #    signature, require the signature to appear in a NEW turn so an
+        #    unrelated new line cannot coincidentally confirm.
+        signature = CodexProvider._task_echo_signature(message)
+        if signature is not None:
+            new_blob = CodexProvider._normalize_pane_text("\n".join(new_fingerprints))
+            if signature in new_blob:
+                return CODEX_SUBMIT_STATE_SUBMITTED
+            # A new turn appeared but it does not carry our signature: it is a
+            # DIFFERENT dispatch's turn, not ours. Window intact, ours not yet
+            # submitted → defer to composer state.
+            return ""
+
+        # 3) Short task (no signature): a short raw task still produces a NEW
+        #    submitted ``›`` turn absent from the baseline. Since the window is
+        #    intact (watermark not shrunk) and a turn we did not have before now
+        #    exists directly above the active composer, that is our submission
+        #    (BLOCKER 2: short fast-completions no longer false-defer).
+        return CODEX_SUBMIT_STATE_SUBMITTED
+
+    @staticmethod
+    def _normalize_pane_text(text: str) -> str:
+        """Collapse whitespace so wrapped/re-spaced pane rows compare stably."""
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _task_echo_signature(message: str | None) -> str | None:
+        """A distinctive normalized prefix of the pasted task for echo matching.
+
+        Returns ``None`` when the message is missing or too short to be a
+        reliable, low-false-positive signature — in that case raw-text matching
+        is skipped and only the unambiguous chip echo (and secondary spinner)
+        can confirm.
+        """
+        if not message:
+            return None
+        norm = CodexProvider._normalize_pane_text(message)
+        # Require a reasonably distinctive run of characters; a handful of
+        # characters could collide with unrelated chrome.
+        if len(norm) < CODEX_SUBMIT_TASK_SIGNATURE_MIN_CHARS:
+            return None
+        return norm[:CODEX_SUBMIT_TASK_SIGNATURE_CHARS]
+
+    def capture_submission_baseline(
+        self,
+        metadata: dict[str, Any],
+        backend: Any,
+    ) -> CodexSubmitBaseline:
+        """F435 r6: snapshot rollout offset + pane BEFORE the paste.
+
+        The PRIMARY dispatch-relative cursor is the rollout file byte offset —
+        any user-turn record written after this offset is from THIS dispatch.
+        The pane snapshot is a FAST-PATH HINT only: if the pane clearly shows
+        submission (new chip/turn), we skip waiting for the rollout flush.
+        Correctness never depends on pane content.
+
+        Called by the send seam immediately before ``backend.send_keys``.
+        """
+        # --- Structural rollout baseline (PRIMARY) ---
+        session_uuid = metadata.get("provider_session_id")
+        rollout_path = self._resolve_rollout_file(session_uuid)
+        rollout_offset = self._rollout_file_offset(rollout_path)
+
+        # --- Pane baseline (fast-path hint) ---
+        session = metadata["tmux_session"]
+        window = metadata["tmux_window"]
+        try:
+            captured = backend.get_history(
+                session,
+                window,
+                tail_lines=CODEX_SUBMIT_BASELINE_TAIL_LINES,
+                strip_escapes=False,
+            )
+            captured = captured if isinstance(captured, str) else None
+        except Exception as exc:
+            logger.warning(
+                "F435 submit-verify: baseline capture failed for terminal %s: %s",
+                self.terminal_id,
+                exc,
+            )
+            captured = None
+
+        # Build pane hint portion
+        pane_baseline = self._build_submission_baseline(captured)
+        # B2 r7: capture pre-paste composer chip count for ambiguity detection
+        pre_paste_chip = None
+        if captured is not None:
+            pre_paste_chip = self._active_composer_chip_count(captured)
+        # Merge rollout state into the baseline
+        return CodexSubmitBaseline(
+            rollout_path=rollout_path,
+            rollout_offset=rollout_offset,
+            turn_fingerprints=pane_baseline.turn_fingerprints,
+            chip_counter=pane_baseline.chip_counter,
+            turn_count=pane_baseline.turn_count,
+            captured_ok=pane_baseline.captured_ok,
+            pre_paste_chip_count=pre_paste_chip,
+        )
+
+    def verify_submission_after_send(
+        self,
+        metadata: dict[str, Any],
+        backend: Any,
+        message: str | None = None,
+        baseline: "CodexSubmitBaseline | None" = None,
+    ) -> None:
+        """F435 r6: confirm the pasted task SUBMITTED; re-Enter if it stuck.
+
+        DIRECTION CHANGE (r6): the PRIMARY confirmation signal is now STRUCTURAL
+        — the Codex session rollout JSONL file gains a user-turn record whose
+        content matches the dispatched message. This is content-unambiguous: it
+        cannot be spoofed by pane reflow, identical repeats, chip eviction, or
+        drafts.
+
+        The pane baseline is retained as a FAST-PATH HINT only: if the pane
+        clearly shows submission early, we return immediately without waiting
+        for the rollout flush. Correctness NEVER depends on pane content.
+
+        Recovery Enter fires ONLY if:
+          1. The rollout file has NO matching user event at the deadline, AND
+          2. The pane shows a stuck chip owned by this dispatch, AND
+          3. The pre-paste baseline had NO existing draft chip of ambiguous
+             length (B2 r7: if it did, ownership is unresolvable → defer), AND
+          4. A FINAL rollout re-check immediately before sending confirms no
+             match (closes the SHOULD double-send race: if the original submit
+             landed between observation and action, the re-check catches it),
+          5. Immediately before send_special_key, the pane is re-read and the
+             composer must STILL show the matching chip (B3 r7 TOCTOU narrow),
+          6. After the Enter, if TWO matching post-cursor events exist, a
+             duplicate-delivery warning is logged (detection only — unsend is
+             impossible). RESIDUAL WINDOW: between the final rollout re-check
+             and the actual key-send, the original submit may land (~50ms on
+             local tmux). This is an honest, documented race that detection
+             can surface but not prevent.
+
+        This closes all r5 blockers:
+          * B1 (partial-baseline false-commit): rollout match is exact content,
+            not pane fingerprint diffing.
+          * B2 (wrap/reflow): rollout content is never wrapped.
+          * B3 (same-length ownership): rollout match is by content, not length.
+          * B4 (double-send race): re-check rollout immediately before Enter.
+          * Identical raw repeats: each dispatch writes a distinct rollout record;
+            even byte-identical messages produce separate events (append, not
+            dedup).
+        """
+        session = metadata["tmux_session"]
+        window = metadata["tmux_window"]
+        own_chip_count = len(message) if message else None
+
+        # --- Resolve rollout file (handle not-yet-created) ---
+        rollout_path = baseline.rollout_path if baseline else None
+        rollout_offset = baseline.rollout_offset if baseline else 0
+        session_uuid = metadata.get("provider_session_id")
+
+        def _ensure_rollout_path() -> Path | None:
+            """Resolve or poll for rollout file creation."""
+            nonlocal rollout_path
+            if rollout_path is not None:
+                return rollout_path
+            # No UUID and no resume seed means no rollout file to find.
+            if not session_uuid and not self.resume_session_uuid():
+                return None
+            # File may not exist yet at dispatch (fresh session). Poll for creation.
+            deadline = time.monotonic() + CODEX_ROLLOUT_CREATION_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                rollout_path = self._resolve_rollout_file(session_uuid)
+                if rollout_path is not None:
+                    return rollout_path
+                time.sleep(CODEX_ROLLOUT_POLL_INTERVAL_SECONDS)
+            return None
+
+        def _rollout_confirms() -> bool:
+            """Check if rollout has a matching user event after baseline offset."""
+            rp = _ensure_rollout_path()
+            return self._rollout_has_user_event(rp, rollout_offset, message or "")
+
+        def _pane_hint_submitted() -> bool:
+            """Fast-path pane hint: check if pane clearly shows submission.
+
+            B1 r7 FIX: this hint NO LONGER returns success directly. It is
+            used only to short-circuit the WAITING state (skip to rollout
+            confirm check immediately). Every success return requires a matching
+            post-cursor rollout event — pane state may only accelerate the
+            path TO the rollout check, never bypass it.
+            """
+            try:
+                captured = backend.get_history(
+                    session, window,
+                    tail_lines=PYTE_SCREEN_ROWS,
+                    strip_escapes=False,
+                )
+                if not isinstance(captured, str):
+                    return False
+            except Exception:
+                return False
+            # Check pane for new submitted turn (fast path)
+            new_task_state = self._pane_shows_new_submitted_task(
+                captured, message, baseline
+            )
+            if new_task_state == CODEX_SUBMIT_STATE_SUBMITTED:
+                return True
+            # Also check the Working/Thinking spinner
+            if self._pane_shows_working(captured):
+                return True
+            return False
+
+        def _pane_shows_stuck_chip() -> bool:
+            """Check if the pane has a stuck chip owned by this dispatch.
+
+            B2 r7: recovery Enter requires:
+              (a) no matching rollout event (checked by caller), AND
+              (b) the pre-paste baseline had NO existing draft chip of ambiguous
+                  length — if the pre-paste composer already held a draft whose
+                  count is within ±1 of own_chip_count, ownership is
+                  unresolvable and we must defer (raise DeliveryDeferredError).
+            """
+            try:
+                captured = backend.get_history(
+                    session, window,
+                    tail_lines=PYTE_SCREEN_ROWS,
+                    strip_escapes=False,
+                )
+                if not isinstance(captured, str):
+                    return False
+            except Exception:
+                return False
+            if not self._pane_shows_pasted_chip(captured):
+                return False
+            # Verify ownership
+            active_n = self._active_composer_chip_count(captured)
+            if active_n is None:
+                return False
+            if own_chip_count is None:
+                return True
+            if abs(active_n - own_chip_count) > 1:
+                return False
+            # B2 r7: check pre-paste ambiguity. If the baseline captured a
+            # draft chip whose length is within ±1 of our dispatch, the chip
+            # we see NOW might be that pre-existing draft, not ours → ambiguous.
+            if baseline and baseline.pre_paste_chip_count is not None:
+                if abs(baseline.pre_paste_chip_count - own_chip_count) <= 1:
+                    # Ambiguous: pre-paste already had a same-length draft.
+                    # Cannot determine ownership → must defer.
+                    from cli_agent_orchestrator.services.draft_guard import (
+                        DeliveryDeferredError,
+                    )
+                    raise DeliveryDeferredError(
+                        f"F435 r7 B2: pre-paste composer already held a draft "
+                        f"(chip {baseline.pre_paste_chip_count} chars) within "
+                        f"±1 of dispatch ({own_chip_count} chars); ownership "
+                        f"is unresolvable — deferring delivery"
+                    )
+            return True
+
+        # --- Main verification loop ---
+        time.sleep(CODEX_SUBMIT_VERIFY_GRACE_SECONDS)
+
+        # B1 r7: When rollout infrastructure is available (rollout_path or
+        # session_uuid exists), pane hint accelerates to rollout check only.
+        # When rollout is unavailable (no UUID, no file), pane is the only
+        # signal and may conclude success (backward compat with pre-r6 tests).
+        _has_rollout_infra = (
+            rollout_path is not None
+            or session_uuid is not None
+            or (self.resume_session_uuid() is not None)
+        )
+
+        if _pane_hint_submitted():
+            if not _has_rollout_infra:
+                # No rollout available — pane is the only signal (pre-r6 compat)
+                logger.info(
+                    "F435 submit-verify: terminal %s confirmed via pane hint "
+                    "(no rollout infrastructure available)",
+                    self.terminal_id,
+                )
+                return
+            # Rollout infra exists — pane hint accelerates to rollout check
+            if _rollout_confirms():
+                logger.info(
+                    "F435 submit-verify: terminal %s confirmed via rollout "
+                    "after pane fast-path hint",
+                    self.terminal_id,
+                )
+                return
+
+        # Primary signal: poll rollout file for the user event
+        poll_deadline = time.monotonic() + CODEX_ROLLOUT_POLL_TIMEOUT_SECONDS
+        while time.monotonic() < poll_deadline:
+            if _rollout_confirms():
+                logger.info(
+                    "F435 submit-verify: terminal %s confirmed via rollout "
+                    "structural signal",
+                    self.terminal_id,
+                )
+                return
+            # B1 r7: pane hint accelerates to rollout recheck (when infra exists)
+            # or confirms directly (when no infra)
+            if _pane_hint_submitted():
+                if not _has_rollout_infra:
+                    logger.info(
+                        "F435 submit-verify: terminal %s confirmed via pane "
+                        "hint during poll (no rollout infrastructure)",
+                        self.terminal_id,
+                    )
+                    return
+                if _rollout_confirms():
+                    logger.info(
+                        "F435 submit-verify: terminal %s confirmed via rollout "
+                        "after pane hint during poll",
+                        self.terminal_id,
+                    )
+                    return
+            time.sleep(CODEX_ROLLOUT_POLL_INTERVAL_SECONDS)
+
+        # Rollout poll exhausted without confirmation. Check if stuck.
+        # Recovery Enter fires ONLY if pane shows a stuck owned chip AND
+        # a final rollout re-check still shows no match.
+        for attempt in range(1, CODEX_SUBMIT_VERIFY_MAX_RETRIES + 1):
+            if not _pane_shows_stuck_chip():
+                # No stuck chip visible — cannot recover with Enter. The task
+                # may have submitted but the rollout flush is slow, OR the pane
+                # is in an indeterminate state. Re-check rollout one more time.
+                logger.warning(
+                    "F435 submit-verify: terminal %s no stuck chip visible "
+                    "(attempt %d/%d); re-checking rollout",
+                    self.terminal_id,
+                    attempt,
+                    CODEX_SUBMIT_VERIFY_MAX_RETRIES,
+                )
+                time.sleep(CODEX_SUBMIT_VERIFY_BACKOFF_SECONDS * attempt)
+                if _rollout_confirms():
+                    logger.info(
+                        "F435 submit-verify: terminal %s confirmed via rollout "
+                        "after extended wait",
+                        self.terminal_id,
+                    )
+                    return
+                continue
+
+            # Stuck chip owned by this dispatch is visible. Before sending
+            # recovery Enter, MUST re-check rollout (closes double-send race:
+            # if the original submit landed between our last check and now,
+            # this re-check catches it and we skip the Enter).
+            if _rollout_confirms():
+                logger.info(
+                    "F435 submit-verify: terminal %s confirmed via rollout "
+                    "re-check before recovery Enter (race avoided)",
+                    self.terminal_id,
+                )
+                return
+
+            # Rollout still has no match AND pane shows stuck chip → re-Enter.
+            # B3 r7: NARROW THE TOCTOU — immediately before sending, re-read
+            # the pane and require the composer STILL shows the matching chip.
+            # This narrows the window between the rollout re-check above and
+            # the actual keystroke.
+            try:
+                pre_enter_pane = backend.get_history(
+                    session, window,
+                    tail_lines=PYTE_SCREEN_ROWS,
+                    strip_escapes=False,
+                )
+                if isinstance(pre_enter_pane, str):
+                    pre_enter_chip = self._active_composer_chip_count(pre_enter_pane)
+                    if pre_enter_chip is None or (
+                        own_chip_count is not None
+                        and abs(pre_enter_chip - own_chip_count) > 1
+                    ):
+                        # Chip gone between re-check and now — the submit may
+                        # have landed (TOCTOU race). Skip this Enter, re-poll.
+                        logger.info(
+                            "F435 submit-verify: terminal %s chip vanished on "
+                            "pre-Enter reread (TOCTOU avoided, attempt %d)",
+                            self.terminal_id,
+                            attempt,
+                        )
+                        time.sleep(CODEX_SUBMIT_VERIFY_BACKOFF_SECONDS * attempt)
+                        if _rollout_confirms():
+                            logger.info(
+                                "F435 submit-verify: terminal %s confirmed via "
+                                "rollout after chip-vanished reread",
+                                self.terminal_id,
+                            )
+                            return
+                        continue
+            except Exception:
+                pass  # If pane read fails, proceed with Enter (best effort)
+
+            logger.warning(
+                "F435 submit-verify: paste chip still drafted on terminal %s "
+                "(attempt %d/%d, rollout negative); re-sending Enter",
+                self.terminal_id,
+                attempt,
+                CODEX_SUBMIT_VERIFY_MAX_RETRIES,
+            )
+            try:
+                backend.send_special_key(session, window, "Enter")
+            except Exception as exc:
+                logger.warning(
+                    "F435 submit-verify: re-Enter failed for terminal %s: %s",
+                    self.terminal_id,
+                    exc,
+                )
+            # Wait for rollout to register the submission after recovery Enter
+            time.sleep(CODEX_SUBMIT_VERIFY_BACKOFF_SECONDS * attempt)
+            if _rollout_confirms():
+                # B3 r7: detect duplicate delivery. Count ALL matching events
+                # after baseline offset. If >1, a duplicate occurred (the
+                # original submit + our recovery Enter both landed). Log and
+                # surface the warning but return success (unsend is impossible).
+                # RESIDUAL WINDOW: between the final rollout re-check and the
+                # send_special_key call, the original submit may land. This
+                # detection catches it post-facto but cannot prevent it. The
+                # window is bounded by one pane-read + one key-send latency
+                # (typically <50ms on local tmux).
+                dup_count = self._count_rollout_matches(
+                    _ensure_rollout_path(), rollout_offset, message or ""
+                )
+                if dup_count > 1:
+                    logger.warning(
+                        "F435 submit-verify: DUPLICATE DELIVERY detected on "
+                        "terminal %s — %d matching post-cursor events "
+                        "(residual TOCTOU window); first confirmed, remainder "
+                        "is a duplicate that cannot be unsent",
+                        self.terminal_id,
+                        dup_count,
+                    )
+                logger.info(
+                    "F435 submit-verify: terminal %s submitted after %d "
+                    "re-Enter(s) (rollout confirmed)",
+                    self.terminal_id,
+                    attempt,
+                )
+                return
+
+        # All retries exhausted. Final rollout check.
+        if _rollout_confirms():
+            logger.info(
+                "F435 submit-verify: terminal %s confirmed via final rollout check",
+                self.terminal_id,
+            )
+            return
+
+        raise CodexSubmitStuckError(
+            f"Codex terminal {self.terminal_id} did not confirm submission of the "
+            f"pasted task after {CODEX_SUBMIT_VERIFY_MAX_RETRIES} recovery attempts; "
+            f"the rollout JSONL has no matching user-turn record after offset "
+            f"{rollout_offset}, so delivery is structurally unconfirmed"
+        )
 
     @staticmethod
     def _raw_after_prompt_glyph(raw_line: str) -> str:

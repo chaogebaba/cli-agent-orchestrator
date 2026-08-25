@@ -550,6 +550,55 @@ class BaseProvider(ABC):
         The default implementation is a no-op (always allows the paste).
         """
 
+    def capture_submission_baseline(
+        self,
+        metadata: dict[str, Any],
+        backend: Any,
+    ) -> Any:
+        """Provider hook called immediately BEFORE send_keys pastes a message.
+
+        Gives TUI providers a chance to snapshot a DISPATCH-RELATIVE baseline of
+        the pane (e.g. the set of submitted-user-turn fingerprints already
+        present) so ``verify_submission_after_send`` can confirm submission by a
+        NEW artifact absent from that baseline rather than by an absolute pane
+        pattern. See ``CodexProvider.capture_submission_baseline`` (F435 r5).
+
+        The default implementation returns ``None`` (no baseline). Providers
+        that ignore the baseline are unaffected; the codex verifier degrades to
+        indeterminate → bounded → defer when it receives ``None``.
+        """
+        return None
+
+    def verify_submission_after_send(
+        self,
+        metadata: dict[str, Any],
+        backend: Any,
+        message: str | None = None,
+        baseline: Any = None,
+    ) -> None:
+        """Provider hook called immediately after send_keys pastes+submits a message.
+
+        Gives TUI providers a chance to confirm the paste was actually SUBMITTED
+        (the submit Enter was not lost to a paste-vs-Enter render race) and to
+        recover by re-sending Enter when — and only when — a durable "still
+        drafted, not submitted" marker is observed on the pane. See
+        ``CodexProvider.verify_submission_after_send`` for the F435 recovery.
+
+        ``message`` is the exact task text that was pasted. ``baseline`` is the
+        opaque pre-send snapshot returned by ``capture_submission_baseline``.
+        TUI providers use them together to anchor confirmation on a
+        DISPATCH-RELATIVE boundary — a submitted user turn that is NEW relative
+        to the pre-send baseline — which excludes historical collisions by
+        construction (F435 r5). Both are optional so callers that cannot supply
+        them (and the no-op default) are unaffected.
+
+        The default implementation is a no-op: providers with no observed
+        submit race are unaffected. Implementations MUST be idempotent — they
+        must never blind-Enter a composer that already submitted, and should
+        raise a clear error naming the terminal if submission cannot be
+        confirmed after bounded retries.
+        """
+
     def _restore_dispatch_locked(self, snapshot: dict[str, float | bool]) -> None:
         self._task_dispatched = bool(snapshot["task_dispatched"])
         self._last_dispatch_time = float(snapshot["last_dispatch_time"])
