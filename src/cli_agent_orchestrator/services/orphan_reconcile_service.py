@@ -264,6 +264,19 @@ def scan_incarnation_processes(
                     # Process started before token was issued → cannot carry it
                     errors.append(f"predates_issuance:pid={pid}")
                     continue
+            # F465: Before failing closed, check if this process is NOT a
+            # descendant of the server. Incarnation tokens are inherited via
+            # env from the spawned tmux pane — only server descendants can
+            # carry them. User-session processes (systemd --user children,
+            # sd-pam, etc.) that are same-UID but not in the server's subtree
+            # are benign and must not cause scan_incomplete false-alarms.
+            try:
+                is_descendant = _is_descendant_of_server(pid)
+            except Exception:
+                is_descendant = True  # fail closed if ancestry walk fails
+            if not is_descendant:
+                errors.append(f"not_server_descendant:pid={pid}")
+                continue
             # Fall through: genuinely unreadable, fail closed
             complete = False
             errors.append(f"permission_denied_same_uid:pid={pid}")
@@ -319,6 +332,43 @@ def _is_server_or_ancestor(pid: int) -> bool:
             current = ppid
         except (OSError, ValueError, IndexError):
             break
+    return False
+
+
+def _is_descendant_of_server(pid: int) -> bool:
+    """F465: Check if pid is a descendant of the current server process.
+
+    Walks the parent chain of `pid` upward. Returns True if the server PID
+    is found in the ancestry before reaching PID 1. Only processes that are
+    descendants of the server can carry an incarnation token (inherited via
+    env from the spawned tmux pane).
+
+    Fails closed: if the parent chain cannot be fully walked (missing /proc
+    entries), returns True (assume potentially dangerous) to preserve
+    scan_incomplete semantics for unresolvable cases.
+    """
+    server_pid = os.getpid()
+    if pid == server_pid:
+        return False  # the server itself is not its own descendant
+    current = pid
+    visited: set[int] = set()
+    while current > 1:
+        if current in visited:
+            return True  # cycle → fail closed
+        visited.add(current)
+        try:
+            stat_data = (_PROC_ROOT / str(current) / "stat").read_text()
+            comm_end = stat_data.rfind(")")
+            if comm_end < 0:
+                return True  # unparseable → fail closed
+            fields = stat_data[comm_end + 2:].split()
+            ppid = int(fields[1])  # ppid is field index 1 after state
+        except (OSError, ValueError, IndexError):
+            return True  # unreadable → fail closed
+        if ppid == server_pid:
+            return True
+        current = ppid
+    # Reached PID 1 (init) without finding server → not a descendant
     return False
 
 
