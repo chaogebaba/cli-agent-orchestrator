@@ -44,10 +44,11 @@ class TmuxBackend(TerminalBackend):
         working_directory: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
         terminal_token: Optional[str] = None,
+        allowed_blocked_values: Optional[Dict[str, str]] = None,
     ) -> str:
         try:
             return self._client.create_session(
-                session_name, window_name, terminal_id, working_directory, extra_env=extra_env, terminal_token=terminal_token
+                session_name, window_name, terminal_id, working_directory, extra_env=extra_env, terminal_token=terminal_token, allowed_blocked_values=allowed_blocked_values
             )
         except Exception as e:
             raise TerminalBackendError(f"Failed to create session '{session_name}': {e}") from e
@@ -75,6 +76,7 @@ class TmuxBackend(TerminalBackend):
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
         terminal_token: Optional[str] = None,
+        allowed_blocked_values: Optional[Dict[str, str]] = None,
     ) -> str:
         try:
             return self._client.create_window(
@@ -85,6 +87,7 @@ class TmuxBackend(TerminalBackend):
                 window_shell,
                 extra_env=extra_env,
                 terminal_token=terminal_token,
+                allowed_blocked_values=allowed_blocked_values,
             )
         except Exception as e:
             raise TerminalBackendError(

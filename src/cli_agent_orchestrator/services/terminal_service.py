@@ -1590,6 +1590,17 @@ async def create_terminal(
             _created_session = False
             _created_window = False
             _created_window_name = window_name
+            # F450: Build the explicit allowed-values escape for blocked-prefix
+            # vars whose value originates from persona-context (bind_pane_identity
+            # injects CODEX_HOME from the persona plan into env_vars; the merge
+            # filter must accept that exact value without a global allowlist).
+            _allowed_blocked: dict[str, str] | None = None
+            if (
+                persona_plan is not None
+                and persona_plan.provider == "codex"
+                and persona_plan.codex_home is not None
+            ):
+                _allowed_blocked = {"CODEX_HOME": str(persona_plan.codex_home)}
             with session_lifecycle_lock(session_name):
                 if new_session:
                     # Prevent duplicate sessions
@@ -1609,6 +1620,7 @@ async def create_terminal(
                         resolved_working_directory,
                         extra_env=env_vars,
                         terminal_token=terminal_token,
+                        allowed_blocked_values=_allowed_blocked,
                     )
                     _created_session = True
                     _created_window = True
@@ -1638,6 +1650,7 @@ async def create_terminal(
                             resolved_working_directory,
                             extra_env=extra_env,
                             terminal_token=terminal_token,
+                            allowed_blocked_values=_allowed_blocked,
                         )
                     except Exception as exc:
                         if lease_token is not None:

@@ -330,6 +330,7 @@ class HerdrBackend(TerminalBackend):
         working_directory: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
         terminal_token: Optional[str] = None,
+        allowed_blocked_values: Optional[Dict[str, str]] = None,
     ) -> str:
         """Create a herdr workspace (= CAO session) with an initial tab."""
         import os
@@ -484,6 +485,7 @@ class HerdrBackend(TerminalBackend):
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
         terminal_token: Optional[str] = None,
+        allowed_blocked_values: Optional[Dict[str, str]] = None,
     ) -> str:
         """Create a new tab in the workspace."""
         import os

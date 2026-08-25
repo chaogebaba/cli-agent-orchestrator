@@ -21,17 +21,30 @@ from cli_agent_orchestrator.clients.tmux import TmuxClient
 
 
 class TestCodexHomeAllowlist:
-    """CODEX_HOME must pass through the blocked-prefix filter."""
+    """CODEX_HOME must pass through the blocked-prefix filter only with explicit escape."""
 
-    def test_codex_home_not_blocked(self):
-        assert TmuxClient._is_blocked_env_key("CODEX_HOME") is False
+    def test_codex_home_blocked_by_prefix(self):
+        """CODEX_HOME is blocked by the CODEX_ prefix — no wholesale allowlist."""
+        assert TmuxClient._is_blocked_env_key("CODEX_HOME") is True
 
-    def test_codex_home_passes_merge_extra_env(self):
+    def test_codex_home_passes_with_allowed_blocked_values(self):
+        """Persona-context CODEX_HOME passes when caller threads the value explicitly."""
+        persona_home = "/run/user/1000/cao-personas/abc/current/gen-1/codex-home"
+        env: dict[str, str] = {}
+        TmuxClient._merge_extra_env(
+            env,
+            {"CODEX_HOME": persona_home},
+            allowed_blocked_values={"CODEX_HOME": persona_home},
+        )
+        assert env["CODEX_HOME"] == persona_home
+
+    def test_codex_home_rejected_without_allowed_blocked_values(self):
+        """Without explicit escape, CODEX_HOME is dropped even with a valid-looking path."""
         env: dict[str, str] = {}
         TmuxClient._merge_extra_env(
             env, {"CODEX_HOME": "/run/user/1000/cao-personas/abc/current/gen-1/codex-home"}
         )
-        assert env["CODEX_HOME"] == "/run/user/1000/cao-personas/abc/current/gen-1/codex-home"
+        assert "CODEX_HOME" not in env
 
     def test_other_codex_prefixed_vars_still_blocked(self):
         """CODEX_TOKEN and similar must still be blocked."""
@@ -148,3 +161,38 @@ class TestValidateSessionArtifactWithPersonaHome:
         provider = CodexProvider("test1234", "sess", "win", "dev")
         with pytest.raises(RetryableArtifactValidation):
             provider.validate_session_artifact("01a03327-3263-76d3-80df-532ba0fd16dd", "/work")
+
+
+
+class TestCodexHomeArbitraryValueDropped:
+    """Regression: arbitrary CODEX_HOME (neither plane nor persona) must be dropped."""
+
+    def test_arbitrary_codex_home_dropped_no_escape(self):
+        """A random CODEX_HOME value with no allowed_blocked_values is dropped."""
+        env: dict[str, str] = {}
+        TmuxClient._merge_extra_env(env, {"CODEX_HOME": "/tmp/attacker/.codex"})
+        assert "CODEX_HOME" not in env
+
+    def test_arbitrary_codex_home_dropped_wrong_allowed_value(self):
+        """CODEX_HOME dropped when value doesn't match allowed_blocked_values."""
+        env: dict[str, str] = {}
+        TmuxClient._merge_extra_env(
+            env,
+            {"CODEX_HOME": "/tmp/attacker/.codex"},
+            allowed_blocked_values={"CODEX_HOME": "/legit/persona/codex-home"},
+        )
+        assert "CODEX_HOME" not in env
+
+    def test_arbitrary_codex_home_dropped_with_plane_mismatch(self, monkeypatch):
+        """CODEX_HOME dropped when value doesn't match plane environment either."""
+        from cli_agent_orchestrator.utils import provider_plane
+
+        monkeypatch.setenv("CAO_INSTANCE_ID", "deadbeef")
+        monkeypatch.setattr(
+            provider_plane,
+            "provider_plane_environment",
+            lambda: {"CODEX_HOME": "/sandbox/codex"},
+        )
+        env: dict[str, str] = {}
+        TmuxClient._merge_extra_env(env, {"CODEX_HOME": "/production/.codex"})
+        assert "CODEX_HOME" not in env

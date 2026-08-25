@@ -101,6 +101,7 @@ class TerminalBackend(ABC):
         working_directory: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
         terminal_token: Optional[str] = None,
+        allowed_blocked_values: Optional[Dict[str, str]] = None,
     ) -> str:
         """Create a new terminal session with an initial window.
 
@@ -242,6 +243,7 @@ class TerminalBackend(ABC):
         window_shell: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
         terminal_token: Optional[str] = None,
+        allowed_blocked_values: Optional[Dict[str, str]] = None,
     ) -> str:
         """Create a new window/tab in an existing session.
 
