@@ -185,6 +185,7 @@ from cli_agent_orchestrator.services.terminal_guard_service import (
 from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
     OutputMode,
+    TerminalCapExceeded,
     TerminalInputBlockedError,
 )
 from cli_agent_orchestrator.services.workflow_journal import (
@@ -2085,7 +2086,9 @@ async def ws_supervisor_doorbell(websocket: WebSocket, terminal_id: str):
     with _WSSessionLocal() as _ws_db:
         ok, _err_code = verify_sender_token(_ws_db, terminal_id, token)
     if not ok:
-        reason = "Terminal not found" if _err_code == "E-SENDER-UNKNOWN" else "Invalid terminal token"
+        reason = (
+            "Terminal not found" if _err_code == "E-SENDER-UNKNOWN" else "Invalid terminal token"
+        )
         code = 4404 if _err_code == "E-SENDER-UNKNOWN" else 4401
         await websocket.close(code=code, reason=reason)
         return
@@ -4148,6 +4151,12 @@ async def create_terminal_in_session(
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
+    except TerminalCapExceeded as e:
+        # F439 (#294): the worker-terminal cap refused BEFORE any resource was
+        # created. 409 Conflict with the structured E-TERMINAL-CAP detail (code,
+        # current_count, cap, reap_candidates) so the supervisor can reap-then-
+        # retry. No terminal row, no tmux window exists to unwind.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=e.detail())
     except KiroCapabilityError as e:
         # Subclasses ValueError, so must precede the generic arm below —
         # a capability rejection is a bad request, not a missing resource. Matches
@@ -5066,6 +5075,16 @@ async def run_step(
             status_code=code,
             detail={"message": str(e), "kind": e.kind, "terminal_id": e.terminal_id},
         )
+    except TerminalCapExceeded as e:
+        # F439 (#294): the worker-terminal cap refused this handoff BEFORE any
+        # terminal was created (mirrors the assign path). 409 with the same
+        # E-TERMINAL-CAP structured detail; kind="terminal_cap" keeps it
+        # distinguishable from the route's other 409s (diverged /
+        # decision_required / input). No terminal ran, so nothing is settled.
+        detail = e.detail()
+        detail["kind"] = "terminal_cap"
+        detail["terminal_id"] = None
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
     except (TimeoutError, TerminalInputBlockedError) as e:
         # TerminalInputBlockedError (PR #539) is kept a DISTINCT type from
         # TimeoutError rather than collapsed into it, because
@@ -7384,8 +7403,12 @@ async def delete_terminal(
         # D12: Typed, logged, structurally non-empty errors
         detail_str = str(e)
         code = detail_str if detail_str else "unknown_runtime_error"
-        if code in ("resume_in_progress", "rebind_in_progress",
-                    "cascade_quiesce_unstable", "cascade_outside_caller_subtree"):
+        if code in (
+            "resume_in_progress",
+            "rebind_in_progress",
+            "cascade_quiesce_unstable",
+            "cascade_outside_caller_subtree",
+        ):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=code,
@@ -7441,12 +7464,15 @@ async def create_inbox_message_endpoint(
     # F352: Sender-token enforcement. Skipped when CAO_SENDER_TOKEN_DISABLED
     # is set (test subprocess servers that cannot inject tokens into callers).
     _sender_token_disabled = os.environ.get("CAO_SENDER_TOKEN_DISABLED", "").strip().lower() in (
-        "1", "true", "yes",
+        "1",
+        "true",
+        "yes",
     )
 
     # If the caller presents a valid operator bearer (CAO_AUTH_LOCAL_TOKEN),
     # the terminal token check is bypassed — the operator is trusted.
     from cli_agent_orchestrator.security.auth import get_local_bearer
+
     operator_bearer = get_local_bearer()
     auth_header = request.headers.get("authorization", "")
     has_operator_bearer = (
@@ -7459,6 +7485,7 @@ async def create_inbox_message_endpoint(
         presented_token = request.headers.get("x-cao-terminal-token")
         with SessionLocal() as _f332_db:
             from cli_agent_orchestrator.services.terminal_token_service import verify_sender_token
+
             ok, error_code = verify_sender_token(_f332_db, sender_id, presented_token)
             if not ok:
                 logger.warning(
@@ -7499,10 +7526,9 @@ async def create_inbox_message_endpoint(
     sender_terminal = None
     try:
         from cli_agent_orchestrator.clients.database import SessionLocal as _f129_session
+
         with _f129_session() as _f129_db:
-            sender_terminal = (
-                _f129_db.query(TerminalModel).filter_by(id=sender_id).first()
-            )
+            sender_terminal = _f129_db.query(TerminalModel).filter_by(id=sender_id).first()
             if sender_terminal is not None:
                 from cli_agent_orchestrator.services.authority_pin_service import (
                     FrozenPinValidation,
@@ -7525,9 +7551,7 @@ async def create_inbox_message_endpoint(
                             },
                         }
                     # Check caller terminal still exists
-                    caller_terminal = (
-                        _f129_db.query(TerminalModel).filter_by(id=caller_id).first()
-                    )
+                    caller_terminal = _f129_db.query(TerminalModel).filter_by(id=caller_id).first()
                     if caller_terminal is None:
                         return {
                             "success": False,
@@ -7539,6 +7563,7 @@ async def create_inbox_message_endpoint(
                     # Dedup: check if drift notice already delivered
                     drift_sender_key = f"cao-system:drift:{sender_id}"
                     from cli_agent_orchestrator.clients.database import InboxModel as _f129_inbox
+
                     existing = (
                         _f129_db.query(_f129_inbox)
                         .filter(

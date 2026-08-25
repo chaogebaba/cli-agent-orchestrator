@@ -95,6 +95,43 @@ class TestLegacyMigration:
         assert ConfigService.get("terminal.backend") == "tmux"
 
 
+class TestWorkerTerminalCapConfig:
+    """F439 (#294): CAO_MAX_WORKER_TERMINALS > orchestrator.max_worker_terminals > 10."""
+
+    def test_default_is_ten(self, _isolated_settings):
+        assert ConfigService.get("orchestrator.max_worker_terminals", default=10) == 10
+
+    def test_file_value_beats_default(self, _isolated_settings):
+        _isolated_settings["settings"].write_text(
+            json.dumps({"orchestrator": {"max_worker_terminals": 5}})
+        )
+        assert ConfigService.get("orchestrator.max_worker_terminals", default=10) == 5
+
+    def test_env_beats_file(self, _isolated_settings, monkeypatch):
+        _isolated_settings["settings"].write_text(
+            json.dumps({"orchestrator": {"max_worker_terminals": 5}})
+        )
+        monkeypatch.setenv("CAO_MAX_WORKER_TERMINALS", "3")
+        assert ConfigService.get("orchestrator.max_worker_terminals", default=10) == 3
+
+    def test_env_beats_default_when_no_file(self, _isolated_settings, monkeypatch):
+        monkeypatch.setenv("CAO_MAX_WORKER_TERMINALS", "7")
+        assert ConfigService.get("orchestrator.max_worker_terminals", default=10) == 7
+
+    def test_zero_disables_via_env(self, _isolated_settings, monkeypatch):
+        monkeypatch.setenv("CAO_MAX_WORKER_TERMINALS", "0")
+        assert ConfigService.get("orchestrator.max_worker_terminals", default=10) == 0
+
+    def test_negative_disables_via_file(self, _isolated_settings):
+        _isolated_settings["settings"].write_text(
+            json.dumps({"orchestrator": {"max_worker_terminals": -1}})
+        )
+        assert ConfigService.get("orchestrator.max_worker_terminals", default=10) == -1
+
+    def test_path_is_in_list_all(self, _isolated_settings):
+        assert "orchestrator.max_worker_terminals" in ConfigService.list_all()
+
+
 class TestMemoryCompileModeConflict:
     """CAO_MEMORY_COMPILE_MODE must win over a conflicting settings.json value."""
 
