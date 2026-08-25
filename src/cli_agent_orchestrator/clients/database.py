@@ -38,7 +38,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import DeclarativeBase, Session, declarative_base, deferred, sessionmaker
-from sqlalchemy.orm.exc import ObjectDeletedError, DetachedInstanceError, StaleDataError
+from sqlalchemy.orm.exc import DetachedInstanceError, ObjectDeletedError, StaleDataError
 from tzlocal import get_localzone
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
@@ -296,6 +296,10 @@ class MailboxModel(Base):
     callback_notified_through_id = Column(Integer, nullable=True)
     cc_inbox_path = Column(String, nullable=True)
     cc_inbox_path_version = Column(Integer, nullable=False, default=0, server_default="0")
+    # F476: Wake recovery columns (D4)
+    wake_notified_at = Column(DateTime(timezone=True), nullable=True)
+    wake_streak = Column(Integer, nullable=False, default=0, server_default="0")
+    wake_notified_id = Column(Integer, nullable=False, default=0, server_default="0")
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow)
     __table_args__ = (UniqueConstraint("session_name", "role", name="uq_mailbox_session_role"),)
@@ -368,9 +372,7 @@ class InboxModel(Base):
     barrier_id = deferred(Column(Integer, nullable=True))
     barrier_member_key = deferred(Column(String, nullable=True))
     created_at = Column(DateTime(timezone=True), default=_utcnow)
-    __table_args__ = (
-        Index("ix_inbox_sender_receiver", "sender_id", "receiver_id"),
-    )
+    __table_args__ = (Index("ix_inbox_sender_receiver", "sender_id", "receiver_id"),)
 
 
 class CallbackBarrierModel(Base):
@@ -649,12 +651,14 @@ def _f413_after_insert(mapper: Any, connection: Any, target: Any) -> None:
     if sess is not None:
         stash = sess.info.setdefault(_F413_DOORBELL_STASH_KEY, [])
         preview = (target.message or "").split("\n", 1)[0]
-        stash.append((
-            target.receiver_id,
-            row_id,
-            (target.sender_id or "")[:8],
-            preview,
-        ))
+        stash.append(
+            (
+                target.receiver_id,
+                row_id,
+                (target.sender_id or "")[:8],
+                preview,
+            )
+        )
 
 
 def _f413_after_commit(session: Any) -> None:
@@ -1303,6 +1307,7 @@ def _ensure_db_dir() -> None:
 # Module-level singletons
 _ensure_db_dir()
 
+
 # ── F334 (#190): Production DB fence ──────────────────────────────────────────
 # If PYTEST_CURRENT_TEST is set (pytest injects this automatically), refuse to
 # bind the real production DATABASE_FILE unless explicitly overridden. This
@@ -1315,6 +1320,7 @@ def _fence_production_db() -> None:
     if os.environ.get("CAO_ALLOW_PROD_DB_IN_TESTS") == "1":
         return  # explicit override — operator knows what they're doing
     import pwd
+
     # Use the REAL user home from passwd (immune to HOME env override)
     real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     prod_db_dir = (real_home / ".aws" / "cli-agent-orchestrator" / "db").resolve()
@@ -1394,6 +1400,7 @@ def init_db() -> None:
     _migrate_f129_frozen_authority()
     _migrate_f127_resolved_model()
     _migrate_terminal_auth_token()
+    _migrate_f476_wake_recovery()
 
 
 def _migrate_f218_dead_supervisor_safety() -> None:
@@ -1455,12 +1462,16 @@ def _migrate_f218_dead_supervisor_safety() -> None:
                     server_boot_id TEXT
                 )
             """))
-            connection.execute(text(
-                "CREATE INDEX ix_tombstone_session ON pane_exit_tombstones(session_name, session_incarnation)"
-            ))
-            connection.execute(text(
-                "CREATE INDEX ix_tombstone_terminal ON pane_exit_tombstones(terminal_id, terminal_generation)"
-            ))
+            connection.execute(
+                text(
+                    "CREATE INDEX ix_tombstone_session ON pane_exit_tombstones(session_name, session_incarnation)"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE INDEX ix_tombstone_terminal ON pane_exit_tombstones(terminal_id, terminal_generation)"
+                )
+            )
 
         if "session_degradations" not in existing_tables:
             connection.execute(text("""
@@ -1534,19 +1545,19 @@ def _migrate_f129_frozen_authority() -> None:
         columns = [row[1] for row in result.fetchall()]
 
         if "frozen" not in columns:
-            connection.execute(text(
-                "ALTER TABLE authority_pin "
-                "ADD COLUMN frozen BOOLEAN NOT NULL DEFAULT 0"
-            ))
+            connection.execute(
+                text("ALTER TABLE authority_pin " "ADD COLUMN frozen BOOLEAN NOT NULL DEFAULT 0")
+            )
             # Existing rows receive frozen=0 (FALSE) via DEFAULT — they remain
             # mutable pins, preserving backward compatibility.
 
         # ── Step 2: Add covering index if missing ──
-        connection.execute(text(
-            "CREATE INDEX IF NOT EXISTS ix_inbox_sender_receiver "
-            "ON inbox (sender_id, receiver_id)"
-        ))
-
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_inbox_sender_receiver "
+                "ON inbox (sender_id, receiver_id)"
+            )
+        )
 
 
 def _migrate_f127_resolved_model() -> None:
@@ -1572,32 +1583,34 @@ def _migrate_terminal_auth_token() -> None:
 def _migrate_fx191_trace_extension() -> None:
     """FX191 D7: Add phase/decision/reason columns to inbox_message_trace_event."""
     with engine.begin() as connection:
-        columns = connection.execute(
-            text("PRAGMA table_info(inbox_message_trace_event)")
-        ).mappings().all()
+        columns = (
+            connection.execute(text("PRAGMA table_info(inbox_message_trace_event)"))
+            .mappings()
+            .all()
+        )
         col_names = {col["name"] for col in columns}
         if "phase" not in col_names:
-            connection.execute(
-                text("ALTER TABLE inbox_message_trace_event ADD COLUMN phase TEXT")
-            )
+            connection.execute(text("ALTER TABLE inbox_message_trace_event ADD COLUMN phase TEXT"))
         if "decision" not in col_names:
             connection.execute(
                 text("ALTER TABLE inbox_message_trace_event ADD COLUMN decision TEXT")
             )
         if "reason" not in col_names:
-            connection.execute(
-                text("ALTER TABLE inbox_message_trace_event ADD COLUMN reason TEXT")
-            )
+            connection.execute(text("ALTER TABLE inbox_message_trace_event ADD COLUMN reason TEXT"))
         # Add the partial index for fx191 phase/decision if not present
         indexes = connection.execute(
-            text("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='inbox_message_trace_event'")
+            text(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='inbox_message_trace_event'"
+            )
         ).fetchall()
         idx_names = {r[0] for r in indexes}
         if "ix_inbox_message_trace_event_fx191_phase_decision" not in idx_names:
-            connection.execute(text(
-                "CREATE INDEX ix_inbox_message_trace_event_fx191_phase_decision "
-                "ON inbox_message_trace_event(phase, decision) WHERE phase IS NOT NULL"
-            ))
+            connection.execute(
+                text(
+                    "CREATE INDEX ix_inbox_message_trace_event_fx191_phase_decision "
+                    "ON inbox_message_trace_event(phase, decision) WHERE phase IS NOT NULL"
+                )
+            )
 
 
 def _migrate_f175_dedup_columns() -> None:
@@ -1619,6 +1632,28 @@ def _migrate_f175_dedup_columns() -> None:
             )
 
 
+def _migrate_f476_wake_recovery() -> None:
+    """F476: Add wake recovery columns to mailboxes table (D4).
+
+    wake_notified_at: timestamp of last wake claim (lease).
+    wake_streak: consecutive re-wake count for the same high-water id.
+    wake_notified_id: the high-water id at last claim (lease pointer).
+    """
+    with engine.begin() as connection:
+        columns = connection.execute(text("PRAGMA table_info(mailboxes)")).mappings().all()
+        col_names = {col["name"] for col in columns}
+        if "wake_notified_at" not in col_names:
+            connection.execute(text("ALTER TABLE mailboxes ADD COLUMN wake_notified_at DATETIME"))
+        if "wake_streak" not in col_names:
+            connection.execute(
+                text("ALTER TABLE mailboxes ADD COLUMN wake_streak INTEGER NOT NULL DEFAULT 0")
+            )
+        if "wake_notified_id" not in col_names:
+            connection.execute(
+                text("ALTER TABLE mailboxes ADD COLUMN wake_notified_id INTEGER NOT NULL DEFAULT 0")
+            )
+
+
 def _migrate_f136_callback_delivery() -> None:
     """F136: Add callback cursor/path columns to mailboxes and replay queue table."""
     with engine.begin() as connection:
@@ -1630,9 +1665,7 @@ def _migrate_f136_callback_delivery() -> None:
                 text("ALTER TABLE mailboxes ADD COLUMN callback_notified_through_id INTEGER")
             )
         if "cc_inbox_path" not in col_names:
-            connection.execute(
-                text("ALTER TABLE mailboxes ADD COLUMN cc_inbox_path TEXT")
-            )
+            connection.execute(text("ALTER TABLE mailboxes ADD COLUMN cc_inbox_path TEXT"))
         if "cc_inbox_path_version" not in col_names:
             connection.execute(
                 text(
@@ -1641,7 +1674,9 @@ def _migrate_f136_callback_delivery() -> None:
             )
         # Replay queue table
         tables = connection.execute(
-            text("SELECT name FROM sqlite_master WHERE type='table' AND name='callback_replay_queue'")
+            text(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='callback_replay_queue'"
+            )
         ).fetchall()
         if not tables:
             connection.execute(
@@ -3332,9 +3367,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
         group = _json.loads(terminal.group) if terminal.group else None
         metadata = _json.loads(terminal.metadata_json) if terminal.metadata_json else None
         worktree_info_raw = (
-            _json.loads(terminal.worktree_info)
-            if isinstance(terminal.worktree_info, str)
-            else None
+            _json.loads(terminal.worktree_info) if isinstance(terminal.worktree_info, str) else None
         )
         result: Dict[str, Any] = {
             "id": terminal.id,
@@ -3487,53 +3520,8 @@ def read_terminal_system_metadata(terminal_id: str) -> Dict[str, Any]:
 
 # ---------------------------------------------------------------------------
 # F175: Dedicated dedup high-water accessors (clobber-proof)
+# F476 D5: Readers/writers REMOVED — columns kept for backward compat.
 # ---------------------------------------------------------------------------
-
-
-def get_terminal_last_notified_inbox_id(terminal_id: str) -> int:
-    """Read the dedicated last_notified_inbox_id column (0 if NULL/missing)."""
-    with SessionLocal() as db:
-        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
-        if terminal and terminal.last_notified_inbox_id is not None:
-            return int(terminal.last_notified_inbox_id)
-    return 0
-
-
-def set_terminal_last_notified_inbox_id(terminal_id: str, message_id: int) -> bool:
-    """Atomically set last_notified_inbox_id (monotonic — only advances)."""
-    with SessionLocal() as db:
-        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
-        if not terminal:
-            return False
-        current = terminal.last_notified_inbox_id or 0
-        if message_id > current:
-            terminal.last_notified_inbox_id = message_id
-            db.commit()
-            invalidate_terminal_metadata_cache(terminal_id)
-        return True
-
-
-def get_terminal_last_doorbell_row_id(terminal_id: str) -> int:
-    """Read the dedicated last_doorbell_row_id column (0 if NULL/missing)."""
-    with SessionLocal() as db:
-        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
-        if terminal and terminal.last_doorbell_row_id is not None:
-            return int(terminal.last_doorbell_row_id)
-    return 0
-
-
-def set_terminal_last_doorbell_row_id(terminal_id: str, row_id: int) -> bool:
-    """Atomically set last_doorbell_row_id (monotonic — only advances)."""
-    with SessionLocal() as db:
-        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
-        if not terminal:
-            return False
-        current = terminal.last_doorbell_row_id or 0
-        if row_id > current:
-            terminal.last_doorbell_row_id = row_id
-            db.commit()
-            invalidate_terminal_metadata_cache(terminal_id)
-        return True
 
 
 def set_terminal_worktree_info(terminal_id: str, info: Dict[str, str]) -> None:
@@ -3708,41 +3696,41 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
         results = []
         for t in terminals:
             try:
-                results.append({
-                    "id": t.id,
-                    "tmux_session": t.tmux_session,
-                    "tmux_window": t.tmux_window,
-                    "provider": t.provider,
-                    "agent_profile": t.agent_profile,
-                    "working_directory": t.working_directory,
-                    "allowed_tools": (
-                        __import__("json").loads(t.allowed_tools)
-                        if isinstance(t.allowed_tools, str) and t.allowed_tools
-                        else None
-                    ),
-                    "shell_command": t.shell_command,
-                    "caller_id": t.caller_id,
-                    "caller_mailbox_id": t.caller_mailbox_id,
-                    "lifecycle": t.lifecycle,
-                    "reparented_from": t.reparented_from,
-                    "provider_session_id": t.provider_session_id,
-                    "recovery_state": t.recovery_state,
-                    "recovery_error": t.recovery_error,
-                    "recovery_updated_at": t.recovery_updated_at,
-                    "fallback_terminal_id": t.fallback_terminal_id,
-                    "init_state": t.init_state,
-                    "init_started_at": t.init_started_at,
-                    "init_owner_epoch": t.init_owner_epoch,
-                    "init_failure_token": t.init_failure_token,
-                    "init_deadline_s": t.init_deadline_s,
-                    "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
-                    "last_active": t.last_active,
-                    "metadata": (
-                        __import__("json").loads(t.metadata_json)
-                        if t.metadata_json
-                        else None
-                    ),
-                })
+                results.append(
+                    {
+                        "id": t.id,
+                        "tmux_session": t.tmux_session,
+                        "tmux_window": t.tmux_window,
+                        "provider": t.provider,
+                        "agent_profile": t.agent_profile,
+                        "working_directory": t.working_directory,
+                        "allowed_tools": (
+                            __import__("json").loads(t.allowed_tools)
+                            if isinstance(t.allowed_tools, str) and t.allowed_tools
+                            else None
+                        ),
+                        "shell_command": t.shell_command,
+                        "caller_id": t.caller_id,
+                        "caller_mailbox_id": t.caller_mailbox_id,
+                        "lifecycle": t.lifecycle,
+                        "reparented_from": t.reparented_from,
+                        "provider_session_id": t.provider_session_id,
+                        "recovery_state": t.recovery_state,
+                        "recovery_error": t.recovery_error,
+                        "recovery_updated_at": t.recovery_updated_at,
+                        "fallback_terminal_id": t.fallback_terminal_id,
+                        "init_state": t.init_state,
+                        "init_started_at": t.init_started_at,
+                        "init_owner_epoch": t.init_owner_epoch,
+                        "init_failure_token": t.init_failure_token,
+                        "init_deadline_s": t.init_deadline_s,
+                        "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
+                        "last_active": t.last_active,
+                        "metadata": (
+                            __import__("json").loads(t.metadata_json) if t.metadata_json else None
+                        ),
+                    }
+                )
             except (ObjectDeletedError, DetachedInstanceError, StaleDataError) as exc:
                 # F264: skip stale/zombie rows whose attribute load raises
                 # ObjectDeletedError (or similar) instead of crashing the pass
@@ -3774,7 +3762,6 @@ def update_terminal_shell_command(terminal_id: str, shell_command: str) -> bool:
             invalidate_terminal_metadata_cache(terminal_id)
             return True
         return False
-
 
 
 def update_terminal_resolved_model(terminal_id: str, resolved_model: str) -> bool:
@@ -3903,8 +3890,8 @@ def _reactivate_parked_rows_in_db(
                 mailbox.updated_at = _utcnow()
             # Collect IDs before bulk update
             logical_ids = [
-                row_id for (row_id,) in
-                db.query(InboxModel.id)
+                row_id
+                for (row_id,) in db.query(InboxModel.id)
                 .filter(
                     InboxModel.status == MessageStatus.PARKED.value,
                     InboxModel.logical_receiver_id == incarnation.mailbox_id,
@@ -3925,8 +3912,8 @@ def _reactivate_parked_rows_in_db(
                 reactivated_ids.extend(logical_ids)
     # Also reactivate non-logical (direct) parked rows
     direct_ids = [
-        row_id for (row_id,) in
-        db.query(InboxModel.id)
+        row_id
+        for (row_id,) in db.query(InboxModel.id)
         .filter(
             InboxModel.status == MessageStatus.PARKED.value,
             InboxModel.logical_receiver_id.is_(None),
@@ -3992,7 +3979,9 @@ def settle_terminal_rebound(
                     cursor_val = int(mb.callback_notified_through_id)
                     below = [rid for rid in reactivated_ids if rid <= cursor_val]
                     if below:
-                        enqueue_callback_replay(db, mailbox_id=str(inc.mailbox_id), inbox_row_ids=below)
+                        enqueue_callback_replay(
+                            db, mailbox_id=str(inc.mailbox_id), inbox_row_ids=below
+                        )
         _f138_old_inc_id = _old_inc.id if _old_inc is not None else None
         _result_generation = int(row.lifecycle_generation)
     # F138: Queue reconciliation job for old incarnation after DB commit
@@ -4183,18 +4172,26 @@ def settle_terminal_fallback(old_terminal_id: str, new_terminal_id: str) -> int:
         changed += len(reactivated_ids)
         # F136-D3: enqueue replay for reactivated rows below cursor
         if reactivated_ids:
-            inc = db.query(MailboxIncarnationModel).filter_by(terminal_id=new_terminal_id).one_or_none()
+            inc = (
+                db.query(MailboxIncarnationModel)
+                .filter_by(terminal_id=new_terminal_id)
+                .one_or_none()
+            )
             if inc:
                 mb_row: Any = db.query(MailboxModel).filter_by(id=inc.mailbox_id).one_or_none()
                 if mb_row and mb_row.callback_notified_through_id is not None:
                     cursor_val = int(mb_row.callback_notified_through_id)
                     below = [rid for rid in reactivated_ids if rid <= cursor_val]
                     if below:
-                        enqueue_callback_replay(db, mailbox_id=str(inc.mailbox_id), inbox_row_ids=below)
+                        enqueue_callback_replay(
+                            db, mailbox_id=str(inc.mailbox_id), inbox_row_ids=below
+                        )
         # S4: query child IDs before bulk update so we can invalidate their caches
         child_ids = [
             row.id
-            for row in db.query(TerminalModel.id).filter(TerminalModel.caller_id == old_terminal_id).all()
+            for row in db.query(TerminalModel.id)
+            .filter(TerminalModel.caller_id == old_terminal_id)
+            .all()
         ]
         changed += (
             db.query(TerminalModel)
@@ -4512,9 +4509,9 @@ def delete_terminal_and_warm_intent(
                 row.enqueue_generation = target_generation or int(target.lifecycle_generation)
                 row.status = MessageStatus.PENDING.value
                 row.failure_reason = None
-                _reap_flipped_rows.append((
-                    MessageStatus.PENDING.value, int(row.id), target_mailbox_id
-                ))
+                _reap_flipped_rows.append(
+                    (MessageStatus.PENDING.value, int(row.id), target_mailbox_id)
+                )
         # F413 D7b: create obligations for flipped rows
         if _reap_flipped_rows:
             db.flush()
@@ -4533,10 +4530,12 @@ def delete_terminal_and_warm_intent(
             # F413 D7b: collect rows before bulk flip so we can create obligations
             _barrier_flip_rows = [
                 (MessageStatus.PENDING.value, int(r.id), r.logical_receiver_id)
-                for r in db.query(InboxModel).filter(
+                for r in db.query(InboxModel)
+                .filter(
                     InboxModel.barrier_id == barrier.id,
                     InboxModel.status == MessageStatus.HELD.value,
-                ).all()
+                )
+                .all()
             ]
             db.query(InboxModel).filter(
                 InboxModel.barrier_id == barrier.id,
@@ -4562,7 +4561,9 @@ def delete_terminal_and_warm_intent(
         # B3: query child IDs before bulk update so we can invalidate their caches
         child_ids = [
             row.id
-            for row in db.query(TerminalModel.id).filter(TerminalModel.caller_id == terminal_id).all()
+            for row in db.query(TerminalModel.id)
+            .filter(TerminalModel.caller_id == terminal_id)
+            .all()
         ]
         child_values = {
             TerminalModel.caller_id: target.id if target is not None else None,
@@ -5500,7 +5501,9 @@ def list_ready_backlog_observations() -> list[ReadyBacklogObservation]:
                 ReadyBacklogObservation(
                     receiver_id=receiver_id,
                     oldest_message_id=oldest.id,
-                    oldest_pending_age_seconds=max(0.0, (now - _as_utc(oldest.created_at)).total_seconds()),
+                    oldest_pending_age_seconds=max(
+                        0.0, (now - _as_utc(oldest.created_at)).total_seconds()
+                    ),
                     has_open_delivering_attempt=has_open,
                     attempt_fingerprint=(count, started, settled, last),
                 )
@@ -6374,10 +6377,12 @@ def cancel_callback_barrier(
         # F413 D7b: collect qualifying rows before bulk flip
         _cancel_flip_rows = [
             (MessageStatus.PENDING.value, int(r.id), r.logical_receiver_id)
-            for r in db.query(InboxModel).filter(
+            for r in db.query(InboxModel)
+            .filter(
                 InboxModel.barrier_id == barrier.id,
                 InboxModel.status == MessageStatus.HELD.value,
-            ).all()
+            )
+            .all()
         ]
         released = (
             db.query(InboxModel)
@@ -8339,8 +8344,7 @@ def _record_p5_orphan_notices(db: Any, rows: list[InboxModel]) -> tuple[int, int
                 receiver_id=notice_receiver,
                 logical_receiver_id=logical_receiver_id,
                 message=(
-                    header
-                    + f"[message-trace] delivery to terminal {receiver_id} failed "
+                    header + f"[message-trace] delivery to terminal {receiver_id} failed "
                     f"because the receiver terminal no longer exists for "
                     f"message(s) {ids}."
                 ),
@@ -8678,8 +8682,7 @@ def record_wpm1_stalled_notice(
                 sender_id=sender,
                 receiver_id=notice_receiver,
                 logical_receiver_id=logical_receiver_id,
-                message=header
-                + "delivery stalled: receiver shows no progress / payload not yet "
+                message=header + "delivery stalled: receiver shows no progress / payload not yet "
                 "confirmed; no reinjection will occur while unproven; will confirm "
                 "if consumed",
                 orchestration_type=OrchestrationType.SEND_MESSAGE,
@@ -8810,8 +8813,7 @@ def settle_wpm1_terminal_batch(
                             sender_id=sender,
                             receiver_id=notice_receiver,
                             logical_receiver_id=logical_receiver_id,
-                            message=corrective_header
-                            + "previously-stalled message was delivered",
+                            message=corrective_header + "previously-stalled message was delivered",
                             orchestration_type=OrchestrationType.SEND_MESSAGE,
                         )
                 else:
@@ -9206,7 +9208,11 @@ def get_supervisor_callback_batch(
                 .filter_by(id=mailbox_id)
                 .one_or_none()
             )
-            if _pre is not None and _pre.cc_inbox_path and _pre.callback_notified_through_id is not None:
+            if (
+                _pre is not None
+                and _pre.cc_inbox_path
+                and _pre.callback_notified_through_id is not None
+            ):
                 if _pre.current_terminal_id == terminal_id and int(_pre.generation) == generation:
                     _cursor_val = int(_pre.callback_notified_through_id)
                     _has_work = db.query(
@@ -9254,27 +9260,38 @@ def get_supervisor_callback_batch(
             mailbox: Any = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
             if mailbox is None:
                 return CallbackBatchResult(
-                    kind="stale_authority", rows=(), has_more=False,
-                    cursor=None, inbox_path=None, path_version=0,
-                    bootstrap_mode=None, reason="unknown_mailbox",
+                    kind="stale_authority",
+                    rows=(),
+                    has_more=False,
+                    cursor=None,
+                    inbox_path=None,
+                    path_version=0,
+                    bootstrap_mode=None,
+                    reason="unknown_mailbox",
                 )
-            if (
-                mailbox.current_terminal_id != terminal_id
-                or int(mailbox.generation) != generation
-            ):
+            if mailbox.current_terminal_id != terminal_id or int(mailbox.generation) != generation:
                 return CallbackBatchResult(
-                    kind="stale_authority", rows=(), has_more=False,
-                    cursor=None, inbox_path=None, path_version=0,
-                    bootstrap_mode=None, reason="terminal_or_generation_mismatch",
+                    kind="stale_authority",
+                    rows=(),
+                    has_more=False,
+                    cursor=None,
+                    inbox_path=None,
+                    path_version=0,
+                    bootstrap_mode=None,
+                    reason="terminal_or_generation_mismatch",
                 )
 
             inbox_path = mailbox.cc_inbox_path
             if not inbox_path:
                 return CallbackBatchResult(
-                    kind="no_path", rows=(), has_more=False,
+                    kind="no_path",
+                    rows=(),
+                    has_more=False,
                     cursor=mailbox.callback_notified_through_id,
-                    inbox_path=None, path_version=int(mailbox.cc_inbox_path_version),
-                    bootstrap_mode=None, reason="no_inbox_path_configured",
+                    inbox_path=None,
+                    path_version=int(mailbox.cc_inbox_path_version),
+                    bootstrap_mode=None,
+                    reason="no_inbox_path_configured",
                 )
 
             path_version = int(mailbox.cc_inbox_path_version)
@@ -9306,7 +9323,9 @@ def get_supervisor_callback_batch(
             # F157 hotfix: also respect consumed_through_id so acked messages
             # are never re-pushed by the callback runner.
             notified_cursor = mailbox.callback_notified_through_id
-            consumption_cursor = int(mailbox.consumed_through_id) if mailbox.consumed_through_id else 0
+            consumption_cursor = (
+                int(mailbox.consumed_through_id) if mailbox.consumed_through_id else 0
+            )
             cursor = notified_cursor
             if cursor is None:
                 min_id_row = (
@@ -9369,7 +9388,7 @@ def get_supervisor_callback_batch(
             ).fetchall()
 
             replay_batch: list[CallbackBatchRow] = []
-            for row in replay_rows_raw[: limit]:
+            for row in replay_rows_raw[:limit]:
                 replay_batch.append(
                     CallbackBatchRow(
                         inbox_row_id=int(row[0]),
@@ -9398,12 +9417,15 @@ def get_supervisor_callback_batch(
                         "LIMIT :lim"
                     ),
                     {
-                        "mb": mailbox_id, "tid": terminal_id,
-                        "gen": generation, "cursor": cursor, "lim": remaining + 1,
+                        "mb": mailbox_id,
+                        "tid": terminal_id,
+                        "gen": generation,
+                        "cursor": cursor,
+                        "lim": remaining + 1,
                     },
                 ).fetchall()
 
-                for row in forward_rows_raw[: remaining]:
+                for row in forward_rows_raw[:remaining]:
                     forward_batch.append(
                         CallbackBatchRow(
                             inbox_row_id=int(row[0]),
@@ -9430,9 +9452,14 @@ def get_supervisor_callback_batch(
     except OperationalError as exc:
         logger.warning("f136_callback_batch_db_error: %s", exc)
         return CallbackBatchResult(
-            kind="retryable_failure", rows=(), has_more=False,
-            cursor=None, inbox_path=None, path_version=0,
-            bootstrap_mode=None, reason=f"db_error: {exc}",
+            kind="retryable_failure",
+            rows=(),
+            has_more=False,
+            cursor=None,
+            inbox_path=None,
+            path_version=0,
+            bootstrap_mode=None,
+            reason=f"db_error: {exc}",
         )
 
 
@@ -9458,10 +9485,7 @@ def commit_supervisor_callback_progress(
             if mailbox is None:
                 return CallbackProgressResult(kind="stale_authority", reason="unknown_mailbox")
 
-            if (
-                mailbox.current_terminal_id != terminal_id
-                or int(mailbox.generation) != generation
-            ):
+            if mailbox.current_terminal_id != terminal_id or int(mailbox.generation) != generation:
                 return CallbackProgressResult(
                     kind="stale_authority", reason="terminal_or_generation_mismatch"
                 )
@@ -9481,7 +9505,9 @@ def commit_supervisor_callback_progress(
                     mailbox.callback_notified_through_id = new_cursor
                     mailbox.updated_at = _utcnow()
                     db.commit()
-                    return CallbackProgressResult(kind="advanced_monotonic", reason="cas_bypass_monotonic")
+                    return CallbackProgressResult(
+                        kind="advanced_monotonic", reason="cas_bypass_monotonic"
+                    )
                 return CallbackProgressResult(kind="cas_mismatch", reason="cursor_mismatch")
 
             # Advance cursor (equal is valid for replay-only progress)
@@ -9505,6 +9531,383 @@ def commit_supervisor_callback_progress(
     except OperationalError as exc:
         logger.warning("f136_callback_progress_db_error: %s", exc)
         return CallbackProgressResult(kind="retryable_failure", reason=f"db_error: {exc}")
+
+
+# --- F476: Single wake cursor (D1/D3/D4) -------------------------------------
+
+# Constants (matching f213's proven values)
+_WAKE_COOLDOWN_SECONDS = 300.0
+_WAKE_STREAK_CAP = 3
+
+
+@dataclass(frozen=True)
+class WakeClaimResult:
+    """Result of claim_unnotified_wake (D3)."""
+
+    kind: str
+    # "stale_authority", "authority_lock_contention", "wake_exhausted",
+    # "lease_held", "claimed"
+    rows: tuple[CallbackBatchRow, ...]
+    claimed_high_water: int
+    path_version: int
+    reason: str
+    exhausted_id: int | None = None  # only set when kind == "wake_exhausted"
+
+
+@dataclass(frozen=True)
+class WakeCommitResult:
+    """Result of commit_wake (D3)."""
+
+    kind: str
+    # "committed", "superseded_by_ack", "stale_authority", "path_changed",
+    # "lease_lost"
+    reason: str
+
+
+def claim_unnotified_wake(
+    *,
+    mailbox_id: str,
+    terminal_id: str,
+    generation: int,
+    limit: int = 50,
+) -> WakeClaimResult:
+    """D3/D4: Select wake-eligible rows and lease them.
+
+    Acquires the mailbox authority lock. Returns rows above
+    max(callback_notified_through_id, consumed_through_id) plus any
+    replay queue entries. Stamps the D4 lease (wake_notified_at/wake_notified_id)
+    WITHOUT advancing callback_notified_through_id.
+
+    Precedence: stale_authority → authority_lock_contention → wake_exhausted
+    → lease_held → claimed.
+    """
+    from cli_agent_orchestrator.services.mailbox_service import get_mailbox_authority_lock
+
+    # Resolve mailbox session/role for lock
+    with SessionLocal() as db:
+        mailbox: Any = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
+        if mailbox is None:
+            return WakeClaimResult(
+                kind="stale_authority",
+                rows=(),
+                claimed_high_water=0,
+                path_version=0,
+                reason="unknown_mailbox",
+            )
+        if mailbox.current_terminal_id != terminal_id or int(mailbox.generation) != generation:
+            return WakeClaimResult(
+                kind="stale_authority",
+                rows=(),
+                claimed_high_water=0,
+                path_version=0,
+                reason="terminal_or_generation_mismatch",
+            )
+        session_name = str(mailbox.session_name)
+        role = str(mailbox.role)
+
+    # D1: acquire authority lock with 0.5s timeout
+    lock = get_mailbox_authority_lock(session_name, role)
+    if not lock.acquire(timeout=0.5):
+        return WakeClaimResult(
+            kind="authority_lock_contention",
+            rows=(),
+            claimed_high_water=0,
+            path_version=0,
+            reason="authority_lock_contention",
+        )
+
+    try:
+        with SessionLocal() as db:
+            db.execute(text("BEGIN IMMEDIATE"))
+
+            # Re-validate authority under lock
+            mailbox = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
+            if mailbox is None:
+                return WakeClaimResult(
+                    kind="stale_authority",
+                    rows=(),
+                    claimed_high_water=0,
+                    path_version=0,
+                    reason="unknown_mailbox",
+                )
+            if mailbox.current_terminal_id != terminal_id or int(mailbox.generation) != generation:
+                return WakeClaimResult(
+                    kind="stale_authority",
+                    rows=(),
+                    claimed_high_water=0,
+                    path_version=0,
+                    reason="terminal_or_generation_mismatch",
+                )
+
+            path_version = int(mailbox.cc_inbox_path_version)
+            notified_cursor = int(mailbox.callback_notified_through_id or 0)
+            consumed_cursor = int(mailbox.consumed_through_id or 0)
+            effective_cursor = max(notified_cursor, consumed_cursor)
+
+            # D4: Read lease state
+            wake_notified_at = mailbox.wake_notified_at
+            wake_streak = int(mailbox.wake_streak or 0)
+            wake_notified_id = int(mailbox.wake_notified_id or 0)
+            now = _utcnow()
+
+            # Check wake_exhausted (before lease check per D4 precedence)
+            if wake_streak >= _WAKE_STREAK_CAP and wake_notified_id > 0:
+                # Exhaustion clears when consumed_through_id passes the stuck id
+                if wake_notified_id > consumed_cursor:
+                    db.commit()
+                    return WakeClaimResult(
+                        kind="wake_exhausted",
+                        rows=(),
+                        claimed_high_water=notified_cursor,
+                        path_version=path_version,
+                        reason="streak_cap_reached",
+                        exhausted_id=wake_notified_id,
+                    )
+
+            # D4: Lease visibility predicate
+            # Row is leased if: wake_notified_at is NOT NULL AND
+            # now - wake_notified_at <= 300s AND claimed_high_water <= wake_notified_id
+            lease_held = False
+            if wake_notified_at is not None:
+                _wake_ts = _as_utc(wake_notified_at)
+                elapsed = (now - _wake_ts).total_seconds() if _wake_ts else 999.0
+                if elapsed <= _WAKE_COOLDOWN_SECONDS:
+                    # Lease still valid — check if we can supersede
+                    lease_held = True
+
+            # Select replay rows
+            replay_rows_raw = db.execute(
+                text(
+                    "SELECT crq.inbox_row_id, i.sender_id, i.message, i.created_at "
+                    "FROM callback_replay_queue crq "
+                    "JOIN inbox i ON i.id = crq.inbox_row_id "
+                    "WHERE crq.mailbox_id = :mb "
+                    "  AND i.logical_receiver_id = :mb "
+                    "  AND i.receiver_id = :tid "
+                    "  AND i.enqueue_generation = :gen "
+                    "  AND i.status = 'pending' "
+                    "ORDER BY crq.inbox_row_id ASC "
+                    "LIMIT :lim"
+                ),
+                {"mb": mailbox_id, "tid": terminal_id, "gen": generation, "lim": limit},
+            ).fetchall()
+
+            replay_batch: list[CallbackBatchRow] = []
+            for row in replay_rows_raw:
+                replay_batch.append(
+                    CallbackBatchRow(
+                        inbox_row_id=int(row[0]),
+                        sender_id=str(row[1]),
+                        message=str(row[2]),
+                        created_at=row[3] if row[3] else now,
+                        tag="replay",
+                    )
+                )
+
+            # Select forward rows above effective cursor
+            remaining = limit - len(replay_batch)
+            forward_batch: list[CallbackBatchRow] = []
+            if remaining > 0:
+                forward_rows_raw = db.execute(
+                    text(
+                        "SELECT i.id, i.sender_id, i.message, i.created_at "
+                        "FROM inbox i "
+                        "WHERE i.logical_receiver_id = :mb "
+                        "  AND i.receiver_id = :tid "
+                        "  AND i.enqueue_generation = :gen "
+                        "  AND i.status = 'pending' "
+                        "  AND i.id > :cursor "
+                        "ORDER BY i.id ASC "
+                        "LIMIT :lim"
+                    ),
+                    {
+                        "mb": mailbox_id,
+                        "tid": terminal_id,
+                        "gen": generation,
+                        "cursor": effective_cursor,
+                        "lim": remaining,
+                    },
+                ).fetchall()
+
+                for row in forward_rows_raw:
+                    forward_batch.append(
+                        CallbackBatchRow(
+                            inbox_row_id=int(row[0]),
+                            sender_id=str(row[1]),
+                            message=str(row[2]),
+                            created_at=row[3] if row[3] else now,
+                            tag="forward",
+                        )
+                    )
+
+            all_rows = tuple(replay_batch + forward_batch)
+
+            # Compute claimed_high_water from forward rows only
+            if forward_batch:
+                claimed_high_water = max(r.inbox_row_id for r in forward_batch)
+            else:
+                claimed_high_water = notified_cursor
+
+            # D4 lease check: if lease held and no new forward rows supersede it
+            if lease_held and claimed_high_water <= wake_notified_id:
+                # D1 exception: replay rows are wake-eligible regardless
+                if not replay_batch:
+                    db.commit()
+                    return WakeClaimResult(
+                        kind="lease_held",
+                        rows=(),
+                        claimed_high_water=notified_cursor,
+                        path_version=path_version,
+                        reason="lease_active",
+                    )
+
+            # No rows at all → empty claim (still "claimed" kind)
+            if not all_rows:
+                db.commit()
+                return WakeClaimResult(
+                    kind="claimed",
+                    rows=(),
+                    claimed_high_water=notified_cursor,
+                    path_version=path_version,
+                    reason="empty",
+                )
+
+            # Stamp the lease (D4): wake_notified_at = now, wake_notified_id = claimed_high_water
+            mailbox.wake_notified_at = now
+            mailbox.wake_notified_id = claimed_high_water
+            mailbox.updated_at = now
+            db.commit()
+
+            return WakeClaimResult(
+                kind="claimed",
+                rows=all_rows,
+                claimed_high_water=claimed_high_water,
+                path_version=path_version,
+                reason="ok",
+            )
+    except OperationalError as exc:
+        logger.warning("f476_wake_claim_db_error: %s", exc)
+        return WakeClaimResult(
+            kind="authority_lock_contention",
+            rows=(),
+            claimed_high_water=0,
+            path_version=0,
+            reason=f"db_error: {exc}",
+        )
+    finally:
+        lock.release()
+
+
+def commit_wake(
+    *,
+    mailbox_id: str,
+    terminal_id: str,
+    generation: int,
+    through_id: int,
+    expected_path_version: int,
+    replay_row_ids: tuple[int, ...] = (),
+) -> WakeCommitResult:
+    """D3: Advance callback_notified_through_id and drain replay entries.
+
+    Must be called AFTER claim and BEFORE emit. Returns the commit verdict.
+    Runs under the mailbox authority lock (D1).
+    """
+    from cli_agent_orchestrator.services.mailbox_service import get_mailbox_authority_lock
+
+    # Resolve mailbox for lock
+    with SessionLocal() as db:
+        mailbox: Any = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
+        if mailbox is None:
+            return WakeCommitResult(kind="stale_authority", reason="unknown_mailbox")
+        if mailbox.current_terminal_id != terminal_id or int(mailbox.generation) != generation:
+            return WakeCommitResult(
+                kind="stale_authority", reason="terminal_or_generation_mismatch"
+            )
+        session_name = str(mailbox.session_name)
+        role = str(mailbox.role)
+
+    lock = get_mailbox_authority_lock(session_name, role)
+    if not lock.acquire(timeout=0.5):
+        return WakeCommitResult(kind="stale_authority", reason="authority_lock_contention")
+
+    try:
+        with SessionLocal() as db:
+            db.execute(text("BEGIN IMMEDIATE"))
+
+            mailbox = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
+            if mailbox is None:
+                return WakeCommitResult(kind="stale_authority", reason="unknown_mailbox")
+            if mailbox.current_terminal_id != terminal_id or int(mailbox.generation) != generation:
+                return WakeCommitResult(
+                    kind="stale_authority", reason="terminal_or_generation_mismatch"
+                )
+
+            # Path guard (D3)
+            if int(mailbox.cc_inbox_path_version) != expected_path_version:
+                return WakeCommitResult(kind="path_changed", reason="path_version_mismatch")
+
+            # D2: superseded_by_ack check (forward high-water only)
+            current_cursor = int(mailbox.callback_notified_through_id or 0)
+            consumed_cursor = int(mailbox.consumed_through_id or 0)
+
+            if through_id > current_cursor and through_id <= consumed_cursor:
+                # Forward high-water already acked — superseded
+                db.commit()
+                return WakeCommitResult(kind="superseded_by_ack", reason="forward_already_consumed")
+
+            # Replay-only commit: through_id == current_cursor, non-empty replay_row_ids
+            # is never superseded (its rows are pending by construction).
+
+            # Lease check: verify the lease is still ours
+            wake_notified_id = int(mailbox.wake_notified_id or 0)
+            wake_notified_at = mailbox.wake_notified_at
+            if wake_notified_at is None and through_id > current_cursor:
+                # Another commit already cleared the lease
+                return WakeCommitResult(kind="lease_lost", reason="lease_already_cleared")
+            if wake_notified_id != 0 and through_id > current_cursor:
+                # Check claimed_high_water matches our claim
+                if wake_notified_id > through_id:
+                    # A newer claimant took the lease
+                    return WakeCommitResult(kind="lease_lost", reason="newer_claimant")
+
+            now = _utcnow()
+
+            # Advance cursor
+            if through_id > current_cursor:
+                mailbox.callback_notified_through_id = through_id
+
+                # D4: streak management
+                # Reset streak when through_id exceeds previously committed wake_notified_id
+                if through_id > wake_notified_id:
+                    mailbox.wake_streak = 0
+                else:
+                    mailbox.wake_streak = int(mailbox.wake_streak or 0) + 1
+            elif replay_row_ids:
+                # Replay-only: increment streak (same high-water)
+                mailbox.wake_streak = int(mailbox.wake_streak or 0) + 1
+
+            # Clear the lease
+            mailbox.wake_notified_at = None
+            mailbox.updated_at = now
+
+            # Drain replay entries
+            if replay_row_ids:
+                for rid in replay_row_ids:
+                    db.execute(
+                        text(
+                            "DELETE FROM callback_replay_queue "
+                            "WHERE mailbox_id = :mb AND inbox_row_id = :rid"
+                        ),
+                        {"mb": mailbox_id, "rid": rid},
+                    )
+
+            db.commit()
+            return WakeCommitResult(kind="committed", reason="ok")
+    except OperationalError as exc:
+        logger.warning("f476_wake_commit_db_error: %s", exc)
+        return WakeCommitResult(kind="stale_authority", reason=f"db_error: {exc}")
+    finally:
+        lock.release()
 
 
 # --- F138: Orphan reconciliation migration and DB helpers ---------------------
@@ -9574,9 +9977,7 @@ def _migrate_f138_issuance_context(connection) -> None:
     """D17: Add issuance_ticks and issuance_boot_id to process_incarnations if missing."""
     existing_cols = {
         row[1]
-        for row in connection.execute(
-            text("PRAGMA table_info('process_incarnations')")
-        ).fetchall()
+        for row in connection.execute(text("PRAGMA table_info('process_incarnations')")).fetchall()
     }
     if "issuance_ticks" not in existing_cols:
         connection.execute(
@@ -9592,9 +9993,7 @@ def _migrate_f166_notify_count(connection) -> None:
     """F166 D7: Add notify_count to orphan_reconcile_jobs if missing (idempotent)."""
     existing_cols = {
         row[1]
-        for row in connection.execute(
-            text("PRAGMA table_info('orphan_reconcile_jobs')")
-        ).fetchall()
+        for row in connection.execute(text("PRAGMA table_info('orphan_reconcile_jobs')")).fetchall()
     }
     if "notify_count" not in existing_cols:
         connection.execute(
@@ -9659,20 +10058,15 @@ def f138_record_liveness_observation(
     )
 
 
-def f138_request_reconciliation(
-    *, incarnation_id: str, source: str
-) -> "JobRequestResult":
+def f138_request_reconciliation(*, incarnation_id: str, source: str) -> "JobRequestResult":
     """Insert a unique reconciliation job for an incarnation."""
     import uuid as _uuid
+
     from cli_agent_orchestrator.services.orphan_reconcile_service import JobRequestResult
 
     now = _utcnow()
     with SessionLocal.begin() as db:
-        inc = (
-            db.query(ProcessIncarnationModel)
-            .filter_by(id=incarnation_id)
-            .one_or_none()
-        )
+        inc = db.query(ProcessIncarnationModel).filter_by(id=incarnation_id).one_or_none()
         if inc is None:
             return JobRequestResult(created=False, job_id=None, detail="incarnation_not_found")
         if inc.state not in ("active", "reconcile_pending"):
@@ -9682,14 +10076,10 @@ def f138_request_reconciliation(
 
         # Check if job already exists
         existing = (
-            db.query(OrphanReconcileJobModel)
-            .filter_by(incarnation_id=incarnation_id)
-            .one_or_none()
+            db.query(OrphanReconcileJobModel).filter_by(incarnation_id=incarnation_id).one_or_none()
         )
         if existing is not None:
-            return JobRequestResult(
-                created=False, job_id=existing.id, detail="job_already_exists"
-            )
+            return JobRequestResult(created=False, job_id=existing.id, detail="job_already_exists")
 
         # Mark incarnation reconcile_pending
         if inc.state == "active":
@@ -9752,11 +10142,7 @@ def f138_claim_jobs(*, limit: int, lease_duration_s: float) -> list[dict[str, st
 def f138_get_incarnation_for_job(incarnation_id: str) -> dict[str, Any] | None:
     """Fetch incarnation data needed for reconciliation."""
     with SessionLocal() as db:
-        inc = (
-            db.query(ProcessIncarnationModel)
-            .filter_by(id=incarnation_id)
-            .one_or_none()
-        )
+        inc = db.query(ProcessIncarnationModel).filter_by(id=incarnation_id).one_or_none()
         if inc is None:
             return None
         return {
@@ -9841,11 +10227,7 @@ def f138_mark_incarnation_reconciled(incarnation_id: str) -> None:
     """Mark incarnation state as reconciled."""
     now = _utcnow()
     with SessionLocal.begin() as db:
-        inc = (
-            db.query(ProcessIncarnationModel)
-            .filter_by(id=incarnation_id)
-            .one_or_none()
-        )
+        inc = db.query(ProcessIncarnationModel).filter_by(id=incarnation_id).one_or_none()
         if inc is not None:
             inc.state = "reconciled"
             inc.reconciled_at = now
@@ -9874,6 +10256,7 @@ def f138_startup_recovery() -> None:
 
         # Sweep stale 'launching' incarnations
         import datetime as _dt
+
         from cli_agent_orchestrator.services.orphan_reconcile_service import (
             INCARNATION_LAUNCH_STALE_SECONDS,
         )
@@ -9892,17 +10275,11 @@ def f138_startup_recovery() -> None:
             from cli_agent_orchestrator.backends.registry import get_backend
 
             try:
-                metadata = (
-                    db.query(TerminalModel)
-                    .filter_by(id=inc.terminal_id)
-                    .one_or_none()
-                )
+                metadata = db.query(TerminalModel).filter_by(id=inc.terminal_id).one_or_none()
                 if metadata is None:
                     # D24: missing terminal row is NOT proof of safe abandon —
                     # force-queue for post-transaction reconciliation instead.
-                    _force_queue_ids.append(
-                        (inc.id, "startup_stale_missing_terminal")
-                    )
+                    _force_queue_ids.append((inc.id, "startup_stale_missing_terminal"))
                     logger.info(
                         "f138_startup_stale_missing_terminal incarnation=%s terminal=%s",
                         inc.id,
@@ -9941,9 +10318,7 @@ def f138_startup_recovery() -> None:
                 )
         except Exception:
             # DB error propagates as warning — no teardown authority granted
-            logger.warning(
-                "f138_startup_force_queue_failed incarnation=%s", inc_id, exc_info=True
-            )
+            logger.warning("f138_startup_force_queue_failed incarnation=%s", inc_id, exc_info=True)
 
 
 # --- F138 incarnation reservation/activation helpers --------------------------
@@ -10007,11 +10382,7 @@ def f138_abandon_incarnation(incarnation_id: str) -> None:
     """Mark incarnation as abandoned (launch failure)."""
     now = _utcnow()
     with SessionLocal.begin() as db:
-        inc = (
-            db.query(ProcessIncarnationModel)
-            .filter_by(id=incarnation_id)
-            .one_or_none()
-        )
+        inc = db.query(ProcessIncarnationModel).filter_by(id=incarnation_id).one_or_none()
         if inc is not None and inc.state == "launching":
             inc.state = "abandoned"
             inc.reconciled_at = now
@@ -10040,11 +10411,7 @@ def f138_update_incarnation_pane(
 ) -> None:
     """Update diagnostic pane PID/start ticks after window creation."""
     with SessionLocal.begin() as db:
-        inc = (
-            db.query(ProcessIncarnationModel)
-            .filter_by(id=incarnation_id)
-            .one_or_none()
-        )
+        inc = db.query(ProcessIncarnationModel).filter_by(id=incarnation_id).one_or_none()
         if inc is not None:
             inc.pane_pid = pane_pid
             inc.pane_start_ticks = pane_start_ticks
@@ -10071,11 +10438,7 @@ def f138_strict_activate(incarnation_id: str) -> ActivationResult:
     """
     now = _utcnow()
     with SessionLocal.begin() as db:
-        inc = (
-            db.query(ProcessIncarnationModel)
-            .filter_by(id=incarnation_id)
-            .one_or_none()
-        )
+        inc = db.query(ProcessIncarnationModel).filter_by(id=incarnation_id).one_or_none()
         if inc is None:
             return ActivationResult(outcome="missing")
         if inc.state == "active":
@@ -10118,11 +10481,7 @@ def f138_force_reconcile_incarnation(incarnation_id: str, source: str) -> ForceR
     result: ForceReconcileResult
 
     with SessionLocal.begin() as db:
-        inc = (
-            db.query(ProcessIncarnationModel)
-            .filter_by(id=incarnation_id)
-            .one_or_none()
-        )
+        inc = db.query(ProcessIncarnationModel).filter_by(id=incarnation_id).one_or_none()
         if inc is None:
             return ForceReconcileResult(
                 outcome="non_durable_missing",
@@ -10131,9 +10490,7 @@ def f138_force_reconcile_incarnation(incarnation_id: str, source: str) -> ForceR
 
         # Check existing job first (needed for reconciled-row classification)
         existing = (
-            db.query(OrphanReconcileJobModel)
-            .filter_by(incarnation_id=incarnation_id)
-            .one_or_none()
+            db.query(OrphanReconcileJobModel).filter_by(incarnation_id=incarnation_id).one_or_none()
         )
 
         # Already fully reconciled — but only proven if succeeded job exists
@@ -10268,9 +10625,7 @@ def f138_emit_attention_message(
         create_inbox_message(terminal_id, supervisor_id, message)
         return True
     except Exception:
-        logger.warning(
-            "f138_attention_failed terminal=%s", terminal_id, exc_info=True
-        )
+        logger.warning("f138_attention_failed terminal=%s", terminal_id, exc_info=True)
         return False
 
 

@@ -6,19 +6,22 @@ Single dedup cursor, never double-ring, never fail silent.
 
 fx168 D1-D13 retained for the fallback path (pane nudge through the gate wall).
 fx170 D1-D11: socket write to CC's per-session UDS, no pane touch.
+
+F476 D8: The doorbell is a transport of path 2, not an independent waker.
+It fires only from the push cycle's max_written_row_id and inherits path 2's
+D3 claim. Its private cursor is removed; the F457
+still-pending check stays (consumed-check, not a wake cursor).
 """
 
 from __future__ import annotations
 
 import logging
-import time
 import threading
+import time
 from typing import Optional
 
 from cli_agent_orchestrator.clients.database import (
-    get_terminal_last_doorbell_row_id,
     get_terminal_metadata,
-    set_terminal_last_doorbell_row_id,
 )
 from cli_agent_orchestrator.services.config_service import ConfigService
 
@@ -27,35 +30,9 @@ logger = logging.getLogger(__name__)
 # D6-as-amended (S1 fold): channel-neutral instruction that provokes a tool call.
 DOORBELL_NUDGE_TEXT = "[cao] You have new callback message(s). Run any command to surface them."
 
-# In-process fallback for last_doorbell_row_id (D4).
-_last_doorbell_row_id: dict[str, int] = {}
-_last_doorbell_lock = threading.Lock()
-
 # D12: rate-limited WARN — one per terminal per 60s.
 _last_warn_time: dict[str, float] = {}
 _WARN_INTERVAL_S = 60.0
-
-
-def _get_last_doorbell_row_id(terminal_id: str) -> int:
-    """Read last_doorbell_row_id from dedicated DB column (F175: clobber-proof)."""
-    try:
-        stored = get_terminal_last_doorbell_row_id(terminal_id)
-        if stored > 0:
-            return stored
-    except Exception:
-        pass
-    with _last_doorbell_lock:
-        return _last_doorbell_row_id.get(terminal_id, 0)
-
-
-def _persist_last_doorbell_row_id(terminal_id: str, row_id: int) -> None:
-    """Persist last_doorbell_row_id in dedicated DB column (F175: clobber-proof)."""
-    with _last_doorbell_lock:
-        _last_doorbell_row_id[terminal_id] = row_id
-    try:
-        set_terminal_last_doorbell_row_id(terminal_id, row_id)
-    except Exception as e:
-        logger.debug("f168_doorbell persist failed for %s: %s", terminal_id, e)
 
 
 def _rate_limited_warn(terminal_id: str, reason: str, row_id: int) -> None:
@@ -67,7 +44,9 @@ def _rate_limited_warn(terminal_id: str, reason: str, row_id: int) -> None:
     _last_warn_time[terminal_id] = now
     logger.warning(
         "f168_doorbell terminal=%s decision=error reason=%s row=%s",
-        terminal_id, reason, row_id,
+        terminal_id,
+        reason,
+        row_id,
     )
 
 
@@ -83,11 +62,7 @@ def _is_row_still_pending(row_id: int) -> bool:
         from cli_agent_orchestrator.models.inbox import MessageStatus
 
         with SessionLocal() as db:
-            status = (
-                db.query(InboxModel.status)
-                .filter(InboxModel.id == row_id)
-                .scalar()
-            )
+            status = db.query(InboxModel.status).filter(InboxModel.id == row_id).scalar()
             if status is None:
                 return False
             return status == MessageStatus.PENDING.value
@@ -104,17 +79,22 @@ def _mark_socket_delivered(row_id: int) -> None:
     skip re-injecting them as a duplicate digest.
     """
     try:
-        from cli_agent_orchestrator.clients.database import SessionLocal, InboxMessageTraceEventModel
+        from cli_agent_orchestrator.clients.database import (
+            InboxMessageTraceEventModel,
+            SessionLocal,
+        )
 
         with SessionLocal() as db:
-            db.add(InboxMessageTraceEventModel(
-                message_id=row_id,
-                kind="f459.socket_delivered",
-                phase="socket_delivered",
-                decision="proceed",
-                reason=None,
-                payload={},
-            ))
+            db.add(
+                InboxMessageTraceEventModel(
+                    message_id=row_id,
+                    kind="f459.socket_delivered",
+                    phase="socket_delivered",
+                    decision="proceed",
+                    reason=None,
+                    payload={},
+                )
+            )
             db.commit()
     except Exception:
         logger.debug("f459 mark_socket_delivered failed for row %s", row_id, exc_info=True)
@@ -126,7 +106,10 @@ def is_socket_delivered(row_id: int) -> bool:
     Used by the drain hook to suppress duplicate surfaces.
     """
     try:
-        from cli_agent_orchestrator.clients.database import SessionLocal, InboxMessageTraceEventModel
+        from cli_agent_orchestrator.clients.database import (
+            InboxMessageTraceEventModel,
+            SessionLocal,
+        )
 
         with SessionLocal() as db:
             exists = (
@@ -165,23 +148,18 @@ def ring_supervisor_doorbell(
     if not ConfigService.get("supervisor.doorbell", default=True):
         logger.info(
             "f170_doorbell terminal=%s decision=skipped_disabled reason=flag_off row=%s",
-            terminal_id, max_written_row_id,
+            terminal_id,
+            max_written_row_id,
         )
         return "skipped_disabled"
 
-    # D4: cursor dedup — skip if already rang for this or higher row.
+    # F476 D8: No cursor dedup — doorbell is a transport of path 2's claim.
+    # Only skip if nothing was written this cycle.
     if written_count <= 0:
         logger.info(
             "f170_doorbell terminal=%s decision=skipped_dedup reason=no_written row=%s",
-            terminal_id, max_written_row_id,
-        )
-        return "skipped_dedup"
-
-    last_row = _get_last_doorbell_row_id(terminal_id)
-    if max_written_row_id <= last_row:
-        logger.info(
-            "f170_doorbell terminal=%s decision=skipped_dedup reason=row_not_higher row=%s",
-            terminal_id, max_written_row_id,
+            terminal_id,
+            max_written_row_id,
         )
         return "skipped_dedup"
 
@@ -189,7 +167,8 @@ def ring_supervisor_doorbell(
     if not _is_row_still_pending(max_written_row_id):
         logger.info(
             "f170_doorbell terminal=%s decision=skipped_acked reason=row_not_pending row=%s",
-            terminal_id, max_written_row_id,
+            terminal_id,
+            max_written_row_id,
         )
         return "skipped_acked"
 
@@ -198,7 +177,8 @@ def ring_supervisor_doorbell(
     if native_enabled:
         try:
             decision = _attempt_native_ring(
-                terminal_id, max_written_row_id,
+                terminal_id,
+                max_written_row_id,
                 message_body=message_body,
                 sender_display_name=sender_display_name,
             )
@@ -207,7 +187,6 @@ def ring_supervisor_doorbell(
             decision = None
 
         if decision == "rang":
-            _persist_last_doorbell_row_id(terminal_id, max_written_row_id)
             # F459: mark row as socket-delivered (best-effort)
             if message_body is not None:
                 try:
@@ -230,19 +209,22 @@ def ring_supervisor_doorbell(
         from cli_agent_orchestrator.services.transport_ejection import (
             transport_ejection_service,
         )
+
         transport_ejection_service.record_refusal(
             terminal_id, "fallback", "not_registered_fallback"
         )
         logger.info(
             "f170_doorbell terminal=%s decision=skipped_disabled "
             "reason=not_registered_fallback row=%s",
-            terminal_id, max_written_row_id,
+            terminal_id,
+            max_written_row_id,
         )
         return "skipped_disabled"
 
     try:
         fallback_decision = _attempt_gated_ring(
-            terminal_id, max_written_row_id,
+            terminal_id,
+            max_written_row_id,
             caller_holds_no_delivery_lock=caller_holds_no_delivery_lock,
         )
     except Exception as exc:
@@ -250,19 +232,20 @@ def ring_supervisor_doorbell(
         return "error"
 
     if fallback_decision == "rang":
-        _persist_last_doorbell_row_id(terminal_id, max_written_row_id)
         if native_refusal is not None:
             # Native was attempted but failed — this is a true fallback
             logger.info(
-                "f170_doorbell terminal=%s decision=fallback transport=nudge "
-                "reason=%s row=%s",
-                terminal_id, native_refusal, max_written_row_id,
+                "f170_doorbell terminal=%s decision=fallback transport=nudge " "reason=%s row=%s",
+                terminal_id,
+                native_refusal,
+                max_written_row_id,
             )
             return "fallback"
         # Native was disabled — gated ring is the primary path
         logger.info(
             "f170_doorbell terminal=%s decision=rang transport=nudge reason=native_disabled row=%s",
-            terminal_id, max_written_row_id,
+            terminal_id,
+            max_written_row_id,
         )
         return "rang"
 
@@ -305,9 +288,10 @@ def _attempt_native_ring(
     result: ResolveResult = resolve_target(terminal_id, tmux_session, tmux_window)
     if result.refusal_reason:
         logger.info(
-            "f170_doorbell terminal=%s decision=fallback transport=socket "
-            "reason=%s row=%s",
-            terminal_id, result.refusal_reason, max_written_row_id,
+            "f170_doorbell terminal=%s decision=fallback transport=socket " "reason=%s row=%s",
+            terminal_id,
+            result.refusal_reason,
+            max_written_row_id,
         )
         return result.refusal_reason
 
@@ -320,14 +304,18 @@ def _attempt_native_ring(
         logger.info(
             "f170_doorbell terminal=%s decision=fallback transport=socket "
             "reason=%s ver=%s row=%s",
-            terminal_id, ver_refusal, record.version, max_written_row_id,
+            terminal_id,
+            ver_refusal,
+            record.version,
+            max_written_row_id,
         )
         return ver_refusal
 
     # D5: build payload
     # F459: pass message_body and sender_display_name for payload-carrying wake
     payload = build_wake_payload(
-        terminal_id, max_written_row_id,
+        terminal_id,
+        max_written_row_id,
         message_body=message_body,
         sender_display_name=sender_display_name,
     )
@@ -341,7 +329,10 @@ def _attempt_native_ring(
         logger.info(
             "f170_doorbell terminal=%s decision=fallback transport=socket "
             "reason=socket_unpublished pid=%s ver=%s row=%s",
-            terminal_id, record.pid, record.version, max_written_row_id,
+            terminal_id,
+            record.pid,
+            record.version,
+            max_written_row_id,
         )
         return "socket_unpublished"
 
@@ -351,7 +342,11 @@ def _attempt_native_ring(
         logger.info(
             "f170_doorbell terminal=%s decision=fallback transport=socket "
             "reason=%s pid=%s ver=%s row=%s",
-            terminal_id, write_err, record.pid, record.version, max_written_row_id,
+            terminal_id,
+            write_err,
+            record.pid,
+            record.version,
+            max_written_row_id,
         )
         return write_err
 
@@ -361,20 +356,27 @@ def _attempt_native_ring(
         logger.info(
             "f170_doorbell terminal=%s decision=fallback transport=socket "
             "reason=wake_unverified pid=%s ver=%s row=%s",
-            terminal_id, record.pid, record.version, max_written_row_id,
+            terminal_id,
+            record.pid,
+            record.version,
+            max_written_row_id,
         )
         return "wake_unverified"
 
     # Success
     logger.info(
-        "f170_doorbell terminal=%s decision=rang transport=socket "
-        "pid=%s ver=%s row=%s",
-        terminal_id, record.pid, record.version, max_written_row_id,
+        "f170_doorbell terminal=%s decision=rang transport=socket " "pid=%s ver=%s row=%s",
+        terminal_id,
+        record.pid,
+        record.version,
+        max_written_row_id,
     )
     return "rang"
 
 
-def _attempt_gated_ring(terminal_id: str, max_written_row_id: int, *, caller_holds_no_delivery_lock: bool = False) -> str:
+def _attempt_gated_ring(
+    terminal_id: str, max_written_row_id: int, *, caller_holds_no_delivery_lock: bool = False
+) -> str:
     """Run through the gate wall and ring if safe.
 
     D13: G1 (delivery_lock) and G2 (recovery_state) exclude the rebind window.
@@ -384,13 +386,13 @@ def _attempt_gated_ring(terminal_id: str, max_written_row_id: int, *, caller_hol
     is provably outside the delivery-lock scope so the rebind-exclusion concern
     does not apply.
     """
+    from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
     from cli_agent_orchestrator.services.inbox_service import (
         InjectSafetyResult,
         get_delivery_lock,
     )
     from cli_agent_orchestrator.services.receiver_state_view import native_probe
     from cli_agent_orchestrator.services.status_monitor import TerminalStatus, status_monitor
-    from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
 
     # G1: delivery-lock non-blocking acquire (rebind exclusion, D13).
     # F186: skip G1 when caller provably holds no delivery lock (reconciler path).
@@ -401,7 +403,8 @@ def _attempt_gated_ring(terminal_id: str, max_written_row_id: int, *, caller_hol
         if not delivery_lock.acquire(blocking=False):
             logger.info(
                 "f168_doorbell terminal=%s decision=skipped_gate reason=delivery_lock row=%s",
-                terminal_id, max_written_row_id,
+                terminal_id,
+                max_written_row_id,
             )
             return "skipped_gate"
         _owns_lock = True
@@ -411,7 +414,8 @@ def _attempt_gated_ring(terminal_id: str, max_written_row_id: int, *, caller_hol
         if not metadata:
             logger.info(
                 "f168_doorbell terminal=%s decision=skipped_gate reason=no_metadata row=%s",
-                terminal_id, max_written_row_id,
+                terminal_id,
+                max_written_row_id,
             )
             return "skipped_gate"
 
@@ -420,7 +424,8 @@ def _attempt_gated_ring(terminal_id: str, max_written_row_id: int, *, caller_hol
         if recovery_state not in (None, "rebound"):
             logger.info(
                 "f168_doorbell terminal=%s decision=skipped_gate reason=recovery_state row=%s",
-                terminal_id, max_written_row_id,
+                terminal_id,
+                max_written_row_id,
             )
             return "skipped_gate"
 
@@ -438,17 +443,22 @@ def _attempt_gated_ring(terminal_id: str, max_written_row_id: int, *, caller_hol
                 if tmux_probe is not None and hasattr(tmux_probe, "status"):
                     _evidence_source = "tmux"
                     # Adapt ProbeResult to the shape _attempt_gated_ring expects
-                    probe_result = type("_TmuxProbe", (), {
-                        "status": tmux_probe.status,
-                        "meta": tmux_probe.meta,
-                    })()
+                    probe_result = type(
+                        "_TmuxProbe",
+                        (),
+                        {
+                            "status": tmux_probe.status,
+                            "meta": tmux_probe.meta,
+                        },
+                    )()
             except Exception:
                 pass
 
         if probe_result is None:
             logger.info(
                 "f168_doorbell terminal=%s decision=skipped_gate reason=probe_failed row=%s",
-                terminal_id, max_written_row_id,
+                terminal_id,
+                max_written_row_id,
             )
             return "skipped_gate"
 
@@ -456,7 +466,13 @@ def _attempt_gated_ring(terminal_id: str, max_written_row_id: int, *, caller_hol
         if probe_result.status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
             logger.info(
                 "f168_doorbell terminal=%s decision=skipped_gate reason=not_idle status=%s row=%s",
-                terminal_id, probe_result.status.value if hasattr(probe_result.status, 'value') else probe_result.status, max_written_row_id,
+                terminal_id,
+                (
+                    probe_result.status.value
+                    if hasattr(probe_result.status, "value")
+                    else probe_result.status
+                ),
+                max_written_row_id,
             )
             return "skipped_gate"
 
@@ -466,17 +482,22 @@ def _attempt_gated_ring(terminal_id: str, max_written_row_id: int, *, caller_hol
         provider = None
         try:
             from cli_agent_orchestrator.providers.manager import provider_manager
+
             provider = provider_manager.get_provider(terminal_id)
         except Exception:
             pass
 
         safety: InjectSafetyResult = inbox_service._inject_safe(
-            terminal_id, provider, probe_result.meta,
+            terminal_id,
+            provider,
+            probe_result.meta,
         )
         if safety.verdict == "veto":
             logger.info(
                 "f168_doorbell terminal=%s decision=skipped_gate reason=%s row=%s",
-                terminal_id, safety.reason, max_written_row_id,
+                terminal_id,
+                safety.reason,
+                max_written_row_id,
             )
             return "skipped_gate"
 
@@ -498,13 +519,17 @@ def _attempt_gated_ring(terminal_id: str, max_written_row_id: int, *, caller_hol
             # D7: draft present or dialog hazard — skip.
             logger.info(
                 "f168_doorbell terminal=%s decision=skipped_gate reason=deferred_%s row=%s",
-                terminal_id, str(dde)[:60], max_written_row_id,
+                terminal_id,
+                str(dde)[:60],
+                max_written_row_id,
             )
             return "skipped_gate"
 
         logger.info(
             "f168_doorbell terminal=%s decision=rang source=%s row=%s",
-            terminal_id, _evidence_source, max_written_row_id,
+            terminal_id,
+            _evidence_source,
+            max_written_row_id,
         )
         return "rang"
     finally:

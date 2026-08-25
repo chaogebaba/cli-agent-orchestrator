@@ -899,6 +899,7 @@ def list_messages(
     generation: int | None = None,
     original_receiver_id: str | None = None,
     audit_browse: bool = False,
+    unconsumed_only: bool = False,
 ) -> dict[str, Any]:
     if (
         status == MessageStatus.PARKED
@@ -928,6 +929,13 @@ def list_messages(
         # D1 (fx157): clamp the default lower bound to the consumption cursor
         if receiver.startswith("mb_") and after_id is None and not audit_browse:
             query = query.filter(InboxModel.id > int(mailbox.consumed_through_id))
+        # F476 D3: unconsumed_only applies consumed_through_id clamp to terminal-id form
+        if unconsumed_only and not receiver.startswith("mb_"):
+            inc = db.query(MailboxIncarnationModel).filter_by(terminal_id=receiver).one_or_none()
+            if inc is not None:
+                mb = db.query(MailboxModel).filter_by(id=inc.mailbox_id).one_or_none()
+                if mb is not None:
+                    query = query.filter(InboxModel.id > int(mb.consumed_through_id))
         if since is not None:
             # Normalize since to aware-UTC unconditionally.
             if since.tzinfo is None:
@@ -1125,17 +1133,21 @@ def ack_messages(terminal_id: str, up_to_id: int) -> dict[str, Any]:
             # FX191: settle delivery obligations for acked messages
             from cli_agent_orchestrator.clients.database import DeliveryObligationModel as _DObl
 
-            _obligations_settled = db.query(_DObl).filter(
-                _DObl.inbox_row_id <= up_to_id,
-                _DObl.state == "OPEN",
-                _DObl.mailbox_id == _f178_mailbox_id,
-            ).update(
-                {
-                    _DObl.state: "ACKED",
-                    _DObl.terminal_at: _utcnow(),
-                    _DObl.terminal_reason: "consumed",
-                },
-                synchronize_session=False,
+            _obligations_settled = (
+                db.query(_DObl)
+                .filter(
+                    _DObl.inbox_row_id <= up_to_id,
+                    _DObl.state == "OPEN",
+                    _DObl.mailbox_id == _f178_mailbox_id,
+                )
+                .update(
+                    {
+                        _DObl.state: "ACKED",
+                        _DObl.terminal_at: _utcnow(),
+                        _DObl.terminal_reason: "consumed",
+                    },
+                    synchronize_session=False,
+                )
             )
             # F193(a): surface obligation rowcount so ack settles obligations
             # synchronously — stops the floor from re-ringing a busy supervisor
@@ -1382,8 +1394,7 @@ def delete_mailbox(mailbox_id: str) -> dict[str, int]:
                                 sender_id=f"message-trace:{mailbox_id}",
                                 receiver_id=receiver,
                                 logical_receiver_id=logical,
-                                message=header
-                                + "delivery failed because the logical mailbox "
+                                message=header + "delivery failed because the logical mailbox "
                                 "was deleted",
                                 orchestration_type=OrchestrationType.SEND_MESSAGE,
                             )

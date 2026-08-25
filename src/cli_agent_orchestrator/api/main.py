@@ -1362,6 +1362,28 @@ class MessageAckRequest(BaseModel):
     up_to_id: int = Field(gt=0)
 
 
+class WakeClaimRequest(BaseModel):
+    """F476 D3: Request body for POST /messages/wake-claim."""
+
+    to: str = Field(pattern=r"^[a-f0-9]{8}$")
+
+
+class WakeCommitRequest(BaseModel):
+    """F476 D3: Request body for POST /messages/wake-commit."""
+
+    to: str = Field(pattern=r"^[a-f0-9]{8}$")
+    through_id: int = Field(ge=0)
+    expected_path_version: int = Field(ge=0)
+    replay_row_ids: List[int] = Field(default_factory=list)
+
+
+class WakeDrainReplayRequest(BaseModel):
+    """F476 D6: Request body for POST /messages/wake-drain-replay."""
+
+    to: str = Field(pattern=r"^[a-f0-9]{8}$")
+    row_ids: List[int] = Field(min_length=1)
+
+
 def _mailbox_http_exception(exc: Exception) -> HTTPException:
     from cli_agent_orchestrator.services.mailbox_service import PublicationCleanupFailed
 
@@ -7908,6 +7930,7 @@ async def list_messages_endpoint(
     generation: Optional[int] = Query(default=None, ge=0),
     original_receiver_id: Optional[TerminalId] = None,
     audit_browse: bool = False,
+    unconsumed_only: bool = Query(default=False),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
 ) -> Dict:
     """Replay a deterministic logical or incarnation-provenance message page."""
@@ -7944,6 +7967,8 @@ async def list_messages_endpoint(
             kwargs["original_receiver_id"] = original_receiver_id
         if audit_browse:
             kwargs["audit_browse"] = True
+        if unconsumed_only:
+            kwargs["unconsumed_only"] = True
         return await asyncio.to_thread(list_messages, to, **kwargs)
     except MailboxDomainError as exc:
         raise _mailbox_http_exception(exc) from exc
@@ -8026,6 +8051,141 @@ async def ack_messages_endpoint(
         return await asyncio.to_thread(ack_messages, body.terminal_id, body.up_to_id)
     except MailboxDomainError as exc:
         raise _mailbox_http_exception(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# F476 D3: Wake claim/commit endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.post("/messages/wake-claim")
+async def wake_claim_endpoint(
+    body: WakeClaimRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """F476 D3: Claim unnotified wake-eligible rows for a terminal."""
+    from cli_agent_orchestrator.clients.database import (
+        MailboxIncarnationModel,
+        MailboxModel,
+        SessionLocal,
+        claim_unnotified_wake,
+    )
+
+    def _do_claim() -> Dict[str, Any]:
+        # Resolve terminal → mailbox
+        with SessionLocal() as db:
+            inc = db.query(MailboxIncarnationModel).filter_by(terminal_id=body.to).one_or_none()
+            if inc is None:
+                return {"kind": "stale_authority", "reason": "no_incarnation", "rows": []}
+            mailbox = db.query(MailboxModel).filter_by(id=inc.mailbox_id).one_or_none()
+            if mailbox is None:
+                return {"kind": "stale_authority", "reason": "no_mailbox", "rows": []}
+            mailbox_id = str(mailbox.id)
+            generation = int(mailbox.generation)
+
+        result = claim_unnotified_wake(
+            mailbox_id=mailbox_id,
+            terminal_id=body.to,
+            generation=generation,
+        )
+        rows_out = [
+            {
+                "inbox_row_id": r.inbox_row_id,
+                "sender_id": r.sender_id,
+                "message": r.message,
+                "tag": r.tag,
+            }
+            for r in result.rows
+        ]
+        resp: Dict[str, Any] = {
+            "kind": result.kind,
+            "rows": rows_out,
+            "claimed_high_water": result.claimed_high_water,
+            "path_version": result.path_version,
+            "reason": result.reason,
+        }
+        if result.exhausted_id is not None:
+            resp["exhausted_id"] = result.exhausted_id
+        return resp
+
+    return await asyncio.to_thread(_do_claim)
+
+
+@app.post("/messages/wake-commit")
+async def wake_commit_endpoint(
+    body: WakeCommitRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """F476 D3: Commit wake progress (advance cursor, drain replay)."""
+    from cli_agent_orchestrator.clients.database import (
+        MailboxIncarnationModel,
+        MailboxModel,
+        SessionLocal,
+        commit_wake,
+    )
+
+    def _do_commit() -> Dict[str, Any]:
+        with SessionLocal() as db:
+            inc = db.query(MailboxIncarnationModel).filter_by(terminal_id=body.to).one_or_none()
+            if inc is None:
+                return {"kind": "stale_authority", "reason": "no_incarnation"}
+            mailbox = db.query(MailboxModel).filter_by(id=inc.mailbox_id).one_or_none()
+            if mailbox is None:
+                return {"kind": "stale_authority", "reason": "no_mailbox"}
+            mailbox_id = str(mailbox.id)
+            generation = int(mailbox.generation)
+
+        result = commit_wake(
+            mailbox_id=mailbox_id,
+            terminal_id=body.to,
+            generation=generation,
+            through_id=body.through_id,
+            expected_path_version=body.expected_path_version,
+            replay_row_ids=tuple(body.replay_row_ids),
+        )
+        return {"kind": result.kind, "reason": result.reason}
+
+    return await asyncio.to_thread(_do_commit)
+
+
+@app.post("/messages/wake-drain-replay")
+async def wake_drain_replay_endpoint(
+    body: WakeDrainReplayRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """F476 D6: Drain replay entries after SessionStart prime surfaces them."""
+    from sqlalchemy import text as sa_text
+
+    from cli_agent_orchestrator.clients.database import (
+        CallbackReplayQueueModel,
+        MailboxIncarnationModel,
+        MailboxModel,
+        SessionLocal,
+    )
+
+    def _do_drain() -> Dict[str, Any]:
+        with SessionLocal() as db:
+            inc = db.query(MailboxIncarnationModel).filter_by(terminal_id=body.to).one_or_none()
+            if inc is None:
+                return {"kind": "stale_authority", "reason": "no_incarnation", "drained": 0}
+            mailbox_id = str(inc.mailbox_id)
+
+        with SessionLocal() as db:
+            db.execute(sa_text("BEGIN IMMEDIATE"))
+            drained = 0
+            for rid in body.row_ids:
+                result = db.execute(
+                    sa_text(
+                        "DELETE FROM callback_replay_queue "
+                        "WHERE mailbox_id = :mb AND inbox_row_id = :rid"
+                    ),
+                    {"mb": mailbox_id, "rid": rid},
+                )
+                drained += result.rowcount
+            db.commit()
+        return {"kind": "drained", "drained": drained}
+
+    return await asyncio.to_thread(_do_drain)
 
 
 @app.get("/mailboxes")
