@@ -465,6 +465,27 @@ class CreateSessionBody(CreateTerminalBody):
         return _check_metadata_size(v)
 
 
+RESUME_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,63}\Z")
+
+
+def _validate_resume_session_id(value: str) -> None:
+    """Validate a ``resume_session_id`` at the request boundary.
+
+    The id is interpolated into the provider's shell command
+    (``claude --resume <sid>``), so the charset is restricted to the shape
+    Claude Code actually emits (UUID-like) — no whitespace, quoting, or
+    shell metacharacters.
+
+    Raises:
+        ValueError: ``value`` does not match RESUME_SESSION_ID_RE.
+    """
+    if not RESUME_SESSION_ID_RE.match(value):
+        raise ValueError(
+            "invalid resume_session_id: expected 8-64 chars of [A-Za-z0-9._-] "
+            "starting with an alphanumeric"
+        )
+
+
 def _validate_model_id(value: str) -> None:
     """Validate a ``model`` override at the request boundary (PR #501 review).
 
@@ -3473,6 +3494,7 @@ async def create_session(
     # alternate bindings for one payload -- not stackable. The
     # {"env_vars": {...}} wire shape is unchanged either way.
     allow_incomplete_brief: bool = False,
+    resume_session_id: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -3536,6 +3558,8 @@ async def create_session(
             validate_tmux_name(effective, "session_name")
         if model is not None:
             _validate_model_id(model)
+        if resume_session_id is not None:
+            _validate_resume_session_id(resume_session_id)
         if initial_message == "":
             raise ValueError("initial_message must not be empty")
         if body and body.initial_message_orchestration_type:
@@ -3566,6 +3590,7 @@ async def create_session(
             initial_message_orchestration_type=initial_message_orchestration_type,
             model=model,
             lifecycle=body.lifecycle if body else None,
+            resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
         )

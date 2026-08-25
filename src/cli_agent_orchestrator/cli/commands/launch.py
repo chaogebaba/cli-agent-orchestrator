@@ -163,6 +163,14 @@ def _parse_env_pairs(pairs):
     is_flag=True,
     help="Allow a required session brief to degrade loudly instead of aborting startup.",
 )
+@click.option(
+    "--resume-session-id",
+    "resume_session_id",
+    default=None,
+    metavar="SESSION_ID",
+    help="Resume a prior Claude Code conversation in the launched supervisor "
+    "(claude --resume <id>). claude_code provider only.",
+)
 def launch(
     message,
     agents,
@@ -178,6 +186,7 @@ def launch(
     memory,
     env_pairs,
     allow_incomplete_brief,
+    resume_session_id,
 ):
     """Launch cao session with specified agent profile."""
     try:
@@ -314,6 +323,8 @@ def launch(
             params["memory"] = "true"
         if allow_incomplete_brief:
             params["allow_incomplete_brief"] = "true"
+        if resume_session_id:
+            params["resume_session_id"] = resume_session_id
 
         # Forwarded env vars travel in the JSON body so values (which may
         # contain secrets) don't end up in cao-server's HTTP access log.

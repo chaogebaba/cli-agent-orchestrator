@@ -74,6 +74,7 @@ class ProviderManager:
         fork_context: Optional[ForkContext] = None,
         persona_plan: "PersonaPlan | None | object" = _NO_PERSONA_PLAN,
         engine: Optional[KiroEngine] = None,
+        resume_session_id: Optional[str] = None,
     ) -> BaseProvider:
         """Construct and commit a provider for ordinary terminal creation."""
         provider = self.construct_provider(
@@ -116,6 +117,11 @@ class ProviderManager:
             if persona_plan is not None and persona_plan.provider != provider_type:
                 raise ValueError("persona manifest provider mismatch")
             provider: BaseProvider
+            if resume_session_id and provider_type != ProviderType.CLAUDE_CODE.value:
+                raise ValueError(
+                    "resume_session_id is only supported by the claude_code provider "
+                    f"(got provider '{provider_type}')"
+                )
             if provider_type == ProviderType.KIRO_CLI.value:
                 if not agent_profile:
                     raise ValueError("Kiro CLI provider requires agent_profile parameter")
@@ -150,6 +156,7 @@ class ProviderManager:
                     skill_prompt=skill_prompt,
                     persona_plan=persona_plan,
                     model=model,
+                    resume_session_id=resume_session_id,
                 )
             elif provider_type == ProviderType.CODEX.value:
                 provider = CodexProvider(

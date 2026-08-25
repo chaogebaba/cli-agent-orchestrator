@@ -375,6 +375,7 @@ class ClaudeCodeProvider(BaseProvider):
         skill_prompt: Optional[str] = None,
         persona_plan: Optional["PersonaPlan"] = None,
         model: Optional[str] = None,
+        resume_session_id: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
@@ -383,6 +384,11 @@ class ClaudeCodeProvider(BaseProvider):
         self._persona_plan = persona_plan
         self.allocated_session_uuid = str(uuid.uuid4())
         self._render_uncertain_active = False
+        # When set, the launched claude process resumes this Claude Code
+        # session id (--resume <sid>) instead of starting a fresh
+        # conversation. Used to re-open a supervisor conversation inside a
+        # new CAO session (durable-orchestra recovery).
+        self._resume_session_id = resume_session_id
         # Explicit per-call override for profile.model (see launch()'s own
         # --model resolution below) -- e.g. a handoff/assign caller pinning a
         # specific model for one worker without needing a dedicated profile.
@@ -495,6 +501,12 @@ class ClaudeCodeProvider(BaseProvider):
         command_parts.extend(["--session-id", self.allocated_session_uuid])
         settings_file = self._write_terminal_settings()
         command_parts.extend(["--settings", str(settings_file)])
+
+        # Resume a prior Claude Code conversation. Applied for every profile
+        # branch below -- resume is orthogonal to profile decomposition; the
+        # session id was validated at the API boundary.
+        if self._resume_session_id:
+            command_parts.extend(["--resume", self._resume_session_id])
 
         # Route based on profile state
         native = getattr(profile, "native_agent", None) if profile else None

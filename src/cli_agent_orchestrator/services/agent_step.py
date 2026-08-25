@@ -147,6 +147,20 @@ async def _teardown_terminal(terminal_id: str, registry: Optional[PluginRegistry
     except Exception as exc:  # noqa: BLE001 - teardown is best-effort
         logger.warning("run_agent_step: failed to tear down terminal %s: %s", terminal_id, exc)
 
+# Delivery verification on the synchronous step path (#562). Readiness cannot
+# prove the TUI will accept input — an OpenCode splash frame carries the same
+# idle footer as a conversation-ready frame — so the paste or its Enter can be
+# dropped right after the send and the worker never sees its task. Wait this
+# long for pickup evidence (any working-state read) before re-delivering, and
+# cap the attempts. The step's own ``timeout`` still bounds everything.
+# 8s mirrors ``_DEFERRED_SUBMIT_CONFIRM_TIMEOUT`` in terminal_service: the
+# same decision helper serves that deferred-init confirm loop, so both paths
+# give the PROCESSING edge the same window before calling a send dropped. It
+# is a consistency number with the sibling path, not a measured provider
+# startup latency — tune them together.
+_PROMPT_PICKUP_GRACE = 8.0
+_PROMPT_REDELIVER_MAX = 3
+
 
 async def _validate_reused_terminal(
     terminal_id: str,

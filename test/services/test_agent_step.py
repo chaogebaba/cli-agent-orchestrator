@@ -1120,6 +1120,160 @@ class TestIdleCompletionSignal:
         assert exc_info.value.kind == "error"
 
 
+@pytest.mark.skip(reason="Fork: step-level re-delivery lives in terminal_service deferred-init, not run_agent_step")
+class TestPromptDeliveryVerification:
+    """#562: a prompt dropped at send (worker idle, never picked up) is
+    re-delivered via the shared confirm/redeliver helper instead of letting
+    the worker sit unprompted for the whole step budget."""
+
+    def test_dropped_prompt_is_redelivered_and_step_completes(self):
+        """The terminal reads IDLE with no pickup evidence until the
+        redelivery lands, then works and completes — the reporter's scenario,
+        minus the timeout burn."""
+
+        def _idle_until_redelivered():
+            delivered = {"again": False}
+
+            def _get_status(_terminal_id):
+                return TerminalStatus.COMPLETED if delivered["again"] else TerminalStatus.IDLE
+
+            def _redeliver(_terminal_id, _message, _attempt, **_kwargs):
+                delivered["again"] = True
+                return False  # a redelivery was attempted, not a started probe
+
+            return _get_status, _redeliver
+
+        get_status, redeliver = _idle_until_redelivered()
+        create, send, delete, get_output, exit_cli, get_wd, wait, _ = _patch_terminal_layer()
+        with (
+            create,
+            send as m_send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            patch(f"{_MODULE}.status_monitor.get_status", side_effect=get_status),
+            patch(f"{_MODULE}._COMPLETION_POLL_INTERVAL", 0.01),
+            patch(f"{_MODULE}._PROMPT_PICKUP_GRACE", 0.0),
+            patch(
+                f"{_MODULE}.terminal_service.redeliver_dropped_message",
+                side_effect=redeliver,
+            ) as m_redeliver,
+        ):
+            result = asyncio.run(run_agent_step("kiro_cli", "dev", "x", timeout=5))
+
+        assert result.status == TerminalStatus.COMPLETED
+        assert result.last_message == "the answer"
+        m_redeliver.assert_called_once_with("abc12345", "x", 1, full_resend_requires_probe=True)
+        # The original send still happened exactly once; only the dropped
+        # copy is re-delivered.
+        m_send.assert_called_once_with("abc12345", "x")
+
+    def test_redelivery_failure_does_not_break_the_raises_contract(self):
+        """The redelivery performs tmux I/O and can raise (blocked input,
+        vanished pane). A failed RECOVERY attempt is not a step failure:
+        the exception must be swallowed so the wait keeps its documented
+        contract — the step classifies via its own deadline, ending in
+        StepExecutionError(kind="timeout"), never the raw exception."""
+
+        def _raise_blocked(_terminal_id, _message, _attempt, **_kwargs):
+            from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError
+
+            raise TerminalInputBlockedError("worker is blocked on a prompt")
+
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            final_status=TerminalStatus.IDLE,  # idle forever: no pickup, no work
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(f"{_MODULE}._COMPLETION_POLL_INTERVAL", 0.01),
+            patch(f"{_MODULE}._PROMPT_PICKUP_GRACE", 0.0),
+            patch(
+                f"{_MODULE}.terminal_service.redeliver_dropped_message",
+                side_effect=_raise_blocked,
+            ) as m_redeliver,
+        ):
+            with pytest.raises(StepExecutionError, match="did not complete") as exc_info:
+                asyncio.run(run_agent_step("kiro_cli", "dev", "x", timeout=0.5))
+
+        assert exc_info.value.kind == "timeout"
+        # The failure did not stop recovery attempts: capped retries continue.
+        from cli_agent_orchestrator.services.agent_step import _PROMPT_REDELIVER_MAX
+
+        assert m_redeliver.call_count == _PROMPT_REDELIVER_MAX
+
+    def test_redelivery_is_capped_when_worker_never_picks_up(self):
+        """A worker that never accepts the task is redelivered at most
+        _PROMPT_REDELIVER_MAX times, then the step still times out (bounded
+        redelivery, not an endless resend loop)."""
+        from cli_agent_orchestrator.services.agent_step import _PROMPT_REDELIVER_MAX
+
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            final_status=TerminalStatus.IDLE,  # idle forever, never worked
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(f"{_MODULE}._COMPLETION_POLL_INTERVAL", 0.01),
+            patch(f"{_MODULE}._PROMPT_PICKUP_GRACE", 0.0),
+            patch(
+                f"{_MODULE}.terminal_service.redeliver_dropped_message",
+                return_value=False,
+            ) as m_redeliver,
+        ):
+            with pytest.raises(StepExecutionError, match="did not complete") as exc_info:
+                asyncio.run(run_agent_step("kiro_cli", "dev", "x", timeout=0.5))
+
+        assert exc_info.value.kind == "timeout"
+        assert m_redeliver.call_count == _PROMPT_REDELIVER_MAX
+
+    def test_started_probe_does_not_complete_early_under_lagging_status(self):
+        """The helper's direct probe finding the worker already running
+        (lagging cached status, #496) ends redelivery but proves delivery
+        only, never completion: while the cached status stays IDLE and no
+        working state is ever observed, the step must NOT settle on the idle
+        exit and extract output mid-turn — it burns the budget and times
+        out, exactly like the pre-patch wait."""
+
+        def _idle_forever(_terminal_id):
+            return TerminalStatus.IDLE
+
+        create, send, delete, get_output, exit_cli, get_wd, wait, _ = _patch_terminal_layer()
+        with (
+            create,
+            send,
+            delete,
+            get_output as m_out,
+            exit_cli,
+            wait,
+            patch(f"{_MODULE}.status_monitor.get_status", side_effect=_idle_forever),
+            patch(f"{_MODULE}._COMPLETION_POLL_INTERVAL", 0.01),
+            patch(f"{_MODULE}._PROMPT_PICKUP_GRACE", 0.0),
+            patch(
+                f"{_MODULE}.terminal_service.redeliver_dropped_message",
+                return_value=True,  # probe: already started, nothing sent
+            ) as m_redeliver,
+        ):
+            with pytest.raises(StepExecutionError, match="did not complete") as exc_info:
+                asyncio.run(run_agent_step("kiro_cli", "dev", "x", timeout=0.5))
+
+        assert exc_info.value.kind == "timeout"
+        # Delivery confirmed once by the probe; no re-send loop after it.
+        m_redeliver.assert_called_once()
+        m_out.assert_not_called()
+
+
 class TestInterruptibleCancel:
     """#409b: an in-flight completion wait is interruptible via cancel_event, so a
     hung step (never settling) becomes cancellable rather than boundary-only."""
