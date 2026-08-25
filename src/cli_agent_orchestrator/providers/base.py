@@ -550,11 +550,31 @@ class BaseProvider(ABC):
         The default implementation is a no-op (always allows the paste).
         """
 
+    def capture_submission_baseline(
+        self,
+        metadata: dict[str, Any],
+        backend: Any,
+    ) -> Any:
+        """Provider hook called immediately BEFORE send_keys pastes a message.
+
+        Gives TUI providers a chance to snapshot a DISPATCH-RELATIVE baseline of
+        the pane (e.g. the set of submitted-user-turn fingerprints already
+        present) so ``verify_submission_after_send`` can confirm submission by a
+        NEW artifact absent from that baseline rather than by an absolute pane
+        pattern. See ``CodexProvider.capture_submission_baseline`` (F435 r5).
+
+        The default implementation returns ``None`` (no baseline). Providers
+        that ignore the baseline are unaffected; the codex verifier degrades to
+        indeterminate → bounded → defer when it receives ``None``.
+        """
+        return None
+
     def verify_submission_after_send(
         self,
         metadata: dict[str, Any],
         backend: Any,
         message: str | None = None,
+        baseline: Any = None,
     ) -> None:
         """Provider hook called immediately after send_keys pastes+submits a message.
 
@@ -564,12 +584,13 @@ class BaseProvider(ABC):
         drafted, not submitted" marker is observed on the pane. See
         ``CodexProvider.verify_submission_after_send`` for the F435 recovery.
 
-        ``message`` is the exact task text that was pasted. TUI providers use it
-        to anchor confirmation on a DURABLE scrollback-content boundary — the
-        pasted task echoed as a SUBMITTED user turn above the active composer —
-        which is positive, position-stable evidence in both directions
-        (F435 r4). It is optional so callers that cannot supply it (and the
-        no-op default) are unaffected.
+        ``message`` is the exact task text that was pasted. ``baseline`` is the
+        opaque pre-send snapshot returned by ``capture_submission_baseline``.
+        TUI providers use them together to anchor confirmation on a
+        DISPATCH-RELATIVE boundary — a submitted user turn that is NEW relative
+        to the pre-send baseline — which excludes historical collisions by
+        construction (F435 r5). Both are optional so callers that cannot supply
+        them (and the no-op default) are unaffected.
 
         The default implementation is a no-op: providers with no observed
         submit race are unaffected. Implementations MUST be idempotent — they

@@ -95,6 +95,25 @@ HISTORICAL_CHIP_THEN_WORKING_PANE = (
 
 METADATA = {"tmux_session": "sess", "tmux_window": "win"}
 
+# A message whose length matches the 3048-char chip fixtures so the r5
+# dispatch-ownership check recognizes the active chip as ours.
+CHIP_MESSAGE = "x" * 3048
+# A clean pre-send baseline: an empty composer, no submitted turn in scrollback.
+# r5 confirms submission by a NEW submitted turn relative to this baseline, so
+# these fixtures' own submitted turn is NEW by construction — the real pre-send
+# condition. The spinner path is secondary evidence consulted once the window is
+# intact and no new turn is seen yet.
+CLEAN_BASELINE = CodexProvider._build_submission_baseline(
+    "• SEED_OK\n\n› Ask Codex to do anything\n\n  ~/x · main · gpt-5.6-sol high\n"
+)
+
+
+def _verify(provider, backend, message: str = CHIP_MESSAGE, baseline=None) -> None:
+    """Drive the r5 hook with an explicit clean pre-send baseline."""
+    provider.verify_submission_after_send(
+        METADATA, backend, message=message, baseline=CLEAN_BASELINE if baseline is None else baseline
+    )
+
 
 @pytest.fixture(autouse=True)
 def _no_sleep():
@@ -209,7 +228,7 @@ def test_historical_chip_then_working_confirms_without_enter():
     """
     provider = _provider()
     backend = _backend_returning(HISTORICAL_CHIP_THEN_WORKING_PANE)
-    provider.verify_submission_after_send(METADATA, backend)
+    _verify(provider, backend)
     backend.send_special_key.assert_not_called()
 
 
@@ -221,7 +240,7 @@ def test_submitted_working_spinner_sends_no_extra_enter():
     provider = _provider()
     backend = _backend_returning(SUBMITTED_WORKING_PANE)
 
-    provider.verify_submission_after_send(METADATA, backend)
+    _verify(provider, backend)
 
     backend.send_special_key.assert_not_called()
 
@@ -257,7 +276,7 @@ def test_stale_prepaste_empty_first_frame_is_not_accepted_as_success():
     backend.get_history.side_effect = _get_history
     backend.send_special_key.side_effect = _send_special_key
 
-    provider.verify_submission_after_send(METADATA, backend)
+    _verify(provider, backend)
 
     # Recovery happened: at least one re-Enter, and it unstuck (Working seen).
     assert _enter_calls(backend) >= 1
@@ -272,7 +291,7 @@ def test_stuck_then_recovered_after_one_reenter():
     # the Working spinner (positive submission).
     backend = _backend_returning(STUCK_CHIP_PANE, SUBMITTED_WORKING_PANE)
 
-    provider.verify_submission_after_send(METADATA, backend)
+    _verify(provider, backend)
 
     assert _enter_calls(backend) == 1
 
@@ -304,7 +323,7 @@ def test_stuck_then_cleared_composer_after_chip_is_submission():
     )
     backend = _backend_returning(STUCK_CHIP_PANE, recovered_submitted_pane)
 
-    provider.verify_submission_after_send(METADATA, backend)
+    _verify(provider, backend)
 
     assert _enter_calls(backend) == 1
 
@@ -317,7 +336,7 @@ def test_stuck_then_recovered_after_two_reenters():
         SUBMITTED_WORKING_PANE,  # re-verify after 2nd Enter: submitted
     )
 
-    provider.verify_submission_after_send(METADATA, backend)
+    _verify(provider, backend)
 
     assert _enter_calls(backend) == 2
 
@@ -330,7 +349,7 @@ def test_stuck_forever_raises_after_bounded_retries():
     backend = _backend_returning(STUCK_CHIP_PANE)  # always stuck
 
     with pytest.raises(CodexSubmitStuckError) as excinfo:
-        provider.verify_submission_after_send(METADATA, backend)
+        _verify(provider, backend)
 
     # Bounded: exactly MAX_RETRIES re-Enters, no more.
     assert _enter_calls(backend) == CODEX_SUBMIT_VERIFY_MAX_RETRIES
@@ -353,7 +372,7 @@ def test_capture_failure_raises_unconfirmed_and_sends_no_blind_enter():
     backend.get_history.side_effect = RuntimeError("concurrent pane capture unavailable")
 
     with pytest.raises(CodexSubmitStuckError) as excinfo:
-        provider.verify_submission_after_send(METADATA, backend)
+        _verify(provider, backend)
 
     backend.send_special_key.assert_not_called()
     assert "term1234" in str(excinfo.value)
@@ -374,7 +393,7 @@ def test_capture_failure_then_recovery_is_confirmed():
 
     backend.get_history.side_effect = _get_history
 
-    provider.verify_submission_after_send(METADATA, backend)
+    _verify(provider, backend)
 
     backend.send_special_key.assert_not_called()
 

@@ -51,6 +51,23 @@ METADATA = {"tmux_session": "sess", "tmux_window": "win"}
 # The task text CAO pasted for this dispatch. Large pastes collapse to a chip,
 # so both a chip echo and a raw-text echo are exercised below.
 TASK_TEXT = "Implement the widget refactor and report back with a diff."
+# A message whose length matches the 3048-char chip fixtures, so the r5
+# ownership check (active chip count ≈ len(message)) recognizes the chip as
+# belonging to THIS dispatch.
+CHIP_MESSAGE = "x" * 3048
+
+# A clean pre-send baseline: an empty composer with NO submitted turn in
+# scrollback — the real pane state immediately before a paste. Built from a
+# capture the provider itself parses, so the dispatch's own submitted turn is
+# NEW relative to it by construction.
+CLEAN_PRESEND_PANE = (
+    "• SEED_OK\n"
+    "\n"
+    "› Ask Codex to do anything\n"
+    "\n"
+    "  ~/VScode_projects/cli-subagents · main · gpt-5.6-sol high\n"
+)
+CLEAN_BASELINE = CodexProvider._build_submission_baseline(CLEAN_PRESEND_PANE)
 
 
 @pytest.fixture(autouse=True)
@@ -82,21 +99,25 @@ def _enter_calls(backend: MagicMock) -> int:
     )
 
 
-def _verify(provider: CodexProvider, backend: MagicMock, message: str = TASK_TEXT) -> None:
-    """Drive the hook, passing the pasted task text (r4 signature).
+def _verify(
+    provider: CodexProvider,
+    backend: MagicMock,
+    message: str = TASK_TEXT,
+    baseline=None,
+) -> None:
+    """Drive the r5 hook with an explicit pre-send baseline (dispatch-relative).
 
-    Signature-tolerant so these probes also exercise the r3 DECISION PATH (r3's
-    hook has no ``message`` parameter): on r3 they demonstrate the behavioral
-    blockers — a false defer, a false commit, a double-Enter — rather than a
-    bare ``TypeError``. On r4 the task text is threaded through and anchors the
-    scrollback-content boundary.
+    r5 confirms submission by a NEW submitted turn relative to a baseline
+    captured BEFORE the paste. These probes pass ``CLEAN_BASELINE`` (an empty
+    composer with no submitted turn) so the dispatch's own submitted turn is,
+    by construction, NEW — exactly the real pre-send condition. A test that
+    wants to model a pre-existing/historical turn passes its own baseline.
     """
-    try:
-        provider.verify_submission_after_send(METADATA, backend, message=message)
-    except TypeError as exc:
-        if "message" not in str(exc):
-            raise
-        provider.verify_submission_after_send(METADATA, backend)
+    if baseline is None:
+        baseline = CLEAN_BASELINE
+    provider.verify_submission_after_send(
+        METADATA, backend, message=message, baseline=baseline
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +219,7 @@ def test_E2_negative_control_truly_stuck_still_raises():
     backend = _backend_returning(STUCK_CHIP_PANE)
 
     with pytest.raises(CodexSubmitStuckError):
-        _verify(provider, backend)
+        _verify(provider, backend, message=CHIP_MESSAGE)
 
 
 # ===========================================================================
@@ -220,16 +241,31 @@ def test_B_chip_then_unrelated_clear_does_not_falsely_confirm():
     backend = _backend_returning(STUCK_CHIP_PANE, EMPTY_COMPOSER_NO_SUBMIT_PANE)
 
     with pytest.raises(CodexSubmitStuckError):
-        _verify(provider, backend)
+        _verify(provider, backend, message=CHIP_MESSAGE)
 
 
 def test_B_negative_control_real_submitted_turn_confirms():
-    """Negative control: a real submitted turn (chip→cleared WITH a submitted
-    block in scrollback) must confirm."""
-    provider = _provider()
-    backend = _backend_returning(STUCK_CHIP_PANE, SUBMITTED_TURN_THEN_EMPTY_PANE)
+    """Negative control: a real submitted turn (chip→submitted-turn) must confirm.
 
-    _verify(provider, backend)  # must NOT raise
+    Frame 1 is the dispatch's own stuck chip; after the recovery Enter the chip
+    has scrolled up into a SUBMITTED turn (new relative to the clean baseline)
+    with the composer cleared. r5 confirms off that NEW submitted turn.
+    """
+    provider = _provider()
+    recovered = (
+        "• SEED_OK\n"
+        "\n"
+        "› [Pasted Content 3048 chars]\n"  # NEW submitted turn (history)
+        "\n"
+        "• On it.\n"
+        "\n"
+        "› Ask Codex to do anything\n"  # empty active composer
+        "\n"
+        "  ~/VScode_projects/cli-subagents · main · gpt-5.6-sol high\n"
+    )
+    backend = _backend_returning(STUCK_CHIP_PANE, recovered)
+
+    _verify(provider, backend, message=CHIP_MESSAGE)  # must NOT raise
 
     # Exactly the re-Enter that unstuck it — and no more.
     assert _enter_calls(backend) >= 1
@@ -272,7 +308,7 @@ def test_C_stale_postsubmit_chip_frame_sends_no_extra_enter():
     )
     backend = _backend_returning(STUCK_CHIP_PANE, stale_after_submit)
 
-    _verify(provider, backend)  # must NOT raise
+    _verify(provider, backend, message=CHIP_MESSAGE)  # must NOT raise
 
     # r4 sends exactly the one Enter that submitted; the stale chip frame does
     # NOT trigger a second Enter (BLOCKER 3).
@@ -314,6 +350,6 @@ def test_C_negative_control_stuck_chip_no_submitted_turn_reenters():
     backend = _backend_returning(STUCK_CHIP_PANE)
 
     with pytest.raises(CodexSubmitStuckError):
-        _verify(provider, backend)
+        _verify(provider, backend, message=CHIP_MESSAGE)
 
     assert _enter_calls(backend) >= 1

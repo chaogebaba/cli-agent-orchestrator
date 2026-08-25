@@ -8,6 +8,8 @@ import re
 import shlex
 import subprocess
 import time
+from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -459,6 +461,63 @@ CODEX_SUBMIT_VERIFY_POLL_INTERVAL_SECONDS = 0.5
 # spinner), never by raw text.
 CODEX_SUBMIT_TASK_SIGNATURE_MIN_CHARS = 12
 CODEX_SUBMIT_TASK_SIGNATURE_CHARS = 40
+# r5 (BLOCKERS 1/2/3 root cause: no DISPATCH-RELATIVE boundary). r4's
+# submission predicate scanned ALL captured history with no pre-send cursor, so
+# any historical paste chip / identical task / identical 40-char prefix
+# false-confirmed the CURRENT unsent chip (B1); wrapped continuations were
+# discarded and short tasks produced no signature (B2); and a fixed 200-row tail
+# could evict the evidence while an unrelated active draft got recovery Enters
+# (B3). r5 makes the evidence dispatch-relative by BASELINE DIFF: immediately
+# BEFORE the paste/submit we capture a baseline observation of the pane (the set
+# of submitted-user-turn fingerprints already present, plus a turn-count
+# watermark). Submission evidence is then a NEW submitted-turn artifact that was
+# ABSENT from that baseline. Historical collisions live in the baseline and are
+# excluded BY CONSTRUCTION (kills B1); wrap is normalized before fingerprinting
+# (B2); and a watermark that shows scrollback advanced/evicted past the capture
+# window is INDETERMINATE → bounded → defer, never a blind Enter into a busy
+# pane (B3).
+#
+# Full-history capture rows for the baseline so eviction of the *baseline* set
+# is itself observable as a shrunk watermark rather than a silent miss.
+CODEX_SUBMIT_BASELINE_TAIL_LINES = 500
+
+
+@dataclass(frozen=True)
+class CodexSubmitBaseline:
+    """A dispatch-relative snapshot of the pane taken BEFORE the paste/submit.
+
+    Captured by ``CodexProvider.capture_submission_baseline`` at the send seam,
+    immediately before ``backend.send_keys`` pastes the task, and threaded into
+    ``verify_submission_after_send``. Submission is confirmed ONLY by a
+    submitted user turn that is NOT in this snapshot — so any pre-existing
+    (historical) turn, chip, or identical brief cannot false-confirm the current
+    unsent paste (BLOCKER 1).
+
+    Fields:
+      * ``turn_fingerprints`` — normalized, wrap-joined content of every
+        submitted ``›``/``»`` user turn already in scrollback at capture time.
+        A post-send fingerprint absent from this set is a NEW turn.
+      * ``chip_counter`` — multiset of ``[Pasted Content N chars]`` chip strings
+        already present as submitted turns, so a repeat dispatch of the SAME N
+        is only "new" when the post-send count exceeds the baseline count.
+      * ``turn_count`` — number of submitted user turns at capture (watermark).
+        A post-send capture whose count is BELOW this means turns were evicted
+        from the tail → the evidence window is unreliable → indeterminate (B3).
+      * ``captured_ok`` — False when the baseline capture itself failed. A
+        missing baseline forces every post-send verdict to be treated as
+        indeterminate (never success), exactly like a failed post-send capture.
+    """
+
+    turn_fingerprints: frozenset[str] = field(default_factory=frozenset)
+    chip_counter: tuple[tuple[str, int], ...] = ()
+    turn_count: int = 0
+    captured_ok: bool = False
+
+    def chip_count(self, chip: str) -> int:
+        for key, count in self.chip_counter:
+            if key == chip:
+                return count
+        return 0
 
 
 class CodexSubmitStuckError(Exception):
@@ -2391,6 +2450,33 @@ class CodexProvider(BaseProvider):
         return CODEX_PASTE_CHIP_PATTERN.search(region) is not None
 
     @staticmethod
+    def _active_composer_chip_count(captured: str) -> int | None:
+        """Return the ``[Pasted Content N chars]`` count on the ACTIVE composer.
+
+        ``None`` when no chip is on the active composer (or it cannot be
+        anchored). Used to prove OWNERSHIP before a recovery Enter (BLOCKER 3):
+        we only re-Enter a stuck chip whose char-count matches the current
+        dispatch, so an UNRELATED queued/steering draft that happens to own the
+        composer is never blind-Entered mid-run.
+        """
+        if not captured:
+            return None
+        raw_lines = [line.rstrip("\r") for line in captured.splitlines()]
+        plain_lines = [strip_terminal_escapes(line).rstrip() for line in raw_lines]
+        footer_idx = _find_tui_footer_index(plain_lines)
+        if footer_idx is None:
+            footer_idx = len(plain_lines)
+        prompt_idx = _find_composer_anchor_index(plain_lines, footer_idx)
+        if prompt_idx is None:
+            return None
+        search_end = footer_idx
+        while search_end > 0 and not plain_lines[search_end - 1].strip():
+            search_end -= 1
+        region = "\n".join(plain_lines[prompt_idx:search_end])
+        match = re.search(r"\[Pasted Content\s+(\d+)\s+chars\]", region)
+        return int(match.group(1)) if match is not None else None
+
+    @staticmethod
     def _pane_shows_working(captured: str) -> bool:
         """Whether the pane shows the Working/Thinking progress spinner.
 
@@ -2435,33 +2521,31 @@ class CodexProvider(BaseProvider):
         return _is_known_composer_placeholder(plain_lines[prompt_idx])
 
     @staticmethod
-    def _pane_shows_submitted_task(captured: str, message: str | None) -> bool:
-        """Whether the pasted task appears as a SUBMITTED user turn in scrollback.
+    def _extract_submitted_turns(captured: str) -> tuple[list[str], int, list[int]]:
+        """Parse submitted user turns from a capture, wrap-joined and normalized.
 
-        This is the F435 r4 primary submission boundary: durable, position-
-        stable, and directional. When a pasted task submits, Codex echoes it as
-        a ``›`` user turn ABOVE the active composer — either as its collapsed
-        ``[Pasted Content N chars]`` chip (large paste, see openai/codex#9050)
-        or as the raw task text (small paste). The active composer below then
-        returns to an empty placeholder / spinner.
+        Returns ``(fingerprints, prompt_idx_or_-1, chip_counts)`` where:
 
-        Unlike the spinner (transient — a fast turn can finish before any
-        capture, BLOCKER 1) and unlike the bare active-composer chip (lags the
-        TUI by a redraw, BLOCKER 3; and its mere clearing is not submission,
-        BLOCKER 2), a submitted turn in scrollback is a content transition that
-        SURVIVES fast completion and CANNOT be produced by a stale frame or an
-        unrelated clear. It is therefore positive proof in both directions.
+          * ``fingerprints`` is the normalized, wrap-joined content of every
+            submitted ``›``/``»`` user turn STRICTLY ABOVE the active composer
+            (history). Each entry strips the ``›`` head glyph and CONCATENATES
+            the head body with its wrapped continuation rows (soft-wrap breaks
+            mid-character with no inserted separator), then collapses internal
+            whitespace — so a turn that soft-wrapped across visual rows produces
+            the SAME fingerprint as its unwrapped text (BLOCKER 2: wrapped
+            continuations are no longer discarded, and no phantom separator is
+            introduced at the wrap column).
+          * ``prompt_idx_or_-1`` is the active-composer anchor index, or ``-1``
+            when no active composer can be anchored (history-less capture).
+          * ``chip_counts`` is the ``[Pasted Content N chars]`` char-count found
+            on each submitted turn's head row (for chip-multiset accounting).
 
-        Detection is HISTORY-SCOPED: only the region strictly ABOVE the active
-        composer anchor is considered. A chip (or task text) still sitting on
-        the active-composer row is the unsubmitted draft, not a submitted turn,
-        and must not be read here (that would resurrect the stale-frame /
-        clear-alone ambiguities). If the active composer cannot be anchored the
-        whole capture is treated as history-less and this returns ``False`` —
-        absence of a locatable boundary is never success.
+        History-scoped by the same footer/composer anchor the rest of the module
+        uses, so a chip or task text still sitting on the ACTIVE composer row is
+        never mistaken for a submitted turn.
         """
         if not captured:
-            return False
+            return [], -1, []
         raw_lines = [line.rstrip("\r") for line in captured.splitlines()]
         plain_lines = [strip_terminal_escapes(line).rstrip() for line in raw_lines]
 
@@ -2470,40 +2554,163 @@ class CodexProvider(BaseProvider):
             footer_idx = len(plain_lines)
         prompt_idx = _find_composer_anchor_index(plain_lines, footer_idx)
         if prompt_idx is None:
-            # No anchorable active composer ⇒ we cannot separate a submitted
-            # history turn from the live draft. Do not guess success.
-            return False
+            return [], -1, []
 
-        # History is everything strictly above the active composer row.
         history = plain_lines[:prompt_idx]
         if not history:
-            return False
+            return [], prompt_idx, []
 
-        # A submitted user turn is a ``›``/``»`` prefixed row in history.
-        submitted_user_rows = [
-            row
-            for row in history
-            if re.match(r"^\s*[›»]\s+\S", row) is not None
-        ]
-        if not submitted_user_rows:
-            return False
+        fingerprints: list[str] = []
+        chip_counts: list[int] = []
+        i = 0
+        n = len(history)
+        while i < n:
+            row = history[i]
+            if re.match(r"^\s*[›»]\s+\S", row) is None:
+                i += 1
+                continue
+            # Start of a submitted user turn. Absorb wrapped continuation rows:
+            # non-empty rows that are NOT themselves a new ``›`` head, an
+            # assistant/tool bullet, or an idle prompt. A blank row ends the turn.
+            head = row
+            # Strip the leading ``›``/``»`` glyph (and one following space) so the
+            # head body concatenates cleanly with continuation rows.
+            head_body = re.sub(r"^\s*[›»]\s?", "", head)
+            block_parts = [head_body]
+            j = i + 1
+            while j < n:
+                nxt = history[j]
+                if not nxt.strip():
+                    break
+                if re.match(r"^\s*[›»]\s", nxt) is not None:
+                    break
+                if re.match(ASSISTANT_PREFIX_PATTERN, nxt, re.IGNORECASE) is not None:
+                    break
+                block_parts.append(nxt)
+                j += 1
+            # Soft-wrap reconstruction: concatenate with NO separator so the
+            # wrap column does not introduce a phantom space, then collapse
+            # internal whitespace runs for a stable fingerprint.
+            block = "".join(block_parts)
+            fingerprints.append(CodexProvider._normalize_pane_text(block))
+            chip_match = CODEX_PASTE_CHIP_PATTERN.search(head)
+            if chip_match is not None:
+                num = re.search(r"(\d+)\s+chars", head)
+                chip_counts.append(int(num.group(1)) if num else -1)
+            i = j
+        return fingerprints, prompt_idx, chip_counts
 
-        # 1) Collapsed-chip echo: our paste submitted as a "[Pasted Content N
-        #    chars]" chip that has scrolled up into a submitted turn.
-        for row in submitted_user_rows:
-            if CODEX_PASTE_CHIP_PATTERN.search(row) is not None:
-                return True
+    @staticmethod
+    def _build_submission_baseline(captured: str | None) -> CodexSubmitBaseline:
+        """Build a dispatch-relative baseline from a PRE-send pane capture.
 
-        # 2) Raw-text echo: the task text itself appears as a submitted turn.
-        #    Match a normalized distinctive prefix so soft-wrap / trailing
-        #    truncation in the pane does not defeat the check, and so an
-        #    unrelated short line cannot coincidentally match.
+        A ``None`` capture (failed baseline read) yields ``captured_ok=False`` so
+        the post-send verifier treats every subsequent verdict as indeterminate
+        (never success) — a missing baseline cannot be used to manufacture a
+        NEW-turn confirmation.
+        """
+        if captured is None:
+            return CodexSubmitBaseline()
+        fingerprints, _prompt_idx, chip_counts = CodexProvider._extract_submitted_turns(captured)
+        chip_counter = Counter(
+            f"[Pasted Content {c} chars]" for c in chip_counts if c >= 0
+        )
+        return CodexSubmitBaseline(
+            turn_fingerprints=frozenset(fingerprints),
+            chip_counter=tuple(sorted(chip_counter.items())),
+            turn_count=len(fingerprints),
+            captured_ok=True,
+        )
+
+    @staticmethod
+    def _pane_shows_new_submitted_task(
+        captured: str,
+        message: str | None,
+        baseline: CodexSubmitBaseline | None,
+    ) -> str:
+        """Classify a POST-send capture relative to the pre-send ``baseline``.
+
+        This is the r5 dispatch-relative submission boundary. Returns one of:
+
+          * ``CODEX_SUBMIT_STATE_SUBMITTED`` — a submitted user turn is present
+            that was ABSENT from the baseline AND is attributable to the current
+            dispatch: a chip whose ``[Pasted Content N chars]`` count now exceeds
+            its baseline multiset count, OR (for messages long enough to have a
+            distinctive signature) a new turn whose text contains the task
+            signature, OR — when the task is too short for a signature — simply
+            ANY new submitted turn absent from the baseline (a short task still
+            produces a NEW turn artifact). Historical collisions are in the
+            baseline and excluded by construction (BLOCKER 1).
+          * ``CODEX_SUBMIT_STATE_INDETERMINATE`` — the baseline is missing/failed,
+            OR the post-send capture shows FEWER submitted turns than the
+            baseline watermark (turns evicted from the tail → the evidence window
+            is unreliable). Never treated as success; the caller re-observes
+            within a bound and, failing that, defers (BLOCKER 3: never a blind
+            Enter into a pane whose scrollback advanced past capture).
+          * ``""`` (empty) — no new submitted turn yet, but the window is intact
+            (watermark not shrunk). The caller consults the active-composer state
+            (stuck chip vs. cleared) to decide.
+
+        Wrap is normalized before comparison so a soft-wrapped submitted turn
+        matches its baseline/absent fingerprint (BLOCKER 2).
+        """
+        if baseline is None or not baseline.captured_ok:
+            # No dispatch-relative reference ⇒ cannot prove a NEW turn.
+            return CODEX_SUBMIT_STATE_INDETERMINATE
+        if not captured:
+            return CODEX_SUBMIT_STATE_INDETERMINATE
+
+        fingerprints, prompt_idx, chip_counts = CodexProvider._extract_submitted_turns(captured)
+        if prompt_idx == -1:
+            # No anchorable active composer: we cannot separate history from the
+            # live draft this frame. Do not guess; re-observe.
+            return CODEX_SUBMIT_STATE_INDETERMINATE
+
+        # BLOCKER 3 watermark: if the current capture shows FEWER submitted turns
+        # than the baseline, the tail evicted history — the window is unreliable
+        # and absence of the current turn is ambiguous. Indeterminate → bounded
+        # → defer; never a blind Enter into a busy/scrolled pane.
+        if len(fingerprints) < baseline.turn_count:
+            return CODEX_SUBMIT_STATE_INDETERMINATE
+
+        # A submitted turn NEW relative to the baseline (fingerprint set diff).
+        new_fingerprints = [fp for fp in fingerprints if fp not in baseline.turn_fingerprints]
+
+        # 1) Chip echo: a new [Pasted Content N chars] occurrence beyond the
+        #    baseline multiset for that exact N. A same-N repeat dispatch only
+        #    counts once the post-send count exceeds the baseline count, so a
+        #    pre-existing identical chip cannot confirm (BLOCKER 1: same-N).
+        post_chip_counter = Counter(
+            f"[Pasted Content {c} chars]" for c in chip_counts if c >= 0
+        )
+        for chip, post_count in post_chip_counter.items():
+            if post_count > baseline.chip_count(chip):
+                return CODEX_SUBMIT_STATE_SUBMITTED
+
+        if not new_fingerprints:
+            # No new submitted turn appeared; window intact. Defer to composer
+            # state (stuck/cleared) in the caller.
+            return ""
+
+        # 2) Raw-text echo: for a message long enough to have a distinctive
+        #    signature, require the signature to appear in a NEW turn so an
+        #    unrelated new line cannot coincidentally confirm.
         signature = CodexProvider._task_echo_signature(message)
-        if signature is None:
-            return False
-        history_blob = "\n".join(submitted_user_rows)
-        history_norm = CodexProvider._normalize_pane_text(history_blob)
-        return signature in history_norm
+        if signature is not None:
+            new_blob = CodexProvider._normalize_pane_text("\n".join(new_fingerprints))
+            if signature in new_blob:
+                return CODEX_SUBMIT_STATE_SUBMITTED
+            # A new turn appeared but it does not carry our signature: it is a
+            # DIFFERENT dispatch's turn, not ours. Window intact, ours not yet
+            # submitted → defer to composer state.
+            return ""
+
+        # 3) Short task (no signature): a short raw task still produces a NEW
+        #    submitted ``›`` turn absent from the baseline. Since the window is
+        #    intact (watermark not shrunk) and a turn we did not have before now
+        #    exists directly above the active composer, that is our submission
+        #    (BLOCKER 2: short fast-completions no longer false-defer).
+        return CODEX_SUBMIT_STATE_SUBMITTED
 
     @staticmethod
     def _normalize_pane_text(text: str) -> str:
@@ -2528,11 +2735,50 @@ class CodexProvider(BaseProvider):
             return None
         return norm[:CODEX_SUBMIT_TASK_SIGNATURE_CHARS]
 
+    def capture_submission_baseline(
+        self,
+        metadata: dict[str, Any],
+        backend: Any,
+    ) -> CodexSubmitBaseline:
+        """F435 r5: snapshot the pane BEFORE the paste for a dispatch-relative diff.
+
+        Called by the send seam immediately before ``backend.send_keys`` pastes
+        the task. The returned baseline records the submitted-user-turn
+        fingerprints and chip multiset already present, plus a turn-count
+        watermark. ``verify_submission_after_send`` then confirms submission ONLY
+        by a NEW submitted turn absent from this snapshot — so a historical turn,
+        an identical prior brief, or a same/different-N chip already on screen
+        cannot false-confirm the current unsent paste (BLOCKER 1).
+
+        A capture failure yields ``captured_ok=False`` (never raises here) so the
+        verifier degrades to indeterminate → bounded → defer rather than
+        manufacturing a confirmation from a missing reference.
+        """
+        session = metadata["tmux_session"]
+        window = metadata["tmux_window"]
+        try:
+            captured = backend.get_history(
+                session,
+                window,
+                tail_lines=CODEX_SUBMIT_BASELINE_TAIL_LINES,
+                strip_escapes=False,
+            )
+            captured = captured if isinstance(captured, str) else None
+        except Exception as exc:
+            logger.warning(
+                "F435 submit-verify: baseline capture failed for terminal %s: %s",
+                self.terminal_id,
+                exc,
+            )
+            captured = None
+        return self._build_submission_baseline(captured)
+
     def verify_submission_after_send(
         self,
         metadata: dict[str, Any],
         backend: Any,
         message: str | None = None,
+        baseline: "CodexSubmitBaseline | None" = None,
     ) -> None:
         """F435: confirm the pasted task SUBMITTED; re-Enter if it stuck.
 
@@ -2541,52 +2787,61 @@ class CodexProvider(BaseProvider):
         chip that never submits (the pane sits idle until the stalled-callback
         watchdog fires ~120s later). This confirms submission and recovers.
 
-        r4 rewrite (BLOCKERS 1/2/3): confirmation ANCHORS on a durable
-        SCROLLBACK-CONTENT boundary — the pasted task echoed as a SUBMITTED user
-        turn ABOVE the active composer (its collapsed ``[Pasted Content N
-        chars]`` chip, or its raw text). That boundary is positive, position-
-        stable evidence in BOTH directions; the Working spinner and the active-
-        composer chip are only SECONDARY corroboration. Each capture is
-        classified ``submitted`` / ``stuck`` / ``indeterminate``:
+        r5 rewrite — DISPATCH-RELATIVE BASELINE DIFF. Every prior round fell to
+        pane-content AMBIGUITY because the evidence had no dispatch-relative
+        boundary: r4's predicate scanned ALL captured history, so a historical
+        chip / identical brief / identical 40-char prefix false-confirmed the
+        current UNSENT chip (B1); wrapped continuations were discarded and short
+        tasks produced no signature (B2); and a 200-row tail could evict the
+        evidence while an unrelated active draft absorbed recovery Enters (B3).
 
-        * ``submitted`` — the pasted task is present as a submitted turn in
-          scrollback (PRIMARY, durable), or the Working/Thinking spinner is
-          visible (secondary). Either returns success.
-        * ``stuck`` — the active composer still carries the unsubmitted chip
-          AND no submitted turn is in scrollback yet. Re-send Enter.
-        * ``indeterminate`` — none of the above (stale pre-paste frame, mid-
-          redraw, or a FAILED capture). NOT success: re-observe within a bound.
+        r5 captures a BASELINE of the pane immediately BEFORE the paste
+        (``capture_submission_baseline`` → ``baseline``) and confirms submission
+        ONLY by a submitted user turn that is NEW relative to that baseline
+        (``_pane_shows_new_submitted_task``). Each capture is classified
+        ``submitted`` / ``stuck`` / ``indeterminate``:
 
-        Why this closes the r3 blockers:
+        * ``submitted`` — a submitted turn attributable to THIS dispatch that was
+          ABSENT from the baseline (new chip occurrence beyond the baseline
+          multiset, a new turn carrying the task signature, or — for a short task
+          with no signature — any new submitted turn while the window is intact),
+          or the Working/Thinking spinner. Returns success.
+        * ``stuck`` — the active composer still carries an unsubmitted chip that
+          OWNS this dispatch (its char-count matches our paste, or we have no
+          message to disambiguate) AND no new submitted turn exists. Re-Enter.
+        * ``indeterminate`` — a failed capture, a missing baseline, a pane whose
+          submitted-turn watermark SHRANK vs. baseline (tail eviction → window
+          unreliable, B3), or a chip on the active composer that does NOT own
+          this dispatch (an unrelated queued/steering draft — never Enter it,
+          B3). NOT success: re-observe within a bound, then defer.
 
-        * BLOCKER 1 (fast completed submit): a turn that submits AND finishes
-          before the first capture leaves no spinner and an empty active
-          composer, but the submitted turn is durably in scrollback — so it now
-          reads ``submitted`` instead of a false ``indeterminate``/defer.
-        * BLOCKER 2 (clear-alone false-commit): the chip→cleared latch is
-          REMOVED. A bare active-composer clear (unrelated wipe, cancel, TUI
-          reset) produces no submitted turn, so it never confirms; with retries
-          exhausted and no boundary, delivery stays UNCONFIRMED and raises.
-        * BLOCKER 3 (stale post-submit chip): a lagged capture that still shows
-          the chip on the active composer is checked for the scrollback
-          boundary FIRST — the submitted turn is already present, so the pane
-          reads ``submitted`` and NO further Enter is sent.
+        Why this closes the r4 blockers:
 
-        Flow: after the grace sleep, poll a bounded number of times for a
-        positive verdict. While ``stuck``, re-send Enter and re-verify with
-        bounded retries. If we never obtain a ``submitted`` observation —
-        including when every capture failed — delivery is UNCONFIRMED and we
-        raise ``CodexSubmitStuckError`` so the send seam aborts the dispatch and
-        surfaces a retry-safe ``DeliveryDeferredError`` rather than a
-        pretend-success.
+        * BLOCKER 1 — historical collisions live in the baseline and are excluded
+          by construction; only a NEW turn (or a chip count that EXCEEDS the
+          baseline multiset for that exact N) confirms. Repeat/identical briefs
+          no longer false-confirm an unsent chip.
+        * BLOCKER 2 — wrapped continuation rows are joined to their ``›`` head
+          before fingerprinting, so a wrapped submitted turn still matches; and a
+          short fast-completed task still produces a NEW submitted turn artifact
+          absent from the baseline, so it confirms instead of false-deferring.
+        * BLOCKER 3 — a shrunk watermark (eviction) is indeterminate → bounded →
+          defer, never a blind Enter into a busy pane; and a recovery Enter fires
+          only when the active chip OWNS this dispatch, so an unrelated active
+          draft is never steered mid-run.
 
-        Idempotent by construction: a re-Enter is only sent while the composer
-        is ``stuck`` (chip on the active composer AND no submitted turn in
-        scrollback), so a composer that already submitted is never blind-Entered
-        — even on a stale chip frame.
+        Idempotent by construction: a re-Enter is only sent while the composer is
+        ``stuck`` (a dispatch-owned chip on the active composer AND no new
+        submitted turn), so a composer that already submitted — even on a stale
+        chip frame whose submitted turn is already in scrollback — is never
+        blind-Entered.
         """
         session = metadata["tmux_session"]
         window = metadata["tmux_window"]
+        # Expected active-composer chip count for THIS dispatch (large pastes
+        # collapse to a chip). ``None`` when we have no message to disambiguate;
+        # in that case any active chip is treated as ours (single-dispatch case).
+        own_chip_count = len(message) if message else None
 
         def _capture() -> str | None:
             """Capture the pane, or ``None`` on failure (delivery-unconfirmed).
@@ -2612,32 +2867,64 @@ class CodexProvider(BaseProvider):
                 )
                 return None
 
-        def _observe() -> str:
-            """One capture → submitted / stuck / indeterminate.
+        def _chip_owns_dispatch(captured: str) -> bool:
+            """Whether the ACTIVE-composer chip belongs to THIS dispatch (B3).
 
-            PRIMARY signal: the pasted task echoed as a submitted turn in
-            scrollback. It is checked FIRST and in every branch so a stale
-            active-composer chip on the same frame cannot cause a spurious
-            re-Enter (BLOCKER 3), a fast-completed turn is confirmed with no
-            spinner (BLOCKER 1), and a bare clear with no submitted turn never
-            confirms (BLOCKER 2).
+            A recovery Enter is only safe on a chip we ourselves pasted. If the
+            active chip's char-count does not match our paste, it is an unrelated
+            queued/steering draft and must NOT be Entered.
+            """
+            active_n = self._active_composer_chip_count(captured)
+            if active_n is None:
+                return False
+            if own_chip_count is None:
+                # No message to disambiguate: single-dispatch assumption.
+                return True
+            # Codex's chip counts the pasted BYTE/char length; a bracketed paste
+            # can differ from ``len(message)`` by trailing-newline handling, so
+            # allow a tiny tolerance rather than an exact match.
+            return abs(active_n - own_chip_count) <= 1
+
+        def _observe() -> str:
+            """One capture → submitted / stuck / indeterminate (dispatch-relative).
+
+            PRIMARY signal: a NEW submitted turn relative to the pre-send
+            baseline. Checked FIRST so a stale active-composer chip whose
+            submitted turn is already in scrollback cannot cause a spurious
+            re-Enter (BLOCKER 3), a fast-completed short/wrapped turn is confirmed
+            (BLOCKERs 1/2), and a bare clear or historical collision never
+            confirms (BLOCKERs 1/2).
             """
             captured = _capture()
             if captured is None:
                 return CODEX_SUBMIT_STATE_INDETERMINATE  # capture failed
-            if self._pane_shows_submitted_task(captured, message):
-                return CODEX_SUBMIT_STATE_SUBMITTED  # durable scrollback boundary
+            new_task_state = self._pane_shows_new_submitted_task(captured, message, baseline)
+            if new_task_state == CODEX_SUBMIT_STATE_SUBMITTED:
+                return CODEX_SUBMIT_STATE_SUBMITTED  # durable dispatch-relative boundary
+            # If OUR chip is still on the active composer with no NEW submitted
+            # turn, we are genuinely stuck — this takes precedence over an
+            # ambient Working spinner (which may belong to an unrelated
+            # concurrently-running turn, not our unsent paste). Only classify
+            # stuck when the active chip OWNS this dispatch (BLOCKER 3: never
+            # Enter an unrelated draft).
+            if new_task_state == "" and self._pane_shows_pasted_chip(captured):
+                if _chip_owns_dispatch(captured):
+                    return CODEX_SUBMIT_STATE_STUCK
+                return CODEX_SUBMIT_STATE_INDETERMINATE
+            # Secondary positive signal: the Working/Thinking spinner means the
+            # agent BEGAN a turn — reachable only after a paste submitted, and a
+            # stale pre-paste frame can never show it. Checked independently of
+            # the composer anchor so a spinner that has replaced the composer row
+            # (no ``›`` to anchor) still confirms a fast submit. Only consulted
+            # once we've ruled out our own chip still being stuck above.
             if self._pane_shows_working(captured):
-                return CODEX_SUBMIT_STATE_SUBMITTED  # secondary: turn started
-            if self._pane_shows_pasted_chip(captured):
-                # Chip on the ACTIVE composer and no submitted turn above it:
-                # genuinely still drafted. (If a submitted turn were present we
-                # would have returned SUBMITTED above — that is the stale-frame
-                # guard for BLOCKER 3.)
-                return CODEX_SUBMIT_STATE_STUCK
-            # Anything else — including a bare cleared/empty composer with no
-            # submitted turn in scrollback — is NOT evidence of submission
-            # (BLOCKER 2). Do not commit; re-observe within the bound.
+                return CODEX_SUBMIT_STATE_SUBMITTED
+            if new_task_state == CODEX_SUBMIT_STATE_INDETERMINATE:
+                # Missing baseline, shrunk watermark (eviction), or no anchorable
+                # composer this frame. Never guess; re-observe within the bound.
+                return CODEX_SUBMIT_STATE_INDETERMINATE
+            # A bare cleared/empty composer with no NEW submitted turn is NOT
+            # evidence of submission (BLOCKER 2). Do not commit; re-observe.
             return CODEX_SUBMIT_STATE_INDETERMINATE
 
         def _poll_state() -> str:
@@ -2663,12 +2950,13 @@ class CodexProvider(BaseProvider):
 
         for attempt in range(1, CODEX_SUBMIT_VERIFY_MAX_RETRIES + 1):
             if state != CODEX_SUBMIT_STATE_STUCK:
-                # No positive verdict yet: either a stale/mid-redraw frame or a
-                # failed capture (indeterminate). We must NOT blind-Enter an
-                # unobservable composer (could double-submit) and must NOT
-                # pretend-commit. Re-poll one bounded round; if it resolves to
-                # submitted we are done, otherwise fall through toward the
-                # unconfirmed raise.
+                # No positive verdict yet: either a stale/mid-redraw frame, a
+                # failed capture, an evicted window, or an unrelated draft owning
+                # the composer (all indeterminate). We must NOT blind-Enter an
+                # unobservable/unowned composer (could double-submit or steer an
+                # unrelated draft) and must NOT pretend-commit. Re-poll one
+                # bounded round; if it resolves to submitted we are done,
+                # otherwise fall through toward the unconfirmed raise.
                 logger.warning(
                     "F435 submit-verify: submission unconfirmed on terminal %s "
                     "(attempt %d/%d, state=%s); re-polling without blind Enter",
@@ -2688,7 +2976,7 @@ class CodexProvider(BaseProvider):
                     return
                 continue
 
-            # state == STUCK: the chip is on the active composer and no
+            # state == STUCK: our chip is on the active composer and no NEW
             # submitted turn is in scrollback. Re-send Enter.
             logger.warning(
                 "F435 submit-verify: paste chip still drafted on terminal %s "
@@ -2718,8 +3006,9 @@ class CodexProvider(BaseProvider):
         raise CodexSubmitStuckError(
             f"Codex terminal {self.terminal_id} did not confirm submission of the "
             f"pasted task after {CODEX_SUBMIT_VERIFY_MAX_RETRIES} recovery attempts; "
-            f"the last observed composer state was '{state}' (no submitted turn in "
-            f"scrollback and no working transition), so delivery is unconfirmed"
+            f"the last observed composer state was '{state}' (no NEW submitted turn "
+            f"relative to the pre-send baseline and no working transition), so "
+            f"delivery is unconfirmed"
         )
 
     @staticmethod

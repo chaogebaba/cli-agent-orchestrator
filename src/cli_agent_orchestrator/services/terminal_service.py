@@ -4512,6 +4512,14 @@ def send_input(
         try:
             if provider:
                 provider.pre_paste_gate()
+            # F435 r5: snapshot the pane BEFORE the paste so submission is
+            # confirmed by a NEW submitted turn relative to this baseline
+            # (dispatch-relative), not by an absolute pane pattern that a
+            # historical/identical turn could satisfy. No-op (None) for
+            # non-codex providers.
+            submit_baseline = (
+                provider.capture_submission_baseline(metadata, backend) if provider else None
+            )
             backend.send_keys(
                 metadata["tmux_session"],
                 metadata["tmux_window"],
@@ -4528,7 +4536,9 @@ def send_input(
             # Provider-scoped: the default hook is a no-op, so non-codex
             # providers are unaffected.
             if provider:
-                provider.verify_submission_after_send(metadata, backend, message=message)
+                provider.verify_submission_after_send(
+                    metadata, backend, message=message, baseline=submit_baseline
+                )
         except CodexSubmitStuckError as stuck:
             status_monitor.abort_dispatch(dispatch_txn)
             # Retry-safe deferred outcome: the dispatch is rolled back and the
@@ -4706,6 +4716,11 @@ def send_prepared_input(
     status_monitor.bind_dispatch_provider(terminal_id, provider)
     dispatch_txn: DispatchTxn = status_monitor.begin_dispatch(terminal_id)
     try:
+        # F435 r5: snapshot the pane BEFORE the paste for a dispatch-relative
+        # submission diff (no-op None for non-codex providers).
+        submit_baseline = (
+            provider.capture_submission_baseline(metadata, backend) if provider else None
+        )
         backend.send_keys(
             metadata["tmux_session"],
             metadata["tmux_window"],
@@ -4727,7 +4742,9 @@ def send_prepared_input(
             # mark_injection_completed / on_submitted publish the submission
             # boundary, and only then is the human draft restored.
             if provider:
-                provider.verify_submission_after_send(metadata, backend, message=message)
+                provider.verify_submission_after_send(
+                    metadata, backend, message=message, baseline=submit_baseline
+                )
         except CodexSubmitStuckError as stuck:
             status_monitor.abort_dispatch(dispatch_txn)
             raise DeliveryDeferredError(str(stuck)) from stuck
