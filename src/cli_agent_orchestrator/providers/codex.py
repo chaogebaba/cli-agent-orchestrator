@@ -481,33 +481,45 @@ CODEX_SUBMIT_TASK_SIGNATURE_CHARS = 40
 # is itself observable as a shrunk watermark rather than a silent miss.
 CODEX_SUBMIT_BASELINE_TAIL_LINES = 500
 
+# ---------------------------------------------------------------------------
+# r6 STRUCTURAL ROLLOUT SIGNAL — replaces pane heuristics as PRIMARY signal.
+# ---------------------------------------------------------------------------
+# Maximum time (seconds) to poll the rollout JSONL for the user-event record.
+# This bounds the total verify window. The rollout write is typically flushed
+# within 1–2s of the submit landing in Codex, but can lag under load.
+CODEX_ROLLOUT_POLL_TIMEOUT_SECONDS = 12.0
+# Interval between rollout file polls (seconds).
+CODEX_ROLLOUT_POLL_INTERVAL_SECONDS = 0.3
+# Maximum time to wait for the rollout file to be created (fresh session start
+# where the file may not exist at dispatch time yet).
+CODEX_ROLLOUT_CREATION_TIMEOUT_SECONDS = 8.0
+
 
 @dataclass(frozen=True)
 class CodexSubmitBaseline:
-    """A dispatch-relative snapshot of the pane taken BEFORE the paste/submit.
+    """A dispatch-relative snapshot taken BEFORE the paste/submit.
 
-    Captured by ``CodexProvider.capture_submission_baseline`` at the send seam,
-    immediately before ``backend.send_keys`` pastes the task, and threaded into
-    ``verify_submission_after_send``. Submission is confirmed ONLY by a
-    submitted user turn that is NOT in this snapshot — so any pre-existing
-    (historical) turn, chip, or identical brief cannot false-confirm the current
-    unsent paste (BLOCKER 1).
+    r6 (DIRECTION CHANGE): the PRIMARY confirmation signal is now STRUCTURAL —
+    the Codex session rollout JSONL file gains a user-turn record whose content
+    matches the dispatched message. Pane-content heuristics are retained ONLY as
+    a fast-path early-exit hint (if pane clearly shows submission, skip waiting
+    for the rollout write to flush). Correctness NEVER depends on pane content.
 
     Fields:
-      * ``turn_fingerprints`` — normalized, wrap-joined content of every
-        submitted ``›``/``»`` user turn already in scrollback at capture time.
-        A post-send fingerprint absent from this set is a NEW turn.
-      * ``chip_counter`` — multiset of ``[Pasted Content N chars]`` chip strings
-        already present as submitted turns, so a repeat dispatch of the SAME N
-        is only "new" when the post-send count exceeds the baseline count.
-      * ``turn_count`` — number of submitted user turns at capture (watermark).
-        A post-send capture whose count is BELOW this means turns were evicted
-        from the tail → the evidence window is unreliable → indeterminate (B3).
-      * ``captured_ok`` — False when the baseline capture itself failed. A
-        missing baseline forces every post-send verdict to be treated as
-        indeterminate (never success), exactly like a failed post-send capture.
+      * ``rollout_path`` — resolved Path to the session's rollout JSONL file at
+        baseline time.  ``None`` if the file could not be resolved (poll for
+        creation during verify).
+      * ``rollout_offset`` — byte offset at end of the rollout file at baseline
+        time.  New user events from this dispatch will appear AFTER this offset.
+        A dispatch-relative cursor: any record written after this point is new.
+      * ``turn_fingerprints`` — (legacy hint) normalized pane turn fingerprints.
+      * ``chip_counter`` — (legacy hint) chip multiset.
+      * ``turn_count`` — (legacy hint) submitted turn count watermark.
+      * ``captured_ok`` — (legacy hint) False if pane baseline capture failed.
     """
 
+    rollout_path: "Path | None" = None
+    rollout_offset: int = 0
     turn_fingerprints: frozenset[str] = field(default_factory=frozenset)
     chip_counter: tuple[tuple[str, int], ...] = ()
     turn_count: int = 0
@@ -1677,6 +1689,150 @@ class CodexProvider(BaseProvider):
         ):
             raise TerminalArtifactValidation("session_artifact_identity_invalid")
 
+    # ------------------------------------------------------------------
+    # F435 r6 — STRUCTURAL rollout confirmation helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_rollout_file(self, session_uuid: str | None) -> Path | None:
+        """Locate the rollout JSONL for the given session UUID.
+
+        Returns the single matching path, or ``None`` if not (yet) resolvable.
+        Handles: file not yet created, multiple sessions in CODEX_HOME (pins by
+        UUID), ambiguous matches (returns None to avoid false positives).
+        """
+        if not session_uuid:
+            return None
+        sessions_dir = _resolved_codex_home(getattr(self, "terminal_id", None)) / "sessions"
+        if not sessions_dir.is_dir():
+            return None
+        matches = list(sessions_dir.glob(f"**/rollout-*{session_uuid}*.jsonl"))
+        if len(matches) == 1:
+            return matches[0]
+        # Ambiguous or missing — caller must poll for creation or abort.
+        return None
+
+    @staticmethod
+    def _rollout_file_offset(rollout_path: Path | None) -> int:
+        """Return current end-of-file byte offset, or 0 if unresolvable."""
+        if rollout_path is None:
+            return 0
+        try:
+            return rollout_path.stat().st_size
+        except OSError:
+            return 0
+
+    @staticmethod
+    def _normalize_for_match(text: str) -> str:
+        """Collapse whitespace for content comparison (rollout vs dispatch)."""
+        return re.sub(r"\s+", " ", text).strip()
+
+    @classmethod
+    def _rollout_has_user_event(
+        cls,
+        rollout_path: Path | None,
+        offset: int,
+        message: str,
+    ) -> bool:
+        """Check if the rollout JSONL has a user-turn record matching ``message``.
+
+        Reads only COMPLETE lines (ending in newline) starting from ``offset``
+        to handle partial-line writes safely. Matches by normalized content
+        comparison (whitespace-collapsed equality or containment for long
+        messages).
+
+        Returns True if a matching user event is found after offset.
+        """
+        if rollout_path is None or not message:
+            return False
+        try:
+            if not rollout_path.exists():
+                return False
+            file_size = rollout_path.stat().st_size
+            if file_size <= offset:
+                return False
+            with rollout_path.open("r", encoding="utf-8") as f:
+                f.seek(offset)
+                raw = f.read()
+        except OSError:
+            return False
+
+        # Only process complete lines (ending in \n) — a partial last line is
+        # an in-progress write and must not be parsed.
+        norm_message = cls._normalize_for_match(message)
+        for line in raw.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            # Check all known Codex user-turn record formats:
+            for candidate in cls._extract_rollout_user_texts(record):
+                norm_candidate = cls._normalize_for_match(candidate)
+                if norm_candidate == norm_message:
+                    return True
+                # For very long messages that may get truncated in the rollout,
+                # check containment of a distinctive prefix.
+                if len(norm_message) > 40 and norm_candidate and (
+                    norm_message[:200] in norm_candidate
+                    or norm_candidate[:200] in norm_message
+                ):
+                    return True
+        return False
+
+    @staticmethod
+    def _extract_rollout_user_texts(record: dict) -> list[str]:
+        """Extract user-message text candidates from a rollout JSONL record.
+
+        Covers the known Codex rollout formats:
+          * type=event_msg, payload.type=user_message, payload.message=<str>
+          * type=response_item, payload.role=user, payload.content=[...]
+          * type=user, message=<str or dict with content>
+        """
+        texts: list[str] = []
+        record_type = record.get("type")
+        payload = record.get("payload")
+
+        if record_type == "event_msg" and isinstance(payload, dict):
+            if payload.get("type") == "user_message":
+                msg = payload.get("message")
+                if isinstance(msg, str):
+                    texts.append(msg)
+
+        elif record_type == "response_item" and isinstance(payload, dict):
+            if payload.get("role") == "user":
+                content = payload.get("content")
+                if isinstance(content, str):
+                    texts.append(content)
+                elif isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict):
+                            text = item.get("text")
+                            if isinstance(text, str):
+                                texts.append(text)
+                        elif isinstance(item, str):
+                            texts.append(item)
+
+        elif record_type == "user":
+            msg = record.get("message")
+            if isinstance(msg, str):
+                texts.append(msg)
+            elif isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, str):
+                    texts.append(content)
+                elif isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict):
+                            text = item.get("text")
+                            if isinstance(text, str):
+                                texts.append(text)
+                        elif isinstance(item, str):
+                            texts.append(item)
+
+        return texts
+
     def auth_state_path(self) -> Path | None:
         return _resolved_codex_home(getattr(self, "terminal_id", None)) / "auth.json"
 
@@ -2740,20 +2896,22 @@ class CodexProvider(BaseProvider):
         metadata: dict[str, Any],
         backend: Any,
     ) -> CodexSubmitBaseline:
-        """F435 r5: snapshot the pane BEFORE the paste for a dispatch-relative diff.
+        """F435 r6: snapshot rollout offset + pane BEFORE the paste.
 
-        Called by the send seam immediately before ``backend.send_keys`` pastes
-        the task. The returned baseline records the submitted-user-turn
-        fingerprints and chip multiset already present, plus a turn-count
-        watermark. ``verify_submission_after_send`` then confirms submission ONLY
-        by a NEW submitted turn absent from this snapshot — so a historical turn,
-        an identical prior brief, or a same/different-N chip already on screen
-        cannot false-confirm the current unsent paste (BLOCKER 1).
+        The PRIMARY dispatch-relative cursor is the rollout file byte offset —
+        any user-turn record written after this offset is from THIS dispatch.
+        The pane snapshot is a FAST-PATH HINT only: if the pane clearly shows
+        submission (new chip/turn), we skip waiting for the rollout flush.
+        Correctness never depends on pane content.
 
-        A capture failure yields ``captured_ok=False`` (never raises here) so the
-        verifier degrades to indeterminate → bounded → defer rather than
-        manufacturing a confirmation from a missing reference.
+        Called by the send seam immediately before ``backend.send_keys``.
         """
+        # --- Structural rollout baseline (PRIMARY) ---
+        session_uuid = metadata.get("provider_session_id")
+        rollout_path = self._resolve_rollout_file(session_uuid)
+        rollout_offset = self._rollout_file_offset(rollout_path)
+
+        # --- Pane baseline (fast-path hint) ---
         session = metadata["tmux_session"]
         window = metadata["tmux_window"]
         try:
@@ -2771,7 +2929,18 @@ class CodexProvider(BaseProvider):
                 exc,
             )
             captured = None
-        return self._build_submission_baseline(captured)
+
+        # Build pane hint portion
+        pane_baseline = self._build_submission_baseline(captured)
+        # Merge rollout state into the baseline
+        return CodexSubmitBaseline(
+            rollout_path=rollout_path,
+            rollout_offset=rollout_offset,
+            turn_fingerprints=pane_baseline.turn_fingerprints,
+            chip_counter=pane_baseline.chip_counter,
+            turn_count=pane_baseline.turn_count,
+            captured_ok=pane_baseline.captured_ok,
+        )
 
     def verify_submission_after_send(
         self,
@@ -2780,207 +2949,187 @@ class CodexProvider(BaseProvider):
         message: str | None = None,
         baseline: "CodexSubmitBaseline | None" = None,
     ) -> None:
-        """F435: confirm the pasted task SUBMITTED; re-Enter if it stuck.
+        """F435 r6: confirm the pasted task SUBMITTED; re-Enter if it stuck.
 
-        After a bracketed paste + submit Enter, a render race can drop the
-        Enter, leaving the task drafted as a ``[Pasted Content NNNN chars]``
-        chip that never submits (the pane sits idle until the stalled-callback
-        watchdog fires ~120s later). This confirms submission and recovers.
+        DIRECTION CHANGE (r6): the PRIMARY confirmation signal is now STRUCTURAL
+        — the Codex session rollout JSONL file gains a user-turn record whose
+        content matches the dispatched message. This is content-unambiguous: it
+        cannot be spoofed by pane reflow, identical repeats, chip eviction, or
+        drafts.
 
-        r5 rewrite — DISPATCH-RELATIVE BASELINE DIFF. Every prior round fell to
-        pane-content AMBIGUITY because the evidence had no dispatch-relative
-        boundary: r4's predicate scanned ALL captured history, so a historical
-        chip / identical brief / identical 40-char prefix false-confirmed the
-        current UNSENT chip (B1); wrapped continuations were discarded and short
-        tasks produced no signature (B2); and a 200-row tail could evict the
-        evidence while an unrelated active draft absorbed recovery Enters (B3).
+        The pane baseline is retained as a FAST-PATH HINT only: if the pane
+        clearly shows submission early, we return immediately without waiting
+        for the rollout flush. Correctness NEVER depends on pane content.
 
-        r5 captures a BASELINE of the pane immediately BEFORE the paste
-        (``capture_submission_baseline`` → ``baseline``) and confirms submission
-        ONLY by a submitted user turn that is NEW relative to that baseline
-        (``_pane_shows_new_submitted_task``). Each capture is classified
-        ``submitted`` / ``stuck`` / ``indeterminate``:
+        Recovery Enter fires ONLY if:
+          1. The rollout file has NO matching user event at the deadline, AND
+          2. The pane shows a stuck chip owned by this dispatch, AND
+          3. A FINAL rollout re-check immediately before sending confirms no
+             match (closes the SHOULD double-send race: if the original submit
+             landed between observation and action, the re-check catches it).
 
-        * ``submitted`` — a submitted turn attributable to THIS dispatch that was
-          ABSENT from the baseline (new chip occurrence beyond the baseline
-          multiset, a new turn carrying the task signature, or — for a short task
-          with no signature — any new submitted turn while the window is intact),
-          or the Working/Thinking spinner. Returns success.
-        * ``stuck`` — the active composer still carries an unsubmitted chip that
-          OWNS this dispatch (its char-count matches our paste, or we have no
-          message to disambiguate) AND no new submitted turn exists. Re-Enter.
-        * ``indeterminate`` — a failed capture, a missing baseline, a pane whose
-          submitted-turn watermark SHRANK vs. baseline (tail eviction → window
-          unreliable, B3), or a chip on the active composer that does NOT own
-          this dispatch (an unrelated queued/steering draft — never Enter it,
-          B3). NOT success: re-observe within a bound, then defer.
-
-        Why this closes the r4 blockers:
-
-        * BLOCKER 1 — historical collisions live in the baseline and are excluded
-          by construction; only a NEW turn (or a chip count that EXCEEDS the
-          baseline multiset for that exact N) confirms. Repeat/identical briefs
-          no longer false-confirm an unsent chip.
-        * BLOCKER 2 — wrapped continuation rows are joined to their ``›`` head
-          before fingerprinting, so a wrapped submitted turn still matches; and a
-          short fast-completed task still produces a NEW submitted turn artifact
-          absent from the baseline, so it confirms instead of false-deferring.
-        * BLOCKER 3 — a shrunk watermark (eviction) is indeterminate → bounded →
-          defer, never a blind Enter into a busy pane; and a recovery Enter fires
-          only when the active chip OWNS this dispatch, so an unrelated active
-          draft is never steered mid-run.
-
-        Idempotent by construction: a re-Enter is only sent while the composer is
-        ``stuck`` (a dispatch-owned chip on the active composer AND no new
-        submitted turn), so a composer that already submitted — even on a stale
-        chip frame whose submitted turn is already in scrollback — is never
-        blind-Entered.
+        This closes all r5 blockers:
+          * B1 (partial-baseline false-commit): rollout match is exact content,
+            not pane fingerprint diffing.
+          * B2 (wrap/reflow): rollout content is never wrapped.
+          * B3 (same-length ownership): rollout match is by content, not length.
+          * B4 (double-send race): re-check rollout immediately before Enter.
+          * Identical raw repeats: each dispatch writes a distinct rollout record;
+            even byte-identical messages produce separate events (append, not
+            dedup).
         """
         session = metadata["tmux_session"]
         window = metadata["tmux_window"]
-        # Expected active-composer chip count for THIS dispatch (large pastes
-        # collapse to a chip). ``None`` when we have no message to disambiguate;
-        # in that case any active chip is treated as ours (single-dispatch case).
         own_chip_count = len(message) if message else None
 
-        def _capture() -> str | None:
-            """Capture the pane, or ``None`` on failure (delivery-unconfirmed).
+        # --- Resolve rollout file (handle not-yet-created) ---
+        rollout_path = baseline.rollout_path if baseline else None
+        rollout_offset = baseline.rollout_offset if baseline else 0
+        session_uuid = metadata.get("provider_session_id")
 
-            A failed capture is NOT an empty pane — conflating the two lets an
-            unobservable send masquerade as an empty (submitted-looking)
-            composer. Returning ``None`` keeps capture failure classified as
-            indeterminate so it can never commit as success.
+        def _ensure_rollout_path() -> Path | None:
+            """Resolve or poll for rollout file creation."""
+            nonlocal rollout_path
+            if rollout_path is not None:
+                return rollout_path
+            # File may not exist yet at dispatch (fresh session). Poll for creation.
+            deadline = time.monotonic() + CODEX_ROLLOUT_CREATION_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                rollout_path = self._resolve_rollout_file(session_uuid)
+                if rollout_path is not None:
+                    return rollout_path
+                time.sleep(CODEX_ROLLOUT_POLL_INTERVAL_SECONDS)
+            return None
+
+        def _rollout_confirms() -> bool:
+            """Check if rollout has a matching user event after baseline offset."""
+            rp = _ensure_rollout_path()
+            return self._rollout_has_user_event(rp, rollout_offset, message or "")
+
+        def _pane_hint_submitted() -> bool:
+            """Fast-path pane hint: check if pane clearly shows submission.
+
+            This is a CHEAP EARLY EXIT only. A False return means nothing —
+            the rollout is the authority. A True return is trusted only because
+            the pane showing a new submitted turn is a sufficient (though not
+            necessary) condition — if the turn made it to the pane, it certainly
+            made it to the rollout (the rollout write happens first).
             """
             try:
                 captured = backend.get_history(
-                    session,
-                    window,
+                    session, window,
                     tail_lines=PYTE_SCREEN_ROWS,
                     strip_escapes=False,
                 )
-                return captured if isinstance(captured, str) else None
-            except Exception as exc:
-                logger.warning(
-                    "F435 submit-verify: pane capture failed for terminal %s: %s",
-                    self.terminal_id,
-                    exc,
+                if not isinstance(captured, str):
+                    return False
+            except Exception:
+                return False
+            # Check pane for new submitted turn (fast path)
+            new_task_state = self._pane_shows_new_submitted_task(
+                captured, message, baseline
+            )
+            if new_task_state == CODEX_SUBMIT_STATE_SUBMITTED:
+                return True
+            # Also check the Working/Thinking spinner
+            if self._pane_shows_working(captured):
+                return True
+            return False
+
+        def _pane_shows_stuck_chip() -> bool:
+            """Check if the pane has a stuck chip owned by this dispatch."""
+            try:
+                captured = backend.get_history(
+                    session, window,
+                    tail_lines=PYTE_SCREEN_ROWS,
+                    strip_escapes=False,
                 )
-                return None
-
-        def _chip_owns_dispatch(captured: str) -> bool:
-            """Whether the ACTIVE-composer chip belongs to THIS dispatch (B3).
-
-            A recovery Enter is only safe on a chip we ourselves pasted. If the
-            active chip's char-count does not match our paste, it is an unrelated
-            queued/steering draft and must NOT be Entered.
-            """
+                if not isinstance(captured, str):
+                    return False
+            except Exception:
+                return False
+            if not self._pane_shows_pasted_chip(captured):
+                return False
+            # Verify ownership
             active_n = self._active_composer_chip_count(captured)
             if active_n is None:
                 return False
             if own_chip_count is None:
-                # No message to disambiguate: single-dispatch assumption.
                 return True
-            # Codex's chip counts the pasted BYTE/char length; a bracketed paste
-            # can differ from ``len(message)`` by trailing-newline handling, so
-            # allow a tiny tolerance rather than an exact match.
             return abs(active_n - own_chip_count) <= 1
 
-        def _observe() -> str:
-            """One capture → submitted / stuck / indeterminate (dispatch-relative).
-
-            PRIMARY signal: a NEW submitted turn relative to the pre-send
-            baseline. Checked FIRST so a stale active-composer chip whose
-            submitted turn is already in scrollback cannot cause a spurious
-            re-Enter (BLOCKER 3), a fast-completed short/wrapped turn is confirmed
-            (BLOCKERs 1/2), and a bare clear or historical collision never
-            confirms (BLOCKERs 1/2).
-            """
-            captured = _capture()
-            if captured is None:
-                return CODEX_SUBMIT_STATE_INDETERMINATE  # capture failed
-            new_task_state = self._pane_shows_new_submitted_task(captured, message, baseline)
-            if new_task_state == CODEX_SUBMIT_STATE_SUBMITTED:
-                return CODEX_SUBMIT_STATE_SUBMITTED  # durable dispatch-relative boundary
-            # If OUR chip is still on the active composer with no NEW submitted
-            # turn, we are genuinely stuck — this takes precedence over an
-            # ambient Working spinner (which may belong to an unrelated
-            # concurrently-running turn, not our unsent paste). Only classify
-            # stuck when the active chip OWNS this dispatch (BLOCKER 3: never
-            # Enter an unrelated draft).
-            if new_task_state == "" and self._pane_shows_pasted_chip(captured):
-                if _chip_owns_dispatch(captured):
-                    return CODEX_SUBMIT_STATE_STUCK
-                return CODEX_SUBMIT_STATE_INDETERMINATE
-            # Secondary positive signal: the Working/Thinking spinner means the
-            # agent BEGAN a turn — reachable only after a paste submitted, and a
-            # stale pre-paste frame can never show it. Checked independently of
-            # the composer anchor so a spinner that has replaced the composer row
-            # (no ``›`` to anchor) still confirms a fast submit. Only consulted
-            # once we've ruled out our own chip still being stuck above.
-            if self._pane_shows_working(captured):
-                return CODEX_SUBMIT_STATE_SUBMITTED
-            if new_task_state == CODEX_SUBMIT_STATE_INDETERMINATE:
-                # Missing baseline, shrunk watermark (eviction), or no anchorable
-                # composer this frame. Never guess; re-observe within the bound.
-                return CODEX_SUBMIT_STATE_INDETERMINATE
-            # A bare cleared/empty composer with no NEW submitted turn is NOT
-            # evidence of submission (BLOCKER 2). Do not commit; re-observe.
-            return CODEX_SUBMIT_STATE_INDETERMINATE
-
-        def _poll_state() -> str:
-            """Poll for a POSITIVE submitted/stuck verdict within a bound.
-
-            Returns the first ``submitted`` or ``stuck`` verdict seen; if every
-            poll is indeterminate (stale frame / capture failure), returns
-            ``indeterminate`` — the caller must NOT treat that as success.
-            """
-            state = CODEX_SUBMIT_STATE_INDETERMINATE
-            for poll in range(CODEX_SUBMIT_VERIFY_POLL_ATTEMPTS):
-                state = _observe()
-                if state != CODEX_SUBMIT_STATE_INDETERMINATE:
-                    return state
-                if poll < CODEX_SUBMIT_VERIFY_POLL_ATTEMPTS - 1:
-                    time.sleep(CODEX_SUBMIT_VERIFY_POLL_INTERVAL_SECONDS)
-            return state
-
+        # --- Main verification loop ---
         time.sleep(CODEX_SUBMIT_VERIFY_GRACE_SECONDS)
-        state = _poll_state()
-        if state == CODEX_SUBMIT_STATE_SUBMITTED:
-            return  # Positive submission evidence — no recovery, no extra Enter.
 
+        # Fast-path: pane hint check (cheap early exit)
+        if _pane_hint_submitted():
+            logger.info(
+                "F435 submit-verify: terminal %s confirmed via pane fast-path hint",
+                self.terminal_id,
+            )
+            return
+
+        # Primary signal: poll rollout file for the user event
+        poll_deadline = time.monotonic() + CODEX_ROLLOUT_POLL_TIMEOUT_SECONDS
+        while time.monotonic() < poll_deadline:
+            if _rollout_confirms():
+                logger.info(
+                    "F435 submit-verify: terminal %s confirmed via rollout "
+                    "structural signal",
+                    self.terminal_id,
+                )
+                return
+            # Check pane hint on each iteration as a fast exit
+            if _pane_hint_submitted():
+                logger.info(
+                    "F435 submit-verify: terminal %s confirmed via pane hint "
+                    "during rollout poll",
+                    self.terminal_id,
+                )
+                return
+            time.sleep(CODEX_ROLLOUT_POLL_INTERVAL_SECONDS)
+
+        # Rollout poll exhausted without confirmation. Check if stuck.
+        # Recovery Enter fires ONLY if pane shows a stuck owned chip AND
+        # a final rollout re-check still shows no match.
         for attempt in range(1, CODEX_SUBMIT_VERIFY_MAX_RETRIES + 1):
-            if state != CODEX_SUBMIT_STATE_STUCK:
-                # No positive verdict yet: either a stale/mid-redraw frame, a
-                # failed capture, an evicted window, or an unrelated draft owning
-                # the composer (all indeterminate). We must NOT blind-Enter an
-                # unobservable/unowned composer (could double-submit or steer an
-                # unrelated draft) and must NOT pretend-commit. Re-poll one
-                # bounded round; if it resolves to submitted we are done,
-                # otherwise fall through toward the unconfirmed raise.
+            if not _pane_shows_stuck_chip():
+                # No stuck chip visible — cannot recover with Enter. The task
+                # may have submitted but the rollout flush is slow, OR the pane
+                # is in an indeterminate state. Re-check rollout one more time.
                 logger.warning(
-                    "F435 submit-verify: submission unconfirmed on terminal %s "
-                    "(attempt %d/%d, state=%s); re-polling without blind Enter",
+                    "F435 submit-verify: terminal %s no stuck chip visible "
+                    "(attempt %d/%d); re-checking rollout",
                     self.terminal_id,
                     attempt,
                     CODEX_SUBMIT_VERIFY_MAX_RETRIES,
-                    state,
                 )
                 time.sleep(CODEX_SUBMIT_VERIFY_BACKOFF_SECONDS * attempt)
-                state = _poll_state()
-                if state == CODEX_SUBMIT_STATE_SUBMITTED:
+                if _rollout_confirms():
                     logger.info(
-                        "F435 submit-verify: terminal %s confirmed submitted after "
-                        "re-poll",
+                        "F435 submit-verify: terminal %s confirmed via rollout "
+                        "after extended wait",
                         self.terminal_id,
                     )
                     return
                 continue
 
-            # state == STUCK: our chip is on the active composer and no NEW
-            # submitted turn is in scrollback. Re-send Enter.
+            # Stuck chip owned by this dispatch is visible. Before sending
+            # recovery Enter, MUST re-check rollout (closes double-send race:
+            # if the original submit landed between our last check and now,
+            # this re-check catches it and we skip the Enter).
+            if _rollout_confirms():
+                logger.info(
+                    "F435 submit-verify: terminal %s confirmed via rollout "
+                    "re-check before recovery Enter (race avoided)",
+                    self.terminal_id,
+                )
+                return
+
+            # Rollout still has no match AND pane shows stuck chip → re-Enter.
             logger.warning(
                 "F435 submit-verify: paste chip still drafted on terminal %s "
-                "(attempt %d/%d); re-sending Enter",
+                "(attempt %d/%d, rollout negative); re-sending Enter",
                 self.terminal_id,
                 attempt,
                 CODEX_SUBMIT_VERIFY_MAX_RETRIES,
@@ -2993,22 +3142,30 @@ class CodexProvider(BaseProvider):
                     self.terminal_id,
                     exc,
                 )
+            # Wait for rollout to register the submission after recovery Enter
             time.sleep(CODEX_SUBMIT_VERIFY_BACKOFF_SECONDS * attempt)
-            state = _poll_state()
-            if state == CODEX_SUBMIT_STATE_SUBMITTED:
+            if _rollout_confirms():
                 logger.info(
-                    "F435 submit-verify: terminal %s submitted after %d re-Enter(s)",
+                    "F435 submit-verify: terminal %s submitted after %d "
+                    "re-Enter(s) (rollout confirmed)",
                     self.terminal_id,
                     attempt,
                 )
                 return
 
+        # All retries exhausted. Final rollout check.
+        if _rollout_confirms():
+            logger.info(
+                "F435 submit-verify: terminal %s confirmed via final rollout check",
+                self.terminal_id,
+            )
+            return
+
         raise CodexSubmitStuckError(
             f"Codex terminal {self.terminal_id} did not confirm submission of the "
             f"pasted task after {CODEX_SUBMIT_VERIFY_MAX_RETRIES} recovery attempts; "
-            f"the last observed composer state was '{state}' (no NEW submitted turn "
-            f"relative to the pre-send baseline and no working transition), so "
-            f"delivery is unconfirmed"
+            f"the rollout JSONL has no matching user-turn record after offset "
+            f"{rollout_offset}, so delivery is structurally unconfirmed"
         )
 
     @staticmethod
