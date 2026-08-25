@@ -643,26 +643,7 @@ def create_logical_inbox_message(
         dispatch_barrier=dispatch_barrier,
         park_warm=park_warm,
     )
-    # D7: signal after commit and lock release
-    if signal_terminal and result.status == MessageStatus.PENDING:
-        from cli_agent_orchestrator.services.inbox_service import request_delivery
-
-        request_delivery(signal_terminal)
-
-    # WPDT W1: Push advisory WS doorbell frame for supervisor targets
-    if signal_terminal:
-        try:
-            from cli_agent_orchestrator.services.ws_doorbell import push_doorbell_frame_sync
-
-            preview = message.split("\n", 1)[0] if message else ""
-            push_doorbell_frame_sync(
-                signal_terminal,
-                result.id,
-                sender_id[:8],
-                preview,
-            )
-        except Exception:
-            pass  # advisory-only, never blocks
+    # F413: delivery signal + WS doorbell now handled by the after_commit ORM listener.
 
     return result
 

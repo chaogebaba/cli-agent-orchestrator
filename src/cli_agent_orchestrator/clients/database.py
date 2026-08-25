@@ -31,7 +31,9 @@ from sqlalchemy import (
     event,
     exists,
     func,
+    insert,
     or_,
+    select,
     text,
 )
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -555,6 +557,188 @@ class DeliveryObligationModel(Base):
         ),
         Index("ix_delivery_obligation_mailbox", "mailbox_id"),
     )
+
+
+# ---------------------------------------------------------------------------
+# F413: ORM listeners — obligation + sentinel + doorbell structurally unbypassable
+# ---------------------------------------------------------------------------
+
+_F413_DOORBELL_STASH_KEY = "_f413_doorbell"
+_F413_DOORBELL_SNAPSHOT_KEY = "_f413_doorbell_snapshot"
+
+
+def _f413_row_qualifies(status: str, logical_receiver_id: str | None) -> bool:
+    """Single predicate: row is PENDING and directed at a supervisor mailbox.
+
+    The supervisor-mailbox check is deferred to the caller that has a connection
+    (after_insert) or a session (D7b helper) — this only checks the column-level
+    preconditions.
+    """
+    return status == MessageStatus.PENDING.value and logical_receiver_id is not None
+
+
+@event.listens_for(InboxModel, "after_insert")
+def _f413_after_insert(mapper: Any, connection: Any, target: Any) -> None:
+    """D1/D2: Create delivery obligation + trace event + touch sentinel on qualifying insert.
+
+    Uses Core-only inserts on the same connection — NO Session operations.
+    """
+    status = target.status
+    logical_receiver_id = target.logical_receiver_id
+    if not _f413_row_qualifies(status, logical_receiver_id):
+        return
+
+    # D2: Core select to check supervisor-mailbox
+    result = connection.execute(
+        select(MailboxModel.__table__.c.id).where(
+            MailboxModel.__table__.c.id == logical_receiver_id,
+            MailboxModel.__table__.c.role == "supervisor",
+        )
+    )
+    if result.first() is None:
+        return
+
+    # Create obligation via Core insert
+    now = _utcnow()
+    row_id = int(target.id)
+    connection.execute(
+        insert(DeliveryObligationModel.__table__).values(
+            inbox_row_id=row_id,
+            mailbox_id=logical_receiver_id,
+            state="OPEN",
+            accepted_at=now,
+            next_attempt_at=now,
+            attempts=0,
+        )
+    )
+    # Create trace event via Core insert
+    connection.execute(
+        insert(InboxMessageTraceEventModel.__table__).values(
+            message_id=row_id,
+            kind="fx191.accept",
+            phase="accept",
+            decision="proceed",
+            reason=None,
+            payload="{}",
+            created_at=now,
+        )
+    )
+    # Touch sentinel (filesystem, best-effort)
+    _touch_supervisor_pending_flag()
+
+    # D3: Stash doorbell tuple for after_commit drain
+    from sqlalchemy.orm import Session as _Session
+
+    sess = _Session.object_session(target)
+    if sess is not None:
+        stash = sess.info.setdefault(_F413_DOORBELL_STASH_KEY, [])
+        preview = (target.message or "").split("\n", 1)[0]
+        stash.append((
+            target.receiver_id,
+            row_id,
+            (target.sender_id or "")[:8],
+            preview,
+        ))
+
+
+def _f413_after_commit(session: Any) -> None:
+    """D3: Drain doorbell stash after commit, with nested-tx guard."""
+    if session.in_nested_transaction():
+        return
+    stash = session.info.pop(_F413_DOORBELL_STASH_KEY, [])
+    # Clear snapshot too — commit succeeded, no longer needed
+    session.info.pop(_F413_DOORBELL_SNAPSHOT_KEY, None)
+    if not stash:
+        return
+    for terminal_id, row_id, sender_short, preview in stash:
+        try:
+            from cli_agent_orchestrator.services.ws_doorbell import push_doorbell_frame_sync
+
+            push_doorbell_frame_sync(terminal_id, row_id, sender_short, preview)
+        except Exception:
+            pass  # advisory-only
+        try:
+            from cli_agent_orchestrator.services.inbox_service import request_delivery
+
+            request_delivery(terminal_id)
+        except Exception:
+            pass  # best-effort
+
+
+def _f413_after_rollback(session: Any) -> None:
+    """D3: On rollback, restore snapshot (nested) or clear (outer).
+
+    Register after_rollback ONLY (not after_soft_rollback — redundant in SA 2.0.x).
+    On nested-tx rollback: restore the stash to the snapshot taken before that
+    nested block (so earlier successful barriers' doorbells survive).
+    On outer rollback: full clear.
+    """
+    if session.in_nested_transaction():
+        # Still inside an outer transaction — this was a savepoint rollback.
+        # Restore stash to the snapshot (entries from before this nested block).
+        snapshot = session.info.get(_F413_DOORBELL_SNAPSHOT_KEY, [])
+        session.info[_F413_DOORBELL_STASH_KEY] = list(snapshot)
+    else:
+        # Outer rollback — discard everything
+        session.info.pop(_F413_DOORBELL_STASH_KEY, None)
+        session.info.pop(_F413_DOORBELL_SNAPSHOT_KEY, None)
+
+
+def _f413_after_begin(session: Any, transaction: Any, connection: Any) -> None:
+    """Snapshot the doorbell stash before each nested transaction begins.
+
+    after_begin fires for both outer and nested transactions. We only snapshot
+    when entering a nested (savepoint) — so a subsequent rollback can restore
+    to this point without losing earlier successful barriers' stash entries.
+    """
+    if transaction.nested:
+        current = session.info.get(_F413_DOORBELL_STASH_KEY, [])
+        session.info[_F413_DOORBELL_SNAPSHOT_KEY] = list(current)
+
+
+def _f413_qualify_and_create(db: Any, rows: list[Any]) -> None:
+    """D7b: Create obligations + sentinel for HELD→PENDING flipped rows that qualify.
+
+    Called after bulk status-flip paths that bypass mapper events (barrier-cancel,
+    terminal-reap). Uses the single predicate _f413_row_qualifies, plus a DB check
+    for supervisor mailbox. Creates obligations/sentinel ONLY — NO doorbell stash
+    (barrier-CANCEL wake rides F136-D17 request_delivery, terminal-reap rides the
+    delivery sweep).
+    """
+    if not rows:
+        return
+    for row_status, row_id, logical_receiver_id in rows:
+        if not _f413_row_qualifies(row_status, logical_receiver_id):
+            continue
+        if not _is_supervisor_mailbox_id(db, logical_receiver_id):
+            continue
+        now = _utcnow()
+        db.add(
+            DeliveryObligationModel(
+                inbox_row_id=row_id,
+                mailbox_id=logical_receiver_id,
+                state="OPEN",
+                accepted_at=now,
+                next_attempt_at=now,
+            )
+        )
+        db.add(
+            InboxMessageTraceEventModel(
+                message_id=row_id,
+                kind="fx191.accept",
+                phase="accept",
+                decision="proceed",
+                reason=None,
+                payload={},
+            )
+        )
+        _touch_supervisor_pending_flag()
+    db.flush()
+
+
+# D6: Registration at model-definition time (runs on import of this module)
+# Note: session-level listeners registered after SessionLocal creation below.
+# The mapper-level @event.listens_for(InboxModel, "after_insert") is already active.
 
 
 class AuthorityPinModel(Base):
@@ -1134,6 +1318,12 @@ _fence_production_db()
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# F413 D6: Register session-level listeners for doorbell drain / rollback clear.
+event.listen(SessionLocal, "after_commit", _f413_after_commit)
+event.listen(SessionLocal, "after_rollback", _f413_after_rollback)
+# Snapshot stash before each nested transaction so rollback can restore it.
+event.listen(SessionLocal, "after_begin", _f413_after_begin)
 
 _READY_COMMIT_CALLBACK = "_cao_ready_commit_callback"
 
@@ -4294,6 +4484,7 @@ def delete_terminal_and_warm_intent(
             InboxModel.status == MessageStatus.HELD.value,
         )
         prefix = f"[released from {terminal_id} ({profile or 'unknown'}) — terminal reaped]\n"
+        _reap_flipped_rows: list[tuple[str, int, str | None]] = []
         for row in held.all():
             row.message = prefix + row.message
             if target_id is None:
@@ -4305,6 +4496,13 @@ def delete_terminal_and_warm_intent(
                 row.enqueue_generation = target_generation or int(target.lifecycle_generation)
                 row.status = MessageStatus.PENDING.value
                 row.failure_reason = None
+                _reap_flipped_rows.append((
+                    MessageStatus.PENDING.value, int(row.id), target_mailbox_id
+                ))
+        # F413 D7b: create obligations for flipped rows
+        if _reap_flipped_rows:
+            db.flush()
+            _f413_qualify_and_create(db, _reap_flipped_rows)
 
         now = _barrier_now()
         owned_barriers = (
@@ -4316,6 +4514,14 @@ def delete_terminal_and_warm_intent(
             .all()
         )
         for barrier in owned_barriers:
+            # F413 D7b: collect rows before bulk flip so we can create obligations
+            _barrier_flip_rows = [
+                (MessageStatus.PENDING.value, int(r.id), r.logical_receiver_id)
+                for r in db.query(InboxModel).filter(
+                    InboxModel.barrier_id == barrier.id,
+                    InboxModel.status == MessageStatus.HELD.value,
+                ).all()
+            ]
             db.query(InboxModel).filter(
                 InboxModel.barrier_id == barrier.id,
                 InboxModel.status == MessageStatus.HELD.value,
@@ -4326,6 +4532,9 @@ def delete_terminal_and_warm_intent(
             barrier.state = "CANCELLED"
             barrier.close_reason = "owner_gone"
             barrier.fired_at = now
+            # F413 D7b: create obligations for qualifying flipped rows
+            if _barrier_flip_rows:
+                _f413_qualify_and_create(db, _barrier_flip_rows)
 
         # FAM-1: nullify mailbox authority when this terminal is the current incarnation
         db.query(MailboxModel).filter(MailboxModel.current_terminal_id == terminal_id).update(
@@ -5998,18 +6207,7 @@ def _insert_routed_inbox_row(
             member.message_id = int(row.id)
             member.arrived_at = _barrier_now()
         _maybe_fire_completed_barrier(db, barrier)
-    # F123: touch supervisor-pending sentinel for hook fast-path.
-    if (
-        status == MessageStatus.PENDING
-        and logical_receiver_id is not None
-        and _is_supervisor_mailbox_id(db, logical_receiver_id)
-    ):
-        _touch_supervisor_pending_flag()
-        # FX191 D1 / F192: create delivery obligation atomically in the same
-        # transaction as the inbox row.  This is the SINGLE choke-point —
-        # every producer (MCP route, fifo_reader, callback_barrier,
-        # mailbox_service, orphan_reconcile, etc.) gets the obligation here.
-        _create_obligation_inline(db, int(row.id), logical_receiver_id)
+    # F413: obligation + sentinel + doorbell now handled by the after_insert ORM listener.
     return row
 
 
@@ -6157,6 +6355,14 @@ def cancel_callback_barrier(
             .distinct()
             .all()
         ]
+        # F413 D7b: collect qualifying rows before bulk flip
+        _cancel_flip_rows = [
+            (MessageStatus.PENDING.value, int(r.id), r.logical_receiver_id)
+            for r in db.query(InboxModel).filter(
+                InboxModel.barrier_id == barrier.id,
+                InboxModel.status == MessageStatus.HELD.value,
+            ).all()
+        ]
         released = (
             db.query(InboxModel)
             .filter(
@@ -6168,6 +6374,9 @@ def cancel_callback_barrier(
         barrier.state = "CANCELLED"
         barrier.close_reason = "cancelled"
         barrier.fired_at = _barrier_now()
+        # F413 D7b: create obligations for qualifying flipped rows
+        if _cancel_flip_rows:
+            _f413_qualify_and_create(db, _cancel_flip_rows)
         # FAM-3: terminalize AWAITING members on cancel
         db.query(CallbackBarrierMemberModel).filter(
             CallbackBarrierMemberModel.barrier_id == barrier.id,
