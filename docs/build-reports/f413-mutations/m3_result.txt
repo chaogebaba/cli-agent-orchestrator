@@ -1,0 +1,3 @@
+exit_code=1
+1 failed in 0.66s
+key test killed: TestAC4bBarrierCancel::test_cancel_creates_obligations_for_qualifying_rows

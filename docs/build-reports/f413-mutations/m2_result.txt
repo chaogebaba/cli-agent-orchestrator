@@ -1,0 +1,3 @@
+exit_code=1
+1 failed, 1 passed
+key test killed: TestD3NestedTxGuard::test_nested_commit_does_not_emit_doorbell

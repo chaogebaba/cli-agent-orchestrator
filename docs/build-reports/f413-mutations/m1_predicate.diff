@@ -1,0 +1,4 @@
+1c1
+<     return status == MessageStatus.PENDING.value and logical_receiver_id is not None
+---
+>     return status != MessageStatus.PENDING.value and logical_receiver_id is not None

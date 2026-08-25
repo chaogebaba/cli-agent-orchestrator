@@ -1,0 +1,4 @@
+1c1
+<     if session.in_nested_transaction():
+---
+>     if False:
