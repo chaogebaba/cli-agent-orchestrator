@@ -103,7 +103,7 @@ class TestSessionPluginEvents:
         async def record_dispatch(*_args):
             call_order.append("dispatch")
 
-        mock_tmux.return_value.session_exists.side_effect = [True, False, False]
+        mock_tmux.return_value.session_exists_strict.side_effect = [True, False, False]
         mock_tmux.return_value.kill_session.side_effect = lambda *_: call_order.append(
             "kill_session"
         )
@@ -135,6 +135,7 @@ class TestSessionPluginEvents:
         """Session deletion failures must not emit events."""
         registry = _registry_mock()
         mock_tmux.return_value.session_exists.return_value = True
+        mock_tmux.return_value.session_exists_strict.return_value = True
         mock_list_terminals.side_effect = RuntimeError("db error")
 
         with pytest.raises(RuntimeError, match="db error"):
@@ -221,9 +222,11 @@ class TestTerminalPluginEvents:
         # loop is running (the now-async create_terminal path); yield so it runs
         # before we assert ordering.
         await asyncio.sleep(0)
-        # pipe-pane is wired up before the provider initializes in the merged
-        # event-driven flow; the dispatch still fires last, after all setup.
-        assert call_order == ["pipe_pane", "db_create", "provider_initialize", "dispatch"]
+        # Under the #498 atomic-create merge (A1), the registry row is published
+        # INSIDE the lifecycle-locked closure, which completes before the FIFO /
+        # pipe-pane is wired up — so db_create now precedes pipe_pane. The
+        # dispatch still fires last, after all setup.
+        assert call_order == ["db_create", "pipe_pane", "provider_initialize", "dispatch"]
         event_type, event = registry.dispatch.await_args.args
         assert event_type == "post_create_terminal"
         assert isinstance(event, PostCreateTerminalEvent)

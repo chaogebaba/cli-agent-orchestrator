@@ -17,6 +17,9 @@ Session Lifecycle:
 1. create_terminal() with new_session=True creates a new tmux session
 2. Additional terminals are added via create_terminal() with new_session=False
 3. delete_session() removes the entire session and all contained terminals
+
+Transitions 1/2 and 3 are mutually exclusive per session NAME, via the lifecycle
+lock in ``services/session_lock.py`` — see ``delete_session`` for why.
 """
 
 import asyncio
@@ -28,7 +31,9 @@ from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.backends.base import TerminalBackend
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.clients.database import list_terminals_by_session
+from cli_agent_orchestrator.clients.database import (
+    list_terminals_by_session,
+)
 from cli_agent_orchestrator.constants import SESSION_PREFIX
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
@@ -40,6 +45,7 @@ from cli_agent_orchestrator.plugins import (
 )
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import clear_session_env
+from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
 from cli_agent_orchestrator.services.terminal_service import create_terminal
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.sandbox_guard import require_provider_admitted
@@ -79,17 +85,40 @@ def canonical_session_env(
 def finalize_session(
     session_name: str, registry: PluginRegistry | None = None, backend=None
 ) -> None:
-    """Kill/verify a backend session and settle shared session-level side effects."""
-    backend = backend or get_backend()
-    if backend.session_exists(session_name):
+    """Kill/verify a backend session and settle shared session-level side effects.
+
+    #498: the final liveness confirmation uses ``session_exists_strict`` so a
+    transient lookup error is never misread as "gone" (which would report a
+    successful teardown for a session that is still running). If the strict
+    check itself cannot answer (raises), we fall back to the lenient
+    ``session_exists`` for that one confirmation rather than hard-failing a
+    teardown whose kill was already dispatched — see the SHOULD note in the
+    merge callback: on a backend whose strict check delegates to the lenient
+    one this is no stronger than the pre-#498 behavior.
+    """
+    backend = get_backend() if backend is None else backend
+
+    def _still_alive() -> bool:
+        try:
+            return bool(backend.session_exists_strict(session_name))
+        except Exception as e:
+            logger.warning(
+                "session_exists_strict for %s could not answer during teardown "
+                "(%s); falling back to lenient session_exists",
+                session_name,
+                e,
+            )
+            return bool(backend.session_exists(session_name))
+
+    if _still_alive():
         backend.kill_session(session_name)
     for attempt in range(SESSION_TEARDOWN_VERIFY_ATTEMPTS):
-        if not backend.session_exists(session_name):
+        if not _still_alive():
             break
         backend.kill_session(session_name)
         if attempt < SESSION_TEARDOWN_VERIFY_ATTEMPTS - 1:
             time.sleep(SESSION_TEARDOWN_VERIFY_DELAY_SECONDS)
-    if backend.session_exists(session_name):
+    if _still_alive():
         raise RuntimeError(f"Session '{session_name}' still exists after teardown")
     clear_session_env(session_name)
     dispatch_plugin_event(
@@ -449,7 +478,34 @@ def get_session(session_name: str) -> Dict:
 def delete_session(
     session_name: str, registry: PluginRegistry | None = None, force: bool = False
 ) -> Dict:
-    """Delete session and cleanup.
+    """Delete session and cleanup, reconciling tmux and the registry atomically.
+
+    Merge of the fork's lease-based teardown spine with upstream's #498 atomic
+    teardown invariant. Two properties keep the tmux server and the SQLite
+    terminal registry from diverging:
+
+    **Mutual exclusion (#498).** The whole critical section runs under the
+    per-session-name lifecycle lock (``services/session_lock.py``) — the SAME
+    lock ``create_terminal`` holds while it creates a session/window and writes
+    the matching row. It is acquired OUTERMOST here, BEFORE the fork's
+    per-session ``session_lifecycle_lease`` and per-terminal ``rebind_lease``,
+    matching the create path's ordering so the two can never deadlock by
+    inversion (create takes the lock without holding any lease; the cascade
+    delete path takes leases but never this lock). Serializing per NAME leaves
+    lifecycles of DIFFERENT sessions fully concurrent.
+
+    **Confirm before reporting success.** ``finalize_session`` now confirms the
+    kill with ``session_exists_strict`` (a lookup error is never misread as
+    "gone") before it reports the session deleted; a teardown whose kill cannot
+    be confirmed raises with the registry intact for reconciliation on re-run.
+
+    Fork features preserved: the ``force`` override, the draft/protection guard
+    (``require_delete_allowed``), the resume/rebind lease fences
+    (``session_lifecycle_lease`` + ``rebind_lease``, which reject teardown while
+    a resume or rebind of the same session/terminal is in flight), the
+    event-driven per-terminal teardown (``_delete_terminal_under_lease``) and its
+    Grok deferred-cleanup handling (a provider that returns False keeps its row
+    as the retry handle and is reported in ``errors`` rather than ``deleted``).
 
     Returns:
         Dict with 'deleted' (list of deleted session names) and 'errors' (list of error dicts).
@@ -465,70 +521,83 @@ def delete_session(
         )
         from cli_agent_orchestrator.services.session_lifecycle_lease import (
             acquire_session_lifecycle_exclusive,
-        )
-
-        terminal_service.quiesce_deferred_session_sync(session_name)
-        lifecycle_lease = acquire_session_lifecycle_exclusive(session_name)
-        if lifecycle_lease is None:
-            raise RuntimeError("resume_in_progress")
-
-        terminals = list_terminals_by_session(session_name)
-
-        from cli_agent_orchestrator.services.terminal_guard_service import require_delete_allowed
-
-        for terminal in terminals:
-            require_delete_allowed(terminal["id"], force=force)
-
-        for terminal in sorted(terminals, key=lambda row: row["id"]):
-            token = acquire_rebind_lease(terminal["id"])
-            if token is None:
-                for held in reversed(leases):
-                    release_rebind_lease(held)
-                raise RuntimeError("rebind_in_progress")
-            leases.append(token)
-
-        terminal_service.preflight_session_teardown(terminals)
-
-        # Clean up each terminal (snapshot, kill window, FIFO reader,
-        # status buffer, provider, DB) via the event-driven teardown path.
-        tokens = {token.terminal_id: token for token in leases}
-        for terminal in terminals:
-            try:
-                result_or_false = terminal_service._delete_terminal_under_lease(
-                    terminal["id"], tokens[terminal["id"]], registry=registry
-                )
-                # Deferred cleanup: provider returned False, row retained
-                if result_or_false is False or (
-                    isinstance(result_or_false, dict) and not result_or_false.get("terminal_deleted", True)
-                ):
-                    result["errors"].append({
-                        "terminal_id": terminal["id"],
-                        "error": "cleanup deferred; retry delete_session",
-                    })
-            except Exception as e:
-                if str(e) == "resume_in_progress":
-                    raise
-                logger.warning(f"Failed to cleanup terminal {terminal['id']}: {e}")
-
-        if not result["errors"]:
-            finalize_session(session_name, registry)
-        else:
-            # Kill the tmux session even if cleanup is deferred — this stops
-            # the processes so a subsequent retry can complete the cleanup.
-            backend = get_backend()
-            if backend.session_exists(session_name):
-                backend.kill_session(session_name)
-
-        for token in reversed(leases):
-            release_rebind_lease(token)
-        leases.clear()
-
-        from cli_agent_orchestrator.services.session_lifecycle_lease import (
             release_session_lifecycle_lease,
         )
+        from cli_agent_orchestrator.services.terminal_guard_service import (
+            require_delete_allowed,
+        )
 
-        release_session_lifecycle_lease(lifecycle_lease)
-        lifecycle_lease = None
+        # #498 mutual exclusion: hold the per-name lifecycle lock across the
+        # ENTIRE critical section, acquired OUTERMOST (before any fork lease) so
+        # the global order lock -> lifecycle_lease -> rebind_lease matches the
+        # create path and cannot invert. The teardown body is synchronous and
+        # bounded (no long ``await`` under the lock), and nothing inside
+        # re-acquires the SAME lock, so there is no self-deadlock. Guaranteed
+        # released on every exit path (context manager). Plugin dispatch is the
+        # only thing deliberately left OUTSIDE — see finalize_session /
+        # _delete_terminal_under_lease, which emit their events themselves.
+        with session_lifecycle_lock(session_name):
+            terminal_service.quiesce_deferred_session_sync(session_name)
+            lifecycle_lease = acquire_session_lifecycle_exclusive(session_name)
+            if lifecycle_lease is None:
+                raise RuntimeError("resume_in_progress")
+
+            terminals = list_terminals_by_session(session_name)
+
+            for terminal in terminals:
+                require_delete_allowed(terminal["id"], force=force)
+
+            for terminal in sorted(terminals, key=lambda row: row["id"]):
+                token = acquire_rebind_lease(terminal["id"])
+                if token is None:
+                    for held in reversed(leases):
+                        release_rebind_lease(held)
+                    raise RuntimeError("rebind_in_progress")
+                leases.append(token)
+
+            terminal_service.preflight_session_teardown(terminals)
+
+            # Clean up each terminal (snapshot, kill window, FIFO reader,
+            # status buffer, provider, DB) via the event-driven teardown path.
+            tokens = {token.terminal_id: token for token in leases}
+            for terminal in terminals:
+                try:
+                    result_or_false = terminal_service._delete_terminal_under_lease(
+                        terminal["id"], tokens[terminal["id"]], registry=registry
+                    )
+                    # Deferred cleanup: provider returned False, row retained
+                    if result_or_false is False or (
+                        isinstance(result_or_false, dict)
+                        and not result_or_false.get("terminal_deleted", True)
+                    ):
+                        result["errors"].append(
+                            {
+                                "terminal_id": terminal["id"],
+                                "error": "cleanup deferred; retry delete_session",
+                            }
+                        )
+                except Exception as e:
+                    if str(e) == "resume_in_progress":
+                        raise
+                    logger.warning(f"Failed to cleanup terminal {terminal['id']}: {e}")
+
+            if not result["errors"]:
+                # #498: finalize_session confirms the kill with
+                # session_exists_strict before reporting success.
+                finalize_session(session_name, registry)
+            else:
+                # Kill the tmux session even if cleanup is deferred — this stops
+                # the processes so a subsequent retry can complete the cleanup.
+                backend = get_backend()
+                if backend.session_exists(session_name):
+                    backend.kill_session(session_name)
+
+            for token in reversed(leases):
+                release_rebind_lease(token)
+            leases.clear()
+
+            release_session_lifecycle_lease(lifecycle_lease)
+            lifecycle_lease = None
 
         if not result["errors"]:
             result["deleted"].append(session_name)

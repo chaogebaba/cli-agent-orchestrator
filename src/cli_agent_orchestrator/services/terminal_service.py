@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol, assert_never, cast
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, assert_never, cast
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
@@ -40,6 +40,7 @@ from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
+from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
     create_terminal_with_warm_intent,
     delete_terminal_and_warm_intent,
@@ -125,6 +126,7 @@ from cli_agent_orchestrator.services.session_env import (
     get_session_env,
     set_session_env,
 )
+from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
 from cli_agent_orchestrator.services.settings_service import (
     get_provider_defaults,
     get_provider_profile_defaults,
@@ -930,6 +932,132 @@ def _resolve_working_directory(working_directory: Optional[str]) -> str:
     )
 
 
+def _roll_back_backend_create_locked(
+    session_name: str,
+    window_name: str,
+    *,
+    created_session: bool,
+) -> None:
+    """Undo the backend resource a create just made. CALLER MUST HOLD the
+    lifecycle lock for ``session_name``.
+
+    Used by ``create_terminal``'s locked critical section so a failure between
+    the backend create and the registry write cannot leave a live tmux
+    session/window with no row. Both branches matter and they are NOT the same
+    teardown:
+
+    * ``created_session=True`` -- this call created the whole session, so kill the
+      session and drop any forwarded env stashed for the name, so secrets don't
+      linger in memory or bleed into a future reuse of the name.
+    * ``created_session=False`` -- this call only added a WINDOW to a session that
+      already existed (``new_session=False``: every MCP spawn/assign-into-an-
+      existing-session call). Kill ONLY that window, so the pre-existing session
+      and its other terminals are left alone. Note this is not a guarantee that
+      the session survives: tmux drops a session when its last window dies, and
+      the peer window that made the session non-empty at the `session_exists`
+      check can be reaped by its own process exiting before this rollback runs --
+      the lifecycle lock serializes CAO's transitions, not a pane's exit. In that
+      race the session collapses and the peer's registry row is left pointing at
+      a dead session. Killing the whole session instead would be strictly worse
+      (it would destroy peers that ARE alive, which is the common case), so this
+      stays window-scoped; the residual race is the same one the outer `except`
+      path already carries and is tracked separately.
+
+    Best-effort and never raises: it runs while an exception is already in
+    flight, and that original failure is the one the caller must see.
+    """
+    if created_session:
+        # `finally`, not a following statement: the env mapping must be dropped
+        # however the kill turns out -- including when it raises a BaseException
+        # (KeyboardInterrupt/SystemExit), which `except Exception` does not catch.
+        # Sequencing these as two independent try blocks skipped the clear on
+        # exactly that path, leaving a forwarded secret in the process-global map
+        # keyed to a session name that is gone and may later be reused.
+        # `finally` still lets a BaseException propagate, which is what we want:
+        # a Ctrl-C must not be swallowed here.
+        try:
+            if not get_backend().kill_session(session_name):
+                # Falsy means the backend could not confirm the kill (or found
+                # nothing to kill). Either way the name may still be live, so say
+                # so -- a silent branch here is how an orphan goes unnoticed.
+                logger.warning(
+                    f"Rollback: kill_session({session_name}) did not confirm the kill; "
+                    "the session may still be live"
+                )
+        except Exception:
+            logger.exception(f"Rollback: failed to kill session {session_name}")
+        finally:
+            try:
+                clear_session_env(session_name)
+            except Exception:
+                logger.exception(f"Rollback: failed to clear session env for {session_name}")
+    else:
+        try:
+            if not get_backend().kill_window(session_name, window_name):
+                logger.warning(
+                    f"Rollback: kill_window({session_name}:{window_name}) did not confirm "
+                    "the kill; the window may still be live"
+                )
+        except Exception:
+            logger.exception(f"Rollback: failed to kill window {session_name}:{window_name}")
+
+
+def _roll_back_cancelled_create(
+    session_name: str,
+    terminal_id: str,
+    window_name: str,
+    *,
+    created_session: bool,
+) -> None:
+    """Undo a create whose awaiter was cancelled AFTER the worker succeeded.
+
+    Runs on a worker thread. Unlike the in-closure rollback this must
+    REACQUIRE the lifecycle lock: the worker released it when it returned, and
+    an unlocked late kill could destroy a NEW incarnation of the name that
+    another caller legitimately built in between — the same
+    never-observable-half-built argument the closure's docstring makes. Under
+    the lock, kill the session/window THIS call created, then drop the
+    committed row, so the cancelled create leaves both stores exactly as it
+    found them.
+
+    Best-effort like its sibling: the cancellation is already propagating and
+    is what the caller must see.
+    """
+    with session_lifecycle_lock(session_name):
+        _roll_back_backend_create_locked(session_name, window_name, created_session=created_session)
+        try:
+            db_delete_terminal(terminal_id)
+        except Exception:
+            logger.exception(
+                f"Rollback: failed to delete registry row {terminal_id} " "after a cancelled create"
+            )
+
+
+async def _finish_and_roll_back_cancelled_create(
+    create_worker: "asyncio.Task[Tuple[str, bool, bool]]",
+    session_name: str,
+    terminal_id: str,
+) -> None:
+    """Await the un-cancellable create worker, then compensate its outcome.
+
+    If the worker RAISED, its locked closure already rolled the backend
+    resource back and never wrote the row — nothing to do. If it RETURNED, it
+    built a session/window and committed a row that no caller will ever hear
+    about; roll both back under the lifecycle lock.
+    """
+    try:
+        window_name, session_created, _ = await create_worker
+    except BaseException:
+        return
+    await asyncio.to_thread(
+        _roll_back_cancelled_create,
+        session_name,
+        terminal_id,
+        window_name,
+        created_session=session_created,
+    )
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -1382,66 +1510,19 @@ async def create_terminal(
         # terminal's working_directory. This is the effective launch cwd either way.
         resolved_working_directory = _resolve_working_directory(working_directory)
 
-        # Step 2: Issue per-terminal auth token (F332) and create tmux session or window
+        # Step 2: Issue per-terminal auth token (F332). Name normalization and
+        # the tmux create + registry publication that follow are the #498
+        # critical section, run off-loop under the lifecycle lock below.
         import secrets as _secrets
 
         terminal_token = _secrets.token_urlsafe(32)
 
-        if new_session:
-            # Ensure session name has the CAO prefix for identification
-            # Prevent duplicate sessions
-            if get_backend().session_exists(session_name):
-                raise ValueError(f"Session '{session_name}' already exists")
-
-            # Wipe any stale mapping a prior aborted lifecycle for this name
-            # may have left behind, so a no-env relaunch can't inherit them.
-            clear_session_env(session_name)
-
-            # Create new tmux session with initial window
-            get_backend().create_session(
-                session_name,
-                window_name,
-                terminal_id,
-                resolved_working_directory,
-                extra_env=env_vars,
-                terminal_token=terminal_token,
-            )
-            session_created = True  # only set after successful creation
-            window_created = True
-            delete_terminals_by_session(session_name)
-
-            # Persist forwarded env only after the tmux session actually
-            # exists; the failure path below clears it if a later step
-            # tears the session back down.
-            if env_vars:
-                set_session_env(session_name, env_vars)
-        else:
-            # Add window to existing session
-            if not get_backend().session_exists(session_name):
-                raise ValueError(f"Session '{session_name}' not found")
-            session_floor = get_session_env(session_name)
-            window_overlay = {
-                key: value for key, value in (env_vars or {}).items() if key != "CAO_ARTIFACTS_DIR"
-            }
-            extra_env = {**session_floor, **window_overlay}
-            try:
-                window_name = get_backend().create_window(
-                    session_name,
-                    window_name,
-                    terminal_id,
-                    resolved_working_directory,
-                    extra_env=extra_env,
-                    terminal_token=terminal_token,
-                )
-            except Exception as exc:
-                if lease_token is not None:
-                    raise RuntimeError("window_create_failed") from exc
-                raise
-            window_created = True
-
-        parent_writer = getattr(get_backend(), "set_window_parent", None)
-        if callable(parent_writer):
-            parent_writer(session_name, window_name, caller_id)
+        # Normalize the session name BEFORE anything keys off it: the lifecycle
+        # lock is per session NAME, so it must be taken on the SAME string the
+        # tmux create and the registry row use, or a create and a teardown of
+        # what is really one session would take two different locks (#498).
+        if new_session and not session_name.startswith(SESSION_PREFIX):
+            session_name = f"{SESSION_PREFIX}{session_name}"
 
         # Step 3: Build a runtime skill catalog only for providers that consume
         # it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
@@ -1473,10 +1554,389 @@ async def create_terminal(
                 f"copilot_cli."
             )
 
+        # Step 3c (#498, merge A1): Create the tmux session/window AND publish the
+        # registry row as ONE atomic step, under the per-session-name lifecycle
+        # lock, off the event loop. This merges the fork's tmux create (Step 2)
+        # and its rich Step-5 publication (warm-intent / dispatch-barrier / resume
+        # variants, F332 auth_token, worktree_info, frozen pins) so the tmux state
+        # and the row become visible together: a concurrent delete_session for the
+        # same name is serialized on the same lock and can never kill a session
+        # this call just created, nor sweep between the tmux create and the row
+        # write.
+        #
+        # Why on a worker thread: session_lifecycle_lock is a threading primitive
+        # (the only kind reachable from both this coroutine and the synchronous
+        # teardown the API runs via to_thread — see services/session_lock.py).
+        # Acquiring it directly on the loop would freeze every request for as long
+        # as a concurrent teardown of this name holds it. Off-loop, only this
+        # worker thread waits.
+        #
+        # Why the section ends before FIFO/provider.initialize(): those are long
+        # and must not queue a same-name teardown behind them. Everything inside
+        # is short, synchronous state mutation. The delivery/mailbox authority
+        # locks the publication takes are nested UNDER the lifecycle lock; the
+        # global order lifecycle_lock -> lifecycle_lease -> rebind_lease ->
+        # delivery_lock -> mailbox_lock is acyclic (no path takes them in the
+        # reverse direction), so the nesting cannot deadlock.
+        def _create_session_or_window_locked() -> Tuple[str, bool, bool]:
+            """Runs under the lifecycle lock on a worker thread.
+
+            Returns (window_name, session_created, window_created). On any failure
+            AFTER the backend resource exists, rolls that resource back HERE,
+            still holding the lock, before re-raising — so on such a raise neither
+            a live tmux session/window nor its row survives, and the outer flags
+            stay False (they are assigned only from a successful return).
+            """
+            assert session_name is not None  # narrowed by the caller
+            _created_session = False
+            _created_window = False
+            _created_window_name = window_name
+            with session_lifecycle_lock(session_name):
+                if new_session:
+                    # Prevent duplicate sessions
+                    if get_backend().session_exists(session_name):
+                        raise ValueError(f"Session '{session_name}' already exists")
+
+                    # Wipe any stale mapping a prior aborted lifecycle for this
+                    # name may have left behind, so a no-env relaunch can't
+                    # inherit them.
+                    clear_session_env(session_name)
+
+                    # Create new tmux session with initial window
+                    get_backend().create_session(
+                        session_name,
+                        window_name,
+                        terminal_id,
+                        resolved_working_directory,
+                        extra_env=env_vars,
+                        terminal_token=terminal_token,
+                    )
+                    _created_session = True
+                    _created_window = True
+                    _created_window_name = window_name
+                    delete_terminals_by_session(session_name)
+
+                    # Persist forwarded env only after the tmux session actually
+                    # exists; rolled back below if a later step tears it down.
+                    if env_vars:
+                        set_session_env(session_name, env_vars)
+                else:
+                    # Add window to existing session
+                    if not get_backend().session_exists(session_name):
+                        raise ValueError(f"Session '{session_name}' not found")
+                    session_floor = get_session_env(session_name)
+                    window_overlay = {
+                        key: value
+                        for key, value in (env_vars or {}).items()
+                        if key != "CAO_ARTIFACTS_DIR"
+                    }
+                    extra_env = {**session_floor, **window_overlay}
+                    try:
+                        _created_window_name = get_backend().create_window(
+                            session_name,
+                            window_name,
+                            terminal_id,
+                            resolved_working_directory,
+                            extra_env=extra_env,
+                            terminal_token=terminal_token,
+                        )
+                    except Exception as exc:
+                        if lease_token is not None:
+                            raise RuntimeError("window_create_failed") from exc
+                        raise
+                    _created_window = True
+
+                parent_writer = getattr(get_backend(), "set_window_parent", None)
+                if callable(parent_writer):
+                    parent_writer(session_name, _created_window_name, caller_id)
+
+                # From here the backend resource EXISTS. Every remaining step is
+                # guarded: on failure the resource is rolled back under this same
+                # lock before the exception leaves the closure (#498). The rich
+                # publication below persists the row plus its warm-intent /
+                # barrier-member / auth_token, all terminal-owned so the
+                # cancellation/failure rollback (db_delete_terminal ->
+                # delete_terminal_and_warm_intent) removes every one of them.
+                try:
+                    init_fields: dict[str, Any] = {}
+                    if defer_init:
+                        from cli_agent_orchestrator.services.settings_service import (
+                            get_server_settings,
+                        )
+
+                        init_fields = {
+                            "init_state": "init_pending",
+                            "init_started_at": datetime.now(timezone.utc),
+                            "init_owner_epoch": SERVER_INIT_OWNER_EPOCH,
+                            "init_deadline_s": float(
+                                get_server_settings()["artifact_validate_deadline_s"]
+                            ),
+                        }
+                    # F127: for kiro_cli, resolved_model is known pre-init; persist at creation
+                    if provider == "kiro_cli" and model:
+                        init_fields["resolved_model"] = model
+                    # F129: Pass authority_files through to the DB publication function
+                    if authority_files:
+                        init_fields["authority_files"] = authority_files
+                    from cli_agent_orchestrator.services.inbox_service import get_delivery_lock
+                    from cli_agent_orchestrator.services.mailbox_service import (
+                        get_mailbox_authority_lock,
+                    )
+
+                    delivery_authority = get_delivery_lock(terminal_id)
+                    mailbox_authority = get_mailbox_authority_lock(session_name, "supervisor")
+                    with delivery_authority:
+                        with mailbox_authority:
+                            if fork_context and fork_context.mode == "fork":
+                                if dispatch_barrier is None:
+                                    cast(
+                                        _LegacyWarmTerminalPublisher,
+                                        create_terminal_with_warm_intent,
+                                    )(
+                                        terminal_id=terminal_id,
+                                        tmux_session=session_name,
+                                        tmux_window=_created_window_name,
+                                        provider=provider,
+                                        agent_profile=agent_profile,
+                                        allowed_tools=allowed_tools,
+                                        caller_id=caller_id,
+                                        **(
+                                            {"lifecycle": resolved_lifecycle}
+                                            if resolved_lifecycle != "ephemeral"
+                                            else {}
+                                        ),
+                                        parent_base_name=fork_context.base_name,
+                                        fork_mode=fork_context.mode,
+                                        engine=(
+                                            resolved_engine.value
+                                            if resolved_engine is not None
+                                            else None
+                                        ),
+                                        group=group,
+                                        metadata=metadata,
+                                        worktree_info=_worktree_info_dict,
+                                        working_directory=resolved_working_directory,
+                                        auth_token=terminal_token,
+                                        **init_fields,
+                                    )
+                                else:
+                                    cast(Any, create_terminal_with_warm_intent)(
+                                        terminal_id=terminal_id,
+                                        tmux_session=session_name,
+                                        tmux_window=_created_window_name,
+                                        provider=provider,
+                                        agent_profile=agent_profile,
+                                        allowed_tools=allowed_tools,
+                                        caller_id=caller_id,
+                                        **(
+                                            {"lifecycle": resolved_lifecycle}
+                                            if resolved_lifecycle != "ephemeral"
+                                            else {}
+                                        ),
+                                        parent_base_name=fork_context.base_name,
+                                        fork_mode=fork_context.mode,
+                                        dispatch_barrier=dispatch_barrier,
+                                        engine=(
+                                            resolved_engine.value
+                                            if resolved_engine is not None
+                                            else None
+                                        ),
+                                        group=group,
+                                        metadata=metadata,
+                                        worktree_info=_worktree_info_dict,
+                                        working_directory=resolved_working_directory,
+                                        auth_token=terminal_token,
+                                        **init_fields,
+                                    )
+                            else:
+                                attempted_resume_uuid = resume_uuid
+                                if attempted_resume_uuid:
+                                    if dispatch_barrier is None:
+                                        cast(_LegacyCreateTerminalPublisher, db_create_terminal)(
+                                            terminal_id,
+                                            session_name,
+                                            _created_window_name,
+                                            provider,
+                                            agent_profile,
+                                            allowed_tools,
+                                            caller_id=caller_id,
+                                            **(
+                                                {"lifecycle": resolved_lifecycle}
+                                                if resolved_lifecycle != "ephemeral"
+                                                else {}
+                                            ),
+                                            provider_session_id=attempted_resume_uuid,
+                                            engine=(
+                                                resolved_engine.value
+                                                if resolved_engine is not None
+                                                else None
+                                            ),
+                                            group=group,
+                                            metadata=metadata,
+                                            worktree_info=_worktree_info_dict,
+                                            working_directory=resolved_working_directory,
+                                            auth_token=terminal_token,
+                                            **init_fields,
+                                        )
+                                    else:
+                                        cast(Any, db_create_terminal)(
+                                            terminal_id,
+                                            session_name,
+                                            _created_window_name,
+                                            provider,
+                                            agent_profile,
+                                            allowed_tools,
+                                            caller_id=caller_id,
+                                            **(
+                                                {"lifecycle": resolved_lifecycle}
+                                                if resolved_lifecycle != "ephemeral"
+                                                else {}
+                                            ),
+                                            provider_session_id=attempted_resume_uuid,
+                                            dispatch_barrier=dispatch_barrier,
+                                            engine=(
+                                                resolved_engine.value
+                                                if resolved_engine is not None
+                                                else None
+                                            ),
+                                            group=group,
+                                            metadata=metadata,
+                                            worktree_info=_worktree_info_dict,
+                                            working_directory=resolved_working_directory,
+                                            auth_token=terminal_token,
+                                            **init_fields,
+                                        )
+                                else:
+                                    if dispatch_barrier is None:
+                                        cast(_LegacyCreateTerminalPublisher, db_create_terminal)(
+                                            terminal_id,
+                                            session_name,
+                                            _created_window_name,
+                                            provider,
+                                            agent_profile,
+                                            allowed_tools,
+                                            caller_id=caller_id,
+                                            **(
+                                                {"lifecycle": resolved_lifecycle}
+                                                if resolved_lifecycle != "ephemeral"
+                                                else {}
+                                            ),
+                                            engine=(
+                                                resolved_engine.value
+                                                if resolved_engine is not None
+                                                else None
+                                            ),
+                                            group=group,
+                                            metadata=metadata,
+                                            worktree_info=_worktree_info_dict,
+                                            working_directory=resolved_working_directory,
+                                            auth_token=terminal_token,
+                                            **init_fields,
+                                        )
+                                    else:
+                                        cast(Any, db_create_terminal)(
+                                            terminal_id,
+                                            session_name,
+                                            _created_window_name,
+                                            provider,
+                                            agent_profile,
+                                            allowed_tools,
+                                            caller_id=caller_id,
+                                            **(
+                                                {"lifecycle": resolved_lifecycle}
+                                                if resolved_lifecycle != "ephemeral"
+                                                else {}
+                                            ),
+                                            dispatch_barrier=dispatch_barrier,
+                                            engine=(
+                                                resolved_engine.value
+                                                if resolved_engine is not None
+                                                else None
+                                            ),
+                                            group=group,
+                                            metadata=metadata,
+                                            worktree_info=_worktree_info_dict,
+                                            working_directory=resolved_working_directory,
+                                            auth_token=terminal_token,
+                                            **init_fields,
+                                        )
+                except Exception as exc:
+                    # The row publication failed (realistically "database is
+                    # locked" out of db_create_terminal). Roll the backend
+                    # resource back under this same lock, then preserve the fork's
+                    # lease-aware error contract: a leased create normalizes this
+                    # to ``db_publish_failed`` for epoch-recovery classification.
+                    _roll_back_backend_create_locked(
+                        session_name,
+                        _created_window_name,
+                        created_session=_created_session,
+                    )
+                    if lease_token is not None:
+                        raise RuntimeError("db_publish_failed") from exc
+                    raise
+                except BaseException:
+                    # Cancellation / KeyboardInterrupt / SystemExit: roll the
+                    # backend resource back but never reshape the signal — the
+                    # cancellation compensator handles the committed-row case.
+                    _roll_back_backend_create_locked(
+                        session_name,
+                        _created_window_name,
+                        created_session=_created_session,
+                    )
+                    raise
+            return _created_window_name, _created_session, _created_window
+
+        # The worker is UN-CANCELLABLE once dispatched: cancelling this await
+        # detaches only the awaiter while the thread proceeds to take the
+        # lifecycle lock, create the backend session/window, and commit the
+        # registry row (plus its warm-intent / barrier-member / auth_token) —
+        # into the void. CancelledError is a BaseException, so the outer
+        # `except Exception` cleanup never sees it and the created-flags are
+        # still False, so it would tear down nothing anyway: a live session +
+        # row with no FIFO, no provider, and no caller that knows the terminal
+        # exists — the exact divergence #498 eliminates. Shield the worker, and
+        # on cancellation hand its outcome to a compensator that rolls back
+        # whatever it built (under the lifecycle lock, dropping the row and every
+        # terminal-owned artifact via db_delete_terminal) before the cancellation
+        # continues.
+        create_worker = asyncio.ensure_future(asyncio.to_thread(_create_session_or_window_locked))
+        try:
+            window_name, session_created, window_created = await asyncio.shield(create_worker)
+        except asyncio.CancelledError:
+            if not create_worker.cancelled():
+                compensator = asyncio.ensure_future(
+                    _finish_and_roll_back_cancelled_create(
+                        create_worker, session_name, terminal_id
+                    )
+                )
+                try:
+                    await asyncio.shield(compensator)
+                except asyncio.CancelledError:
+                    # A repeat cancellation landed while the compensator ran; the
+                    # shielded task still completes on the loop. The ORIGINAL
+                    # cancellation is re-raised below either way.
+                    pass
+            raise
+
+        # The registry row now exists (published inside the locked closure). Drop
+        # the session lifecycle lease for the first-time (non-resume) path, exactly
+        # as the fork flow did right after its Step-5 publication.
+        if not resume_uuid and owned_lifecycle_lease:
+            from cli_agent_orchestrator.services.session_lifecycle_lease import (
+                release_session_lifecycle_lease,
+            )
+
+            release_session_lifecycle_lease(session_lifecycle_lease_token)
+            owned_lifecycle_lease = False
+            session_lifecycle_lease_token = None
+        db_created = True
+
         # Step 4: Set up the FIFO event-driven output pipeline for pipe-pane
         # backends (tmux). Event-inbox backends (herdr) deliver via their own
         # socket events and their pipe_pane is a no-op, so skip the FIFO there and
-        # rely on the herdr inbox registration below.
+        # rely on the herdr inbox registration below. Runs AFTER the locked
+        # closure: the FIFO needs no lock and #498 keeps the lock section down to
+        # the tmux + registry writes that must be atomic.
         if not get_backend().supports_event_inbox():
             fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
 
@@ -1521,217 +1981,6 @@ async def create_terminal(
             # Enter produces a fresh prompt line that flows through the pipe.
             get_backend().send_special_key(session_name, window_name, "Enter")
 
-        # Step 5: Persist terminal metadata after output capture is attached.
-        # The manifest below then sees the new row, while rollback unwinds DB
-        # before pipe-pane/FIFO/window in exact reverse acquisition order.
-        try:
-            from cli_agent_orchestrator.services.inbox_service import get_delivery_lock
-            from cli_agent_orchestrator.services.mailbox_service import (
-                get_mailbox_authority_lock,
-            )
-
-            init_fields = {}
-            if defer_init:
-                from cli_agent_orchestrator.services.settings_service import get_server_settings
-
-                init_fields = {
-                    "init_state": "init_pending",
-                    "init_started_at": datetime.now(timezone.utc),
-                    "init_owner_epoch": SERVER_INIT_OWNER_EPOCH,
-                    "init_deadline_s": float(get_server_settings()["artifact_validate_deadline_s"]),
-                }
-            # F127: for kiro_cli, resolved_model is known pre-init; persist at creation
-            if provider == "kiro_cli" and model:
-                init_fields["resolved_model"] = model
-            # F129: Pass authority_files through to the DB publication function
-            if authority_files:
-                init_fields["authority_files"] = authority_files
-            delivery_authority = get_delivery_lock(terminal_id)
-            mailbox_authority = get_mailbox_authority_lock(session_name, "supervisor")
-            with delivery_authority:
-                with mailbox_authority:
-                    if fork_context and fork_context.mode == "fork":
-                        if dispatch_barrier is None:
-                            cast(
-                                _LegacyWarmTerminalPublisher,
-                                create_terminal_with_warm_intent,
-                            )(
-                                terminal_id=terminal_id,
-                                tmux_session=session_name,
-                                tmux_window=window_name,
-                                provider=provider,
-                                agent_profile=agent_profile,
-                                allowed_tools=allowed_tools,
-                                caller_id=caller_id,
-                                **(
-                                    {"lifecycle": resolved_lifecycle}
-                                    if resolved_lifecycle != "ephemeral"
-                                    else {}
-                                ),
-                                parent_base_name=fork_context.base_name,
-                                fork_mode=fork_context.mode,
-                                engine=(
-                                    resolved_engine.value if resolved_engine is not None else None
-                                ),
-                                group=group,
-                                metadata=metadata,
-                                worktree_info=_worktree_info_dict,
-                                working_directory=resolved_working_directory,
-                                auth_token=terminal_token,
-                                **init_fields,
-                            )
-                        else:
-                            cast(Any, create_terminal_with_warm_intent)(
-                                terminal_id=terminal_id,
-                                tmux_session=session_name,
-                                tmux_window=window_name,
-                                provider=provider,
-                                agent_profile=agent_profile,
-                                allowed_tools=allowed_tools,
-                                caller_id=caller_id,
-                                **(
-                                    {"lifecycle": resolved_lifecycle}
-                                    if resolved_lifecycle != "ephemeral"
-                                    else {}
-                                ),
-                                parent_base_name=fork_context.base_name,
-                                fork_mode=fork_context.mode,
-                                dispatch_barrier=dispatch_barrier,
-                                engine=(
-                                    resolved_engine.value if resolved_engine is not None else None
-                                ),
-                                group=group,
-                                metadata=metadata,
-                                worktree_info=_worktree_info_dict,
-                                working_directory=resolved_working_directory,
-                                auth_token=terminal_token,
-                                **init_fields,
-                            )
-                    else:
-                        attempted_resume_uuid = resume_uuid
-                        if attempted_resume_uuid:
-                            if dispatch_barrier is None:
-                                cast(_LegacyCreateTerminalPublisher, db_create_terminal)(
-                                    terminal_id,
-                                    session_name,
-                                    window_name,
-                                    provider,
-                                    agent_profile,
-                                    allowed_tools,
-                                    caller_id=caller_id,
-                                    **(
-                                        {"lifecycle": resolved_lifecycle}
-                                        if resolved_lifecycle != "ephemeral"
-                                        else {}
-                                    ),
-                                    provider_session_id=attempted_resume_uuid,
-                                    engine=(
-                                        resolved_engine.value
-                                        if resolved_engine is not None
-                                        else None
-                                    ),
-                                    group=group,
-                                    metadata=metadata,
-                                    worktree_info=_worktree_info_dict,
-                                    working_directory=resolved_working_directory,
-                                    auth_token=terminal_token,
-                                    **init_fields,
-                                )
-                            else:
-                                cast(Any, db_create_terminal)(
-                                    terminal_id,
-                                    session_name,
-                                    window_name,
-                                    provider,
-                                    agent_profile,
-                                    allowed_tools,
-                                    caller_id=caller_id,
-                                    **(
-                                        {"lifecycle": resolved_lifecycle}
-                                        if resolved_lifecycle != "ephemeral"
-                                        else {}
-                                    ),
-                                    provider_session_id=attempted_resume_uuid,
-                                    dispatch_barrier=dispatch_barrier,
-                                    engine=(
-                                        resolved_engine.value
-                                        if resolved_engine is not None
-                                        else None
-                                    ),
-                                    group=group,
-                                    metadata=metadata,
-                                    worktree_info=_worktree_info_dict,
-                                    working_directory=resolved_working_directory,
-                                    auth_token=terminal_token,
-                                    **init_fields,
-                                )
-                        else:
-                            if dispatch_barrier is None:
-                                cast(_LegacyCreateTerminalPublisher, db_create_terminal)(
-                                    terminal_id,
-                                    session_name,
-                                    window_name,
-                                    provider,
-                                    agent_profile,
-                                    allowed_tools,
-                                    caller_id=caller_id,
-                                    **(
-                                        {"lifecycle": resolved_lifecycle}
-                                        if resolved_lifecycle != "ephemeral"
-                                        else {}
-                                    ),
-                                    engine=(
-                                        resolved_engine.value
-                                        if resolved_engine is not None
-                                        else None
-                                    ),
-                                    group=group,
-                                    metadata=metadata,
-                                    worktree_info=_worktree_info_dict,
-                                    working_directory=resolved_working_directory,
-                                    auth_token=terminal_token,
-                                    **init_fields,
-                                )
-                            else:
-                                cast(Any, db_create_terminal)(
-                                    terminal_id,
-                                    session_name,
-                                    window_name,
-                                    provider,
-                                    agent_profile,
-                                    allowed_tools,
-                                    caller_id=caller_id,
-                                    **(
-                                        {"lifecycle": resolved_lifecycle}
-                                        if resolved_lifecycle != "ephemeral"
-                                        else {}
-                                    ),
-                                    dispatch_barrier=dispatch_barrier,
-                                    engine=(
-                                        resolved_engine.value
-                                        if resolved_engine is not None
-                                        else None
-                                    ),
-                                    group=group,
-                                    metadata=metadata,
-                                    worktree_info=_worktree_info_dict,
-                                    working_directory=resolved_working_directory,
-                                    auth_token=terminal_token,
-                                    **init_fields,
-                                )
-        except Exception as exc:
-            if lease_token is not None:
-                raise RuntimeError("db_publish_failed") from exc
-            raise
-        if not resume_uuid and owned_lifecycle_lease:
-            from cli_agent_orchestrator.services.session_lifecycle_lease import (
-                release_session_lifecycle_lease,
-            )
-
-            release_session_lifecycle_lease(session_lifecycle_lease_token)
-            owned_lifecycle_lease = False
-            session_lifecycle_lease_token = None
-        db_created = True
 
         # The live snapshot is transactional launch context. Build it only after
         # the terminal row and output plumbing exist, so it includes itself and a
@@ -5113,6 +5362,77 @@ def peek_terminal(terminal_id: str, lines: int = 40) -> str:
         tail_lines=capped_lines,
         strip_escapes=True,
     )
+
+
+def capture_terminal_snapshot(terminal_id: str) -> Optional[Dict]:
+    """Persist a terminal's scrollback + metadata snapshot. NON-DESTRUCTIVE.
+
+    The read-only first third of terminal teardown, split out so session
+    teardown can run it BEFORE the session kill while leaving every destructive
+    step until AFTER the kill is confirmed (#498). It has to precede the kill --
+    scrollback only exists while the pane does -- and because it only reads tmux
+    and writes two files under ``TERMINAL_LOG_DIR``, running it ahead of a kill
+    that then fails to confirm changes no terminal state at all.
+
+    Returns the terminal's metadata (both later thirds need it), or None when no
+    registry row exists -- i.e. there is nothing to tear down. The returned dict
+    carries one key that is NOT a registry column: ``live_working_directory``,
+    the pane's cwd read here while the pane still exists.
+    ``dismantle_terminal_runtime`` needs it for issue #100's worktree cleanup and
+    cannot read it itself -- on the session-teardown path the pane is already
+    gone by the time it runs -- so the single read is captured here and passed
+    along rather than repeated.
+    """
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata:
+        return None
+
+    # Read the pane's live working directory BEFORE anything destroys the pane.
+    # Single read, reused for two purposes: the scrollback snapshot below, and
+    # issue #100 Phase 1's worktree cleanup (recognizing a worktree-backed
+    # terminal from its live cwd alone -- there is no separate CAO-side record
+    # of which terminals are worktree-backed). Best-effort: a read failure
+    # means the snapshot's working_directory field is None and no worktree
+    # cleanup runs later.
+    live_working_directory = None
+    try:
+        live_working_directory = get_backend().get_pane_working_directory(
+            metadata["tmux_session"], metadata["tmux_window"]
+        )
+    except Exception as e:
+        logger.warning(f"Failed to read working directory for {terminal_id}: {e}")
+    metadata["live_working_directory"] = live_working_directory
+
+    # Snapshot scrollback + metadata before killing (for debugging/restore)
+    try:
+        # Capture plain text full scrollback (no -e, no line cap)
+        scrollback = get_backend().get_history(
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            strip_escapes=True,
+            full_history=True,
+        )
+        scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
+        scrollback_path.write_text(scrollback, encoding="utf-8")
+
+        import json as _json
+
+        snapshot = {
+            "terminal_id": terminal_id,
+            "session_name": metadata["tmux_session"],
+            "window_name": metadata["tmux_window"],
+            "agent_profile": metadata.get("agent_profile"),
+            "provider": metadata["provider"],
+            "working_directory": live_working_directory,
+            "allowed_tools": metadata.get("allowed_tools"),
+            "caller_id": metadata.get("caller_id"),
+        }
+        snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
+        snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to snapshot terminal {terminal_id}: {e}")
+
+    return metadata
 
 
 def provider_session_owner(session_uuid: str) -> dict:
