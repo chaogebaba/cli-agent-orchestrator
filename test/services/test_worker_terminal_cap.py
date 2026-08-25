@@ -956,6 +956,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     _cap_publishing_ids,
     _cap_reservations,
     _count_worker_terminals_detailed,
+    _live_worker_count,
     _mark_publishing,
     _release_worker_slot,
     _reserve_worker_slot,
@@ -963,17 +964,50 @@ from cli_agent_orchestrator.services.terminal_service import (
 
 
 def _reset_cap_session(session: str) -> None:
-    """Clear all per-session cap ledger state so a test starts from quiescent."""
+    """Clear all per-session cap ledger state so a test starts from quiescent.
+
+    F439 r6: the admission LOCK, the GENERATION, and the token SEQUENCE are
+    intentionally NEVER reclaimed by production (that reclamation was the r5 ABA).
+    A TEST, though, may reset the generation/sequence directly (it holds the
+    lock) to start from a known-clean slate; only production is forbidden from
+    doing so mid-flight.
+    """
     lock = _cap_admission_lock(session)
     with lock:
         _cap_reservations.pop(session, None)
         _cap_publishing_ids.pop(session, None)
         ts._cap_gen.pop(session, None)
+        ts._cap_token_seq.pop(session, None)
+
+
+def _seed_reservation(session: str, terminal_id: str | None = None) -> int:
+    """Book a real reservation token under the lock; optionally mark it publishing.
+
+    F439 r6 / BLOCKER 2: reservations are a live-token SET and every exclusion is
+    bound to a token, so a test can no longer fake in-flight state with a bare
+    ``_cap_reservations[session] = 1``. This issues a genuine token (as
+    ``_reserve_worker_slot`` would) and, when ``terminal_id`` is given, registers
+    the matching publishing exclusion — reproducing a real in-flight publisher.
+    Returns the issued token.
+    """
+    lock = _cap_admission_lock(session)
+    with lock:
+        seq = ts._cap_token_seq.get(session, 0) + 1
+        ts._cap_token_seq[session] = seq
+        tokens = _cap_reservations.get(session)
+        if tokens is None:
+            _cap_reservations[session] = {seq}
+        else:
+            tokens.add(seq)
+        ts._cap_gen[session] = ts._cap_gen.get(session, 0) + 1
+    if terminal_id is not None:
+        _mark_publishing(session, terminal_id, seq)
+    return seq
 
 
 class TestR5LedgerAuthoritativeAdmission:
     """The row-visible-before-retire window (r4 BLOCKER 1) is closed and cannot
-    over-admit either."""
+    over-admit either (carried forward to r6 on the token-bound ledger)."""
 
     @pytest.mark.asyncio
     async def test_row_visible_while_reserved_admits_peer_not_spurious_refuse(self, monkeypatch):
@@ -983,10 +1017,10 @@ class TestR5LedgerAuthoritativeAdmission:
         a concurrent peer B at cap-minus-one is ADMITTED, not spuriously refused.
 
         r4 computed ``count(2) + reservations(1) = 3`` and refused B at cap 3.
-        r5 computes ``reservations(1) + live(1)`` where ``live`` EXCLUDES A's row
-        (its id is in ``publishing_ids``) → 2 < 3 → B admitted. Both directions
-        are asserted: B admitted here, and the negative control below still
-        refuses the 4th arrival at cap."""
+        r5/r6 compute ``reservations(1) + live(1)`` where ``live`` EXCLUDES A's row
+        (its id maps to a LIVE token in ``publishing_ids``) → 2 < 3 → B admitted.
+        Both directions are asserted: B admitted here, and the negative control
+        below still refuses the 4th arrival at cap."""
         session = "cao-r5-invert"
         supervisor = "sup-r5-invert"
         _reset_cap_session(session)
@@ -997,11 +1031,8 @@ class TestR5LedgerAuthoritativeAdmission:
         monkeypatch.setattr(ts, "list_terminals_by_session", lambda _s: list(db_rows))
         monkeypatch.setattr(ts.status_monitor, "get_status", lambda tid: TerminalStatus.PROCESSING)
 
-        # Reproduce A's in-flight state: reservation held AND row visible.
-        lock = _cap_admission_lock(session)
-        with lock:
-            _cap_reservations[session] = 1
-            _cap_publishing_ids[session] = {a_id}
+        # Reproduce A's in-flight state: reservation held AND row visible+excluded.
+        _seed_reservation(session, a_id)
 
         # Confirm the gap really is the r4 double-count trap: 2 rows visible while
         # a reservation is held. r4 would have summed these to 3.
@@ -1009,10 +1040,10 @@ class TestR5LedgerAuthoritativeAdmission:
         assert len(gap_ids) == 2 and a_id in gap_ids
 
         # B (peer) MUST be admitted: reservations(1) + live(existing only = 1) = 2 < 3.
-        reserved_b = await _reserve_worker_slot(session, supervisor)
-        assert reserved_b is True
-        # Ledger now: A + B reserved (2), A's row still excluded from live.
-        assert _cap_reservations[session] == 2
+        token_b = await _reserve_worker_slot(session, supervisor)
+        assert token_b is not None
+        # Ledger now: A + B reserved (2 live tokens), A's row still excluded from live.
+        assert len(_cap_reservations[session]) == 2
 
         # NEGATIVE CONTROL: a 4th arrival now exceeds cap 3 and IS refused.
         # reservations(2) + live(1) = 3 >= 3.
@@ -1037,23 +1068,21 @@ class TestR5LedgerAuthoritativeAdmission:
         monkeypatch.setattr(ts, "list_terminals_by_session", lambda _s: list(db_rows))
         monkeypatch.setattr(ts.status_monitor, "get_status", lambda tid: TerminalStatus.PROCESSING)
 
-        lock = _cap_admission_lock(session)
-        with lock:
-            _cap_reservations[session] = 1
-            _cap_publishing_ids[session] = {a_id}
+        token_a = _seed_reservation(session, a_id)
 
         # BEFORE the transition: reservation held, A's row excluded → admitted for
         # a hypothetical peer = reservations(1) + live(1) = 2.
+        lock = _cap_admission_lock(session)
+
         def _peek_admitted():
             with lock:
-                reserved = _cap_reservations.get(session, 0)
-                publishing = _cap_publishing_ids.get(session, set())
-            _c, _r, ids = _count_worker_terminals_detailed(session, supervisor)
-            return reserved + sum(1 for wid in ids if wid not in publishing)
+                reserved = len(_cap_reservations.get(session) or ())
+                _c, _r, ids = _count_worker_terminals_detailed(session, supervisor)
+                return reserved + _live_worker_count(session, ids)
 
         assert _peek_admitted() == 2
         # Transition: A's row is already visible; retire the reservation + drop id.
-        _release_worker_slot(session, a_id, published=True)
+        _release_worker_slot(session, a_id, token=token_a, published=True)
         # AFTER: reservation gone, A's row now counted via live → admitted STILL 2.
         assert _peek_admitted() == 2
         _reset_cap_session(session)
@@ -1084,7 +1113,7 @@ class TestR5LedgerAuthoritativeAdmission:
                     asyncio.run(_create_worker(session=session, tmpdir=wd))
 
             # The failed create left NO stranded reservation/publishing unit.
-            assert _cap_reservations.get(session, 0) == 0
+            assert not _cap_reservations.get(session)
             assert not _cap_publishing_ids.get(session)
             # A row may or may not remain depending on rollback; the point is the
             # ledger no longer double-books. Whatever rows exist, a fresh admission
@@ -1108,19 +1137,22 @@ class TestR5DriftSelfHealing:
         monkeypatch.setattr(ts, "list_terminals_by_session", lambda _s: list(db_rows))
         monkeypatch.setattr(ts.status_monitor, "get_status", lambda tid: TerminalStatus.PROCESSING)
 
-        # POISON A: a stale publishing id with NO backing DB row. It must NOT
-        # permanently shrink the cap — it is simply not present in the listing, so
-        # ``live`` excludes nothing real and the phantom does not consume a slot.
+        # POISON A: a stale publishing entry with NO backing DB row AND no live
+        # token (an orphan). It must NOT permanently shrink the cap — it is not in
+        # the listing, and r6 also PURGES it because its token is not live.
         lock = _cap_admission_lock(session)
         with lock:
-            _cap_publishing_ids[session] = {"ghost999"}
-            _cap_reservations[session] = 0
+            _cap_publishing_ids[session] = {"ghost999": 999}  # token 999 is not live
+            _cap_reservations.pop(session, None)
+            ts._cap_gen[session] = ts._cap_gen.get(session, 0) + 1
 
         # DB truth = 2 live rows, cap 3 → one more admission must be allowed.
-        reserved = await _reserve_worker_slot(session, SUPERVISOR)
-        assert reserved is True  # 2 live + 0 reservations < 3
+        token = await _reserve_worker_slot(session, SUPERVISOR)
+        assert token is not None  # 2 live + 0 reservations < 3
+        # The orphan exclusion was purged during the count (its token was dead).
+        assert "ghost999" not in (_cap_publishing_ids.get(session) or {})
         # Retire it as a failure so no row is added.
-        _release_worker_slot(session, "newcomer", published=False)
+        _release_worker_slot(session, "newcomer", token=token, published=False)
 
         # POISON B: a DB row that never went through reserve/publish (restart /
         # external create). It must count EXACTLY ONCE. Add a third live row so DB
@@ -1131,9 +1163,151 @@ class TestR5DriftSelfHealing:
         assert refused.value.current_count == 3 and refused.value.cap == 3
         _reset_cap_session(session)
 
+    @pytest.mark.asyncio
+    async def test_stale_publishing_id_matching_live_db_row_does_not_over_admit(self, monkeypatch):
+        """F439 r6 / BLOCKER 2 (the r5 gate's second blocker), recycled-id
+        direction. A stale publishing entry left behind (crash after mark, leak)
+        whose terminal id ALSO matches a LIVE/recycled DB row must NOT exclude that
+        row with no backing reservation and admit a second unit at cap 1.
 
-class TestR5BoundedProgressAndReclamation:
-    """SHOULD 1 (bounded progress under churn) + SHOULD 2 (lock reclamation)."""
+        r5 stored publishing ids as a bare SET and excluded any listed row whose
+        id was in it, regardless of whether a reservation backed it. With
+        ``_cap_publishing_ids = {'recycled-id'}``, ``reservations = 0`` and a DB
+        row ``recycled-id`` at cap 1, r5 computed ``live = 0`` and ADMITTED —
+        two units at a one-worker cap. r6 binds the exclusion to a live token: the
+        stale entry's token is dead, so it excludes nothing, the row counts, and
+        the next admission is REFUSED. The stale entry is also purged.
+        """
+        session = "cao-r6-recycled"
+        supervisor = "sup-r6-recycled"
+        _reset_cap_session(session)
+        recycled = "recycled-id"
+        db_rows = [_row(recycled, caller_id=supervisor)]  # a LIVE row with the id
+        monkeypatch.setattr(ts, "_resolve_worker_terminal_cap", lambda: 1)
+        monkeypatch.setattr(ts, "list_terminals_by_session", lambda _s: list(db_rows))
+        monkeypatch.setattr(ts.status_monitor, "get_status", lambda tid: TerminalStatus.PROCESSING)
+
+        # Poison: a leaked publishing entry for the recycled id, NO live token
+        # backing it (reservations empty) — exactly the r5 gate's shape.
+        lock = _cap_admission_lock(session)
+        with lock:
+            _cap_publishing_ids[session] = {recycled: 42}  # token 42 is not live
+            _cap_reservations.pop(session, None)
+            ts._cap_gen[session] = ts._cap_gen.get(session, 0) + 1
+
+        # r5 admitted here (live counted 0). r6 MUST refuse: reservations(0) +
+        # live(1, the recycled row's stale exclusion is a dead orphan) = 1 >= 1.
+        with pytest.raises(TerminalCapExceeded) as refused:
+            await _reserve_worker_slot(session, supervisor)
+        assert refused.value.current_count == 1 and refused.value.cap == 1
+        # The orphaned exclusion was purged (converged to DB truth).
+        assert not _cap_publishing_ids.get(session)
+        _reset_cap_session(session)
+
+    def test_live_worker_count_ignores_and_purges_orphan_exclusion(self):
+        """Unit-level guard for the r6 B2 invariant: an exclusion whose token is
+        NOT a live reservation neither excludes a matching row NOR survives the
+        count. A held-token exclusion, by contrast, does exclude its row."""
+        session = "cao-r6-orphan-unit"
+        _reset_cap_session(session)
+        lock = _cap_admission_lock(session)
+        # One live reservation (token T) that excludes 'held'; one orphan token
+        # that (wrongly, if honoured) would exclude the live 'recycled' row.
+        with lock:
+            _cap_reservations[session] = {7}
+            _cap_publishing_ids[session] = {"held": 7, "recycled": 999}
+            # held row excluded (token 7 live); recycled NOT excluded (999 dead).
+            live = _live_worker_count(session, ["held", "recycled", "other"])
+            # 'held' excluded → count {'recycled','other'} = 2.
+            assert live == 2
+            # The orphan was purged; the live-token exclusion remains.
+            assert _cap_publishing_ids[session] == {"held": 7}
+        _reset_cap_session(session)
+
+
+class TestR6ReclamationSafety:
+    """F439 r6 / BLOCKER 1: the reclamation ABA is killed by construction — the
+    per-session lock is never swapped and the generation never resets."""
+
+    @pytest.mark.asyncio
+    async def test_stale_reader_aba_schedule_refuses_at_cap_one(self, monkeypatch):
+        """The r5 gate's four-step ABA schedule, deterministic:
+
+        1. A stale reader (lane L1) reads the generation and takes an EMPTY
+           lock-free listing snapshot, then PAUSES before deciding.
+        2. A keeper reservation is retired; r5 reclamation removed L1's lock+gen.
+        3. A new lane (L2) obtains a lock, reserves, publishes row ``published``,
+           retires + reclaims — under r5 the generation was back to 0.
+        4. L1 resumes; under r5 ``gen_before == gen_after == 0`` falsely validated
+           its stale empty snapshot and it over-admitted at cap 1.
+
+        r6: the lock is never swapped (L1 and L2 share ONE lock object) and the
+        generation is monotonic (never popped), so when L1 resumes it observes a
+        STRICTLY GREATER generation, re-lists, sees ``published``, and is REFUSED
+        at cap 1. Asserted here without real threads by driving the exact ledger
+        transitions the schedule produces and then reserving from the post-churn
+        state."""
+        session = "cao-r6-aba"
+        supervisor = "sup-r6-aba"
+        _reset_cap_session(session)
+        monkeypatch.setattr(ts, "_resolve_worker_terminal_cap", lambda: 1)
+
+        # Step 1: capture the lock identity + generation a stale reader would hold
+        # at the start, against an EMPTY fleet.
+        lock_before = _cap_admission_lock(session)
+        with lock_before:
+            gen_l1_before = ts._cap_gen.get(session, 0)
+
+        # Step 2+3: a keeper reserves against the empty fleet, publishes its row,
+        # then retires+reclaims (the full churn r5 would have ABA-reset).
+        db_rows: list = []
+        monkeypatch.setattr(ts, "list_terminals_by_session", lambda _s: list(db_rows))
+        monkeypatch.setattr(ts.status_monitor, "get_status", lambda tid: TerminalStatus.PROCESSING)
+        keeper = await _reserve_worker_slot(session, supervisor)
+        assert keeper is not None
+        published_id = "published"
+        _mark_publishing(session, published_id, keeper)
+        db_rows.append(_row(published_id, caller_id=supervisor))  # row now visible
+        _release_worker_slot(session, published_id, token=keeper, published=True)
+        # The session is quiescent → mutable state reclaimed, BUT lock+gen kept.
+        assert not _cap_reservations.get(session)
+        assert not _cap_publishing_ids.get(session)
+
+        # r6 invariant A: the lock object is the SAME (never swapped/recreated).
+        lock_after = _cap_admission_lock(session)
+        assert lock_after is lock_before, "reclamation must NOT swap the per-session lock (r5 ABA)"
+        # r6 invariant B: the generation strictly advanced (never reset to 0).
+        with lock_after:
+            gen_now = ts._cap_gen.get(session, 0)
+        assert gen_now > gen_l1_before, "generation must be monotonic across churn (r5 ABA)"
+
+        # Step 4: the stale reader L1 resumes and decides. Its snapshot generation
+        # (gen_l1_before) no longer matches → r6 re-lists, sees the published row,
+        # and REFUSES at cap 1. (Under r5's 0==0 reset it would have admitted.)
+        with pytest.raises(TerminalCapExceeded) as refused:
+            await _reserve_worker_slot(session, supervisor)
+        assert refused.value.current_count == 1 and refused.value.cap == 1
+        _reset_cap_session(session)
+
+    def test_admission_lock_identity_is_stable_across_full_lifecycle(self):
+        """The per-session lock object is stable across a full reserve→release
+        (quiescence) cycle — never a fresh object a stale reader could diverge
+        from. This is the direct kill of the r5 lock-domain-swap."""
+        session = "cao-r6-lock-stable"
+        _reset_cap_session(session)
+        lock_a = _cap_admission_lock(session)
+        token = _seed_reservation(session)
+        lock_b = _cap_admission_lock(session)
+        _release_worker_slot(session, None, token=token, published=True)  # -> quiescent
+        lock_c = _cap_admission_lock(session)
+        assert lock_a is lock_b is lock_c
+        _reset_cap_session(session)
+
+
+class TestR5BoundedProgress:
+    """SHOULD 1 (bounded progress under churn). SHOULD 2 (lock reclamation) is
+    intentionally DROPPED in r6: the lock+gen are never reclaimed (that was the
+    r5 ABA); see ``TestR6RetainedRegistryIsBoundedButTiny`` for the memory note."""
 
     @pytest.mark.asyncio
     async def test_reserve_completes_under_sustained_generation_churn(self, monkeypatch):
@@ -1164,30 +1338,39 @@ class TestR5BoundedProgressAndReclamation:
         try:
             # Must return (not hang): the bounded fallback eventually takes the
             # listing+decision under the lock, where the writer cannot race it.
-            result = await asyncio.wait_for(_reserve_worker_slot(session, "sup"), timeout=10)
-            assert result is True
-            assert _cap_reservations.get(session) == 1
+            token = await asyncio.wait_for(_reserve_worker_slot(session, "sup"), timeout=10)
+            assert token is not None
+            assert len(_cap_reservations.get(session) or ()) == 1
         finally:
             stop.set()
             writer.join(timeout=5)
-        _release_worker_slot(session, None, published=False)
+        _release_worker_slot(session, None, token=token, published=False)
         _reset_cap_session(session)
 
+
+class TestR6RetainedRegistryIsBoundedButTiny:
+    """F439 r6 / BLOCKER 1: after a full reserve→release cycle the MUTABLE ledger
+    state is reclaimed (no phantom reservation/exclusion lingers), while the
+    lock+gen+token-seq are intentionally RETAINED (never popped) — the deliberate,
+    documented unbounded-but-tiny growth that replaces the unsafe r5 reclamation.
+    """
+
     @pytest.mark.asyncio
-    async def test_quiescent_sessions_reclaim_admission_lock_registry(self, monkeypatch):
-        """SHOULD 2: after a full reserve→release cycle a session leaves NO entry
-        in the per-session lock registry (r4 grew it unbounded)."""
+    async def test_quiescent_sessions_reclaim_mutable_state_but_retain_lock(self, monkeypatch):
         monkeypatch.setattr(ts, "_resolve_worker_terminal_cap", lambda: 10)
         monkeypatch.setattr(ts, "_count_worker_terminals_detailed", lambda _s, _sup: (0, [], []))
-        before = set(_cap_admission_locks)
-        sessions = [f"cao-r5-reclaim-{i:04d}" for i in range(200)]
+        sessions = [f"cao-r6-reclaim-{i:04d}" for i in range(200)]
         for session in sessions:
-            reserved = await _reserve_worker_slot(session, "sup")
-            assert reserved is True
-            _release_worker_slot(session, f"tid-{session}", published=True)
+            token = await _reserve_worker_slot(session, "sup")
+            assert token is not None
+            _release_worker_slot(session, f"tid-{session}", token=token, published=True)
+            # MUTABLE state fully reclaimed on quiescence.
             assert session not in _cap_reservations
             assert session not in _cap_publishing_ids
-            assert session not in ts._cap_gen
-        leaked = set(_cap_admission_locks) - before
-        # No quiescent session retains a lock entry.
-        assert leaked & set(sessions) == set(), sorted(leaked & set(sessions))[:5]
+            # But the lock + generation are RETAINED (r6: never reclaim → no ABA).
+            assert session in _cap_admission_locks
+            assert session in ts._cap_gen
+        # The retained registry is bounded by DISTINCT session names (tiny), and
+        # every retained gen is monotonic (>= 1 after one cycle).
+        for session in sessions:
+            assert ts._cap_gen[session] >= 1
