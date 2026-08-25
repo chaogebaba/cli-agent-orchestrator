@@ -50,6 +50,10 @@ def tmux_env(request, monkeypatch):
     socket_name = _make_socket_name(request)
     monkeypatch.setenv("CAO_TMUX_SOCKET", socket_name)
     monkeypatch.setenv("CAO_INSTANCE_ID", "test-f469")
+    # pty.fork() children inherit os.environ; tmux attach-session requires TERM
+    # to be set or it silently refuses to register a client. Under headless
+    # environments (xdist workers, SSH non-interactive, CI) TERM may be absent.
+    monkeypatch.setenv("TERM", os.environ.get("TERM", "xterm-256color"))
 
     def _tmux(*args):
         return subprocess.run(
