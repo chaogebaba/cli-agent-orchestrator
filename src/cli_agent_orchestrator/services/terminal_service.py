@@ -4516,9 +4516,11 @@ def send_input(
             # confirmed by a NEW submitted turn relative to this baseline
             # (dispatch-relative), not by an absolute pane pattern that a
             # historical/identical turn could satisfy. No-op (None) for
-            # non-codex providers.
+            # non-codex providers. getattr-guarded so provider doubles that
+            # predate the hook are unaffected.
+            _capture_baseline = getattr(provider, "capture_submission_baseline", None)
             submit_baseline = (
-                provider.capture_submission_baseline(metadata, backend) if provider else None
+                _capture_baseline(metadata, backend) if callable(_capture_baseline) else None
             )
             backend.send_keys(
                 metadata["tmux_session"],
@@ -4717,9 +4719,11 @@ def send_prepared_input(
     dispatch_txn: DispatchTxn = status_monitor.begin_dispatch(terminal_id)
     try:
         # F435 r5: snapshot the pane BEFORE the paste for a dispatch-relative
-        # submission diff (no-op None for non-codex providers).
+        # submission diff (no-op None for non-codex providers). getattr-guarded
+        # so provider doubles that predate the hook are unaffected.
+        _capture_baseline = getattr(provider, "capture_submission_baseline", None)
         submit_baseline = (
-            provider.capture_submission_baseline(metadata, backend) if provider else None
+            _capture_baseline(metadata, backend) if callable(_capture_baseline) else None
         )
         backend.send_keys(
             metadata["tmux_session"],
