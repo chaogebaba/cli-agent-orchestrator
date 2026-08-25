@@ -1697,18 +1697,47 @@ class CodexProvider(BaseProvider):
         """Locate the rollout JSONL for the given session UUID.
 
         Returns the single matching path, or ``None`` if not (yet) resolvable.
-        Handles: file not yet created, multiple sessions in CODEX_HOME (pins by
-        UUID), ambiguous matches (returns None to avoid false positives).
+
+        Resolution strategy:
+          1. Exact UUID match (glob ``rollout-*{uuid}*.jsonl``) — unambiguous
+             when exactly one file matches.
+          2. Ambiguous multi-match: pin by NEWEST mtime (the most recently
+             written rollout file for this UUID is the active session).
+          3. No UUID (fresh session before capture): fall back to the resume
+             seed (``self._fork_context.session_uuid`` when mode == resume), or
+             the single newest rollout file in the sessions dir.
         """
-        if not session_uuid:
-            return None
         sessions_dir = _resolved_codex_home(getattr(self, "terminal_id", None)) / "sessions"
         if not sessions_dir.is_dir():
             return None
-        matches = list(sessions_dir.glob(f"**/rollout-*{session_uuid}*.jsonl"))
-        if len(matches) == 1:
-            return matches[0]
-        # Ambiguous or missing — caller must poll for creation or abort.
+
+        # --- Try explicit UUID first ---
+        if session_uuid:
+            matches = list(sessions_dir.glob(f"**/rollout-*{session_uuid}*.jsonl"))
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                # Ambiguous: pin by newest mtime (most recently active).
+                return max(matches, key=lambda p: p.stat().st_mtime)
+            # No match — file not yet created; caller will poll.
+            return None
+
+        # --- No UUID: try resume seed ---
+        resume_uuid = self.resume_session_uuid()
+        if resume_uuid:
+            matches = list(sessions_dir.glob(f"**/rollout-*{resume_uuid}*.jsonl"))
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                return max(matches, key=lambda p: p.stat().st_mtime)
+
+        # --- Last resort: newest rollout file in sessions dir ---
+        all_rollouts = list(sessions_dir.glob("**/rollout-*.jsonl"))
+        if len(all_rollouts) == 1:
+            return all_rollouts[0]
+        if all_rollouts:
+            return max(all_rollouts, key=lambda p: p.stat().st_mtime)
+
         return None
 
     @staticmethod
@@ -1757,9 +1786,14 @@ class CodexProvider(BaseProvider):
             return False
 
         # Only process complete lines (ending in \n) — a partial last line is
-        # an in-progress write and must not be parsed.
+        # an in-progress write and must not be parsed.  If the raw chunk ends
+        # with \n, every segment is complete; otherwise discard the trailing
+        # fragment.
+        lines = raw.split("\n")
+        if not raw.endswith("\n"):
+            lines = lines[:-1]  # drop incomplete trailing fragment
         norm_message = cls._normalize_for_match(message)
-        for line in raw.split("\n"):
+        for line in lines:
             line = line.strip()
             if not line:
                 continue
