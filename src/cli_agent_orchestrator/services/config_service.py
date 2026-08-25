@@ -152,6 +152,9 @@ _LEGACY_KEY_MAP: Dict[str, Tuple[str, ...]] = {
 _OWNED_DEFAULTS: Dict[str, Any] = {
     "terminal.backend": "tmux",
     "terminal.herdr_session": "cao",
+    # F439 (#294): default worker-terminal cap when neither env nor
+    # settings.json sets it.
+    "orchestrator.max_worker_terminals": 10,
     "apps.enabled": False,
     "apps.static_dir": None,
     "auth.jwks_uri": "",
@@ -171,6 +174,9 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
 ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_TERMINAL_BACKEND": ("terminal.backend", "str", "tmux"),
     "CAO_HERDR_SESSION": ("terminal.herdr_session", "str", "cao"),
+    # F439 (#294): server-side worker-terminal cap. <=0 disables. env beats
+    # settings.json (orchestrator.max_worker_terminals) beats this default 10.
+    "CAO_MAX_WORKER_TERMINALS": ("orchestrator.max_worker_terminals", "int", 10),
     "CAO_MCP_APPS_ENABLED": ("apps.enabled", "bool", False),
     "CAO_MCP_APPS_STATIC_DIR": ("apps.static_dir", "str", None),
     "CAO_AUTH_JWKS_URI": ("auth.jwks_uri", "str", ""),

@@ -1017,6 +1017,57 @@ def _extract_structured_detail(response: requests.Response, fallback: str) -> st
     return detail if isinstance(detail, str) and detail else fallback
 
 
+def _extract_terminal_cap_detail(response: "requests.Response | None") -> Optional[Dict[str, Any]]:
+    """Return the E-TERMINAL-CAP structured detail from a 409 response, else None.
+
+    F439 (#294): the server refuses over-cap assign/handoff with a 409 whose
+    ``detail`` carries ``code="E-TERMINAL-CAP"`` plus ``current_count``, ``cap``
+    and ``reap_candidates``. This recognizes that shape (on either route — the
+    assign route's plain detail, or the run-step route's detail that also adds a
+    ``kind``) so the caller can render the reap-candidate surface rather than
+    losing it to a bare error string.
+    """
+    if response is None:
+        return None
+    try:
+        detail = response.json().get("detail")
+    except ValueError:
+        return None
+    if isinstance(detail, dict) and detail.get("code") == "E-TERMINAL-CAP":
+        return detail
+    return None
+
+
+def _render_terminal_cap_message(detail: Dict[str, Any], action: str) -> str:
+    """Render an E-TERMINAL-CAP detail into a supervisor-facing message.
+
+    Lists the idle reap candidates (id, display_name, idle-since) so the
+    supervisor can reap-then-retry — the server never auto-reaps.
+    """
+    current = detail.get("current_count")
+    cap = detail.get("cap")
+    candidates = detail.get("reap_candidates") or []
+    lines = [
+        f"{action} refused (E-TERMINAL-CAP): {current} live worker terminal(s) "
+        f"at cap {cap}. No terminal was created. Reap an idle worker with "
+        f"delete_terminal, then retry — the server never auto-reaps."
+    ]
+    if candidates:
+        lines.append("Idle reap candidates:")
+        for cand in candidates:
+            idle_since = cand.get("idle_since")
+            suffix = f" (idle since {idle_since})" if idle_since else ""
+            lines.append(
+                f"  - {cand.get('display_name', cand.get('id'))} " f"[{cand.get('id')}]{suffix}"
+            )
+    else:
+        lines.append(
+            "No idle workers to reap — every worker is busy; wait for one to "
+            "finish or raise CAO_MAX_WORKER_TERMINALS."
+        )
+    return "\n".join(lines)
+
+
 def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
     """Fetch a skill body from cao-server and return content or a structured error."""
     try:
@@ -1225,6 +1276,20 @@ async def _handoff_impl(
             )
 
         if response.status_code != 200:
+            # F439 (#294): the worker-terminal cap refuses handoff with a 409
+            # E-TERMINAL-CAP; render the reap-candidate surface (no terminal was
+            # created, so there is nothing to delete).
+            cap_detail = _extract_terminal_cap_detail(response)
+            if cap_detail is not None:
+                return HandoffResult(
+                    success=False,
+                    message=_render_terminal_cap_message(cap_detail, "Handoff"),
+                    output=None,
+                    terminal_id=None,
+                    display_name=None,
+                    window_name=None,
+                    resolved_model=None,
+                )
             # Map the boundary's HTTPException back into a HandoffResult. The
             # run-step endpoint returns a STRUCTURED detail object
             # ({message, kind, terminal_id}) so we read terminal_id and the
@@ -1237,10 +1302,7 @@ async def _handoff_impl(
             # (504 -> timeout, 502 -> error).
             _dn = display_name(tid, agent_profile) if tid else "unknown"
             if kind == "input_blocked":
-                msg = (
-                    f"Handoff blocked: {_dn} is waiting on a dialog "
-                    f"({structured_detail})"
-                )
+                msg = f"Handoff blocked: {_dn} is waiting on a dialog " f"({structured_detail})"
             elif kind == "waiting_user_input":
                 msg = (
                     f"Handoff blocked: worker is waiting for user input "
@@ -1277,6 +1339,7 @@ async def _handoff_impl(
         if terminal_id:
             try:
                 from cli_agent_orchestrator.services.terminal_service import get_terminal_metadata
+
                 _hm = get_terminal_metadata(terminal_id)
                 if _hm:
                     _f127_handoff_model = _hm.get("resolved_model")
@@ -1319,6 +1382,7 @@ async def interrupt_terminal(
 
     try:
         from cli_agent_orchestrator.services.terminal_service import get_terminal_metadata
+
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             return {"success": False, "terminal_id": terminal_id, "message": "Terminal not found"}
@@ -1335,6 +1399,7 @@ async def interrupt_terminal(
 
         # Guard: only interrupt PROCESSING terminals
         from cli_agent_orchestrator.services.status_monitor import status_monitor
+
         current_status = status_monitor.get_status(terminal_id).value
         if current_status != "processing":
             return {
@@ -1347,6 +1412,7 @@ async def interrupt_terminal(
 
         # Get provider interrupt keys
         from cli_agent_orchestrator.providers.manager import get_provider_class
+
         provider_type = metadata.get("provider", "")
         provider_cls = get_provider_class(provider_type)
         keys = provider_cls.interrupt_keys
@@ -1734,6 +1800,7 @@ def _assign_impl(
         if agent_profile:
             try:
                 from cli_agent_orchestrator.services.terminal_service import get_terminal_metadata
+
                 _f127_meta = get_terminal_metadata(terminal_id)
                 if _f127_meta:
                     _f127_resolved = _f127_meta.get("resolved_model")
@@ -1763,6 +1830,16 @@ def _assign_impl(
         return result
 
     except requests.HTTPError as exc:
+        cap_detail = _extract_terminal_cap_detail(exc.response)
+        if cap_detail is not None:
+            # F439 (#294): render the reap-candidate surface, and echo the
+            # structured fields so programmatic callers can branch on them.
+            return {
+                "success": False,
+                "terminal_id": None,
+                "error": cap_detail,
+                "message": _render_terminal_cap_message(cap_detail, "Assignment"),
+            }
         detail = (
             _extract_error_detail(exc.response, str(exc)) if exc.response is not None else str(exc)
         )
@@ -4267,10 +4344,11 @@ from cli_agent_orchestrator.plugins.registry import register_mcp_server_surfaces
 register_mcp_server_surfaces(mcp)
 
 
+from typing import Sequence as _Seq  # noqa: E402
+
 # --- Deterministic tools/list ordering (MCP 2026-07-28: servers SHOULD return
 # tools/list in deterministic order for prompt-cache stability) ---
 from fastmcp.server.middleware import Middleware as _Middleware  # noqa: E402
-from typing import Sequence as _Seq  # noqa: E402
 
 
 class _DeterministicToolOrder(_Middleware):

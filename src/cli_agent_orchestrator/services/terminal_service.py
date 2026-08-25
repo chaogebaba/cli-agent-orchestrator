@@ -142,6 +142,7 @@ from cli_agent_orchestrator.utils.sandbox_guard import (
 )
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
+    display_name,
     generate_session_name,
     generate_terminal_id,
     generate_window_name,
@@ -149,6 +150,45 @@ from cli_agent_orchestrator.utils.terminal import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class TerminalCapExceeded(RuntimeError):
+    """F439 (#294): raised when a worker terminal would exceed the session cap.
+
+    Fail-closed structured error. Carries the counting surface the supervisor
+    needs to reap-then-retry (the server never auto-reaps): the current live
+    worker count, the resolved cap, and the idle worker terminals that are the
+    natural reap candidates. Both HTTP boundaries (``POST
+    /sessions/{s}/terminals`` and ``POST /terminals/run-step``) map this to a
+    409 whose ``detail`` carries ``code="E-TERMINAL-CAP"`` plus these fields.
+    """
+
+    code = "E-TERMINAL-CAP"
+
+    def __init__(
+        self,
+        current_count: int,
+        cap: int,
+        reap_candidates: List[Dict[str, Any]],
+    ) -> None:
+        self.current_count = current_count
+        self.cap = cap
+        self.reap_candidates = reap_candidates
+        super().__init__(
+            f"worker-terminal cap reached: {current_count} live worker terminal(s) "
+            f"at cap {cap}. Reap an idle worker (delete_terminal) then retry; the "
+            f"server never auto-reaps."
+        )
+
+    def detail(self) -> Dict[str, Any]:
+        """Structured HTTP detail body carrying the reap-candidate surface."""
+        return {
+            "code": self.code,
+            "message": str(self),
+            "current_count": self.current_count,
+            "cap": self.cap,
+            "reap_candidates": self.reap_candidates,
+        }
 
 
 class IdentityAmbiguousError(RuntimeError):
@@ -254,6 +294,74 @@ class _DeferredTaskRecord:
 
 _deferred_tasks_by_terminal: dict[str, _DeferredTaskRecord] = {}
 _fork_refresh_locks: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock] = {}
+# F439 (#294) round 2 / BLOCKER 1: per-session admission lock. The worker-cap
+# check is check-then-act (count -> create); without serializing the decision
+# through publication, N concurrent create_terminal calls for the same session
+# all observe the same pre-create count and all get admitted, oversubscribing
+# the cap. This is a threading.Lock (NOT asyncio.Lock) so it serializes across
+# BOTH coroutines on the server's single event loop AND separate-loop threads
+# (the gate's adversarial probe drives create_terminal from four threads, each
+# with its own loop — an asyncio.Lock keyed by loop would not serialize them).
+# It is acquired with a loop-friendly non-blocking spin (``_acquire_cap_lock``)
+# so it never freezes the event loop while contended.
+#
+# F439 (#294) round 3 / BLOCKER: the lock must NOT be held across the count's
+# ``list_terminals_by_session`` callout. The round-1 gate probe patches a
+# ``threading.Barrier(N)`` INSIDE that listing so all N racers must reach it
+# concurrently; holding the admission lock across the count let only the first
+# entrant reach the barrier while the other N-1 spun on the lock, so the
+# barrier broke instead of producing 1 admit / N-1 refusals. The repair keeps
+# the SLOW, OBSERVABLE listing lock-free (every racer counts concurrently) and
+# uses the lock only to guard a tiny in-memory reservation ledger.
+#
+# F439 (#294) round 4 / BLOCKER 1: the round-3 ledger retired a reservation the
+# instant its row published, which oversubscribed the cap. A racer that took its
+# lock-free live-count snapshot at cap-minus-one could be held (at any of the
+# awaits between the count and publication — the provider preflight, the
+# ``to_thread`` worktree checkout, the capability probe) until a PEER both
+# published its row AND released its reservation; the delayed racer then resumed
+# with a snapshot that missed the peer's row and a ledger that no longer showed
+# the peer's reservation, so it saw neither representation of the peer's slot and
+# admitted from a stale count — 3 workers at cap 2.
+#
+# The round-4 repair makes the reservation-to-row handoff atomic WITHOUT
+# serializing the barriered listing, via a per-session monotonic PUBLISH EPOCH
+# incremented under the admission lock every time a row is published (in the same
+# critical section that retires the publishing reservation). Every racer records
+# the epoch it observed when it took its lock-free snapshot; at reserve time,
+# under the lock, the authoritative admitted total is
+#
+#     snapshot_live_count
+#       + (epoch_now - snapshot_epoch)   # rows published AFTER my snapshot that
+#                                        # my stale listing could not see
+#       + reservations                   # peers' booked-but-unpublished slots
+#
+# so a peer's slot is ALWAYS visible to a delayed racer — as a reservation before
+# the peer publishes, and as an epoch delta after it publishes — with no double
+# count (publication moves the slot from ``reservations`` to the epoch delta in
+# one locked step). The listing itself stays lock-free, so the gate's
+# barrier-inside-listing probe still has all N racers reach the barrier at once.
+_cap_admission_locks: dict[str, threading.Lock] = {}
+_cap_admission_locks_guard = threading.Lock()
+# Per-session count of admissions granted but whose DB row is not yet published.
+# Mutated ONLY while holding that session's ``_cap_admission_lock``. Keyed by
+# session_name; a session's entry is removed when its reservation count returns
+# to zero AND its publish epoch is quiescent so the map does not grow unbounded.
+_cap_reservations: dict[str, int] = {}
+# F439 (#294) round 4 / BLOCKER 1: per-session monotonic count of worker rows
+# published since this ledger entry was created. Mutated ONLY while holding that
+# session's ``_cap_admission_lock``, and ONLY on a publication (not on a failed
+# create — a rollback publishes no countable row, so it must not bump the epoch).
+# A racer folds ``epoch_now - snapshot_epoch`` into its admitted total so a row
+# published after its lock-free snapshot is still counted even though the stale
+# listing missed it. Cleared together with the reservation entry once the session
+# is fully quiescent (no reservations AND no racer mid-flight).
+_cap_publish_epoch: dict[str, int] = {}
+# In-flight admission attempts per session: incremented when a reservation is
+# booked, decremented when it is retired (publish OR failure). While > 0 a racer
+# may still hold a snapshot epoch that the ledger must be able to diff against, so
+# the epoch entry is retained; it is dropped only when this returns to zero.
+_cap_inflight: dict[str, int] = {}
 
 
 def _preflight_disk_space(path: str, floor_gb: float = DISK_SPACE_FLOOR_GB) -> None:
@@ -929,6 +1037,93 @@ def _resolve_working_directory(working_directory: Optional[str]) -> str:
     )
 
 
+def _resolve_worker_terminal_cap() -> int:
+    """Resolve the worker-terminal cap (F439 #294).
+
+    Precedence: ``CAO_MAX_WORKER_TERMINALS`` env > ``orchestrator.max_worker_terminals``
+    in settings.json > built-in default 10. Delegates entirely to ConfigService
+    so the precedence chain is the single one the rest of the server uses — no
+    new config file, no bespoke env read. A ``<= 0`` value disables the cap
+    (callers treat that as "no limit").
+    """
+    from cli_agent_orchestrator.services.config_service import ConfigService
+
+    try:
+        cap = int(ConfigService.get("orchestrator.max_worker_terminals", default=10))
+    except (TypeError, ValueError):
+        # A malformed settings.json value must not brick terminal creation;
+        # fall back to the built-in default rather than raising.
+        logger.warning("invalid orchestrator.max_worker_terminals; using default cap 10")
+        cap = 10
+    return cap
+
+
+def _count_worker_terminals(
+    session_name: str, supervisor_id: Optional[str]
+) -> tuple[int, List[Dict[str, Any]]]:
+    """Count live worker terminals in a session, excluding the supervisor.
+
+    Derived from live state on every call (no persistent counter), so it
+    survives a server restart. A "worker" is every terminal row in the session
+    other than ``supervisor_id`` (the terminal doing the assign/handoff). Idle
+    workers COUNT toward the cap — their RAM cost is real — but are ALSO
+    returned as reap candidates so the supervisor can reap-then-retry.
+
+    Returns ``(count, reap_candidates)`` where each candidate is
+    ``{"id", "display_name", "idle_since"}`` for a worker whose live status is
+    IDLE. ``idle_since`` is the row's ``last_active`` ISO string (best-effort;
+    None when unavailable).
+    """
+    rows = list_terminals_by_session(session_name)
+    count = 0
+    reap_candidates: List[Dict[str, Any]] = []
+    for row in rows:
+        tid = row.get("id")
+        if not tid or tid == supervisor_id:
+            # The supervisor's own terminal is never a worker and never counted.
+            continue
+        count += 1
+        try:
+            live_status = status_monitor.get_status(tid)
+        except Exception:
+            live_status = None
+        if live_status == TerminalStatus.IDLE:
+            last_active = row.get("last_active")
+            idle_since: Optional[str] = None
+            if isinstance(last_active, datetime):
+                idle_since = last_active.isoformat()
+            elif last_active is not None:
+                idle_since = str(last_active)
+            reap_candidates.append(
+                {
+                    "id": tid,
+                    "display_name": display_name(tid, row.get("agent_profile")),
+                    "idle_since": idle_since,
+                }
+            )
+    return count, reap_candidates
+
+
+def _enforce_worker_terminal_cap(session_name: str, supervisor_id: Optional[str]) -> None:
+    """Refuse fail-closed when a new worker would breach the session cap (F439).
+
+    Called ONLY for supervisor-created workers joining an existing session
+    (``new_session=False`` and ``caller_id`` set) — operator-launched terminals
+    and the supervisor itself are never capped. Raises ``TerminalCapExceeded``
+    BEFORE any tmux window, DB row, worktree, or provider init exists (same
+    fail-before-side-effects atomicity as the authority-pin refusal path), so a
+    refusal leaves no resource to unwind.
+
+    A cap of ``<= 0`` disables enforcement entirely.
+    """
+    cap = _resolve_worker_terminal_cap()
+    if cap <= 0:
+        return
+    count, reap_candidates = _count_worker_terminals(session_name, supervisor_id)
+    if count >= cap:
+        raise TerminalCapExceeded(current_count=count, cap=cap, reap_candidates=reap_candidates)
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -1022,51 +1217,134 @@ async def create_terminal(
         TimeoutError: If provider initialization times out
     """
     require_provider_admitted(provider)
-    if working_directory is not None:
-        # Expand and resolve early so the preflight disk-space check and
-        # worktree path-override see an absolute, canonical path. Relative
-        # paths (e.g. ".") are resolved via os.getcwd() at this point.
-        expanded = os.path.realpath(os.path.abspath(os.path.expanduser(working_directory)))
-        try:
-            working_directory = resolve_and_validate_path(expanded, description="Working directory")
-        except ValueError as exc:
-            raise ValueError(f"invalid_working_directory: {exc}") from exc
-    else:
-        working_directory = resolve_and_validate_path(os.getcwd(), description="Working directory")
-    _preflight_disk_space(working_directory)
-    provider_class = get_provider_class(provider)
-    if provider_class.supports_seed_resume_identity is True and fork_context is None:
-        raise RuntimeError("seed_required")
-    resume_uuid = (
-        fork_context.session_uuid
-        if fork_context is not None and fork_context.mode == "resume"
-        else None
-    )
-    if not session_name:
-        session_name = generate_session_name()
-    if new_session and not session_name.startswith(SESSION_PREFIX):
-        session_name = f"{SESSION_PREFIX}{session_name}"
-    owned_lifecycle_lease = False
-    owned_uuid_lease = False
-    if resume_uuid:
-        (
-            uuid_lease_token,
-            owned_uuid_lease,
-            session_lifecycle_lease_token,
-            owned_lifecycle_lease,
-        ) = _acquire_resume_creation_authority(
-            session_name,
-            resume_uuid,
-            uuid_lease_token,
-            session_lifecycle_lease_token,
-            fallback_source_terminal_id,
-            fallback_source_lease_token,
+    # F439 (#294): enforce the worker-terminal cap BEFORE any resource is
+    # created — no tmux window, no DB row, no worktree, no provider init — so a
+    # refusal is atomic and leaves nothing to unwind (mirrors the authority-pin
+    # pre-init refusal). Only supervisor-created workers joining an EXISTING
+    # session are capped: new_session=True (operator/new-session launches) and
+    # caller_id=None (operator-launched terminals, the supervisor itself) are
+    # never workers and are never counted. session_name is always supplied by
+    # both assign (POST /sessions/{s}/terminals) and handoff (run-step) on this
+    # path, so the guard is exact.
+    # F439 (#294) round 3 / BLOCKER: admission is a lock-free COUNT + a locked
+    # RESERVE (``_reserve_worker_slot``) so the observable
+    # ``list_terminals_by_session`` callout inside the count is NOT serialized by
+    # the admission lock — every concurrent same-session racer counts at once
+    # (and reaches any barrier the gate probe installs in the listing). The
+    # per-session admission lock guards ONLY the tiny reservation ledger.
+    # F439 (#294) round 4 / BLOCKER 1: the reservation-to-row handoff is made
+    # atomic via a per-session publish EPOCH (see the ledger comment on
+    # ``_cap_publish_epoch``). ``_reserve_worker_slot`` returns the epoch this
+    # create observed at snapshot time; the release closure threads it back so
+    # the publishing release can bump the epoch in the SAME locked step that
+    # retires the reservation, and a delayed racer's stale snapshot still counts
+    # this row via ``epoch_now - snapshot_epoch``. Retired the instant the DB row
+    # is published (``published=True``) or on ANY earlier failure via the
+    # rollback/except seams (``published=False`` — a rollback publishes no row,
+    # so it must not bump the epoch), so a concurrent racer's in-flight admit is
+    # always visible as either a reservation or an epoch delta.
+    _cap_capped = new_session is False and bool(caller_id) and bool(session_name)
+    _cap_reserved = False
+    _cap_snapshot_epoch: int = 0
+
+    def _release_cap_lock(published: bool = False) -> None:
+        # Retire this create's worker-slot reservation exactly once. Idempotent
+        # via the ``_cap_reserved`` flag so the success path (right after
+        # ``db_created`` with ``published=True``), the rollback ``except``, and
+        # the outer ``finally`` (both ``published=False``) can all call it
+        # without double-decrementing the ledger. Only the FIRST call takes
+        # effect: on success that is the publishing release, so the epoch is
+        # bumped exactly once; on failure only the ``published=False`` releases
+        # fire, so no phantom row is ever counted.
+        nonlocal _cap_reserved
+        if _cap_reserved:
+            _cap_reserved = False
+            _release_worker_slot(
+                session_name,  # type: ignore[arg-type]
+                _cap_snapshot_epoch,
+                published=published,
+            )
+
+    if _cap_capped:
+        # Lock-free count + locked reserve. Raises TerminalCapExceeded fail-closed
+        # BEFORE any resource is created when the session is at cap. Returns the
+        # observed publish epoch (None when the cap is disabled).
+        _reserved_epoch = await _reserve_worker_slot(session_name, caller_id)  # type: ignore[arg-type]
+        if _reserved_epoch is not None:
+            _cap_reserved = True
+            _cap_snapshot_epoch = _reserved_epoch
+    try:
+        if working_directory is not None:
+            # Expand and resolve early so the preflight disk-space check and
+            # worktree path-override see an absolute, canonical path. Relative
+            # paths (e.g. ".") are resolved via os.getcwd() at this point.
+            expanded = os.path.realpath(os.path.abspath(os.path.expanduser(working_directory)))
+            try:
+                working_directory = resolve_and_validate_path(
+                    expanded, description="Working directory"
+                )
+            except ValueError as exc:
+                raise ValueError(f"invalid_working_directory: {exc}") from exc
+        else:
+            working_directory = resolve_and_validate_path(
+                os.getcwd(), description="Working directory"
+            )
+        _preflight_disk_space(working_directory)
+        provider_class = get_provider_class(provider)
+        if provider_class.supports_seed_resume_identity is True and fork_context is None:
+            raise RuntimeError("seed_required")
+        resume_uuid = (
+            fork_context.session_uuid
+            if fork_context is not None and fork_context.mode == "resume"
+            else None
         )
+        if not session_name:
+            session_name = generate_session_name()
+        if new_session and not session_name.startswith(SESSION_PREFIX):
+            session_name = f"{SESSION_PREFIX}{session_name}"
+        owned_lifecycle_lease = False
+        owned_uuid_lease = False
+        if resume_uuid:
+            (
+                uuid_lease_token,
+                owned_uuid_lease,
+                session_lifecycle_lease_token,
+                owned_lifecycle_lease,
+            ) = _acquire_resume_creation_authority(
+                session_name,
+                resume_uuid,
+                uuid_lease_token,
+                session_lifecycle_lease_token,
+                fallback_source_terminal_id,
+                fallback_source_lease_token,
+            )
+    except BaseException:
+        # Any failure in the reserve/admission OR the pre-publication preamble
+        # (working-dir validation, disk preflight, provider-class resolution,
+        # resume authority) must retire the worker-slot reservation — none of
+        # these created a countable row, so a leaked reservation would refuse the
+        # next same-session create forever. The big creation ``try`` below has
+        # its own ``finally`` for the publication region.
+        _release_cap_lock()
+        raise
 
     try:
         try:
             early_profile = load_agent_profile(agent_profile)
         except FileNotFoundError:
+            early_profile = None
+        except Exception:
+            # F439 (#294) round 4: this pre-publication read is a REDUNDANT,
+            # best-effort read used only to derive ``sessionBrief`` and the
+            # lifecycle default. The AUTHORITATIVE profile load happens inside the
+            # creation try below and stays strict. A malformed/unloadable profile
+            # here (e.g. a validation error) must not crash the preamble and leak
+            # the reservation through the round-4 BLOCKER 2 window — fall back to
+            # "no early profile" and let the authoritative load decide.
+            early_profile = None
+        # Treat a load that returns a non-AgentProfile the same way the
+        # authoritative load below does (``if not isinstance(...): = None``).
+        if early_profile is not None and not isinstance(early_profile, AgentProfile):
             early_profile = None
         candidate_brief_mode = early_profile.sessionBrief if early_profile else None
         brief_mode = (
@@ -1102,6 +1380,17 @@ async def create_terminal(
 
             validate_session_lifecycle_shared(session_name, session_lifecycle_lease_token)
     except Exception:
+        # F439 (#294) round 4 / BLOCKER 2: this profile/lifecycle block sits
+        # BETWEEN the preamble try (which releases on failure) and the big
+        # creation try (whose ``finally`` releases). An exception raised HERE —
+        # a bad sessionBrief/lifecycle, a failed lifecycle-lease acquisition, or
+        # the ``load_agent_profile`` call above — previously escaped both release
+        # regions, leaking this create's worker-slot reservation permanently and
+        # poisoning every later same-session create with a phantom count. Retire
+        # the reservation on this path too (no countable row was published, so
+        # ``published=False`` — the epoch must not move). Idempotent via
+        # ``_cap_reserved``. Runs BEFORE the lease releases below and the re-raise.
+        _release_cap_lock()
         if owned_uuid_lease:
             from cli_agent_orchestrator.services.provider_session_lease import (
                 release_provider_session_lease,
@@ -1731,6 +2020,19 @@ async def create_terminal(
             owned_lifecycle_lease = False
             session_lifecycle_lease_token = None
         db_created = True
+        # F439 (#294) round 3 / BLOCKER: the row is now durably published, so a
+        # concurrent same-session create's lock-free count will include it.
+        # Retire this create's reservation HERE — before the slow provider-init
+        # phase below — so it is not double-counted (live row + reservation) and
+        # so parallel same-session assigns still initialize concurrently.
+        # Idempotent; the outer ``finally`` re-checks and is a no-op once retired.
+        # F439 (#294) round 4 / BLOCKER 1: ``published=True`` bumps the per-session
+        # publish epoch in the SAME locked step that retires this reservation, so
+        # a delayed racer whose lock-free snapshot predates this row still counts
+        # it via ``epoch_now - snapshot_epoch`` and cannot admit from a stale
+        # count. The slot moves atomically from ``reservations`` to the epoch
+        # delta — never invisible, never double-counted.
+        _release_cap_lock(published=True)
 
         # The live snapshot is transactional launch context. Build it only after
         # the terminal row and output plumbing exist, so it includes itself and a
@@ -2148,6 +2450,12 @@ async def create_terminal(
                 worktree_service.remove_worktree, worktree_repo_root, terminal_id
             )
         raise
+    finally:
+        # F439 (#294) round 3 / BLOCKER: guarantee this create's worker-slot
+        # reservation is retired on EVERY exit of the create body — success
+        # (already retired right after ``db_created``), rollback, or an early
+        # pre-publication raise inside this try. Idempotent via ``_cap_reserved``.
+        _release_cap_lock()
 
 
 _PERSIST_FAILURE_CODES = {
@@ -3068,6 +3376,179 @@ def _fork_refresh_lock(base_name: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _fork_refresh_locks[key] = lock
     return lock
+
+
+def _cap_admission_lock(session_name: str) -> threading.Lock:
+    """Return the per-session admission lock (F439 #294, BLOCKER 1).
+
+    A process-wide ``threading.Lock`` (not asyncio) keyed by session, so it
+    serializes the worker-cap count -> admission -> row-publication window
+    across coroutines AND separate-loop threads alike. The map itself is guarded
+    by ``_cap_admission_locks_guard`` so two racers creating the per-session lock
+    cannot each make a different one.
+    """
+    with _cap_admission_locks_guard:
+        lock = _cap_admission_locks.get(session_name)
+        if lock is None:
+            lock = threading.Lock()
+            _cap_admission_locks[session_name] = lock
+        return lock
+
+
+async def _acquire_cap_lock(lock: threading.Lock) -> None:
+    """Acquire a ``threading.Lock`` without ever freezing the event loop.
+
+    A blocking ``lock.acquire()`` inside a coroutine would stall the whole loop
+    while contended (and could deadlock against the holder if the holder is
+    awaiting on the same loop). Instead spin with a non-blocking try and yield
+    control between attempts, so other coroutines (including the current
+    holder's continuation) keep running until the lock frees.
+    """
+    while not lock.acquire(blocking=False):
+        await asyncio.sleep(0.005)
+
+
+async def _reserve_worker_slot(session_name: str, supervisor_id: Optional[str]) -> Optional[int]:
+    """Atomically reserve one worker slot, or raise ``TerminalCapExceeded`` (F439 r4).
+
+    Splits the admission decision into a lock-free COUNT and a locked RESERVE so
+    the slow, observable ``list_terminals_by_session`` callout inside the count
+    is NOT serialized by the admission lock (round-3 BLOCKER: the gate probe
+    patches a barrier inside that listing and every racer must reach it):
+
+    1. Lock-free ``_count_worker_terminals`` — every concurrent racer counts at
+       once (and all reach any barrier the probe installed in the listing). The
+       count is bracketed by an epoch read BEFORE and AFTER (a seqlock): if a row
+       was published DURING the count the two epochs differ and the count is
+       retried, so the ``(count, snapshot_epoch)`` pair is always internally
+       consistent — ``snapshot_epoch`` is exactly the number of publications that
+       ``count`` already reflects.
+
+    2. Under the per-session admission lock, compute the authoritative admitted
+       total as ``count + (epoch_now - snapshot_epoch) + reservations`` (F439 r4
+       / BLOCKER 1). The epoch delta counts rows PUBLISHED AFTER this racer's
+       consistent snapshot that the stale listing could not see; ``reservations``
+       counts peers' booked-but-unpublished slots. A peer's slot is therefore
+       ALWAYS visible — as a reservation before it publishes and as an epoch
+       delta after — so a delayed racer cannot admit from a stale count. If the
+       total ``>= cap`` refuse fail-closed BEFORE any resource exists; otherwise
+       book a reservation and return.
+
+    ``inflight`` is incremented for this racer BEFORE its count (lock-free entry),
+    so while any racer is mid-flight the session's epoch entry is retained and a
+    delayed racer always has a live epoch to diff its ``snapshot_epoch`` against.
+    It is decremented in ``_release_worker_slot`` on publish or failure.
+
+    Returns the consistent ``snapshot_epoch`` (``int``) when a reservation was
+    booked (the caller MUST later call ``_release_worker_slot`` exactly once, on
+    publish or on any failure). Returns ``None`` — no count, no reservation — when
+    the cap is ``<= 0`` (disabled).
+    """
+    cap = _resolve_worker_terminal_cap()
+    if cap <= 0:
+        return None
+    lock = _cap_admission_lock(session_name)
+
+    # Register this racer as in-flight and take a consistent (count, epoch) pair.
+    # The epoch is read under the lock; the count is lock-free (barrier-friendly).
+    # Bracket the count with a before/after epoch read (seqlock): a publication
+    # DURING the count would change the epoch, so retry until the pair is stable.
+    await _acquire_cap_lock(lock)
+    try:
+        _cap_inflight[session_name] = _cap_inflight.get(session_name, 0) + 1
+    finally:
+        lock.release()
+
+    try:
+        while True:
+            with lock:
+                epoch_before = _cap_publish_epoch.get(session_name, 0)
+            # (1) Lock-free count: the observable listing runs concurrently for
+            # every racer. Do NOT hold the admission lock across this callout.
+            count, reap_candidates = _count_worker_terminals(session_name, supervisor_id)
+            with lock:
+                epoch_after = _cap_publish_epoch.get(session_name, 0)
+            if epoch_before == epoch_after:
+                snapshot_epoch = epoch_before
+                break
+            # A publish landed during the count; the snapshot may be inconsistent.
+            # Yield and re-count so (count, snapshot_epoch) is a coherent pair.
+            await asyncio.sleep(0)
+
+        # (2) Locked reserve. No await between reading epoch_now/reserved and the
+        # decision, so the compute-decide-book step is atomic under the lock.
+        await _acquire_cap_lock(lock)
+        try:
+            epoch_now = _cap_publish_epoch.get(session_name, 0)
+            reserved = _cap_reservations.get(session_name, 0)
+            # Rows published AFTER this racer's consistent snapshot that its stale
+            # listing could not see, plus peers' booked-but-unpublished slots.
+            admitted = count + (epoch_now - snapshot_epoch) + reserved
+            if admitted >= cap:
+                raise TerminalCapExceeded(
+                    current_count=admitted, cap=cap, reap_candidates=reap_candidates
+                )
+            _cap_reservations[session_name] = reserved + 1
+            return snapshot_epoch
+        finally:
+            lock.release()
+    except BaseException:
+        # Refused (or an unexpected failure) before booking: retire this racer's
+        # in-flight registration so the epoch entry can be reclaimed once quiescent.
+        # No reservation was booked on this path, so decrement inflight directly
+        # (``_release_worker_slot`` is only for booked reservations).
+        with lock:
+            inflight = _cap_inflight.get(session_name, 0) - 1
+            if inflight > 0:
+                _cap_inflight[session_name] = inflight
+            else:
+                _cap_inflight.pop(session_name, None)
+                if session_name not in _cap_reservations:
+                    _cap_publish_epoch.pop(session_name, None)
+        raise
+
+
+def _release_worker_slot(session_name: str, snapshot_epoch: int, *, published: bool) -> None:
+    """Retire one reservation booked by ``_reserve_worker_slot`` (F439 r4).
+
+    Called exactly once per booked reservation — the instant the DB row is
+    published (``published=True``) or on ANY failure/rollback (``published=False``).
+
+    F439 r4 / BLOCKER 1: when ``published=True`` this bumps the per-session
+    publish epoch in the SAME locked critical section that decrements the
+    reservation, so the slot moves atomically from ``reservations`` to the epoch
+    delta and is never simultaneously invisible to a concurrent racer's stale
+    snapshot. A failure (``published=False``) publishes no countable row, so it
+    must NOT bump the epoch — it only releases the reservation.
+
+    Idempotent-safe against a session with no live reservations (never goes
+    negative). The reservation, in-flight, and epoch entries for a session are
+    dropped together ONLY when the session is fully quiescent (no reservations
+    AND no racer still mid-flight), so a delayed racer's ``snapshot_epoch`` always
+    has a live epoch to diff against while any admission is in progress.
+    """
+    lock = _cap_admission_lock(session_name)
+    lock.acquire()
+    try:
+        remaining = _cap_reservations.get(session_name, 0) - 1
+        if remaining > 0:
+            _cap_reservations[session_name] = remaining
+        else:
+            _cap_reservations.pop(session_name, None)
+        if published:
+            _cap_publish_epoch[session_name] = _cap_publish_epoch.get(session_name, 0) + 1
+        inflight = _cap_inflight.get(session_name, 0) - 1
+        if inflight > 0:
+            _cap_inflight[session_name] = inflight
+        else:
+            # Fully quiescent: no reservation outstanding and no racer mid-flight.
+            # Safe to forget the epoch — no live snapshot can diff against it — so
+            # the ledger does not grow unbounded across many short-lived sessions.
+            _cap_inflight.pop(session_name, None)
+            if session_name not in _cap_reservations:
+                _cap_publish_epoch.pop(session_name, None)
+    finally:
+        lock.release()
 
 
 def _dispatch_base_refresh(
