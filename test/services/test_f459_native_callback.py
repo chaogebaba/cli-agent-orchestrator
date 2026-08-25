@@ -212,7 +212,7 @@ class TestF459MarkerSuppression:
         mock_db.__exit__ = MagicMock(return_value=False)
 
         with patch(
-            "cli_agent_orchestrator.services.doorbell_service.SessionLocal",
+            "cli_agent_orchestrator.clients.database.SessionLocal",
             return_value=mock_db,
         ):
             _mark_socket_delivered(42)
@@ -236,7 +236,7 @@ class TestF459MarkerSuppression:
         mock_session.query.return_value.filter.return_value.first.return_value = (1,)
 
         with patch(
-            "cli_agent_orchestrator.services.doorbell_service.SessionLocal",
+            "cli_agent_orchestrator.clients.database.SessionLocal",
             return_value=mock_db,
         ):
             result = is_socket_delivered(42)
@@ -255,7 +255,7 @@ class TestF459MarkerSuppression:
         mock_session.query.return_value.filter.return_value.first.return_value = None
 
         with patch(
-            "cli_agent_orchestrator.services.doorbell_service.SessionLocal",
+            "cli_agent_orchestrator.clients.database.SessionLocal",
             return_value=mock_db,
         ):
             result = is_socket_delivered(42)
@@ -368,7 +368,7 @@ class TestF459Fallback:
                 return_value="socket_econnrefused",
             ),
             patch(
-                "cli_agent_orchestrator.services.doorbell_service._should_teammate_push",
+                "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push",
                 return_value=True,
             ),
             patch(
