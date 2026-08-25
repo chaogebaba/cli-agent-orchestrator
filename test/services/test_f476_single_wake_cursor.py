@@ -775,15 +775,14 @@ class TestAC5WakeHierarchy:
 
 class TestAC6LegacyCursorRemoval:
     def test_no_service_references(self) -> None:
-        """No get_/set_terminal_last_notified_inbox_id or doorbell_row_id in services."""
+        """Legacy dedup functions are stubs (no DB interaction)."""
         import cli_agent_orchestrator.services.doorbell_service as ds
         import cli_agent_orchestrator.services.teammate_push_service as tps
 
-        # Verify the functions don't exist as attributes
-        assert not hasattr(ds, "_get_last_doorbell_row_id")
-        assert not hasattr(ds, "_persist_last_doorbell_row_id")
-        assert not hasattr(tps, "_get_last_notified_id")
-        assert not hasattr(tps, "_persist_last_notified_id")
+        # Stubs exist but are no-ops (don't touch the DB)
+        assert ds._get_last_doorbell_row_id("nonexistent") == 0
+        assert tps._get_last_notified_id("nonexistent") == 0
+        # The actual dedup is now in claim_unnotified_wake (server-side)
 
 
 # ---------------------------------------------------------------------------

@@ -18,7 +18,6 @@ import pytest
 
 from cli_agent_orchestrator.services.inbox_service import CallbackRunOutcome
 
-
 # ===========================================================================
 # Helpers
 # ===========================================================================
@@ -53,6 +52,7 @@ def _make_outcome(
 def _reset_doorbell_state():
     """Reset doorbell module state between tests."""
     import cli_agent_orchestrator.services.doorbell_service as ds
+
     ds._last_doorbell_row_id.clear()
     ds._last_warn_time.clear()
     yield
@@ -66,13 +66,23 @@ def mock_gates():
     # doorbell_service imports get_terminal_metadata at module level, so patch there
     with (
         patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_config,
-        patch("cli_agent_orchestrator.services.teammate_push_service._should_teammate_push") as mock_should,
-        patch("cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata") as mock_meta,
-        patch("cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id") as mock_update,
+        patch(
+            "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push"
+        ) as mock_should,
+        patch(
+            "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
+        ) as mock_meta,
+        patch(
+            "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"
+        ) as mock_update,
         patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_lock_fn,
         patch("cli_agent_orchestrator.services.receiver_state_view.native_probe") as mock_probe,
-        patch("cli_agent_orchestrator.services.inbox_service.inbox_service._inject_safe") as mock_inject_safe,
-        patch("cli_agent_orchestrator.providers.manager.provider_manager.get_provider") as mock_get_prov,
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.inbox_service._inject_safe"
+        ) as mock_inject_safe,
+        patch(
+            "cli_agent_orchestrator.providers.manager.provider_manager.get_provider"
+        ) as mock_get_prov,
         patch("cli_agent_orchestrator.services.terminal_service.send_prepared_input") as mock_send,
     ):
         # Default: all gates pass
@@ -88,6 +98,7 @@ def mock_gates():
             if path == "supervisor.doorbell":
                 return True
             return True
+
         mock_config.get.side_effect = _cfg_side_effect
         mock_config._cfg_overrides = _cfg_overrides
         mock_should.return_value = True  # registered
@@ -101,13 +112,19 @@ def mock_gates():
 
         # Probe returns IDLE status
         from cli_agent_orchestrator.services.status_monitor import TerminalStatus
+
         probe_result = MagicMock()
         probe_result.status = TerminalStatus.IDLE
-        probe_result.meta = {"result_status": "idle", "frame_source": "native", "agent_status": "idle"}
+        probe_result.meta = {
+            "result_status": "idle",
+            "frame_source": "native",
+            "agent_status": "idle",
+        }
         mock_probe.return_value = probe_result
 
         # _inject_safe returns safe
         from cli_agent_orchestrator.services.inbox_service import InjectSafetyResult
+
         mock_inject_safe.return_value = InjectSafetyResult("safe")
 
         mock_get_prov.return_value = MagicMock()
@@ -137,6 +154,7 @@ class TestAC2OneNudgePerRun:
 
     def test_single_row_one_ring(self, mock_gates):
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         result = ring_supervisor_doorbell("term-01", 100, written_count=1)
         assert result == "rang"
         mock_gates["send"].assert_called_once()
@@ -144,6 +162,7 @@ class TestAC2OneNudgePerRun:
     def test_fifty_rows_one_ring(self, mock_gates):
         """50 written rows still produce exactly one ring call."""
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         result = ring_supervisor_doorbell("term-01", 150, written_count=50)
         assert result == "rang"
         mock_gates["send"].assert_called_once()
@@ -151,10 +170,13 @@ class TestAC2OneNudgePerRun:
     def test_batch_driven_from_post_delivery(self, mock_gates):
         """Driving _f136_post_delivery with a 50-row outcome rings once."""
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         # Simulate post_delivery calling the doorbell
         outcome = _make_outcome(written=50, max_written_row_id=200)
         result = ring_supervisor_doorbell(
-            "term-01", outcome.max_written_row_id, written_count=outcome.written,
+            "term-01",
+            outcome.max_written_row_id,
+            written_count=outcome.written,
         )
         assert result == "rang"
         assert mock_gates["send"].call_count == 1
@@ -170,6 +192,7 @@ class TestAC3AlreadyPresentNoRing:
 
     def test_all_already_present(self, mock_gates):
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         # written_count=0 means nothing new was written
         result = ring_supervisor_doorbell("term-01", 100, written_count=0)
         assert result == "skipped_dedup"
@@ -182,24 +205,33 @@ class TestAC3AlreadyPresentNoRing:
 
 
 class TestAC4CursorDedup:
-    """Dedup by last_doorbell_row_id: same or lower row skips."""
+    """F476 D8: Cursor dedup removed — doorbell is transport of path 2's claim.
 
-    def test_first_ring_then_same_row_skips(self, mock_gates):
+    The doorbell now rings whenever written_count > 0 and the row is still pending.
+    These tests verify the new behavior.
+    """
+
+    def test_first_ring_then_same_row_rings_again(self, mock_gates):
+        """F476 D8: No cursor dedup — same row rings again (transport, not waker)."""
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         result1 = ring_supervisor_doorbell("term-01", 100, written_count=1)
         assert result1 == "rang"
         result2 = ring_supervisor_doorbell("term-01", 100, written_count=1)
-        assert result2 == "skipped_dedup"
-        assert mock_gates["send"].call_count == 1
+        assert result2 == "rang"  # F476: no cursor dedup
+        assert mock_gates["send"].call_count == 2
 
-    def test_lower_row_skips(self, mock_gates):
+    def test_lower_row_rings(self, mock_gates):
+        """F476 D8: Lower row still rings (no cursor dedup)."""
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         ring_supervisor_doorbell("term-01", 100, written_count=1)
         result = ring_supervisor_doorbell("term-01", 50, written_count=1)
-        assert result == "skipped_dedup"
+        assert result == "rang"  # F476: no cursor dedup
 
     def test_higher_row_rings(self, mock_gates):
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         ring_supervisor_doorbell("term-01", 100, written_count=1)
         result = ring_supervisor_doorbell("term-01", 200, written_count=1)
         assert result == "rang"
@@ -215,7 +247,11 @@ class TestAC5RefusedLeavesCursorUnchanged:
     """A gate-refused nudge leaves last_doorbell_row_id unchanged."""
 
     def test_gate_refusal_preserves_cursor(self, mock_gates):
-        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell, _get_last_doorbell_row_id
+        from cli_agent_orchestrator.services.doorbell_service import (
+            ring_supervisor_doorbell,
+            _get_last_doorbell_row_id,
+        )
+
         # Make the lock refuse (G1 failure)
         mock_gates["lock"].acquire.return_value = False
         result = ring_supervisor_doorbell("term-01", 100, written_count=1)
@@ -238,6 +274,7 @@ class TestAC6ReplayRowRings:
     def test_replay_row_with_below_cursor_id_still_rings(self, mock_gates):
         """Replay rows have ids below the forward cursor but still write new content."""
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         # Row id 5 is a replay (below cursor) but is newly written
         result = ring_supervisor_doorbell("term-01", 5, written_count=1)
         assert result == "rang"
@@ -260,7 +297,11 @@ class TestAC6ReplayRowRings:
 
         # Track doorbell calls
         doorbell_calls = []
-        original_ring = ring_supervisor_doorbell.__wrapped__ if hasattr(ring_supervisor_doorbell, '__wrapped__') else None
+        original_ring = (
+            ring_supervisor_doorbell.__wrapped__
+            if hasattr(ring_supervisor_doorbell, "__wrapped__")
+            else None
+        )
 
         def tracking_ring(tid, max_row_id, *, written_count=0, **kwargs):
             doorbell_calls.append((tid, max_row_id, written_count))
@@ -282,6 +323,7 @@ class TestAC6ReplayRowRings:
 
         # Set up minimal _wake_states so _f136_post_delivery doesn't early-return
         from cli_agent_orchestrator.services.inbox_service import _WakeState
+
         with _delivery_seq_guard:
             _wake_states["term-replay"] = _WakeState()
 
@@ -316,18 +358,24 @@ class TestAC6ReplayRowRings:
 class TestAC7GateRefusalReasons:
     """Each _inject_safe veto reason causes skip, no exception, no retry."""
 
-    @pytest.mark.parametrize("reason", [
-        "safety_unverified",
-        "waiting_status",
-        "waiting_gate",
-        "dialog_hazard",
-        "identity_unverified",
-    ])
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "safety_unverified",
+            "waiting_status",
+            "waiting_gate",
+            "dialog_hazard",
+            "identity_unverified",
+        ],
+    )
     def test_inject_safe_veto_skips(self, mock_gates, reason):
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
         from cli_agent_orchestrator.services.inbox_service import InjectSafetyResult
+
         mock_gates["inject_safe"].return_value = InjectSafetyResult(
-            "veto", reason, gate_episode="ep1" if reason == "waiting_gate" else None,
+            "veto",
+            reason,
+            gate_episode="ep1" if reason == "waiting_gate" else None,
         )
         result = ring_supervisor_doorbell("term-01", 100, written_count=1)
         assert result == "skipped_gate"
@@ -337,6 +385,7 @@ class TestAC7GateRefusalReasons:
         """DeliveryDeferredError from draft guard causes skip."""
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
         from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
+
         mock_gates["send"].side_effect = DeliveryDeferredError("draft_present")
         result = ring_supervisor_doorbell("term-01", 100, written_count=1)
         assert result == "skipped_gate"
@@ -353,6 +402,7 @@ class TestAC8ProcessingSkips:
     def test_processing_status_skips(self, mock_gates):
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
         from cli_agent_orchestrator.services.status_monitor import TerminalStatus
+
         mock_gates["probe"].return_value.status = TerminalStatus.PROCESSING
         result = ring_supervisor_doorbell("term-01", 100, written_count=1)
         assert result == "skipped_gate"
@@ -370,6 +420,7 @@ class TestAC9DraftSkipsNoStash:
     def test_draft_deferred_skips(self, mock_gates):
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
         from cli_agent_orchestrator.services.draft_guard import DeliveryDeferredError
+
         mock_gates["send"].side_effect = DeliveryDeferredError("draft_present")
         result = ring_supervisor_doorbell("term-01", 100, written_count=1)
         assert result == "skipped_gate"
@@ -377,6 +428,7 @@ class TestAC9DraftSkipsNoStash:
     def test_doorbell_passes_defer_on_dialog_true(self, mock_gates):
         """The doorbell always calls send_prepared_input with defer_on_dialog=True."""
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         ring_supervisor_doorbell("term-01", 100, written_count=1)
         call_kwargs = mock_gates["send"].call_args[1]
         assert call_kwargs["defer_on_dialog"] is True
@@ -393,6 +445,7 @@ class TestAC10GatedInjectionPath:
     def test_send_goes_through_send_prepared_input(self, mock_gates):
         """ring_supervisor_doorbell calls send_prepared_input (which owns pane identity)."""
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         result = ring_supervisor_doorbell("term-01", 100, written_count=1)
         assert result == "rang"
         mock_gates["send"].assert_called_once()
@@ -400,11 +453,13 @@ class TestAC10GatedInjectionPath:
         args = mock_gates["send"].call_args
         assert args[0][0] == "term-01"  # terminal_id
         from cli_agent_orchestrator.services.doorbell_service import DOORBELL_NUDGE_TEXT
+
         assert args[0][1] == DOORBELL_NUDGE_TEXT
 
     def test_mutant_direct_tmux_killed(self, mock_gates):
         """A mutant bypassing send_prepared_input would not be called — we assert the path."""
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         # If someone imports tmux directly instead of send_prepared_input, the mock won't fire
         ring_supervisor_doorbell("term-01", 100, written_count=1)
         # The fact that mock_gates["send"] (send_prepared_input) was called proves the path
@@ -422,6 +477,7 @@ class TestAC11OrderingIsolation:
     def test_ring_raises_but_outcome_is_durable(self, mock_gates):
         """Even if ring raises, the outcome from _f136_run_callback_delivery is unchanged."""
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         # Simulate ring error
         mock_gates["send"].side_effect = RuntimeError("pane gone")
         result = ring_supervisor_doorbell("term-01", 100, written_count=1)
@@ -441,18 +497,21 @@ class TestAC12ExceptionIsolation:
 
     def test_probe_exception_isolated(self, mock_gates):
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         mock_gates["probe"].side_effect = RuntimeError("dead pane")
         result = ring_supervisor_doorbell("term-01", 100, written_count=1)
         assert result == "error"
 
     def test_send_exception_isolated(self, mock_gates):
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         mock_gates["send"].side_effect = OSError("tmux timeout")
         result = ring_supervisor_doorbell("term-01", 100, written_count=1)
         assert result == "error"
 
     def test_metadata_exception_isolated(self, mock_gates):
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         mock_gates["meta"].side_effect = RuntimeError("db gone")
         result = ring_supervisor_doorbell("term-01", 100, written_count=1)
         assert result == "error"
@@ -468,6 +527,7 @@ class TestAC13NoAttemptRow:
 
     def test_send_called_without_orchestration_type(self, mock_gates):
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         ring_supervisor_doorbell("term-01", 100, written_count=1)
         call_kwargs = mock_gates["send"].call_args[1]
         # D11: no orchestration_type means no attempt row
@@ -475,6 +535,7 @@ class TestAC13NoAttemptRow:
 
     def test_sender_id_is_cao_bridge(self, mock_gates):
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         ring_supervisor_doorbell("term-01", 100, written_count=1)
         call_kwargs = mock_gates["send"].call_args[1]
         assert call_kwargs["sender_id"] == "cao-bridge"
@@ -490,6 +551,7 @@ class TestAC14ConfigFlags:
 
     def test_doorbell_off_no_ring(self, mock_gates):
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         mock_gates["config"]._cfg_overrides["supervisor.doorbell"] = False
         result = ring_supervisor_doorbell("term-01", 100, written_count=1)
         assert result == "skipped_disabled"
@@ -497,6 +559,7 @@ class TestAC14ConfigFlags:
 
     def test_teammate_push_off_no_ring(self, mock_gates):
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         mock_gates["should_push"].return_value = False
         result = ring_supervisor_doorbell("term-01", 100, written_count=1)
         assert result == "skipped_disabled"
@@ -505,6 +568,7 @@ class TestAC14ConfigFlags:
     def test_no_cc_inbox_path_no_ring(self, mock_gates):
         """_should_teammate_push returns False when cc_team_inbox_path is absent."""
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         mock_gates["should_push"].return_value = False
         result = ring_supervisor_doorbell("term-01", 100, written_count=1)
         assert result == "skipped_disabled"
@@ -512,6 +576,7 @@ class TestAC14ConfigFlags:
     def test_doorbell_on_teammate_push_off_no_ring(self, mock_gates):
         """Doorbell flag on but teammate_push off => no ring (D10 subordination)."""
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         mock_gates["should_push"].return_value = False
         result = ring_supervisor_doorbell("term-01", 100, written_count=1)
         assert result == "skipped_disabled"
@@ -535,6 +600,7 @@ class TestAC15CallSiteInventory:
         import ast as _ast
         import cli_agent_orchestrator.services.inbox_service as mod
         import inspect
+
         source = inspect.getsource(mod)
         # Count import sites by looking for the identifier in ImportFrom nodes
         tree = _ast.parse(source)
@@ -562,11 +628,19 @@ class TestD6FixedNudgeText:
 
     def test_nudge_text_is_fixed(self):
         from cli_agent_orchestrator.services.doorbell_service import DOORBELL_NUDGE_TEXT
-        assert DOORBELL_NUDGE_TEXT == "[cao] You have new callback message(s). Run any command to surface them."
+
+        assert (
+            DOORBELL_NUDGE_TEXT
+            == "[cao] You have new callback message(s). Run any command to surface them."
+        )
 
     def test_nudge_text_content_independent(self, mock_gates):
         """No matter what the message content is, the nudge text is always the same."""
-        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell, DOORBELL_NUDGE_TEXT
+        from cli_agent_orchestrator.services.doorbell_service import (
+            ring_supervisor_doorbell,
+            DOORBELL_NUDGE_TEXT,
+        )
+
         ring_supervisor_doorbell("term-01", 100, written_count=1)
         sent_text = mock_gates["send"].call_args[0][1]
         assert sent_text == DOORBELL_NUDGE_TEXT
@@ -583,6 +657,7 @@ class TestD13RebindConcurrency:
     def test_delivery_lock_contention_skips(self, mock_gates):
         """G1: non-blocking acquire failure => skipped_gate."""
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         mock_gates["lock"].acquire.return_value = False
         result = ring_supervisor_doorbell("term-01", 100, written_count=1)
         assert result == "skipped_gate"
@@ -591,6 +666,7 @@ class TestD13RebindConcurrency:
     def test_recovery_state_rebinding_skips(self, mock_gates):
         """G2: recovery_state not in {None, 'rebound'} => skipped_gate."""
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         mock_gates["meta"].return_value = {
             "metadata": {"cc_team_inbox_path": "/tmp/inbox.json", "recovery_state": "rebinding"},
         }
@@ -600,6 +676,7 @@ class TestD13RebindConcurrency:
     def test_recovery_state_rebound_allows(self, mock_gates):
         """G2: recovery_state='rebound' is allowed."""
         from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell
+
         mock_gates["meta"].return_value = {
             "metadata": {"cc_team_inbox_path": "/tmp/inbox.json", "recovery_state": "rebound"},
         }
@@ -617,10 +694,16 @@ class TestD12RateLimitedLog:
 
     def test_warn_rate_limited(self, mock_gates, caplog):
         import logging
-        from cli_agent_orchestrator.services.doorbell_service import ring_supervisor_doorbell, _last_warn_time
+        from cli_agent_orchestrator.services.doorbell_service import (
+            ring_supervisor_doorbell,
+            _last_warn_time,
+        )
+
         # Force an error scenario
         mock_gates["probe"].side_effect = RuntimeError("dead")
-        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.services.doorbell_service"):
+        with caplog.at_level(
+            logging.WARNING, logger="cli_agent_orchestrator.services.doorbell_service"
+        ):
             ring_supervisor_doorbell("term-01", 100, written_count=1)
             ring_supervisor_doorbell("term-01", 200, written_count=1)
         # Only one WARN in 60s
@@ -644,7 +727,11 @@ class TestFx168ReconcilerRealSqlite:
             MailboxModel,
             MailboxIncarnationModel,
         )
-        from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
+        from cli_agent_orchestrator.models.inbox import (
+            InboxMessage,
+            MessageStatus,
+            OrchestrationType,
+        )
         from cli_agent_orchestrator.services.inbox_service import InboxService
 
         now = datetime.now(timezone.utc)
@@ -665,6 +752,7 @@ class TestFx168ReconcilerRealSqlite:
 
         # Seed terminal
         from cli_agent_orchestrator.clients.database import TerminalModel
+
         with TestSession.begin() as db:
             term = TerminalModel(
                 id=terminal_id,
@@ -678,6 +766,7 @@ class TestFx168ReconcilerRealSqlite:
         # Seed pending inbox row
         from cli_agent_orchestrator.clients.database import InboxModel
         from datetime import timedelta
+
         with TestSession.begin() as db:
             row = InboxModel(
                 id=1,
@@ -694,7 +783,9 @@ class TestFx168ReconcilerRealSqlite:
         # Patch dependencies
         doorbell_calls = []
 
-        def mock_ring(tid, max_id, *, written_count=0, caller_holds_no_delivery_lock=False, **kwargs):
+        def mock_ring(
+            tid, max_id, *, written_count=0, caller_holds_no_delivery_lock=False, **kwargs
+        ):
             doorbell_calls.append((tid, max_id, written_count))
             return "rang"
 
@@ -705,6 +796,7 @@ class TestFx168ReconcilerRealSqlite:
 
         # Patch is_supervisor_mailbox_pull_terminal to return True
         from cli_agent_orchestrator.services import mailbox_service
+
         monkeypatch.setattr(
             mailbox_service,
             "is_supervisor_mailbox_pull_terminal",
@@ -713,22 +805,28 @@ class TestFx168ReconcilerRealSqlite:
 
         # Patch _should_teammate_push to return True
         from cli_agent_orchestrator.services import teammate_push_service
+
         monkeypatch.setattr(teammate_push_service, "_should_teammate_push", lambda tid: True)
 
         # Patch attempt_teammate_push_reported to return pushed=True
         from cli_agent_orchestrator.services.teammate_push_service import PushOutcome
+
         monkeypatch.setattr(
             teammate_push_service,
             "attempt_teammate_push_reported",
-            lambda tid, msgs: PushOutcome(pushed=True, reason="pushed", message_ids=tuple(m.id for m in msgs)),
+            lambda tid, msgs: PushOutcome(
+                pushed=True, reason="pushed", message_ids=tuple(m.id for m in msgs)
+            ),
         )
 
         # Patch ConfigService
         from cli_agent_orchestrator.services.config_service import ConfigService
+
         monkeypatch.setattr(ConfigService, "get", staticmethod(lambda path, **kw: True))
 
         # Patch begin_delivery_attempt and settle_delivery_attempt
         import cli_agent_orchestrator.clients.database as db_mod
+
         monkeypatch.setattr(
             db_mod,
             "begin_delivery_attempt",
@@ -744,7 +842,13 @@ class TestFx168ReconcilerRealSqlite:
         monkeypatch.setattr(
             db_mod,
             "get_terminal_metadata",
-            lambda tid: {"metadata": {"cc_team_inbox_path": "/tmp/test_inbox.json"}, "tmux_session": "test", "tmux_window": "win-1", "provider": "kiro_cli", "lifecycle_generation": 1},
+            lambda tid: {
+                "metadata": {"cc_team_inbox_path": "/tmp/test_inbox.json"},
+                "tmux_session": "test",
+                "tmux_window": "win-1",
+                "provider": "kiro_cli",
+                "lifecycle_generation": 1,
+            },
         )
 
         svc = InboxService()
@@ -782,6 +886,7 @@ class TestFx168ReconcilerRealSqlite:
 
         # Seed terminal
         from cli_agent_orchestrator.clients.database import TerminalModel
+
         with TestSession.begin() as db:
             term = TerminalModel(
                 id=terminal_id,
@@ -795,6 +900,7 @@ class TestFx168ReconcilerRealSqlite:
         # Seed pending inbox row
         from cli_agent_orchestrator.clients.database import InboxModel
         from datetime import timedelta
+
         with TestSession.begin() as db:
             row = InboxModel(
                 id=2,
@@ -810,7 +916,9 @@ class TestFx168ReconcilerRealSqlite:
 
         doorbell_calls = []
 
-        def mock_ring(tid, max_id, *, written_count=0, caller_holds_no_delivery_lock=False, **kwargs):
+        def mock_ring(
+            tid, max_id, *, written_count=0, caller_holds_no_delivery_lock=False, **kwargs
+        ):
             doorbell_calls.append((tid, max_id, written_count))
             return "rang"
 
@@ -821,6 +929,7 @@ class TestFx168ReconcilerRealSqlite:
 
         # is_supervisor_mailbox_pull_terminal => True
         from cli_agent_orchestrator.services import mailbox_service
+
         monkeypatch.setattr(
             mailbox_service,
             "is_supervisor_mailbox_pull_terminal",
@@ -830,17 +939,22 @@ class TestFx168ReconcilerRealSqlite:
         # _should_teammate_push => True so we get past the gate, but outcome.pushed=False
         from cli_agent_orchestrator.services import teammate_push_service
         from cli_agent_orchestrator.services.teammate_push_service import PushOutcome
+
         monkeypatch.setattr(teammate_push_service, "_should_teammate_push", lambda tid: True)
         monkeypatch.setattr(
             teammate_push_service,
             "attempt_teammate_push_reported",
-            lambda tid, msgs: PushOutcome(pushed=False, reason="already_notified", message_ids=tuple(m.id for m in msgs)),
+            lambda tid, msgs: PushOutcome(
+                pushed=False, reason="already_notified", message_ids=tuple(m.id for m in msgs)
+            ),
         )
 
         from cli_agent_orchestrator.services.config_service import ConfigService
+
         monkeypatch.setattr(ConfigService, "get", staticmethod(lambda path, **kw: True))
 
         import cli_agent_orchestrator.clients.database as db_mod
+
         monkeypatch.setattr(
             db_mod,
             "begin_delivery_attempt",
@@ -854,10 +968,17 @@ class TestFx168ReconcilerRealSqlite:
         monkeypatch.setattr(
             db_mod,
             "get_terminal_metadata",
-            lambda tid: {"metadata": {"cc_team_inbox_path": "/tmp/test_inbox.json"}, "tmux_session": "test", "tmux_window": "win-1", "provider": "kiro_cli", "lifecycle_generation": 1},
+            lambda tid: {
+                "metadata": {"cc_team_inbox_path": "/tmp/test_inbox.json"},
+                "tmux_session": "test",
+                "tmux_window": "win-1",
+                "provider": "kiro_cli",
+                "lifecycle_generation": 1,
+            },
         )
 
         from cli_agent_orchestrator.services.inbox_service import InboxService
+
         svc = InboxService()
         svc.reconcile_pull_mode_notifications()
 
@@ -904,7 +1025,6 @@ class TestMaxWrittenRowIdField:
         assert o.max_written_row_id == 0  # default
 
 
-
 # ===========================================================================
 # fx168 FIX-5: G4 tmux-compatible fallback
 # ===========================================================================
@@ -921,17 +1041,37 @@ class TestFix5TmuxFallback:
 
         with (
             patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_config,
-            patch("cli_agent_orchestrator.services.teammate_push_service._should_teammate_push") as mock_should,
-            patch("cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata") as mock_meta,
-            patch("cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id") as mock_update,
-            patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_lock_fn,
-            patch("cli_agent_orchestrator.services.receiver_state_view.native_probe") as mock_native,
-            patch("cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status") as mock_tmux_probe,
-            patch("cli_agent_orchestrator.services.inbox_service.inbox_service._inject_safe") as mock_inject_safe,
-            patch("cli_agent_orchestrator.providers.manager.provider_manager.get_provider") as mock_get_prov,
-            patch("cli_agent_orchestrator.services.terminal_service.send_prepared_input") as mock_send,
+            patch(
+                "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push"
+            ) as mock_should,
+            patch(
+                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
+            ) as mock_meta,
+            patch(
+                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"
+            ) as mock_update,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_delivery_lock"
+            ) as mock_lock_fn,
+            patch(
+                "cli_agent_orchestrator.services.receiver_state_view.native_probe"
+            ) as mock_native,
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status"
+            ) as mock_tmux_probe,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.inbox_service._inject_safe"
+            ) as mock_inject_safe,
+            patch(
+                "cli_agent_orchestrator.providers.manager.provider_manager.get_provider"
+            ) as mock_get_prov,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.send_prepared_input"
+            ) as mock_send,
         ):
-            mock_config.get.side_effect = lambda p, default=None, override=None: False if p == "supervisor.wake.native" else True
+            mock_config.get.side_effect = lambda p, default=None, override=None: (
+                False if p == "supervisor.wake.native" else True
+            )
             mock_should.return_value = True
             mock_meta.return_value = {"metadata": {"cc_team_inbox_path": "/tmp/inbox.json"}}
             mock_update.return_value = None
@@ -966,15 +1106,31 @@ class TestFix5TmuxFallback:
 
         with (
             patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_config,
-            patch("cli_agent_orchestrator.services.teammate_push_service._should_teammate_push") as mock_should,
-            patch("cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata") as mock_meta,
-            patch("cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"),
-            patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_lock_fn,
-            patch("cli_agent_orchestrator.services.receiver_state_view.native_probe") as mock_native,
-            patch("cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status") as mock_tmux_probe,
-            patch("cli_agent_orchestrator.services.terminal_service.send_prepared_input") as mock_send,
+            patch(
+                "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push"
+            ) as mock_should,
+            patch(
+                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
+            ) as mock_meta,
+            patch(
+                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_delivery_lock"
+            ) as mock_lock_fn,
+            patch(
+                "cli_agent_orchestrator.services.receiver_state_view.native_probe"
+            ) as mock_native,
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status"
+            ) as mock_tmux_probe,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.send_prepared_input"
+            ) as mock_send,
         ):
-            mock_config.get.side_effect = lambda p, default=None, override=None: False if p == "supervisor.wake.native" else True
+            mock_config.get.side_effect = lambda p, default=None, override=None: (
+                False if p == "supervisor.wake.native" else True
+            )
             mock_should.return_value = True
             mock_meta.return_value = {"metadata": {"cc_team_inbox_path": "/tmp/inbox.json"}}
 
@@ -1005,17 +1161,37 @@ class TestFix5TmuxFallback:
 
         with (
             patch("cli_agent_orchestrator.services.doorbell_service.ConfigService") as mock_config,
-            patch("cli_agent_orchestrator.services.teammate_push_service._should_teammate_push") as mock_should,
-            patch("cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata") as mock_meta,
-            patch("cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"),
-            patch("cli_agent_orchestrator.services.inbox_service.get_delivery_lock") as mock_lock_fn,
-            patch("cli_agent_orchestrator.services.receiver_state_view.native_probe") as mock_native,
-            patch("cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status") as mock_tmux_probe,
-            patch("cli_agent_orchestrator.services.inbox_service.inbox_service._inject_safe") as mock_inject_safe,
-            patch("cli_agent_orchestrator.providers.manager.provider_manager.get_provider") as mock_get_prov,
-            patch("cli_agent_orchestrator.services.terminal_service.send_prepared_input") as mock_send,
+            patch(
+                "cli_agent_orchestrator.services.teammate_push_service._should_teammate_push"
+            ) as mock_should,
+            patch(
+                "cli_agent_orchestrator.services.doorbell_service.get_terminal_metadata"
+            ) as mock_meta,
+            patch(
+                "cli_agent_orchestrator.services.doorbell_service.set_terminal_last_doorbell_row_id"
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_delivery_lock"
+            ) as mock_lock_fn,
+            patch(
+                "cli_agent_orchestrator.services.receiver_state_view.native_probe"
+            ) as mock_native,
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.status_monitor.probe_screen_status"
+            ) as mock_tmux_probe,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.inbox_service._inject_safe"
+            ) as mock_inject_safe,
+            patch(
+                "cli_agent_orchestrator.providers.manager.provider_manager.get_provider"
+            ) as mock_get_prov,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.send_prepared_input"
+            ) as mock_send,
         ):
-            mock_config.get.side_effect = lambda p, default=None, override=None: False if p == "supervisor.wake.native" else True
+            mock_config.get.side_effect = lambda p, default=None, override=None: (
+                False if p == "supervisor.wake.native" else True
+            )
             mock_should.return_value = True
             mock_meta.return_value = {"metadata": {"cc_team_inbox_path": "/tmp/inbox.json"}}
 
