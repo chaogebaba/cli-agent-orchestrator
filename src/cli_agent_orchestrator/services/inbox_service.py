@@ -491,6 +491,9 @@ class CallbackRunOutcome:
     max_written_row_id: int = 0  # F168 D4: highest row id written this run
     # fx168 FIX-2: stale path heal data (mailbox_id, terminal_id, generation, new_path)
     _fx168_stale_heal: tuple[str, str, int, str] | None = None
+    # F459: last written row's message body and sender display name for native bridge
+    _f459_message_body: str | None = None
+    _f459_sender_display_name: str | None = None
 
 
 def _get_backoff_delay(terminal_id: str) -> float:
@@ -958,6 +961,8 @@ class InboxService:
             identity_conflicts = 0
             processed = 0
             _max_written_row_id = 0  # F168 D4: track highest row id written
+            _f459_last_body: str | None = None  # F459: last written message body
+            _f459_last_sender: str | None = None  # F459: last written sender_id
 
             # D13: Process replay rows first, then forward rows
             for row in batch.rows:
@@ -985,6 +990,9 @@ class InboxService:
                     written += 1
                     if row.inbox_row_id > _max_written_row_id:
                         _max_written_row_id = row.inbox_row_id
+                    # F459: capture last written row's content for native bridge
+                    _f459_last_body = row.message
+                    _f459_last_sender = row.sender_id
                 elif result.kind == "already_present":
                     already_present += 1
                 elif result.kind == "retryable_failure":
@@ -1057,6 +1065,8 @@ class InboxService:
                 retry_delay_s=_get_backoff_delay(terminal_id) if retryable_failures else None,
                 reason="ok",
                 max_written_row_id=_max_written_row_id,
+                _f459_message_body=_f459_last_body,
+                _f459_sender_display_name=_f459_last_sender,
             )
         except Exception as exc:
             logger.exception("f136_delivery_run_error terminal=%s", terminal_id)
@@ -1186,10 +1196,21 @@ class InboxService:
                     ring_supervisor_doorbell,
                 )
 
+                # F459: resolve worker display name for from-name in native bridge
+                _f459_display = outcome._f459_sender_display_name
+                if _f459_display:
+                    try:
+                        from cli_agent_orchestrator.utils.terminal import display_name as _dn
+                        _f459_display = _dn(_f459_display)
+                    except Exception:
+                        pass
+
                 ring_supervisor_doorbell(
                     terminal_id,
                     outcome.max_written_row_id,
                     written_count=outcome.written,
+                    message_body=outcome._f459_message_body,
+                    sender_display_name=_f459_display,
                 )
             except Exception as _bell_exc:
                 logger.debug(
@@ -3524,11 +3545,24 @@ class InboxService:
                         )
 
                         max_id = max(outcome.message_ids)
+                        # F459: pass last message content and sender display name
+                        _f459_body = None
+                        _f459_sender = None
+                        if messages:
+                            _last_msg = max(messages, key=lambda m: m.id)
+                            _f459_body = _last_msg.message
+                            try:
+                                from cli_agent_orchestrator.utils.terminal import display_name as _dn
+                                _f459_sender = _dn(_last_msg.sender_id)
+                            except Exception:
+                                _f459_sender = _last_msg.sender_id
                         ring_supervisor_doorbell(
                             mb.current_terminal_id,
                             max_id,
                             written_count=1,
                             caller_holds_no_delivery_lock=True,
+                            message_body=_f459_body,
+                            sender_display_name=_f459_sender,
                         )
                     except Exception:
                         pass
