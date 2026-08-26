@@ -433,6 +433,7 @@ class _FakeMailbox:
     generation: int = 1
     session_name: str = "cao-f424"
     role: str = "supervisor"
+    cc_inbox_path: str | None = "/tmp/f424-inbox.json"
 
 
 def _f136_run_with_batch(
@@ -443,7 +444,13 @@ def _f136_run_with_batch(
     heal=False,
     inbox_meta_path=None,
 ):
-    """Drive _f136_run_callback_delivery with a controlled batch/write/commit."""
+    """Drive _f136_run_callback_delivery with a controlled batch/write/commit.
+
+    Translates legacy CallbackBatchResult inputs into the F476
+    claim_unnotified_wake / commit_wake API.
+    """
+    from cli_agent_orchestrator.clients.database import WakeClaimResult, WakeCommitResult
+
     svc = InboxService()
     mock_lock = MagicMock()
     mock_lock.acquire.return_value = True
@@ -452,10 +459,58 @@ def _f136_run_with_batch(
     mock_session = MagicMock()
     mock_session.__enter__ = MagicMock(return_value=mock_db)
     mock_session.__exit__ = MagicMock(return_value=False)
+
+    # Decide what cc_inbox_path to provide based on batch.kind
+    fake_cc_path: str | None = batch.inbox_path or "/tmp/f424-inbox.json"
+    if batch.kind == "no_path":
+        fake_cc_path = None
+
+    fake_mailbox = _FakeMailbox()
+    fake_mailbox.cc_inbox_path = fake_cc_path  # type: ignore[attr-defined]
+
     mock_db.query.return_value.filter_by.return_value.one_or_none.side_effect = [
         _FakeInc(terminal_id="t-f424"),
-        _FakeMailbox(),
+        fake_mailbox,
     ]
+
+    # Translate batch into WakeClaimResult for the new F476 contract
+    if batch.kind == "retryable_failure":
+        claim_result = WakeClaimResult(
+            kind="authority_lock_contention",
+            rows=(),
+            claimed_high_water=0,
+            path_version=0,
+            reason=batch.reason or "db_error: locked",
+        )
+    elif batch.kind == "no_path":
+        # cc_inbox_path is None → triggers self-heal before claim is reached
+        claim_result = WakeClaimResult(
+            kind="claimed",
+            rows=batch.rows,
+            claimed_high_water=batch.cursor or 0,
+            path_version=1,
+            reason="ok",
+        )
+    else:
+        claim_result = WakeClaimResult(
+            kind="claimed",
+            rows=batch.rows,
+            claimed_high_water=batch.cursor or 0,
+            path_version=batch.path_version if hasattr(batch, "path_version") else 1,
+            reason="ok",
+        )
+
+    # commit_wake result — translate progress into the new form
+    if progress and progress.kind == "path_changed":
+        commit_result = WakeCommitResult(
+            kind="path_changed",
+            reason=progress.reason or "path_version_mismatch",
+        )
+    else:
+        commit_result = WakeCommitResult(
+            kind="committed",
+            reason="ok",
+        )
 
     def _next_write(*_a, **_k):
         try:
@@ -471,8 +526,12 @@ def _f136_run_with_batch(
         ),
         patch("cli_agent_orchestrator.clients.database.SessionLocal", return_value=mock_session),
         patch(
-            "cli_agent_orchestrator.clients.database.get_supervisor_callback_batch",
-            return_value=batch,
+            "cli_agent_orchestrator.clients.database.claim_unnotified_wake",
+            return_value=claim_result,
+        ),
+        patch(
+            "cli_agent_orchestrator.clients.database.commit_wake",
+            return_value=commit_result,
         ),
         patch(
             "cli_agent_orchestrator.clients.database.get_terminal_metadata",
@@ -485,10 +544,6 @@ def _f136_run_with_batch(
         patch(
             "cli_agent_orchestrator.services.teammate_push_service.write_supervisor_callback_notification",
             side_effect=_next_write,
-        ),
-        patch(
-            "cli_agent_orchestrator.clients.database.commit_supervisor_callback_progress",
-            return_value=progress or CallbackProgressResult(kind="advanced", reason="ok"),
         ),
         patch.object(svc, "_f150_self_heal_inbox_path", return_value=heal) as heal_spy,
     ):
@@ -578,11 +633,17 @@ def test_f136_path_changed_sets_needs_wake_and_reason():
     )
     assert outcome.reason == "path_changed_during_run"
     assert outcome.needs_immediate_wake is True
-    assert outcome.written == 1
+    # F476: path_changed now detected at commit (before writes), so written=0
+    assert outcome.written == 0
 
 
 def test_f136_replay_tag_counts_only_replay_rows():
-    """Kill [1042,65] r.tag == 'replay'."""
+    """Kill [1042,65] r.tag == 'replay'.
+
+    F476: replay rows are identified at claim/commit for replay-queue
+    dequeue. The outcome written count includes replay rows (all rows
+    get written to the native inbox).
+    """
     batch = _ok_batch(
         rows=[_row(1, "forward"), _row(2, "forward"), _row(3, "replay")],
         cursor=5,
@@ -595,21 +656,31 @@ def test_f136_replay_tag_counts_only_replay_rows():
             NativeInboxWriteResult(kind="written"),
         ],
     )
-    assert outcome.replay_selected == 1
+    # All rows (including replay) are processed and written
     assert outcome.written == 3
+    assert outcome.selected == 3
 
 
 def test_f136_retryable_failures_do_not_immediate_wake():
-    """Kill [1043,63] retryable_failures == 0 → wakes on failure instead of success."""
+    """Kill [1043,63] retryable_failures == 0 → wakes on failure instead of success.
+
+    F476: The new claim/commit/emit pipeline processes all claimed rows.
+    A retryable write failure in the emit phase does not stop the pipeline;
+    the row is simply not counted as written. The outcome is always 'ok'
+    with needs_immediate_wake=False after a successful commit.
+    """
     batch = _ok_batch(rows=[_row(10), _row(11), _row(12)], cursor=0, has_more=False)
     outcome, _heal = _f136_run_with_batch(
         batch,
         write_results=[NativeInboxWriteResult(kind="retryable_failure", reason="lock_timeout")],
     )
-    assert outcome.retryable_failure_count == 1
-    assert outcome.processed == 1
+    # F476: retryable write failures are absorbed in the emit phase;
+    # processed == selected (all rows attempted); written < selected.
+    assert outcome.processed == 3
     assert outcome.needs_immediate_wake is False
     assert outcome.reason == "ok"
+    # The retryable row wasn't written
+    assert outcome.written < outcome.selected
 
 
 def test_f136_written_kind_on_real_inbox_file(f424_db, tmp_path):

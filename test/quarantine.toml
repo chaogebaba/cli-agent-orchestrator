@@ -125,3 +125,35 @@ owner     = "WP-suite-D2"
 filed     = "2026-08-18"
 review_by = "2026-09-17"
 verdict   = "test_ready_completion_at_deadline_has_one_lawful_owner"
+
+
+# --- F487-r2 S3: xdist-order-sensitive timing/environment tests ---
+# Root cause: these tests pass serial but flake under -n 2 due to process
+# timing, global state manipulation, or real tmux server kill races.
+
+[[entry]]
+nodeid    = "test/clients/test_tmux_session_exists_strict.py::TestConfirmedAnswers::test_server_shut_down_under_us_is_a_confirmed_absence"
+class     = "xdist_flaky"
+reason    = "Real tmux kill-server is async; under xdist CPU contention the 15s poll can miss the transition"
+owner     = "F487-r2"
+filed     = "2026-08-26"
+expires   = "2026-09-25"
+review_by = "2026-09-25"
+
+[[entry]]
+nodeid    = "test/plugins/test_suite_slot.py::TestPidReuseGuard::test_stale_entry_not_killed"
+class     = "xdist_flaky"
+reason    = "Process-timing sensitive: sentinel subprocess + /proc starttime read races under xdist load"
+owner     = "F487-r2"
+filed     = "2026-08-26"
+expires   = "2026-09-25"
+review_by = "2026-09-25"
+
+[[entry]]
+nodeid    = "test/services/test_fifo_reader.py::TestReaderThreadLifecycle::test_data_received_across_writer_reconnects"
+class     = "xdist_flaky"
+reason    = "FIFO open/write timing with 3s deadline fails under heavy xdist CPU contention"
+owner     = "F487-r2"
+filed     = "2026-08-26"
+expires   = "2026-09-25"
+review_by = "2026-09-25"

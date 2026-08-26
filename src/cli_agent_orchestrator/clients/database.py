@@ -6219,12 +6219,13 @@ def _insert_routed_inbox_row(
     # Only eligible if: SEND_MESSAGE, non-barrier-bound, non-park_warm, sender→caller.
     # Uses INSERT ... WHERE NOT EXISTS with a rolling 60s window on normalized content.
     content_hash: str | None = None
+    _f475_dedup_hit_id: int | None = None
     if (
         barrier_id is None
         and not park_warm
         and dispatch_barrier is None
         and orchestration_type == OrchestrationType.SEND_MESSAGE
-        and not sender_id.startswith(("watchdog:", "cao-"))
+        and not sender_id.startswith(_BARRIER_INTERNAL_PREFIXES)
     ):
         try:
             if _f475_should_dedup(
@@ -6236,33 +6237,53 @@ def _insert_routed_inbox_row(
             ):
                 content_hash = _f475_compute_content_hash(_f475_normalize_message(message))
                 effective_receiver = logical_receiver_id or receiver_id
-                # Check for existing identical row within rolling 60s window
+                # Check for existing identical row within rolling 60s window.
+                # Use a SAVEPOINT on the caller's session so the dedup lookup
+                # is transaction-safe for ALL pool topologies (including SQLite
+                # :memory: where separate sessions share the thread-local DBAPI
+                # connection). A savepoint failure rolls back only itself,
+                # never the caller's pending work.
                 cutoff = _utcnow() - __import__("datetime").timedelta(
                     seconds=_F475_CALLBACK_DEDUP_WINDOW_S
                 )
-                existing = (
-                    db.query(InboxModel)
-                    .filter(
-                        InboxModel.sender_id == sender_id,
-                        InboxModel.receiver_id == receiver_id,
-                        InboxModel.callback_dedup_key == content_hash,
-                        InboxModel.created_at >= cutoff,
-                        InboxModel.park_warm.isnot(True),
-                        InboxModel.barrier_id.is_(None),
+                nested = db.begin_nested()
+                try:
+                    existing = (
+                        db.query(InboxModel)
+                        .filter(
+                            InboxModel.sender_id == sender_id,
+                            InboxModel.receiver_id == receiver_id,
+                            InboxModel.callback_dedup_key == content_hash,
+                            InboxModel.created_at >= cutoff,
+                            InboxModel.park_warm.isnot(True),
+                            InboxModel.barrier_id.is_(None),
+                        )
+                        .first()
                     )
-                    .first()
-                )
-                if existing is not None:
+                    _f475_dedup_hit_id = existing.id if existing is not None else None
+                    nested.commit()
+                except Exception:
+                    nested.rollback()
+                    raise  # propagate to outer dedup handler
+                if _f475_dedup_hit_id is not None:
                     logger.info(
                         "f475_callback_dedup sender=%s receiver=%s suppressed=true",
                         sender_id,
                         effective_receiver,
                     )
-                    return existing
         except Exception:
-            # Dedup check failed — proceed with insert (fail-open)
+            # Dedup LOOKUP failed — proceed with insert (fail-open).
+            # Only the savepoint query is covered; the caller-session re-fetch
+            # below is intentionally OUTSIDE this handler.
             logger.debug("f475_dedup_check_failed", exc_info=True)
             content_hash = None
+            _f475_dedup_hit_id = None
+
+    # Re-fetch the dedup hit from the CALLER's session so the returned object
+    # is properly bound.  This is OUTSIDE the fail-open handler: a failure here
+    # means the caller's session is broken and we must NOT continue to insert.
+    if _f475_dedup_hit_id is not None:
+        return db.query(InboxModel).filter(InboxModel.id == _f475_dedup_hit_id).one()
 
     fields = _stamp_enqueue_generation(
         db,
@@ -6661,7 +6682,7 @@ def _f475_should_dedup(
         return False
     if dispatch_barrier is not None:
         return False
-    if sender_id.startswith("watchdog:") or sender_id.startswith("cao-"):
+    if sender_id.startswith(_BARRIER_INTERNAL_PREFIXES):
         return False
     try:
         meta = get_terminal_metadata(sender_id)

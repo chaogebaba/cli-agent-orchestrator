@@ -169,3 +169,20 @@ Format: nodeid heading, bucket tag, root cause, arm counts, fix commit or retire
 - **Arm counts:** A 3/3, B 20/20, C 20/20, D 5/5
 - **Retirement date:** 2026-08-18
 - **Re-quarantine trigger:** Any failure under `-n 2`.
+
+
+## test_server_shut_down_under_us_is_a_confirmed_absence
+
+- **Bucket:** (b) xdist resource contention
+- **Root cause:** Real tmux kill-server is async; under xdist CPU contention the 15s poll may miss the server-down transition.
+- **Arm counts:** isolated 5/5 pass, full -n 2 flake observed 2026-08-26
+- **Retirement date:** 2026-08-26
+- **Re-quarantine trigger:** Any failure under `-n 2`.
+
+## test_stale_entry_not_killed
+
+- **Bucket:** (b) xdist resource contention
+- **Root cause:** Process-timing sensitive: sentinel subprocess + /proc starttime read races under xdist load.
+- **Arm counts:** isolated 5/5 pass, full -n 2 flake observed 2026-08-26
+- **Retirement date:** 2026-08-26
+- **Re-quarantine trigger:** Any failure under `-n 2`.
