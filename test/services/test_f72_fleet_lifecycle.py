@@ -907,6 +907,23 @@ def test_collision_quiesces_first_refuses_once_and_deletes_nothing(f72_env, monk
         "cli_agent_orchestrator.services.session_lifecycle_lease.acquire_session_lifecycle_exclusive",
         acquire,
     )
+    # F513 (#368): delete now waits a bounded interval on the exclusive
+    # lifecycle lease before refusing, which would otherwise poll
+    # acquire_session_lifecycle_exclusive repeatedly here. Pin the wait to 0 so
+    # this test keeps asserting the original one-shot instant-refuse contract;
+    # the default (5s) bounded-wait behaviour is covered by
+    # test/services/test_f512_f513_lease_and_passthrough.py. Preserve every
+    # other config key by returning the caller-supplied default.
+    from cli_agent_orchestrator.services.config_service import ConfigService
+
+    _real_config_get = ConfigService.get
+
+    def _config_get(key, default=None, *args, **kwargs):
+        if key == "delete.lifecycle_lease_wait_s":
+            return 0.0
+        return _real_config_get(key, default, *args, **kwargs)
+
+    monkeypatch.setattr(ConfigService, "get", staticmethod(_config_get))
     try:
         with pytest.raises(RuntimeError, match="resume_in_progress"):
             terminal_service.delete_terminal("22222222", caller_id="11111111")
