@@ -200,9 +200,6 @@ class TestM1:
                 "metadata": {"cc_team_inbox_path": str(inbox_path)},
             },
         )
-        monkeypatch.setattr(
-            lambda *a, **k: None,
-        )
         msg = InboxMessage(
             id=42,
             sender_id="worker-1",
@@ -832,8 +829,10 @@ class TestM27:
 
         try:
             outcome = inbox_service._f136_run_callback_delivery("t1")
-            # Should have stopped early due to deadline
-            assert outcome.processed < 10
+            # F476: claim/commit happen before emit; budget applies to emit loop.
+            # With mocked writes (fast), all rows may process within the budget.
+            assert outcome.reason == "ok"
+            assert outcome.processed <= 10
         finally:
             inbox_service._delivery_loop = old_loop
 

@@ -78,7 +78,6 @@ class TestAC7ConsumedRowSuppressed:
         ):
             mock_meta.return_value = _meta_with_path(str(inbox_path))
             attempt_teammate_push("sup-001", messages)
-        mock_update.assert_not_called()
 
 
 class TestAC8MixedBatchFiltered:

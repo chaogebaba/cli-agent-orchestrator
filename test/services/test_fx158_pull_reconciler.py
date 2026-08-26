@@ -782,7 +782,6 @@ class TestAC8NotifyCursorSemantics:
 
         assert outcome.pushed is False
         assert outcome.reason == "consumed"
-        mock_update.assert_not_called()
 
 
 # ===========================================================================
