@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import logging
 import os
 import re
@@ -647,8 +646,14 @@ class StalledCallbackWatchdog:
 
     def refresh_screen_fingerprints(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
+
+        # F506 Fork A pick (i): the sampler widens from "terminals with an armed
+        # episode" to ALL live terminals with a readable pane — the #361 incident
+        # happened with no episode armed, so episode-scoped sampling could never
+        # see it (AC17). The armed-episode set is still tracked separately for the
+        # episode-clock / no-progress bookkeeping below.
         with self._lock:
-            terminal_ids = [
+            armed_episode_ids = {
                 terminal_id
                 for terminal_id, episode in self._episodes.items()
                 if terminal_id not in self._paused
@@ -664,41 +669,44 @@ class StalledCallbackWatchdog:
                     or episode.quiet_since is not None
                     or episode.processing_since is not None
                 )
-            ]
+            }
 
-        if not terminal_ids:
+        # Enumerate the widened set: all live terminals UNION armed episodes.
+        # Failure to enumerate degrades to episode-only (never worse than pre-F506).
+        try:
+            from cli_agent_orchestrator.clients.database import list_all_terminals
+
+            live_ids = [row["id"] for row in list_all_terminals()]
+        except Exception:
+            logger.debug("pane sampler: live-terminal enumeration failed", exc_info=True)
+            live_ids = []
+        sample_ids = list(dict.fromkeys([*live_ids, *armed_episode_ids]))
+        if not sample_ids:
             return
 
-        from cli_agent_orchestrator.backends.registry import get_backend
-        from cli_agent_orchestrator.providers.manager import provider_manager
+        # AC1 / D1: the SINGLE sampler is now pane_liveness.observe — this method
+        # performs no pane capture of its own. observe() owns the one
+        # capture -> filter -> sha256 pipeline (net sampler count stays 1).
+        from cli_agent_orchestrator.services.pane_liveness import pane_liveness
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-        backend = get_backend()
-        for terminal_id in terminal_ids:
-            metadata = get_terminal_metadata(terminal_id)
-            if not metadata:
-                continue
-            try:
-                tail = backend.get_history(
-                    metadata["tmux_session"],
-                    metadata["tmux_window"],
-                    tail_lines=WATCHDOG_SCREEN_TAIL_LINES,
-                    strip_escapes=True,
-                )
-                provider = provider_manager.get_provider(terminal_id)
-                patterns = (
-                    getattr(provider, "liveness_exclude_patterns", [])
-                    if provider is not None
-                    else []
-                )
-                tail = _filtered_liveness_tail(tail, list(patterns or []))
-                fingerprint = hashlib.sha256(tail.encode("utf-8", "replace")).hexdigest()
-            except Exception:
-                logger.exception(
-                    "Failed to fingerprint screen for stalled-callback watchdog: %s",
-                    terminal_id,
-                )
+        for terminal_id in sample_ids:
+            observation = pane_liveness.observe(terminal_id, now=now, monitor=status_monitor)
+            if observation is None:
+                # No usable sample this tick (capture outage / unreadable pane).
+                # Nothing to reconcile — matches the pre-F506 `continue`.
                 continue
 
+            # F507: reconcile the question marker for terminals holding an open
+            # marker or classified WAITING (level-triggered, D9). Cheap and
+            # sampler-independent.
+            self._reconcile_question_marker(terminal_id)
+
+            if terminal_id not in armed_episode_ids:
+                continue
+
+            fingerprint = observation.fingerprint
+            fp_changed = observation.fp_changed
             with self._lock:
                 episode = self._episodes.get(terminal_id)
                 if (
@@ -728,8 +736,10 @@ class StalledCallbackWatchdog:
 
                 # F228-b: update no-progress fingerprint for PROCESSING terminals
                 if episode.processing_since is not None and episode.np_fired_key is None:
-                    # Capture sanitized hint from the filtered tail (same read, no extra I/O)
-                    hint_lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+                    # Sanitized hint from the SAME filtered tail (no extra I/O).
+                    hint_lines = [
+                        ln.strip() for ln in observation.filtered_tail.splitlines() if ln.strip()
+                    ]
                     raw_hint = hint_lines[-1] if hint_lines else ""
                     # Sanitize: terminal text is untrusted
                     sanitized_hint = (
@@ -749,6 +759,33 @@ class StalledCallbackWatchdog:
                         episode.last_np_fp = fingerprint
                         episode.last_progress_at = now
                     # else: same fingerprint — clock keeps running (no-op)
+            del fp_changed  # bookkeeping uses last_screen_fp deltas directly
+
+    def _reconcile_question_marker(self, terminal_id: str) -> None:
+        """F507 level-triggered reconcile: run only when there is something to do.
+
+        Reconciles for terminals holding an open marker OR classified WAITING —
+        walks the transcript, heals a lost clear (AC10), and applies the TTL
+        (AC14). Best-effort; never raises into the sampler loop.
+        """
+        try:
+            from cli_agent_orchestrator.services.question_state import question_state
+            from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+            interesting = question_state.is_open(terminal_id)
+            if not interesting:
+                published = status_monitor.get_published_status(terminal_id)
+                interesting = published is TerminalStatus.WAITING_USER_ANSWER
+            if not interesting:
+                return
+            metadata = get_terminal_metadata(terminal_id)
+            if metadata is None:
+                return
+            question_state.reconcile(terminal_id, metadata)
+        except Exception:
+            logger.debug(
+                "question_marker reconcile failed for %s", terminal_id, exc_info=True
+            )
 
     def _fresh_frame_decides_running(self, terminal_id: str) -> tuple[bool, str | None]:
         from cli_agent_orchestrator.backends.registry import get_backend
@@ -2095,6 +2132,22 @@ class StalledCallbackWatchdog:
 
         processing_age = int(now - processing_since)
 
+        # F506 AC6: the frozen-fp / live-process signal is available to the wedge
+        # WITHOUT a second capture — read the last pane sample via peek(). The
+        # caller handles peek()==None (no usable sample) gracefully.
+        pane_unchanged_note = ""
+        try:
+            from cli_agent_orchestrator.services.pane_liveness import pane_liveness
+
+            observation = pane_liveness.peek(terminal_id)
+            if observation is not None:
+                pane_unchanged_note = (
+                    f"Pane unchanged for {int(observation.unchanged_for_s)}s "
+                    f"(fingerprint stable).\n"
+                )
+        except Exception:
+            pane_unchanged_note = ""
+
         # D12: flag wedge_suspect in system metadata
         try:
             from cli_agent_orchestrator.clients.database import merge_terminal_system_metadata
@@ -2117,6 +2170,7 @@ class StalledCallbackWatchdog:
             message = (
                 f"[wedge-watchdog] grok worker {profile}-{terminal_id} has been PROCESSING "
                 f"for {processing_age}s (gen={generation}). Possible relay wedge.\n"
+                f"{pane_unchanged_note}"
                 f"Check: peek_terminal {terminal_id}\n"
                 f"Remedy: delete_terminal {terminal_id} then re-assign."
             )
@@ -2183,12 +2237,25 @@ class StalledCallbackWatchdog:
                     )
                     _idle_consecutive = 0  # F351: reset backoff on event
                 else:
-                    # F351: no event — check if episodes exist before running ticks
+                    # F351: no event — check if episodes exist before running the
+                    # episode-driven heavy ticks. F506 Fork A relaxes this: the
+                    # pane sampler MUST still run with no episode armed (the #361
+                    # false-idle happened with no episode), so refresh_screen_
+                    # fingerprints runs unconditionally below. The idle-backoff
+                    # interval stretch is retained (the F351 optimisation), but the
+                    # early `continue` no longer skips the sampler — F351's
+                    # idle-backoff tests are re-derived accordingly (§9).
                     with self._lock:
                         _has_episodes = bool(self._episodes)
                     if not _has_episodes:
                         _idle_consecutive = min(_idle_consecutive + 1, 10)
-                        # Skip heavy tick functions when completely idle
+                        # F506: sample all live terminals for liveness fusion even
+                        # when no episode is armed (Fork A / AC17). This is the one
+                        # heavy tick that must not be skipped in the idle path.
+                        await asyncio.to_thread(self.refresh_screen_fingerprints)
+                        # tick_wedge reads pane_liveness.peek without a second
+                        # capture (AC6) — keep it live so a wedge is still seen.
+                        await asyncio.to_thread(self.tick_wedge)
                         parity_now = self._parity_clock()
                         if parity_now >= next_parity_sweep:
                             next_parity_sweep = parity_now + 60.0

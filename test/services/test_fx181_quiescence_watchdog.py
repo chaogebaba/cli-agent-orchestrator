@@ -24,6 +24,17 @@ def _make_watchdog(grace=3):
     return StalledCallbackWatchdog(grace_seconds=grace)
 
 
+@pytest.fixture(autouse=True)
+def _reset_pane_liveness():
+    """F506: clear the pane sampler singleton's per-terminal state between tests
+    so a reused terminal id never inherits a stale fingerprint/debounce count."""
+    from cli_agent_orchestrator.services.pane_liveness import pane_liveness
+
+    pane_liveness._state.clear()
+    yield
+    pane_liveness._state.clear()
+
+
 def _meta(terminal_id="worker1", caller_id="sup1"):
     return {
         "id": terminal_id,
@@ -468,6 +479,14 @@ class TestRingPredicate:
             patch(
                 "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
                 return_value=_meta("w1", "sup1"),
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+                return_value=_meta("w1", "sup1"),
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.list_all_terminals",
+                return_value=[{"id": "w1"}],
             ),
             patch(
                 "cli_agent_orchestrator.backends.registry.get_backend",
@@ -1581,6 +1600,14 @@ class TestErrorMemberFingerprintTracking:
             patch(
                 "cli_agent_orchestrator.services.stalled_callback_watchdog.get_terminal_metadata",
                 return_value=_meta("w1", "sup1"),
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+                return_value=_meta("w1", "sup1"),
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.list_all_terminals",
+                return_value=[{"id": "w1"}],
             ),
             patch(
                 "cli_agent_orchestrator.backends.registry.get_backend",

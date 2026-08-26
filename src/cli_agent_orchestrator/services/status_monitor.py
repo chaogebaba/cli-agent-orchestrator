@@ -187,6 +187,22 @@ class BoundaryObservation:
     seq: int
     last_non_ready_seq: Optional[int]
     last_ready_seq: Optional[int]
+    # F506: appended AFTER the seven existing fields and both DEFAULTED so the
+    # deliberately-unfused mark_injection_completed construction, the keyword
+    # get_boundary_observation site, and the ~30 positional seven-arg test
+    # constructions all compile unchanged and read as "no fusion applied"
+    # (r7 R7-S1; r8 R8-N1 — appending is load-bearing, a defaulted field before
+    # the required seven is a Python error and positional fixtures would shift).
+    #
+    # fusion_reason is an EVIDENCE TAG (rules 1/3 stamp it on unchanged
+    # statuses); fusion_changed is True iff the fused status differs from the
+    # status passed in — the reason alone cannot recover this (rules 1/2 share
+    # "question_marker", rule 3a stamps "pane_delta" on no-ops, R5-S2). §8's
+    # fleet-TUI asterisk keys on fusion_changed. fusion_changed is pass-relative
+    # and does NOT re-derive on a second pass, which is why AC21 scopes
+    # idempotence to status and reason only.
+    fusion_reason: Optional[str] = None
+    fusion_changed: bool = False
 
 
 class StatusMonitor:
@@ -1615,18 +1631,124 @@ class StatusMonitor:
         with self._lock:
             return self._status_gen.get(terminal_id, 0)
 
+    def get_published_status(self, terminal_id: str) -> Optional[TerminalStatus]:
+        """Return the pre-fusion latched status, or None if never published.
+
+        F506 (r8 R8-S2): the SET-edge published-status read for the pane-hold
+        bound. This is the ONE public accessor that does NOT fuse — post-change
+        every other public accessor (get_boundary_observation/get_raw_status/
+        get_status) does, and the sampler must not call those: they fuse, and
+        fusing inside the sampler would re-enter observe(). Returns the raw
+        ``self._last_status`` entry under the lock.
+        """
+        with self._lock:
+            return self._last_status.get(terminal_id)
+
+    def fuse_status(
+        self, terminal_id: str, status: Optional[TerminalStatus]
+    ) -> Tuple[Optional[TerminalStatus], Optional[str]]:
+        """Compose liveness/marker evidence onto one status read (F506, D2).
+
+        PUBLIC and read-time: wraps every status egress consumed for admission,
+        display, or parity. Acquires ``self._lock`` itself (RLock — safe from
+        call sites already holding it, and several sit outside it). IDEMPOTENT
+        BY RE-DERIVATION: a second pass recomputes the same status and the same
+        reason given unchanged inputs (AC21). Pure on the read path — it only
+        READS ``question_state`` and ``pane_liveness.peek`` (never captures, D2).
+
+        Precondition (stated ONCE): the rules apply only when ``status is not
+        None``; ``None ⇒ (None, None)`` — the none_behavior="none" pass-through
+        (R4-S1). Ordered rules, first match wins:
+
+        1. status is WAITING_USER_ANSWER ⇒ (status, "question_marker" if a marker
+           is open else None). Additive-only on WAITING: may RAISE into it, never
+           LOWER out of it — keeps the fusion from fighting the 16 producers and
+           specifically auto_responder.force_status (D5).
+        2. a question marker is open ⇒ (WAITING_USER_ANSWER, "question_marker").
+        3a. status in {IDLE, COMPLETED, PROCESSING}, a usable sample exists,
+            unchanged_count < K, NOT pane_hold_expired ⇒ (PROCESSING,
+            "pane_delta"). The "usable sample" guard IS the whole no-evidence
+            rule (R3-B1). PROCESSING⇒PROCESSING is a status no-op that
+            reproduces the reason.
+        3b. same preconditions but pane_hold_expired ⇒ status UNCHANGED,
+            "pane_delta_expired" (fusion_changed stays False — the caller sets
+            it from the status delta). The expiry is a distinct outcome (R5-S3).
+        4. else ⇒ (status, None).
+        """
+        if status is None:
+            return None, None
+
+        with self._lock:
+            try:
+                from cli_agent_orchestrator.services.question_state import question_state
+
+                marker_open = question_state.is_open(terminal_id)
+            except Exception:
+                marker_open = False
+
+            # Rule 1: additive-only on an already-WAITING status.
+            if status is TerminalStatus.WAITING_USER_ANSWER:
+                return status, ("question_marker" if marker_open else None)
+
+            # Rule 2: a marker raises any other status into WAITING.
+            if marker_open:
+                return TerminalStatus.WAITING_USER_ANSWER, "question_marker"
+
+            # Rules 3a/3b: pane-delta downgrade, bounded by the hold clock.
+            if status in (
+                TerminalStatus.IDLE,
+                TerminalStatus.COMPLETED,
+                TerminalStatus.PROCESSING,
+            ):
+                try:
+                    from cli_agent_orchestrator.services.pane_liveness import pane_liveness
+
+                    observation = pane_liveness.peek(terminal_id)
+                except Exception:
+                    observation = None
+                if observation is not None:
+                    k = self._stable_samples()
+                    if observation.unchanged_count < k:
+                        if not observation.pane_hold_expired:
+                            return TerminalStatus.PROCESSING, "pane_delta"
+                        # 3b: the bound expired — admit the published status but
+                        # tag it so the withhold is explicable (AC22 second arm).
+                        return status, "pane_delta_expired"
+
+            # Rule 4.
+            return status, None
+
+    @staticmethod
+    def _stable_samples() -> int:
+        from cli_agent_orchestrator.services.config_service import ConfigService
+
+        try:
+            return int(ConfigService.get("liveness.stable_samples", 3))
+        except Exception:
+            return 3
+
     def get_boundary_observation(self, terminal_id: str) -> BoundaryObservation:
         """Return one status/cycle snapshot sampled under the monitor lock."""
         with self._lock:
-            status = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            published = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            # F506: fuse at read time (D2). fuse_status re-acquires the RLock
+            # (safe) and only READS question_state/pane_liveness — no capture.
+            fused_status, fusion_reason = self.fuse_status(terminal_id, published)
+            if fused_status is None:
+                fused_status = published
+            # fusion_changed is set HERE from the status delta (R6-S5): the
+            # fuse_status tuple contract is unchanged; this getter owns the flag.
+            fusion_changed = fused_status is not published
             return BoundaryObservation(
                 observation_epoch=self._epoch_locked(terminal_id),
-                status=status,
+                status=fused_status,
                 status_gen=self._status_gen.get(terminal_id, 0),
                 input_gen=self._input_gen.get(terminal_id, 0),
                 seq=self._observation_seq.get(terminal_id, 0),
                 last_non_ready_seq=self._last_non_ready_seq.get(terminal_id),
                 last_ready_seq=self._last_ready_seq.get(terminal_id),
+                fusion_reason=fusion_reason,
+                fusion_changed=fusion_changed,
             )
 
     def mark_injection_completed(self, terminal_id: str) -> BoundaryObservation:
@@ -1821,7 +1943,11 @@ class StatusMonitor:
                     # get_native_status()==None fallback still gets what we have.
                     # provider.get_status may shell out to the herdr CLI — call
                     # it outside the lock.
-                    return provider.get_status(buffer)
+                    native = provider.get_status(buffer)
+                    # F506: fuse the egress (bare status; the reason is not on
+                    # this return, AC16/R-S7). fuse_status only reads.
+                    fused, _reason = self.fuse_status(terminal_id, native)
+                    return fused if fused is not None else native
                 except Exception as e:
                     logger.error(f"Error deriving native status for {terminal_id}: {e}")
                     return TerminalStatus.UNKNOWN
@@ -1853,8 +1979,14 @@ class StatusMonitor:
             )
             if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
                 self._apply_detection(terminal_id, fresh)
-                return fresh
-        return cached
+                # F506 (AC16): :1856 still publishes the RAW fresh via
+                # _apply_detection above (the latch does not move); the EGRESS
+                # is fused (bare status — reason not on this return, R-N2).
+                fused, _reason = self.fuse_status(terminal_id, fresh)
+                return fused if fused is not None else fresh
+        # F506: fuse the cached egress (bare status, R-S7).
+        fused_cached, _reason = self.fuse_status(terminal_id, cached)
+        return fused_cached if fused_cached is not None else cached
 
     def get_status(self, terminal_id: str) -> TerminalStatus:
         """Return externally projected health, quarantining recovery states."""

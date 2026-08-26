@@ -1106,6 +1106,24 @@ class TranscriptBindingRequest(BaseModel):
         return value
 
 
+class InteractionMarkerRequest(BaseModel):
+    """F507 layer-1 edge marker pushed by the interaction hooks.
+
+    Deliberately provider-agnostic (Do-NOT #8, AC11): nothing here names a
+    provider or a CC-specific tool semantic. ``kind`` is the only closed
+    vocabulary; ``event``/``source``/``tool_name`` are opaque descriptive tags
+    the server stores but does not branch on.
+    """
+
+    terminal_id: str
+    kind: Literal["question_open", "question_clear"]
+    source: str = ""
+    event: str = ""
+    tool_name: Optional[str] = None
+    ts: Optional[str] = None
+    nonce: Optional[str] = None
+
+
 class InstallAgentProfileRequest(BaseModel):
     """Request body for installing an agent profile.
 
@@ -4541,6 +4559,42 @@ async def bind_transcript(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"invalid_transcript_binding: {exc}",
         ) from exc
+
+
+@app.post("/terminals/{terminal_id}/interaction-marker")
+async def push_interaction_marker(
+    terminal_id: TerminalId,
+    body: InteractionMarkerRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Accept one F507 interaction-marker edge (question_open/question_clear).
+
+    404 on an unknown terminal — the exact shape of ``bind_transcript``. Unlike
+    the transcript-binding endpoint this does NOT touch the filesystem: it never
+    reads a transcript and imposes no path-existence contract, so an A1 marker
+    that arrives before the transcript file exists returns 200, not 400 (AC14).
+    The marker is applied to the in-process ``question_state`` service; the
+    watchdog reconcile tick and the fusion helper read it from there.
+
+    Provider-agnostic (AC11): the marker is stored for any terminal regardless
+    of provider, with no claude-specific field required.
+    """
+    if get_terminal_metadata(terminal_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Terminal not found")
+    if body.terminal_id != terminal_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid_interaction_marker: terminal_id does not match route",
+        )
+    from cli_agent_orchestrator.services.question_state import question_state
+
+    question_state.push_marker(
+        terminal_id,
+        body.kind,
+        source_layer="hook",
+        tool_name=body.tool_name,
+    )
+    return {"success": True, "terminal_id": terminal_id, "kind": body.kind}
 
 
 @app.get("/terminals/{terminal_id}/transcript-binding/compact-latest")

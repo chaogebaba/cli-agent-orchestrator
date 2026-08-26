@@ -702,6 +702,21 @@ class ClaudeCodeProvider(BaseProvider):
                 ]
             )
             hooks.append({"type": "command", "command": brief_command, "timeout": 5})
+        # F507 layer 1: the interaction-marker hook. Same env/credential shape as
+        # the SessionStart transcript-binding hook (D8). Fired on the D7 event set
+        # and matcher-scoped per Fork B pick (iii) — the module itself classifies
+        # each event into a question_open/question_clear edge, so the same command
+        # is reused for every block below.
+        marker_command = shlex.join(
+            [
+                "env",
+                f"CAO_API_BASE_URL={resolve_endpoint()}",
+                sys.executable,
+                "-m",
+                "cli_agent_orchestrator.hooks.question_marker",
+            ]
+        )
+        marker_hooks = [{"type": "command", "command": marker_command, "timeout": 5}]
         settings = {
             "hooks": {
                 "SessionStart": [
@@ -709,7 +724,46 @@ class ClaudeCodeProvider(BaseProvider):
                         "matcher": "startup|resume|clear|compact",
                         "hooks": hooks,
                     }
-                ]
+                ],
+                # OPEN edges (D7):
+                #   Notification notification_type permission_prompt|
+                #     elicitation_dialog|elicitation_url_dialog (Fork B pick iii)
+                #   PreToolUse matcher AskUserQuestion
+                "Notification": [
+                    {
+                        "matcher": (
+                            "permission_prompt|elicitation_dialog|elicitation_url_dialog"
+                            "|elicitation_complete|elicitation_response"
+                        ),
+                        "hooks": marker_hooks,
+                    }
+                ],
+                "PreToolUse": [
+                    {
+                        "matcher": "AskUserQuestion",
+                        "hooks": marker_hooks,
+                    }
+                ],
+                # CLEAR edges (D7):
+                #   PostToolUse / PostToolUseFailure matcher AskUserQuestion
+                #   Stop (no matcher — takes none)
+                "PostToolUse": [
+                    {
+                        "matcher": "AskUserQuestion",
+                        "hooks": marker_hooks,
+                    }
+                ],
+                "PostToolUseFailure": [
+                    {
+                        "matcher": "AskUserQuestion",
+                        "hooks": marker_hooks,
+                    }
+                ],
+                "Stop": [
+                    {
+                        "hooks": marker_hooks,
+                    }
+                ],
             }
         }
         # When persona composition is active, the real ~/.claude/settings.json
@@ -1676,3 +1730,19 @@ class ClaudeCodeProvider(BaseProvider):
                 tmp_file.unlink(missing_ok=True)
             except OSError:
                 pass
+        # F507: drop this terminal's interaction-marker state and any cooldown
+        # files so a re-used terminal id never inherits a stale question-open.
+        try:
+            from cli_agent_orchestrator.services.question_state import question_state
+
+            question_state.forget(self.terminal_id)
+        except Exception:
+            pass
+        try:
+            for cooldown in tmp_dir.glob(f"qmarker-cooldown.{self.terminal_id}.*"):
+                try:
+                    cooldown.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        except OSError:
+            pass

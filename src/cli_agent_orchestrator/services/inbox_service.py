@@ -576,6 +576,20 @@ def get_delivery_lock(terminal_id: str) -> threading.Lock:
 _get_delivery_lock = get_delivery_lock
 
 
+def _claude_eager_eligible(admission_kind: str | None, status: "TerminalStatus | None") -> bool:
+    """F506 D13: is the claude s4_initial eager hatch eligible for this status?
+
+    Pure decision extracted from deliver_pending so the clause is unit-testable
+    in isolation (biting test test_f506_d13_claude_eager_excludes_waiting).
+    Eligible ONLY when the admission kind is ``s4_initial`` AND the (fused)
+    status is not WAITING_USER_ANSWER — a WAITING status (marker-raised OR
+    provider-published) must never open the eager hatch into an open dialog
+    (the §1 misdelivery). Option (c) — allowing provider-published WAITING —
+    was rejected.
+    """
+    return admission_kind == "s4_initial" and status is not TerminalStatus.WAITING_USER_ANSWER
+
+
 def clear_terminal_delivery_state(terminal_id: str) -> None:
     """Clear per-terminal state while retaining permanent delivery-lock identity."""
     with _delivery_seq_guard:
@@ -2483,7 +2497,18 @@ class InboxService:
                             if metadata.get("provider") == "claude_code":
                                 if provider is None:
                                     provider = provider_manager.get_provider(terminal_id)
-                                eager_eligible = admission_kind == "s4_initial"
+                                # F506 D13: exclude ANY fused-path WAITING from the
+                                # claude s4_initial eager hatch. Unamended, the
+                                # hatch fires BECAUSE status is not IDLE/COMPLETED
+                                # and pastes into the open dialog on the
+                                # repeat-defer path — the exact §1 shape. Applies
+                                # to marker-raised AND provider-published WAITING
+                                # (option (c) rejected). :2482 is the shared status
+                                # check — editing there would leak D13 into the
+                                # non-claude arm. Extracted to a pure helper so the
+                                # clause is unit-testable in isolation (biting test
+                                # test_f506_d13_claude_eager_excludes_waiting).
+                                eager_eligible = _claude_eager_eligible(admission_kind, status)
                             elif EAGER_INBOX_DELIVERY and status == TerminalStatus.PROCESSING:
                                 # F354: WAITING_USER_ANSWER is deliberately NOT
                                 # eager-admissible. A blocking dialog means the
