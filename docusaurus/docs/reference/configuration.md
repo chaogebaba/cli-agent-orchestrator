@@ -113,7 +113,7 @@ Timeouts and buffer sizes for the CAO runtime. Override only if you experience t
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `enabled` | `true` | Master switch for the memory subsystem |
+| `enabled` | `false` | Master switch for the memory subsystem |
 | `compile_mode` | `"llm"` | `"llm"` (wiki compiler) or `"append"` (skip LLM compilation) |
 | `flush_threshold` | `0.85` | Context-usage fraction that triggers a memory flush |
 | `compile_timeout_s` | `120.0` | Wall-clock timeout for wiki compile |

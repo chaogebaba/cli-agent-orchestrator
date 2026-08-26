@@ -1,9 +1,9 @@
-"""SC-6 — ``memory.enabled`` settings-flag tests (U5).
+"""SC-6 — ``memory.enabled`` settings-flag tests (U5 + F488).
 
-Covers the master enable/disable switch introduced in U5:
+Covers the master enable/disable switch:
 
 - **AC1** — ``is_memory_enabled()`` reflects the ``memory.enabled`` key in
-  ``settings.json`` and defaults to True (opt-out) when absent.
+  ``settings.json`` and defaults to False (opt-in) when absent.
 - **AC2** — Every public entry point on ``MemoryService`` short-circuits when
   disabled:
     * ``store()``    → raises ``MemoryDisabledError``
@@ -13,8 +13,10 @@ Covers the master enable/disable switch introduced in U5:
     * ``get_curated_memory_context()``        → returns ``""``
 - **AC3** — Disabled ``store()`` touches neither the filesystem (no wiki
   files, no ``index.md``) nor SQLite (no metadata row).
-- **AC4** — With ``enabled=True`` (default) behavior is unchanged — a
-  round-trip store + recall still works.
+- **AC4** — With ``enabled=True`` (explicitly enabled) behavior is unchanged
+  — a round-trip store + recall still works.
+- **AC6** — ``MemoryConfig()`` and ``CAOConfig()`` model defaults are False.
+- **AC7** — Production memory guards fail closed on errors.
 - **MCP** — The MCP memory tools return an explicit ``disabled`` discriminator
   plus the shared ``MEMORY_DISABLED_MESSAGE`` so the agent can surface a
   clear error to the user.
@@ -104,9 +106,11 @@ class TestIsMemoryEnabledFlag:
         settings_file.write_text(json.dumps({"memory": {"enabled": False}}))
         assert is_memory_enabled() is False
 
-    def test_returns_true_when_explicitly_enabled(self, settings_file: Path) -> None:
+    def test_returns_true_when_explicitly_enabled(self, settings_file: Path, monkeypatch) -> None:
         from cli_agent_orchestrator.services.settings_service import is_memory_enabled
 
+        # F488: clear the autouse env so this tests the file setting alone
+        monkeypatch.delenv("CAO_MEMORY_ENABLED", raising=False)
         settings_file.write_text(json.dumps({"memory": {"enabled": True}}))
         assert is_memory_enabled() is True
 
@@ -242,11 +246,11 @@ def test_disabled_store_writes_nothing_to_filesystem_or_sqlite(tmp_path: Path) -
 
 
 # ---------------------------------------------------------------------------
-# AC4 — enabled=True (default) preserves existing behavior
+# AC4 — enabled=True (explicitly enabled) preserves existing behavior
 # ---------------------------------------------------------------------------
 
 
-def test_enabled_default_preserves_round_trip(tmp_path: Path) -> None:
+def test_enabled_explicitly_preserves_round_trip(tmp_path: Path) -> None:
     svc = _make_svc(tmp_path / "mem", tmp_path / "u5-on.db")
     with patch(
         "cli_agent_orchestrator.services.memory_service._is_memory_enabled",
@@ -399,3 +403,79 @@ class TestMcpToolsDisabledSurface:
         assert result["success"] is False
         assert result["disabled"] is True
         assert result["error"] == srv.MEMORY_DISABLED_MESSAGE
+
+
+
+# ---------------------------------------------------------------------------
+# AC6 — MemoryConfig() and CAOConfig() model defaults are False (F488)
+# ---------------------------------------------------------------------------
+
+
+class TestConfigModelDefaults:
+    """Regression for BLOCKER 1: typed config models must default memory OFF."""
+
+    def test_memory_config_default_enabled_is_false(self) -> None:
+        from cli_agent_orchestrator.services.config_service import MemoryConfig
+
+        cfg = MemoryConfig()
+        assert cfg.enabled is False
+
+    def test_cao_config_default_memory_enabled_is_false(self) -> None:
+        from cli_agent_orchestrator.services.config_service import CAOConfig
+
+        cfg = CAOConfig()
+        assert cfg.memory.enabled is False
+
+    def test_memory_config_json_schema_default_is_false(self) -> None:
+        from cli_agent_orchestrator.services.config_service import MemoryConfig
+
+        schema = MemoryConfig.model_json_schema()
+        enabled_prop = schema["properties"]["enabled"]
+        assert enabled_prop["default"] is False
+
+
+# ---------------------------------------------------------------------------
+# AC7 — Fail-closed error-path regression tests (F488)
+# ---------------------------------------------------------------------------
+
+
+class TestFailClosedGuards:
+    """Regression for BLOCKER 2: every guard returns False on errors."""
+
+    def test_memory_service_guard_fails_closed(self, monkeypatch) -> None:
+        """_is_memory_enabled() returns False when settings import raises."""
+        monkeypatch.delenv("CAO_MEMORY_ENABLED", raising=False)
+        with patch(
+            "cli_agent_orchestrator.services.settings_service.is_memory_enabled",
+            side_effect=RuntimeError("simulated settings import failure"),
+        ):
+            from cli_agent_orchestrator.services.memory_service import (
+                _is_memory_enabled,
+            )
+
+            assert _is_memory_enabled() is False
+
+    def test_audit_log_guard_fails_closed(self, monkeypatch) -> None:
+        """_is_memory_enabled_safe() returns False when delegation raises."""
+        monkeypatch.delenv("CAO_MEMORY_ENABLED", raising=False)
+        with patch(
+            "cli_agent_orchestrator.services.settings_service.is_memory_enabled",
+            side_effect=RuntimeError("settings file corrupt"),
+        ):
+            from cli_agent_orchestrator.services.audit_log import (
+                _is_memory_enabled_safe,
+            )
+
+            assert _is_memory_enabled_safe() is False
+
+    def test_wiki_lint_guard_fails_closed(self, tmp_path: Path, monkeypatch) -> None:
+        """wiki lint returns [] when is_memory_enabled raises."""
+        monkeypatch.delenv("CAO_MEMORY_ENABLED", raising=False)
+        with patch(
+            "cli_agent_orchestrator.services.settings_service.is_memory_enabled",
+            side_effect=RuntimeError("settings file corrupt"),
+        ):
+            from cli_agent_orchestrator.services.wiki_lint import run_lint
+
+            result = asyncio.run(run_lint("test-hash", repo_root=str(tmp_path)))
+            assert result == []

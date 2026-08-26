@@ -61,7 +61,7 @@ class ServerConfig(BaseModel):
 
 
 class MemoryConfig(BaseModel):
-    enabled: bool = True
+    enabled: bool = False
     compile_mode: str = "llm"
     flush_threshold: float = 0.85
     compile_timeout_s: float = 120.0
