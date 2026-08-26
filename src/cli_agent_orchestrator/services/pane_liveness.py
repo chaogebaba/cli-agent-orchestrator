@@ -174,6 +174,20 @@ class PaneLivenessService:
         now = self._clock() if now is None else now
         captured = self._capture(terminal_id)
 
+        # HOTFIX 2026-08-26 (live deadlock): read the published status BEFORE
+        # taking the pane lock. get_published_status acquires the monitor lock,
+        # while fuse_status holds the monitor lock and calls peek (pane lock) --
+        # reading it under our lock nests the two locks in ABBA order and
+        # deadlocks the server. Pre-reading fixes the order: the monitor lock is
+        # never acquired while the pane lock is held. The value is at most one
+        # capture older than before, which the 5s sampler tick already tolerates.
+        resolved_monitor = monitor
+        if resolved_monitor is None:
+            from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+            resolved_monitor = status_monitor
+        published = resolved_monitor.get_published_status(terminal_id)
+
         with self._lock:
             state = self._state.get(terminal_id)
             if state is None:
@@ -205,7 +219,7 @@ class PaneLivenessService:
                 state.last_change_monotonic = now
             state.sampled_at = now
 
-            self._update_hold_bound(terminal_id, state, now, monitor)
+            self._update_hold_bound(terminal_id, state, now, published)
 
             return PaneObservation(
                 unchanged_count=state.unchanged_count,
@@ -221,7 +235,7 @@ class PaneLivenessService:
         terminal_id: str,
         state: _PaneState,
         now: float,
-        monitor: "StatusMonitor | None",
+        published: "TerminalStatus | None",
     ) -> None:
         """Set/clear ``downgrade_since`` and flip ``pane_hold_expired`` (D12).
 
@@ -231,7 +245,7 @@ class PaneLivenessService:
         Any other condition clears the bound (both fields).
         """
         k = self._stable_samples()
-        would_downgrade = self._rule3a_would_downgrade(terminal_id, state, k, monitor)
+        would_downgrade = self._rule3a_would_downgrade(terminal_id, state, k, published)
 
         if not would_downgrade:
             # Not actually withholding — clear the bound (both fields together)
@@ -260,7 +274,7 @@ class PaneLivenessService:
         terminal_id: str,
         state: _PaneState,
         k: int,
-        monitor: "StatusMonitor | None",
+        published: "TerminalStatus | None",
     ) -> bool:
         """True iff rule 3a would downgrade on this sample (the SET-edge test).
 
@@ -277,12 +291,8 @@ class PaneLivenessService:
                 return False
         except Exception:
             pass
-        resolved_monitor = monitor
-        if resolved_monitor is None:
-            from cli_agent_orchestrator.services.status_monitor import status_monitor
-
-            resolved_monitor = status_monitor
-        published = resolved_monitor.get_published_status(terminal_id)
+        # HOTFIX 2026-08-26: published is pre-read by observe() BEFORE the pane
+        # lock is taken (lock-order fix); this method must NOT touch the monitor.
         return published in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
 
     # ---- eviction ---------------------------------------------------------
