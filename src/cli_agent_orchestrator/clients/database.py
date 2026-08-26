@@ -365,6 +365,7 @@ class InboxModel(Base):
     )
     status = Column(String, nullable=False)  # MessageStatus enum value
     park_warm = Column(Boolean, nullable=True, default=False)
+    callback_dedup_key = Column(String, nullable=True)
     failure_reason = Column(Text, nullable=True)
     digested_into = deferred(Column(Integer, nullable=True))
     enqueue_generation = deferred(Column(Integer, nullable=True))
@@ -1917,6 +1918,8 @@ def _migrate_mailbox_columns() -> None:
             connection.execute(text("ALTER TABLE inbox ADD COLUMN owner_generation INTEGER"))
         if inbox_columns and "park_warm" not in inbox_column_names:
             connection.execute(text("ALTER TABLE inbox ADD COLUMN park_warm BOOLEAN"))
+        if inbox_columns and "callback_dedup_key" not in inbox_column_names:
+            connection.execute(text("ALTER TABLE inbox ADD COLUMN callback_dedup_key TEXT"))
         if inbox_columns:
             connection.execute(
                 text(
@@ -6168,7 +6171,13 @@ def _insert_routed_inbox_row(
     profile_name: str | None = None,
     created_at: datetime | None = None,
 ) -> Any:
-    """The single raw/logical insert choke point for WPQ7 routing."""
+    """The single raw/logical insert choke point for WPQ7 routing.
+
+    F475: After barrier association is resolved, if the row is eligible for
+    callback dedup (sender→caller, SEND_MESSAGE, non-barrier, non-park_warm),
+    atomically check for existing identical content within a rolling 60s window.
+    If a duplicate exists, return the existing row instead of inserting.
+    """
     if dispatch_barrier is not None:
         _attach_dispatch_barrier_in_db(
             db,
@@ -6205,6 +6214,56 @@ def _insert_routed_inbox_row(
             )
             if closed is not None:
                 routed_message = f"[late callback after barrier {closed[0].label}]\n{message}"
+
+    # F475: atomic callback dedup — AFTER barrier association is resolved.
+    # Only eligible if: SEND_MESSAGE, non-barrier-bound, non-park_warm, sender→caller.
+    # Uses INSERT ... WHERE NOT EXISTS with a rolling 60s window on normalized content.
+    content_hash: str | None = None
+    if (
+        barrier_id is None
+        and not park_warm
+        and dispatch_barrier is None
+        and orchestration_type == OrchestrationType.SEND_MESSAGE
+        and not sender_id.startswith(("watchdog:", "cao-"))
+    ):
+        try:
+            if _f475_should_dedup(
+                sender_id,
+                receiver_id,
+                orchestration_type,
+                park_warm,
+                dispatch_barrier,
+            ):
+                content_hash = _f475_compute_content_hash(_f475_normalize_message(message))
+                effective_receiver = logical_receiver_id or receiver_id
+                # Check for existing identical row within rolling 60s window
+                cutoff = _utcnow() - __import__("datetime").timedelta(
+                    seconds=_F475_CALLBACK_DEDUP_WINDOW_S
+                )
+                existing = (
+                    db.query(InboxModel)
+                    .filter(
+                        InboxModel.sender_id == sender_id,
+                        InboxModel.receiver_id == receiver_id,
+                        InboxModel.callback_dedup_key == content_hash,
+                        InboxModel.created_at >= cutoff,
+                        InboxModel.park_warm.isnot(True),
+                        InboxModel.barrier_id.is_(None),
+                    )
+                    .first()
+                )
+                if existing is not None:
+                    logger.info(
+                        "f475_callback_dedup sender=%s receiver=%s suppressed=true",
+                        sender_id,
+                        effective_receiver,
+                    )
+                    return existing
+        except Exception:
+            # Dedup check failed — proceed with insert (fail-open)
+            logger.debug("f475_dedup_check_failed", exc_info=True)
+            content_hash = None
+
     fields = _stamp_enqueue_generation(
         db,
         {
@@ -6217,6 +6276,7 @@ def _insert_routed_inbox_row(
             "park_warm": bool(park_warm),
             "barrier_id": barrier_id,
             "barrier_member_key": barrier_member_key,
+            "callback_dedup_key": content_hash,
             **({"created_at": created_at} if created_at is not None else {}),
         },
     )
@@ -6556,6 +6616,67 @@ def insert_barrier_escalation_message(
         return WatchdogInsertResult("inserted", int(row.id))
 
 
+# F475: callback deduplication — atomic write-side enforcement.
+# Enforced inside _insert_routed_inbox_row (the TRUE single choke point) AFTER
+# barrier association is resolved. Uses a rolling 60s window with normalized
+# content hash (strips server-injected framing like attestation blocks).
+_F475_CALLBACK_DEDUP_WINDOW_S = 60
+
+_F475_ATTESTATION_RE = __import__("re").compile(
+    r"\[FROZEN-PIN-ATTESTATION[^\]]*\]\n*", __import__("re").DOTALL
+)
+
+
+def _f475_normalize_message(message: str) -> str:
+    """Strip server-injected framing before hashing for dedup identity.
+
+    Removes [FROZEN-PIN-ATTESTATION ...] blocks so identical logical callbacks
+    with differing attestation timestamps produce the same hash.
+    """
+    return _F475_ATTESTATION_RE.sub("", message).strip()
+
+
+def _f475_compute_content_hash(message: str) -> str:
+    """SHA-256 of the NORMALIZED message content."""
+    import hashlib
+
+    return hashlib.sha256(message.encode("utf-8", "replace")).hexdigest()
+
+
+def _f475_should_dedup(
+    sender_id: str,
+    receiver_id: str,
+    orchestration_type: OrchestrationType,
+    park_warm: bool,
+    dispatch_barrier: "dict[str, Any] | None",
+) -> bool:
+    """Return True if this insert is eligible for F475 callback dedup.
+
+    Criteria: SEND_MESSAGE orchestration, no barrier, not park_warm,
+    and the receiver is the sender's recorded caller (terminal or mailbox).
+    """
+    if orchestration_type != OrchestrationType.SEND_MESSAGE:
+        return False
+    if park_warm:
+        return False
+    if dispatch_barrier is not None:
+        return False
+    if sender_id.startswith("watchdog:") or sender_id.startswith("cao-"):
+        return False
+    try:
+        meta = get_terminal_metadata(sender_id)
+    except Exception:
+        return False
+    if meta is None:
+        return False
+    caller_targets: set[str] = set()
+    if meta.get("caller_id"):
+        caller_targets.add(meta["caller_id"])
+    if meta.get("caller_mailbox_id"):
+        caller_targets.add(meta["caller_mailbox_id"])
+    return receiver_id in caller_targets
+
+
 def create_inbox_message(
     sender_id: str,
     receiver_id: str,
@@ -6654,6 +6775,10 @@ def _create_inbox_message_unfenced(
 ) -> InboxMessage:
     """Create inbox message with status=MessageStatus.PENDING.
 
+    F475 dedup is enforced inside _insert_routed_inbox_row (the single choke
+    point for ALL inbox inserts). This function resolves the receiver and
+    delegates.
+
     Raises:
         ValueError: If the receiver terminal does not exist.
     """
@@ -6667,6 +6792,7 @@ def _create_inbox_message_unfenced(
             and not db.query(TerminalModel).filter(TerminalModel.id == receiver_cache).first()
         ):
             raise ValueError(f"Terminal '{receiver_id}' not found")
+
         inbox_msg = _insert_routed_inbox_row(
             db,
             sender_id=sender_id,

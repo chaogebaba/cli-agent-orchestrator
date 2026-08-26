@@ -150,14 +150,14 @@ class _Episode:
     auto_resume_attempted_at: str | None = None
     waiting_last_push_at: float | None = None
     # F228-b: processing-no-progress tracker
-    processing_since: float | None = None       # monotonic time PROCESSING was accepted
-    last_np_fp: str | None = None               # last fingerprint taken WHILE processing
-    last_progress_at: float | None = None       # monotonic time of last FP change while processing
+    processing_since: float | None = None  # monotonic time PROCESSING was accepted
+    last_np_fp: str | None = None  # last fingerprint taken WHILE processing
+    last_progress_at: float | None = None  # monotonic time of last FP change while processing
     np_fired_key: tuple[int, float] | None = None  # (generation, processing_since) dedup
-    last_np_hint: str | None = None             # sanitized bounded last-line hint from filtered tail
+    last_np_hint: str | None = None  # sanitized bounded last-line hint from filtered tail
     # F295 Half 2 D9: absolute-age wedge arm (grok_cli only)
     wedge_fired_key: tuple[int, float] | None = None  # (generation, processing_since) dedup
-    wedge_flagged: bool = False                 # whether wedge_suspect is currently set
+    wedge_flagged: bool = False  # whether wedge_suspect is currently set
 
 
 @dataclass(frozen=True)
@@ -324,6 +324,18 @@ class StalledCallbackWatchdog:
     def record_inbound_task(self, terminal_id: str, caller_id: str, profile: str) -> None:
         if caller_id.startswith("watchdog:"):
             return
+        # F487: never arm an episode for a warm-parked terminal. The
+        # park_warm flag is persisted in the terminal's system metadata at
+        # creation time; checking it here is the single-point-of-enforcement
+        # guard that prevents false alarms regardless of how the dispatch
+        # reached this point.
+        meta = get_terminal_metadata(terminal_id)
+        if meta is not None and isinstance(meta, dict):
+            raw_metadata = meta.get("metadata")
+            if isinstance(raw_metadata, dict):
+                cao_ns = raw_metadata.get("cao")
+                if isinstance(cao_ns, dict) and cao_ns.get("park_warm") is True:
+                    return
         now = time.monotonic()
         wall_now = _utcnow()
         with self._lock:
@@ -392,8 +404,7 @@ class StalledCallbackWatchdog:
         except Exception:
             # DB unavailable: fall through to the conservative path (fire).
             logger.debug(
-                "F310: get_callback_status_since failed for %s; "
-                "falling through to loss warning",
+                "F310: get_callback_status_since failed for %s; " "falling through to loss warning",
                 terminal_id,
                 exc_info=True,
             )
@@ -557,18 +568,15 @@ class StalledCallbackWatchdog:
         # (idle transition = a consumption boundary where pull can deliver)
         if status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
             try:
+                # Look up the mailbox for this terminal
+                from cli_agent_orchestrator.clients.database import MailboxModel, SessionLocal
                 from cli_agent_orchestrator.services.boundary_pull_service import (
                     boundary_pull_service,
                 )
 
-                # Look up the mailbox for this terminal
-                from cli_agent_orchestrator.clients.database import SessionLocal, MailboxModel
-
                 with SessionLocal() as db:
                     mailbox = (
-                        db.query(MailboxModel)
-                        .filter_by(current_terminal_id=terminal_id)
-                        .first()
+                        db.query(MailboxModel).filter_by(current_terminal_id=terminal_id).first()
                     )
                     if mailbox:
                         boundary_pull_service.notify_boundary(terminal_id, mailbox.id)
@@ -651,8 +659,11 @@ class StalledCallbackWatchdog:
                 # None so notify_due keeps its pre-FX181 semantics, AC3), and
                 # without this they had no anti-false-idle protection at all.
                 # F228-b B1: PROCESSING terminals included for NP fingerprint tracking.
-                and (episode.idle_since is not None or episode.quiet_since is not None
-                     or episode.processing_since is not None)
+                and (
+                    episode.idle_since is not None
+                    or episode.quiet_since is not None
+                    or episode.processing_since is not None
+                )
             ]
 
         if not terminal_ids:
@@ -694,8 +705,11 @@ class StalledCallbackWatchdog:
                     episode is None
                     or episode.callback_seen
                     or episode.fired
-                    or (episode.idle_since is None and episode.quiet_since is None
-                        and episode.processing_since is None)
+                    or (
+                        episode.idle_since is None
+                        and episode.quiet_since is None
+                        and episode.processing_since is None
+                    )
                 ):
                     continue
                 if episode.last_screen_fp is None:
@@ -718,8 +732,10 @@ class StalledCallbackWatchdog:
                     hint_lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
                     raw_hint = hint_lines[-1] if hint_lines else ""
                     # Sanitize: terminal text is untrusted
-                    sanitized_hint = raw_hint.replace('"', "'").replace('\n', ' ').replace('\r', ' ')
-                    sanitized_hint = ''.join(c if c.isprintable() else '?' for c in sanitized_hint)
+                    sanitized_hint = (
+                        raw_hint.replace('"', "'").replace("\n", " ").replace("\r", " ")
+                    )
+                    sanitized_hint = "".join(c if c.isprintable() else "?" for c in sanitized_hint)
                     if len(sanitized_hint) > 80:
                         sanitized_hint = sanitized_hint[:77] + "..."
                     episode.last_np_hint = sanitized_hint if sanitized_hint else None
@@ -1373,12 +1389,17 @@ class StalledCallbackWatchdog:
                 # Check if this is a supervisor-role terminal — if so, self-notify
                 # via the obligation path instead of refusing.
                 agent_profile = metadata.get("agent_profile", "")
-                if not caller_id and agent_profile in ("supervisor", "code_supervisor", "chao_supervisor"):
+                if not caller_id and agent_profile in (
+                    "supervisor",
+                    "code_supervisor",
+                    "chao_supervisor",
+                ):
                     # Supervisor self-notify: create obligation targeting own mailbox
                     try:
                         from cli_agent_orchestrator.services.delivery_service import (
                             _create_self_notify_obligation,
                         )
+
                         _create_self_notify_obligation(terminal_id)
                         logger.debug(
                             "waiting-inbox watchdog: supervisor self-notify for %s",
@@ -1387,7 +1408,8 @@ class StalledCallbackWatchdog:
                     except Exception:
                         logger.debug(
                             "waiting-inbox watchdog: supervisor self-notify failed for %s",
-                            terminal_id, exc_info=True,
+                            terminal_id,
+                            exc_info=True,
                         )
                     continue
                 # Worker with corrupt caller_id — original refusal behavior
@@ -1473,15 +1495,12 @@ class StalledCallbackWatchdog:
             # this tick's status view lags at IDLE. Defer to that source:
             # suppress the alert whenever the busy-gate would hold delivery.
             try:
-                delivery_gate_status = status_monitor.get_boundary_observation(
-                    terminal_id
-                ).status
+                delivery_gate_status = status_monitor.get_boundary_observation(terminal_id).status
             except Exception:
                 delivery_gate_status = None
             busy_per_delivery_gate = (
                 delivery_gate_status is not None
-                and delivery_gate_status
-                not in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
+                and delivery_gate_status not in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
             )
             if (
                 status not in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
@@ -1509,11 +1528,16 @@ class StalledCallbackWatchdog:
                 if not caller_id or caller_id == terminal_id:
                     # F203 D15: supervisor self-notify for caller-less supervisor terminals
                     agent_profile = metadata.get("agent_profile", "")
-                    if not caller_id and agent_profile in ("supervisor", "code_supervisor", "chao_supervisor"):
+                    if not caller_id and agent_profile in (
+                        "supervisor",
+                        "code_supervisor",
+                        "chao_supervisor",
+                    ):
                         try:
                             from cli_agent_orchestrator.services.delivery_service import (
                                 _create_self_notify_obligation,
                             )
+
                             _create_self_notify_obligation(terminal_id)
                             logger.debug(
                                 "ready-backlog watchdog: supervisor self-notify for %s",
@@ -1522,7 +1546,8 @@ class StalledCallbackWatchdog:
                         except Exception:
                             logger.debug(
                                 "ready-backlog watchdog: supervisor self-notify failed for %s",
-                                terminal_id, exc_info=True,
+                                terminal_id,
+                                exc_info=True,
                             )
                         continue
                     # Worker with corrupt caller_id
@@ -1955,7 +1980,7 @@ class StalledCallbackWatchdog:
         message = (
             f"[no-progress advisory] worker {profile}-{terminal_id} has been processing "
             f"for {processing_age}s with no visible output change for {stall_age}s "
-            f"(gen={stall_generation}, last_visible=\"{hint}\").\n"
+            f'(gen={stall_generation}, last_visible="{hint}").\n'
             f"This is a HEURISTIC — a silent legitimate tool can produce a static screen.\n"
             f"Check: peek_terminal {terminal_id} | If confirmed stuck: Ctrl-C or delete_terminal."
         )
@@ -1964,14 +1989,10 @@ class StalledCallbackWatchdog:
         try:
             from cli_agent_orchestrator.services.mailbox_service import create_routed_inbox_message
 
-            create_routed_inbox_message(
-                f"watchdog:no_progress:{terminal_id}", caller_id, message
-            )
+            create_routed_inbox_message(f"watchdog:no_progress:{terminal_id}", caller_id, message)
         except Exception:
             # D2 ordering: fired key NOT set on persist failure — next tick retries
-            logger.warning(
-                "Failed to persist no-progress alert for %s", terminal_id, exc_info=True
-            )
+            logger.warning("Failed to persist no-progress alert for %s", terminal_id, exc_info=True)
             return
 
         # D2: set fired key ONLY after successful persist
@@ -2024,9 +2045,7 @@ class StalledCallbackWatchdog:
             try:
                 self._evaluate_wedge(terminal_id, episode, now)
             except Exception:
-                logger.exception(
-                    "tick_wedge per-terminal fault for %s (fail-silent)", terminal_id
-                )
+                logger.exception("tick_wedge per-terminal fault for %s (fail-silent)", terminal_id)
 
     def _evaluate_wedge(self, terminal_id: str, episode: _Episode, now: float) -> None:
         """D9/D10/D11: recheck + flag + notify for a single grok_cli terminal."""
@@ -2106,9 +2125,7 @@ class StalledCallbackWatchdog:
                     create_routed_inbox_message,
                 )
 
-                create_routed_inbox_message(
-                    f"watchdog:wedge:{terminal_id}", recipient, message
-                )
+                create_routed_inbox_message(f"watchdog:wedge:{terminal_id}", recipient, message)
             except Exception:
                 logger.warning(
                     "F295 wedge: failed to send notice for %s", terminal_id, exc_info=True
@@ -2149,9 +2166,11 @@ class StalledCallbackWatchdog:
         while True:
             try:
                 # F351: use stretched interval when idle
-                effective_interval = min(
-                    interval + (_idle_consecutive * 0.5), _IDLE_BACKOFF_MAX_S
-                ) if _idle_consecutive > 0 else interval
+                effective_interval = (
+                    min(interval + (_idle_consecutive * 0.5), _IDLE_BACKOFF_MAX_S)
+                    if _idle_consecutive > 0
+                    else interval
+                )
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=effective_interval)
                 except asyncio.TimeoutError:
