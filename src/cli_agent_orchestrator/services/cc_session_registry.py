@@ -463,15 +463,28 @@ def read_peer_token(
     MUST match the live process incarnation. A mismatch means a stale key from
     a recycled PID — returns None (clean fallback, no auth frame sent).
 
+    F337-r3 B1: Exactly one valid candidate must exist. Multiple valid key files
+    for the same PID (ambiguity) return None — directory order is not an identity
+    rule, so a stale/rotated key must never be selected arbitrarily.
+
+    F337-r3 S1: Directory enumeration errors (OSError) return None cleanly.
+
     Returns the peerToken string, or None if no key file exists, is unreadable,
-    malformed, or the procStart identity check fails.
+    malformed, ambiguous, or the procStart identity check fails.
     """
     base = sessions_dir or _sessions_dir()
     if base is None or not base.is_dir():
         return None
     # F337-r2 B2: strict filename — <pid>.<64hex>.key only
     _KEY_PATTERN = re.compile(rf"^{pid}\.[0-9a-fA-F]{{64}}\.key$")
-    for entry in base.iterdir():
+    # F337-r3 B1: collect ALL valid candidates, require exactly one
+    candidates: list[str] = []
+    # F337-r3 S1: wrap iterdir() so unreadable directory degrades cleanly
+    try:
+        entries = list(base.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
         if not _KEY_PATTERN.match(entry.name):
             continue
         try:
@@ -499,8 +512,17 @@ def read_peer_token(
                 continue
         token = data.get("peerToken")
         if token and isinstance(token, str):
-            return token
-    return None
+            candidates.append(token)
+    # F337-r3 B1: ambiguity → None (fail closed before write_to_socket)
+    if len(candidates) != 1:
+        if len(candidates) > 1:
+            logger.debug(
+                "f337_peer_token_ambiguous pid=%s candidate_count=%d",
+                pid,
+                len(candidates),
+            )
+        return None
+    return candidates[0]
 
 
 def _build_auth_frame(token: str) -> str:
