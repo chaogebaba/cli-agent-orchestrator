@@ -1084,3 +1084,271 @@ def test_wpq1_production_fresh_capture_confirms_once_without_overwriting_screen(
         )
     finally:
         status_monitor._screens.pop("term1", None)
+
+
+
+# ---------------------------------------------------------------------------
+# F491: auto-responder fires whitelisted codex dialog during deferred init
+# ---------------------------------------------------------------------------
+
+
+class TestF491ResumeWorkingDirectoryRule:
+    """F491: the codex-resume-working-directory seed rule fires on the dialog."""
+
+    RESUME_CWD_SCREEN = [
+        "  Choose working directory to resume this session",
+        "",
+        "› 1. /home/user/project",
+        "  2. /home/user/other-project",
+        "  3. /tmp/scratch",
+        "  4. Start fresh (new directory)",
+        "",
+        "  Press enter to confirm",
+    ]
+
+    def test_seed_rule_matches_resume_cwd_dialog(self):
+        """The resume-cwd seed rule matches the normalized dialog."""
+        rule = ar.Rule(
+            name="codex-resume-working-directory",
+            enabled=True,
+            match_mode="contains",
+            question="Choose working directory to resume this session",
+            options=["Press enter"],
+            answer=["Enter"],
+        )
+        normalized = ar.normalize_screen(self.RESUME_CWD_SCREEN)
+        assert rule.matches(normalized)
+
+    def test_seed_rule_fires_and_sends_enter(self, monkeypatch, _reset_engine):
+        """The auto-responder fires Enter when the resume-cwd dialog is active."""
+        engine = _reset_engine
+        sent_keys = []
+        _wire_common(monkeypatch, sent_keys=sent_keys)
+
+        # Inject the resume-cwd rule
+        monkeypatch.setattr(
+            ar._store,
+            "get_rules",
+            lambda provider: [
+                ar.Rule(
+                    name="codex-resume-working-directory",
+                    enabled=True,
+                    match_mode="contains",
+                    question="Choose working directory to resume this session",
+                    options=["Press enter"],
+                    answer=["Enter"],
+                )
+            ],
+        )
+
+        result = engine.on_screen("term1", FakeProvider(), self.RESUME_CWD_SCREEN)
+        # Rule fires (returns None, not an override status)
+        assert result is None
+        # Enter was sent
+        assert any(key == "Enter" for (_, _, key) in sent_keys)
+
+    def test_seed_rule_present_in_codex_seeds(self):
+        """The codex-resume-working-directory rule is in SEED_RULES."""
+        codex_seed = ar.SEED_RULES.get("codex.yaml", "")
+        assert "codex-resume-working-directory" in codex_seed
+        assert "Choose working directory to resume this session" in codex_seed
+
+
+class TestF491DecisionLogging:
+    """F491: decision logging records outcome of every on_screen evaluation."""
+
+    def test_decision_logged_on_fire(self, monkeypatch, _reset_engine, tmp_path):
+        """A 'matched' decision is logged when a rule fires."""
+        engine = _reset_engine
+        monkeypatch.setattr(ar, "AUTO_ANSWER_LOG_DIR", tmp_path)
+        _wire_common(monkeypatch, sent_keys=[])
+
+        monkeypatch.setattr(
+            ar._store,
+            "get_rules",
+            lambda provider: [
+                ar.Rule(
+                    name="test-rule",
+                    enabled=True,
+                    match_mode="contains",
+                    question="Do you trust",
+                    options=["Yes, continue", "No, quit"],
+                    answer=["Enter"],
+                )
+            ],
+        )
+
+        lines = [
+            "Do you trust the contents of this directory?",
+            "› 1. Yes, continue",
+            "  2. No, quit",
+            "  Press enter to confirm",
+        ]
+        engine.on_screen("term1", FakeProvider(), lines)
+
+        decision_log = tmp_path / "term1.decisions.log"
+        assert decision_log.exists()
+        content = decision_log.read_text()
+        assert "outcome=matched" in content
+        assert "reason=firing" in content
+        assert "rule=test-rule" in content
+
+    def test_decision_logged_on_no_match(self, monkeypatch, _reset_engine, tmp_path):
+        """A 'no_match' decision is logged when no rule matches."""
+        engine = _reset_engine
+        monkeypatch.setattr(ar, "AUTO_ANSWER_LOG_DIR", tmp_path)
+        _wire_common(monkeypatch, sent_keys=[])
+
+        monkeypatch.setattr(ar._store, "get_rules", lambda provider: [])
+
+        lines = ["Some arbitrary screen content", "Nothing special here"]
+        engine.on_screen("term1", FakeProvider(), lines)
+
+        decision_log = tmp_path / "term1.decisions.log"
+        assert decision_log.exists()
+        content = decision_log.read_text()
+        assert "outcome=no_match" in content
+        assert "reason=no_rule_matched" in content
+
+    def test_decision_logged_when_exit_suppressed(self, monkeypatch, _reset_engine, tmp_path):
+        """A 'not_running' decision is logged when terminal is exit-suppressed."""
+        engine = _reset_engine
+        monkeypatch.setattr(ar, "AUTO_ANSWER_LOG_DIR", tmp_path)
+        _wire_common(monkeypatch, sent_keys=[])
+        engine.mark_exit_suppress("term1")
+
+        lines = ["Something on screen"]
+        engine.on_screen("term1", FakeProvider(), lines)
+
+        decision_log = tmp_path / "term1.decisions.log"
+        assert decision_log.exists()
+        content = decision_log.read_text()
+        assert "outcome=not_running" in content
+        assert "reason=exit_suppressed" in content
+
+    def test_decision_logged_on_busy_veto(self, monkeypatch, _reset_engine, tmp_path):
+        """A 'no_match' decision with busy_veto is logged when status is PROCESSING."""
+        engine = _reset_engine
+        monkeypatch.setattr(ar, "AUTO_ANSWER_LOG_DIR", tmp_path)
+        _wire_common(monkeypatch, sent_keys=[])
+
+        class ProcessingProvider(FakeProvider):
+            def get_status_from_screen(self, _lines):
+                return TerminalStatus.PROCESSING
+
+        monkeypatch.setattr(
+            ar._store,
+            "get_rules",
+            lambda provider: [
+                ar.Rule(
+                    name="test-rule",
+                    enabled=True,
+                    match_mode="contains",
+                    question="Do you trust",
+                    options=["Yes, continue", "No, quit"],
+                    answer=["Enter"],
+                )
+            ],
+        )
+
+        lines = [
+            "Do you trust the contents of this directory?",
+            "› 1. Yes, continue",
+            "  2. No, quit",
+            "  Press enter to confirm",
+        ]
+        engine.on_screen("term1", ProcessingProvider(), lines)
+
+        decision_log = tmp_path / "term1.decisions.log"
+        assert decision_log.exists()
+        content = decision_log.read_text()
+        assert "outcome=no_match" in content
+        assert "reason=busy_veto" in content
+
+
+class TestF491DeferredInitDialogWait:
+    """F491: _wait_for_auto_responder_dialog_clear integration."""
+
+    @pytest.mark.asyncio
+    async def test_returns_immediately_when_no_dialog(self, monkeypatch):
+        """If status is not WAITING_USER_ANSWER, returns immediately."""
+        import asyncio
+
+        from cli_agent_orchestrator.services.terminal_service import (
+            _wait_for_auto_responder_dialog_clear,
+        )
+
+        class FakeStatusMonitor:
+            def get_status(self, tid):
+                return TerminalStatus.IDLE
+
+            def get_rendered_screen(self, tid):
+                return None
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.status_monitor",
+            FakeStatusMonitor(),
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.auto_responder.auto_responder",
+            ar.AutoResponder(),
+        )
+
+        # Patch asyncio.sleep to avoid real delays
+        sleep_calls = []
+
+        async def mock_sleep(s):
+            sleep_calls.append(s)
+
+        monkeypatch.setattr(asyncio, "sleep", mock_sleep)
+
+        await _wait_for_auto_responder_dialog_clear("term1", "gen1", None, timeout=5.0)
+        # Only the initial grace sleep should have happened
+        assert len(sleep_calls) == 1  # _F491_DIALOG_CLEAR_INITIAL_GRACE
+
+    @pytest.mark.asyncio
+    async def test_waits_and_clears_when_dialog_dismissed(self, monkeypatch):
+        """Polls until status changes from WAITING_USER_ANSWER."""
+        import asyncio
+
+        from cli_agent_orchestrator.services.terminal_service import (
+            _wait_for_auto_responder_dialog_clear,
+        )
+
+        call_count = [0]
+
+        class FakeStatusMonitor:
+            def get_status(self, tid):
+                call_count[0] += 1
+                # First 2 polls: dialog active; 3rd: cleared
+                if call_count[0] <= 2:
+                    return TerminalStatus.WAITING_USER_ANSWER
+                return TerminalStatus.IDLE
+
+            def get_rendered_screen(self, tid):
+                return ["some lines"]
+
+        class FakeAutoResponder:
+            def waiting_gate(self, tid):
+                return None
+
+            def on_screen(self, tid, provider, lines):
+                return None
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.status_monitor",
+            FakeStatusMonitor(),
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.auto_responder.auto_responder",
+            FakeAutoResponder(),
+        )
+
+        async def mock_sleep(s):
+            pass
+
+        monkeypatch.setattr(asyncio, "sleep", mock_sleep)
+
+        await _wait_for_auto_responder_dialog_clear("term1", "gen1", None, timeout=10.0)
+        # Should have polled until clear
+        assert call_count[0] == 3
