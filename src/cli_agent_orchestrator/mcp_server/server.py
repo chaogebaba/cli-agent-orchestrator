@@ -2767,6 +2767,21 @@ async def load_skill(
     return _load_skill_impl(name)
 
 
+def _cleanup_deferred_message(terminal_id: str) -> str:
+    """Build provider-aware cleanup-deferred message for delete_terminal."""
+    try:
+        from cli_agent_orchestrator.services.terminal_service import get_terminal_metadata
+
+        meta = get_terminal_metadata(terminal_id)
+        provider = meta.get("provider", "unknown") if meta else "unknown"
+    except Exception:
+        provider = "unknown"
+    return (
+        f"Terminal {terminal_id} cleanup is pending; retry delete_terminal "
+        f"after the {provider} process exits."
+    )
+
+
 @mcp.tool()
 def delete_terminal(
     terminal_id: str = Field(
@@ -2810,27 +2825,21 @@ def delete_terminal(
             except (ValueError, AttributeError, TypeError):
                 pass
             # TerminalProtectionError and cascade conflicts carry a specific
-            # detail that is NOT about Grok cleanup deferral.
+            # detail that is NOT about cleanup deferral.
             protection_indicators = ("ready_base", "protected", "cascade", "subtree")
             if any(ind in str(detail).lower() for ind in protection_indicators):
                 msg = f"Failed to delete terminal: 409 Conflict ({detail})"
                 return {"success": False, "message": msg}
             return {
                 "success": False,
-                "message": (
-                    f"Terminal {terminal_id} cleanup is pending; retry delete_terminal "
-                    "after the Grok process exits."
-                ),
+                "message": _cleanup_deferred_message(terminal_id),
             }
         response.raise_for_status()
         payload = response.json()
         if not payload.get("success", True):
             return {
                 "success": False,
-                "message": (
-                    f"Terminal {terminal_id} cleanup is pending; retry delete_terminal "
-                    "after the Grok process exits."
-                ),
+                "message": _cleanup_deferred_message(terminal_id),
             }
         # F483: Remove fleet-labels.tsv rows for all reaped terminals.
         from cli_agent_orchestrator.services.fleet_labels import remove_label
@@ -2863,10 +2872,7 @@ def delete_terminal(
                 return {"success": False, "message": msg}
             return {
                 "success": False,
-                "message": (
-                    f"Terminal {terminal_id} cleanup is pending; retry delete_terminal "
-                    "after the Grok process exits."
-                ),
+                "message": _cleanup_deferred_message(terminal_id),
             }
         # Surface server detail for all non-404 errors
         detail = ""

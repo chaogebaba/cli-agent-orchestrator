@@ -7428,11 +7428,14 @@ async def delete_terminal(
             **delete_kwargs,
         )
         if result is False or (isinstance(result, dict) and not result.get("success", True)):
+            # Determine the terminal's actual provider for an accurate message.
+            _meta = get_terminal_metadata(terminal_id)
+            _provider = _meta.get("provider", "unknown") if _meta else "unknown"
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
                     f"cleanup deferred for terminal '{terminal_id}'; "
-                    "retry delete after residual Grok processes exit"
+                    f"retry delete after residual {_provider} processes exit"
                 ),
             )
         return {"success": True, **result} if isinstance(result, dict) else {"success": True}
