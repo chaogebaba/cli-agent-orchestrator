@@ -2782,12 +2782,66 @@ def _cleanup_deferred_message(terminal_id: str) -> str:
     )
 
 
+# F512 (#367): the API returns several structurally distinct 409 causes on
+# DELETE /terminals/{id}. Historically every non-protection 409 was collapsed
+# into the generic cleanup-deferred message, so an operator could not tell
+# "a sibling create/init is finishing, retry in a few seconds" (lease
+# contention) apart from "wait for the provider process to exit" (real
+# cleanup deferral) apart from rebind/cascade conflicts. Surface the real
+# API `detail` verbatim for every recognized cause; reserve the generic
+# cleanup wording only for an actual cleanup_provider=False deferral.
+#
+# Substrings the API uses in its 409 detail strings:
+#   - TerminalProtectionError / cascade conflicts: ready_base, protected,
+#     cascade, subtree
+#   - session-lifecycle / rebind contention (F513): resume_in_progress,
+#     rebind_in_progress, cascade_quiesce_unstable
+#   - actual cleanup deferral: the phrase "cleanup deferred"
+_DELETE_409_PASSTHROUGH_INDICATORS = (
+    "ready_base",
+    "protected",
+    "cascade",
+    "subtree",
+    "resume_in_progress",
+    "rebind_in_progress",
+    "cascade_quiesce_unstable",
+    "cascade_outside_caller_subtree",
+)
+
+
+def _classify_delete_409(detail: str, terminal_id: str) -> Dict[str, Any]:
+    """Map a 409 `detail` from DELETE /terminals to an MCP result dict.
+
+    Passes the API detail through verbatim for every recognized cause so the
+    caller can distinguish lease contention from cleanup deferral. Only a
+    detail that is empty or explicitly a cleanup-deferral falls back to the
+    generic provider-aware "cleanup is pending" message (F512, #367).
+    """
+    detail_l = str(detail).lower()
+    if detail and any(ind in detail_l for ind in _DELETE_409_PASSTHROUGH_INDICATORS):
+        return {
+            "success": False,
+            "message": f"Failed to delete terminal: 409 Conflict ({detail})",
+        }
+    # Actual cleanup-deferral, or an empty/unrecognized detail: keep the
+    # provider-aware retry guidance.
+    return {"success": False, "message": _cleanup_deferred_message(terminal_id)}
+
+
 @mcp.tool()
 def delete_terminal(
     terminal_id: str = Field(
         description="The terminal ID to delete (obtained from assign or handoff results)"
     ),
-    force: bool = Field(default=False, description="Override ready-base and profile protection"),
+    force: bool = Field(
+        default=False,
+        description=(
+            "Override ready-base and profile protection AND authorize the "
+            "server's cleanup-force path (bypass cleanup_provider=False so a "
+            "terminal with residual provider processes is still torn down). "
+            "Forwarded verbatim as ?force=true on DELETE /terminals/{id}."
+        ),
+    ),
     orphan: bool = Field(default=False, description="Leave descendants running and re-parent them"),
 ) -> Dict[str, Any]:
     """Delete a terminal that is no longer needed, freeing system resources.
@@ -2799,8 +2853,18 @@ def delete_terminal(
     Handoff terminals are automatically cleaned up on success — you only need
     to call this for assign terminals.
 
+    The ``force`` flag is forwarded to the API as ``?force=true`` and reaches
+    ``terminal_service.delete_terminal(force=True)``: it overrides ready-base
+    and profile protection AND authorizes the server-side cleanup-force path
+    (bypassing ``cleanup_provider() is False``). It does NOT bypass the
+    session-lifecycle lease gate (F513) — a 409 whose detail names lease
+    contention (``resume_in_progress`` etc.) means a sibling create/init on
+    the same session is finishing; retry shortly.
+
     Args:
         terminal_id: The terminal ID to delete
+        force: Override protection and authorize the cleanup-force path
+        orphan: Leave descendants running and re-parent them
 
     Returns:
         Dict with success status and message
@@ -2808,6 +2872,8 @@ def delete_terminal(
     try:
         # F172 input leniency: accept display form.
         terminal_id = _resolve_input_terminal_id(terminal_id)
+        # F493/F512: `force` is the same flag the API maps to its cleanup-force
+        # path — forward it verbatim as a query param.
         params: dict[str, Any] = {"force": force is True, "orphan": orphan is True}
         caller_id = _current_terminal_id()
         if caller_id:
@@ -2824,16 +2890,9 @@ def delete_terminal(
                 detail = body.get("detail", "") if isinstance(body, dict) else ""
             except (ValueError, AttributeError, TypeError):
                 pass
-            # TerminalProtectionError and cascade conflicts carry a specific
-            # detail that is NOT about cleanup deferral.
-            protection_indicators = ("ready_base", "protected", "cascade", "subtree")
-            if any(ind in str(detail).lower() for ind in protection_indicators):
-                msg = f"Failed to delete terminal: 409 Conflict ({detail})"
-                return {"success": False, "message": msg}
-            return {
-                "success": False,
-                "message": _cleanup_deferred_message(terminal_id),
-            }
+            # F512 (#367): surface the real cause verbatim instead of
+            # collapsing every 409 into the generic cleanup-deferred message.
+            return _classify_delete_409(detail, terminal_id)
         response.raise_for_status()
         payload = response.json()
         if not payload.get("success", True):
@@ -2866,14 +2925,8 @@ def delete_terminal(
                 detail = body.get("detail", "") if isinstance(body, dict) else ""
             except (ValueError, AttributeError, TypeError):
                 pass
-            protection_indicators = ("ready_base", "protected", "cascade", "subtree")
-            if any(ind in str(detail).lower() for ind in protection_indicators):
-                msg = f"Failed to delete terminal: {e}" + (f" ({detail})" if detail else "")
-                return {"success": False, "message": msg}
-            return {
-                "success": False,
-                "message": _cleanup_deferred_message(terminal_id),
-            }
+            # F512 (#367): same classification as the direct-response path.
+            return _classify_delete_409(detail, terminal_id)
         # Surface server detail for all non-404 errors
         detail = ""
         if e.response is not None:
