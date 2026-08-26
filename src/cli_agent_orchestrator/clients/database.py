@@ -9581,7 +9581,7 @@ class WakeCommitResult:
 
     kind: str
     # "committed", "superseded_by_ack", "stale_authority", "path_changed",
-    # "lease_lost"
+    # "lease_lost", "invalid_range"
     reason: str
 
 
@@ -9672,18 +9672,46 @@ def claim_unnotified_wake(
             now = _utcnow()
 
             # Check wake_exhausted (before lease check per D4 precedence)
+            # B5: Only block if there is no strictly newer pending forward row
             if wake_streak >= _WAKE_STREAK_CAP and wake_notified_id > 0:
                 # Exhaustion clears when consumed_through_id passes the stuck id
                 if wake_notified_id > consumed_cursor:
-                    db.commit()
-                    return WakeClaimResult(
-                        kind="wake_exhausted",
-                        rows=(),
-                        claimed_high_water=notified_cursor,
-                        path_version=path_version,
-                        reason="streak_cap_reached",
-                        exhausted_id=wake_notified_id,
-                    )
+                    # B5: check if newer work exists that can supersede exhaustion
+                    has_newer = db.execute(
+                        text(
+                            "SELECT 1 FROM inbox "
+                            "WHERE logical_receiver_id = :mb "
+                            "  AND receiver_id = :tid "
+                            "  AND enqueue_generation = :gen "
+                            "  AND status = 'pending' "
+                            "  AND id > :stuck_id "
+                            "LIMIT 1"
+                        ),
+                        {
+                            "mb": mailbox_id,
+                            "tid": terminal_id,
+                            "gen": generation,
+                            "stuck_id": wake_notified_id,
+                        },
+                    ).fetchone()
+                    if not has_newer:
+                        # B5: log WARNING once per exhaustion episode
+                        logger.warning(
+                            "f476_wake_exhausted mailbox=%s wake_notified_id=%d streak=%d"
+                            " — row stuck; supervisor may need manual intervention",
+                            mailbox_id,
+                            wake_notified_id,
+                            wake_streak,
+                        )
+                        db.commit()
+                        return WakeClaimResult(
+                            kind="wake_exhausted",
+                            rows=(),
+                            claimed_high_water=notified_cursor,
+                            path_version=path_version,
+                            reason="streak_cap_reached",
+                            exhausted_id=wake_notified_id,
+                        )
 
             # D4: Lease visibility predicate
             # Row is leased if: wake_notified_at is NOT NULL AND
@@ -9761,7 +9789,47 @@ def claim_unnotified_wake(
                         )
                     )
 
-            all_rows = tuple(replay_batch + forward_batch)
+            # B3: AC3 committed-pending lost-wake recovery.
+            # If no forward rows AND notified_cursor > consumed_cursor, look for
+            # pending rows that were committed but never consumed (still pending
+            # between consumed_cursor and notified_cursor). These are recovery
+            # candidates subject to the 300s cooldown (lease_held blocks them).
+            recovery_batch: list[CallbackBatchRow] = []
+            if not forward_batch and not replay_batch and notified_cursor > consumed_cursor:
+                recovery_rows_raw = db.execute(
+                    text(
+                        "SELECT i.id, i.sender_id, i.message, i.created_at "
+                        "FROM inbox i "
+                        "WHERE i.logical_receiver_id = :mb "
+                        "  AND i.receiver_id = :tid "
+                        "  AND i.enqueue_generation = :gen "
+                        "  AND i.status = 'pending' "
+                        "  AND i.id > :consumed "
+                        "  AND i.id <= :notified "
+                        "ORDER BY i.id ASC "
+                        "LIMIT :lim"
+                    ),
+                    {
+                        "mb": mailbox_id,
+                        "tid": terminal_id,
+                        "gen": generation,
+                        "consumed": consumed_cursor,
+                        "notified": notified_cursor,
+                        "lim": limit,
+                    },
+                ).fetchall()
+                for row in recovery_rows_raw:
+                    recovery_batch.append(
+                        CallbackBatchRow(
+                            inbox_row_id=int(row[0]),
+                            sender_id=str(row[1]),
+                            message=str(row[2]),
+                            created_at=row[3] if row[3] else now,
+                            tag="forward",  # treated as forward for cursor purposes
+                        )
+                    )
+
+            all_rows = tuple(replay_batch + forward_batch + recovery_batch)
 
             # Compute claimed_high_water from forward rows only
             if forward_batch:
@@ -9769,18 +9837,16 @@ def claim_unnotified_wake(
             else:
                 claimed_high_water = notified_cursor
 
-            # D4 lease check: if lease held and no new forward rows supersede it
+            # D4 lease check: if lease held, return lease_held (no bypass for replay — B4)
             if lease_held and claimed_high_water <= wake_notified_id:
-                # D1 exception: replay rows are wake-eligible regardless
-                if not replay_batch:
-                    db.commit()
-                    return WakeClaimResult(
-                        kind="lease_held",
-                        rows=(),
-                        claimed_high_water=notified_cursor,
-                        path_version=path_version,
-                        reason="lease_active",
-                    )
+                db.commit()
+                return WakeClaimResult(
+                    kind="lease_held",
+                    rows=(),
+                    claimed_high_water=notified_cursor,
+                    path_version=path_version,
+                    reason="lease_active",
+                )
 
             # No rows at all → empty claim (still "claimed" kind)
             if not all_rows:
@@ -9825,6 +9891,7 @@ def commit_wake(
     terminal_id: str,
     generation: int,
     through_id: int,
+    claimed_high_water: int,
     expected_path_version: int,
     replay_row_ids: tuple[int, ...] = (),
 ) -> WakeCommitResult:
@@ -9832,8 +9899,15 @@ def commit_wake(
 
     Must be called AFTER claim and BEFORE emit. Returns the commit verdict.
     Runs under the mailbox authority lock (D1).
+    through_id must be <= claimed_high_water (B2: bound to claim).
     """
     from cli_agent_orchestrator.services.mailbox_service import get_mailbox_authority_lock
+
+    # B2: reject through_id beyond claimed_high_water
+    if through_id > claimed_high_water:
+        return WakeCommitResult(
+            kind="invalid_range", reason="through_id_exceeds_claimed_high_water"
+        )
 
     # Resolve mailbox for lock
     with SessionLocal() as db:
@@ -9885,6 +9959,10 @@ def commit_wake(
             if wake_notified_at is None and through_id > current_cursor:
                 # Another commit already cleared the lease
                 return WakeCommitResult(kind="lease_lost", reason="lease_already_cleared")
+            # B2: verify claimed_high_water matches what the lease stamped
+            if wake_notified_id != 0 and claimed_high_water != wake_notified_id:
+                # A different claim stamped a different high-water
+                return WakeCommitResult(kind="lease_lost", reason="claim_mismatch")
 
             now = _utcnow()
 

@@ -1373,6 +1373,7 @@ class WakeCommitRequest(BaseModel):
 
     to: str = Field(pattern=r"^[a-f0-9]{8}$")
     through_id: int = Field(ge=0)
+    claimed_high_water: int = Field(ge=0)
     expected_path_version: int = Field(ge=0)
     replay_row_ids: List[int] = Field(default_factory=list)
 
@@ -8140,6 +8141,7 @@ async def wake_commit_endpoint(
             terminal_id=body.to,
             generation=generation,
             through_id=body.through_id,
+            claimed_high_water=body.claimed_high_water,
             expected_path_version=body.expected_path_version,
             replay_row_ids=tuple(body.replay_row_ids),
         )
@@ -8164,26 +8166,55 @@ async def wake_drain_replay_endpoint(
     )
 
     def _do_drain() -> Dict[str, Any]:
+        from cli_agent_orchestrator.services.mailbox_service import get_mailbox_authority_lock
+
         with SessionLocal() as db:
             inc = db.query(MailboxIncarnationModel).filter_by(terminal_id=body.to).one_or_none()
             if inc is None:
                 return {"kind": "stale_authority", "reason": "no_incarnation", "drained": 0}
             mailbox_id = str(inc.mailbox_id)
+            mailbox = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
+            if mailbox is None:
+                return {"kind": "stale_authority", "reason": "no_mailbox", "drained": 0}
+            # B7: validate current incarnation authority
+            if mailbox.current_terminal_id != body.to:
+                return {
+                    "kind": "stale_authority",
+                    "reason": "not_current_incarnation",
+                    "drained": 0,
+                }
+            session_name = str(mailbox.session_name)
+            role = str(mailbox.role)
 
-        with SessionLocal() as db:
-            db.execute(sa_text("BEGIN IMMEDIATE"))
-            drained = 0
-            for rid in body.row_ids:
-                result = db.execute(
-                    sa_text(
-                        "DELETE FROM callback_replay_queue "
-                        "WHERE mailbox_id = :mb AND inbox_row_id = :rid"
-                    ),
-                    {"mb": mailbox_id, "rid": rid},
-                )
-                drained += result.rowcount
-            db.commit()
-        return {"kind": "drained", "drained": drained}
+        # B7: take authority lock
+        lock = get_mailbox_authority_lock(session_name, role)
+        if not lock.acquire(timeout=0.5):
+            return {"kind": "stale_authority", "reason": "authority_lock_contention", "drained": 0}
+        try:
+            with SessionLocal() as db:
+                db.execute(sa_text("BEGIN IMMEDIATE"))
+                # Re-validate under lock
+                mailbox = db.query(MailboxModel).filter_by(id=mailbox_id).one_or_none()
+                if mailbox is None or mailbox.current_terminal_id != body.to:
+                    return {
+                        "kind": "stale_authority",
+                        "reason": "not_current_incarnation",
+                        "drained": 0,
+                    }
+                drained = 0
+                for rid in body.row_ids:
+                    result = db.execute(
+                        sa_text(
+                            "DELETE FROM callback_replay_queue "
+                            "WHERE mailbox_id = :mb AND inbox_row_id = :rid"
+                        ),
+                        {"mb": mailbox_id, "rid": rid},
+                    )
+                    drained += result.rowcount
+                db.commit()
+            return {"kind": "drained", "drained": drained}
+        finally:
+            lock.release()
 
     return await asyncio.to_thread(_do_drain)
 

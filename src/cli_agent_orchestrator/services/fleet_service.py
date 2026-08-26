@@ -215,3 +215,34 @@ def build_fleet(session_name: str) -> dict[str, Any]:
             }
         )
     return {"session_name": session_name, "terminals": projected}
+
+
+def get_wake_exhaustion_alarms() -> list[dict[str, Any]]:
+    """F476 B5: Return active wake-exhaustion alarms for fleet/dashboard surfaces."""
+    from cli_agent_orchestrator.clients.database import (
+        MailboxModel,
+        SessionLocal,
+        _WAKE_STREAK_CAP,
+    )
+
+    alarms: list[dict[str, Any]] = []
+    with SessionLocal() as db:
+        exhausted = (
+            db.query(MailboxModel)
+            .filter(
+                MailboxModel.wake_streak >= _WAKE_STREAK_CAP,
+                MailboxModel.wake_notified_id > MailboxModel.consumed_through_id,
+            )
+            .all()
+        )
+        for mb in exhausted:
+            alarms.append(
+                {
+                    "mailbox_id": mb.id,
+                    "session_name": mb.session_name,
+                    "role": mb.role,
+                    "stuck_row_id": int(mb.wake_notified_id),
+                    "wake_streak": int(mb.wake_streak),
+                }
+            )
+    return alarms

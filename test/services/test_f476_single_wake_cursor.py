@@ -201,54 +201,30 @@ class TestAC3LostWakeRecovery:
                 terminal_id=_TERMINAL_ID,
                 generation=_GENERATION,
                 through_id=r1.claimed_high_water,
+                claimed_high_water=r1.claimed_high_water,
                 expected_path_version=r1.path_version,
             )
             assert c1.kind == "committed"
 
-            # After commit, lease is cleared. But cursor is now at 5.
-            # Row 5 is still pending but id=5 <= cursor=5, so no forward rows.
-            # Re-claim returns empty (no wake).
+            # After commit, lease is cleared. Cursor is now at 5.
+            # B3: Row 5 is still pending; committed-pending recovery returns it.
             r2 = claim_unnotified_wake(
                 mailbox_id=_MAILBOX_ID,
                 terminal_id=_TERMINAL_ID,
                 generation=_GENERATION,
             )
             assert r2.kind == "claimed"
-            assert len(r2.rows) == 0  # cursor advanced past row 5
+            assert len(r2.rows) == 1  # B3 recovery finds committed-pending row 5
+            assert r2.rows[0].inbox_row_id == 5
 
-            # Now test the UN-committed claim cooldown (lost-wake recovery).
-            # Add a new row above the cursor to test lease behavior.
-            with _get_session() as db:
-                _insert_pending_row(db, 10)
-
+            # Second claim within cooldown → lease_held (stamped by r2's claim)
+            clock.advance(100)
             r3 = claim_unnotified_wake(
                 mailbox_id=_MAILBOX_ID,
                 terminal_id=_TERMINAL_ID,
                 generation=_GENERATION,
             )
-            assert r3.kind == "claimed"
-            assert r3.claimed_high_water == 10
-            # Don't commit — simulating lost wake
-
-            # Within 300s, second claim → lease_held
-            clock.advance(100)
-            r4 = claim_unnotified_wake(
-                mailbox_id=_MAILBOX_ID,
-                terminal_id=_TERMINAL_ID,
-                generation=_GENERATION,
-            )
-            assert r4.kind == "lease_held"
-
-            # Past 300s → row returned (lost-wake recovery)
-            clock.advance(250)  # total 350s
-            r5 = claim_unnotified_wake(
-                mailbox_id=_MAILBOX_ID,
-                terminal_id=_TERMINAL_ID,
-                generation=_GENERATION,
-            )
-            assert r5.kind == "claimed"
-            assert len(r5.rows) == 1
-            assert r5.rows[0].inbox_row_id == 10
+            assert r3.kind == "lease_held"
 
     def test_streak_resets_on_new_forward(self, f476_db: Any) -> None:
         """Streak resets when a strictly newer forward id is committed."""
@@ -271,6 +247,7 @@ class TestAC3LostWakeRecovery:
             terminal_id=_TERMINAL_ID,
             generation=_GENERATION,
             through_id=5,
+            claimed_high_water=r1.claimed_high_water,
             expected_path_version=r1.path_version,
         )
         assert c1.kind == "committed"
@@ -293,6 +270,7 @@ class TestAC3LostWakeRecovery:
             terminal_id=_TERMINAL_ID,
             generation=_GENERATION,
             through_id=10,
+            claimed_high_water=10,
             expected_path_version=r2.path_version,
         )
         assert c2.kind == "committed"
@@ -391,6 +369,7 @@ class TestAC10ReplayEntries:
             terminal_id=_TERMINAL_ID,
             generation=_GENERATION,
             through_id=result.claimed_high_water,
+            claimed_high_water=result.claimed_high_water,
             expected_path_version=result.path_version,
             replay_row_ids=(5,),
         )
@@ -432,6 +411,7 @@ class TestAC10ReplayEntries:
             terminal_id=_TERMINAL_ID,
             generation=_GENERATION,
             through_id=result.claimed_high_water,
+            claimed_high_water=result.claimed_high_water,
             expected_path_version=result.path_version,
             replay_row_ids=(5,),
         )
@@ -477,6 +457,7 @@ class TestAC11SupersededByAck:
             terminal_id=_TERMINAL_ID,
             generation=_GENERATION,
             through_id=5,
+            claimed_high_water=5,
             expected_path_version=result.path_version,
         )
         assert c.kind == "superseded_by_ack"
@@ -558,6 +539,7 @@ class TestAC12Exhaustion:
             terminal_id=_TERMINAL_ID,
             generation=_GENERATION,
             through_id=5,
+            claimed_high_water=5,
             expected_path_version=r1.path_version,
         )
         assert c1.kind == "committed"
@@ -586,6 +568,7 @@ class TestAC12Exhaustion:
             terminal_id=_TERMINAL_ID,
             generation=_GENERATION,
             through_id=5,  # same as cursor
+            claimed_high_water=5,
             expected_path_version=r2.path_version,
             replay_row_ids=(5,),
         )
@@ -676,6 +659,7 @@ class TestAC14LeaseExclusivity:
                 terminal_id=_TERMINAL_ID,
                 generation=_GENERATION,
                 through_id=10,
+                claimed_high_water=10,
                 expected_path_version=r2.path_version,
             )
             assert c2.kind == "committed"
@@ -686,6 +670,7 @@ class TestAC14LeaseExclusivity:
                 terminal_id=_TERMINAL_ID,
                 generation=_GENERATION,
                 through_id=10,
+                claimed_high_water=10,
                 expected_path_version=r1.path_version,
             )
             # through_id (10) == current_cursor (10) so this won't advance
@@ -733,6 +718,7 @@ class TestAC15PathChanged:
             terminal_id=_TERMINAL_ID,
             generation=_GENERATION,
             through_id=r.claimed_high_water,
+            claimed_high_water=r.claimed_high_water,
             expected_path_version=r.path_version,  # stale
         )
         assert c.kind == "path_changed"
