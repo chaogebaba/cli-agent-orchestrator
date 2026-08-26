@@ -763,3 +763,73 @@ def set_extra_skill_dirs(dirs: List[str]) -> List[str]:
     settings["extra_skill_dirs"] = extra_skill_dirs
     _save(settings)
     return extra_skill_dirs
+
+
+
+# --- TUI settings (F489) ---
+
+_TUI_DEFAULTS: Dict[str, Any] = {
+    "autostart": True,
+    "ensure_script": "/home/chao/VScode_projects/cli-subagents/scripts/fleet-tui-ensure.sh",
+}
+
+_TUI_ENV_VARS: Dict[str, str] = {
+    "autostart": "CAO_TUI_AUTOSTART",
+    "ensure_script": "CAO_TUI_ENSURE_SCRIPT",
+}
+
+
+def get_tui_settings() -> Dict[str, Any]:
+    """Return TUI settings from settings.json ``tui`` section.
+
+    Precedence per key: CAO_TUI_* env var > tui.* in settings.json > default.
+    """
+    settings = _load()
+    saved = settings.get("tui", {})
+    if not isinstance(saved, dict):
+        saved = {}
+    result = dict(_TUI_DEFAULTS)
+    result.update({k: v for k, v in saved.items() if k in _TUI_DEFAULTS})
+
+    # Env-var overlay
+    for key, env_name in _TUI_ENV_VARS.items():
+        raw = os.environ.get(env_name)
+        if raw is None:
+            continue
+        raw = raw.strip()
+        if key == "autostart":
+            if raw.lower() in _BOOL_TRUE_VALUES:
+                result[key] = True
+            elif raw.lower() in _BOOL_FALSE_VALUES:
+                result[key] = False
+        elif key == "ensure_script":
+            if raw:
+                result[key] = raw
+
+    return result
+
+
+def is_tui_autostart_enabled() -> bool:
+    """Return True when fleet TUI auto-start on dispatch is enabled.
+
+    Precedence: CAO_TUI_AUTOSTART env var > tui.autostart in settings.json
+    > default (True).
+    """
+    try:
+        return bool(get_tui_settings().get("autostart", True))
+    except Exception as e:
+        logger.warning(f"Failed to read tui.autostart, defaulting to True: {e}")
+        return True
+
+
+def get_tui_ensure_script() -> str:
+    """Return the absolute path to the fleet-tui-ensure.sh script.
+
+    Precedence: CAO_TUI_ENSURE_SCRIPT env var > tui.ensure_script in settings.json
+    > default.
+    """
+    try:
+        return str(get_tui_settings().get("ensure_script", _TUI_DEFAULTS["ensure_script"]))
+    except Exception as e:
+        logger.warning(f"Failed to read tui.ensure_script, using default: {e}")
+        return _TUI_DEFAULTS["ensure_script"]
